@@ -38,11 +38,11 @@ dbLoadRecords("db/d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=$(DEPTH_POR
 
 # Color image (RGB8: XSIZE * YSIZE * 3)
 NDStdArraysConfigure("IMAGE1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,DTYP=asynIMAGE1,NDARRAY_PORT=$(PORT),TYPE=Int8,FTVL=UCHAR,NELEMENTS=6220800")
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=IMAGE1,DTYP=asynIMAGE1,NDARRAY_PORT=$(PORT),TYPE=Int8,FTVL=UCHAR,NELEMENTS=6220800,ENABLED=1")
 
 # Depth image (Z16: XSIZE * YSIZE)
 NDStdArraysConfigure("IMAGE2", $(QSIZE), 0, "$(DEPTH_PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=IMAGE2,DTYP=asynIMAGE2,NDARRAY_PORT=$(DEPTH_PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=2073600")
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=IMAGE2,DTYP=asynIMAGE2,NDARRAY_PORT=$(DEPTH_PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=2073600,ENABLED=1")
 
 # ===== Load all common plugins (wired to color port) =====
 < $(ADCORE)/ioc/commonPlugins.cmd

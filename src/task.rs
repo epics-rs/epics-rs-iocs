@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use asyn_rs::port_handle::PortHandle;
 
+use ad_core::color::NDColorMode;
 use ad_core::driver::{ADStatus, ImageMode};
 use ad_core::attributes::NDAttributeList;
-use ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use ad_core::params::ADBaseParams;
 use ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
 
@@ -147,6 +148,25 @@ fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame) {
     }
 }
 
+/// Copy frame data, stripping any row stride padding.
+/// Returns a tightly-packed buffer of `row_bytes * h` bytes.
+fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usize) -> Vec<u8> {
+    if stride == row_bytes {
+        // No padding — fast path
+        let total = row_bytes * h;
+        unsafe { std::slice::from_raw_parts(frame_ptr, total) }.to_vec()
+    } else {
+        // Strip per-row padding
+        let mut buf = Vec::with_capacity(row_bytes * h);
+        for row in 0..h {
+            let offset = row * stride;
+            let row_slice = unsafe { std::slice::from_raw_parts(frame_ptr.add(offset), row_bytes) };
+            buf.extend_from_slice(row_slice);
+        }
+        buf
+    }
+}
+
 fn process_color_frame(
     composite: &CompositeFrame,
     ctx: &AcquisitionContext,
@@ -156,14 +176,13 @@ fn process_color_frame(
     if let Some(frame) = color_frames.first() {
         let w = frame.width();
         let h = frame.height();
-        let data_size = frame.get_data_size();
+        let stride = frame.stride();
+        let row_bytes = w * 3; // RGB8: 3 bytes per pixel
 
-        let bytes = unsafe {
-            let ptr = frame.get_data() as *const std::os::raw::c_void as *const u8;
-            std::slice::from_raw_parts(ptr, data_size)
-        };
+        let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
+        let bytes = copy_frame_data(ptr, stride, row_bytes, h);
 
-        let data = NDDataBuffer::U8(bytes.to_vec());
+        let data = NDDataBuffer::U8(bytes);
         // RGB1 layout: [3, width, height]
         let dims = vec![
             NDDimension::new(3),
@@ -187,10 +206,13 @@ fn process_color_frame(
         ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.epics_ts_sec, 0, ts.sec as i32);
         ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.epics_ts_nsec, 0, ts.nsec as i32);
 
-        // Update array size info
+        // Update array size and type info
         ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.array_size_x, 0, w as i32);
         ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.array_size_y, 0, h as i32);
         ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.array_size_z, 0, 3);
+        ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.n_dimensions, 0, 3);
+        ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.color_mode, 0, NDColorMode::RGB1 as i32);
+        ctx.color_handle.write_int32_no_wait(ctx.color_ad.base.data_type, 0, NDDataType::UInt8 as u8 as i32);
 
         let _ = ctx.color_handle.call_param_callbacks_blocking(0);
 
@@ -207,14 +229,19 @@ fn process_depth_frame(
     if let Some(frame) = depth_frames.first() {
         let w = frame.width();
         let h = frame.height();
-        let data_size = frame.get_data_size();
+        let stride = frame.stride();
+        let row_bytes = w * 2; // Z16: 2 bytes per pixel
 
-        let pixels = unsafe {
-            let ptr = frame.get_data() as *const std::os::raw::c_void as *const u16;
-            std::slice::from_raw_parts(ptr, data_size / 2)
-        };
+        let ptr = unsafe { frame.get_data() as *const std::os::raw::c_void as *const u8 };
+        let bytes = copy_frame_data(ptr, stride, row_bytes, h);
 
-        let data = NDDataBuffer::U16(pixels.to_vec());
+        // Reinterpret as u16
+        let pixels: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect();
+
+        let data = NDDataBuffer::U16(pixels);
         // Mono layout: [width, height]
         let dims = vec![
             NDDimension::new(w),
@@ -237,10 +264,13 @@ fn process_depth_frame(
         ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.epics_ts_sec, 0, ts.sec as i32);
         ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.epics_ts_nsec, 0, ts.nsec as i32);
 
-        // Update array size info
+        // Update array size and type info
         ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.array_size_x, 0, w as i32);
         ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.array_size_y, 0, h as i32);
         ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.array_size_z, 0, 0);
+        ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.n_dimensions, 0, 2);
+        ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.color_mode, 0, NDColorMode::Mono as i32);
+        ctx.depth_handle.write_int32_no_wait(ctx.depth_ad.base.data_type, 0, NDDataType::UInt16 as u8 as i32);
 
         let _ = ctx.depth_handle.call_param_callbacks_blocking(0);
 
@@ -351,6 +381,8 @@ fn acquisition_loop(ctx: AcquisitionContext) {
 
         let mut first_frame = true;
         let mut sensor_options_applied = false;
+        let mut consecutive_errors: u32 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 50;
 
         // Inner acquisition loop
         loop {
@@ -401,13 +433,34 @@ fn acquisition_loop(ctx: AcquisitionContext) {
 
             // Wait for frames
             let composite = match pipeline.wait(Some(Duration::from_secs(5))) {
-                Ok(f) => f,
+                Ok(f) => {
+                    consecutive_errors = 0;
+                    f
+                }
                 Err(e) => {
-                    eprintln!("D435i: frame wait error: {e}");
+                    consecutive_errors += 1;
+                    // Log first error, then every 10th to avoid spam
+                    if consecutive_errors == 1 || consecutive_errors % 10 == 0 {
+                        eprintln!(
+                            "D435i: frame wait error ({consecutive_errors}x): {e}"
+                        );
+                    }
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        eprintln!(
+                            "D435i: {} consecutive frame errors, stopping acquisition",
+                            consecutive_errors
+                        );
+                        break;
+                    }
                     // Check for stop
                     if let Ok(AcqCommand::Stop) = ctx.acq_rx.try_recv() {
                         break;
                     }
+                    // Backoff: sleep up to 2 seconds based on error count
+                    let backoff = Duration::from_millis(
+                        100 * (consecutive_errors as u64).min(20)
+                    );
+                    std::thread::sleep(backoff);
                     continue;
                 }
             };

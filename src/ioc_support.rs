@@ -147,6 +147,85 @@ fn build_depth_param_registry(ad: &ADBaseParams) -> ParamRegistry {
     let mut map = HashMap::new();
     let base = &ad.base;
 
+    // ===== ADBase.db params =====
+
+    // Image size
+    map.insert("MaxSizeX_RBV".into(), ParamInfo::int32(ad.max_size_x, "MAX_SIZE_X"));
+    map.insert("MaxSizeY_RBV".into(), ParamInfo::int32(ad.max_size_y, "MAX_SIZE_Y"));
+    map.insert("SizeX".into(), ParamInfo::int32(ad.size_x, "SIZE_X"));
+    map.insert("SizeX_RBV".into(), ParamInfo::int32(ad.size_x, "SIZE_X"));
+    map.insert("SizeY".into(), ParamInfo::int32(ad.size_y, "SIZE_Y"));
+    map.insert("SizeY_RBV".into(), ParamInfo::int32(ad.size_y, "SIZE_Y"));
+    map.insert("MinX".into(), ParamInfo::int32(ad.min_x, "MIN_X"));
+    map.insert("MinX_RBV".into(), ParamInfo::int32(ad.min_x, "MIN_X"));
+    map.insert("MinY".into(), ParamInfo::int32(ad.min_y, "MIN_Y"));
+    map.insert("MinY_RBV".into(), ParamInfo::int32(ad.min_y, "MIN_Y"));
+    map.insert("BinX".into(), ParamInfo::int32(ad.bin_x, "BIN_X"));
+    map.insert("BinX_RBV".into(), ParamInfo::int32(ad.bin_x, "BIN_X"));
+    map.insert("BinY".into(), ParamInfo::int32(ad.bin_y, "BIN_Y"));
+    map.insert("BinY_RBV".into(), ParamInfo::int32(ad.bin_y, "BIN_Y"));
+    map.insert("ReverseX".into(), ParamInfo::int32(ad.reverse_x, "REVERSE_X"));
+    map.insert("ReverseX_RBV".into(), ParamInfo::int32(ad.reverse_x, "REVERSE_X"));
+    map.insert("ReverseY".into(), ParamInfo::int32(ad.reverse_y, "REVERSE_Y"));
+    map.insert("ReverseY_RBV".into(), ParamInfo::int32(ad.reverse_y, "REVERSE_Y"));
+
+    // Acquire control
+    map.insert("Acquire".into(), ParamInfo::int32(ad.acquire, "ACQUIRE"));
+    map.insert("Acquire_RBV".into(), ParamInfo::int32(ad.acquire, "ACQUIRE"));
+    map.insert("ImageMode".into(), ParamInfo::int32(ad.image_mode, "IMAGE_MODE"));
+    map.insert("ImageMode_RBV".into(), ParamInfo::int32(ad.image_mode, "IMAGE_MODE"));
+    map.insert("NumImages".into(), ParamInfo::int32(ad.num_images, "NUM_IMAGES"));
+    map.insert("NumImages_RBV".into(), ParamInfo::int32(ad.num_images, "NUM_IMAGES"));
+    map.insert("NumImagesCounter_RBV".into(), ParamInfo::int32(ad.num_images_counter, "NUM_IMAGES_COUNTER"));
+    map.insert("NumExposures".into(), ParamInfo::int32(ad.num_exposures, "NUM_EXPOSURES"));
+    map.insert("NumExposures_RBV".into(), ParamInfo::int32(ad.num_exposures, "NUM_EXPOSURES"));
+    map.insert("NumExposuresCounter_RBV".into(), ParamInfo::int32(ad.num_exposures_counter, "NUM_EXPOSURES_COUNTER"));
+    map.insert("AcquireTime".into(), ParamInfo::float64(ad.acquire_time, "ACQUIRE_TIME"));
+    map.insert("AcquireTime_RBV".into(), ParamInfo::float64(ad.acquire_time, "ACQUIRE_TIME"));
+    map.insert("AcquirePeriod".into(), ParamInfo::float64(ad.acquire_period, "ACQUIRE_PERIOD"));
+    map.insert("AcquirePeriod_RBV".into(), ParamInfo::float64(ad.acquire_period, "ACQUIRE_PERIOD"));
+    map.insert("TimeRemaining_RBV".into(), ParamInfo::float64(ad.time_remaining, "TIME_REMAINING"));
+    map.insert("Status_RBV".into(), ParamInfo::int32(ad.status, "DETECTOR_STATE"));
+    map.insert("DetectorState_RBV".into(), ParamInfo::int32(ad.status, "DETECTOR_STATE"));
+    map.insert("StatusMessage_RBV".into(), ParamInfo::string(ad.status_message, "STATUS_MESSAGE"));
+    map.insert("AcquireBusy".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
+    map.insert("AcquireBusy_RBV".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
+    map.insert("WaitForPlugins".into(), ParamInfo::int32(ad.wait_for_plugins, "WAIT_FOR_PLUGINS"));
+    map.insert("ReadStatus".into(), ParamInfo::int32(ad.read_status, "READ_STATUS"));
+    map.insert("AcquireBusyCB".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
+
+    // Detector
+    map.insert("ADGain".into(), ParamInfo::float64(ad.gain, "GAIN"));
+    map.insert("ADGain_RBV".into(), ParamInfo::float64(ad.gain, "GAIN"));
+    map.insert("FrameType".into(), ParamInfo::int32(ad.frame_type, "FRAME_TYPE"));
+    map.insert("FrameType_RBV".into(), ParamInfo::int32(ad.frame_type, "FRAME_TYPE"));
+    map.insert("TriggerMode".into(), ParamInfo::int32(ad.trigger_mode, "TRIGGER_MODE"));
+    map.insert("TriggerMode_RBV".into(), ParamInfo::int32(ad.trigger_mode, "TRIGGER_MODE"));
+
+    // Shutter
+    map.insert("ShutterControl".into(), ParamInfo::int32(ad.shutter_control, "SHUTTER_CONTROL"));
+    map.insert("ShutterControl_RBV".into(), ParamInfo::int32(ad.shutter_control, "SHUTTER_CONTROL"));
+    map.insert("ShutterControlEPICS".into(), ParamInfo::int32(ad.shutter_control_epics, "SHUTTER_CONTROL_EPICS"));
+    map.insert("ShutterStatus_RBV".into(), ParamInfo::int32(ad.shutter_status, "SHUTTER_STATUS"));
+    map.insert("ShutterStatusEPICS_RBV".into(), ParamInfo::int32(ad.shutter_status_epics, "SHUTTER_STATUS_EPICS"));
+    map.insert("ShutterMode".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
+    map.insert("ShutterMode_RBV".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
+    map.insert("ShutterOpenDelay".into(), ParamInfo::float64(ad.shutter_open_delay, "SHUTTER_OPEN_DELAY"));
+    map.insert("ShutterOpenDelay_RBV".into(), ParamInfo::float64(ad.shutter_open_delay, "SHUTTER_OPEN_DELAY"));
+    map.insert("ShutterCloseDelay".into(), ParamInfo::float64(ad.shutter_close_delay, "SHUTTER_CLOSE_DELAY"));
+    map.insert("ShutterCloseDelay_RBV".into(), ParamInfo::float64(ad.shutter_close_delay, "SHUTTER_CLOSE_DELAY"));
+
+    // Temperature
+    map.insert("Temperature".into(), ParamInfo::float64(ad.temperature, "TEMPERATURE"));
+    map.insert("Temperature_RBV".into(), ParamInfo::float64(ad.temperature, "TEMPERATURE"));
+    map.insert("TemperatureActual".into(), ParamInfo::float64(ad.temperature_actual, "TEMPERATURE_ACTUAL"));
+
+    // Communication
+    map.insert("StringToServer".into(), ParamInfo::string(ad.string_to_server, "STRING_TO_SERVER"));
+    map.insert("StringToServer_RBV".into(), ParamInfo::string(ad.string_to_server, "STRING_TO_SERVER"));
+    map.insert("StringFromServer_RBV".into(), ParamInfo::string(ad.string_from_server, "STRING_FROM_SERVER"));
+
+    // ===== NDArrayBase.db params =====
     insert_ndarray_base_params(&mut map, base);
 
     map
@@ -459,6 +538,12 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
         ));
     }
 
+    // Clone handles/registries for standard asyn DTYP support before moving originals
+    let std_c_ph = color_handle.clone();
+    let std_c_reg = color_registry.clone();
+    let std_d_ph = depth_handle.clone();
+    let std_d_reg = depth_registry.clone();
+
     // --- asynD435i device support (Color) ---
     {
         let ph = color_handle;
@@ -490,6 +575,41 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
                 .as_ref().expect("d435iConfig must be called before iocInit")
                 .clone();
             Box::new(D435iDepthDeviceSupport::from_handle(handle, registry))
+        });
+    }
+
+    // --- Standard asyn DTYP support (asynInt32, asynFloat64, asynOctetRead, asynOctetWrite) ---
+    // ADBase.template and NDArrayBase.template use these hardcoded DTYPs.
+    // Route them to the correct driver port by parsing the @asyn(PORT,...) link.
+    {
+        ioc.register_dynamic_device_support(move |ctx| {
+            match ctx.dtyp {
+                "asynInt32" | "asynFloat64" | "asynOctetRead" | "asynOctetWrite" => {}
+                _ => return None,
+            }
+
+            let link_str = if !ctx.inp.is_empty() { ctx.inp } else { ctx.out };
+            let link = asyn_rs::adapter::parse_asyn_link(link_str).ok()?;
+
+            // Color port
+            if let Some(ref handle) = *std_c_ph.lock().unwrap() {
+                if handle.port_name() == link.port_name {
+                    let registry = std_c_reg.lock().unwrap().as_ref()?.clone();
+                    return Some(Box::new(D435iDeviceSupport::from_handle(handle.clone(), registry))
+                        as Box<dyn epics_base_rs::server::device_support::DeviceSupport>);
+                }
+            }
+
+            // Depth port
+            if let Some(ref handle) = *std_d_ph.lock().unwrap() {
+                if handle.port_name() == link.port_name {
+                    let registry = std_d_reg.lock().unwrap().as_ref()?.clone();
+                    return Some(Box::new(D435iDepthDeviceSupport::from_handle(handle.clone(), registry))
+                        as Box<dyn epics_base_rs::server::device_support::DeviceSupport>);
+                }
+            }
+
+            None
         });
     }
 }

@@ -42,6 +42,8 @@ impl D435iColorDriver {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Intel".into())?;
         base.set_string_param(ad.params.base.model, 0, "RealSense D435i".into())?;
+        base.set_string_param(ad.params.base.serial_number, 0, "Not connected".into())?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "Unknown".into())?;
         base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION").into())?;
 
         // Default stream config
@@ -50,9 +52,24 @@ impl D435iColorDriver {
         base.set_int32_param(rs_params.rs_res_x, 0, default_mode.width)?;
         base.set_int32_param(rs_params.rs_res_y, 0, default_mode.height)?;
         base.set_int32_param(rs_params.rs_frame_rate, 0, default_mode.fps)?;
+
+        // Image size and ROI
         base.set_int32_param(ad.params.size_x, 0, default_mode.width)?;
         base.set_int32_param(ad.params.size_y, 0, default_mode.height)?;
+        base.set_int32_param(ad.params.min_x, 0, 0)?;
+        base.set_int32_param(ad.params.min_y, 0, 0)?;
+        base.set_int32_param(ad.params.bin_x, 0, 1)?;
+        base.set_int32_param(ad.params.bin_y, 0, 1)?;
+        base.set_int32_param(ad.params.reverse_x, 0, 0)?;
+        base.set_int32_param(ad.params.reverse_y, 0, 0)?;
+
+        // Acquire timing and control
         base.set_float64_param(ad.params.acquire_time, 0, 1.0 / default_mode.fps as f64)?;
+        base.set_float64_param(ad.params.acquire_period, 0, 1.0 / default_mode.fps as f64)?;
+        base.set_int32_param(ad.params.image_mode, 0, ImageMode::Continuous as i32)?;
+        base.set_int32_param(ad.params.num_images, 0, 100)?;
+        base.set_int32_param(ad.params.num_exposures, 0, 1)?;
+        base.set_int32_param(ad.params.trigger_mode, 0, 0)?;
 
         // Default sensor options
         base.set_float64_param(rs_params.rs_exposure, 0, 8500.0)?;
@@ -64,9 +81,6 @@ impl D435iColorDriver {
         // Read-only defaults
         base.set_float64_param(rs_params.rs_depth_units, 0, 0.001)?;
         base.set_int32_param(rs_params.rs_connected, 0, 0)?;
-
-        // Acquire defaults
-        base.set_int32_param(ad.params.image_mode, 0, ImageMode::Continuous as i32)?;
 
         Ok(Self {
             ad,
@@ -131,6 +145,7 @@ impl PortDriver for D435iColorDriver {
             // Dirty flag routing
             if reason == self.rs_params.rs_auto_exposure
                 || reason == self.rs_params.rs_emitter_enabled
+                || reason == self.ad.params.base.array_callbacks
             {
                 self.dirty.lock().update_sensor_options = true;
             }
@@ -187,7 +202,28 @@ impl D435iDepthDriver {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Intel".into())?;
         base.set_string_param(ad.params.base.model, 0, "RealSense D435i (Depth)".into())?;
+        base.set_string_param(ad.params.base.serial_number, 0, "Not connected".into())?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "Unknown".into())?;
         base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION").into())?;
+
+        // Image size and ROI (use default stream mode)
+        let default_mode = &STREAM_MODES[DEFAULT_STREAM_MODE as usize];
+        base.set_int32_param(ad.params.size_x, 0, default_mode.width)?;
+        base.set_int32_param(ad.params.size_y, 0, default_mode.height)?;
+        base.set_int32_param(ad.params.min_x, 0, 0)?;
+        base.set_int32_param(ad.params.min_y, 0, 0)?;
+        base.set_int32_param(ad.params.bin_x, 0, 1)?;
+        base.set_int32_param(ad.params.bin_y, 0, 1)?;
+        base.set_int32_param(ad.params.reverse_x, 0, 0)?;
+        base.set_int32_param(ad.params.reverse_y, 0, 0)?;
+
+        // Acquire timing and control
+        base.set_float64_param(ad.params.acquire_time, 0, 1.0 / default_mode.fps as f64)?;
+        base.set_float64_param(ad.params.acquire_period, 0, 1.0 / default_mode.fps as f64)?;
+        base.set_int32_param(ad.params.image_mode, 0, ImageMode::Continuous as i32)?;
+        base.set_int32_param(ad.params.num_images, 0, 100)?;
+        base.set_int32_param(ad.params.num_exposures, 0, 1)?;
+        base.set_int32_param(ad.params.trigger_mode, 0, 0)?;
 
         Ok(Self { ad })
     }
