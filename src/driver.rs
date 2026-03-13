@@ -72,15 +72,39 @@ impl D435iColorDriver {
         base.set_int32_param(ad.params.trigger_mode, 0, 0)?;
 
         // Default sensor options
-        base.set_float64_param(rs_params.rs_exposure, 0, 8500.0)?;
-        base.set_float64_param(rs_params.rs_gain, 0, 16.0)?;
+        const DEFAULT_EXPOSURE_US: f64 = 8500.0;
+        const DEFAULT_GAIN: f64 = 16.0;
+        const DEFAULT_LASER_POWER_MW: f64 = 150.0;
+        base.set_float64_param(rs_params.rs_exposure, 0, DEFAULT_EXPOSURE_US)?;
+        base.set_float64_param(rs_params.rs_gain, 0, DEFAULT_GAIN)?;
         base.set_int32_param(rs_params.rs_auto_exposure, 0, 1)?;
-        base.set_float64_param(rs_params.rs_laser_power, 0, 150.0)?;
+        base.set_float64_param(rs_params.rs_laser_power, 0, DEFAULT_LASER_POWER_MW)?;
         base.set_int32_param(rs_params.rs_emitter_enabled, 0, 1)?;
 
         // Read-only defaults
         base.set_float64_param(rs_params.rs_depth_units, 0, 0.001)?;
         base.set_int32_param(rs_params.rs_connected, 0, 0)?;
+
+        // Diagnostics
+        base.set_int32_param(rs_params.rs_frames_dropped, 0, 0)?;
+        base.set_int32_param(rs_params.rs_error_count, 0, 0)?;
+
+        // Post-processing filter defaults (all off)
+        base.set_int32_param(rs_params.rs_decimation_enable, 0, 0)?;
+        base.set_int32_param(rs_params.rs_decimation_magnitude, 0, 2)?;
+        base.set_int32_param(rs_params.rs_spatial_enable, 0, 0)?;
+        base.set_float64_param(rs_params.rs_spatial_alpha, 0, 0.5)?;
+        base.set_int32_param(rs_params.rs_spatial_delta, 0, 20)?;
+        base.set_int32_param(rs_params.rs_spatial_magnitude, 0, 2)?;
+        base.set_int32_param(rs_params.rs_temporal_enable, 0, 0)?;
+        base.set_float64_param(rs_params.rs_temporal_alpha, 0, 0.4)?;
+        base.set_int32_param(rs_params.rs_temporal_delta, 0, 20)?;
+        base.set_int32_param(rs_params.rs_hole_fill_enable, 0, 0)?;
+        base.set_int32_param(rs_params.rs_hole_fill_mode, 0, 1)?;
+
+        // Alignment & pointcloud (off)
+        base.set_int32_param(rs_params.rs_align_enable, 0, 0)?;
+        base.set_int32_param(rs_params.rs_pointcloud_enable, 0, 0)?;
 
         Ok(Self {
             ad,
@@ -113,7 +137,11 @@ impl PortDriver for D435iColorDriver {
                     "Acquiring data".into(),
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
-                let _ = self.acq_tx.send(AcqCommand::Start);
+                if self.acq_tx.send(AcqCommand::Start).is_err() {
+                    log::error!("D435i: acquisition task is not running");
+                    self.ad.port_base.set_string_param(self.ad.params.status_message, 0, "Acquisition task crashed".into())?;
+                    self.ad.port_base.set_int32_param(acquire_idx, 0, 0)?;
+                }
             } else if value == 0 && acquiring != 0 {
                 self.ad.port_base.set_string_param(
                     self.ad.params.status_message,
@@ -121,7 +149,9 @@ impl PortDriver for D435iColorDriver {
                     "Acquisition stopped".into(),
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
-                let _ = self.acq_tx.send(AcqCommand::Stop);
+                if self.acq_tx.send(AcqCommand::Stop).is_err() {
+                    log::error!("D435i: acquisition task is not running");
+                }
             } else {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
             }
@@ -137,8 +167,9 @@ impl PortDriver for D435iColorDriver {
                 self.ad.port_base.params.set_int32(self.ad.params.size_y, 0, mode.height)?;
                 self.ad.port_base.params.set_float64(self.ad.params.acquire_time, 0, 1.0 / mode.fps as f64)?;
                 self.dirty.lock().reconfigure_pipeline = true;
+            } else {
+                log::warn!("D435i: invalid stream mode index {value}, max is {}", STREAM_MODES.len() - 1);
             }
-            // Invalid index: silently ignore
         } else {
             self.ad.port_base.params.set_int32(reason, user.addr, value)?;
 
@@ -146,6 +177,17 @@ impl PortDriver for D435iColorDriver {
             if reason == self.rs_params.rs_auto_exposure
                 || reason == self.rs_params.rs_emitter_enabled
                 || reason == self.ad.params.base.array_callbacks
+                || reason == self.rs_params.rs_decimation_enable
+                || reason == self.rs_params.rs_decimation_magnitude
+                || reason == self.rs_params.rs_spatial_enable
+                || reason == self.rs_params.rs_spatial_delta
+                || reason == self.rs_params.rs_spatial_magnitude
+                || reason == self.rs_params.rs_temporal_enable
+                || reason == self.rs_params.rs_temporal_delta
+                || reason == self.rs_params.rs_hole_fill_enable
+                || reason == self.rs_params.rs_hole_fill_mode
+                || reason == self.rs_params.rs_align_enable
+                || reason == self.rs_params.rs_pointcloud_enable
             {
                 self.dirty.lock().update_sensor_options = true;
             }
@@ -163,6 +205,8 @@ impl PortDriver for D435iColorDriver {
         if reason == self.rs_params.rs_exposure
             || reason == self.rs_params.rs_gain
             || reason == self.rs_params.rs_laser_power
+            || reason == self.rs_params.rs_spatial_alpha
+            || reason == self.rs_params.rs_temporal_alpha
         {
             dirty.update_sensor_options = true;
         }
@@ -260,6 +304,8 @@ pub struct D435iColorRuntime {
     pool: Arc<NDArrayPool>,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     queued_counter: Arc<QueuedArrayCounter>,
+    pc_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pc_queued: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     task_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -280,6 +326,15 @@ impl D435iColorRuntime {
     pub fn connect_downstream(&self, mut sender: NDArraySender) {
         sender.set_queued_counter(self.queued_counter.clone());
         self.array_output.lock().add(sender);
+    }
+
+    pub fn pc_output(&self) -> &Arc<parking_lot::Mutex<NDArrayOutput>> {
+        &self.pc_output
+    }
+
+    pub fn connect_pc_downstream(&self, mut sender: NDArraySender) {
+        sender.set_queued_counter(self.pc_queued.clone());
+        self.pc_output.lock().add(sender);
     }
 }
 
@@ -335,6 +390,8 @@ pub fn create_d435i_detector(
     let (color_runtime_handle, _) = create_port_runtime(color_det, RuntimeConfig::default());
     let color_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let color_queued = Arc::new(QueuedArrayCounter::new());
+    let pc_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+    let pc_queued = Arc::new(QueuedArrayCounter::new());
 
     // --- Depth port ---
     let depth_det = D435iDepthDriver::new(&depth_port_name, max_size_x, max_size_y, max_memory)?;
@@ -353,6 +410,8 @@ pub fn create_d435i_detector(
         depth_handle: depth_runtime_handle.port_handle().clone(),
         depth_output: depth_output.clone(),
         depth_queued: depth_queued.clone(),
+        pc_output: pc_output.clone(),
+        pc_queued: pc_queued.clone(),
         dirty,
         color_ad: color_ad_params,
         depth_ad: depth_ad_params,
@@ -367,6 +426,8 @@ pub fn create_d435i_detector(
         pool: color_pool,
         array_output: color_output,
         queued_counter: color_queued,
+        pc_output,
+        pc_queued,
         task_handle: Some(task_handle),
     };
 

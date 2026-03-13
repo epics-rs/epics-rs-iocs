@@ -62,11 +62,18 @@ class D435iMainDisplay(Display):
         mid.addWidget(self._sensor_controls_group())
         layout.addLayout(mid)
 
-        # Bottom row: Depth Info + IMU
+        # Bottom row: Depth Info + IMU + Diagnostics
         bot = QHBoxLayout()
         bot.addWidget(self._depth_info_group())
         bot.addWidget(self._imu_group())
+        bot.addWidget(self._diagnostics_group())
         layout.addLayout(bot)
+
+        # Processing row: Post-Processing + Alignment
+        proc = QHBoxLayout()
+        proc.addWidget(self._postprocessing_group())
+        proc.addWidget(self._alignment_group())
+        layout.addLayout(proc)
 
         # Image plugin buttons
         layout.addWidget(self._image_plugins_group())
@@ -84,7 +91,7 @@ class D435iMainDisplay(Display):
             ("Serial", "SerialNumber_RBV"),
             ("Firmware", "FirmwareVersion_RBV"),
             ("SDK Version", "SDKVersion_RBV"),
-            ("Connected", "IsConnected_RBV"),
+            ("Connected", "RSConnected_RBV"),
         ]:
             w = PyDMLabel(init_channel=self._pv(f"cam1:{suf}"))
             form.addRow(f"{label}:", w)
@@ -184,6 +191,53 @@ class D435iMainDisplay(Display):
             form.addRow(f"Gyro {axis}:", g)
         return grp
 
+    def _diagnostics_group(self):
+        grp = QGroupBox("Diagnostics")
+        form = QFormLayout()
+        grp.setLayout(form)
+        for label, suf in [
+            ("Frames Dropped", "cam1:RSFramesDropped_RBV"),
+            ("Error Count", "cam1:RSErrorCount_RBV"),
+            ("Last Error", "cam1:RSLastError_RBV"),
+            ("Connected", "cam1:RSConnected_RBV"),
+        ]:
+            w = PyDMLabel(init_channel=self._pv(suf))
+            form.addRow(f"{label}:", w)
+        return grp
+
+    def _postprocessing_group(self):
+        grp = QGroupBox("Depth Post-Processing")
+        form = QFormLayout()
+        grp.setLayout(form)
+
+        # Decimation
+        form.addRow("Decimation:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSDecimationEnable")))
+        form.addRow("  Magnitude:", PyDMLineEdit(init_channel=self._pv("cam1:RSDecimationMag")))
+
+        # Spatial filter
+        form.addRow("Spatial:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSSpatialEnable")))
+        form.addRow("  Alpha:", PyDMLineEdit(init_channel=self._pv("cam1:RSSpatialAlpha")))
+        form.addRow("  Delta:", PyDMLineEdit(init_channel=self._pv("cam1:RSSpatialDelta")))
+
+        # Temporal filter
+        form.addRow("Temporal:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSTemporalEnable")))
+        form.addRow("  Alpha:", PyDMLineEdit(init_channel=self._pv("cam1:RSTemporalAlpha")))
+        form.addRow("  Delta:", PyDMLineEdit(init_channel=self._pv("cam1:RSTemporalDelta")))
+
+        # Hole filling
+        form.addRow("Hole Fill:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSHoleFillEnable")))
+        form.addRow("  Mode:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSHoleFillMode")))
+
+        return grp
+
+    def _alignment_group(self):
+        grp = QGroupBox("Alignment & Pointcloud")
+        form = QFormLayout()
+        grp.setLayout(form)
+        form.addRow("Align D->C:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSAlignEnable")))
+        form.addRow("Pointcloud:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSPointcloudEnable")))
+        return grp
+
     def _image_plugins_group(self):
         grp = QGroupBox("Image Viewers")
         h = QHBoxLayout()
@@ -203,7 +257,7 @@ class D435iMainDisplay(Display):
         h = QHBoxLayout()
         grp.setLayout(h)
 
-        for title, prefix in [("Color (image1)", "image1"), ("Depth (image2)", "image2")]:
+        for title, prefix in [("Color (image1)", "image1"), ("Depth (image2)", "image2"), ("Pointcloud (image3)", "image3")]:
             sub = QGroupBox(title)
             form = QFormLayout()
             sub.setLayout(form)

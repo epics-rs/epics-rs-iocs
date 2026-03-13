@@ -19,12 +19,7 @@ use crate::params::D435iParams;
 // Parameter registries
 // ============================================================================
 
-fn build_color_param_registry(ad: &ADBaseParams, rs: &D435iParams) -> ParamRegistry {
-    let mut map = HashMap::new();
-    let base = &ad.base;
-
-    // ===== ADBase.db params =====
-
+fn insert_ad_base_params(map: &mut ParamRegistry, ad: &ADBaseParams) {
     // Image size
     map.insert("MaxSizeX_RBV".into(), ParamInfo::int32(ad.max_size_x, "MAX_SIZE_X"));
     map.insert("MaxSizeY_RBV".into(), ParamInfo::int32(ad.max_size_y, "MAX_SIZE_Y"));
@@ -101,12 +96,9 @@ fn build_color_param_registry(ad: &ADBaseParams, rs: &D435iParams) -> ParamRegis
     map.insert("StringToServer".into(), ParamInfo::string(ad.string_to_server, "STRING_TO_SERVER"));
     map.insert("StringToServer_RBV".into(), ParamInfo::string(ad.string_to_server, "STRING_TO_SERVER"));
     map.insert("StringFromServer_RBV".into(), ParamInfo::string(ad.string_from_server, "STRING_FROM_SERVER"));
+}
 
-    // ===== NDArrayBase.db params =====
-    insert_ndarray_base_params(&mut map, base);
-
-    // ===== D435i-specific params =====
-
+fn insert_d435i_params(map: &mut ParamRegistry, rs: &D435iParams) {
     // Stream config
     map.insert("RSStreamMode".into(), ParamInfo::int32(rs.rs_stream_mode, "RS_STREAM_MODE"));
     map.insert("RSStreamMode_RBV".into(), ParamInfo::int32(rs.rs_stream_mode, "RS_STREAM_MODE"));
@@ -141,95 +133,59 @@ fn build_color_param_registry(ad: &ADBaseParams, rs: &D435iParams) -> ParamRegis
     map.insert("RSSerial_RBV".into(), ParamInfo::string(rs.rs_serial, "RS_SERIAL"));
     map.insert("RSConnected_RBV".into(), ParamInfo::int32(rs.rs_connected, "RS_CONNECTED"));
 
+    // Diagnostics
+    map.insert("RSFramesDropped_RBV".into(), ParamInfo::int32(rs.rs_frames_dropped, "RS_FRAMES_DROPPED"));
+    map.insert("RSErrorCount_RBV".into(), ParamInfo::int32(rs.rs_error_count, "RS_ERROR_COUNT"));
+    map.insert("RSLastError_RBV".into(), ParamInfo::string(rs.rs_last_error, "RS_LAST_ERROR"));
+
+    // Post-processing filters
+    map.insert("RSDecimationEnable".into(), ParamInfo::int32(rs.rs_decimation_enable, "RS_DECIMATION_ENABLE"));
+    map.insert("RSDecimationEnable_RBV".into(), ParamInfo::int32(rs.rs_decimation_enable, "RS_DECIMATION_ENABLE"));
+    map.insert("RSDecimationMag".into(), ParamInfo::int32(rs.rs_decimation_magnitude, "RS_DECIMATION_MAGNITUDE"));
+    map.insert("RSDecimationMag_RBV".into(), ParamInfo::int32(rs.rs_decimation_magnitude, "RS_DECIMATION_MAGNITUDE"));
+
+    map.insert("RSSpatialEnable".into(), ParamInfo::int32(rs.rs_spatial_enable, "RS_SPATIAL_ENABLE"));
+    map.insert("RSSpatialEnable_RBV".into(), ParamInfo::int32(rs.rs_spatial_enable, "RS_SPATIAL_ENABLE"));
+    map.insert("RSSpatialAlpha".into(), ParamInfo::float64(rs.rs_spatial_alpha, "RS_SPATIAL_ALPHA"));
+    map.insert("RSSpatialAlpha_RBV".into(), ParamInfo::float64(rs.rs_spatial_alpha, "RS_SPATIAL_ALPHA"));
+    map.insert("RSSpatialDelta".into(), ParamInfo::int32(rs.rs_spatial_delta, "RS_SPATIAL_DELTA"));
+    map.insert("RSSpatialDelta_RBV".into(), ParamInfo::int32(rs.rs_spatial_delta, "RS_SPATIAL_DELTA"));
+    map.insert("RSSpatialMag".into(), ParamInfo::int32(rs.rs_spatial_magnitude, "RS_SPATIAL_MAGNITUDE"));
+    map.insert("RSSpatialMag_RBV".into(), ParamInfo::int32(rs.rs_spatial_magnitude, "RS_SPATIAL_MAGNITUDE"));
+
+    map.insert("RSTemporalEnable".into(), ParamInfo::int32(rs.rs_temporal_enable, "RS_TEMPORAL_ENABLE"));
+    map.insert("RSTemporalEnable_RBV".into(), ParamInfo::int32(rs.rs_temporal_enable, "RS_TEMPORAL_ENABLE"));
+    map.insert("RSTemporalAlpha".into(), ParamInfo::float64(rs.rs_temporal_alpha, "RS_TEMPORAL_ALPHA"));
+    map.insert("RSTemporalAlpha_RBV".into(), ParamInfo::float64(rs.rs_temporal_alpha, "RS_TEMPORAL_ALPHA"));
+    map.insert("RSTemporalDelta".into(), ParamInfo::int32(rs.rs_temporal_delta, "RS_TEMPORAL_DELTA"));
+    map.insert("RSTemporalDelta_RBV".into(), ParamInfo::int32(rs.rs_temporal_delta, "RS_TEMPORAL_DELTA"));
+
+    map.insert("RSHoleFillEnable".into(), ParamInfo::int32(rs.rs_hole_fill_enable, "RS_HOLE_FILL_ENABLE"));
+    map.insert("RSHoleFillEnable_RBV".into(), ParamInfo::int32(rs.rs_hole_fill_enable, "RS_HOLE_FILL_ENABLE"));
+    map.insert("RSHoleFillMode".into(), ParamInfo::int32(rs.rs_hole_fill_mode, "RS_HOLE_FILL_MODE"));
+    map.insert("RSHoleFillMode_RBV".into(), ParamInfo::int32(rs.rs_hole_fill_mode, "RS_HOLE_FILL_MODE"));
+
+    // Alignment
+    map.insert("RSAlignEnable".into(), ParamInfo::int32(rs.rs_align_enable, "RS_ALIGN_ENABLE"));
+    map.insert("RSAlignEnable_RBV".into(), ParamInfo::int32(rs.rs_align_enable, "RS_ALIGN_ENABLE"));
+
+    // Pointcloud
+    map.insert("RSPointcloudEnable".into(), ParamInfo::int32(rs.rs_pointcloud_enable, "RS_POINTCLOUD_ENABLE"));
+    map.insert("RSPointcloudEnable_RBV".into(), ParamInfo::int32(rs.rs_pointcloud_enable, "RS_POINTCLOUD_ENABLE"));
+}
+
+fn build_color_param_registry(ad: &ADBaseParams, rs: &D435iParams) -> ParamRegistry {
+    let mut map = HashMap::new();
+    insert_ad_base_params(&mut map, ad);
+    insert_ndarray_base_params(&mut map, &ad.base);
+    insert_d435i_params(&mut map, rs);
     map
 }
 
 fn build_depth_param_registry(ad: &ADBaseParams) -> ParamRegistry {
     let mut map = HashMap::new();
-    let base = &ad.base;
-
-    // ===== ADBase.db params =====
-
-    // Image size
-    map.insert("MaxSizeX_RBV".into(), ParamInfo::int32(ad.max_size_x, "MAX_SIZE_X"));
-    map.insert("MaxSizeY_RBV".into(), ParamInfo::int32(ad.max_size_y, "MAX_SIZE_Y"));
-    map.insert("SizeX".into(), ParamInfo::int32(ad.size_x, "SIZE_X"));
-    map.insert("SizeX_RBV".into(), ParamInfo::int32(ad.size_x, "SIZE_X"));
-    map.insert("SizeY".into(), ParamInfo::int32(ad.size_y, "SIZE_Y"));
-    map.insert("SizeY_RBV".into(), ParamInfo::int32(ad.size_y, "SIZE_Y"));
-    map.insert("MinX".into(), ParamInfo::int32(ad.min_x, "MIN_X"));
-    map.insert("MinX_RBV".into(), ParamInfo::int32(ad.min_x, "MIN_X"));
-    map.insert("MinY".into(), ParamInfo::int32(ad.min_y, "MIN_Y"));
-    map.insert("MinY_RBV".into(), ParamInfo::int32(ad.min_y, "MIN_Y"));
-    map.insert("BinX".into(), ParamInfo::int32(ad.bin_x, "BIN_X"));
-    map.insert("BinX_RBV".into(), ParamInfo::int32(ad.bin_x, "BIN_X"));
-    map.insert("BinY".into(), ParamInfo::int32(ad.bin_y, "BIN_Y"));
-    map.insert("BinY_RBV".into(), ParamInfo::int32(ad.bin_y, "BIN_Y"));
-    map.insert("ReverseX".into(), ParamInfo::int32(ad.reverse_x, "REVERSE_X"));
-    map.insert("ReverseX_RBV".into(), ParamInfo::int32(ad.reverse_x, "REVERSE_X"));
-    map.insert("ReverseY".into(), ParamInfo::int32(ad.reverse_y, "REVERSE_Y"));
-    map.insert("ReverseY_RBV".into(), ParamInfo::int32(ad.reverse_y, "REVERSE_Y"));
-
-    // Acquire control
-    map.insert("Acquire".into(), ParamInfo::int32(ad.acquire, "ACQUIRE"));
-    map.insert("Acquire_RBV".into(), ParamInfo::int32(ad.acquire, "ACQUIRE"));
-    map.insert("ImageMode".into(), ParamInfo::int32(ad.image_mode, "IMAGE_MODE"));
-    map.insert("ImageMode_RBV".into(), ParamInfo::int32(ad.image_mode, "IMAGE_MODE"));
-    map.insert("NumImages".into(), ParamInfo::int32(ad.num_images, "NUM_IMAGES"));
-    map.insert("NumImages_RBV".into(), ParamInfo::int32(ad.num_images, "NUM_IMAGES"));
-    map.insert("NumImagesCounter_RBV".into(), ParamInfo::int32(ad.num_images_counter, "NUM_IMAGES_COUNTER"));
-    map.insert("NumExposures".into(), ParamInfo::int32(ad.num_exposures, "NUM_EXPOSURES"));
-    map.insert("NumExposures_RBV".into(), ParamInfo::int32(ad.num_exposures, "NUM_EXPOSURES"));
-    map.insert("NumExposuresCounter_RBV".into(), ParamInfo::int32(ad.num_exposures_counter, "NUM_EXPOSURES_COUNTER"));
-    map.insert("AcquireTime".into(), ParamInfo::float64(ad.acquire_time, "ACQUIRE_TIME"));
-    map.insert("AcquireTime_RBV".into(), ParamInfo::float64(ad.acquire_time, "ACQUIRE_TIME"));
-    map.insert("AcquirePeriod".into(), ParamInfo::float64(ad.acquire_period, "ACQUIRE_PERIOD"));
-    map.insert("AcquirePeriod_RBV".into(), ParamInfo::float64(ad.acquire_period, "ACQUIRE_PERIOD"));
-    map.insert("TimeRemaining_RBV".into(), ParamInfo::float64(ad.time_remaining, "TIME_REMAINING"));
-    map.insert("Status_RBV".into(), ParamInfo::int32(ad.status, "DETECTOR_STATE"));
-    map.insert("DetectorState_RBV".into(), ParamInfo::int32(ad.status, "DETECTOR_STATE"));
-    map.insert("StatusMessage_RBV".into(), ParamInfo::string(ad.status_message, "STATUS_MESSAGE"));
-    map.insert("AcquireBusy".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
-    map.insert("AcquireBusy_RBV".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
-    map.insert("WaitForPlugins".into(), ParamInfo::int32(ad.wait_for_plugins, "WAIT_FOR_PLUGINS"));
-    map.insert("ReadStatus".into(), ParamInfo::int32(ad.read_status, "READ_STATUS"));
-    map.insert("AcquireBusyCB".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
-
-    // Detector
-    map.insert("Gain".into(), ParamInfo::float64(ad.gain, "GAIN"));
-    map.insert("Gain_RBV".into(), ParamInfo::float64(ad.gain, "GAIN"));
-    map.insert("ADGain".into(), ParamInfo::float64(ad.gain, "GAIN"));
-    map.insert("ADGain_RBV".into(), ParamInfo::float64(ad.gain, "GAIN"));
-    map.insert("FrameType".into(), ParamInfo::int32(ad.frame_type, "FRAME_TYPE"));
-    map.insert("FrameType_RBV".into(), ParamInfo::int32(ad.frame_type, "FRAME_TYPE"));
-    map.insert("TriggerMode".into(), ParamInfo::int32(ad.trigger_mode, "TRIGGER_MODE"));
-    map.insert("TriggerMode_RBV".into(), ParamInfo::int32(ad.trigger_mode, "TRIGGER_MODE"));
-
-    // Shutter
-    map.insert("ShutterControl".into(), ParamInfo::int32(ad.shutter_control, "SHUTTER_CONTROL"));
-    map.insert("ShutterControl_RBV".into(), ParamInfo::int32(ad.shutter_control, "SHUTTER_CONTROL"));
-    map.insert("ShutterControlEPICS".into(), ParamInfo::int32(ad.shutter_control_epics, "SHUTTER_CONTROL_EPICS"));
-    map.insert("ShutterStatus_RBV".into(), ParamInfo::int32(ad.shutter_status, "SHUTTER_STATUS"));
-    map.insert("ShutterMode".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
-    map.insert("ShutterMode_RBV".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
-    map.insert("ShutterOpenDelay".into(), ParamInfo::float64(ad.shutter_open_delay, "SHUTTER_OPEN_DELAY"));
-    map.insert("ShutterOpenDelay_RBV".into(), ParamInfo::float64(ad.shutter_open_delay, "SHUTTER_OPEN_DELAY"));
-    map.insert("ShutterCloseDelay".into(), ParamInfo::float64(ad.shutter_close_delay, "SHUTTER_CLOSE_DELAY"));
-    map.insert("ShutterCloseDelay_RBV".into(), ParamInfo::float64(ad.shutter_close_delay, "SHUTTER_CLOSE_DELAY"));
-
-    // Temperature
-    map.insert("Temperature".into(), ParamInfo::float64(ad.temperature, "TEMPERATURE"));
-    map.insert("Temperature_RBV".into(), ParamInfo::float64(ad.temperature, "TEMPERATURE"));
-    map.insert("TemperatureActual".into(), ParamInfo::float64(ad.temperature_actual, "TEMPERATURE_ACTUAL"));
-
-    // Communication
-    map.insert("StringToServer".into(), ParamInfo::string(ad.string_to_server, "STRING_TO_SERVER"));
-    map.insert("StringToServer_RBV".into(), ParamInfo::string(ad.string_to_server, "STRING_TO_SERVER"));
-    map.insert("StringFromServer_RBV".into(), ParamInfo::string(ad.string_from_server, "STRING_FROM_SERVER"));
-
-    // ===== NDArrayBase.db params =====
-    insert_ndarray_base_params(&mut map, base);
-
+    insert_ad_base_params(&mut map, ad);
+    insert_ndarray_base_params(&mut map, &ad.base);
     map
 }
 
@@ -341,16 +297,17 @@ fn insert_ndarray_base_params(
 }
 
 // ============================================================================
-// Device support
+// Device support (unified for Color and Depth)
 // ============================================================================
 
 struct D435iDeviceSupport {
     inner: AsynDeviceSupport,
     registry: Arc<ParamRegistry>,
+    dtyp_name: &'static str,
 }
 
 impl D435iDeviceSupport {
-    fn from_handle(handle: PortHandle, registry: Arc<ParamRegistry>) -> Self {
+    fn from_handle(handle: PortHandle, registry: Arc<ParamRegistry>, dtyp_name: &'static str) -> Self {
         use asyn_rs::adapter::AsynLink;
         let link = AsynLink {
             port_name: String::new(),
@@ -362,13 +319,14 @@ impl D435iDeviceSupport {
             inner: AsynDeviceSupport::from_handle(handle, link, "asynInt32")
                 .with_initial_readback(),
             registry,
+            dtyp_name,
         }
     }
 }
 
 impl DeviceSupport for D435iDeviceSupport {
     fn dtyp(&self) -> &str {
-        "asynD435i"
+        self.dtyp_name
     }
 
     fn set_record_info(&mut self, name: &str, scan: ScanType) {
@@ -384,61 +342,7 @@ impl DeviceSupport for D435iDeviceSupport {
             };
             self.inner.set_iface_type(iface);
         } else {
-            eprintln!("asynD435i: no param mapping for record suffix '{suffix}' (record: {name})");
-        }
-        self.inner.set_record_info(name, scan);
-    }
-
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> { self.inner.init(record) }
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<()> { self.inner.read(record) }
-    fn write(&mut self, record: &mut dyn Record) -> CaResult<()> { self.inner.write(record) }
-    fn write_begin(&mut self, record: &mut dyn Record) -> CaResult<Option<Box<dyn WriteCompletion>>> { self.inner.write_begin(record) }
-    fn last_alarm(&self) -> Option<(u16, u16)> { self.inner.last_alarm() }
-    fn last_timestamp(&self) -> Option<std::time::SystemTime> { self.inner.last_timestamp() }
-    fn io_intr_receiver(&mut self) -> Option<tokio::sync::mpsc::Receiver<()>> { self.inner.io_intr_receiver() }
-}
-
-struct D435iDepthDeviceSupport {
-    inner: AsynDeviceSupport,
-    registry: Arc<ParamRegistry>,
-}
-
-impl D435iDepthDeviceSupport {
-    fn from_handle(handle: PortHandle, registry: Arc<ParamRegistry>) -> Self {
-        use asyn_rs::adapter::AsynLink;
-        let link = AsynLink {
-            port_name: String::new(),
-            addr: 0,
-            timeout: std::time::Duration::from_secs(1),
-            drv_info: String::new(),
-        };
-        Self {
-            inner: AsynDeviceSupport::from_handle(handle, link, "asynInt32")
-                .with_initial_readback(),
-            registry,
-        }
-    }
-}
-
-impl DeviceSupport for D435iDepthDeviceSupport {
-    fn dtyp(&self) -> &str {
-        "asynD435iDepth"
-    }
-
-    fn set_record_info(&mut self, name: &str, scan: ScanType) {
-        let suffix = name.rsplit(':').next().unwrap_or(name);
-        if let Some(info) = self.registry.get(suffix) {
-            self.inner.set_drv_info(&info.drv_info);
-            self.inner.set_reason(info.param_index);
-            let iface = match info.param_type {
-                RegistryParamType::Int32 => "asynInt32",
-                RegistryParamType::Float64 => "asynFloat64",
-                RegistryParamType::Float64Array => "asynFloat64Array",
-                RegistryParamType::OctetString => "asynOctet",
-            };
-            self.inner.set_iface_type(iface);
-        } else {
-            eprintln!("asynD435iDepth: no param mapping for record suffix '{suffix}' (record: {name})");
+            log::warn!("{}: no param mapping for record suffix '{suffix}' (record: {name})", self.dtyp_name);
         }
         self.inner.set_record_info(name, scan);
     }
@@ -505,6 +409,7 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
                 let max_memory = match args.get(4) { Some(ArgValue::Int(n)) => *n as usize, _ => 100_000_000 };
 
                 let depth_port_name = format!("{port_name}_DEPTH");
+                let pc_port_name = format!("{port_name}_PC");
 
                 println!("d435iConfig: port={port_name}, serial={serial}, size={size_x}x{size_y}, maxMemory={max_memory}");
 
@@ -530,6 +435,9 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
 
                 // Register depth port in the wiring registry so plugins can wire to it
                 mgr.wiring().register_output(&depth_port_name, depth_rt.array_output().clone());
+
+                // Register pointcloud output in the wiring registry
+                mgr.wiring().register_output(&pc_port_name, color_rt.pc_output().clone());
 
                 *c_ph.lock().unwrap() = Some(c_port_handle);
                 *c_reg.lock().unwrap() = Some(c_registry);
@@ -562,7 +470,7 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
             let registry = reg.lock().unwrap()
                 .as_ref().expect("d435iConfig must be called before iocInit")
                 .clone();
-            Box::new(D435iDeviceSupport::from_handle(handle, registry))
+            Box::new(D435iDeviceSupport::from_handle(handle, registry, "asynD435i"))
         });
     }
 
@@ -579,7 +487,7 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
             let registry = reg.lock().unwrap()
                 .as_ref().expect("d435iConfig must be called before iocInit")
                 .clone();
-            Box::new(D435iDepthDeviceSupport::from_handle(handle, registry))
+            Box::new(D435iDeviceSupport::from_handle(handle, registry, "asynD435iDepth"))
         });
     }
 
@@ -600,7 +508,7 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
             if let Some(ref handle) = *std_c_ph.lock().unwrap() {
                 if handle.port_name() == link.port_name {
                     let registry = std_c_reg.lock().unwrap().as_ref()?.clone();
-                    return Some(Box::new(D435iDeviceSupport::from_handle(handle.clone(), registry))
+                    return Some(Box::new(D435iDeviceSupport::from_handle(handle.clone(), registry, "asynD435i"))
                         as Box<dyn epics_base_rs::server::device_support::DeviceSupport>);
                 }
             }
@@ -609,7 +517,7 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
             if let Some(ref handle) = *std_d_ph.lock().unwrap() {
                 if handle.port_name() == link.port_name {
                     let registry = std_d_reg.lock().unwrap().as_ref()?.clone();
-                    return Some(Box::new(D435iDepthDeviceSupport::from_handle(handle.clone(), registry))
+                    return Some(Box::new(D435iDeviceSupport::from_handle(handle.clone(), registry, "asynD435iDepth"))
                         as Box<dyn epics_base_rs::server::device_support::DeviceSupport>);
                 }
             }
