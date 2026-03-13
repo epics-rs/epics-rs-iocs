@@ -1,0 +1,310 @@
+# D435i Color port records
+# Macros: P, R, PORT, ADDR, TIMEOUT
+
+# ===== Acquire control =====
+record(bo, "$(P)$(R)Acquire") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ACQUIRE")
+    field(ZNAM, "Done")
+    field(ONAM, "Acquire")
+}
+
+record(bi, "$(P)$(R)Acquire_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ACQUIRE")
+    field(ZNAM, "Done")
+    field(ONAM, "Acquire")
+    field(SCAN, "I/O Intr")
+}
+
+record(mbbo, "$(P)$(R)ImageMode") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))IMAGE_MODE")
+    field(ZRST, "Single")
+    field(ONST, "Multiple")
+    field(TWST, "Continuous")
+}
+
+record(mbbi, "$(P)$(R)ImageMode_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))IMAGE_MODE")
+    field(ZRST, "Single")
+    field(ONST, "Multiple")
+    field(TWST, "Continuous")
+    field(SCAN, "I/O Intr")
+}
+
+# ===== Array info =====
+record(longin, "$(P)$(R)ArrayCounter_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ARRAY_COUNTER")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)ArraySizeX_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ARRAY_SIZE_X")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)ArraySizeY_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ARRAY_SIZE_Y")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)ArraySizeZ_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ARRAY_SIZE_Z")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo, "$(P)$(R)ArrayCallbacks") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ARRAY_CALLBACKS")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+}
+
+record(bi, "$(P)$(R)ArrayCallbacks_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))ARRAY_CALLBACKS")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(SCAN, "I/O Intr")
+}
+
+# ===== Device info =====
+record(stringin, "$(P)$(R)Manufacturer_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))MANUFACTURER")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)Model_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))MODEL")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)SerialNumber_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))SERIAL_NUMBER")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)FirmwareVersion_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))FIRMWARE_VERSION")
+    field(SCAN, "I/O Intr")
+}
+
+# ===== D435i Stream config =====
+record(longout, "$(P)$(R)RSResX") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_X")
+}
+
+record(longin, "$(P)$(R)RSResX_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_X")
+    field(SCAN, "I/O Intr")
+}
+
+record(longout, "$(P)$(R)RSResY") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_Y")
+}
+
+record(longin, "$(P)$(R)RSResY_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_Y")
+    field(SCAN, "I/O Intr")
+}
+
+record(longout, "$(P)$(R)RSFrameRate") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_FRAME_RATE")
+}
+
+record(longin, "$(P)$(R)RSFrameRate_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_FRAME_RATE")
+    field(SCAN, "I/O Intr")
+}
+
+# ===== D435i Sensor options =====
+record(ao, "$(P)$(R)RSExposure") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EXPOSURE")
+    field(EGU,  "us")
+    field(PREC, "1")
+}
+
+record(ai, "$(P)$(R)RSExposure_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EXPOSURE")
+    field(EGU,  "us")
+    field(PREC, "1")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)$(R)RSGain") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GAIN")
+    field(PREC, "1")
+}
+
+record(ai, "$(P)$(R)RSGain_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GAIN")
+    field(PREC, "1")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo, "$(P)$(R)RSAutoExposure") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_AUTO_EXPOSURE")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bi, "$(P)$(R)RSAutoExposure_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_AUTO_EXPOSURE")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)$(R)RSLaserPower") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_LASER_POWER")
+    field(EGU,  "mW")
+    field(PREC, "0")
+}
+
+record(ai, "$(P)$(R)RSLaserPower_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_LASER_POWER")
+    field(EGU,  "mW")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo, "$(P)$(R)RSEmitterEnabled") {
+    field(DTYP, "asynD435i")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EMITTER_ENABLED")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bi, "$(P)$(R)RSEmitterEnabled_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EMITTER_ENABLED")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(SCAN, "I/O Intr")
+}
+
+# ===== Depth info (read-only, on color port) =====
+record(ai, "$(P)$(R)RSDepthUnits_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_UNITS")
+    field(EGU,  "m/unit")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+# ===== IMU =====
+record(ai, "$(P)$(R)RSAccelX_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ACCEL_X")
+    field(EGU,  "m/s^2")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSAccelY_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ACCEL_Y")
+    field(EGU,  "m/s^2")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSAccelZ_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ACCEL_Z")
+    field(EGU,  "m/s^2")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSGyroX_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GYRO_X")
+    field(EGU,  "rad/s")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSGyroY_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GYRO_Y")
+    field(EGU,  "rad/s")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSGyroZ_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GYRO_Z")
+    field(EGU,  "rad/s")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+# ===== Device status =====
+record(stringin, "$(P)$(R)RSSerial_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SERIAL")
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)$(R)RSConnected_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_CONNECTED")
+    field(ZNAM, "Disconnected")
+    field(ONAM, "Connected")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)StatusMessage_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))STATUS_MESSAGE")
+    field(SCAN, "I/O Intr")
+}
+
+record(mbbi, "$(P)$(R)DetectorState_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))DETECTOR_STATE")
+    field(ZRST, "Idle")
+    field(ONST, "Acquire")
+    field(TWST, "Readout")
+    field(THST, "Correct")
+    field(FRST, "Saving")
+    field(FVST, "Aborting")
+    field(SXST, "Error")
+    field(SVST, "Waiting")
+    field(EIST, "Initializing")
+    field(NIST, "Disconnected")
+    field(TEST, "Aborted")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)NumImagesCounter_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))NUM_IMAGES_COUNTER")
+    field(SCAN, "I/O Intr")
+}

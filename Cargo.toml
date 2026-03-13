@@ -1,0 +1,27 @@
+[package]
+name = "d435i"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+ioc = ["dep:epics-base-rs", "dep:tokio", "dep:ad-plugins",
+       "ad-plugins/ioc", "ad-core/ioc", "asyn-rs/epics"]
+
+[dependencies]
+ad-core = { path = "../../crates/ad-core" }
+ad-plugins = { path = "../../crates/ad-plugins", optional = true }
+asyn-rs = { path = "../../crates/asyn" }
+parking_lot = "0.12"
+epics-base-rs = { path = "../../crates/epics-base", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+realsense-rust = { path = "../realsense-rust", default-features = false }
+anyhow = "1.0"
+log = "0.4"
+
+[[bin]]
+name = "d435i_ioc"
+path = "src/bin/d435i_ioc.rs"
+required-features = ["ioc"]
