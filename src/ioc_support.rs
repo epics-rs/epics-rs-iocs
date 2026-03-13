@@ -107,11 +107,10 @@ fn build_color_param_registry(ad: &ADBaseParams, rs: &D435iParams) -> ParamRegis
     // ===== D435i-specific params =====
 
     // Stream config
-    map.insert("RSResX".into(), ParamInfo::int32(rs.rs_res_x, "RS_RES_X"));
+    map.insert("RSStreamMode".into(), ParamInfo::int32(rs.rs_stream_mode, "RS_STREAM_MODE"));
+    map.insert("RSStreamMode_RBV".into(), ParamInfo::int32(rs.rs_stream_mode, "RS_STREAM_MODE"));
     map.insert("RSResX_RBV".into(), ParamInfo::int32(rs.rs_res_x, "RS_RES_X"));
-    map.insert("RSResY".into(), ParamInfo::int32(rs.rs_res_y, "RS_RES_Y"));
     map.insert("RSResY_RBV".into(), ParamInfo::int32(rs.rs_res_y, "RS_RES_Y"));
-    map.insert("RSFrameRate".into(), ParamInfo::int32(rs.rs_frame_rate, "RS_FRAME_RATE"));
     map.insert("RSFrameRate_RBV".into(), ParamInfo::int32(rs.rs_frame_rate, "RS_FRAME_RATE"));
 
     // Sensor options

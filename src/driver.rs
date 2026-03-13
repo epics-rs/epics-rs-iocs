@@ -14,7 +14,7 @@ use ad_core::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter}
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
-use crate::types::{AcqCommand, DirtyFlags};
+use crate::types::{AcqCommand, DirtyFlags, STREAM_MODES, DEFAULT_STREAM_MODE};
 
 // ============================================================================
 // Color Driver (main)
@@ -45,9 +45,11 @@ impl D435iColorDriver {
         base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION").into())?;
 
         // Default stream config
-        base.set_int32_param(rs_params.rs_res_x, 0, 640)?;
-        base.set_int32_param(rs_params.rs_res_y, 0, 480)?;
-        base.set_int32_param(rs_params.rs_frame_rate, 0, 30)?;
+        let default_mode = &STREAM_MODES[DEFAULT_STREAM_MODE as usize];
+        base.set_int32_param(rs_params.rs_stream_mode, 0, DEFAULT_STREAM_MODE)?;
+        base.set_int32_param(rs_params.rs_res_x, 0, default_mode.width)?;
+        base.set_int32_param(rs_params.rs_res_y, 0, default_mode.height)?;
+        base.set_int32_param(rs_params.rs_frame_rate, 0, default_mode.fps)?;
 
         // Default sensor options
         base.set_float64_param(rs_params.rs_exposure, 0, 8500.0)?;
@@ -106,20 +108,24 @@ impl PortDriver for D435iColorDriver {
             } else {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
             }
+        } else if reason == self.rs_params.rs_stream_mode {
+            // Validate mode index and apply
+            if let Some(mode) = STREAM_MODES.get(value as usize) {
+                self.ad.port_base.params.set_int32(reason, user.addr, value)?;
+                self.ad.port_base.params.set_int32(self.rs_params.rs_res_x, 0, mode.width)?;
+                self.ad.port_base.params.set_int32(self.rs_params.rs_res_y, 0, mode.height)?;
+                self.ad.port_base.params.set_int32(self.rs_params.rs_frame_rate, 0, mode.fps)?;
+                self.dirty.lock().reconfigure_pipeline = true;
+            }
+            // Invalid index: silently ignore
         } else {
             self.ad.port_base.params.set_int32(reason, user.addr, value)?;
 
             // Dirty flag routing
-            let mut dirty = self.dirty.lock();
-            if reason == self.rs_params.rs_res_x
-                || reason == self.rs_params.rs_res_y
-                || reason == self.rs_params.rs_frame_rate
-            {
-                dirty.reconfigure_pipeline = true;
-            } else if reason == self.rs_params.rs_auto_exposure
+            if reason == self.rs_params.rs_auto_exposure
                 || reason == self.rs_params.rs_emitter_enabled
             {
-                dirty.update_sensor_options = true;
+                self.dirty.lock().update_sensor_options = true;
             }
         }
 

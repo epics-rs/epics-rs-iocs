@@ -100,9 +100,46 @@ record(stringin, "$(P)$(R)FirmwareVersion_RBV") {
 }
 
 # ===== D435i Stream config =====
-record(longout, "$(P)$(R)RSResX") {
+# Valid modes: intersection of Color(RGB8) and Depth(Z16) capabilities.
+record(mbbo, "$(P)$(R)RSStreamMode") {
     field(DTYP, "asynD435i")
-    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_X")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_STREAM_MODE")
+    field(ZRST, "424x240 @ 15fps")
+    field(ONST, "424x240 @ 30fps")
+    field(TWST, "424x240 @ 60fps")
+    field(THST, "640x360 @ 15fps")
+    field(FRST, "640x360 @ 30fps")
+    field(FVST, "640x360 @ 60fps")
+    field(SXST, "640x480 @ 15fps")
+    field(SVST, "640x480 @ 30fps")
+    field(EIST, "640x480 @ 60fps")
+    field(NIST, "848x480 @ 15fps")
+    field(TEST, "848x480 @ 30fps")
+    field(ELST, "848x480 @ 60fps")
+    field(TVST, "1280x720 @ 6fps")
+    field(TTST, "1280x720 @ 15fps")
+    field(FTST, "1280x720 @ 30fps")
+}
+
+record(mbbi, "$(P)$(R)RSStreamMode_RBV") {
+    field(DTYP, "asynD435i")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_STREAM_MODE")
+    field(ZRST, "424x240 @ 15fps")
+    field(ONST, "424x240 @ 30fps")
+    field(TWST, "424x240 @ 60fps")
+    field(THST, "640x360 @ 15fps")
+    field(FRST, "640x360 @ 30fps")
+    field(FVST, "640x360 @ 60fps")
+    field(SXST, "640x480 @ 15fps")
+    field(SVST, "640x480 @ 30fps")
+    field(EIST, "640x480 @ 60fps")
+    field(NIST, "848x480 @ 15fps")
+    field(TEST, "848x480 @ 30fps")
+    field(ELST, "848x480 @ 60fps")
+    field(TVST, "1280x720 @ 6fps")
+    field(TTST, "1280x720 @ 15fps")
+    field(FTST, "1280x720 @ 30fps")
+    field(SCAN, "I/O Intr")
 }
 
 record(longin, "$(P)$(R)RSResX_RBV") {
@@ -111,20 +148,10 @@ record(longin, "$(P)$(R)RSResX_RBV") {
     field(SCAN, "I/O Intr")
 }
 
-record(longout, "$(P)$(R)RSResY") {
-    field(DTYP, "asynD435i")
-    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_Y")
-}
-
 record(longin, "$(P)$(R)RSResY_RBV") {
     field(DTYP, "asynD435i")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_Y")
     field(SCAN, "I/O Intr")
-}
-
-record(longout, "$(P)$(R)RSFrameRate") {
-    field(DTYP, "asynD435i")
-    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_FRAME_RATE")
 }
 
 record(longin, "$(P)$(R)RSFrameRate_RBV") {

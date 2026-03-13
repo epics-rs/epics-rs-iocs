@@ -8,6 +8,7 @@ use asyn_rs::port_handle::PortHandle;
 #[derive(Clone, Copy)]
 pub struct D435iParams {
     // Stream configuration
+    pub rs_stream_mode: usize,
     pub rs_res_x: usize,
     pub rs_res_y: usize,
     pub rs_frame_rate: usize,
@@ -38,6 +39,7 @@ pub struct D435iParams {
 impl D435iParams {
     pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
+            rs_stream_mode: base.create_param("RS_STREAM_MODE", ParamType::Int32)?,
             rs_res_x: base.create_param("RS_RES_X", ParamType::Int32)?,
             rs_res_y: base.create_param("RS_RES_Y", ParamType::Int32)?,
             rs_frame_rate: base.create_param("RS_FRAME_RATE", ParamType::Int32)?,

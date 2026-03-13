@@ -81,8 +81,30 @@ d435iConfig("RS1", "012345678901", 1920, 1080, 100000000)
 
 | PV | Type | Description |
 |----|------|-------------|
-| `RSResX` / `RSResY` | longout | Requested resolution (default 640x480) |
-| `RSFrameRate` | longout | Requested FPS (default 30) |
+| `RSStreamMode` | mbbo | Stream mode selector (see table below) |
+| `RSResX_RBV` | longin | Active resolution width (read-only) |
+| `RSResY_RBV` | longin | Active resolution height (read-only) |
+| `RSFrameRate_RBV` | longin | Active frame rate (read-only) |
+
+Available stream modes (valid for both Color RGB8 and Depth Z16):
+
+| Index | Mode |
+|-------|------|
+| 0 | 424x240 @ 15fps |
+| 1 | 424x240 @ 30fps |
+| 2 | 424x240 @ 60fps |
+| 3 | 640x360 @ 15fps |
+| 4 | 640x360 @ 30fps |
+| 5 | 640x360 @ 60fps |
+| 6 | 640x480 @ 15fps |
+| 7 | 640x480 @ 30fps (default) |
+| 8 | 640x480 @ 60fps |
+| 9 | 848x480 @ 15fps |
+| 10 | 848x480 @ 30fps |
+| 11 | 848x480 @ 60fps |
+| 12 | 1280x720 @ 6fps |
+| 13 | 1280x720 @ 15fps |
+| 14 | 1280x720 @ 30fps |
 
 ### Sensor Options (`RS1:cam1:`)
 
@@ -144,9 +166,8 @@ caget RS1:depth1:ArrayCounter_RBV
 # Read IMU (expect ~9.8 m/s^2 on Y-axis when level)
 caget RS1:cam1:RSAccelY_RBV
 
-# Change resolution (pipeline restarts automatically during acquisition)
-caput RS1:cam1:RSResX 1280
-caput RS1:cam1:RSResY 720
+# Change stream mode to 1280x720 @ 30fps (pipeline restarts automatically)
+caput RS1:cam1:RSStreamMode 14
 
 # Stop acquisition
 caput RS1:cam1:Acquire 0
