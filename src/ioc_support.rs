@@ -444,6 +444,9 @@ pub fn register(ioc: &mut ad_plugins::ioc::AdIoc) {
                     mgr.wiring(),
                 )));
 
+                // Register depth port in the wiring registry so plugins can wire to it
+                mgr.wiring().register_output(&depth_port_name, depth_rt.array_output().clone());
+
                 *c_ph.lock().unwrap() = Some(c_port_handle);
                 *c_reg.lock().unwrap() = Some(c_registry);
                 *d_ph.lock().unwrap() = Some(d_port_handle);
