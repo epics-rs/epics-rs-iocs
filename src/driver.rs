@@ -50,6 +50,9 @@ impl D435iColorDriver {
         base.set_int32_param(rs_params.rs_res_x, 0, default_mode.width)?;
         base.set_int32_param(rs_params.rs_res_y, 0, default_mode.height)?;
         base.set_int32_param(rs_params.rs_frame_rate, 0, default_mode.fps)?;
+        base.set_int32_param(ad.params.size_x, 0, default_mode.width)?;
+        base.set_int32_param(ad.params.size_y, 0, default_mode.height)?;
+        base.set_float64_param(ad.params.acquire_time, 0, 1.0 / default_mode.fps as f64)?;
 
         // Default sensor options
         base.set_float64_param(rs_params.rs_exposure, 0, 8500.0)?;
@@ -115,6 +118,10 @@ impl PortDriver for D435iColorDriver {
                 self.ad.port_base.params.set_int32(self.rs_params.rs_res_x, 0, mode.width)?;
                 self.ad.port_base.params.set_int32(self.rs_params.rs_res_y, 0, mode.height)?;
                 self.ad.port_base.params.set_int32(self.rs_params.rs_frame_rate, 0, mode.fps)?;
+                // Update AD params to match
+                self.ad.port_base.params.set_int32(self.ad.params.size_x, 0, mode.width)?;
+                self.ad.port_base.params.set_int32(self.ad.params.size_y, 0, mode.height)?;
+                self.ad.port_base.params.set_float64(self.ad.params.acquire_time, 0, 1.0 / mode.fps as f64)?;
                 self.dirty.lock().reconfigure_pipeline = true;
             }
             // Invalid index: silently ignore
