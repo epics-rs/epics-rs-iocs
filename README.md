@@ -151,6 +151,53 @@ Available stream modes (valid for both Color RGB8 and Depth Z16):
 | `RS1:image1:ArrayData` | UInt8 (RGB) | Color image data |
 | `RS1:image2:ArrayData` | Int16 (Mono) | Depth image data |
 
+## PyDM Displays
+
+GUI displays built with [PyDM](https://slaclab.github.io/pydm/) are provided for detector control and image viewing.
+
+### Requirements
+
+```bash
+pip install pydm
+```
+
+### Main Control Display (`display/d435i_main.py`)
+
+Full control panel for the D435i camera.
+
+- **Device Info**: Model, Serial, Firmware, Connection status
+- **Acquire**: Start/stop acquisition, ImageMode, DetectorState, ArrayCounter
+- **Stream Config**: Resolution/frame-rate mode selector
+- **Sensor Controls**: Exposure, Gain, AutoExposure, LaserPower, Emitter
+- **Depth Info**: Depth units (m/unit)
+- **IMU Readback**: Accelerometer/Gyroscope X/Y/Z
+- **Image Viewers**: Button to launch dual viewer
+- **Array Info**: Color/Depth image dimensions and callback settings
+
+```bash
+pydm display/d435i_main.py -m '{"P":"RS1:"}'
+```
+
+### Dual Image Viewer (`display/d435i_dual_view.py`)
+
+Side-by-side live display of Color (RGB) and Depth (Z16) images.
+
+- Left panel: Color image (`RS1:image1:ArrayData`)
+- Right panel: Depth image (`RS1:image2:ArrayData`)
+- Bottom toolbar: Depth colormap selector (inferno, viridis, plasma, etc.), Acquire control
+
+```bash
+pydm display/d435i_dual_view.py -m '{"P":"RS1:"}'
+```
+
+### Using a Custom Prefix
+
+When running multiple cameras, change the `P` macro:
+
+```bash
+pydm display/d435i_main.py -m '{"P":"RS2:"}'
+```
+
 ## Quick Test
 
 ```bash
@@ -190,6 +237,9 @@ iocs/d435i/
 ├── db/
 │   ├── d435i_color.template  # Color port EPICS records
 │   └── d435i_depth.template  # Depth port EPICS records
+├── display/
+│   ├── d435i_main.py         # Main detector control display (PyDM)
+│   └── d435i_dual_view.py    # Dual color+depth image viewer (PyDM)
 └── ioc/
     └── st.cmd              # IOC startup script
 ```
