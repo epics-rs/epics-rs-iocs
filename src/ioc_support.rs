@@ -71,6 +71,8 @@ fn build_color_param_registry(ad: &ADBaseParams, rs: &D435iParams) -> ParamRegis
     map.insert("AcquireBusyCB".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
 
     // Detector
+    map.insert("Gain".into(), ParamInfo::float64(ad.gain, "GAIN"));
+    map.insert("Gain_RBV".into(), ParamInfo::float64(ad.gain, "GAIN"));
     map.insert("ADGain".into(), ParamInfo::float64(ad.gain, "GAIN"));
     map.insert("ADGain_RBV".into(), ParamInfo::float64(ad.gain, "GAIN"));
     map.insert("FrameType".into(), ParamInfo::int32(ad.frame_type, "FRAME_TYPE"));
@@ -83,7 +85,6 @@ fn build_color_param_registry(ad: &ADBaseParams, rs: &D435iParams) -> ParamRegis
     map.insert("ShutterControl_RBV".into(), ParamInfo::int32(ad.shutter_control, "SHUTTER_CONTROL"));
     map.insert("ShutterControlEPICS".into(), ParamInfo::int32(ad.shutter_control_epics, "SHUTTER_CONTROL_EPICS"));
     map.insert("ShutterStatus_RBV".into(), ParamInfo::int32(ad.shutter_status, "SHUTTER_STATUS"));
-    map.insert("ShutterStatusEPICS_RBV".into(), ParamInfo::int32(ad.shutter_status_epics, "SHUTTER_STATUS_EPICS"));
     map.insert("ShutterMode".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
     map.insert("ShutterMode_RBV".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
     map.insert("ShutterOpenDelay".into(), ParamInfo::float64(ad.shutter_open_delay, "SHUTTER_OPEN_DELAY"));
@@ -195,6 +196,8 @@ fn build_depth_param_registry(ad: &ADBaseParams) -> ParamRegistry {
     map.insert("AcquireBusyCB".into(), ParamInfo::int32(ad.acquire_busy, "ACQUIRE_BUSY"));
 
     // Detector
+    map.insert("Gain".into(), ParamInfo::float64(ad.gain, "GAIN"));
+    map.insert("Gain_RBV".into(), ParamInfo::float64(ad.gain, "GAIN"));
     map.insert("ADGain".into(), ParamInfo::float64(ad.gain, "GAIN"));
     map.insert("ADGain_RBV".into(), ParamInfo::float64(ad.gain, "GAIN"));
     map.insert("FrameType".into(), ParamInfo::int32(ad.frame_type, "FRAME_TYPE"));
@@ -207,7 +210,6 @@ fn build_depth_param_registry(ad: &ADBaseParams) -> ParamRegistry {
     map.insert("ShutterControl_RBV".into(), ParamInfo::int32(ad.shutter_control, "SHUTTER_CONTROL"));
     map.insert("ShutterControlEPICS".into(), ParamInfo::int32(ad.shutter_control_epics, "SHUTTER_CONTROL_EPICS"));
     map.insert("ShutterStatus_RBV".into(), ParamInfo::int32(ad.shutter_status, "SHUTTER_STATUS"));
-    map.insert("ShutterStatusEPICS_RBV".into(), ParamInfo::int32(ad.shutter_status_epics, "SHUTTER_STATUS_EPICS"));
     map.insert("ShutterMode".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
     map.insert("ShutterMode_RBV".into(), ParamInfo::int32(ad.shutter_mode, "SHUTTER_MODE"));
     map.insert("ShutterOpenDelay".into(), ParamInfo::float64(ad.shutter_open_delay, "SHUTTER_OPEN_DELAY"));
@@ -282,6 +284,9 @@ fn insert_ndarray_base_params(
     map.insert("PoolFreeBuffers_RBV".into(), ParamInfo::int32(base.pool_free_buffers, "POOL_FREE_BUFFERS"));
     map.insert("PoolMaxBuffers_RBV".into(), ParamInfo::int32(base.pool_max_buffers, "POOL_MAX_BUFFERS"));
     map.insert("PoolPreAlloc".into(), ParamInfo::int32(base.pool_pre_alloc, "POOL_PRE_ALLOC"));
+    map.insert("PreAllocBuffers".into(), ParamInfo::int32(base.pool_pre_alloc, "POOL_PRE_ALLOC_BUFFERS"));
+    map.insert("NumPreAllocBuffers".into(), ParamInfo::int32(base.pool_num_pre_alloc_buffers, "POOL_NUM_PRE_ALLOC_BUFFERS"));
+    map.insert("NumPreAllocBuffers_RBV".into(), ParamInfo::int32(base.pool_num_pre_alloc_buffers, "POOL_NUM_PRE_ALLOC_BUFFERS"));
     map.insert("PoolEmptyFreeList".into(), ParamInfo::int32(base.pool_empty_free_list, "POOL_EMPTY_FREE_LIST"));
     map.insert("EmptyFreeList".into(), ParamInfo::int32(base.pool_empty_free_list, "POOL_EMPTY_FREE_LIST"));
     map.insert("PoolPollStats".into(), ParamInfo::int32(base.pool_poll_stats, "POOL_POLL_STATS"));
