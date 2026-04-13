@@ -5,13 +5,15 @@ Launch with: pydm d435i_dual_view.py -m '{"P":"RS1:"}'
 """
 
 from pydm import Display
-from pydm.widgets import PyDMEnumComboBox, PyDMImageView, PyDMLabel
+from pydm.widgets import PyDMEnumComboBox, PyDMImageView, PyDMLabel, PyDMPushButton
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QVBoxLayout,
 )
 
@@ -31,20 +33,43 @@ class D435iDualViewDisplay(Display):
     def _pv(self, suffix):
         return f"ca://{self.p}{suffix}"
 
+    def _caput(self, suffix, value):
+        try:
+            from epics import caput
+        except ImportError:
+            return
+        try:
+            caput(f"{self.p}{suffix}", value, wait=False)
+        except Exception as e:
+            print(f"caput failed for {self.p}{suffix}: {e}")
+
     def _setup_ui(self):
         layout = QVBoxLayout()
         self.setLayout(layout)
 
-        # Title
         title = QLabel(f"D435i Dual View — {self.p}")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(title)
 
+        # Required plugin enables (image1/image2 StdArrays must be on to see frames)
+        plugins = QHBoxLayout()
+        plugins.addWidget(QLabel("Viewer plugins:"))
+        for prefix, label in [("image1:", "image1 (color)"), ("image2:", "image2 (depth)")]:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.stateChanged.connect(
+                lambda state, p=prefix: self._caput(
+                    f"{p}EnableCallbacks", 1 if state else 0
+                )
+            )
+            plugins.addWidget(cb)
+        plugins.addStretch()
+        layout.addLayout(plugins)
+
         # Image viewers side by side
         images = QHBoxLayout()
 
-        # Color image
         color_box = QGroupBox("Color (RGB)")
         color_layout = QVBoxLayout()
         color_box.setLayout(color_layout)
@@ -57,7 +82,6 @@ class D435iDualViewDisplay(Display):
         color_layout.addWidget(self.color_image)
         images.addWidget(color_box)
 
-        # Depth image
         depth_box = QGroupBox("Depth (Z16)")
         depth_layout = QVBoxLayout()
         depth_box.setLayout(depth_layout)
@@ -72,10 +96,9 @@ class D435iDualViewDisplay(Display):
 
         layout.addLayout(images, stretch=1)
 
-        # Bottom toolbar
+        # Bottom toolbar: colormap + trigger buttons + state
         toolbar = QHBoxLayout()
 
-        # Depth colormap selector
         toolbar.addWidget(QLabel("Depth Colormap:"))
         self.cmap_combo = QComboBox()
         self.cmap_combo.addItems([
@@ -86,26 +109,36 @@ class D435iDualViewDisplay(Display):
 
         toolbar.addStretch()
 
-        # Acquire control
-        toolbar.addWidget(QLabel("Acquire:"))
-        acq = PyDMEnumComboBox(init_channel=self._pv("cam1:Acquire"))
-        toolbar.addWidget(acq)
+        toolbar.addWidget(QLabel("Mode:"))
+        toolbar.addWidget(PyDMEnumComboBox(init_channel=self._pv("cam1:ImageMode")))
 
-        # Detector state
+        start = PyDMPushButton(label="Start", init_channel=self._pv("cam1:Acquire"), pressValue=1)
+        stop = PyDMPushButton(label="Stop", init_channel=self._pv("cam1:Acquire"), pressValue=0)
+        for b in (start, stop):
+            b.setStyleSheet("padding: 4px 12px;")
+            toolbar.addWidget(b)
+
+        single = QPushButton("Single")
+        single.setStyleSheet("padding: 4px 12px;")
+        single.clicked.connect(self._trigger_single)
+        toolbar.addWidget(single)
+
         toolbar.addWidget(QLabel("State:"))
-        state = PyDMLabel(init_channel=self._pv("cam1:DetectorState_RBV"))
-        toolbar.addWidget(state)
+        toolbar.addWidget(PyDMLabel(init_channel=self._pv("cam1:DetectorState_RBV")))
 
         layout.addLayout(toolbar)
 
-        # Apply default colormap
         self._set_depth_colormap("inferno")
+
+    def _trigger_single(self):
+        self._caput("cam1:ImageMode", 0)
+        self._caput("cam1:NumImages", 1)
+        self._caput("cam1:Acquire", 1)
 
     def _set_depth_colormap(self, name):
         try:
             self.depth_image.colorMap = name
         except Exception:
-            # Fallback for PyDM versions with different colormap API
             try:
                 import numpy as np
                 from matplotlib import colormaps
