@@ -366,7 +366,7 @@ class D435iMainDisplay(Display):
 
                 grid.addWidget(QLabel(name), row, 2)
 
-                queue = PyDMLabel(init_channel=self._pv(f"{r_prefix}QueueUse_RBV"))
+                queue = PyDMLabel(init_channel=self._pv(f"{r_prefix}QueueUse"))
                 grid.addWidget(queue, row, 3)
 
                 dropped = PyDMLabel(init_channel=self._pv(f"{r_prefix}DroppedArrays_RBV"))

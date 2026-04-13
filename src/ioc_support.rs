@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use epics_base_rs::server::iocsh::registry::*;
+use epics_rs::base::server::iocsh::registry::*;
 
-use ad_core_rs::ioc::GenericDriverContext;
+use epics_rs::ad_core::ioc::GenericDriverContext;
 
 use crate::driver::{D435iColorRuntime, D435iDepthRuntime, create_d435i_detector};
 
@@ -11,8 +11,8 @@ use crate::driver::{D435iColorRuntime, D435iDepthRuntime, create_d435i_detector}
 /// After calling this, `d435iConfig(...)` can be used in st.cmd to create
 /// a D435i detector. All records use standard asyn DTYPs handled by
 /// the universal asyn device support factory.
-pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
-    epics_base_rs::runtime::env::set_default("ADD435I", env!("CARGO_MANIFEST_DIR"));
+pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
+    epics_rs::base::runtime::env::set_default("ADD435I", env!("CARGO_MANIFEST_DIR"));
 
     let color_runtime: Arc<std::sync::Mutex<Option<D435iColorRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));
@@ -58,8 +58,8 @@ pub fn register(ioc: &mut ad_plugins_rs::ioc::AdIoc) {
                 let c_port_handle = color_rt.port_handle().clone();
                 let d_port_handle = depth_rt.port_handle().clone();
 
-                asyn_rs::asyn_record::register_port(&port_name, c_port_handle, trace.clone());
-                asyn_rs::asyn_record::register_port(&depth_port_name, d_port_handle, trace.clone());
+                epics_rs::asyn::asyn_record::register_port(&port_name, c_port_handle, trace.clone());
+                epics_rs::asyn::asyn_record::register_port(&depth_port_name, d_port_handle, trace.clone());
 
                 // Register color port as the primary driver context (pool + fan-out).
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

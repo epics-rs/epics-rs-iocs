@@ -8,7 +8,7 @@
 
 # ===== StdArrays: image3 (Float32 waveform) =====
 NDStdArraysConfigure("IMAGE3", $(QSIZE), 0, "$(PC_PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image3:,PORT=IMAGE3,NDARRAY_PORT=$(PC_PORT),TYPE=Float32,FTVL=FLOAT,NELEMENTS=6220800")
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image3:,PORT=IMAGE3,NDARRAY_PORT=$(PC_PORT),TYPE=Float32,FTVL=FLOAT,NELEMENTS=$(NELEMENTS_PC)")
 
 # ===== HDF5: archive XYZ point clouds =====
 NDFileHDF5Configure("FileHDF1_PC", $(QSIZE), 0, "$(PC_PORT)", 0)

@@ -2,14 +2,14 @@ use std::ffi::CString;
 use std::sync::Arc;
 use std::time::Duration;
 
-use asyn_rs::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::PortHandle;
 
-use ad_core_rs::color::NDColorMode;
-use ad_core_rs::driver::{ADStatus, ImageMode};
-use ad_core_rs::attributes::NDAttributeList;
-use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
-use ad_core_rs::params::ADBaseParams;
-use ad_core_rs::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
+use epics_rs::ad_core::color::NDColorMode;
+use epics_rs::ad_core::driver::{ADStatus, ImageMode};
+use epics_rs::ad_core::attributes::NDAttributeList;
+use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::params::ADBaseParams;
+use epics_rs::ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
 
 use realsense_rust::config::Config;
 use realsense_rust::context::Context;
@@ -26,8 +26,8 @@ use realsense_rust::processing_blocks::options::{
     DecimationOptions, SpatialFilterOptions, TemporalFilterOptions, HoleFillingOptions,
 };
 
-use asyn_rs::request::RequestOp;
-use asyn_rs::user::AsynUser;
+use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::user::AsynUser;
 
 use crate::params::{D435iConfigSnapshot, D435iParams};
 use crate::types::{AcqCommand, DirtyFlags};
@@ -67,7 +67,7 @@ pub(crate) struct AcquisitionContext {
 
 impl AcquisitionContext {
     fn end_acquisition(&self, wait_for_plugins: bool) {
-        use asyn_rs::request::ParamSetValue;
+        use epics_rs::asyn::request::ParamSetValue;
         if wait_for_plugins {
             self.color_queued.wait_until_zero(Duration::from_secs(5));
             self.depth_queued.wait_until_zero(Duration::from_secs(5));
@@ -187,7 +187,7 @@ fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usi
 fn publish_array(
     handle: &PortHandle,
     output: &parking_lot::Mutex<NDArrayOutput>,
-    base_params: &ad_core_rs::params::ndarray_driver::NDArrayDriverParams,
+    base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     array: NDArray,
     color_mode: NDColorMode,
 ) {
@@ -199,8 +199,14 @@ fn publish_array(
         _ => (0, 0, 0),
     };
     let data_type = array.data.data_type();
+    // ArraySize_RBV is total bytes (C ADCore NDPluginBase convention):
+    //   size = prod(dims) * bytes_per_element
+    let num_elements: i64 = array.dims.iter().map(|d| d.size as i64).product();
+    let array_size: i32 = num_elements
+        .saturating_mul(data_type.element_size() as i64)
+        .min(i32::MAX as i64) as i32;
 
-    use asyn_rs::request::ParamSetValue;
+    use epics_rs::asyn::request::ParamSetValue;
     handle.set_params_and_notify(0, vec![
         ParamSetValue::Int32   { reason: base_params.array_counter, addr: 0, value: array.unique_id },
         ParamSetValue::Float64 { reason: base_params.timestamp_rbv, addr: 0, value: ts.as_f64() },
@@ -209,6 +215,7 @@ fn publish_array(
         ParamSetValue::Int32   { reason: base_params.array_size_x,  addr: 0, value: size_x },
         ParamSetValue::Int32   { reason: base_params.array_size_y,  addr: 0, value: size_y },
         ParamSetValue::Int32   { reason: base_params.array_size_z,  addr: 0, value: size_z },
+        ParamSetValue::Int32   { reason: base_params.array_size,    addr: 0, value: array_size },
         ParamSetValue::Int32   { reason: base_params.n_dimensions,  addr: 0, value: n_dims as i32 },
         ParamSetValue::Int32   { reason: base_params.color_mode,    addr: 0, value: color_mode as i32 },
         ParamSetValue::Int32   { reason: base_params.data_type,     addr: 0, value: data_type as u8 as i32 },
@@ -240,7 +247,7 @@ fn process_color_frame(
             NDDimension::new(h),
         ];
 
-        let ts = ad_core_rs::timestamp::EpicsTimestamp::now();
+        let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
         let array = NDArray {
             unique_id: array_counter,
             timestamp: ts,
@@ -295,7 +302,7 @@ fn process_depth_frame(
         NDDimension::new(h),
     ];
 
-    let ts = ad_core_rs::timestamp::EpicsTimestamp::now();
+    let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
     let array = NDArray {
         unique_id: array_counter,
         timestamp: ts,
@@ -339,7 +346,7 @@ fn process_pointcloud(
             .flat_map(|v| v.xyz.iter().copied())
             .collect();
 
-        let ts = ad_core_rs::timestamp::EpicsTimestamp::now();
+        let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
         let array = NDArray {
             unique_id: array_counter,
             timestamp: ts,
@@ -452,7 +459,7 @@ fn try_connect_pipeline(
     ctx: &AcquisitionContext,
     config: &D435iConfigSnapshot,
 ) -> Option<realsense_rust::pipeline::ActivePipeline> {
-    use asyn_rs::request::ParamSetValue;
+    use epics_rs::asyn::request::ParamSetValue;
     ctx.color_handle.set_params_and_notify(0, vec![
         ParamSetValue::Octet { reason: ctx.color_ad.status_message, addr: 0, value: "Connecting to camera...".into() },
         ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 0 },
@@ -503,7 +510,7 @@ fn acquisition_loop(ctx: AcquisitionContext) {
         }
 
         // Initialize counters
-        use asyn_rs::request::ParamSetValue;
+        use epics_rs::asyn::request::ParamSetValue;
         ctx.color_handle.set_params_and_notify(0, vec![
             ParamSetValue::Int32 { reason: ctx.color_ad.num_images_counter, addr: 0, value: 0 },
             ParamSetValue::Int32 { reason: ctx.color_ad.status,             addr: 0, value: ADStatus::Acquire as i32 },

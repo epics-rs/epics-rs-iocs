@@ -1,10 +1,12 @@
 # d435iColorPlugins.cmd — Plugin chain for the D435i Color (RGB8) port
 #
-# Required macros: PREFIX, PORT, QSIZE, XSIZE, YSIZE, NCHANS, CBUFFS
-# Inherits defaults TYPE=Int8 FTVL=UCHAR NELEMENTS=XSIZE*YSIZE*3 from st.cmd.
+# Delegates to $(ADCORE)/ioc/commonPlugins.cmd with the color-specific
+# waveform typing. st.cmd must set $(NELEMENTS_COLOR) = XSIZE*YSIZE*3.
+#
+# Required macros: PREFIX, PORT, QSIZE, NCHANS, CBUFFS, NELEMENTS_COLOR
 
 epicsEnvSet("TYPE",      "Int8")
 epicsEnvSet("FTVL",      "UCHAR")
-epicsEnvSet("NELEMENTS", "6220800")
+epicsEnvSet("NELEMENTS", "$(NELEMENTS_COLOR)")
 
 < $(ADCORE)/ioc/commonPlugins.cmd

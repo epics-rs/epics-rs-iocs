@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use asyn_rs::error::AsynResult;
-use asyn_rs::port::{PortDriver, PortDriverBase};
-use asyn_rs::port_handle::PortHandle;
-use asyn_rs::runtime::config::RuntimeConfig;
-use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use asyn_rs::user::AsynUser;
+use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::port::{PortDriver, PortDriverBase};
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::runtime::config::RuntimeConfig;
+use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::user::AsynUser;
 
-use ad_core_rs::driver::{ADDriver, ADDriverBase, ImageMode};
-use ad_core_rs::ndarray_pool::NDArrayPool;
-use ad_core_rs::params::ADBaseParams;
-use ad_core_rs::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::params::ADBaseParams;
+use epics_rs::ad_core::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};

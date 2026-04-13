@@ -7,7 +7,7 @@
 
 # ===== StdArrays: image2 =====
 NDStdArraysConfigure("IMAGE2", $(QSIZE), 0, "$(DEPTH_PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=IMAGE2,NDARRAY_PORT=$(DEPTH_PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=2073600")
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=IMAGE2,NDARRAY_PORT=$(DEPTH_PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS_DEPTH)")
 
 # ===== ROI + ROIStat for region analysis =====
 NDROIConfigure("ROI1_D", $(QSIZE), 0, "$(DEPTH_PORT)", 0)
