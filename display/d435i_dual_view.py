@@ -55,7 +55,7 @@ class D435iDualViewDisplay(Display):
         # Required plugin enables (image1/image2 StdArrays must be on to see frames)
         plugins = QHBoxLayout()
         plugins.addWidget(QLabel("Viewer plugins:"))
-        for prefix, label in [("image1:", "image1 (color)"), ("image2:", "image2 (depth)")]:
+        for prefix, label in [("CC1:", "CC1 (RGB→Mono)"), ("image1:", "image1 (color)"), ("image2:", "image2 (depth)")]:
             cb = QCheckBox(label)
             cb.setChecked(True)
             cb.stateChanged.connect(
@@ -129,6 +129,14 @@ class D435iDualViewDisplay(Display):
         layout.addLayout(toolbar)
 
         self._set_depth_colormap("inferno")
+        self._setup_color_pipeline()
+
+    def _setup_color_pipeline(self):
+        """Route color frames through CC1 (RGB→Mono) so PyDMImageView can display them."""
+        self._caput("CC1:ColorModeOut", 0)  # Mono
+        self._caput("CC1:EnableCallbacks", 1)
+        self._caput("image1:NDArrayPort", "CC1")
+        self._caput("image1:EnableCallbacks", 1)
 
     def _trigger_single(self):
         self._caput("cam1:ImageMode", 0)
