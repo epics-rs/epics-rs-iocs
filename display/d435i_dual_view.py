@@ -80,6 +80,9 @@ class D435iDualViewDisplay(Display):
         self.color_image.setMinimumSize(320, 240)
         self.color_image.readingOrder = PyDMImageView.ReadingOrder.Clike
         color_layout.addWidget(self.color_image)
+        self.color_info = QLabel("x=- y=- val=-")
+        self.color_info.setStyleSheet("font-family: 'Menlo'; font-size: 11px;")
+        color_layout.addWidget(self.color_info)
         images.addWidget(color_box)
 
         depth_box = QGroupBox("Depth (Z16)")
@@ -92,7 +95,13 @@ class D435iDualViewDisplay(Display):
         self.depth_image.setMinimumSize(320, 240)
         self.depth_image.readingOrder = PyDMImageView.ReadingOrder.Clike
         depth_layout.addWidget(self.depth_image)
+        self.depth_info = QLabel("x=- y=- val=-")
+        self.depth_info.setStyleSheet("font-family: 'Menlo'; font-size: 11px;")
+        depth_layout.addWidget(self.depth_info)
         images.addWidget(depth_box)
+
+        self._setup_crosshair(self.color_image, self.color_info)
+        self._setup_crosshair(self.depth_image, self.depth_info)
 
         layout.addLayout(images, stretch=1)
 
@@ -130,6 +139,29 @@ class D435iDualViewDisplay(Display):
 
         self._set_depth_colormap("inferno")
         self._setup_color_pipeline()
+
+    def _setup_crosshair(self, image_view, info_label):
+        """Show pixel coordinates and value on mouse hover."""
+        plot_item = image_view.getView()
+        proxy = plot_item.scene().sigMouseMoved.connect(
+            lambda pos, iv=image_view, lbl=info_label: self._on_mouse_moved(pos, iv, lbl)
+        )
+
+    def _on_mouse_moved(self, pos, image_view, label):
+        plot_item = image_view.getView()
+        vb = plot_item.getViewBox()
+        if not plot_item.sceneBoundingRect().contains(pos):
+            return
+        mouse_point = vb.mapSceneToView(pos)
+        x, y = int(mouse_point.x()), int(mouse_point.y())
+        image_item = image_view.imageItem
+        if image_item is not None and image_item.image is not None:
+            img = image_item.image
+            if 0 <= x < img.shape[0] and 0 <= y < img.shape[1]:
+                val = img[x, y]
+                label.setText(f"x={x}  y={y}  val={val}")
+                return
+        label.setText(f"x={x}  y={y}  val=-")
 
     def _setup_color_pipeline(self):
         """Route color frames through CC1 (RGB→Mono) so PyDMImageView can display them."""

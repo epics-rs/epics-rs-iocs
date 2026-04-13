@@ -105,38 +105,49 @@ class D435iMainDisplay(Display):
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(title)
 
-        # Top row: Device Info + Acquire/Trigger
+        tabs = QTabWidget()
+        layout.addWidget(tabs, stretch=1)
+
+        # Tab 1: Detector — Device Info, Acquire, Stream, Sensor
+        det_tab = QWidget()
+        det_layout = QVBoxLayout()
+        det_tab.setLayout(det_layout)
         top = QHBoxLayout()
         top.addWidget(self._device_info_group())
         top.addWidget(self._acquire_group(), stretch=1)
-        layout.addLayout(top)
-
-        # Middle row: Stream Config + Sensor Controls
+        det_layout.addLayout(top)
         mid = QHBoxLayout()
         mid.addWidget(self._stream_config_group())
         mid.addWidget(self._sensor_controls_group())
-        layout.addLayout(mid)
+        det_layout.addLayout(mid)
+        det_layout.addStretch()
+        tabs.addTab(det_tab, "Detector")
 
-        # Bottom row: Depth Info + IMU + Diagnostics
+        # Tab 2: Processing — Depth Info, IMU, Diagnostics, Post-Processing, Alignment
+        proc_tab = QWidget()
+        proc_layout = QVBoxLayout()
+        proc_tab.setLayout(proc_layout)
         bot = QHBoxLayout()
         bot.addWidget(self._depth_info_group())
         bot.addWidget(self._imu_group())
         bot.addWidget(self._diagnostics_group())
-        layout.addLayout(bot)
+        proc_layout.addLayout(bot)
+        proc_row = QHBoxLayout()
+        proc_row.addWidget(self._postprocessing_group())
+        proc_row.addWidget(self._alignment_group())
+        proc_layout.addLayout(proc_row)
+        proc_layout.addStretch()
+        tabs.addTab(proc_tab, "Processing")
 
-        # Processing row: Post-Processing + Alignment
-        proc = QHBoxLayout()
-        proc.addWidget(self._postprocessing_group())
-        proc.addWidget(self._alignment_group())
-        layout.addLayout(proc)
+        # Tab 3: Plugins — Enable/Status, File Capture
+        plug_tab = QWidget()
+        plug_layout = QVBoxLayout()
+        plug_tab.setLayout(plug_layout)
+        plug_layout.addWidget(self._plugins_group(), stretch=1)
+        plug_layout.addWidget(self._capture_group())
+        tabs.addTab(plug_tab, "Plugins")
 
-        # Plugin enable/status tabs
-        layout.addWidget(self._plugins_group(), stretch=1)
-
-        # File capture row
-        layout.addWidget(self._capture_group())
-
-        # Image viewer launcher
+        # Image viewer launcher (always visible)
         layout.addWidget(self._image_plugins_group())
 
     # ------------------------------------------------------------------ groups
@@ -332,7 +343,6 @@ class D435iMainDisplay(Display):
         for port_label, entries in PLUGIN_MANIFEST.items():
             tab = QWidget()
             grid = QGridLayout()
-            tab.setLayout(grid)
 
             # Header row
             for col, text in enumerate(["On", "State", "Plugin", "Queue", "Dropped"]):
@@ -363,6 +373,11 @@ class D435iMainDisplay(Display):
                 grid.addWidget(dropped, row, 4)
 
             grid.setColumnStretch(2, 1)
+
+            wrapper = QVBoxLayout()
+            wrapper.addLayout(grid)
+            wrapper.addStretch()
+            tab.setLayout(wrapper)
             tabs.addTab(tab, port_label)
 
         return grp
