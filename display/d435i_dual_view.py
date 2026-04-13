@@ -154,14 +154,12 @@ class D435iDualViewDisplay(Display):
             return
         mouse_point = vb.mapSceneToView(pos)
         x, y = int(mouse_point.x()), int(mouse_point.y())
-        image_item = image_view.imageItem
-        if image_item is not None and image_item.image is not None:
-            img = image_item.image
-            if 0 <= x < img.shape[0] and 0 <= y < img.shape[1]:
-                val = img[x, y]
-                label.setText(f"x={x}  y={y}  val={val}")
-                return
-        label.setText(f"x={x}  y={y}  val=-")
+        try:
+            img = image_view.imageItem.image
+            val = img[y, x]
+            label.setText(f"x={x}  y={y}  val={val}")
+        except Exception:
+            label.setText(f"x={x}  y={y}  val=-")
 
     def _setup_color_pipeline(self):
         """Route color frames through CC1 (RGB→Mono) so PyDMImageView can display them."""
