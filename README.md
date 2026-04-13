@@ -1,18 +1,25 @@
 # D435i RealSense areaDetector IOC
 
-An epics-rs based areaDetector IOC for the Intel RealSense D435i camera.
-A single pipeline outputs Color (RGB8) and Depth (Z16) simultaneously on two separate ports, with IMU data published as PVs.
+An epics-rs (v0.9) based areaDetector IOC for the Intel RealSense D435i
+camera. A single pipeline produces three NDArray outputs simultaneously
+(Color RGB8, Depth Z16, optional XYZ Pointcloud) and publishes IMU data
+as PVs.
 
 ## Architecture
 
 ```
 RealSense Pipeline
     |
-    +- ColorFrame (RGB8) --> RS1       (Color ADDriver Port)
-    +- DepthFrame (Z16)  --> RS1_DEPTH (Depth ADDriver Port)
-    +- AccelFrame        --> RS1:cam1:RSAccelX/Y/Z_RBV
-    +- GyroFrame         --> RS1:cam1:RSGyroX/Y/Z_RBV
+    +- ColorFrame (RGB8)   --> RS1       (Color ADDriver port, full plugin chain)
+    +- DepthFrame (Z16)    --> RS1_DEPTH (Depth ADDriver port, lean plugin chain)
+    +- PointCloud (Float32)--> RS1_PC    (NDArray source only, minimal chain)
+    +- AccelFrame          --> RS1:cam1:RSAccelX/Y/Z_RBV
+    +- GyroFrame           --> RS1:cam1:RSGyroX/Y/Z_RBV
 ```
+
+`RS1_PC` is not a full ADDriver port — it is a secondary `NDArrayOutput`
+on the color driver, registered in the plugin wiring registry so plugins
+can attach via `NDARRAY_PORT=RS1_PC`. It does not carry control records.
 
 ## Prerequisites
 
@@ -146,10 +153,25 @@ Available stream modes (valid for both Color RGB8 and Depth Z16):
 
 ### Image Arrays (NDStdArrays Plugin)
 
-| PV | Format | Description |
-|----|--------|-------------|
-| `RS1:image1:ArrayData` | UInt8 (RGB) | Color image data |
-| `RS1:image2:ArrayData` | Int16 (Mono) | Depth image data |
+| PV | Format | Source port | Description |
+|----|--------|-------------|-------------|
+| `RS1:image1:ArrayData` | UInt8 (RGB)   | `RS1`       | Color image data |
+| `RS1:image2:ArrayData` | Int16 (Mono)  | `RS1_DEPTH` | Depth image data |
+| `RS1:image3:ArrayData` | Float32 (XYZ) | `RS1_PC`    | Pointcloud vertices |
+
+## Plugin Configuration
+
+Each NDArray output port has its own plugin script, loaded from
+`ioc/st.cmd`:
+
+| Script | Applied to | Plugins |
+|--------|------------|---------|
+| `d435iColorPlugins.cmd` | `RS1` (RGB8)     | Full `commonPlugins.cmd` (StdArrays image1, ROI, Stats, Over, Trans, Process, CB, Attr, FFT, Codec, TIFF, JPEG, HDF5, Nexus, NetCDF, ColorConvert, PVA, ...) |
+| `d435iDepthPlugins.cmd` | `RS1_DEPTH` (Z16) | StdArrays image2, ROI, ROIStat, Stats, TIFF, HDF5 — JPEG/ColorConvert skipped (not meaningful for mono Z16) |
+| `d435iPCPlugins.cmd`    | `RS1_PC` (Float32 XYZ) | StdArrays image3 + HDF5 only — most AD plugins cannot process a (3, W, H) vertex array |
+
+To add or remove plugins for a given port, edit the corresponding
+`.cmd` file rather than the shared `commonPlugins.cmd`.
 
 ## PyDM Displays
 
@@ -223,23 +245,26 @@ caput RS1:cam1:Acquire 0
 ## Project Structure
 
 ```
-iocs/d435i/
+epics-rs-iocs/
 ├── Cargo.toml
 ├── src/
 │   ├── lib.rs              # Module declarations
 │   ├── types.rs            # AcqCommand, DirtyFlags
 │   ├── params.rs           # D435iParams, D435iConfigSnapshot
 │   ├── driver.rs           # D435iColorDriver, D435iDepthDriver, runtimes
-│   ├── task.rs             # Acquisition loop (pipeline management, frame processing)
-│   ├── ioc_support.rs      # IOC registration, device support
+│   ├── task.rs             # Acquisition loop (pipeline, filters, publish)
+│   ├── ioc_support.rs      # d435iConfig command + wiring registration
 │   └── bin/
 │       └── d435i_ioc.rs    # IOC binary entry point
 ├── db/
-│   ├── d435i_color.template  # Color port EPICS records
-│   └── d435i_depth.template  # Depth port EPICS records
+│   ├── d435i_color.template  # Color port EPICS records (standard asyn DTYPs)
+│   └── d435i_depth.template  # Depth port EPICS records (NDArrayBase include)
 ├── display/
 │   ├── d435i_main.py         # Main detector control display (PyDM)
 │   └── d435i_dual_view.py    # Dual color+depth image viewer (PyDM)
 └── ioc/
-    └── st.cmd              # IOC startup script
+    ├── st.cmd                   # IOC startup script
+    ├── d435iColorPlugins.cmd    # Full plugin chain for RS1 (RGB8)
+    ├── d435iDepthPlugins.cmd    # Lean chain for RS1_DEPTH (Z16)
+    └── d435iPCPlugins.cmd       # Minimal chain for RS1_PC (XYZ Float32)
 ```

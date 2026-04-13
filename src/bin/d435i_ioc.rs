@@ -3,10 +3,10 @@
 //! Usage:
 //!   cargo run --bin d435i_ioc --features ioc -- ioc/st.cmd
 
-use ad_plugins::ioc::AdIoc;
+use ad_plugins_rs::ioc::AdIoc;
 use epics_base_rs::error::CaResult;
 
-#[tokio::main]
+#[epics_base_rs::epics_main]
 async fn main() -> CaResult<()> {
     let mut ioc = AdIoc::new();
     d435i::ioc_support::register(&mut ioc);

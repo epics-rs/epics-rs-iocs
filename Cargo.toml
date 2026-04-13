@@ -1,21 +1,21 @@
 [package]
 name = "d435i"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [workspace]
 
 [features]
-ioc = ["dep:epics-base-rs", "dep:tokio", "dep:ad-plugins",
-       "ad-plugins/ioc", "ad-core/ioc", "asyn-rs/epics"]
+ioc = ["dep:epics-base-rs", "dep:tokio", "dep:ad-plugins-rs",
+       "ad-plugins-rs/ioc", "ad-core-rs/ioc", "asyn-rs/epics"]
 
 [dependencies]
-ad-core = { path = "../../crates/ad-core" }
-ad-plugins = { path = "../../crates/ad-plugins", optional = true }
-asyn-rs = { path = "../../crates/asyn" }
+ad-core-rs = { path = "../epics-rs/crates/ad-core-rs" }
+ad-plugins-rs = { path = "../epics-rs/crates/ad-plugins-rs", optional = true }
+asyn-rs = { path = "../epics-rs/crates/asyn-rs" }
 parking_lot = "0.12"
-epics-base-rs = { path = "../../crates/epics-base", optional = true }
+epics-base-rs = { path = "../epics-rs/crates/epics-base-rs", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 realsense-rust = "1.3"
 anyhow = "1.0"

@@ -1,4 +1,4 @@
-use ad_core::params::ADBaseParams;
+use ad_core_rs::params::ADBaseParams;
 use asyn_rs::error::AsynResult;
 use asyn_rs::param::ParamType;
 use asyn_rs::port::PortDriverBase;
@@ -115,7 +115,7 @@ pub struct D435iConfigSnapshot {
     pub laser_power: f64,
     pub emitter_enabled: bool,
     pub serial: String,
-    pub image_mode: ad_core::driver::ImageMode,
+    pub image_mode: ad_core_rs::driver::ImageMode,
     pub num_images: i32,
     pub array_callbacks: bool,
     pub wait_for_plugins: bool,
@@ -164,7 +164,7 @@ impl D435iConfigSnapshot {
             laser_power: handle.read_float64_blocking(rs.rs_laser_power, 0)?,
             emitter_enabled: handle.read_int32_blocking(rs.rs_emitter_enabled, 0)? != 0,
             serial: serial.to_string(),
-            image_mode: ad_core::driver::ImageMode::from_i32(
+            image_mode: ad_core_rs::driver::ImageMode::from_i32(
                 handle.read_int32_blocking(ad.image_mode, 0)?,
             ),
             num_images: handle.read_int32_blocking(ad.num_images, 0)?,

@@ -6,7 +6,7 @@ include "ADBase.template"
 # ===== D435i Stream config =====
 # Valid modes: intersection of Color(RGB8) and Depth(Z16) capabilities.
 record(mbbo, "$(P)$(R)RSStreamMode") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_STREAM_MODE")
     field(ZRST, "424x240 @ 15fps")
     field(ONST, "424x240 @ 30fps")
@@ -26,7 +26,7 @@ record(mbbo, "$(P)$(R)RSStreamMode") {
 }
 
 record(mbbi, "$(P)$(R)RSStreamMode_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_STREAM_MODE")
     field(ZRST, "424x240 @ 15fps")
     field(ONST, "424x240 @ 30fps")
@@ -47,19 +47,19 @@ record(mbbi, "$(P)$(R)RSStreamMode_RBV") {
 }
 
 record(longin, "$(P)$(R)RSResX_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_X")
     field(SCAN, "I/O Intr")
 }
 
 record(longin, "$(P)$(R)RSResY_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_RES_Y")
     field(SCAN, "I/O Intr")
 }
 
 record(longin, "$(P)$(R)RSFrameRate_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_FRAME_RATE")
     field(EGU,  "fps")
     field(SCAN, "I/O Intr")
@@ -67,7 +67,7 @@ record(longin, "$(P)$(R)RSFrameRate_RBV") {
 
 # ===== D435i Sensor options =====
 record(ao, "$(P)$(R)RSExposure") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EXPOSURE")
     field(EGU,  "us")
     field(PREC, "1")
@@ -76,7 +76,7 @@ record(ao, "$(P)$(R)RSExposure") {
 }
 
 record(ai, "$(P)$(R)RSExposure_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EXPOSURE")
     field(EGU,  "us")
     field(PREC, "1")
@@ -84,7 +84,7 @@ record(ai, "$(P)$(R)RSExposure_RBV") {
 }
 
 record(ao, "$(P)$(R)RSGain") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GAIN")
     field(PREC, "1")
     field(DRVL, "16")
@@ -92,21 +92,21 @@ record(ao, "$(P)$(R)RSGain") {
 }
 
 record(ai, "$(P)$(R)RSGain_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GAIN")
     field(PREC, "1")
     field(SCAN, "I/O Intr")
 }
 
 record(bo, "$(P)$(R)RSAutoExposure") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_AUTO_EXPOSURE")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 
 record(bi, "$(P)$(R)RSAutoExposure_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_AUTO_EXPOSURE")
     field(ZNAM, "Off")
     field(ONAM, "On")
@@ -114,7 +114,7 @@ record(bi, "$(P)$(R)RSAutoExposure_RBV") {
 }
 
 record(ao, "$(P)$(R)RSLaserPower") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_LASER_POWER")
     field(EGU,  "mW")
     field(PREC, "0")
@@ -123,7 +123,7 @@ record(ao, "$(P)$(R)RSLaserPower") {
 }
 
 record(ai, "$(P)$(R)RSLaserPower_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_LASER_POWER")
     field(EGU,  "mW")
     field(PREC, "0")
@@ -131,14 +131,14 @@ record(ai, "$(P)$(R)RSLaserPower_RBV") {
 }
 
 record(bo, "$(P)$(R)RSEmitterEnabled") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EMITTER_ENABLED")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 
 record(bi, "$(P)$(R)RSEmitterEnabled_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_EMITTER_ENABLED")
     field(ZNAM, "Off")
     field(ONAM, "On")
@@ -147,7 +147,7 @@ record(bi, "$(P)$(R)RSEmitterEnabled_RBV") {
 
 # ===== Depth info (read-only, on color port) =====
 record(ai, "$(P)$(R)RSDepthUnits_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_UNITS")
     field(EGU,  "m/unit")
     field(PREC, "6")
@@ -156,7 +156,7 @@ record(ai, "$(P)$(R)RSDepthUnits_RBV") {
 
 # ===== IMU =====
 record(ai, "$(P)$(R)RSAccelX_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ACCEL_X")
     field(EGU,  "m/s^2")
     field(PREC, "3")
@@ -164,7 +164,7 @@ record(ai, "$(P)$(R)RSAccelX_RBV") {
 }
 
 record(ai, "$(P)$(R)RSAccelY_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ACCEL_Y")
     field(EGU,  "m/s^2")
     field(PREC, "3")
@@ -172,7 +172,7 @@ record(ai, "$(P)$(R)RSAccelY_RBV") {
 }
 
 record(ai, "$(P)$(R)RSAccelZ_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ACCEL_Z")
     field(EGU,  "m/s^2")
     field(PREC, "3")
@@ -180,7 +180,7 @@ record(ai, "$(P)$(R)RSAccelZ_RBV") {
 }
 
 record(ai, "$(P)$(R)RSGyroX_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GYRO_X")
     field(EGU,  "rad/s")
     field(PREC, "4")
@@ -188,7 +188,7 @@ record(ai, "$(P)$(R)RSGyroX_RBV") {
 }
 
 record(ai, "$(P)$(R)RSGyroY_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GYRO_Y")
     field(EGU,  "rad/s")
     field(PREC, "4")
@@ -196,7 +196,7 @@ record(ai, "$(P)$(R)RSGyroY_RBV") {
 }
 
 record(ai, "$(P)$(R)RSGyroZ_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_GYRO_Z")
     field(EGU,  "rad/s")
     field(PREC, "4")
@@ -205,13 +205,13 @@ record(ai, "$(P)$(R)RSGyroZ_RBV") {
 
 # ===== Device status =====
 record(stringin, "$(P)$(R)RSSerial_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SERIAL")
     field(SCAN, "I/O Intr")
 }
 
 record(bi, "$(P)$(R)RSConnected_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_CONNECTED")
     field(ZNAM, "Disconnected")
     field(ONAM, "Connected")
@@ -220,65 +220,65 @@ record(bi, "$(P)$(R)RSConnected_RBV") {
 
 # ===== Diagnostics =====
 record(longin, "$(P)$(R)RSFramesDropped_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_FRAMES_DROPPED")
     field(SCAN, "I/O Intr")
 }
 
 record(longin, "$(P)$(R)RSErrorCount_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ERROR_COUNT")
     field(SCAN, "I/O Intr")
 }
 
 record(stringin, "$(P)$(R)RSLastError_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_LAST_ERROR")
     field(SCAN, "I/O Intr")
 }
 
 # ===== Depth Post-Processing =====
 record(bo, "$(P)$(R)RSDecimationEnable") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DECIMATION_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 record(bi, "$(P)$(R)RSDecimationEnable_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DECIMATION_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
     field(SCAN, "I/O Intr")
 }
 record(longout, "$(P)$(R)RSDecimationMag") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DECIMATION_MAGNITUDE")
     field(DRVL, "2")
     field(DRVH, "8")
     field(VAL,  "2")
 }
 record(longin, "$(P)$(R)RSDecimationMag_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DECIMATION_MAGNITUDE")
     field(SCAN, "I/O Intr")
 }
 
 record(bo, "$(P)$(R)RSSpatialEnable") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 record(bi, "$(P)$(R)RSSpatialEnable_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
     field(SCAN, "I/O Intr")
 }
 record(ao, "$(P)$(R)RSSpatialAlpha") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_ALPHA")
     field(PREC, "2")
     field(DRVL, "0.25")
@@ -286,51 +286,51 @@ record(ao, "$(P)$(R)RSSpatialAlpha") {
     field(VAL,  "0.5")
 }
 record(ai, "$(P)$(R)RSSpatialAlpha_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_ALPHA")
     field(PREC, "2")
     field(SCAN, "I/O Intr")
 }
 record(longout, "$(P)$(R)RSSpatialDelta") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_DELTA")
     field(DRVL, "1")
     field(DRVH, "50")
     field(VAL,  "20")
 }
 record(longin, "$(P)$(R)RSSpatialDelta_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_DELTA")
     field(SCAN, "I/O Intr")
 }
 record(longout, "$(P)$(R)RSSpatialMag") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_MAGNITUDE")
     field(DRVL, "1")
     field(DRVH, "5")
     field(VAL,  "2")
 }
 record(longin, "$(P)$(R)RSSpatialMag_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_SPATIAL_MAGNITUDE")
     field(SCAN, "I/O Intr")
 }
 
 record(bo, "$(P)$(R)RSTemporalEnable") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_TEMPORAL_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 record(bi, "$(P)$(R)RSTemporalEnable_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_TEMPORAL_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
     field(SCAN, "I/O Intr")
 }
 record(ao, "$(P)$(R)RSTemporalAlpha") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_TEMPORAL_ALPHA")
     field(PREC, "2")
     field(DRVL, "0.0")
@@ -338,46 +338,46 @@ record(ao, "$(P)$(R)RSTemporalAlpha") {
     field(VAL,  "0.4")
 }
 record(ai, "$(P)$(R)RSTemporalAlpha_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_TEMPORAL_ALPHA")
     field(PREC, "2")
     field(SCAN, "I/O Intr")
 }
 record(longout, "$(P)$(R)RSTemporalDelta") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_TEMPORAL_DELTA")
     field(DRVL, "1")
     field(DRVH, "100")
     field(VAL,  "20")
 }
 record(longin, "$(P)$(R)RSTemporalDelta_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_TEMPORAL_DELTA")
     field(SCAN, "I/O Intr")
 }
 
 record(bo, "$(P)$(R)RSHoleFillEnable") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_HOLE_FILL_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 record(bi, "$(P)$(R)RSHoleFillEnable_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_HOLE_FILL_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
     field(SCAN, "I/O Intr")
 }
 record(mbbo, "$(P)$(R)RSHoleFillMode") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_HOLE_FILL_MODE")
     field(ZRST, "Fill from left")
     field(ONST, "Farthest from around")
     field(TWST, "Nearest from around")
 }
 record(mbbi, "$(P)$(R)RSHoleFillMode_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_HOLE_FILL_MODE")
     field(ZRST, "Fill from left")
     field(ONST, "Farthest from around")
@@ -387,13 +387,13 @@ record(mbbi, "$(P)$(R)RSHoleFillMode_RBV") {
 
 # ===== Alignment =====
 record(bo, "$(P)$(R)RSAlignEnable") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ALIGN_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 record(bi, "$(P)$(R)RSAlignEnable_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_ALIGN_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
@@ -402,13 +402,13 @@ record(bi, "$(P)$(R)RSAlignEnable_RBV") {
 
 # ===== Pointcloud =====
 record(bo, "$(P)$(R)RSPointcloudEnable") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_POINTCLOUD_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
 record(bi, "$(P)$(R)RSPointcloudEnable_RBV") {
-    field(DTYP, "asynD435i")
+    field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_POINTCLOUD_ENABLE")
     field(ZNAM, "Off")
     field(ONAM, "On")

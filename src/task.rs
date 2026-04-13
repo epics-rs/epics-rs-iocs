@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use asyn_rs::port_handle::PortHandle;
 
-use ad_core::color::NDColorMode;
-use ad_core::driver::{ADStatus, ImageMode};
-use ad_core::attributes::NDAttributeList;
-use ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
-use ad_core::params::ADBaseParams;
-use ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
+use ad_core_rs::color::NDColorMode;
+use ad_core_rs::driver::{ADStatus, ImageMode};
+use ad_core_rs::attributes::NDAttributeList;
+use ad_core_rs::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use ad_core_rs::params::ADBaseParams;
+use ad_core_rs::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
 
 use realsense_rust::config::Config;
 use realsense_rust::context::Context;
@@ -67,17 +67,17 @@ pub(crate) struct AcquisitionContext {
 
 impl AcquisitionContext {
     fn end_acquisition(&self, wait_for_plugins: bool) {
+        use asyn_rs::request::ParamSetValue;
         if wait_for_plugins {
             self.color_queued.wait_until_zero(Duration::from_secs(5));
             self.depth_queued.wait_until_zero(Duration::from_secs(5));
         }
-        let _ = self.color_handle.write_int32_blocking(self.color_ad.acquire_busy, 0, 0);
-        let _ = self.color_handle.write_int32_blocking(self.color_ad.status, 0, ADStatus::Idle as i32);
-        let _ = self.color_handle.write_int32_blocking(self.color_ad.acquire, 0, 0);
-        let _ = self.color_handle.call_param_callbacks_blocking(0);
-
-        let _ = self.color_handle.write_int32_blocking(self.rs_params.rs_connected, 0, 0);
-        let _ = self.color_handle.call_param_callbacks_blocking(0);
+        self.color_handle.set_params_and_notify(0, vec![
+            ParamSetValue::Int32 { reason: self.color_ad.acquire_busy, addr: 0, value: 0 },
+            ParamSetValue::Int32 { reason: self.color_ad.status,       addr: 0, value: ADStatus::Idle as i32 },
+            ParamSetValue::Int32 { reason: self.color_ad.acquire,      addr: 0, value: 0 },
+            ParamSetValue::Int32 { reason: self.rs_params.rs_connected, addr: 0, value: 0 },
+        ]);
     }
 }
 
@@ -187,7 +187,7 @@ fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usi
 fn publish_array(
     handle: &PortHandle,
     output: &parking_lot::Mutex<NDArrayOutput>,
-    base_params: &ad_core::params::ndarray_driver::NDArrayDriverParams,
+    base_params: &ad_core_rs::params::ndarray_driver::NDArrayDriverParams,
     array: NDArray,
     color_mode: NDColorMode,
 ) {
@@ -200,16 +200,19 @@ fn publish_array(
     };
     let data_type = array.data.data_type();
 
-    handle.write_int32_no_wait(base_params.array_counter, 0, array.unique_id);
-    handle.write_float64_no_wait(base_params.timestamp_rbv, 0, ts.as_f64());
-    handle.write_int32_no_wait(base_params.epics_ts_sec, 0, ts.sec as i32);
-    handle.write_int32_no_wait(base_params.epics_ts_nsec, 0, ts.nsec as i32);
-    handle.write_int32_no_wait(base_params.array_size_x, 0, size_x);
-    handle.write_int32_no_wait(base_params.array_size_y, 0, size_y);
-    handle.write_int32_no_wait(base_params.array_size_z, 0, size_z);
-    handle.write_int32_no_wait(base_params.n_dimensions, 0, n_dims as i32);
-    handle.write_int32_no_wait(base_params.color_mode, 0, color_mode as i32);
-    handle.write_int32_no_wait(base_params.data_type, 0, data_type as u8 as i32);
+    use asyn_rs::request::ParamSetValue;
+    handle.set_params_and_notify(0, vec![
+        ParamSetValue::Int32   { reason: base_params.array_counter, addr: 0, value: array.unique_id },
+        ParamSetValue::Float64 { reason: base_params.timestamp_rbv, addr: 0, value: ts.as_f64() },
+        ParamSetValue::Int32   { reason: base_params.epics_ts_sec,  addr: 0, value: ts.sec as i32 },
+        ParamSetValue::Int32   { reason: base_params.epics_ts_nsec, addr: 0, value: ts.nsec as i32 },
+        ParamSetValue::Int32   { reason: base_params.array_size_x,  addr: 0, value: size_x },
+        ParamSetValue::Int32   { reason: base_params.array_size_y,  addr: 0, value: size_y },
+        ParamSetValue::Int32   { reason: base_params.array_size_z,  addr: 0, value: size_z },
+        ParamSetValue::Int32   { reason: base_params.n_dimensions,  addr: 0, value: n_dims as i32 },
+        ParamSetValue::Int32   { reason: base_params.color_mode,    addr: 0, value: color_mode as i32 },
+        ParamSetValue::Int32   { reason: base_params.data_type,     addr: 0, value: data_type as u8 as i32 },
+    ]);
 
     output.lock().publish(Arc::new(array));
 }
@@ -237,9 +240,11 @@ fn process_color_frame(
             NDDimension::new(h),
         ];
 
+        let ts = ad_core_rs::timestamp::EpicsTimestamp::now();
         let array = NDArray {
             unique_id: array_counter,
-            timestamp: ad_core::timestamp::EpicsTimestamp::now(),
+            timestamp: ts,
+            time_stamp: ts.as_f64(),
             dims,
             data,
             attributes: NDAttributeList::new(),
@@ -290,9 +295,11 @@ fn process_depth_frame(
         NDDimension::new(h),
     ];
 
+    let ts = ad_core_rs::timestamp::EpicsTimestamp::now();
     let array = NDArray {
         unique_id: array_counter,
-        timestamp: ad_core::timestamp::EpicsTimestamp::now(),
+        timestamp: ts,
+        time_stamp: ts.as_f64(),
         dims,
         data,
         attributes: NDAttributeList::new(),
@@ -332,9 +339,11 @@ fn process_pointcloud(
             .flat_map(|v| v.xyz.iter().copied())
             .collect();
 
+        let ts = ad_core_rs::timestamp::EpicsTimestamp::now();
         let array = NDArray {
             unique_id: array_counter,
-            timestamp: ad_core::timestamp::EpicsTimestamp::now(),
+            timestamp: ts,
+            time_stamp: ts.as_f64(),
             dims: vec![
                 NDDimension::new(3),
                 NDDimension::new(w),
@@ -443,10 +452,11 @@ fn try_connect_pipeline(
     ctx: &AcquisitionContext,
     config: &D435iConfigSnapshot,
 ) -> Option<realsense_rust::pipeline::ActivePipeline> {
-    write_string_no_wait(&ctx.color_handle, ctx.color_ad.status_message, 0,
-        "Connecting to camera...".into());
-    let _ = ctx.color_handle.write_int32_blocking(ctx.rs_params.rs_connected, 0, 0);
-    let _ = ctx.color_handle.call_param_callbacks_blocking(0);
+    use asyn_rs::request::ParamSetValue;
+    ctx.color_handle.set_params_and_notify(0, vec![
+        ParamSetValue::Octet { reason: ctx.color_ad.status_message, addr: 0, value: "Connecting to camera...".into() },
+        ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 0 },
+    ]);
 
     let mut retry_count = 0u32;
     loop {
@@ -493,9 +503,12 @@ fn acquisition_loop(ctx: AcquisitionContext) {
         }
 
         // Initialize counters
-        let _ = ctx.color_handle.write_int32_blocking(ctx.color_ad.num_images_counter, 0, 0);
-        let _ = ctx.color_handle.write_int32_blocking(ctx.color_ad.status, 0, ADStatus::Acquire as i32);
-        let _ = ctx.color_handle.write_int32_blocking(ctx.color_ad.acquire_busy, 0, 1);
+        use asyn_rs::request::ParamSetValue;
+        ctx.color_handle.set_params_and_notify(0, vec![
+            ParamSetValue::Int32 { reason: ctx.color_ad.num_images_counter, addr: 0, value: 0 },
+            ParamSetValue::Int32 { reason: ctx.color_ad.status,             addr: 0, value: ADStatus::Acquire as i32 },
+            ParamSetValue::Int32 { reason: ctx.color_ad.acquire_busy,       addr: 0, value: 1 },
+        ]);
 
         let mut num_counter = 0i32;
         let mut color_array_counter = ctx.color_handle
@@ -534,10 +547,10 @@ fn acquisition_loop(ctx: AcquisitionContext) {
         };
 
         // Mark connected
-        let _ = ctx.color_handle.write_int32_blocking(ctx.rs_params.rs_connected, 0, 1);
-        write_string_no_wait(&ctx.color_handle, ctx.color_ad.status_message, 0,
-            "Acquiring data".into());
-        let _ = ctx.color_handle.call_param_callbacks_blocking(0);
+        ctx.color_handle.set_params_and_notify(0, vec![
+            ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 1 },
+            ParamSetValue::Octet { reason: ctx.color_ad.status_message, addr: 0, value: "Acquiring data".into() },
+        ]);
 
         // Create processing blocks
         let mut depth_filters = match DepthFilterChain::new() {
@@ -662,8 +675,9 @@ fn acquisition_loop(ctx: AcquisitionContext) {
                                     consecutive_errors = 0;
                                     first_frame = true;
                                     sensor_options_applied = false;
-                                    let _ = ctx.color_handle.write_int32_blocking(ctx.rs_params.rs_connected, 0, 1);
-                                    let _ = ctx.color_handle.call_param_callbacks_blocking(0);
+                                    ctx.color_handle.set_params_and_notify(0, vec![
+                                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 1 },
+                                    ]);
                                     continue;
                                 }
                                 None => {
