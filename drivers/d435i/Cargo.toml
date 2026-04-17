@@ -1,0 +1,12 @@
+[package]
+name = "d435i"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["asyn", "ad"] }
+parking_lot = "0.12"
+realsense-rust = "1.3"
+anyhow = "1.0"
+log = "0.4"

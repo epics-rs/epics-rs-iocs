@@ -1,9 +1,59 @@
+# epics-rs-iocs
+
+Cargo workspace containing epics-rs based IOC applications.
+Each device driver is an independent library crate under `drivers/`, and
+each IOC binary lives under `iocs/`.
+
+> **Platform**: Linux only. Windows is not currently supported.
+
+## Workspace Structure
+
+```
+epics-rs-iocs/
+├── Cargo.toml                        # Workspace root
+├── drivers/
+│   ├── uldaq-sys/                    # Raw FFI bindings to libuldaq
+│   ├── meascomp/                     # Safe wrapper (DaqDevice, DIO, counter, timer, AI/AO)
+│   ├── usb-ctr/                      # USB-CTR08 PortDriver (counters, pulse gen, DIO)
+│   ├── usb-2408/                     # USB-2408-2AO PortDriver (AI, AO, temp, DIO)
+│   └── d435i/                        # RealSense D435i areaDetector driver
+├── iocs/
+│   ├── usb-ctr-ioc/                  # USB-CTR08 IOC binary + st.cmd
+│   ├── usb-2408-ioc/                 # USB-2408-2AO IOC binary + st.cmd
+│   └── d435i-ioc/                    # D435i IOC binary + st.cmd + plugin cmds
+├── db/                               # Shared EPICS templates
+│   ├── meascomp_device.template      # Board info (model, firmware, UL version)
+│   ├── meascomp_counter.template     # Counter counts + reset
+│   ├── meascomp_pulse_gen.template   # Pulse generator control
+│   ├── meascomp_binary_in.template   # Digital input (per-bit)
+│   ├── meascomp_binary_out.template  # Digital output (per-bit)
+│   ├── meascomp_analog_in.template   # Voltage input + range selector
+│   ├── meascomp_temperature.template # Thermocouple input
+│   ├── meascomp_analog_out.template  # DAC output
+│   ├── d435i_color.template
+│   └── d435i_depth.template
+└── display/                          # Shared PyDM displays
+```
+
+### Adding a New Device
+
+1. Create `drivers/<device>/` with a library crate (driver logic only, no IOC deps)
+2. Create `iocs/<device>-ioc/` with a binary crate that depends on the driver
+3. Add both to the workspace `members` in the root `Cargo.toml`
+
+---
+
 # D435i RealSense areaDetector IOC
 
 An epics-rs (v0.9) based areaDetector IOC for the Intel RealSense D435i
 camera. A single pipeline produces three NDArray outputs simultaneously
 (Color RGB8, Depth Z16, optional XYZ Pointcloud) and publishes IMU data
 as PVs.
+
+The IOC serves both **Channel Access (CA)** and **pvAccess (PVA)** — every
+record is reachable via `caget`/`camonitor` *and* `pvget`/`pvmonitor`
+simultaneously. PVA is wired through `epics-bridge-rs` (QSRV-equivalent)
+via `AdIoc::run_from_args_with_pva`.
 
 ## Architecture
 
@@ -24,41 +74,43 @@ can attach via `NDARRAY_PORT=RS1_PC`. It does not carry control records.
 ## Prerequisites
 
 - Rust toolchain (stable)
-- [librealsense2](https://github.com/IntelRealSense/librealsense) installed on the system
-  - macOS: `brew install librealsense`
+- [librealsense2](https://github.com/IntelRealSense/librealsense) (for d435i driver)
   - Ubuntu: `sudo apt install librealsense2-dev`
 
 ## Build
 
 ```bash
 # Debug build
-cargo build --features ioc
+cargo build -p d435i-ioc
 
 # Release build (recommended)
-cargo build --release --features ioc
+cargo build -p d435i-ioc --release
 ```
 
 ## Run
 
-Connect a D435i camera to a USB 3.0 port, then:
+Connect a D435i camera to a USB 3.0 port, then from the workspace root:
 
 ```bash
 # Run with debug build
-cargo run --features ioc --bin d435i_ioc -- ioc/st.cmd
+cargo run -p d435i-ioc -- iocs/d435i-ioc/st.cmd
 
 # Run with release build (recommended)
-cargo run --release --features ioc --bin d435i_ioc -- ioc/st.cmd
+cargo run -p d435i-ioc --release -- iocs/d435i-ioc/st.cmd
 ```
 
 Or run the compiled binary directly:
 
 ```bash
-./target/release/d435i_ioc ioc/st.cmd
+./target/release/d435i-ioc iocs/d435i-ioc/st.cmd
 ```
+
+> The bin target is `d435i-ioc` (hyphen, not underscore), and the startup
+> script path is `iocs/d435i-ioc/st.cmd` relative to the workspace root.
 
 ## Startup Script (st.cmd)
 
-Camera settings can be configured in `ioc/st.cmd`.
+Camera settings can be configured in `iocs/d435i-ioc/st.cmd`.
 
 ```bash
 # d435iConfig(portName, serial, maxSizeX, maxSizeY, maxMemory)
@@ -159,20 +211,6 @@ Available stream modes (valid for both Color RGB8 and Depth Z16):
 | `RS1:image2:ArrayData` | Int16 (Mono)  | `RS1_DEPTH` | Depth image data |
 | `RS1:image3:ArrayData` | Float32 (XYZ) | `RS1_PC`    | Pointcloud vertices |
 
-## Plugin Configuration
-
-Each NDArray output port has its own plugin script, loaded from
-`ioc/st.cmd`:
-
-| Script | Applied to | Plugins |
-|--------|------------|---------|
-| `d435iColorPlugins.cmd` | `RS1` (RGB8)     | Full `commonPlugins.cmd` (StdArrays image1, ROI, Stats, Over, Trans, Process, CB, Attr, FFT, Codec, TIFF, JPEG, HDF5, Nexus, NetCDF, ColorConvert, PVA, ...) |
-| `d435iDepthPlugins.cmd` | `RS1_DEPTH` (Z16) | StdArrays image2, ROI, ROIStat, Stats, TIFF, HDF5 — JPEG/ColorConvert skipped (not meaningful for mono Z16) |
-| `d435iPCPlugins.cmd`    | `RS1_PC` (Float32 XYZ) | StdArrays image3 + HDF5 only — most AD plugins cannot process a (3, W, H) vertex array |
-
-To add or remove plugins for a given port, edit the corresponding
-`.cmd` file rather than the shared `commonPlugins.cmd`.
-
 ## PyDM Displays
 
 GUI displays built with [PyDM](https://slaclab.github.io/pydm/) are provided for detector control and image viewing.
@@ -242,29 +280,22 @@ caput RS1:cam1:RSStreamMode 14
 caput RS1:cam1:Acquire 0
 ```
 
-## Project Structure
+The same records are available over pvAccess — substitute `pvget`/`pvput`
+for `caget`/`caput`:
 
+```bash
+pvget  RS1:cam1:ArrayCounter_RBV
+pvput  RS1:cam1:Acquire 1
+pvmonitor RS1:cam1:RSAccelY_RBV
 ```
-epics-rs-iocs/
-├── Cargo.toml
-├── src/
-│   ├── lib.rs              # Module declarations
-│   ├── types.rs            # AcqCommand, DirtyFlags
-│   ├── params.rs           # D435iParams, D435iConfigSnapshot
-│   ├── driver.rs           # D435iColorDriver, D435iDepthDriver, runtimes
-│   ├── task.rs             # Acquisition loop (pipeline, filters, publish)
-│   ├── ioc_support.rs      # d435iConfig command + wiring registration
-│   └── bin/
-│       └── d435i_ioc.rs    # IOC binary entry point
-├── db/
-│   ├── d435i_color.template  # Color port EPICS records (standard asyn DTYPs)
-│   └── d435i_depth.template  # Depth port EPICS records (NDArrayBase include)
-├── display/
-│   ├── d435i_main.py         # Main detector control display (PyDM)
-│   └── d435i_dual_view.py    # Dual color+depth image viewer (PyDM)
-└── ioc/
-    ├── st.cmd                   # IOC startup script
-    ├── d435iColorPlugins.cmd    # Full plugin chain for RS1 (RGB8)
-    ├── d435iDepthPlugins.cmd    # Lean chain for RS1_DEPTH (Z16)
-    └── d435iPCPlugins.cmd       # Minimal chain for RS1_PC (XYZ Float32)
-```
+
+## Plugin Configuration (D435i)
+
+Each NDArray output port has its own plugin script, loaded from
+`iocs/d435i-ioc/st.cmd`:
+
+| Script | Applied to | Plugins |
+|--------|------------|---------|
+| `d435iColorPlugins.cmd` | `RS1` (RGB8)     | Full `commonPlugins.cmd` chain |
+| `d435iDepthPlugins.cmd` | `RS1_DEPTH` (Z16) | StdArrays, ROI, ROIStat, Stats, TIFF, HDF5 |
+| `d435iPCPlugins.cmd`    | `RS1_PC` (Float32 XYZ) | StdArrays + HDF5 only |

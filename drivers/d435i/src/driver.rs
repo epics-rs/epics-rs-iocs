@@ -11,6 +11,7 @@ use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
+use epics_rs::ad_core::runtime as rt;
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
@@ -24,7 +25,7 @@ pub struct D435iColorDriver {
     pub ad: ADDriverBase,
     pub rs_params: D435iParams,
     pub dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
-    acq_tx: std::sync::mpsc::Sender<AcqCommand>,
+    acq_tx: rt::CommandSender<AcqCommand>,
 }
 
 impl D435iColorDriver {
@@ -33,7 +34,7 @@ impl D435iColorDriver {
         max_size_x: i32,
         max_size_y: i32,
         max_memory: usize,
-        acq_tx: std::sync::mpsc::Sender<AcqCommand>,
+        acq_tx: rt::CommandSender<AcqCommand>,
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     ) -> AsynResult<Self> {
         let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
@@ -137,7 +138,7 @@ impl PortDriver for D435iColorDriver {
                     "Acquiring data".into(),
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
-                if self.acq_tx.send(AcqCommand::Start).is_err() {
+                if self.acq_tx.try_send(AcqCommand::Start).is_err() {
                     log::error!("D435i: acquisition task is not running");
                     self.ad.port_base.set_string_param(self.ad.params.status_message, 0, "Acquisition task crashed".into())?;
                     self.ad.port_base.set_int32_param(acquire_idx, 0, 0)?;
@@ -149,7 +150,7 @@ impl PortDriver for D435iColorDriver {
                     "Acquisition stopped".into(),
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
-                if self.acq_tx.send(AcqCommand::Stop).is_err() {
+                if self.acq_tx.try_send(AcqCommand::Stop).is_err() {
                     log::error!("D435i: acquisition task is not running");
                 }
             } else {
@@ -376,7 +377,7 @@ pub fn create_d435i_detector(
     let depth_port_name = format!("{port_name}_DEPTH");
 
     // Shared state
-    let (acq_tx, acq_rx) = std::sync::mpsc::channel();
+    let (acq_tx, acq_rx) = rt::command_channel::<AcqCommand>(16);
     let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
     dirty.lock().set_all();
 

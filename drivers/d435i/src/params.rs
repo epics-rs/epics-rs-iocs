@@ -145,49 +145,50 @@ impl D435iConfigSnapshot {
         std::time::Duration::from_millis(timeout_ms)
     }
 
-    /// Read config via PortHandle (blocking). For use from the acquisition task thread.
+    /// Read config via PortHandle (async). For use from the acquisition task.
     ///
     /// `serial` is passed in separately since PortHandle has no blocking string read.
-    pub fn read_via_handle(
+    pub async fn read_via_handle(
         handle: &PortHandle,
         ad: &ADBaseParams,
         rs: &D435iParams,
         serial: &str,
     ) -> AsynResult<Self> {
         Ok(Self {
-            res_x: handle.read_int32_blocking(rs.rs_res_x, 0)?,
-            res_y: handle.read_int32_blocking(rs.rs_res_y, 0)?,
-            frame_rate: handle.read_int32_blocking(rs.rs_frame_rate, 0)?,
-            exposure: handle.read_float64_blocking(rs.rs_exposure, 0)?,
-            gain: handle.read_float64_blocking(rs.rs_gain, 0)?,
-            auto_exposure: handle.read_int32_blocking(rs.rs_auto_exposure, 0)? != 0,
-            laser_power: handle.read_float64_blocking(rs.rs_laser_power, 0)?,
-            emitter_enabled: handle.read_int32_blocking(rs.rs_emitter_enabled, 0)? != 0,
+            res_x: handle.read_int32(rs.rs_res_x, 0).await?,
+            res_y: handle.read_int32(rs.rs_res_y, 0).await?,
+            frame_rate: handle.read_int32(rs.rs_frame_rate, 0).await?,
+            exposure: handle.read_float64(rs.rs_exposure, 0).await?,
+            gain: handle.read_float64(rs.rs_gain, 0).await?,
+            auto_exposure: handle.read_int32(rs.rs_auto_exposure, 0).await? != 0,
+            laser_power: handle.read_float64(rs.rs_laser_power, 0).await?,
+            emitter_enabled: handle.read_int32(rs.rs_emitter_enabled, 0).await? != 0,
             serial: serial.to_string(),
             image_mode: epics_rs::ad_core::driver::ImageMode::from_i32(
-                handle.read_int32_blocking(ad.image_mode, 0)?,
+                handle.read_int32(ad.image_mode, 0).await?,
             ),
-            num_images: handle.read_int32_blocking(ad.num_images, 0)?,
-            array_callbacks: handle.read_int32_blocking(ad.base.array_callbacks, 0)? != 0,
+            num_images: handle.read_int32(ad.num_images, 0).await?,
+            array_callbacks: handle.read_int32(ad.base.array_callbacks, 0).await? != 0,
             wait_for_plugins: handle
-                .read_int32_blocking(ad.base.wait_for_plugins, 0)
+                .read_int32(ad.base.wait_for_plugins, 0)
+                .await
                 .unwrap_or(0)
                 != 0,
 
-            decimation_enable: handle.read_int32_blocking(rs.rs_decimation_enable, 0).unwrap_or(0) != 0,
-            decimation_magnitude: handle.read_int32_blocking(rs.rs_decimation_magnitude, 0).unwrap_or(2),
-            spatial_enable: handle.read_int32_blocking(rs.rs_spatial_enable, 0).unwrap_or(0) != 0,
-            spatial_alpha: handle.read_float64_blocking(rs.rs_spatial_alpha, 0).unwrap_or(0.5),
-            spatial_delta: handle.read_int32_blocking(rs.rs_spatial_delta, 0).unwrap_or(20),
-            spatial_magnitude: handle.read_int32_blocking(rs.rs_spatial_magnitude, 0).unwrap_or(2),
-            temporal_enable: handle.read_int32_blocking(rs.rs_temporal_enable, 0).unwrap_or(0) != 0,
-            temporal_alpha: handle.read_float64_blocking(rs.rs_temporal_alpha, 0).unwrap_or(0.4),
-            temporal_delta: handle.read_int32_blocking(rs.rs_temporal_delta, 0).unwrap_or(20),
-            hole_fill_enable: handle.read_int32_blocking(rs.rs_hole_fill_enable, 0).unwrap_or(0) != 0,
-            hole_fill_mode: handle.read_int32_blocking(rs.rs_hole_fill_mode, 0).unwrap_or(1),
+            decimation_enable: handle.read_int32(rs.rs_decimation_enable, 0).await.unwrap_or(0) != 0,
+            decimation_magnitude: handle.read_int32(rs.rs_decimation_magnitude, 0).await.unwrap_or(2),
+            spatial_enable: handle.read_int32(rs.rs_spatial_enable, 0).await.unwrap_or(0) != 0,
+            spatial_alpha: handle.read_float64(rs.rs_spatial_alpha, 0).await.unwrap_or(0.5),
+            spatial_delta: handle.read_int32(rs.rs_spatial_delta, 0).await.unwrap_or(20),
+            spatial_magnitude: handle.read_int32(rs.rs_spatial_magnitude, 0).await.unwrap_or(2),
+            temporal_enable: handle.read_int32(rs.rs_temporal_enable, 0).await.unwrap_or(0) != 0,
+            temporal_alpha: handle.read_float64(rs.rs_temporal_alpha, 0).await.unwrap_or(0.4),
+            temporal_delta: handle.read_int32(rs.rs_temporal_delta, 0).await.unwrap_or(20),
+            hole_fill_enable: handle.read_int32(rs.rs_hole_fill_enable, 0).await.unwrap_or(0) != 0,
+            hole_fill_mode: handle.read_int32(rs.rs_hole_fill_mode, 0).await.unwrap_or(1),
 
-            align_enable: handle.read_int32_blocking(rs.rs_align_enable, 0).unwrap_or(0) != 0,
-            pointcloud_enable: handle.read_int32_blocking(rs.rs_pointcloud_enable, 0).unwrap_or(0) != 0,
+            align_enable: handle.read_int32(rs.rs_align_enable, 0).await.unwrap_or(0) != 0,
+            pointcloud_enable: handle.read_int32(rs.rs_pointcloud_enable, 0).await.unwrap_or(0) != 0,
         })
     }
 }

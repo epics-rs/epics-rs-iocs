@@ -10,6 +10,7 @@ use epics_rs::ad_core::attributes::NDAttributeList;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
+use epics_rs::ad_core::runtime as rt;
 
 use realsense_rust::config::Config;
 use realsense_rust::context::Context;
@@ -26,8 +27,7 @@ use realsense_rust::processing_blocks::options::{
     DecimationOptions, SpatialFilterOptions, TemporalFilterOptions, HoleFillingOptions,
 };
 
-use epics_rs::asyn::request::RequestOp;
-use epics_rs::asyn::user::AsynUser;
+use epics_rs::asyn::request::ParamSetValue;
 
 use crate::params::{D435iConfigSnapshot, D435iParams};
 use crate::types::{AcqCommand, DirtyFlags};
@@ -35,15 +35,17 @@ use crate::types::{AcqCommand, DirtyFlags};
 const MAX_CONSECUTIVE_ERRORS: u32 = 50;
 const MAX_CONNECT_RETRIES: u32 = 10;
 
-/// Helper: write a string param via the no-wait path.
-fn write_string_no_wait(handle: &PortHandle, reason: usize, addr: i32, value: String) {
-    let user = AsynUser::new(reason).with_addr(addr);
-    handle.submit_no_wait(RequestOp::OctetWrite { data: value.into_bytes() }, user);
+/// Helper: update a single string param via the notify path.
+async fn write_string(handle: &PortHandle, reason: usize, addr: i32, value: String) {
+    let _ = handle.set_params_and_notify(
+        addr,
+        vec![ParamSetValue::Octet { reason, addr, value }],
+    ).await;
 }
 
 /// Bundled state for the acquisition task thread.
 pub(crate) struct AcquisitionContext {
-    pub acq_rx: std::sync::mpsc::Receiver<AcqCommand>,
+    pub acq_rx: rt::CommandReceiver<AcqCommand>,
     // Color port
     pub color_handle: PortHandle,
     pub color_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
@@ -66,27 +68,23 @@ pub(crate) struct AcquisitionContext {
 }
 
 impl AcquisitionContext {
-    fn end_acquisition(&self, wait_for_plugins: bool) {
-        use epics_rs::asyn::request::ParamSetValue;
+    async fn end_acquisition(&self, wait_for_plugins: bool) {
         if wait_for_plugins {
             self.color_queued.wait_until_zero(Duration::from_secs(5));
             self.depth_queued.wait_until_zero(Duration::from_secs(5));
         }
-        self.color_handle.set_params_and_notify(0, vec![
+        let _ = self.color_handle.set_params_and_notify(0, vec![
             ParamSetValue::Int32 { reason: self.color_ad.acquire_busy, addr: 0, value: 0 },
             ParamSetValue::Int32 { reason: self.color_ad.status,       addr: 0, value: ADStatus::Idle as i32 },
             ParamSetValue::Int32 { reason: self.color_ad.acquire,      addr: 0, value: 0 },
             ParamSetValue::Int32 { reason: self.rs_params.rs_connected, addr: 0, value: 0 },
-        ]);
+        ]).await;
     }
 }
 
-/// Start the acquisition task thread.
+/// Start the acquisition task thread via the `rt` facade.
 pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .name("D435iTask".into())
-        .spawn(move || acquisition_loop(ctx))
-        .expect("failed to spawn D435iTask thread")
+    rt::run_thread_named("D435iTask", move || acquisition_loop_async(ctx))
 }
 
 fn build_config(config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
@@ -141,7 +139,7 @@ fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot
     }
 }
 
-fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame) {
+async fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame) {
     use realsense_rust::frame::FrameEx;
 
     let color_frames: Vec<ColorFrame> = composite.frames_of_type();
@@ -150,14 +148,14 @@ fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame) {
             if let Ok(device) = sensor.device() {
                 if let Some(serial) = device.info(Rs2CameraInfo::SerialNumber) {
                     let s = serial.to_string_lossy().into_owned();
-                    write_string_no_wait(&ctx.color_handle, ctx.color_ad.base.serial_number, 0, s.clone());
-                    write_string_no_wait(&ctx.color_handle, ctx.rs_params.rs_serial, 0, s);
+                    write_string(&ctx.color_handle, ctx.color_ad.base.serial_number, 0, s.clone()).await;
+                    write_string(&ctx.color_handle, ctx.rs_params.rs_serial, 0, s).await;
                 }
                 if let Some(fw) = device.info(Rs2CameraInfo::FirmwareVersion) {
-                    write_string_no_wait(&ctx.color_handle, ctx.color_ad.base.firmware_version, 0, fw.to_string_lossy().into_owned());
+                    write_string(&ctx.color_handle, ctx.color_ad.base.firmware_version, 0, fw.to_string_lossy().into_owned()).await;
                 }
                 if let Some(name) = device.info(Rs2CameraInfo::Name) {
-                    write_string_no_wait(&ctx.color_handle, ctx.color_ad.base.model, 0, name.to_string_lossy().into_owned());
+                    write_string(&ctx.color_handle, ctx.color_ad.base.model, 0, name.to_string_lossy().into_owned()).await;
                 }
             }
         }
@@ -184,7 +182,7 @@ fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usi
 }
 
 /// Publish an NDArray through a port handle, updating counters and metadata.
-fn publish_array(
+async fn publish_array(
     handle: &PortHandle,
     output: &parking_lot::Mutex<NDArrayOutput>,
     base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
@@ -206,8 +204,7 @@ fn publish_array(
         .saturating_mul(data_type.element_size() as i64)
         .min(i32::MAX as i64) as i32;
 
-    use epics_rs::asyn::request::ParamSetValue;
-    handle.set_params_and_notify(0, vec![
+    let _ = handle.set_params_and_notify(0, vec![
         ParamSetValue::Int32   { reason: base_params.array_counter, addr: 0, value: array.unique_id },
         ParamSetValue::Float64 { reason: base_params.timestamp_rbv, addr: 0, value: ts.as_f64() },
         ParamSetValue::Int32   { reason: base_params.epics_ts_sec,  addr: 0, value: ts.sec as i32 },
@@ -219,12 +216,14 @@ fn publish_array(
         ParamSetValue::Int32   { reason: base_params.n_dimensions,  addr: 0, value: n_dims as i32 },
         ParamSetValue::Int32   { reason: base_params.color_mode,    addr: 0, value: color_mode as i32 },
         ParamSetValue::Int32   { reason: base_params.data_type,     addr: 0, value: data_type as u8 as i32 },
-    ]);
+    ]).await;
 
-    output.lock().publish(Arc::new(array));
+    // Hold the parking_lot guard across .await: safe on a current-thread runtime
+    // with no concurrent tasks — no other task will try to re-acquire the lock.
+    output.lock().publish(Arc::new(array)).await;
 }
 
-fn process_color_frame(
+async fn process_color_frame(
     composite: &CompositeFrame,
     ctx: &AcquisitionContext,
     array_counter: i32,
@@ -264,11 +263,11 @@ fn process_color_frame(
             &ctx.color_ad.base,
             array,
             NDColorMode::RGB1,
-        );
+        ).await;
     }
 }
 
-fn process_depth_frame(
+async fn process_depth_frame(
     depth_frame: DepthFrame,
     ctx: &AcquisitionContext,
     array_counter: i32,
@@ -319,10 +318,10 @@ fn process_depth_frame(
         &ctx.depth_ad.base,
         array,
         NDColorMode::Mono,
-    );
+    ).await;
 }
 
-fn process_pointcloud(
+async fn process_pointcloud(
     depth_frame: DepthFrame,
     ctx: &AcquisitionContext,
     pc_block: &mut PointCloud,
@@ -367,25 +366,31 @@ fn process_pointcloud(
             &ctx.color_ad.base,
             array,
             NDColorMode::Mono,
-        );
+        ).await;
     }
 }
 
-fn process_imu(composite: &CompositeFrame, ctx: &AcquisitionContext) {
+async fn process_imu(composite: &CompositeFrame, ctx: &AcquisitionContext) {
+    let mut updates: Vec<ParamSetValue> = Vec::new();
+
     let accel_frames: Vec<AccelFrame> = composite.frames_of_type();
     if let Some(accel) = accel_frames.first() {
         let a = accel.acceleration();
-        ctx.color_handle.write_float64_no_wait(ctx.rs_params.rs_accel_x, 0, a[0] as f64);
-        ctx.color_handle.write_float64_no_wait(ctx.rs_params.rs_accel_y, 0, a[1] as f64);
-        ctx.color_handle.write_float64_no_wait(ctx.rs_params.rs_accel_z, 0, a[2] as f64);
+        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_accel_x, addr: 0, value: a[0] as f64 });
+        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_accel_y, addr: 0, value: a[1] as f64 });
+        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_accel_z, addr: 0, value: a[2] as f64 });
     }
 
     let gyro_frames: Vec<GyroFrame> = composite.frames_of_type();
     if let Some(gyro) = gyro_frames.first() {
         let g = gyro.rotational_velocity();
-        ctx.color_handle.write_float64_no_wait(ctx.rs_params.rs_gyro_x, 0, g[0] as f64);
-        ctx.color_handle.write_float64_no_wait(ctx.rs_params.rs_gyro_y, 0, g[1] as f64);
-        ctx.color_handle.write_float64_no_wait(ctx.rs_params.rs_gyro_z, 0, g[2] as f64);
+        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_gyro_x, addr: 0, value: g[0] as f64 });
+        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_gyro_y, addr: 0, value: g[1] as f64 });
+        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_gyro_z, addr: 0, value: g[2] as f64 });
+    }
+
+    if !updates.is_empty() {
+        let _ = ctx.color_handle.set_params_and_notify(0, updates).await;
     }
 }
 
@@ -455,20 +460,19 @@ impl DepthFilterChain {
 
 /// Try to connect to the camera with retries.
 /// Returns Some(pipeline) on success, None if all retries exhausted or Stop received.
-fn try_connect_pipeline(
-    ctx: &AcquisitionContext,
+async fn try_connect_pipeline(
+    ctx: &mut AcquisitionContext,
     config: &D435iConfigSnapshot,
 ) -> Option<realsense_rust::pipeline::ActivePipeline> {
-    use epics_rs::asyn::request::ParamSetValue;
-    ctx.color_handle.set_params_and_notify(0, vec![
+    let _ = ctx.color_handle.set_params_and_notify(0, vec![
         ParamSetValue::Octet { reason: ctx.color_ad.status_message, addr: 0, value: "Connecting to camera...".into() },
         ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 0 },
-    ]);
+    ]).await;
 
     let mut retry_count = 0u32;
     loop {
         // Check for Stop command
-        if let Ok(AcqCommand::Stop) = ctx.acq_rx.try_recv() {
+        if matches!(ctx.acq_rx.try_recv(), Ok(AcqCommand::Stop)) {
             return None;
         }
 
@@ -488,41 +492,47 @@ fn try_connect_pipeline(
                 }
                 if retry_count >= MAX_CONNECT_RETRIES {
                     log::error!("D435i: giving up after {retry_count} connection attempts");
-                    write_string_no_wait(&ctx.color_handle, ctx.color_ad.status_message, 0,
-                        format!("Connection failed: {e}"));
+                    write_string(&ctx.color_handle, ctx.color_ad.status_message, 0,
+                        format!("Connection failed: {e}")).await;
                     return None;
                 }
-                // Exponential backoff: 1s, 2s, 4s, ... max 10s
+                // Exponential backoff: 1s, 2s, 4s, ... max 10s, interruptible by Stop.
                 let backoff = Duration::from_secs((1u64 << retry_count.min(3)).min(10));
-                std::thread::sleep(backoff);
+                if matches!(
+                    rt::timeout(backoff, ctx.acq_rx.recv()).await,
+                    Ok(Some(AcqCommand::Stop)) | Ok(None)
+                ) {
+                    return None;
+                }
             }
         }
     }
 }
 
-fn acquisition_loop(ctx: AcquisitionContext) {
+async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
     loop {
         // Wait for Start command
-        match ctx.acq_rx.recv() {
-            Ok(AcqCommand::Start) => {}
-            Ok(AcqCommand::Stop) => continue,
-            Err(_) => break,
+        match ctx.acq_rx.recv().await {
+            Some(AcqCommand::Start) => {}
+            Some(AcqCommand::Stop) => continue,
+            None => break,
         }
 
         // Initialize counters
-        use epics_rs::asyn::request::ParamSetValue;
-        ctx.color_handle.set_params_and_notify(0, vec![
+        let _ = ctx.color_handle.set_params_and_notify(0, vec![
             ParamSetValue::Int32 { reason: ctx.color_ad.num_images_counter, addr: 0, value: 0 },
             ParamSetValue::Int32 { reason: ctx.color_ad.status,             addr: 0, value: ADStatus::Acquire as i32 },
             ParamSetValue::Int32 { reason: ctx.color_ad.acquire_busy,       addr: 0, value: 1 },
-        ]);
+        ]).await;
 
         let mut num_counter = 0i32;
         let mut color_array_counter = ctx.color_handle
-            .read_int32_blocking(ctx.color_ad.base.array_counter, 0)
+            .read_int32(ctx.color_ad.base.array_counter, 0)
+            .await
             .unwrap_or(0);
         let mut depth_array_counter = ctx.depth_handle
-            .read_int32_blocking(ctx.depth_ad.base.array_counter, 0)
+            .read_int32(ctx.depth_ad.base.array_counter, 0)
+            .await
             .unwrap_or(0);
 
         // Diagnostic counters
@@ -535,36 +545,36 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             &ctx.color_ad,
             &ctx.rs_params,
             &ctx.serial,
-        ) {
+        ).await {
             Ok(cfg) => cfg,
             Err(e) => {
                 log::error!("D435i: failed to read config: {e}");
-                ctx.end_acquisition(false);
+                ctx.end_acquisition(false).await;
                 continue;
             }
         };
 
         // Connect to camera with retries
-        let mut pipeline = match try_connect_pipeline(&ctx, &config) {
+        let mut pipeline = match try_connect_pipeline(&mut ctx, &config).await {
             Some(p) => p,
             None => {
-                ctx.end_acquisition(false);
+                ctx.end_acquisition(false).await;
                 continue;
             }
         };
 
         // Mark connected
-        ctx.color_handle.set_params_and_notify(0, vec![
+        let _ = ctx.color_handle.set_params_and_notify(0, vec![
             ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 1 },
             ParamSetValue::Octet { reason: ctx.color_ad.status_message, addr: 0, value: "Acquiring data".into() },
-        ]);
+        ]).await;
 
         // Create processing blocks
         let mut depth_filters = match DepthFilterChain::new() {
             Ok(f) => f,
             Err(e) => {
                 log::error!("D435i: failed to create depth filters: {e}");
-                ctx.end_acquisition(false);
+                ctx.end_acquisition(false).await;
                 continue;
             }
         };
@@ -574,7 +584,7 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             Ok(a) => a,
             Err(e) => {
                 log::error!("D435i: failed to create align block: {e}");
-                ctx.end_acquisition(false);
+                ctx.end_acquisition(false).await;
                 continue;
             }
         };
@@ -583,7 +593,7 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("D435i: failed to create pointcloud block: {e}");
-                ctx.end_acquisition(false);
+                ctx.end_acquisition(false).await;
                 continue;
             }
         };
@@ -604,7 +614,7 @@ fn acquisition_loop(ctx: AcquisitionContext) {
                     &ctx.color_ad,
                     &ctx.rs_params,
                     &ctx.serial,
-                ) {
+                ).await {
                     Ok(cfg) => cfg,
                     Err(_) => break,
                 };
@@ -633,7 +643,7 @@ fn acquisition_loop(ctx: AcquisitionContext) {
                     &ctx.color_ad,
                     &ctx.rs_params,
                     &ctx.serial,
-                ) {
+                ).await {
                     Ok(cfg) => cfg,
                     Err(_) => break,
                 };
@@ -652,10 +662,12 @@ fn acquisition_loop(ctx: AcquisitionContext) {
                     consecutive_errors += 1;
                     frames_dropped += 1;
                     total_errors += 1;
-                    ctx.color_handle.write_int32_no_wait(ctx.rs_params.rs_frames_dropped, 0, frames_dropped);
-                    ctx.color_handle.write_int32_no_wait(ctx.rs_params.rs_error_count, 0, total_errors);
-                    write_string_no_wait(&ctx.color_handle, ctx.rs_params.rs_last_error, 0,
-                        format!("Frame wait: {e}"));
+                    let _ = ctx.color_handle.set_params_and_notify(0, vec![
+                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_frames_dropped, addr: 0, value: frames_dropped },
+                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_error_count,    addr: 0, value: total_errors },
+                    ]).await;
+                    write_string(&ctx.color_handle, ctx.rs_params.rs_last_error, 0,
+                        format!("Frame wait: {e}")).await;
 
                     // Log first error, then every 10th to avoid spam
                     if consecutive_errors == 1 || consecutive_errors.is_multiple_of(10) {
@@ -672,26 +684,28 @@ fn acquisition_loop(ctx: AcquisitionContext) {
                         // Continuous mode: attempt reconnection
                         if config.image_mode == ImageMode::Continuous {
                             log::info!("D435i: attempting reconnection...");
-                            write_string_no_wait(&ctx.color_handle, ctx.color_ad.status_message, 0,
-                                "Reconnecting...".into());
+                            write_string(&ctx.color_handle, ctx.color_ad.status_message, 0,
+                                "Reconnecting...".into()).await;
                             drop(pipeline);
 
-                            match try_connect_pipeline(&ctx, &config) {
+                            match try_connect_pipeline(&mut ctx, &config).await {
                                 Some(p) => {
                                     pipeline = p;
                                     consecutive_errors = 0;
                                     first_frame = true;
                                     sensor_options_applied = false;
-                                    ctx.color_handle.set_params_and_notify(0, vec![
+                                    let _ = ctx.color_handle.set_params_and_notify(0, vec![
                                         ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 1 },
-                                    ]);
+                                    ]).await;
                                     continue;
                                 }
                                 None => {
                                     total_errors += 1;
-                                    ctx.color_handle.write_int32_no_wait(ctx.rs_params.rs_error_count, 0, total_errors);
-                                    write_string_no_wait(&ctx.color_handle, ctx.rs_params.rs_last_error, 0,
-                                        "Reconnection failed".into());
+                                    let _ = ctx.color_handle.set_params_and_notify(0, vec![
+                                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_error_count, addr: 0, value: total_errors },
+                                    ]).await;
+                                    write_string(&ctx.color_handle, ctx.rs_params.rs_last_error, 0,
+                                        "Reconnection failed".into()).await;
                                     break;
                                 }
                             }
@@ -700,14 +714,14 @@ fn acquisition_loop(ctx: AcquisitionContext) {
                         }
                     }
                     // Check for stop
-                    if let Ok(AcqCommand::Stop) = ctx.acq_rx.try_recv() {
+                    if matches!(ctx.acq_rx.try_recv(), Ok(AcqCommand::Stop)) {
                         break;
                     }
                     // Backoff: sleep up to 2 seconds based on error count
                     let backoff = Duration::from_millis(
                         100 * (consecutive_errors as u64).min(20)
                     );
-                    std::thread::sleep(backoff);
+                    rt::sleep(backoff).await;
                     continue;
                 }
             };
@@ -727,7 +741,7 @@ fn acquisition_loop(ctx: AcquisitionContext) {
 
             // On first frame, update device info
             if first_frame {
-                update_device_info(&ctx, &composite);
+                update_device_info(&ctx, &composite).await;
                 first_frame = false;
             }
 
@@ -742,33 +756,37 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             color_array_counter += 1;
             depth_array_counter += 1;
 
-            ctx.color_handle.write_int32_no_wait(ctx.color_ad.num_images_counter, 0, num_counter);
+            let _ = ctx.color_handle.set_params_and_notify(0, vec![
+                ParamSetValue::Int32 { reason: ctx.color_ad.num_images_counter, addr: 0, value: num_counter },
+            ]).await;
 
             if config.array_callbacks {
-                process_color_frame(&composite, &ctx, color_array_counter);
+                process_color_frame(&composite, &ctx, color_array_counter).await;
 
                 // Extract depth frames — each frames_of_type() call gives new owned frames
                 let depth_frames: Vec<DepthFrame> = composite.frames_of_type();
                 if let Some(depth_frame) = depth_frames.into_iter().next() {
                     // Read depth units from the original frame before filtering
                     if let Ok(units) = depth_frame.depth_units() {
-                        ctx.color_handle.write_float64_no_wait(ctx.rs_params.rs_depth_units, 0, units as f64);
+                        let _ = ctx.color_handle.set_params_and_notify(0, vec![
+                            ParamSetValue::Float64 { reason: ctx.rs_params.rs_depth_units, addr: 0, value: units as f64 },
+                        ]).await;
                     }
-                    process_depth_frame(depth_frame, &ctx, depth_array_counter, &mut depth_filters, &config);
+                    process_depth_frame(depth_frame, &ctx, depth_array_counter, &mut depth_filters, &config).await;
                 }
 
                 if config.pointcloud_enable {
                     // Get another owned depth frame for pointcloud processing
                     let depth_frames: Vec<DepthFrame> = composite.frames_of_type();
                     if let Some(depth_frame) = depth_frames.into_iter().next() {
-                        process_pointcloud(depth_frame, &ctx, &mut pc_block, depth_array_counter);
+                        process_pointcloud(depth_frame, &ctx, &mut pc_block, depth_array_counter).await;
                     }
                 }
             }
 
-            process_imu(&composite, &ctx);
-            let _ = ctx.color_handle.call_param_callbacks_blocking(0);
-            let _ = ctx.depth_handle.call_param_callbacks_blocking(0);
+            process_imu(&composite, &ctx).await;
+            let _ = ctx.color_handle.call_param_callbacks(0).await;
+            let _ = ctx.depth_handle.call_param_callbacks(0).await;
 
             // Check stop conditions
             if config.image_mode == ImageMode::Single
@@ -778,14 +796,12 @@ fn acquisition_loop(ctx: AcquisitionContext) {
             }
 
             // Check for stop command (non-blocking)
-            match ctx.acq_rx.try_recv() {
-                Ok(AcqCommand::Stop) => break,
-                Ok(AcqCommand::Start) => {} // stale
-                Err(_) => {}
+            if matches!(ctx.acq_rx.try_recv(), Ok(AcqCommand::Stop)) {
+                break;
             }
         }
 
         // Pipeline is dropped here (ActivePipeline::drop calls rs2_delete_pipeline)
-        ctx.end_acquisition(config.wait_for_plugins);
+        ctx.end_acquisition(config.wait_for_plugins).await;
     }
 }

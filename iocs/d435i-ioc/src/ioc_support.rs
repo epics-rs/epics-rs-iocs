@@ -4,7 +4,7 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use epics_rs::ad_core::ioc::GenericDriverContext;
 
-use crate::driver::{D435iColorRuntime, D435iDepthRuntime, create_d435i_detector};
+use d435i::{D435iColorRuntime, D435iDepthRuntime, create_d435i_detector};
 
 /// Register the D435i configure command on an `AdIoc`.
 ///

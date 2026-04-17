@@ -1,9 +1,9 @@
-#!../../target/debug/d435i_ioc
+#!../../target/debug/d435i-ioc
 #============================================================
 # st.cmd — D435i RealSense areaDetector IOC startup script
 #
 # Usage:
-#   cargo run --bin d435i_ioc --features ioc -- ioc/st.cmd
+#   cargo run -p d435i-ioc -- iocs/d435i-ioc/st.cmd
 #============================================================
 
 # Environment
@@ -27,20 +27,20 @@ epicsEnvSet("NELEMENTS_COLOR", "2764800")
 epicsEnvSet("NELEMENTS_DEPTH", "921600")
 epicsEnvSet("NELEMENTS_PC",    "2764800")
 
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADD435I)/db:$(ADCORE)/db")
+# $(ADD435I) is set to this crate's root (iocs/d435i-ioc) by ioc_support at
+# IOC startup. The shared workspace db/ lives two levels up from there.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADD435I)/../../db:$(ADCORE)/db")
 
-# $(ADD435I) is set to this crate's root by the d435i module at IOC startup,
-# so db/ and ioc/ paths below resolve regardless of the shell's cwd.
 d435iConfig("$(PORT)", "", $(XSIZE), $(YSIZE), 100000000)
 
 # Load per-port record databases
 dbLoadRecords("d435i_color.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
 dbLoadRecords("d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=$(DEPTH_PORT),ADDR=0,TIMEOUT=1")
 
-# Load plugin chains per port
-< $(ADD435I)/ioc/d435iColorPlugins.cmd
-< $(ADD435I)/ioc/d435iDepthPlugins.cmd
-< $(ADD435I)/ioc/d435iPCPlugins.cmd
+# Load plugin chains per port (plugin scripts live next to this st.cmd)
+< $(ADD435I)/d435iColorPlugins.cmd
+< $(ADD435I)/d435iDepthPlugins.cmd
+< $(ADD435I)/d435iPCPlugins.cmd
 
 # iocInit is called automatically by IocApplication after this script completes.
 #
