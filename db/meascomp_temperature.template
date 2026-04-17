@@ -1,0 +1,46 @@
+record(ai, "$(P)$(R)") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)TEMPERATURE_IN_VALUE")
+    field(PREC, "2")
+    field(SCAN, "I/O Intr")
+}
+
+record(mbbo, "$(P)$(R)TCType") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)THERMOCOUPLE_TYPE")
+    field(ZRST, "J")  field(ZRVL, "1")
+    field(ONST, "K")  field(ONVL, "2")
+    field(TWST, "T")  field(TWVL, "3")
+    field(THST, "E")  field(THVL, "4")
+    field(FRST, "R")  field(FRVL, "5")
+    field(FVST, "S")  field(FVVL, "6")
+    field(SXST, "B")  field(SXVL, "7")
+    field(SVST, "N")  field(SVVL, "8")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(mbbo, "$(P)$(R)Scale") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)TEMPERATURE_SCALE")
+    field(ZRST, "Celsius")    field(ZRVL, "1")
+    field(ONST, "Fahrenheit") field(ONVL, "2")
+    field(TWST, "Kelvin")     field(TWVL, "3")
+    field(THST, "Volts")      field(THVL, "4")
+    field(FRST, "NoScale")    field(FRVL, "5")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)$(R)Filter") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)TEMPERATURE_FILTER")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bo, "$(P)$(R)OpenTCDetect") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)THERMOCOUPLE_OPEN_DETECT")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}

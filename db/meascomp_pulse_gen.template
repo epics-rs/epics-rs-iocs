@@ -1,0 +1,65 @@
+record(bo, "$(P)$(R)Run") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_RUN")
+    field(ZNAM, "Stop")
+    field(ONAM, "Run")
+}
+
+record(ao, "$(P)$(R)Period") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_PERIOD")
+    field(PREC, "6")
+    field(VAL,  "0.001")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)$(R)Period_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)PULSE_PERIOD")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)$(R)DutyCycle") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_DUTY_CYCLE")
+    field(PREC, "4")
+    field(VAL,  "0.5")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)$(R)DutyCycle_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)PULSE_DUTY_CYCLE")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)$(R)Delay") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_DELAY")
+    field(PREC, "6")
+    field(VAL,  "0")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)$(R)Delay_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)PULSE_DELAY")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(longout, "$(P)$(R)Count") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_COUNT")
+    field(VAL,  "0")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)$(R)IdleState") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_IDLE_STATE")
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+}

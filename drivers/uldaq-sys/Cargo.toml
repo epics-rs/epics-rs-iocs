@@ -1,0 +1,9 @@
+[package]
+name = "uldaq-sys"
+version = "0.1.0"
+edition = "2024"
+publish = false
+links = "uldaq"
+
+[build-dependencies]
+pkg-config = "0.3"

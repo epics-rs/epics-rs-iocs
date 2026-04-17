@@ -1,0 +1,93 @@
+# Waveform digitizer control records
+# Macros: P (prefix), PORT (asyn port)
+
+record(bo, "$(P)WaveDigRun") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_RUN")
+    field(ZNAM, "Stop")
+    field(ONAM, "Run")
+}
+
+record(longout, "$(P)WaveDigNumPoints") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_NUM_POINTS")
+    field(VAL,  "2048")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)WaveDigFirstChan") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_FIRST_CHAN")
+    field(VAL,  "0")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)WaveDigNumChans") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_NUM_CHANS")
+    field(VAL,  "8")
+    field(PINI, "YES")
+}
+
+record(ao, "$(P)WaveDigDwell") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_DWELL")
+    field(PREC, "6")
+    field(VAL,  "0.001")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)WaveDigDwellActual") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEDIG_DWELL_ACTUAL")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)WaveDigTotalTime") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEDIG_TOTAL_TIME")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)WaveDigCurrentPoint") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEDIG_CURRENT_POINT")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo, "$(P)WaveDigExtTrigger") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_EXT_TRIGGER")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bo, "$(P)WaveDigExtClock") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_EXT_CLOCK")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bo, "$(P)WaveDigContinuous") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_CONTINUOUS")
+    field(ZNAM, "One-shot")
+    field(ONAM, "Continuous")
+}
+
+record(bo, "$(P)WaveDigAutoRestart") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_AUTO_RESTART")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bo, "$(P)WaveDigBurstMode") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_BURST_MODE")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}

@@ -1,0 +1,12 @@
+record(longin, "$(P)$(R)Counts") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)COUNTER_VALUE")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo, "$(P)$(R)Reset") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)COUNTER_RESET")
+    field(ZNAM, "Done")
+    field(ONAM, "Reset")
+}

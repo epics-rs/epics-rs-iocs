@@ -43,6 +43,98 @@ epics-rs-iocs/
 
 ---
 
+# USB-CTR08 Counter/Timer IOC
+
+8-channel 32-bit counter/timer with 4 pulse generators and 8-bit digital I/O.
+Ported from [measComp](https://github.com/epics-modules/measComp) `drvUSBCTR`.
+
+## Build
+
+```bash
+cargo build -p usb-ctr-ioc --release
+```
+
+## Run
+
+Connect a USB-CTR08 to a USB port, then:
+
+```bash
+cargo run -p usb-ctr-ioc --release -- iocs/usb-ctr-ioc/st.cmd
+```
+
+Edit `iocs/usb-ctr-ioc/st.cmd` to set your device serial number:
+
+```
+epicsEnvSet("UNIQUE_ID", "0214D582")
+```
+
+An empty `UNIQUE_ID` connects to the first available device.
+
+## Quick Test
+
+```bash
+# Start a 1kHz pulse on timer 0
+caput USBCTR:PulseGen1Period 0.001
+caput USBCTR:PulseGen1Run 1
+
+# Read counter 1
+caget USBCTR:Counter1Counts
+
+# Reset counter 1
+caput USBCTR:Counter1Reset 1
+
+# Read digital input bit 1
+caget USBCTR:Bi1
+```
+
+---
+
+# USB-2408-2AO Analog I/O IOC
+
+8-channel 24-bit analog input (voltage + thermocouple), 2-channel 16-bit
+analog output, 8-bit digital I/O, and 2 counters.
+Ported from [measComp](https://github.com/epics-modules/measComp) `drvMultiFunction`.
+
+## Build
+
+```bash
+cargo build -p usb-2408-ioc --release
+```
+
+## Run
+
+```bash
+cargo run -p usb-2408-ioc --release -- iocs/usb-2408-ioc/st.cmd
+```
+
+Edit `iocs/usb-2408-ioc/st.cmd` to set your device serial number:
+
+```
+epicsEnvSet("UNIQUE_ID", "01AAA83E")
+```
+
+## Quick Test
+
+```bash
+# Read voltage on channel 1 (±10V range)
+caget USB2408:Ai1
+
+# Read thermocouple temperature on channel 1
+caput USB2408:Ai1Type 1          # Switch to TC mode
+caput USB2408:Ti1TCType 1        # J-type thermocouple
+caget USB2408:Ti1
+
+# Set analog output 1 to mid-scale
+caput USB2408:Ao1 32768
+
+# Start waveform digitizer (8 channels, 1000 points)
+caput USB2408:WaveDigNumPoints 1000
+caput USB2408:WaveDigDwell 0.001
+caput USB2408:WaveDigRun 1
+```
+
+---
+
 # D435i RealSense areaDetector IOC
 
 An epics-rs (v0.9) based areaDetector IOC for the Intel RealSense D435i

@@ -1,0 +1,65 @@
+# Waveform generator control records
+# Macros: P (prefix), PORT (asyn port)
+
+record(bo, "$(P)WaveGenRun") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_RUN")
+    field(ZNAM, "Stop")
+    field(ONAM, "Run")
+}
+
+record(ao, "$(P)WaveGenFreq") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_FREQ")
+    field(PREC, "3")
+    field(VAL,  "1.0")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)WaveGenDwellActual") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_DWELL_ACTUAL")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)WaveGenTotalTime") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_TOTAL_TIME")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(longout, "$(P)WaveGenNumPoints") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_NUM_POINTS")
+    field(VAL,  "2048")
+    field(PINI, "YES")
+}
+
+record(longin, "$(P)WaveGenCurrentPoint") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_CURRENT_POINT")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo, "$(P)WaveGenExtTrigger") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_TRIGGER")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bo, "$(P)WaveGenExtClock") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_CLOCK")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+}
+
+record(bo, "$(P)WaveGenContinuous") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_CONTINUOUS")
+    field(ZNAM, "One-shot")
+    field(ONAM, "Continuous")
+}

@@ -1,0 +1,11 @@
+[package]
+name = "usb-ctr-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+usb-ctr = { path = "../../drivers/usb-ctr" }
+epics-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["asyn", "scaler", "bridge"] }
+asyn-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["epics"] }
+tokio = { version = "1", features = ["full"] }

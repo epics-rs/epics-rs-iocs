@@ -1,0 +1,28 @@
+record(ai, "$(P)$(R)") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)VOLTAGE_IN_VALUE")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(mbbo, "$(P)$(R)Range") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_RANGE")
+    field(ZRST, "+/-10V")    field(ZRVL, "5")
+    field(ONST, "+/-5V")     field(ONVL, "6")
+    field(TWST, "+/-2.5V")   field(TWVL, "8")
+    field(THST, "+/-1.25V")  field(THVL, "10")
+    field(FRST, "+/-0.625V") field(FRVL, "12")
+    field(FVST, "+/-0.312V") field(FVVL, "23")
+    field(SXST, "+/-0.156V") field(SXVL, "24")
+    field(SVST, "+/-0.078V") field(SVVL, "18")
+    field(PINI, "YES")
+}
+
+record(mbbo, "$(P)$(R)Type") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_TYPE")
+    field(ZRST, "Volts")
+    field(ONST, "TC deg.")
+    field(PINI, "YES")
+}

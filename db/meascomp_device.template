@@ -1,0 +1,50 @@
+record(stringin, "$(P)ModelName") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1.0)MODEL_NAME")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)ModelNumber") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MODEL_NUMBER")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)FirmwareVersion") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1.0)FIRMWARE_VERSION")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)UniqueID") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1.0)UNIQUE_ID")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)ULVersion") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1.0)UL_VERSION")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)DriverVersion") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1.0)DRIVER_VERSION")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)PollTimeMS") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)POLL_TIME_MS")
+    field(PREC, "1")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)PollSleepMS") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1.0)POLL_SLEEP_MS")
+    field(PREC, "1")
+    field(VAL,  "50")
+    field(PINI, "YES")
+}

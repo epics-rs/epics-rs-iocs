@@ -1,0 +1,13 @@
+record(ao, "$(P)$(R)") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_VALUE")
+    field(PREC, "4")
+}
+
+record(mbbo, "$(P)$(R)Range") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_RANGE")
+    field(ZRST, "+/-10V")
+    field(ZRVL, "5")
+    field(PINI, "YES")
+}

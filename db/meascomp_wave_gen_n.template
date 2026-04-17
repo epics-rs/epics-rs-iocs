@@ -1,0 +1,48 @@
+# Per-channel waveform generator records
+# Macros: P (prefix), R (record name), PORT (asyn port), ADDR (channel)
+
+record(mbbo, "$(P)$(R)WaveType") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_WAVE_TYPE")
+    field(ZRST, "User")
+    field(ONST, "Sin")
+    field(TWST, "Square")
+    field(THST, "Sawtooth")
+    field(FRST, "Pulse")
+    field(FVST, "Random")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)$(R)Enable") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_ENABLE")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(ao, "$(P)$(R)Amplitude") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_AMPLITUDE")
+    field(PREC, "4")
+    field(VAL,  "1.0")
+    field(PINI, "YES")
+}
+
+record(ao, "$(P)$(R)Offset") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_OFFSET")
+    field(PREC, "4")
+    field(VAL,  "0.0")
+    field(PINI, "YES")
+}
+
+record(ao, "$(P)$(R)PulseWidth") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_PULSE_WIDTH")
+    field(PREC, "6")
+    field(VAL,  "0.001")
+    field(PINI, "YES")
+}

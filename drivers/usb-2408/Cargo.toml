@@ -1,0 +1,13 @@
+[package]
+name = "usb-2408"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+uldaq-sys = { path = "../uldaq-sys" }
+meascomp = { path = "../meascomp" }
+epics-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["asyn"] }
+parking_lot = "0.12"
+log = "0.4"
+anyhow = "1.0"

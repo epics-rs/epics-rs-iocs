@@ -1,0 +1,11 @@
+[package]
+name = "usb-2408-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+usb-2408 = { path = "../../drivers/usb-2408" }
+epics-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["asyn", "bridge"] }
+asyn-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["epics"] }
+tokio = { version = "1", features = ["full"] }

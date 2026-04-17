@@ -1,0 +1,75 @@
+# MCS (Multi-Channel Scaler) control records
+# Macros: P (prefix), PORT (asyn port)
+
+record(bo, "$(P)MCS:StartAll") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_START_ACQUIRE")
+    field(ZNAM, "Done")
+    field(ONAM, "Start")
+}
+
+record(bo, "$(P)MCS:StopAll") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_STOP_ACQUIRE")
+    field(ZNAM, "Done")
+    field(ONAM, "Stop")
+}
+
+record(bo, "$(P)MCS:EraseAll") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_ERASE")
+    field(ZNAM, "Done")
+    field(ONAM, "Erase")
+}
+
+record(bi, "$(P)MCS:Acquiring") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_ACQUIRING")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+}
+
+record(ao, "$(P)MCS:Dwell") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_DWELL_TIME")
+    field(PREC, "6")
+    field(VAL,  "0.001")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)MCS:NuseAll") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_NUM_CHANNELS")
+    field(VAL,  "2048")
+    field(PINI, "YES")
+}
+
+record(ao, "$(P)MCS:PresetReal") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_PRESET_REAL_TIME")
+    field(PREC, "3")
+    field(VAL,  "0")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)MCS:ElapsedReal") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_ELAPSED_REAL_TIME")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)MCS:CurrentChannel") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MCS_CURRENT_POINT")
+    field(SCAN, "I/O Intr")
+}
+
+record(mbbo, "$(P)MCS:ChannelAdvance") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADVANCE_SOURCE")
+    field(ZRST, "Internal")
+    field(ONST, "External")
+    field(PINI, "YES")
+}

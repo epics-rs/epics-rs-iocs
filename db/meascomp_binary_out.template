@@ -1,0 +1,6 @@
+record(bo, "$(P)$(R)") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_OUTPUT")
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+}
