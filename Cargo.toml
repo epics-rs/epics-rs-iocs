@@ -2,13 +2,13 @@
 resolver = "3"
 members = [
     "drivers/d435i",
-    "drivers/uldaq-sys",
-    "drivers/meascomp",
-    "drivers/usb-ctr",
-    "drivers/usb-2408",
+    "drivers/meascomp/meascomp",
+    "drivers/meascomp/uldaq-sys",
+    "drivers/meascomp/usb-2408",
+    "drivers/meascomp/usb-ctr",
     "iocs/d435i-ioc",
-    "iocs/usb-ctr-ioc",
     "iocs/usb-2408-ioc",
+    "iocs/usb-ctr-ioc",
 ]
 
 [patch."https://github.com/epics-rs/epics-rs.git"]

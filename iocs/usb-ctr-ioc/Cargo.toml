@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-usb-ctr = { path = "../../drivers/usb-ctr" }
+usb-ctr = { path = "../../drivers/meascomp/usb-ctr" }
 epics-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["asyn", "scaler", "bridge"] }
 asyn-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["epics"] }
 tokio = { version = "1", features = ["full"] }

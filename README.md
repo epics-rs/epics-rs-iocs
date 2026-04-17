@@ -12,10 +12,11 @@ each IOC binary lives under `iocs/`.
 epics-rs-iocs/
 ├── Cargo.toml                        # Workspace root
 ├── drivers/
-│   ├── uldaq-sys/                    # Raw FFI bindings to libuldaq
-│   ├── meascomp/                     # Safe wrapper (DaqDevice, DIO, counter, timer, AI/AO)
-│   ├── usb-ctr/                      # USB-CTR08 PortDriver (counters, pulse gen, DIO)
-│   ├── usb-2408/                     # USB-2408-2AO PortDriver (AI, AO, temp, DIO)
+│   ├── meascomp/                     # Measurement Computing (MCC) driver family
+│   │   ├── uldaq-sys/                # Raw FFI bindings to libuldaq
+│   │   ├── meascomp/                 # Safe wrapper (DaqDevice, DIO, counter, timer, AI/AO)
+│   │   ├── usb-ctr/                  # USB-CTR08 PortDriver (counters, pulse gen, DIO)
+│   │   └── usb-2408/                 # USB-2408-2AO PortDriver (AI, AO, temp, DIO)
 │   └── d435i/                        # RealSense D435i areaDetector driver
 ├── iocs/
 │   ├── usb-ctr-ioc/                  # USB-CTR08 IOC binary + st.cmd
