@@ -2059,8 +2059,3 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
-
-[[patch.unused]]
-name = "spvirit-tools"
-version = "0.1.9"
-source = "git+https://github.com/ISISNeutronMuon/spvirit.git?rev=5af368efda9cdea5e4946af5d4157d2cf5645edd#5af368efda9cdea5e4946af5d4157d2cf5645edd"

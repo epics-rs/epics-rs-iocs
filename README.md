@@ -68,7 +68,27 @@ Edit `iocs/usb-ctr-ioc/st.cmd` to set your device serial number:
 epicsEnvSet("UNIQUE_ID", "0214D582")
 ```
 
-An empty `UNIQUE_ID` connects to the first available device.
+An empty `UNIQUE_ID` connects to the first available device, which is
+**not safe when multiple MCC devices are plugged in** — both this IOC
+and `usb-2408-ioc` would grab the same `descriptors[0]`. Always set
+`UNIQUE_ID` explicitly in multi-device setups.
+
+To list all connected MCC devices and their UNIQUE_IDs:
+
+```bash
+cargo run -p meascomp --bin list-devices --release
+```
+
+Example output:
+
+```
+Found 2 device(s):
+#    product_name                   unique_id            product_id
+0    USB-2408-2AO                   01DA523D             0x00fe
+1    USB-CTR08                      01DAB0FB             0x0127
+```
+
+Copy the relevant `unique_id` into the matching `st.cmd`.
 
 ## Quick Test
 
@@ -111,6 +131,13 @@ Edit `iocs/usb-2408-ioc/st.cmd` to set your device serial number:
 
 ```
 epicsEnvSet("UNIQUE_ID", "01AAA83E")
+```
+
+Use the device discovery tool to find the real UNIQUE_ID (see the
+USB-CTR08 section above for details):
+
+```bash
+cargo run -p meascomp --bin list-devices --release
 ```
 
 ## Quick Test

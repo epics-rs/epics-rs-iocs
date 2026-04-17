@@ -2,7 +2,7 @@
 
 epicsEnvSet("PREFIX", "USB2408:")
 epicsEnvSet("PORT",   "USB2408_1")
-epicsEnvSet("UNIQUE_ID", "")
+epicsEnvSet("UNIQUE_ID", "01DA523D")
 
 # Create the USB-2408-2AO driver
 MultiFunctionConfig("$(PORT)", "$(UNIQUE_ID)", 2048, 2048)

@@ -2,7 +2,7 @@
 
 epicsEnvSet("PREFIX", "USBCTR:")
 epicsEnvSet("PORT",   "USBCTR_1")
-epicsEnvSet("UNIQUE_ID", "")
+epicsEnvSet("UNIQUE_ID", "01DAB0FB")
 
 # Create the USB-CTR08 driver
 USBCTRConfig("$(PORT)", "$(UNIQUE_ID)", 2048)
