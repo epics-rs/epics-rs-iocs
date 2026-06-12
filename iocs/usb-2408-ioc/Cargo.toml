@@ -6,6 +6,6 @@ publish = false
 
 [dependencies]
 usb-2408 = { path = "../../drivers/meascomp/usb-2408" }
-epics-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["asyn", "bridge"] }
-asyn-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", features = ["epics"] }
+epics-rs = { version = "0.19.2", features = ["asyn", "bridge"] }
+asyn-rs = { version = "0.19.2", features = ["epics"] }
 tokio = { version = "1", features = ["full"] }

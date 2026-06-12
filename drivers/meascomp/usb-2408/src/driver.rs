@@ -296,7 +296,7 @@ impl PortDriver for MultiFunctionDriver {
             }
         }
 
-        self.base.params.set_uint32(reason, addr, value, mask)?;
+        self.base.params.set_uint32(reason, addr, value, mask, 0)?;
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }
