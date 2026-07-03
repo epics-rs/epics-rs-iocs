@@ -308,6 +308,32 @@ impl XpsSocket {
         Ok(())
     }
 
+    /// `PositionerPositionCompareAquadBWindowedSet(positioner, min, max)`.
+    pub fn positioner_position_compare_aquadb_windowed_set(
+        &self,
+        positioner: &str,
+        min_position: f64,
+        max_position: f64,
+    ) -> XpsResult<()> {
+        let cmd = format!(
+            "PositionerPositionCompareAquadBWindowedSet ({positioner},{},{})",
+            g(min_position),
+            g(max_position),
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `PositionerPositionCompareAquadBAlwaysEnable(positioner)`.
+    pub fn positioner_position_compare_aquadb_always_enable(
+        &self,
+        positioner: &str,
+    ) -> XpsResult<()> {
+        let cmd = format!("PositionerPositionCompareAquadBAlwaysEnable ({positioner})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
     /// `PositionerHardwareStatusGet(positioner)` → the hardware status bitmask.
     pub fn positioner_hardware_status_get(&self, positioner: &str) -> XpsResult<i32> {
         let cmd = format!("PositionerHardwareStatusGet ({positioner},int *)");
