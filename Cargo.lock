@@ -2682,6 +2682,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "xps-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "motor-newport",
+]
+
+[[package]]
 name = "yasna"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

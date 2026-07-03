@@ -36,6 +36,7 @@ use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
 use crate::smc100::Smc100Axis;
+use crate::xps::{SocketMode, XpsAxis, XpsController, XpsSocket};
 
 /// Default moving/idle poll intervals (ms) when the iocsh args are omitted.
 const DEFAULT_MOVING_POLL_MS: u64 = 100;
@@ -54,11 +55,27 @@ const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
 const AGAP_TIMEOUT: Duration = Duration::from_secs(2);
 const AG_UC_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// XPS poll-socket timeout (C `XPS_POLL_TIMEOUT` = 2 s): waits for the full
+/// `,EndOfAPI`-framed reply.
+const XPS_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+/// XPS move-socket timeout (C sets `-0.1` s): the fire-and-forget write does
+/// not wait for the move to finish, so the read times out quickly.
+const XPS_MOVE_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// A shared Agilis controller registered by `AG_UCCreateController`, awaiting
 /// its axes to be added by `AG_UCCreateAxis`. Carries the poll intervals from
 /// the controller command so each later axis inherits them.
 struct AgUcRegistration {
     controller: Arc<Mutex<AgUcController>>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+}
+
+/// A shared XPS controller registered by `XPSCreateController`, awaiting its
+/// axes to be added by `XPSCreateAxis`. Carries the poll intervals so each
+/// later axis inherits them.
+struct XpsRegistration {
+    controller: Arc<Mutex<XpsController>>,
     moving_poll_ms: u64,
     idle_poll_ms: u64,
 }
@@ -73,6 +90,9 @@ pub struct NewportHolder {
     /// Agilis controllers keyed by motor port, bridging the two-step
     /// `AG_UCCreateController` / `AG_UCCreateAxis` iocsh API.
     ag_uc_controllers: Mutex<HashMap<String, AgUcRegistration>>,
+    /// XPS controllers keyed by motor port, bridging the two-step
+    /// `XPSCreateController` / `XPSCreateAxis` iocsh API.
+    xps_controllers: Mutex<HashMap<String, XpsRegistration>>,
 }
 
 impl NewportHolder {
@@ -81,6 +101,7 @@ impl NewportHolder {
             motors: Mutex::new(HashMap::new()),
             poll_senders: Mutex::new(Vec::new()),
             ag_uc_controllers: Mutex::new(HashMap::new()),
+            xps_controllers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -435,6 +456,160 @@ impl NewportHolder {
         )
     }
 
+    /// Create the `XPSCreateController` iocsh command.
+    ///
+    /// Usage:
+    /// `XPSCreateController(motorPort, pollPort, numAxes, [movingPollMs], [idlePollMs], [enableSetPosition], [setPositionSettlingMs])`
+    ///
+    /// `pollPort` is a `drvAsynIPPort` (TCP) to the XPS, shared by the
+    /// controller and all its axes for reads. Add axes with `XPSCreateAxis`.
+    /// Unlike the C `XPSCreateController` (which takes an IP/port and opens the
+    /// sockets itself), this looks up asyn ports registered in `st.cmd`, matching
+    /// the port-name convention of the other Newport Rust drivers.
+    pub fn xps_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSCreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("pollPort"),
+                ArgDesc {
+                    name: "numAxes",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+                arg_int_opt("enableSetPosition"),
+                arg_int_opt("setPositionSettlingMs"),
+            ],
+            "XPSCreateController(motorPort, pollPort, numAxes, [movingPollMs], [idlePollMs], [enableSetPosition], [setPositionSettlingMs]) - Create a Newport XPS controller (add axes with XPSCreateAxis)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let poll_port = req_string(args, 1, "pollPort")?;
+                let num_axes = match &args[2] {
+                    ArgValue::Int(v) => *v,
+                    _ => return Err("numAxes must be an integer".into()),
+                };
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+                let enable_set_position = match args.get(5) {
+                    Some(ArgValue::Int(v)) => *v != 0,
+                    None | Some(ArgValue::Missing) => false,
+                    _ => return Err("enableSetPosition must be an integer".into()),
+                };
+                let settling_ms = match args.get(6) {
+                    Some(ArgValue::Int(v)) if *v >= 0 => *v as u64,
+                    None | Some(ArgValue::Missing) => 0,
+                    _ => return Err("setPositionSettlingMs must be a non-negative integer".into()),
+                };
+
+                let handle = connect_ip(&poll_port, XPS_POLL_TIMEOUT)?;
+                let poll_sock = XpsSocket::new(handle, SocketMode::Query);
+                let controller = XpsController::new(
+                    poll_sock,
+                    enable_set_position,
+                    Duration::from_millis(settling_ms),
+                )
+                .map_err(|e| format!("XPSCreateController: {e}"))?;
+                let firmware = controller.firmware().to_string();
+                holder
+                    .xps_controllers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        motor_port.clone(),
+                        XpsRegistration {
+                            controller: Arc::new(Mutex::new(controller)),
+                            moving_poll_ms,
+                            idle_poll_ms,
+                        },
+                    );
+                println!(
+                    "XPSCreateController: motorPort={motor_port} pollPort={poll_port} firmware=\"{firmware}\" numAxes={num_axes} enableSetPosition={enable_set_position} settling={settling_ms}ms poll=[{moving_poll_ms}/{idle_poll_ms}]ms (add axes with XPSCreateAxis)"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `XPSCreateAxis` iocsh command.
+    ///
+    /// Usage:
+    /// `XPSCreateAxis(motorPort, movePort, axis, positionerName, stepsPerUnit)`
+    ///
+    /// Adds one [`XpsAxis`] to the controller registered under `motorPort` by
+    /// `XPSCreateController`, registered under DTYP `XPS_{motorPort}_{axis}`.
+    /// `movePort` is this axis's own `drvAsynIPPort` (TCP), used for the
+    /// fire-and-forget move socket. `positionerName` is `group.positioner` and
+    /// `stepsPerUnit` follows C: `stepSize = 1 / stepsPerUnit`. [`XpsAxis::new`]
+    /// performs blocking RPC (reads the S-gamma jerk times), so the controller
+    /// must be reachable when this command runs.
+    pub fn xps_create_axis_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSCreateAxis",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("movePort"),
+                ArgDesc {
+                    name: "axis",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                arg_str_req("positionerName"),
+                ArgDesc {
+                    name: "stepsPerUnit",
+                    arg_type: ArgType::Double,
+                    optional: false,
+                },
+            ],
+            "XPSCreateAxis(motorPort, movePort, axis, positionerName, stepsPerUnit) - Add an axis to a Newport XPS controller",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let move_port = req_string(args, 1, "movePort")?;
+                let axis = match &args[2] {
+                    ArgValue::Int(v) => *v as i32,
+                    _ => return Err("axis must be an integer".into()),
+                };
+                let positioner_name = req_string(args, 3, "positionerName")?;
+                let steps_per_unit = match &args[4] {
+                    ArgValue::Double(v) => *v,
+                    _ => return Err("stepsPerUnit must be a number".into()),
+                };
+                if steps_per_unit == 0.0 {
+                    return Err("stepsPerUnit must be non-zero".into());
+                }
+                let step_size = 1.0 / steps_per_unit;
+
+                let (controller, moving_poll_ms, idle_poll_ms) = {
+                    let controllers = holder
+                        .xps_controllers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let reg = controllers.get(&motor_port).ok_or_else(|| {
+                        format!(
+                            "XPSCreateAxis: controller '{motor_port}' not found (call XPSCreateController first)"
+                        )
+                    })?;
+                    (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
+                };
+
+                let handle = connect_ip(&move_port, XPS_MOVE_TIMEOUT)?;
+                let move_sock = XpsSocket::new(handle, SocketMode::Fire);
+                let ax = XpsAxis::new(controller, move_sock, &positioner_name, step_size)
+                    .map_err(|e| format!("XPSCreateAxis: {e}"))?;
+                let dtyp_key = format!("XPS_{motor_port}_{axis}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+
+                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                println!(
+                    "XPSCreateAxis: motorPort={motor_port} movePort={move_port} axis={axis} positioner={positioner_name} stepsPerUnit={steps_per_unit} (DTYP={dtyp_key})"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
     /// Return a dynamic device support factory that dispatches by DTYP name.
     /// Each device support is consumed once (take semantics).
     pub fn device_support_factory(
@@ -507,6 +682,20 @@ fn poll_ms(arg: Option<&ArgValue>, default: u64, name: &str) -> Result<u64, Stri
 fn connect_serial(serial_port: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
     let port = get_port(serial_port).ok_or_else(|| {
         format!("serial port '{serial_port}' not found (call drvAsynSerialPortConfigure first)")
+    })?;
+    Ok(SyncIOHandle::from_handle(
+        port.handle.clone(),
+        SERIAL_ADDR,
+        timeout,
+    ))
+}
+
+/// Connect a [`SyncIOHandle`] to a pre-configured TCP octet port by name
+/// (created by `drvAsynIPPortConfigure`). Same lookup as [`connect_serial`] —
+/// separate only for a TCP-appropriate error message.
+fn connect_ip(ip_port: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
+    let port = get_port(ip_port).ok_or_else(|| {
+        format!("IP port '{ip_port}' not found (call drvAsynIPPortConfigure first)")
     })?;
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),

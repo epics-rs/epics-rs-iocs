@@ -13,9 +13,11 @@ pub mod ioc;
 pub mod protocol;
 pub mod smc100;
 mod util;
+pub mod xps;
 
 pub use agap::{AgapAxis, AgapController};
 pub use agilis::{AgUcAxis, AgUcController};
 pub use conex::ConexAxis;
 pub use ioc::NewportHolder;
 pub use smc100::Smc100Axis;
+pub use xps::{XpsAxis, XpsController};
