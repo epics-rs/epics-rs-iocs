@@ -308,6 +308,13 @@ impl XpsSocket {
         Ok(())
     }
 
+    /// `PositionerHardwareStatusGet(positioner)` → the hardware status bitmask.
+    pub fn positioner_hardware_status_get(&self, positioner: &str) -> XpsResult<i32> {
+        let cmd = format!("PositionerHardwareStatusGet ({positioner},int *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok(r.int(1))
+    }
+
     // --- TCL scripting ----------------------------------------------------
 
     /// `TCLScriptExecute(file, task, parameters)` — run a TCL script from a file

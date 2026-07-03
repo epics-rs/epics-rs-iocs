@@ -11,6 +11,8 @@
 //! `stepSize_`): commands send `value * step_size`, readbacks divide by it.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
@@ -18,7 +20,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use super::controller::XpsController;
 use super::corrector;
-use super::rpc::{XpsError, XpsSocket};
+use super::rpc::{XpsError, XpsResult, XpsSocket};
 
 /// Velocity below which the axis is considered stopped (C
 /// `XPS_VELOCITY_DEADBAND`).
@@ -34,6 +36,23 @@ const XPSC8_END_OF_RUN_MINUS: u32 = 0x8000_0100;
 /// The XPS group status code (`GroupStatusGet`) that means "home switch
 /// active" for the encoder-home (ATHM) signal.
 const XPS_STATUS_HOMING_DONE: i32 = 11;
+
+/// `PositionerHardwareStatusGet` bit for "at high level of the home (ZM) zone"
+/// (C `XPSC8_ZM_HIGH_LEVEL`). Used by move-to-home to pick the search direction.
+const XPSC8_ZM_HIGH_LEVEL: i32 = 0x0000_0004;
+
+/// Short settle between move-to-home referencing steps (C uses `epicsThreadSleep`
+/// of 0.05 s to dodge XPS firmware race conditions).
+const XPS_REFERENCING_SETTLE: Duration = Duration::from_millis(50);
+
+/// Poll interval while waiting for the move-to-home search to reach the switch
+/// (C `epicsThreadSleep(0.2)`).
+const XPS_REFERENCING_POLL: Duration = Duration::from_millis(200);
+
+/// Safety cap on the move-to-home switch-crossing wait. C's loop is unbounded
+/// (isolated on its own thread); the synchronous port bounds it so a switch
+/// that is never reached cannot hang the async worker. 300 × 0.2 s = 60 s.
+const XPS_REFERENCING_MAX_POLLS: u32 = 300;
 
 /// Encoder settling time (ms) used for position-compare pulse parameters. C
 /// drives this from the `XPSPositionCompareSettlingTime_` asyn param via a
@@ -127,6 +146,14 @@ impl XpsAxis {
 
     fn lock_controller(&self) -> MutexGuard<'_, XpsController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Read the group status over the poll socket, holding the controller lock
+    /// only for the single exchange (used by the move-to-home step sequence,
+    /// which must release the lock between RPCs and sleeps).
+    fn locked_group_status(&self) -> XpsResult<i32> {
+        let ctrl = self.lock_controller();
+        ctrl.poll_socket().group_status_get(&self.group_name)
     }
 
     /// Shared move preamble (C `XPSAxis::move`, before the `GroupMove*` call):
@@ -283,7 +310,9 @@ impl AsynMotor for XpsAxis {
     ) -> AsynResult<()> {
         // The XPS home search takes no direction; C ignores `forwards`.
         {
-            let ctrl = self.lock_controller();
+            let mut ctrl = self.lock_controller();
+            // C home() clears referencing mode for every axis in the group.
+            ctrl.set_group_referencing(&self.group_name, false);
             let sock = ctrl.poll_socket();
             // A Ready group (10..=18) will refuse home; kill it first.
             let status = sock.group_status_get(&self.group_name)?;
@@ -426,6 +455,160 @@ impl AsynMotor for XpsAxis {
         Ok(())
     }
 
+    fn move_to_home(
+        &mut self,
+        _user: &AsynUser,
+        position: f64,
+        _min_velocity: f64,
+        _velocity: f64,
+        _acceleration: f64,
+    ) -> AsynResult<()> {
+        // Port of XPSAxis::doMoveToHome. The trait `position` is the referencing
+        // move distance (C getReferencingModeMove); zero means "not enabled".
+        // C computes velocity/2 from SGamma and ignores the passed vel/accel.
+        //
+        // Runs synchronously. C uses a dedicated background thread; here the
+        // controller lock is released between every RPC and during sleeps, so
+        // sibling axes keep polling and only this axis's own command task
+        // blocks while homing. DEVIATION: C's final wait loop is unbounded
+        // (safe on its own thread); we cap it (below) so a home switch that is
+        // never reached cannot hang the async worker forever.
+        if position == 0.0 {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "XPS move-to-home for {} is not enabled (distance is 0)",
+                    self.positioner_name
+                ),
+            });
+        }
+        let mut distance = position * self.step_size;
+
+        // A Ready group (10..=18) refuses the sequence; kill it (move socket).
+        let group_status = self.locked_group_status()?;
+        if (10..=18).contains(&group_status) {
+            self.move_sock.group_kill(&self.group_name)?;
+        }
+        thread::sleep(XPS_REFERENCING_SETTLE);
+        {
+            let ctrl = self.lock_controller();
+            ctrl.poll_socket().group_initialize(&self.group_name)?;
+        }
+        thread::sleep(XPS_REFERENCING_SETTLE);
+        self.move_sock.group_referencing_start(&self.group_name)?;
+        thread::sleep(XPS_REFERENCING_SETTLE);
+        self.move_sock.group_referencing_stop(&self.group_name)?;
+        thread::sleep(XPS_REFERENCING_SETTLE);
+
+        // Must now be in referencing mode (status 11).
+        let group_status = self.locked_group_status()?;
+        if group_status != XPS_STATUS_HOMING_DONE {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "XPS {} failed to enter referencing mode (status {group_status})",
+                    self.group_name
+                ),
+            });
+        }
+        // Flag referencing for the whole group (poll suppresses home/homed).
+        {
+            let mut ctrl = self.lock_controller();
+            ctrl.set_group_referencing(&self.group_name, true);
+        }
+
+        // Pick the search direction from which side of the home switch we start.
+        let initial_hw = {
+            let ctrl = self.lock_controller();
+            ctrl.poll_socket()
+                .positioner_hardware_status_get(&self.positioner_name)?
+        };
+        distance = referencing_distance(distance, initial_hw);
+
+        // Halve the velocity so the user can intervene before an overrun.
+        {
+            let ctrl = self.lock_controller();
+            let sock = ctrl.poll_socket();
+            let (vel, accel, min_jerk, max_jerk) =
+                sock.positioner_sgamma_parameters_get(&self.positioner_name)?;
+            sock.positioner_sgamma_parameters_set(
+                &self.positioner_name,
+                vel / 2.0,
+                accel,
+                min_jerk,
+                max_jerk,
+            )?;
+        }
+        thread::sleep(XPS_REFERENCING_SETTLE);
+
+        // Move toward the home switch (move socket).
+        if let Err(e) = self
+            .move_sock
+            .group_move_relative(&self.positioner_name, distance)
+        {
+            let _ = self.move_sock.group_kill(&self.group_name);
+            return Err(e.into());
+        }
+        thread::sleep(XPS_REFERENCING_POLL);
+
+        // Must be moving (status 44) to begin the switch-crossing wait.
+        let group_status = self.locked_group_status()?;
+        if group_status != 44 {
+            let _ = self.move_sock.group_kill(&self.group_name);
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "XPS move-to-home for {} did not start moving (status {group_status})",
+                    self.group_name
+                ),
+            });
+        }
+        // Wait until the hardware status flips (crossed the switch), aborting
+        // if the move stops for any other reason. Bounded (see DEVIATION above).
+        let mut polls = 0;
+        loop {
+            thread::sleep(XPS_REFERENCING_POLL);
+            let hw = {
+                let ctrl = self.lock_controller();
+                ctrl.poll_socket()
+                    .positioner_hardware_status_get(&self.positioner_name)?
+            };
+            if hw != initial_hw {
+                break;
+            }
+            let group_status = self.locked_group_status()?;
+            if group_status != 44 {
+                let _ = self.move_sock.group_kill(&self.group_name);
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!(
+                        "XPS move-to-home for {} stopped before home (status {group_status})",
+                        self.group_name
+                    ),
+                });
+            }
+            polls += 1;
+            if polls >= XPS_REFERENCING_MAX_POLLS {
+                let _ = self.move_sock.group_kill(&self.group_name);
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!(
+                        "XPS move-to-home for {} timed out before reaching home",
+                        self.group_name
+                    ),
+                });
+            }
+        }
+        // Reached the switch: abort the move (poll socket, as C does).
+        let ctrl = self.lock_controller();
+        if let Err(e) = ctrl.poll_socket().group_move_abort(&self.group_name) {
+            drop(ctrl);
+            let _ = self.move_sock.group_kill(&self.group_name);
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         // Clone the Arc into a local so the lock guard does not borrow `self`
         // (we mutate `self.axis_status` after the reads).
@@ -438,6 +621,9 @@ impl AsynMotor for XpsAxis {
         let setpoint = sock.group_position_setpoint_get(&self.positioner_name)?;
         let positioner_error = sock.positioner_error_get(&self.positioner_name)?;
         let velocity = sock.group_velocity_current_get(&self.positioner_name)?;
+        // In referencing (move-to-home) mode C reports the axis as not homed /
+        // not at home regardless of status (XPSAxis::poll 636/648).
+        let referencing = ctrl.is_group_referencing(&self.group_name);
         drop(ctrl);
 
         self.axis_status = axis_status;
@@ -456,8 +642,8 @@ impl AsynMotor for XpsAxis {
             moving,
             high_limit,
             low_limit,
-            encoder_home: flags.encoder_home,
-            homed: flags.homed,
+            encoder_home: flags.encoder_home && !referencing,
+            homed: flags.homed && !referencing,
             powered: flags.powered,
             problem: flags.problem,
             direction: velocity > XPS_VELOCITY_DEADBAND,
@@ -467,6 +653,18 @@ impl AsynMotor for XpsAxis {
             vbas_supported: false,
             ..Default::default()
         })
+    }
+}
+
+/// Move-to-home search direction (C `doMoveToHome`): the referencing distance
+/// keeps its sign when the positioner starts at the high level of the home (ZM)
+/// zone, and is reversed otherwise, so the search always drives toward the
+/// switch.
+fn referencing_distance(distance: f64, hardware_status: i32) -> f64 {
+    if hardware_status & XPSC8_ZM_HIGH_LEVEL == 0 {
+        -distance
+    } else {
+        distance
     }
 }
 
@@ -566,5 +764,18 @@ mod tests {
         assert_eq!(limits_from_error(0x8000_0000), (true, true));
         // An unrelated low-bit error touches neither limit.
         assert_eq!(limits_from_error(0x0000_0004), (false, false));
+    }
+
+    #[test]
+    fn referencing_distance_picks_direction() {
+        // Starting at the high level of the ZM zone: keep the sign (drive down).
+        assert_eq!(referencing_distance(5.0, XPSC8_ZM_HIGH_LEVEL), 5.0);
+        // A status with the ZM bit set among others still counts as "high".
+        assert_eq!(referencing_distance(5.0, XPSC8_ZM_HIGH_LEVEL | 0x1), 5.0);
+        // ZM bit clear: reverse toward the switch (drive up).
+        assert_eq!(referencing_distance(5.0, 0), -5.0);
+        assert_eq!(referencing_distance(5.0, 0x2), -5.0);
+        // Sign is flipped, not forced: a negative distance reverses to positive.
+        assert_eq!(referencing_distance(-5.0, 0), 5.0);
     }
 }

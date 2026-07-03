@@ -9,6 +9,7 @@
 //! can enumerate siblings sharing an XPS group — the single owner of that
 //! cross-axis state.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use super::rpc::{XpsResult, XpsSocket};
@@ -26,6 +27,11 @@ pub struct XpsController {
     /// XPS group name of each registered axis, for group-membership counts
     /// (C `XPSAxis::isInGroup`).
     axis_groups: Vec<String>,
+    /// Groups currently in referencing (move-to-home) mode. C tracks this
+    /// per-axis as `referencingMode_`, but sets it for every axis in the group
+    /// at once (`doMoveToHome`/`home`), so it is group-scoped state. While a
+    /// group is here, poll reports its axes as not-homed/not-at-home.
+    referencing_groups: HashSet<String>,
 }
 
 impl XpsController {
@@ -46,6 +52,7 @@ impl XpsController {
             set_position_settling,
             auto_enable: true,
             axis_groups: Vec::new(),
+            referencing_groups: HashSet::new(),
         })
     }
 
@@ -77,6 +84,21 @@ impl XpsController {
     /// Number of registered axes in `group` (C `XPSAxis::isInGroup`).
     pub fn axes_in_group(&self, group: &str) -> usize {
         self.axis_groups.iter().filter(|g| *g == group).count()
+    }
+
+    /// Set or clear referencing (move-to-home) mode for `group`. `doMoveToHome`
+    /// sets it on success; the normal `home` seek clears it.
+    pub fn set_group_referencing(&mut self, group: &str, on: bool) {
+        if on {
+            self.referencing_groups.insert(group.to_string());
+        } else {
+            self.referencing_groups.remove(group);
+        }
+    }
+
+    /// Whether `group` is in referencing mode (poll suppresses home/homed).
+    pub fn is_group_referencing(&self, group: &str) -> bool {
+        self.referencing_groups.contains(group)
     }
 
     /// Redefine the current position of `positioner` to `position` device
