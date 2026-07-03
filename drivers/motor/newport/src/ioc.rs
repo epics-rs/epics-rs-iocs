@@ -610,6 +610,69 @@ impl NewportHolder {
         )
     }
 
+    /// Create the `XPSTclScriptExecute` iocsh command.
+    ///
+    /// Usage:
+    /// `XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters])`
+    ///
+    /// Runs a TCL script file on the XPS registered under `motorPort`, over its
+    /// shared poll socket. Ports `TCLScriptExecute`; `taskName`/`parameters`
+    /// default to `"0"` as the C driver does. DEVIATION from C's record-driven
+    /// trigger (`XPSTclScript_`/`XPSTclScriptExecute_` asyn params): this is an
+    /// imperative iocsh command, the natural interface for a one-shot script.
+    pub fn xps_tcl_script_execute_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSTclScriptExecute",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("tclFile"),
+                ArgDesc {
+                    name: "taskName",
+                    arg_type: ArgType::String,
+                    optional: true,
+                },
+                ArgDesc {
+                    name: "parameters",
+                    arg_type: ArgType::String,
+                    optional: true,
+                },
+            ],
+            "XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters]) - Run a TCL script file on a Newport XPS controller",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let tcl_file = req_string(args, 1, "tclFile")?;
+                let task_name = opt_string(args, 2).unwrap_or_else(|| "0".to_string());
+                let parameters = opt_string(args, 3).unwrap_or_else(|| "0".to_string());
+
+                let controller = {
+                    let controllers = holder
+                        .xps_controllers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    controllers
+                        .get(&motor_port)
+                        .map(|reg| reg.controller.clone())
+                        .ok_or_else(|| {
+                            format!(
+                                "XPSTclScriptExecute: controller '{motor_port}' not found (call XPSCreateController first)"
+                            )
+                        })?
+                };
+                {
+                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    ctrl.poll_socket()
+                        .tcl_script_execute(&tcl_file, &task_name, &parameters)
+                        .map_err(|e| format!("XPSTclScriptExecute: {e}"))?;
+                }
+                println!(
+                    "XPSTclScriptExecute: motorPort={motor_port} tclFile={tcl_file} task={task_name} params={parameters}"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
     /// Return a dynamic device support factory that dispatches by DTYP name.
     /// Each device support is consumed once (take semantics).
     pub fn device_support_factory(
@@ -657,6 +720,15 @@ fn req_string(args: &[ArgValue], i: usize, name: &str) -> Result<String, String>
     match args.get(i) {
         Some(ArgValue::String(s)) => Ok(s.clone()),
         _ => Err(format!("{name} must be a string")),
+    }
+}
+
+/// Read an optional string arg: `Some` if a non-empty string was given, else
+/// `None` (absent or `Missing`).
+fn opt_string(args: &[ArgValue], i: usize) -> Option<String> {
+    match args.get(i) {
+        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
     }
 }
 

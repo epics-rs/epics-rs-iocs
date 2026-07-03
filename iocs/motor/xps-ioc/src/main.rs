@@ -44,6 +44,7 @@ async fn main() -> CaResult<()> {
     let holder = NewportHolder::new();
     app = app.register_startup_command(holder.xps_create_controller_command());
     app = app.register_startup_command(holder.xps_create_axis_command());
+    app = app.register_startup_command(holder.xps_tcl_script_execute_command());
     app = app.register_dynamic_device_support(holder.device_support_factory());
 
     app.startup_script(&script)

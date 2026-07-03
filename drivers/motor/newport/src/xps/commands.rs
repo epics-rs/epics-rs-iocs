@@ -307,4 +307,15 @@ impl XpsSocket {
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }
+
+    // --- TCL scripting ----------------------------------------------------
+
+    /// `TCLScriptExecute(file, task, parameters)` — run a TCL script from a file
+    /// on the controller. C `XPS_C8_drivers.cpp:358` passes task/parameters as
+    /// `"0"`/`"0"` when triggered from the driver.
+    pub fn tcl_script_execute(&self, file: &str, task: &str, parameters: &str) -> XpsResult<()> {
+        let cmd = format!("TCLScriptExecute ({file},{task},{parameters})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
 }

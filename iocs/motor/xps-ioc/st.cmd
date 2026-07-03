@@ -37,6 +37,9 @@ dbLoadRecords("db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT)")
 
 iocInit()
 
+# Run a TCL script file stored on the XPS (task name + parameters default "0"):
+#   XPSTclScriptExecute("$(PORT)", "MyScript.tcl")
+
 # Example:
 #   dbl
 #   camonitor XPS:m0 XPS:m0.RBV
