@@ -309,6 +309,34 @@ impl AsynMotor for XpsAxis {
         Ok(())
     }
 
+    fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        // C `setHighLimit`: read both travel limits, then rewrite with the new
+        // (device-unit) high limit and the existing low limit.
+        let ctrl = self.lock_controller();
+        let sock = ctrl.poll_socket();
+        let (low, _high) = sock.positioner_user_travel_limits_get(&self.positioner_name)?;
+        sock.positioner_user_travel_limits_set(
+            &self.positioner_name,
+            low,
+            position * self.step_size,
+        )?;
+        Ok(())
+    }
+
+    fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        // C `setLowLimit`: read both travel limits, then rewrite with the new
+        // (device-unit) low limit and the existing high limit.
+        let ctrl = self.lock_controller();
+        let sock = ctrl.poll_socket();
+        let (_low, high) = sock.positioner_user_travel_limits_get(&self.positioner_name)?;
+        sock.positioner_user_travel_limits_set(
+            &self.positioner_name,
+            position * self.step_size,
+            high,
+        )?;
+        Ok(())
+    }
+
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
         let ctrl = self.lock_controller();
         corrector::set_pid(ctrl.poll_socket(), &self.positioner_name, kind, gain)?;
