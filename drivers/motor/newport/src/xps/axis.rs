@@ -35,6 +35,46 @@ const XPSC8_END_OF_RUN_MINUS: u32 = 0x8000_0100;
 /// active" for the encoder-home (ATHM) signal.
 const XPS_STATUS_HOMING_DONE: i32 = 11;
 
+/// Encoder settling time (ms) used for position-compare pulse parameters. C
+/// drives this from the `XPSPositionCompareSettlingTime_` asyn param via a
+/// 4-entry table `{0.075, 1.0, 4.0, 12.0}`; the generic `set_pco_config` hook
+/// carries no settling time, so we use the table's smallest (default) entry.
+/// DEVIATION from full C parity: full-mode PCO would drive this from a record.
+const XPS_PCO_DEFAULT_SETTLING_TIME: f64 = 0.075;
+
+/// Latched position-compare configuration (device units), applied on the next
+/// [`enable_pco`](AsynMotor::enable_pco). C splits this across
+/// `setPositionCompare`/`getPositionCompare` driven by XPS-specific asyn params;
+/// the generic `set_pco_config` hook expresses only the "Pulse" mode.
+#[derive(Clone, Copy, Debug, Default)]
+struct PcoConfig {
+    min_position: f64,
+    max_position: f64,
+    position_step: f64,
+    /// Pulse width (µs). Passed straight through — DEVIATION from C, which
+    /// selects one of `{0.2, 1.0, 2.5, 10.0}` via a table index.
+    pulse_width_us: f64,
+}
+
+impl PcoConfig {
+    /// Convert record-frame config into device units (C `motorRecPositionToXPS`
+    /// = value * stepSize; the step uses `fabs`).
+    fn from_record(
+        start: f64,
+        end: f64,
+        increment: f64,
+        pulse_width_us: f64,
+        step_size: f64,
+    ) -> Self {
+        PcoConfig {
+            min_position: start * step_size,
+            max_position: end * step_size,
+            position_step: (increment * step_size).abs(),
+            pulse_width_us,
+        }
+    }
+}
+
 /// One XPS positioner as an asyn motor axis.
 pub struct XpsAxis {
     controller: Arc<Mutex<XpsController>>,
@@ -49,6 +89,8 @@ pub struct XpsAxis {
     /// Last group status code seen by [`poll`](AsynMotor::poll); `move` reads it
     /// to decide whether to auto-enable a disabled axis.
     axis_status: i32,
+    /// Latched position-compare config, applied on the next `enable_pco`.
+    pco: PcoConfig,
 }
 
 impl XpsAxis {
@@ -79,6 +121,7 @@ impl XpsAxis {
             min_jerk,
             max_jerk,
             axis_status: 0,
+            pco: PcoConfig::default(),
         })
     }
 
@@ -343,6 +386,46 @@ impl AsynMotor for XpsAxis {
         Ok(())
     }
 
+    fn set_pco_config(
+        &mut self,
+        _user: &AsynUser,
+        start: f64,
+        end: f64,
+        increment: f64,
+        pulse_width_us: f64,
+    ) -> AsynResult<()> {
+        // Latch the config in device units; applied on the next enable_pco.
+        // C converts via motorRecPositionToXPSPosition (value * stepSize) and
+        // fabs() on the step. DEVIATION: the generic hook has no direction, so
+        // the C min/max swap-on-reverse-DIR is not applied here.
+        self.pco = PcoConfig::from_record(start, end, increment, pulse_width_us, self.step_size);
+        Ok(())
+    }
+
+    fn enable_pco(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
+        // C setPositionCompare "Pulse" mode: disable, set pulse parameters, set
+        // the compare window, then enable. Disabling just calls Disable. All on
+        // the poll socket (C uses pollSocket_).
+        let ctrl = self.lock_controller();
+        let sock = ctrl.poll_socket();
+        sock.positioner_position_compare_disable(&self.positioner_name)?;
+        if enable {
+            sock.positioner_position_compare_pulse_parameters_set(
+                &self.positioner_name,
+                self.pco.pulse_width_us,
+                XPS_PCO_DEFAULT_SETTLING_TIME,
+            )?;
+            sock.positioner_position_compare_set(
+                &self.positioner_name,
+                self.pco.min_position,
+                self.pco.max_position,
+                self.pco.position_step,
+            )?;
+            sock.positioner_position_compare_enable(&self.positioner_name)?;
+        }
+        Ok(())
+    }
+
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         // Clone the Arc into a local so the lock guard does not borrow `self`
         // (we mutate `self.axis_status` after the reads).
@@ -458,6 +541,17 @@ mod tests {
         // Ready and moving states are not a problem.
         assert!(!StatusFlags::from_status(10).problem);
         assert!(!StatusFlags::from_status(43).problem);
+    }
+
+    #[test]
+    fn pco_config_scales_to_device_units() {
+        // step_size = 0.5 device units per motor step; increment negative → fabs.
+        let c = PcoConfig::from_record(2.0, 8.0, -0.25, 1.0, 0.5);
+        assert_eq!(c.min_position, 1.0);
+        assert_eq!(c.max_position, 4.0);
+        assert_eq!(c.position_step, 0.125);
+        // Pulse width passes straight through (µs), not scaled.
+        assert_eq!(c.pulse_width_us, 1.0);
     }
 
     #[test]

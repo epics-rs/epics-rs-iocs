@@ -257,4 +257,54 @@ impl XpsSocket {
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }
+
+    // --- Position compare output (PCO) ------------------------------------
+
+    /// `PositionerPositionCompareDisable(positioner)`.
+    pub fn positioner_position_compare_disable(&self, positioner: &str) -> XpsResult<()> {
+        self.exec(&format!("PositionerPositionCompareDisable ({positioner})"))?
+            .require_ok()?;
+        Ok(())
+    }
+
+    /// `PositionerPositionCompareEnable(positioner)`.
+    pub fn positioner_position_compare_enable(&self, positioner: &str) -> XpsResult<()> {
+        self.exec(&format!("PositionerPositionCompareEnable ({positioner})"))?
+            .require_ok()?;
+        Ok(())
+    }
+
+    /// `PositionerPositionComparePulseParametersSet(positioner, pulseWidth, settlingTime)`.
+    pub fn positioner_position_compare_pulse_parameters_set(
+        &self,
+        positioner: &str,
+        pulse_width: f64,
+        settling_time: f64,
+    ) -> XpsResult<()> {
+        let cmd = format!(
+            "PositionerPositionComparePulseParametersSet ({positioner},{},{})",
+            g(pulse_width),
+            g(settling_time),
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `PositionerPositionCompareSet(positioner, min, max, step)`.
+    pub fn positioner_position_compare_set(
+        &self,
+        positioner: &str,
+        min_position: f64,
+        max_position: f64,
+        position_step: f64,
+    ) -> XpsResult<()> {
+        let cmd = format!(
+            "PositionerPositionCompareSet ({positioner},{},{},{})",
+            g(min_position),
+            g(max_position),
+            g(position_step),
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
 }
