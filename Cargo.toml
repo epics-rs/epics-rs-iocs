@@ -2,11 +2,22 @@
 resolver = "3"
 members = [
     "drivers/d435i",
+    "drivers/motor/newport",
     "drivers/meascomp/meascomp",
     "drivers/meascomp/uldaq-sys",
     "drivers/meascomp/usb-2408",
     "drivers/meascomp/usb-ctr",
     "iocs/d435i-ioc",
+    "iocs/motor/conex-ioc",
+    "iocs/motor/smc100-ioc",
     "iocs/usb-2408-ioc",
     "iocs/usb-ctr-ioc",
 ]
+
+# Single source of truth for the epics-rs crate versions every driver/IOC
+# consumes. Bump here once per epics-rs release instead of editing each crate.
+# Per-crate feature sets stay in the crates (features are additive over these).
+[workspace.dependencies]
+epics-rs = { version = "0.21.0" }
+asyn-rs = { version = "0.21.0" }
+ad-plugins-rs = { version = "0.21.0" }

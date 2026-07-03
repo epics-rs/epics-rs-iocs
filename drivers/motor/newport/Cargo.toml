@@ -1,0 +1,17 @@
+[package]
+name = "motor-newport"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Newport motor controller family (SMC100, and later ESP300/XPS/…), ported
+# from epics-modules/motor motorNewport. One crate per vendor family; each
+# controller model is a module implementing asyn-rs `AsynMotor`. Pure serial
+# ASCII protocols — no vendor library, so this crate builds and tests on any
+# host (unlike the vendor-SDK drivers under drivers/meascomp and drivers/d435i).
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+# The holder stores poll-loop command senders (tokio mpsc) created by
+# motor-rs's MotorBuilder; only the `sync` channel type is needed here.
+tokio = { version = "1", features = ["sync"] }
