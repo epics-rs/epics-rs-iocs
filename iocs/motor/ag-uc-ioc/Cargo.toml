@@ -1,0 +1,13 @@
+[package]
+name = "ag-uc-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Newport Agilis AG-UC2/UC8 open-loop piezo stepper IOC binary. Wires the
+# motor-newport Agilis driver to a serial octet port and one motor record per
+# axis. No vendor library — builds on any host.
+
+[dependencies]
+motor-newport = { path = "../../../drivers/motor/newport" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

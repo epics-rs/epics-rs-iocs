@@ -33,6 +33,7 @@ use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
 
 use crate::agap::{self, AgapAxis, AgapController};
+use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
 use crate::smc100::Smc100Axis;
 
@@ -51,6 +52,16 @@ const SERIAL_ADDR: i32 = 0;
 const SMC100_TIMEOUT: Duration = Duration::from_secs(1);
 const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
 const AGAP_TIMEOUT: Duration = Duration::from_secs(2);
+const AG_UC_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A shared Agilis controller registered by `AG_UCCreateController`, awaiting
+/// its axes to be added by `AG_UCCreateAxis`. Carries the poll intervals from
+/// the controller command so each later axis inherits them.
+struct AgUcRegistration {
+    controller: Arc<Mutex<AgUcController>>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+}
 
 /// Holds Newport motor device-support instances created by the family's
 /// `*CreateController` commands. Each controller is stored under a
@@ -59,6 +70,9 @@ const AGAP_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct NewportHolder {
     motors: Mutex<HashMap<String, Option<MotorDeviceSupport>>>,
     poll_senders: Mutex<Vec<tokio::sync::mpsc::Sender<PollCommand>>>,
+    /// Agilis controllers keyed by motor port, bridging the two-step
+    /// `AG_UCCreateController` / `AG_UCCreateAxis` iocsh API.
+    ag_uc_controllers: Mutex<HashMap<String, AgUcRegistration>>,
 }
 
 impl NewportHolder {
@@ -66,6 +80,7 @@ impl NewportHolder {
         Arc::new(Self {
             motors: Mutex::new(HashMap::new()),
             poll_senders: Mutex::new(Vec::new()),
+            ag_uc_controllers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -266,6 +281,154 @@ impl NewportHolder {
                 }
                 println!(
                     "AGAP_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=AGAP_{motor_port}_U, AGAP_{motor_port}_V)"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `AG_UCCreateController` iocsh command.
+    ///
+    /// Usage:
+    /// `AG_UCCreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs])`
+    ///
+    /// Registers a shared Agilis [`AgUcController`] under `motorPort`; the axes
+    /// are added afterward by [`Self::ag_uc_create_axis_command`]. `numAxes` is
+    /// accepted for C-parity but the axes are created individually.
+    /// [`AgUcController::new`] resets the controller and performs blocking
+    /// serial I/O, so it must be reachable when this command runs.
+    pub fn ag_uc_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "AG_UCCreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("serialPort"),
+                ArgDesc {
+                    name: "numAxes",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+            ],
+            "AG_UCCreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs]) - Create a Newport Agilis AG-UC controller (add axes with AG_UCCreateAxis)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let serial_port = req_string(args, 1, "serialPort")?;
+                let num_axes = match &args[2] {
+                    ArgValue::Int(v) => *v,
+                    _ => return Err("numAxes must be an integer".into()),
+                };
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+                let handle = connect_serial(&serial_port, AG_UC_TIMEOUT)?;
+                let controller = AgUcController::new(handle)
+                    .map_err(|e| format!("AG_UCCreateController: {e}"))?;
+                let model = controller.model();
+                holder
+                    .ag_uc_controllers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        motor_port.clone(),
+                        AgUcRegistration {
+                            controller: Arc::new(Mutex::new(controller)),
+                            moving_poll_ms,
+                            idle_poll_ms,
+                        },
+                    );
+                println!(
+                    "AG_UCCreateController: motorPort={motor_port} serialPort={serial_port} model={model:?} numAxes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (add axes with AG_UCCreateAxis)"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `AG_UCCreateAxis` iocsh command.
+    ///
+    /// Usage:
+    /// `AG_UCCreateAxis(motorPort, axis, hasLimits, forwardAmplitude, reverseAmplitude)`
+    ///
+    /// Adds one [`AgUcAxis`] to the controller registered under `motorPort` by
+    /// `AG_UCCreateController`, registered under DTYP `AG_UC_{motorPort}_{axis}`.
+    /// [`AgUcAxis::new`] performs blocking serial I/O (step-amplitude setup).
+    pub fn ag_uc_create_axis_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "AG_UCCreateAxis",
+            vec![
+                arg_str_req("motorPort"),
+                ArgDesc {
+                    name: "axis",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "hasLimits",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "forwardAmplitude",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "reverseAmplitude",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "AG_UCCreateAxis(motorPort, axis, hasLimits, forwardAmplitude, reverseAmplitude) - Add an axis to a Newport Agilis AG-UC controller",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let axis = match &args[1] {
+                    ArgValue::Int(v) => *v as i32,
+                    _ => return Err("axis must be an integer".into()),
+                };
+                let has_limits = match &args[2] {
+                    ArgValue::Int(v) => *v != 0,
+                    _ => return Err("hasLimits must be an integer".into()),
+                };
+                let forward_amplitude = match &args[3] {
+                    ArgValue::Int(v) => *v as i32,
+                    _ => return Err("forwardAmplitude must be an integer".into()),
+                };
+                let reverse_amplitude = match &args[4] {
+                    ArgValue::Int(v) => *v as i32,
+                    _ => return Err("reverseAmplitude must be an integer".into()),
+                };
+
+                let controller = {
+                    let controllers = holder
+                        .ag_uc_controllers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let reg = controllers.get(&motor_port).ok_or_else(|| {
+                        format!(
+                            "AG_UCCreateAxis: controller '{motor_port}' not found (call AG_UCCreateController first)"
+                        )
+                    })?;
+                    (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
+                };
+                let (controller, moving_poll_ms, idle_poll_ms) = controller;
+
+                let ax = AgUcAxis::new(
+                    controller,
+                    axis,
+                    has_limits,
+                    forward_amplitude,
+                    reverse_amplitude,
+                )
+                .map_err(|e| format!("AG_UCCreateAxis: {e}"))?;
+                let dtyp_key = format!("AG_UC_{motor_port}_{axis}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+
+                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                println!(
+                    "AG_UCCreateAxis: motorPort={motor_port} axis={axis} hasLimits={has_limits} fwdAmp={forward_amplitude} revAmp={reverse_amplitude} (DTYP={dtyp_key})"
                 );
                 Ok(CommandOutcome::Continue)
             },

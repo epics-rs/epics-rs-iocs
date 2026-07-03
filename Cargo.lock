@@ -65,6 +65,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ag-uc-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "motor-newport",
+]
+
+[[package]]
 name = "agap-conex-ioc"
 version = "0.1.0"
 dependencies = [
