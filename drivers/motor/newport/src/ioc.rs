@@ -32,6 +32,7 @@ use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
 
+use crate::agap::{self, AgapAxis, AgapController};
 use crate::conex::ConexAxis;
 use crate::smc100::Smc100Axis;
 
@@ -45,10 +46,11 @@ const SMC100_AXIS: u8 = 1;
 /// Octet `addr` used on the serial transport port (single-device serial line).
 const SERIAL_ADDR: i32 = 0;
 
-/// Per-command serial I/O timeout: SMC100 (`from_handle` default) and CONEX
-/// (`CONEX_TIMEOUT`).
+/// Per-command serial I/O timeout: SMC100 (`from_handle` default) and CONEX /
+/// AGAP (`CONEX_TIMEOUT`).
 const SMC100_TIMEOUT: Duration = Duration::from_secs(1);
 const CONEX_TIMEOUT: Duration = Duration::from_secs(2);
+const AGAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Holds Newport motor device-support instances created by the family's
 /// `*CreateController` commands. Each controller is stored under a
@@ -207,6 +209,63 @@ impl NewportHolder {
                 holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
                 println!(
                     "AG_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `AGAP_CONEXCreateController` iocsh command.
+    ///
+    /// Usage:
+    /// `AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])`
+    ///
+    /// The AGAP is a two-axis (`U`/`V`) controller: this creates one shared
+    /// [`AgapController`] plus two [`AgapAxis`] device supports, registered
+    /// under DTYP keys `AGAP_{motorPort}_U` and `AGAP_{motorPort}_V`. Both
+    /// axes share one serial line; each axis operation locks the controller so
+    /// its write→read exchange stays atomic. [`AgapController::new`] and
+    /// [`AgapAxis::new`] perform blocking serial I/O, so the controller must be
+    /// reachable when this command runs.
+    pub fn agap_conex_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "AGAP_CONEXCreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("serialPort"),
+                ArgDesc {
+                    name: "controllerID",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+            ],
+            "AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs]) - Create a Newport CONEX-AGAP two-axis controller",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let serial_port = req_string(args, 1, "serialPort")?;
+                let controller_id = match &args[2] {
+                    ArgValue::Int(v) => *v as i32,
+                    _ => return Err("controllerID must be an integer".into()),
+                };
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+                let handle = connect_serial(&serial_port, AGAP_TIMEOUT)?;
+                let controller = AgapController::new(handle, controller_id)
+                    .map_err(|e| format!("AGAP_CONEXCreateController: {e}"))?;
+                let controller = Arc::new(Mutex::new(controller));
+
+                for axis_index in 0..agap::NUM_AXES {
+                    let axis = AgapAxis::new(controller.clone(), axis_index)
+                        .map_err(|e| format!("AGAP_CONEXCreateController: {e}"))?;
+                    let dtyp_key = format!("AGAP_{motor_port}_{}", agap::axis_name(axis_index));
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                }
+                println!(
+                    "AGAP_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=AGAP_{motor_port}_U, AGAP_{motor_port}_V)"
                 );
                 Ok(CommandOutcome::Continue)
             },

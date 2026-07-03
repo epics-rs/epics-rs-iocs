@@ -65,6 +65,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "agap-conex-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "motor-newport",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -36,6 +36,8 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use crate::util::{leading_hex, parse_int_at, parse_value_at};
+
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
 
@@ -271,76 +273,6 @@ fn conex_err(message: String) -> AsynError {
 
 fn parse_error(what: &str) -> AsynError {
     conex_err(format!("CONEX: could not parse {what} response"))
-}
-
-/// Mimic C `atof`: parse the leading numeric prefix as `f64`, returning `0.0`
-/// on junk (as C `atof` does).
-fn atof(s: &str) -> f64 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i < b.len() && b[i] == b'.' {
-        i += 1;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
-        let mut j = i + 1;
-        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
-            j += 1;
-        }
-        let exp_start = j;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > exp_start {
-            i = j;
-        }
-    }
-    t.get(..i)
-        .and_then(|p| p.parse::<f64>().ok())
-        .unwrap_or(0.0)
-}
-
-/// Mimic C `atoi`: parse the leading integer prefix, `0` on junk.
-fn atoi(s: &str) -> i32 {
-    let t = s.trim_start();
-    let b = t.as_bytes();
-    let mut i = 0;
-    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
-        i += 1;
-    }
-    while i < b.len() && b[i].is_ascii_digit() {
-        i += 1;
-    }
-    t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
-}
-
-/// Parse leading hex digits as `u32` (C `sscanf` `%x`); `None` if there is no
-/// hex digit (C `sscanf` count `!= 1`).
-fn leading_hex(s: &str) -> Option<u32> {
-    let n = s.bytes().take_while(u8::is_ascii_hexdigit).count();
-    if n == 0 {
-        return None;
-    }
-    u32::from_str_radix(&s[..n], 16).ok()
-}
-
-/// `atof(&resp[offset..])`; `None` only when `offset` is past the reply.
-fn parse_value_at(resp: &str, offset: usize) -> Option<f64> {
-    resp.get(offset..).map(atof)
-}
-
-/// `atoi(&resp[offset..])`; `None` only when `offset` is past the reply.
-fn parse_int_at(resp: &str, offset: usize) -> Option<i32> {
-    resp.get(offset..).map(atoi)
 }
 
 // --- Raw framed serial I/O (usable before `ConexAxis` exists, e.g. in `new`).
@@ -764,15 +696,5 @@ mod tests {
         assert_eq!(parse_closed_loop("1MM0a"), Some(false));
         assert_eq!(parse_closed_loop("1MM3c"), Some(false));
         assert_eq!(parse_closed_loop("1XX"), None);
-    }
-
-    #[test]
-    fn value_parse_skips_variable_prefix_like_atof() {
-        // ID?/SU?/SL?/TP replies: data at offset 3 ("1TP" prefix).
-        assert_eq!(parse_value_at("1TP-0.1234", 3), Some(-0.1234));
-        // FRM? int reply: data at offset 4 ("1FRM" prefix).
-        assert_eq!(parse_int_at("1FRM400", 4), Some(400));
-        // Offset past the reply.
-        assert_eq!(parse_value_at("1TP", 5), None);
     }
 }

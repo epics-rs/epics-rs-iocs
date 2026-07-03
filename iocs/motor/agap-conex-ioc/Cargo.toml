@@ -1,0 +1,13 @@
+[package]
+name = "agap-conex-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Newport CONEX-AGAP two-axis piezo goniometer IOC binary. Wires the
+# motor-newport AGAP driver to a serial octet port and two motor records
+# (U/V axes). No vendor library — builds on any host.
+
+[dependencies]
+motor-newport = { path = "../../../drivers/motor/newport" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
