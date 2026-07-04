@@ -75,9 +75,45 @@ pub(crate) fn parse_int_at(resp: &str, offset: usize) -> Option<i32> {
     resp.get(offset..).map(atoi)
 }
 
+/// C `NINT(f)`: round to nearest integer, away from zero on the half.
+pub(crate) fn nint(f: f64) -> i32 {
+    (if f > 0.0 { f + 0.5 } else { f - 0.5 }) as i32
+}
+
+/// Shared ESP300/MM3000 `recv_mess` retry predicate: a reply longer than 3
+/// characters starting with `E` whose number is a hard-travel-limit code
+/// (35..=42) is an unsolicited error message to flush with a re-read.
+pub(crate) fn is_unsolicited_limit_error(reply: &str) -> bool {
+    reply.len() > 3 && reply.starts_with('E') && (35..=42).contains(&atoi(&reply[1..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nint_rounds_away_from_zero() {
+        assert_eq!(nint(1.5), 2);
+        assert_eq!(nint(1.4), 1);
+        assert_eq!(nint(-1.5), -2);
+        assert_eq!(nint(-1.4), -1);
+        assert_eq!(nint(0.0), 0);
+    }
+
+    #[test]
+    fn unsolicited_limit_error_predicate() {
+        // Hard-travel-limit codes 35..=42 with a message are flushed.
+        assert!(is_unsolicited_limit_error("E35 HARDWARE LIMIT"));
+        assert!(is_unsolicited_limit_error("E42 x"));
+        // Codes outside 35..=42 are real replies.
+        assert!(!is_unsolicited_limit_error("E34 x"));
+        assert!(!is_unsolicited_limit_error("E43 x"));
+        // C requires nread > 3: a bare short reply is never flushed.
+        assert!(!is_unsolicited_limit_error("E35"));
+        // Ordinary replies pass through.
+        assert!(!is_unsolicited_limit_error("0, NO ERROR DETECTED"));
+        assert!(!is_unsolicited_limit_error("1"));
+    }
 
     #[test]
     fn atof_parses_leading_numeric_prefix() {

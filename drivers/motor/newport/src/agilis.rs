@@ -42,7 +42,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::util::parse_int_at;
+use crate::util::{nint, parse_int_at};
 
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
@@ -96,11 +96,6 @@ fn agilis_err(message: String) -> AsynError {
 
 fn parse_error(what: &str) -> AsynError {
     agilis_err(format!("Agilis: could not parse {what} response"))
-}
-
-/// C `NINT(f)`: round to nearest integer, away from zero on the half.
-fn nint(f: f64) -> i32 {
-    (if f > 0.0 { f + 0.5 } else { f - 0.5 }) as i32
 }
 
 /// C `AG_UCAxis::velocityToSpeedCode`: bucket the velocity magnitude to an
@@ -417,15 +412,6 @@ mod tests {
     fn uc8pc_detected_before_uc8_substring() {
         // "AG-UC8" is a substring of "AG-UC8PC"; the PC variant must win.
         assert_eq!(AgUcModel::from_version("AG-UC8PC"), Some(AgUcModel::Uc8Pc));
-    }
-
-    #[test]
-    fn nint_rounds_away_from_zero() {
-        assert_eq!(nint(1.5), 2);
-        assert_eq!(nint(1.4), 1);
-        assert_eq!(nint(-1.5), -2);
-        assert_eq!(nint(-1.4), -1);
-        assert_eq!(nint(0.0), 0);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+# Newport MM3000: one motor record per axis. Load once per configured axis
+# with N = 0-based axis index (DTYP MM3000_$(PORT)_$(N)).
+# The MM3000 wire is step-native (integer motor steps / encoder counts), so
+# MRES defaults to 1 and the record EGU is counts; velocities are
+# counts/sec. The driver jogs by moving to DHLM/DLLM, so set real soft
+# limits.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MM3000_$(PORT)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=100000)")
+    field(DLLM, "$(LLM=-100000)")
+    field(MRES, "$(MRES=1)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+}

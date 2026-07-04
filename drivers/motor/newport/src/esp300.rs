@@ -32,7 +32,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::util::{atof, atoi, leading_hex};
+use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -163,13 +163,6 @@ impl Esp300Controller {
         // Replies end in CR/LF (C strips the LF via input EOS, the CR itself).
         Ok(s.trim_end_matches(['\r', '\n']).to_string())
     }
-}
-
-/// C `recv_mess` retry predicate: a reply longer than 3 characters starting
-/// with `E` whose number is a hard-travel-limit code (35..=42) is an
-/// unsolicited error message to flush.
-fn is_unsolicited_limit_error(reply: &str) -> bool {
-    reply.len() > 3 && reply.starts_with('E') && (35..=42).contains(&atoi(&reply[1..]))
 }
 
 /// The velocity/acceleration preamble every motion transaction carries
@@ -465,20 +458,5 @@ mod tests {
             motion_preamble(12, 0.0, 1.0, 4.0),
             "12VB0.000000;12VA1.000000;12AC4.000000;12AG4.000000"
         );
-    }
-
-    #[test]
-    fn unsolicited_limit_error_predicate() {
-        // Hard-travel-limit codes 35..=42 with a message are flushed.
-        assert!(is_unsolicited_limit_error("E35 HARDWARE LIMIT"));
-        assert!(is_unsolicited_limit_error("E42 x"));
-        // Codes outside 35..=42 are real replies.
-        assert!(!is_unsolicited_limit_error("E34 x"));
-        assert!(!is_unsolicited_limit_error("E43 x"));
-        // C requires nread > 3: a bare short reply is never flushed.
-        assert!(!is_unsolicited_limit_error("E35"));
-        // Ordinary replies pass through.
-        assert!(!is_unsolicited_limit_error("0, NO ERROR DETECTED"));
-        assert!(!is_unsolicited_limit_error("1"));
     }
 }

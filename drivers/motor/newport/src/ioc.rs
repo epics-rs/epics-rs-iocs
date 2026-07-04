@@ -38,6 +38,7 @@ use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
 use crate::esp300::{Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
+use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
@@ -83,6 +84,9 @@ const HXP_MOVE_TIMEOUT: Duration = Duration::from_millis(100);
 /// ESP300 serial command timeout (C `SERIAL_TIMEOUT` 5 s — "the ESP300 does
 /// not respond for 2 to 5 seconds after hitting a travel limit").
 const ESP300_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// MM3000 serial command timeout (C drvMM3000 `SERIAL_TIMEOUT` 5 s).
+const MM3000_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default XPS FTP account and trajectory directory. C uses the factory
 /// `Administrator`/`Administrator` login; `/Admin/Public/Trajectories` is the
@@ -1516,6 +1520,57 @@ impl NewportHolder {
                 }
                 println!(
                     "ESP300CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=ESP300_{motor_port}_{{0..{}}})",
+                    num_axes - 1
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `MM3000CreateController` iocsh command.
+    ///
+    /// `MM3000CreateController(motorPort, serialPort, [movingPollMs],
+    /// [idlePollMs])`
+    ///
+    /// Creates a Newport MM3000 controller on a pre-configured serial (or
+    /// GPIB octet) port, reads its axis configuration (`RC`), and creates one
+    /// motor axis per configured slot (DTYP `MM3000_{motorPort}_{0..}`,
+    /// including a trailing `unused` slot exactly as C counts it). Replaces
+    /// the C `MM3000Setup`/`MM3000Config` pair; the scan rate is the poll
+    /// intervals. The MM3000 wire is step-native — use `MRES = 1` records
+    /// (see [`crate::mm3000`] module Units note).
+    pub fn mm3000_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "MM3000CreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("serialPort"),
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+            ],
+            "MM3000CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs]) - Create a Newport MM3000 controller, reading its axis configuration (DTYP MM3000_{motorPort}_{0..})",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let serial_port = req_string(args, 1, "serialPort")?;
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+
+                let handle = connect_serial(&serial_port, MM3000_TIMEOUT)?;
+                let controller = Mm3000Controller::new(handle)
+                    .map_err(|e| format!("MM3000CreateController: {e}"))?;
+                let ident = controller.ident().to_string();
+                let num_axes = controller.axis_types().len();
+                let controller = Arc::new(Mutex::new(controller));
+
+                for axis in 1..=num_axes {
+                    let ax = Mm3000Axis::new(controller.clone(), axis)
+                        .map_err(|e| format!("MM3000CreateController: axis {axis}: {e}"))?;
+                    let dtyp_key = format!("MM3000_{motor_port}_{}", axis - 1);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                }
+                println!(
+                    "MM3000CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM3000_{motor_port}_{{0..{}}})",
                     num_axes - 1
                 );
                 Ok(CommandOutcome::Continue)
