@@ -56,6 +56,33 @@ iocInit()
 # base DB-link parser caps target field names at 4 chars, and these are longer.
 # Use caput (CA/PVA), which resolves full field names.
 
+# PVT trajectory profiles (driver-private). A profile is defined from a CSV
+# points file, built (trajectory-file generation + FTP upload to the XPS +
+# verification against dynamics and soft limits), then executed on a background
+# thread over a dedicated socket so polling continues.
+#
+# The CSV has one row per point: "time, pos_0, pos_1, ..." with one position
+# column per positioner in the group, in the order the axes were created
+# (device/positioner units and seconds). '#' comments and blank lines are
+# skipped. Example one-axis file db/scan.csv:
+#     # time,  GROUP1.POSITIONER
+#     0.5, 0.0
+#     0.5, 1.0
+#     0.5, 2.0
+#     0.5, 3.0
+#
+# Execution needs its own TCP socket (MultipleAxesPVTExecution blocks until the
+# trajectory finishes). Configure a dedicated exec port alongside the move port:
+#     drvAsynIPPortConfigure("XPSEXEC0", "$(HOST)", 0, 0, 1)
+#
+# Then, after iocInit:
+#     XPSDefineProfileFromFile("$(PORT)", "GROUP1", "db/scan.csv", "absolute")
+#     XPSBuildProfile("$(PORT)", "TrajectoryScan.trj", "192.168.0.254")
+#     XPSExecuteProfile("$(PORT)", "XPSEXEC0", 1)
+# XPSBuildProfile FTP credentials/dir default to the XPS factory Administrator
+# account and /Admin/Public/Trajectories; override with extra args if changed.
+# Only plain FTP (XPS-C/Q) is supported; XPS-D SFTP is not implemented.
+
 # Example:
 #   dbl
 #   camonitor XPS:m0 XPS:m0.RBV

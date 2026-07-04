@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
@@ -36,7 +37,7 @@ use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
 use crate::smc100::Smc100Axis;
-use crate::xps::{SocketMode, XpsAxis, XpsController, XpsSocket};
+use crate::xps::{MoveMode, Profile, SocketMode, XpsAxis, XpsController, XpsSocket, ftp};
 
 /// Default moving/idle poll intervals (ms) when the iocsh args are omitted.
 const DEFAULT_MOVING_POLL_MS: u64 = 100;
@@ -61,6 +62,20 @@ const XPS_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 /// XPS move-socket timeout (C sets `-0.1` s): the fire-and-forget write does
 /// not wait for the move to finish, so the read times out quickly.
 const XPS_MOVE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// XPS PVT execution socket timeout. `MultipleAxesPVTExecution` — and the
+/// move-to-start moves that precede it on the same socket — block until the
+/// motion finishes, so this bounds a whole trajectory run rather than a single
+/// RPC. C runs this on a dedicated socket with no explicit cap; 1 h is a
+/// generous upper bound so a wedged run cannot hang the executor thread forever.
+const XPS_PVT_EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Default XPS FTP account and trajectory directory. C uses the factory
+/// `Administrator`/`Administrator` login; `/Admin/Public/Trajectories` is the
+/// XPS-C/Q public trajectory folder. Both are overridable on `XPSBuildProfile`.
+const XPS_FTP_USER: &str = "Administrator";
+const XPS_FTP_PASSWORD: &str = "Administrator";
+const XPS_TRAJECTORY_DIR: &str = "/Admin/Public/Trajectories";
 
 /// A shared Agilis controller registered by `AG_UCCreateController`, awaiting
 /// its axes to be added by `AG_UCCreateAxis`. Carries the poll intervals from
@@ -673,6 +688,245 @@ impl NewportHolder {
         )
     }
 
+    /// Look up a registered XPS controller by motor port, or produce a
+    /// `"{cmd}: controller '...' not found"` error. Shared by the PVT commands.
+    fn xps_controller(
+        &self,
+        motor_port: &str,
+        cmd: &str,
+    ) -> Result<Arc<Mutex<XpsController>>, String> {
+        let controllers = self
+            .xps_controllers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        controllers
+            .get(motor_port)
+            .map(|reg| reg.controller.clone())
+            .ok_or_else(|| {
+                format!(
+                    "{cmd}: controller '{motor_port}' not found (call XPSCreateController first)"
+                )
+            })
+    }
+
+    /// Create the `XPSDefineProfileFromFile` iocsh command.
+    ///
+    /// `XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode])`
+    ///
+    /// Loads a PVT profile for `group` from a CSV points file: each row is
+    /// `time, pos_0, pos_1, ...` with one position column per positioner in the
+    /// group (controller registration order), in device units and seconds; `#`
+    /// comments and blank lines are skipped. `moveMode` is `absolute` (default)
+    /// or `relative`, selecting whether the execute-time move to the trajectory
+    /// start is absolute or relative. Driver-private: the epics-rs motor
+    /// framework has no profileMove record subsystem, so profiles are defined by
+    /// this command instead of by the C `profileMove` database.
+    pub fn xps_define_profile_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSDefineProfileFromFile",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("group"),
+                arg_str_req("csvFile"),
+                ArgDesc {
+                    name: "moveMode",
+                    arg_type: ArgType::String,
+                    optional: true,
+                },
+            ],
+            "XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode]) - Load a PVT profile for an XPS group from a CSV points file (time + one position column per group positioner; moveMode absolute|relative, default absolute)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let group = req_string(args, 1, "group")?;
+                let csv_file = req_string(args, 2, "csvFile")?;
+                let move_mode = parse_move_mode(opt_string(args, 3))?;
+
+                let controller = holder.xps_controller(&motor_port, "XPSDefineProfileFromFile")?;
+                let csv = std::fs::read_to_string(&csv_file).map_err(|e| {
+                    format!("XPSDefineProfileFromFile: cannot read '{csv_file}': {e}")
+                })?;
+
+                let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                let positioners = ctrl.positioners_in_group(&group);
+                let num_axes = positioners.len();
+                let profile = Profile::from_csv(&group, move_mode, &positioners, &csv)
+                    .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
+                let num_points = profile.num_points();
+                ctrl.define_profile(profile)
+                    .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
+                drop(ctrl);
+                println!(
+                    "XPSDefineProfileFromFile: motorPort={motor_port} group={group} points={num_points} axes={num_axes} mode={move_mode:?}"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `XPSBuildProfile` iocsh command.
+    ///
+    /// `XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir])`
+    ///
+    /// Generates the defined profile's trajectory file, FTP-uploads it to the
+    /// XPS trajectory folder, then verifies it against the group dynamics and
+    /// each axis's soft limits (C `buildProfile`). `fileName` is the bare
+    /// trajectory file name the controller opens; `host` is the XPS IP/hostname
+    /// (no port). Credentials and directory default to the XPS factory
+    /// `Administrator` account and `/Admin/Public/Trajectories`; `ftpDir` must
+    /// name the controller's actual trajectory folder if overridden.
+    pub fn xps_build_profile_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSBuildProfile",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("fileName"),
+                arg_str_req("host"),
+                ArgDesc {
+                    name: "ftpUser",
+                    arg_type: ArgType::String,
+                    optional: true,
+                },
+                ArgDesc {
+                    name: "ftpPassword",
+                    arg_type: ArgType::String,
+                    optional: true,
+                },
+                ArgDesc {
+                    name: "ftpDir",
+                    arg_type: ArgType::String,
+                    optional: true,
+                },
+            ],
+            "XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir]) - Generate the defined profile's trajectory file, FTP it to the XPS, and verify it against dynamics + soft limits",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let file_name = req_string(args, 1, "fileName")?;
+                let host = req_string(args, 2, "host")?;
+                let ftp_user = opt_string(args, 3).unwrap_or_else(|| XPS_FTP_USER.to_string());
+                let ftp_pass = opt_string(args, 4).unwrap_or_else(|| XPS_FTP_PASSWORD.to_string());
+                let ftp_dir = opt_string(args, 5).unwrap_or_else(|| XPS_TRAJECTORY_DIR.to_string());
+
+                let controller = holder.xps_controller(&motor_port, "XPSBuildProfile")?;
+
+                // Generate and verify hold the controller lock (they use the
+                // poll socket); the FTP upload touches no controller state, so
+                // it runs between the two without the lock held.
+                let built = {
+                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    ctrl.build_profile_text()
+                        .map_err(|e| format!("XPSBuildProfile: {e}"))?
+                };
+                ftp::upload_trajectory(
+                    &host,
+                    &ftp_dir,
+                    &file_name,
+                    &built.text,
+                    &ftp_user,
+                    &ftp_pass,
+                )
+                .map_err(|e| format!("XPSBuildProfile: {e}"))?;
+                {
+                    let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    ctrl.verify_profile(&file_name, &built)
+                        .map_err(|e| format!("XPSBuildProfile: {e}"))?;
+                }
+                println!(
+                    "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{ftp_dir} and verified"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `XPSExecuteProfile` iocsh command.
+    ///
+    /// `XPSExecuteProfile(motorPort, execPort, [executions])`
+    ///
+    /// Moves the group to the trajectory start, then runs the built PVT profile
+    /// with `MultipleAxesPVTExecution`. Both block until the motion finishes, so
+    /// they run on a background thread over a dedicated socket (`execPort`, a
+    /// `drvAsynIPPort` to the XPS) — the shared poll socket keeps polling
+    /// meanwhile. `executions` (default 1) repeats the trajectory. Ordering the
+    /// start move and execution mirrors C `runProfile`.
+    pub fn xps_execute_profile_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSExecuteProfile",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("execPort"),
+                arg_int_opt("executions"),
+            ],
+            "XPSExecuteProfile(motorPort, execPort, [executions]) - Move the group to the trajectory start and run the built PVT profile on a background thread over its own socket (execPort: a drvAsynIPPort to the XPS; executions default 1)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let exec_port = req_string(args, 1, "execPort")?;
+                let executions = match args.get(2) {
+                    Some(ArgValue::Int(v)) if *v >= 1 => *v as i32,
+                    None | Some(ArgValue::Missing) => 1,
+                    Some(ArgValue::Int(_)) => return Err("executions must be >= 1".into()),
+                    _ => return Err("executions must be an integer".into()),
+                };
+
+                let controller = holder.xps_controller(&motor_port, "XPSExecuteProfile")?;
+                let plan = {
+                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    ctrl.execution_plan()
+                }
+                .ok_or_else(|| {
+                    "XPSExecuteProfile: no built profile (call XPSBuildProfile first)".to_string()
+                })?;
+
+                // A dedicated blocking socket so the seconds-to-minutes-long
+                // execution never contends with the shared poll socket.
+                let handle = connect_ip(&exec_port, XPS_PVT_EXEC_TIMEOUT)?;
+                let exec_sock = XpsSocket::new(handle, SocketMode::Query);
+
+                println!(
+                    "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} (running on background thread)",
+                    plan.group, plan.file_name
+                );
+                thread::spawn(move || {
+                    for (positioner, target) in &plan.start_moves {
+                        let moved = match plan.move_mode {
+                            MoveMode::Absolute => {
+                                exec_sock.group_move_absolute(positioner, *target)
+                            }
+                            MoveMode::Relative => {
+                                exec_sock.group_move_relative(positioner, *target)
+                            }
+                        };
+                        if let Err(e) = moved {
+                            eprintln!(
+                                "XPSExecuteProfile: move to start for {positioner} failed: {e}"
+                            );
+                            return;
+                        }
+                    }
+                    match exec_sock.multiple_axes_pvt_execution(
+                        &plan.group,
+                        &plan.file_name,
+                        executions,
+                    ) {
+                        Ok(()) => {
+                            println!(
+                                "XPSExecuteProfile: trajectory '{}' complete",
+                                plan.file_name
+                            )
+                        }
+                        Err(e) => eprintln!(
+                            "XPSExecuteProfile: execution of '{}' failed: {e}",
+                            plan.file_name
+                        ),
+                    }
+                });
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
     /// Return a dynamic device support factory that dispatches by DTYP name.
     /// Each device support is consumed once (take semantics).
     pub fn device_support_factory(
@@ -713,6 +967,18 @@ fn arg_int_opt(name: &'static str) -> ArgDesc {
         name,
         arg_type: ArgType::Int,
         optional: true,
+    }
+}
+
+/// Parse the optional `moveMode` arg for the PVT commands: `absolute`/`abs`/`0`
+/// (default) or `relative`/`rel`/`1`.
+fn parse_move_mode(arg: Option<String>) -> Result<MoveMode, String> {
+    match arg.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") | Some("absolute") | Some("abs") | Some("0") => Ok(MoveMode::Absolute),
+        Some("relative") | Some("rel") | Some("1") => Ok(MoveMode::Relative),
+        Some(other) => Err(format!(
+            "moveMode must be absolute or relative, got '{other}'"
+        )),
     }
 }
 
