@@ -1,0 +1,16 @@
+# ThorLabs MDT693/694/695 piezo controller driver, ported from
+# epics-modules/motor motorThorLabs (drvMDT695.cc + devMDT695.cc). Pure serial
+# ASCII protocol — no vendor library, so this crate builds/tests on any host.
+#
+# NOTE: the motorThorLabs Kinesis drivers (drvKinesis*) bind the ThorLabs
+# Kinesis SDK (Thorlabs.MotionControl.*.h, Windows-only) and are NOT ported.
+
+[package]
+name = "motor-thorlabs"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

@@ -1,0 +1,21 @@
+# ThorLabs MDT693/694/695 piezo: one motor record per channel. Load once per
+# channel with N = 0-based axis index (DTYP MDT695_$(CARD)_$(N)); the driver maps
+# index 0,1,2 to channels X,Y,Z.
+#
+# The controller is open-loop voltage control: a move sets the channel output
+# voltage and readback reports the commanded voltage. Positions travel the driver
+# boundary in volts, so MRES = 1 and EGU = V. There is no motion feedback, so the
+# record is always done immediately, with no limit switches and no encoder.
+# Set DHLM/DLLM to the controller's voltage range (commonly 0..75 or 0..150 V).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MDT695_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=75.0)")
+    field(DLLM, "$(LLM=0.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=V)")
+    field(PREC, "$(PREC=1)")
+}
