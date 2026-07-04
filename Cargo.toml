@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "drivers/d435i",
     "drivers/motor/common",
+    "drivers/motor/micronix",
     "drivers/motor/newport",
     "drivers/meascomp/meascomp",
     "drivers/meascomp/uldaq-sys",
@@ -17,6 +18,7 @@ members = [
     "iocs/motor/mm3000-ioc",
     "iocs/motor/mm4000-ioc",
     "iocs/motor/pm500-ioc",
+    "iocs/motor/micronix-ioc",
     "iocs/motor/newfocus-ioc",
     "iocs/motor/smc100-ioc",
     "iocs/motor/xps-ioc",

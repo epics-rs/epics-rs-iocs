@@ -1,0 +1,19 @@
+# Micronix MMC-100/200: one motor record per axis. Load once per axis with
+# N = 0-based axis index (DTYP MMC200_$(PORT)_$(N)); the driver maps index
+# 0,1,2,... to controller axes 1,2,3,...
+# Positions travel the driver boundary in EGU (controller units, mm or deg)
+# directly; MRES only sets the record's raw-count resolution (display/deadband
+# granularity) and should match the axis's physical resolution. Velocities are
+# EGU/sec.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MMC200_$(PORT)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=3.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=10.0)")
+    field(DLLM, "$(LLM=-10.0)")
+    field(MRES, "$(MRES=2.44140625e-6)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=5)")
+}

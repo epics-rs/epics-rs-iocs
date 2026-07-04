@@ -1,0 +1,14 @@
+# Micronix MMC-100/103/110/200 motor controller driver, ported from
+# epics-modules/motor motorMicronix (MMC200Driver.cpp, a model-3
+# asynMotorController/asynMotorAxis driver). Pure serial ASCII protocol — no
+# vendor library, so this crate builds and tests on any host.
+
+[package]
+name = "motor-micronix"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

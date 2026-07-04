@@ -1,0 +1,14 @@
+# Micronix MMC-100/200 motor IOC binary. Wires the motor-micronix driver to a
+# serial octet port (drvAsynSerialPortConfigure) and one motor record per axis,
+# exposing CA + PVA. No vendor library — builds on any host.
+
+[package]
+name = "micronix-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-micronix = { path = "../../../drivers/motor/micronix" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
