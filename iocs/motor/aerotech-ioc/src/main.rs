@@ -1,9 +1,9 @@
-//! Aerotech Ensemble motor IOC.
+//! Aerotech motor IOC (Ensemble + A3200).
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
-//! `drvAsynSerialPortConfigure`), the Ensemble iocsh command
-//! (`EnsembleAsynConfig`), the motor record type, and the CA + PVA (QSRV)
-//! server.
+//! `drvAsynSerialPortConfigure`), the Aerotech iocsh commands
+//! (`EnsembleAsynConfig`, `A3200AsynConfig`), the motor record type, and the
+//! CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p aerotech-ioc -- st.cmd
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_aerotech::ioc::ensemble_config_command;
+use motor_aerotech::ioc::{a3200_config_command, ensemble_config_command};
 use motor_common::MotorHolder;
 
 #[epics_rs::base::epics_main]
@@ -38,10 +38,11 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // Ensemble config command creates the controller + all axes on one motor
-    // device support.
+    // Aerotech config commands create the controller + all axes on one motor
+    // device support (Ensemble by axis index, A3200 by discovered axis name).
     let holder = MotorHolder::new();
     app = app.register_startup_command(ensemble_config_command(&holder));
+    app = app.register_startup_command(a3200_config_command(&holder));
     app = app.register_dynamic_device_support(holder.device_support_factory());
 
     app.startup_script(&script)
