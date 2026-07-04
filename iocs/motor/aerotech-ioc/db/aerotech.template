@@ -1,0 +1,20 @@
+# Aerotech Ensemble: one motor record per axis. Load once per axis, matching an
+# axis found by EnsembleAsynConfig. DTYP is ENSEMBLE_$(CTRL)_$(AXIS), where AXIS
+# is the controller axis number.
+#
+# The driver works in the Ensemble's user units (the C stepSize = 1/CountsPerUnit
+# scaling cancels at the EGU boundary), so MRES = 1 and EGU is whatever the
+# controller's CountsPerUnit is configured for (e.g. mm or deg). VELO/ACCL are in
+# those user units per second / per second^2.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "ENSEMBLE_$(CTRL)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=100.0)")
+    field(DLLM, "$(LLM=-100.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=4)")
+}
