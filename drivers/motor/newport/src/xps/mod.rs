@@ -12,6 +12,7 @@ pub mod axis;
 pub mod commands;
 pub mod controller;
 pub mod corrector;
+pub mod ftp;
 pub mod profile;
 pub mod rpc;
 
