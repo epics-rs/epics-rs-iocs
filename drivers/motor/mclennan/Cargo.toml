@@ -1,0 +1,13 @@
+# Mclennan PM304 / PM600 stepper motor controller driver, ported from
+# epics-modules/motor motorMclennan (drvPM304.cc + devPM304.cc). Pure serial
+# ASCII protocol — no vendor library, so this crate builds/tests on any host.
+
+[package]
+name = "motor-mclennan"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

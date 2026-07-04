@@ -1,0 +1,21 @@
+# Mclennan PM304/PM600: one motor record per axis. Load once per axis with
+# N = 0-based axis index (DTYP PM304_$(CARD)_$(N)); the driver maps index
+# 0,1,2,... to controller axes 1,2,3,...
+#
+# The PM304/PM600 is a stepper controller working in motor steps / encoder
+# counts. Positions travel the driver boundary in steps, so MRES = 1 and
+# EGU = steps. VELO (steps/s) and ACCL feed the controller's SV/SA/SD
+# parameters. Done comes from the controller status; the plus/minus limit
+# switches are reported.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PM304_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10000.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=10000000.0)")
+    field(DLLM, "$(LLM=-10000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}
