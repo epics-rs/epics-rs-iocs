@@ -1,0 +1,19 @@
+# Parker OEM750: one motor record per axis. Load once per axis with N = 0-based
+# axis index (DTYP OEM_$(CARD)_$(N)); the controller unit address is N + 1.
+#
+# The driver reports positions in controller counts (the motor resolution MR is
+# set to 1 and the velocity scale cancels), so MRES = 1 and EGU = counts. Done,
+# direction, limit and home status come from the R / W3 / IS queries; homing
+# zeroes the position at the home switch.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "OEM_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10000)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=10000000)")
+    field(DLLM, "$(LLM=-10000000)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+}
