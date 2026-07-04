@@ -26,8 +26,9 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MCDC2805 framing: commands and replies are CR-terminated.
-asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
+# MCDC2805 framing: the driver appends the CR terminator to each command, so
+# only the input EOS is configured here (replies are CR-terminated). Do not also
+# set an output EOS — the port would append it a second time.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r")
 
 # ---- MCDC2805 controller ----

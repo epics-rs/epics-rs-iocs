@@ -23,9 +23,9 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# E-516 framing: commands are CR-terminated (the driver appends the CR); each
-# reply is framed by an ETX (0x11) input EOS.
-asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
+# E-516 framing: the driver appends the CR terminator to each command, so only
+# the input EOS is configured here (each reply is framed by an ETX (0x11) input
+# EOS). Do not also set an output EOS — the port would append it a second time.
 asynOctetSetInputEos("$(SERIAL)", 0, "\021")
 
 # ---- PIJEDS controller ----

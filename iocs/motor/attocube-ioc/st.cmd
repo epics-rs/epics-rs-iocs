@@ -23,9 +23,10 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# ANC150 framing: commands are CR+LF terminated (the driver appends them), and
-# each reply blob ends at the "> " console prompt.
-asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
+# ANC150 framing: the driver appends the CR+LF terminator to each command, so
+# only the input EOS is configured here (each reply blob ends at the "> "
+# console prompt). Do not also set an output EOS — the port would append it a
+# second time.
 asynOctetSetInputEos("$(SERIAL)", 0, "> ")
 
 # ---- ANC150 controller ----

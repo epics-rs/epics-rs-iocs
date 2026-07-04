@@ -24,9 +24,9 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MMC framing: commands are CR-terminated (the driver appends the CR), and
-# replies are LF+CR terminated.
-asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
+# MMC framing: the driver appends the CR terminator to each command, so only
+# the input EOS is configured here (replies are LF+CR terminated). Do not also
+# set an output EOS — the port would append it a second time.
 asynOctetSetInputEos("$(SERIAL)", 0, "\n\r")
 
 # ---- MMC-200 controller ----
