@@ -1,0 +1,13 @@
+# Oriel Encoder Mike 18011 (EMC18011) motor controller driver, ported from
+# epics-modules/motor motorOriel (drvEMC18011.cc + devEMC18011.cc). Pure serial
+# ASCII protocol — no vendor library, so this crate builds/tests on any host.
+
+[package]
+name = "motor-oriel"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

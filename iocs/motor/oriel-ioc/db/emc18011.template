@@ -1,0 +1,21 @@
+# Oriel Encoder Mike 18011: one motor record per axis. Load once per axis with
+# N = 0-based axis index (DTYP EMC18011_$(CARD)_$(N)); the driver maps index
+# 0,1,2 to controller motors 1,2,3.
+#
+# The controller works in millimetres (position query and G/T moves are mm).
+# Positions travel the driver boundary in mm, so MRES = 1 and EGU = mm. VELO
+# (mm/s) feeds the V command; done and the plus/minus limit switches come from
+# the Z status character. The controller only reports position when stopped, and
+# only for the currently selected motor.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "EMC18011_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=25.0)")
+    field(DLLM, "$(LLM=-25.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=3)")
+}

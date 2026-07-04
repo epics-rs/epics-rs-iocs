@@ -1,0 +1,14 @@
+# Oriel Encoder Mike 18011 motor IOC binary. Wires the motor-oriel driver to a
+# serial octet port (drvAsynSerialPortConfigure) and one motor record per axis,
+# exposing CA + PVA. No vendor library — builds on any host.
+
+[package]
+name = "oriel-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-oriel = { path = "../../../drivers/motor/oriel" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
