@@ -1,0 +1,13 @@
+# Newport MM4000/4005/4006 motor IOC binary. Wires the motor-newport MM4000
+# driver to a serial octet port (drvAsynSerialPortConfigure) and one motor
+# record per axis, exposing CA + PVA. No vendor library — builds on any host.
+
+[package]
+name = "mm4000-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-newport = { path = "../../../drivers/motor/newport" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

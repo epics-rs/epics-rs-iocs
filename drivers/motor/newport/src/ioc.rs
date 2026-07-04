@@ -39,6 +39,7 @@ use crate::conex::ConexAxis;
 use crate::esp300::{Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
+use crate::mm4000::{Mm4000Axis, Mm4000Controller};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
@@ -87,6 +88,9 @@ const ESP300_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// MM3000 serial command timeout (C drvMM3000 `SERIAL_TIMEOUT` 5 s).
 const MM3000_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// MM4000 serial command timeout (C drvMM4000Asyn `TIMEOUT` 2 s).
+const MM4000_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default XPS FTP account and trajectory directory. C uses the factory
 /// `Administrator`/`Administrator` login; `/Admin/Public/Trajectories` is the
@@ -1571,6 +1575,67 @@ impl NewportHolder {
                 }
                 println!(
                     "MM3000CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM3000_{motor_port}_{{0..{}}})",
+                    num_axes - 1
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `MM4000CreateController` iocsh command.
+    ///
+    /// `MM4000CreateController(motorPort, serialPort, numAxes,
+    /// [movingPollMs], [idlePollMs])`
+    ///
+    /// Creates a Newport MM4000/4005/4006 controller on a pre-configured
+    /// serial (or GPIB octet) port and `numAxes` motor axes (DTYP
+    /// `MM4000_{motorPort}_{0..}`); the controller must report at least that
+    /// many axes on `TP;`. Replaces the C `MM4000AsynSetup`/`MM4000AsynConfig`
+    /// pair.
+    pub fn mm4000_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "MM4000CreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("serialPort"),
+                ArgDesc {
+                    name: "numAxes",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+            ],
+            "MM4000CreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs]) - Create a Newport MM4000/4005/4006 controller (DTYP MM4000_{motorPort}_{0..})",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let serial_port = req_string(args, 1, "serialPort")?;
+                let num_axes = match &args[2] {
+                    ArgValue::Int(v) if *v >= 1 => *v as usize,
+                    _ => return Err("numAxes must be a positive integer".into()),
+                };
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+                let handle = connect_serial(&serial_port, MM4000_TIMEOUT)?;
+                // Six per-axis polls share one controller-wide exchange (see
+                // the HXP driver for the TTL rationale).
+                let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
+                let controller = Mm4000Controller::new(handle, num_axes, cache_ttl)
+                    .map_err(|e| format!("MM4000CreateController: {e}"))?;
+                let firmware = controller.firmware().to_string();
+                let model = controller.model();
+                let controller = Arc::new(Mutex::new(controller));
+
+                for axis in 1..=num_axes {
+                    let ax = Mm4000Axis::new(controller.clone(), axis)
+                        .map_err(|e| format!("MM4000CreateController: axis {axis}: {e}"))?;
+                    let dtyp_key = format!("MM4000_{motor_port}_{}", axis - 1);
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                }
+                println!(
+                    "MM4000CreateController: motorPort={motor_port} serialPort={serial_port} firmware=\"{firmware}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM4000_{motor_port}_{{0..{}}})",
                     num_axes - 1
                 );
                 Ok(CommandOutcome::Continue)
