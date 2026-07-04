@@ -1,11 +1,13 @@
-//! SmarAct MCS2 motor IOC.
+//! SmarAct motor IOC (MCS2 + SCU).
 //!
-//! Assembles: an asyn IP octet port (`drvAsynIPPortConfigure`), the MCS2 iocsh
-//! command (`MCS2CreateController`), the motor record type, and the CA + PVA
-//! (QSRV) server.
+//! Assembles: an asyn octet port (`drvAsynIPPortConfigure` for the MCS2 or
+//! `drvAsynSerialPortConfigure` for the SCU), the SmarAct iocsh commands
+//! (`MCS2CreateController`; `smarActSCUCreateController` + `smarActSCUCreateAxis`),
+//! the motor record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
-//!   cargo run -p smaract-ioc -- st.cmd
+//!   cargo run -p smaract-ioc -- st.cmd        # MCS2
+//!   cargo run -p smaract-ioc -- st.scu.cmd    # SCU
 
 use std::sync::Arc;
 
@@ -13,7 +15,9 @@ use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_common::MotorHolder;
-use motor_smaract::ioc::mcs2_create_controller_command;
+use motor_smaract::ioc::{
+    mcs2_create_controller_command, scu_create_axis_command, scu_create_controller_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -37,9 +41,11 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // MCS2 iocsh command + motor device support.
+    // SmarAct iocsh commands (MCS2 + SCU) + motor device support.
     let holder = MotorHolder::new();
     app = app.register_startup_command(mcs2_create_controller_command(&holder));
+    app = app.register_startup_command(scu_create_controller_command());
+    app = app.register_startup_command(scu_create_axis_command(&holder));
     app = app.register_dynamic_device_support(holder.device_support_factory());
 
     app.startup_script(&script)

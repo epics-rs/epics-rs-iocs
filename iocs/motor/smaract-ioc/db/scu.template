@@ -1,0 +1,22 @@
+# SmarAct SCU: one motor record per axis. Load once per axis with N = 0-based
+# axis number (DTYP SCU_$(CARD)_$(N)); the controller channel it drives is set
+# separately by smarActSCUCreateAxis.
+#
+# The SCU works in microns (linear) / millidegrees (rotary); the driver scales
+# these to motor-record steps by 1000 (1000 steps = 1 micron / millidegree).
+# Positions cross the driver boundary in steps, so MRES = 0.001 makes the record
+# read directly in microns / millidegrees. CNEN enables closed-loop hold (the
+# controller actively holds the target after a move). Homed comes from the
+# SCU's persistent physical-position-known bit (GPPK).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "SCU_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=20000)")
+    field(DLLM, "$(LLM=-20000)")
+    field(MRES, "$(MRES=0.001)")
+    field(EGU,  "$(EGU=um)")
+    field(PREC, "$(PREC=3)")
+}
