@@ -1,0 +1,14 @@
+# piezosystem jena E-516 (PIJEDS) closed-loop piezo controller driver, ported
+# from epics-modules/motor motorPiJena (drvPIJEDS.cc + devPIJEDS.cc). Pure
+# serial ASCII protocol — no vendor library, so this crate builds/tests on any
+# host.
+
+[package]
+name = "motor-pijena"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }
