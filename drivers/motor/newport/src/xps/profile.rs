@@ -98,6 +98,72 @@ impl Profile {
         self.times.len()
     }
 
+    /// Parse a profile from CSV text for the group's `positioners` (given in the
+    /// order the trajectory columns map to — the controller's registration
+    /// order). Each non-empty, non-`#`-comment line is one point:
+    /// `time, pos_0, pos_1, ...` with one position column per positioner, in
+    /// device (positioner) units and seconds. Blank lines and `#` comments are
+    /// skipped. At least two points are required.
+    pub fn from_csv(
+        group: &str,
+        move_mode: MoveMode,
+        positioners: &[String],
+        csv: &str,
+    ) -> Result<Profile, String> {
+        if positioners.is_empty() {
+            return Err(format!("group '{group}' has no positioners"));
+        }
+        let expected_cols = positioners.len() + 1;
+        let mut times = Vec::new();
+        let mut columns: Vec<Vec<f64>> = vec![Vec::new(); positioners.len()];
+        for (lineno, raw) in csv.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let fields: Vec<f64> = line
+                .split(',')
+                .map(|f| {
+                    f.trim()
+                        .parse::<f64>()
+                        .map_err(|_| format!("line {}: '{}' is not a number", lineno + 1, f.trim()))
+                })
+                .collect::<Result<_, _>>()?;
+            if fields.len() != expected_cols {
+                return Err(format!(
+                    "line {}: expected {expected_cols} columns (time + {} positioners), got {}",
+                    lineno + 1,
+                    positioners.len(),
+                    fields.len()
+                ));
+            }
+            times.push(fields[0]);
+            for (col, value) in columns.iter_mut().zip(&fields[1..]) {
+                col.push(*value);
+            }
+        }
+        if times.len() < 2 {
+            return Err(format!(
+                "profile needs at least 2 points, got {}",
+                times.len()
+            ));
+        }
+        let axes = positioners
+            .iter()
+            .zip(columns)
+            .map(|(positioner, positions)| ProfileAxis {
+                positioner: positioner.clone(),
+                positions,
+            })
+            .collect();
+        Ok(Profile {
+            group: group.to_string(),
+            move_mode,
+            times,
+            axes,
+        })
+    }
+
     /// Build the XPS trajectory-file text (C `buildProfile`, XPSController.cpp:578-693).
     ///
     /// `max_acceleration` gives each axis's controller S-gamma max acceleration
@@ -322,6 +388,44 @@ mod tests {
         // Middle element 0 carries the averaged 1.5 velocity.
         assert_eq!(lines[1], "1.000000, 2.000000, 1.500000");
         assert_eq!(lines[2], "1.000000, 1.000000, 1.000000");
+    }
+
+    #[test]
+    fn parses_csv_skipping_comments_and_blanks() {
+        let csv = "\
+# a two-axis scan
+0.5, 0.0, 10.0
+
+0.5, 1.0, 12.0
+0.5, 2.0, 14.0
+";
+        let positioners = vec!["XY.X".to_string(), "XY.Y".to_string()];
+        let p = Profile::from_csv("XY", MoveMode::Absolute, &positioners, csv).unwrap();
+        assert_eq!(p.num_points(), 3);
+        assert_eq!(p.times, vec![0.5, 0.5, 0.5]);
+        assert_eq!(p.axes[0].positioner, "XY.X");
+        assert_eq!(p.axes[0].positions, vec![0.0, 1.0, 2.0]);
+        assert_eq!(p.axes[1].positions, vec![10.0, 12.0, 14.0]);
+    }
+
+    #[test]
+    fn csv_rejects_wrong_column_count_and_too_few_points() {
+        let positioners = vec!["XY.X".to_string()];
+        // Two columns for a one-positioner group (expects time + 1 = 2)? That is
+        // correct; make it wrong with three columns.
+        let bad = "0.5, 1.0, 2.0\n0.5, 3.0, 4.0\n";
+        assert!(Profile::from_csv("XY", MoveMode::Absolute, &positioners, bad).is_err());
+
+        let short = "0.5, 1.0\n";
+        let err = Profile::from_csv("XY", MoveMode::Absolute, &positioners, short).unwrap_err();
+        assert!(err.contains("at least 2 points"), "got: {err}");
+    }
+
+    #[test]
+    fn csv_rejects_non_numeric() {
+        let positioners = vec!["XY.X".to_string()];
+        let bad = "0.5, foo\n0.5, 1.0\n";
+        assert!(Profile::from_csv("XY", MoveMode::Absolute, &positioners, bad).is_err());
     }
 
     #[test]

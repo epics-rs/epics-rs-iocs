@@ -143,7 +143,7 @@ impl XpsAxis {
             let (_vel, _accel, min_jerk, max_jerk) = ctrl
                 .poll_socket()
                 .positioner_sgamma_parameters_get(positioner_name)?;
-            ctrl.register_axis(&group_name);
+            ctrl.register_axis(positioner_name, &group_name);
             (min_jerk, max_jerk)
         };
         Ok(Self {
