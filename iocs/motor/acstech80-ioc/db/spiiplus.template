@@ -1,0 +1,20 @@
+# ACS Tech80 SPiiPlus: one motor record per axis. Load once per axis with
+# N = 0-based axis index (DTYP SPIIPLUS_$(CARD)_$(N)); the driver uses the index
+# directly as the controller axis number.
+#
+# The SPiiPlus works in controller counts (?APOS/?FPOS return counts, ptp takes
+# counts). Positions travel the driver boundary in counts, so MRES = 1 and
+# EGU = counts. VELO (counts/s) feeds VEL; done and the plus/minus limit
+# switches come from the MST / FAULT status words.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "SPIIPLUS_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=100000.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=100000000.0)")
+    field(DLLM, "$(LLM=-100000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+}

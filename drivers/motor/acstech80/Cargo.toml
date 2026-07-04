@@ -1,0 +1,13 @@
+# ACS Tech80 SPiiPlus motion controller driver, ported from epics-modules/motor
+# motorAcsTech80 (drvSPiiPlus.cc + devSPiiPlus.cc). Pure serial/TCP ASCII ACSPL+
+# protocol — no vendor library, so this crate builds/tests on any host.
+
+[package]
+name = "motor-acstech80"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

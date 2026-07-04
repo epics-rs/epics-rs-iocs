@@ -19,6 +19,15 @@ pub fn arg_str_req(name: &'static str) -> ArgDesc {
     }
 }
 
+/// An optional string argument.
+pub fn arg_str_opt(name: &'static str) -> ArgDesc {
+    ArgDesc {
+        name,
+        arg_type: ArgType::String,
+        optional: true,
+    }
+}
+
 /// A required integer argument.
 pub fn arg_int_req(name: &'static str) -> ArgDesc {
     ArgDesc {
