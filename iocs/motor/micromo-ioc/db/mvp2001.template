@@ -1,0 +1,20 @@
+# MicroMo MVP 2001: one motor record per axis. Load once per axis with N =
+# 0-based axis index (DTYP MVP2001_$(CARD)_$(N)); the driver maps index 0,1,...
+# to controller axes 1,2,...
+#
+# Positions cross the driver boundary in the controller's native encoder counts,
+# so MRES = 1 and EGU = counts. VELO (counts/s) and ACCL feed the controller's
+# SP/AC conversions. The done, limit and power-on status come from the ST word.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MVP2001_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=1000000)")
+    field(DLLM, "$(LLM=-1000000)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+    field(CNEN, "$(CNEN=0)")
+}
