@@ -14,10 +14,14 @@
 //!
 //! ## Units
 //!
-//! The motor record works in raw steps; `step_size` (C `stepSize_`) is the
-//! controller EGU-per-step, computed at construction from model-specific
-//! queries. Outgoing positions/velocities are multiplied by `step_size` and
-//! the polled position divided back, matching the C driver.
+//! The asyn-rs motor boundary is dial-frame EGU in both directions (the
+//! record converts EGU ↔ raw counts itself), and CONEX commands/readbacks
+//! are already in physical units (mm/deg) — so positions and velocities pass
+//! through unscaled. C's `stepSize_` conversion existed only because the C
+//! record boundary was raw steps; applying it here would move the stage by
+//! the wrong factor. `step_size` is still computed from the model-specific
+//! queries because C uses it as the one-step offset from the soft limit in
+//! `moveVelocity`.
 //!
 //! ## Parity notes
 //!
@@ -297,7 +301,8 @@ pub struct ConexAxis {
     /// Numeric controller ID prefixed on every command (C `controllerID_`).
     controller_id: i32,
     model: ConexModel,
-    /// Controller EGU per motor step (C `stepSize_`).
+    /// Physical size of one motor step (C `stepSize_`), used only as the
+    /// one-step jog offset from the soft limits (see module Units note).
     step_size: f64,
     /// Soft travel limits in controller EGU (C `lowLimit_`/`highLimit_`).
     low_limit: f64,
@@ -387,17 +392,12 @@ impl ConexAxis {
         parse_closed_loop(&resp).ok_or_else(|| parse_error("MM?"))
     }
 
-    /// C `AG_CONEXAxis::move` velocity/accel preamble (model-gated).
+    /// C `AG_CONEXAxis::move` velocity/accel preamble (model-gated). Values
+    /// arrive in EGU/sec(²) — already controller units (module Units note).
     fn send_accel_and_velocity(&self, acceleration: f64, velocity: f64) -> AsynResult<()> {
         if self.model.supports_velocity() {
-            self.write(&cmd_set_acceleration(
-                self.controller_id,
-                acceleration * self.step_size,
-            ))?;
-            self.write(&cmd_set_velocity(
-                self.controller_id,
-                velocity * self.step_size,
-            ))?;
+            self.write(&cmd_set_acceleration(self.controller_id, acceleration))?;
+            self.write(&cmd_set_velocity(self.controller_id, velocity))?;
         }
         Ok(())
     }
@@ -413,10 +413,7 @@ impl AsynMotor for ConexAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.send_accel_and_velocity(acceleration, velocity)?;
-        self.write(&cmd_move_absolute(
-            self.controller_id,
-            position * self.step_size,
-        ))
+        self.write(&cmd_move_absolute(self.controller_id, position))
     }
 
     fn move_relative(
@@ -430,10 +427,7 @@ impl AsynMotor for ConexAxis {
         // C `move()` has a native relative branch (PR); override the trait's
         // poll-then-absolute default to match.
         self.send_accel_and_velocity(acceleration, velocity)?;
-        self.write(&cmd_move_relative(
-            self.controller_id,
-            distance * self.step_size,
-        ))
+        self.write(&cmd_move_relative(self.controller_id, distance))
     }
 
     fn move_velocity(
@@ -527,10 +521,9 @@ impl AsynMotor for ConexAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Position (TP): controller EGU → raw steps via step_size.
-        let position_egu = parse_value_at(&self.write_read(&query(self.controller_id, "TP"))?, 3)
+        // Position (TP): controller units == record EGU, reported directly.
+        let position = parse_value_at(&self.write_read(&query(self.controller_id, "TP"))?, 3)
             .ok_or_else(|| parse_error("TP"))?;
-        let position = position_egu / self.step_size;
 
         // Status (TS): done + limits (model-dependent parse).
         let status = parse_ts(

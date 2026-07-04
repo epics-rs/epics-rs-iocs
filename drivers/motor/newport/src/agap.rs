@@ -20,9 +20,11 @@
 //!
 //! ## Units
 //!
-//! The AGAP operates in mm; the C driver fixes `stepSize_ = 1e-4` so the motor
-//! record's integer step readback keeps four decimals. Outgoing positions are
-//! multiplied by `STEP_SIZE`, the polled position divided back.
+//! The AGAP operates in mm/deg — the same physical units as the asyn-rs
+//! motor boundary, which is dial-frame EGU in both directions. Positions
+//! therefore pass through unscaled. C's fixed `stepSize_ = 1e-4` existed
+//! only to map its raw-step record boundary onto the wire units; applying
+//! it here would command the wrong physical position.
 
 use std::sync::{Arc, Mutex};
 
@@ -40,9 +42,10 @@ const READ_BUF: usize = 256;
 /// [`crate::conex`] for rationale).
 const TERMINATOR: &[u8] = b"\r\n";
 
-/// Fixed controller EGU-per-step (C `stepSize_ = 0.0001`): AGAP is in mm,
-/// scaled by 1e4 so the motor record keeps four decimals.
-const STEP_SIZE: f64 = 0.0001;
+// C fixes `stepSize_ = 0.0001` to map its raw-step record boundary onto the
+// AGAP's mm/deg wire units. The asyn-rs motor boundary is dial-frame EGU in
+// both directions, which already matches the wire units, so this port applies
+// no step scaling (see `crate::conex` module Units note).
 
 /// Closed-loop gain maxima (C constructor: `KPMax_ = KIMax_ = LFMax_ = 31`).
 const KP_MAX: f64 = 31.0;
@@ -193,9 +196,7 @@ impl AsynMotor for AgapAxis {
         // AGAP move sends no AC/VA preamble — position only.
         ctrl.write(&format!(
             "{}PA{}{:.6}",
-            ctrl.controller_id,
-            self.axis_name,
-            position * STEP_SIZE
+            ctrl.controller_id, self.axis_name, position
         ))
     }
 
@@ -212,9 +213,7 @@ impl AsynMotor for AgapAxis {
         let ctrl = self.lock();
         ctrl.write(&format!(
             "{}PR{}{:.6}",
-            ctrl.controller_id,
-            self.axis_name,
-            distance * STEP_SIZE
+            ctrl.controller_id, self.axis_name, distance
         ))
     }
 
@@ -297,10 +296,8 @@ impl AsynMotor for AgapAxis {
         let id = ctrl.controller_id;
 
         // Position (per-axis TP): "1TPU<value>", value at offset 4.
-        let position_egu =
-            parse_value_at(&ctrl.write_read(&format!("{id}TP{}", self.axis_name))?, 4)
-                .ok_or_else(|| parse_error("TP"))?;
-        let position = position_egu / STEP_SIZE;
+        let position = parse_value_at(&ctrl.write_read(&format!("{id}TP{}", self.axis_name))?, 4)
+            .ok_or_else(|| parse_error("TP"))?;
 
         // Moving status (controller-wide TS) and power-on (controller-wide MM?)
         // are shared by both axes.
@@ -355,14 +352,8 @@ mod tests {
     fn move_command_formatting_matches_c_sprintf() {
         // Verify the per-axis command shape (id, axis letter, %f 6-decimals).
         let id = 1;
-        assert_eq!(
-            format!("{id}PA{}{:.6}", 'U', 5.0 * STEP_SIZE),
-            "1PAU0.000500"
-        );
-        assert_eq!(
-            format!("{id}PR{}{:.6}", 'V', -10.0 * STEP_SIZE),
-            "1PRV-0.001000"
-        );
+        assert_eq!(format!("{id}PA{}{:.6}", 'U', 0.0005), "1PAU0.000500");
+        assert_eq!(format!("{id}PR{}{:.6}", 'V', -0.001), "1PRV-0.001000");
         assert_eq!(format!("{id}ST{}", 'U'), "1STU");
         assert_eq!(format!("{id}KP{}{:.6}", 'U', 0.5 * KP_MAX), "1KPU15.500000");
         // Controller-wide (no axis letter).

@@ -18,9 +18,11 @@ pub const HXP_GROUP: &str = "HEXAPOD";
 /// Number of hexapod axes: X, Y, Z, U, V, W (C `NUM_AXES`).
 pub const NUM_HXP_AXES: usize = 6;
 
-/// Device units per motor-record step (C hardcodes `MRES 0.00001`): commands
-/// send `steps * HXP_MRES`, readbacks divide by it.
-pub const HXP_MRES: f64 = 0.00001;
+// Units note: C HXPDriver hardcodes record `MRES 0.00001` and converts its
+// raw-step record boundary to hexapod mm/deg with it. The asyn-rs motor
+// boundary is dial-frame EGU in both directions — the same physical units the
+// hexapod RPCs speak — so this port applies no step scaling anywhere and the
+// record's MRES is a free display/deadband resolution.
 
 /// Coordinate system used for motor-record moves (C `HXP_MOVE_COORD_SYS`
 /// param: 0=Work, 1=Tool).

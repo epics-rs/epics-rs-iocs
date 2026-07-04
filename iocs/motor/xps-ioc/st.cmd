@@ -31,6 +31,9 @@ drvAsynIPPortConfigure("$(MOVE0)", "$(HOST)", 0, 0, 1)
 #                     [enableSetPosition], [setPositionSettlingMs])
 XPSCreateController("$(PORT)", "$(POLL)", 1, 100, 1000, 0, 0)
 # XPSCreateAxis(motorPort, movePort, axis, positionerName, stepsPerUnit)
+# stepsPerUnit: pass 1 in the normal configuration (record EGU == positioner
+# units); the record boundary is EGU, so the C steps-per-unit value does not
+# apply here.
 XPSCreateAxis("$(PORT)", "$(MOVE0)", 0, "GROUP1.POSITIONER", 1)
 
 dbLoadRecords("db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT)")

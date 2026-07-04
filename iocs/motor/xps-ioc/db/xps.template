@@ -1,6 +1,8 @@
 # Newport XPS: one motor record per axis. The XPS is a closed-loop servo with
 # an encoder, so RBV tracks the encoder position. Positions are in engineering
-# units (mm/deg); with stepsPerUnit=1 in XPSCreateAxis, MRES = 1 EGU per step.
+# units (mm/deg); pass stepsPerUnit=1 in XPSCreateAxis so positions travel the
+# driver boundary in EGU unscaled. MRES only sets the record's raw-count
+# resolution (display/deadband granularity).
 
 record(motor, "$(P)$(M0)") {
     field(DTYP, "XPS_$(PORT)_0")

@@ -13,11 +13,14 @@
 //!
 //! ## Units
 //!
-//! The motor record works in raw motor steps; `step_size` is the controller's
-//! EGU-per-step (`eguPerStep` in `SMC100CreateController`). The C driver
-//! multiplies outgoing positions/velocities by `stepSize_` and divides the
-//! polled position back, and this port does the same so the record's raw
-//! readback matches.
+//! The asyn-rs motor boundary is dial-frame EGU in both directions (the
+//! record converts EGU ↔ raw counts itself), and SMC100 commands/readbacks
+//! are already in physical units (mm) — so the correct wire scale is 1.0 in
+//! the normal record-EGU-equals-controller-units configuration. `step_size`
+//! is kept as a record-EGU → controller-units conversion factor for records
+//! deliberately using a different unit (e.g. µm records on an mm
+//! controller). C's `stepSize_` (`eguPerStep`) converted its raw-step record
+//! boundary instead; passing that C value here would scale moves wrongly.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
@@ -45,13 +48,15 @@ pub struct Smc100Axis {
     /// 1-based controller axis number sent as the command prefix (C
     /// `axisNo_ + 1`). The SMC100 supports a single axis, addressed as `1`.
     axis: u8,
-    /// Controller EGU per motor step (C `stepSize_`).
+    /// Controller units per record EGU (wire scale; 1.0 in the normal
+    /// configuration — see the module Units note).
     step_size: f64,
 }
 
 impl Smc100Axis {
     /// Create a driver for `axis` (1-based) over the given serial-port handle.
-    /// `step_size` is the controller EGU-per-step (`eguPerStep`).
+    /// `step_size` is the controller-units-per-record-EGU wire scale
+    /// (normally 1.0; see the module Units note).
     pub fn new(handle: SyncIOHandle, axis: u8, step_size: f64) -> Self {
         Self {
             handle,
@@ -82,8 +87,8 @@ impl Smc100Axis {
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 
-    /// C `SMC100Axis::sendAccelAndVelocity`: send `VA` then `AC`, both scaled
-    /// by `stepSize_`.
+    /// C `SMC100Axis::sendAccelAndVelocity`: send `VA` then `AC`, through the
+    /// wire scale (identity in the normal configuration).
     fn send_accel_and_velocity(&self, acceleration: f64, velocity: f64) -> AsynResult<()> {
         self.write(&protocol::cmd_set_velocity(
             self.axis,
@@ -184,11 +189,12 @@ impl AsynMotor for Smc100Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Position (TP): controller EGU -> raw steps via step_size.
-        let position_egu =
+        // Position (TP): controller units -> record EGU via the wire scale
+        // (identity in the normal configuration).
+        let position_units =
             protocol::parse_value(&self.write_read(&protocol::cmd_query_position(self.axis))?)
                 .ok_or_else(|| parse_error("TP"))?;
-        let position = position_egu / self.step_size;
+        let position = position_units / self.step_size;
 
         // Status (TS): moving / limits / at-home.
         let status =

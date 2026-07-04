@@ -7,8 +7,9 @@
 //! go out the axis's own move socket without waiting for completion — the poll
 //! observes when the move finishes via `GroupStatusGet`.
 //!
-//! Positions are scaled by `step_size` (device units per motor step, C
-//! `stepSize_`): commands send `value * step_size`, readbacks divide by it.
+//! Positions pass through `step_size` as a record-EGU → positioner-units
+//! wire scale (1.0 in the normal configuration; C's `stepSize_` instead
+//! converted its raw-step record boundary — the asyn-rs boundary is EGU).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;

@@ -1,7 +1,8 @@
 # Newport HXP hexapod: one motor record per hexapod coordinate.
-# X/Y/Z are translations (mm), U/V/W rotations (deg). The driver hardcodes
-# MRES = 0.00001 device units per step (C HXPDriver MRES), so the records use
-# the same value and RBV reads back in engineering units.
+# X/Y/Z are translations (mm), U/V/W rotations (deg). Positions travel the
+# driver boundary in engineering units (mm/deg) directly; MRES only sets the
+# record's raw-count resolution (display/deadband granularity). 0.00001
+# matches the C HXPDriver's hardcoded record MRES.
 
 record(motor, "$(P)$(MX)") {
     field(DTYP, "HXP_$(PORT)_0")

@@ -16,10 +16,14 @@
 //!
 //! ## Units
 //!
-//! The record works in steps; command values are `steps *
-//! drive_resolution` and position readbacks divide back (C `cntrl_units` /
-//! `set_status`). `drive_resolution` is discovered per axis at startup from
-//! the feedback configuration (`ZB?` → `FR?`/`QS?` or `SU?`).
+//! The asyn-rs motor boundary is dial-frame EGU in both directions, and the
+//! ESP300 commands/readbacks are already in physical units (mm/deg per the
+//! stage's SN configuration) — so positions, velocities, and accelerations
+//! pass through unscaled. C's `cntrl_units = dval * drive_resolution` existed
+//! only because the C record boundary was raw steps. `drive_resolution` is
+//! still discovered per axis at startup (`ZB?` → `FR?`/`QS?` or `SU?`)
+//! because C scales PID gain writes by it (kept for wire parity) and the
+//! `ZB?` feedback bits drive encoder/gain-support status.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -184,7 +188,8 @@ pub struct Esp300Axis {
     /// 1-based controller axis number, sent zero-padded (`%.2d`).
     axis: usize,
     /// Controller units per motor step (C `drive_resolution`), discovered at
-    /// construction from the feedback configuration.
+    /// construction from the feedback configuration. Used only to scale PID
+    /// gain writes for C wire parity (module Units note).
     drive_resolution: f64,
     /// Stage has an encoder (`ZB?` feedback bits 8/9) — drives the
     /// gain-support/has-encoder status bits (C `EA_PRESENT`/`GAIN_SUPPORT`).
@@ -237,19 +242,10 @@ impl Esp300Axis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Steps → controller units (C `cntrl_units = dval * drive_resolution`).
-    fn units(&self, steps: f64) -> f64 {
-        steps * self.drive_resolution
-    }
-
-    /// [`motion_preamble`] with this axis's step scaling applied.
+    /// [`motion_preamble`] for this axis. Values arrive in EGU/sec(²),
+    /// already controller units (module Units note).
     fn motion_preamble(&self, min_velocity: f64, velocity: f64, acceleration: f64) -> String {
-        motion_preamble(
-            self.axis,
-            self.units(min_velocity),
-            self.units(velocity),
-            self.units(acceleration),
-        )
+        motion_preamble(self.axis, min_velocity, velocity, acceleration)
     }
 }
 
@@ -269,7 +265,7 @@ impl AsynMotor for Esp300Axis {
             "{};{:02}PA{:.6}",
             self.motion_preamble(min_velocity, velocity, acceleration),
             self.axis,
-            self.units(position)
+            position
         ))
     }
 
@@ -286,7 +282,7 @@ impl AsynMotor for Esp300Axis {
             "{};{:02}PR{:.6}",
             self.motion_preamble(min_velocity, velocity, acceleration),
             self.axis,
-            self.units(distance)
+            distance
         ))
     }
 
@@ -300,13 +296,11 @@ impl AsynMotor for Esp300Axis {
         // Record JOG transaction: SET_ACCEL then VA with the jog speed and a
         // signed MV (C `JOG` case).
         let a = self.axis;
-        let sign = if self.units(velocity) > 0.0 { '+' } else { '-' };
+        let sign = if velocity > 0.0 { '+' } else { '-' };
         let ctrl = self.lock();
         ctrl.write(&format!(
-            "{a:02}AC{:.6};{a:02}AG{:.6};{a:02}VA{:.6};{a:02}MV{sign}",
-            self.units(acceleration),
-            self.units(acceleration),
-            self.units(velocity).abs(),
+            "{a:02}AC{acceleration:.6};{a:02}AG{acceleration:.6};{a:02}VA{:.6};{a:02}MV{sign}",
+            velocity.abs(),
         ))
     }
 
@@ -336,7 +330,7 @@ impl AsynMotor for Esp300Axis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `LOAD_POS`: define home (DH) at the given position.
         let ctrl = self.lock();
-        ctrl.write(&format!("{:02}DH{:.6}", self.axis, self.units(position)))
+        ctrl.write(&format!("{:02}DH{position:.6}", self.axis))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
@@ -351,12 +345,12 @@ impl AsynMotor for Esp300Axis {
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write(&format!("{:02}SR{:.6}", self.axis, self.units(position)))
+        ctrl.write(&format!("{:02}SR{position:.6}", self.axis))
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write(&format!("{:02}SL{:.6}", self.axis, self.units(position)))
+        ctrl.write(&format!("{:02}SL{position:.6}", self.axis))
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
@@ -369,8 +363,11 @@ impl AsynMotor for Esp300Axis {
             PidGainKind::Integral => "KI",
             PidGainKind::Derivative => "KD",
         };
+        // C passes the gain through its uniform `dval * drive_resolution`
+        // conversion even though the gain is dimensionless; kept bug-for-bug
+        // so the wire bytes match.
         let ctrl = self.lock();
-        ctrl.write(&format!("{a}{cc}{:.6};{a}UF", self.units(gain)))
+        ctrl.write(&format!("{a}{cc}{:.6};{a}UF", gain * self.drive_resolution))
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -406,7 +403,8 @@ impl AsynMotor for Esp300Axis {
         }
         let done = md == "1";
 
-        let position = atof(&ctrl.write_read(&format!("{a:02}TP?"))?) / self.drive_resolution;
+        // TP? reports controller units == record EGU (module Units note).
+        let position = atof(&ctrl.write_read(&format!("{a:02}TP?"))?);
         // Direction from the position delta; only one position query exists,
         // so the encoder position is the same value (C set_status).
         if position != self.last_status.position {

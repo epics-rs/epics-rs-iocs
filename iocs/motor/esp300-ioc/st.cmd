@@ -34,8 +34,8 @@ asynOctetSetInputEos("$(SERIAL)", 0, "\n")
 ESP300CreateController("$(PORT)", "$(SERIAL)", 100, 1000)
 
 # One motor record per discovered axis (DTYP ESP300_$(PORT)_0, _1, ...).
-# MRES must be set to the axis drive resolution (see motorNewport README):
-# the driver reads positions back in drive-resolution steps.
+# Positions travel the driver boundary in EGU directly; MRES only sets the
+# record's raw-count resolution (display/deadband granularity).
 dbLoadRecords("db/esp300.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.0001,EGU=mm")
 
 iocInit()

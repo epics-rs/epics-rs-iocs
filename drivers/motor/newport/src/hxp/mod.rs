@@ -14,4 +14,4 @@ pub mod commands;
 pub mod controller;
 
 pub use axis::HxpAxis;
-pub use controller::{HXP_GROUP, HXP_MRES, HxpController, MoveCoordSys, NUM_HXP_AXES};
+pub use controller::{HXP_GROUP, HxpController, MoveCoordSys, NUM_HXP_AXES};

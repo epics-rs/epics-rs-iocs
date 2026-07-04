@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! drvAsynSerialPortConfigure("SERIAL", "/dev/ttyUSB0", ...)   // built-in asyn
-//!   -> SMC100CreateController("MOTOR", "SERIAL", eguPerStep, ...)
+//!   -> SMC100CreateController("MOTOR", "SERIAL", wireScale, ...)
 //!        get_port("SERIAL") -> SyncIOHandle -> Smc100Axis -> MotorBuilder
 //!        -> spawn poll loop, store device support under DTYP "SMC100_MOTOR"
 //!   -> dbLoadRecords(smc100.template, "P=..,M=..,PORT=MOTOR")   // DTYP match
@@ -199,7 +199,13 @@ impl NewportHolder {
     /// Create the `SMC100CreateController` iocsh command.
     ///
     /// Usage:
-    /// `SMC100CreateController(motorPort, serialPort, eguPerStep, [movingPollMs], [idlePollMs])`
+    /// `SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs])`
+    ///
+    /// `wireScale` is the controller-units-per-record-EGU factor — 1.0 in the
+    /// normal configuration where the record EGU is the controller's native
+    /// unit (mm). It fills C's `eguPerStep` argument slot but is NOT that
+    /// value: the asyn-rs record boundary is EGU, not raw steps (see
+    /// [`crate::smc100`] module Units note).
     pub fn smc100_create_controller_command(self: &Arc<Self>) -> CommandDef {
         let holder = self.clone();
         CommandDef::new(
@@ -208,37 +214,34 @@ impl NewportHolder {
                 arg_str_req("motorPort"),
                 arg_str_req("serialPort"),
                 ArgDesc {
-                    name: "eguPerStep",
+                    name: "wireScale",
                     arg_type: ArgType::Double,
                     optional: false,
                 },
                 arg_int_opt("movingPollMs"),
                 arg_int_opt("idlePollMs"),
             ],
-            "SMC100CreateController(motorPort, serialPort, eguPerStep, [movingPollMs], [idlePollMs]) - Create a Newport SMC100 controller",
+            "SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs]) - Create a Newport SMC100 controller (wireScale: controller units per record EGU, normally 1.0)",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let motor_port = req_string(args, 0, "motorPort")?;
                 let serial_port = req_string(args, 1, "serialPort")?;
-                let egu_per_step = match &args[2] {
+                let wire_scale = match &args[2] {
                     ArgValue::Double(v) => *v,
-                    _ => return Err("eguPerStep must be a number".into()),
+                    _ => return Err("wireScale must be a number".into()),
                 };
-                if egu_per_step == 0.0 {
-                    return Err("eguPerStep must be non-zero".into());
+                if wire_scale == 0.0 {
+                    return Err("wireScale must be non-zero".into());
                 }
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
                 let handle = connect_serial(&serial_port, SMC100_TIMEOUT)?;
                 let dtyp_key = format!("SMC100_{motor_port}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Smc100Axis::new(
-                    handle,
-                    SMC100_AXIS,
-                    egu_per_step,
-                )));
+                let motor: Arc<Mutex<dyn AsynMotor>> =
+                    Arc::new(Mutex::new(Smc100Axis::new(handle, SMC100_AXIS, wire_scale)));
 
                 holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
                 println!(
-                    "SMC100CreateController: motorPort={motor_port} serialPort={serial_port} eguPerStep={egu_per_step} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
+                    "SMC100CreateController: motorPort={motor_port} serialPort={serial_port} wireScale={wire_scale} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
                 );
                 Ok(CommandOutcome::Continue)
             },
@@ -583,7 +586,11 @@ impl NewportHolder {
     /// `XPSCreateController`, registered under DTYP `XPS_{motorPort}_{axis}`.
     /// `movePort` is this axis's own `drvAsynIPPort` (TCP), used for the
     /// fire-and-forget move socket. `positionerName` is `group.positioner` and
-    /// `stepsPerUnit` follows C: `stepSize = 1 / stepsPerUnit`. [`XpsAxis::new`]
+    /// `stepsPerUnit` fills C's argument slot; the driver applies
+    /// `1 / stepsPerUnit` as a record-EGU → positioner-units wire scale, so
+    /// pass 1 in the normal configuration where the record EGU is the
+    /// positioner's native unit — NOT the C steps-per-unit value (the asyn-rs
+    /// record boundary is EGU, not raw steps). [`XpsAxis::new`]
     /// performs blocking RPC (reads the S-gamma jerk times), so the controller
     /// must be reachable when this command runs.
     pub fn xps_create_axis_command(self: &Arc<Self>) -> CommandDef {

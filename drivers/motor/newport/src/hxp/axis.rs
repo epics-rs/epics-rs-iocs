@@ -18,7 +18,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::user::AsynUser;
 
-use super::controller::{HXP_GROUP, HXP_MRES, HxpController, MoveCoordSys};
+use super::controller::{HXP_GROUP, HxpController, MoveCoordSys};
 use crate::xps::rpc::{XpsError, XpsSocket};
 
 /// One hexapod coordinate as an asyn motor axis.
@@ -65,7 +65,9 @@ impl AsynMotor for HxpAxis {
         _velocity: f64,
         _acceleration: f64,
     ) -> AsynResult<()> {
-        let end_pos = position * HXP_MRES;
+        // Boundary EGU == hexapod mm/deg: no step scaling (see HXP_GROUP
+        // module Units note in `super::controller`).
+        let end_pos = position;
         let (coord_sys, current) = {
             let ctrl = self.lock_controller();
             (ctrl.move_coord_sys(), ctrl.current_positions()?)
@@ -106,7 +108,7 @@ impl AsynMotor for HxpAxis {
             MoveCoordSys::Tool => "Tool",
         };
         let mut deltas = [0.0; 6];
-        deltas[self.axis_no] = distance * HXP_MRES;
+        deltas[self.axis_no] = distance;
         tolerate_dir_change(
             self.move_sock
                 .hexapod_move_incremental(HXP_GROUP, cs_name, &deltas),
@@ -157,8 +159,8 @@ impl AsynMotor for HxpAxis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let data = self.lock_controller().poll_data();
         Ok(MotorStatus {
-            position: data.setpoint[self.axis_no] / HXP_MRES,
-            encoder_position: data.encoder[self.axis_no] / HXP_MRES,
+            position: data.setpoint[self.axis_no],
+            encoder_position: data.encoder[self.axis_no],
             done: !data.moving,
             moving: data.moving,
             problem: data.problem,

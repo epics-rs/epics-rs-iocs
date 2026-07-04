@@ -1,6 +1,7 @@
 # CONEX-AGAP two-axis piezo goniometer: one motor record per axis (U, V).
-# The driver fixes stepSize = 1e-4, so MRES = 1e-4 keeps four decimals of the
-# controller's mm/deg readback.
+# Positions travel the driver boundary in EGU (controller units, mm/deg)
+# directly; MRES only sets the record's raw-count resolution
+# (display/deadband granularity).
 
 record(motor, "$(P)$(MU)") {
     field(DTYP, "AGAP_$(PORT)_U")

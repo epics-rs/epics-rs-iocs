@@ -32,9 +32,14 @@ asynSetOption("$(SERIAL)", 0, "stop",   "1")
 # simulator before production use.
 
 # ---- SMC100 controller ----
-# SMC100CreateController(motorPort, serialPort, eguPerStep, [movingPollMs], [idlePollMs])
-SMC100CreateController("$(PORT)", "$(SERIAL)", 0.001, 100, 1000)
+# SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs])
+# wireScale is controller-units-per-record-EGU: 1.0 when the record EGU is the
+# controller's native unit (mm), which is the normal configuration. This is
+# NOT the C driver's eguPerStep — the record boundary here is EGU, not steps.
+SMC100CreateController("$(PORT)", "$(SERIAL)", 1.0, 100, 1000)
 
+# MRES only sets the record's raw-count resolution (display/deadband
+# granularity); positions travel the driver boundary in EGU directly.
 dbLoadRecords("db/smc100.template", "P=$(P),M=$(M),PORT=$(PORT),MRES=0.001,EGU=mm")
 
 iocInit()

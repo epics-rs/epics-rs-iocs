@@ -5,9 +5,9 @@ record(motor, "$(P)$(M)") {
     field(ACCL, "$(ACCL=0.5)")
     field(DHLM, "$(HLM=100.0)")
     field(DLLM, "$(LLM=-100.0)")
-    # MRES (EGU per step) must match the driver's runtime stepSize for the
-    # controller/stage. Default 1e-4 suits the DL model; CC/AGP use the stage
-    # encoder increment, CONEX-PP uses fullStepSize/microSteps.
+    # Positions travel the driver boundary in EGU (controller units, mm)
+    # directly; MRES only sets the record's raw-count resolution
+    # (display/deadband granularity).
     field(MRES, "$(MRES=0.0001)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
