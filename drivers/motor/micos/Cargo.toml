@@ -1,0 +1,12 @@
+# Micos motor controllers (SMC corvus and siblings), ASCII over an asyn octet
+# port. No vendor library — builds on any host.
+
+[package]
+name = "motor-micos"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }
