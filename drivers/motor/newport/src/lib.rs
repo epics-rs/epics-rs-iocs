@@ -9,6 +9,7 @@
 pub mod agap;
 pub mod agilis;
 pub mod conex;
+pub mod hxp;
 pub mod ioc;
 pub mod protocol;
 pub mod smc100;
@@ -18,6 +19,7 @@ pub mod xps;
 pub use agap::{AgapAxis, AgapController};
 pub use agilis::{AgUcAxis, AgUcController};
 pub use conex::ConexAxis;
+pub use hxp::{HxpAxis, HxpController};
 pub use ioc::NewportHolder;
 pub use smc100::Smc100Axis;
 pub use xps::{XpsAxis, XpsController};

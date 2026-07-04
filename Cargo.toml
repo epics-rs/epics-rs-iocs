@@ -11,6 +11,7 @@ members = [
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
     "iocs/motor/conex-ioc",
+    "iocs/motor/hxp-ioc",
     "iocs/motor/smc100-ioc",
     "iocs/motor/xps-ioc",
     "iocs/usb-2408-ioc",

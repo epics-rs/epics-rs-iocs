@@ -1,0 +1,64 @@
+# Newport HXP hexapod: one motor record per hexapod coordinate.
+# X/Y/Z are translations (mm), U/V/W rotations (deg). The driver hardcodes
+# MRES = 0.00001 device units per step (C HXPDriver MRES), so the records use
+# the same value and RBV reads back in engineering units.
+
+record(motor, "$(P)$(MX)") {
+    field(DTYP, "HXP_$(PORT)_0")
+    field(SCAN, "Passive")
+    field(DHLM, "$(HLM=50)")
+    field(DLLM, "$(LLM=-50)")
+    field(MRES, "$(MRES=0.00001)")
+    field(EGU,  "mm")
+    field(PREC, "$(PREC=5)")
+}
+
+record(motor, "$(P)$(MY)") {
+    field(DTYP, "HXP_$(PORT)_1")
+    field(SCAN, "Passive")
+    field(DHLM, "$(HLM=50)")
+    field(DLLM, "$(LLM=-50)")
+    field(MRES, "$(MRES=0.00001)")
+    field(EGU,  "mm")
+    field(PREC, "$(PREC=5)")
+}
+
+record(motor, "$(P)$(MZ)") {
+    field(DTYP, "HXP_$(PORT)_2")
+    field(SCAN, "Passive")
+    field(DHLM, "$(HLM=50)")
+    field(DLLM, "$(LLM=-50)")
+    field(MRES, "$(MRES=0.00001)")
+    field(EGU,  "mm")
+    field(PREC, "$(PREC=5)")
+}
+
+record(motor, "$(P)$(MU)") {
+    field(DTYP, "HXP_$(PORT)_3")
+    field(SCAN, "Passive")
+    field(DHLM, "$(HLM=15)")
+    field(DLLM, "$(LLM=-15)")
+    field(MRES, "$(MRES=0.00001)")
+    field(EGU,  "deg")
+    field(PREC, "$(PREC=5)")
+}
+
+record(motor, "$(P)$(MV)") {
+    field(DTYP, "HXP_$(PORT)_4")
+    field(SCAN, "Passive")
+    field(DHLM, "$(HLM=15)")
+    field(DLLM, "$(LLM=-15)")
+    field(MRES, "$(MRES=0.00001)")
+    field(EGU,  "deg")
+    field(PREC, "$(PREC=5)")
+}
+
+record(motor, "$(P)$(MW)") {
+    field(DTYP, "HXP_$(PORT)_5")
+    field(SCAN, "Passive")
+    field(DHLM, "$(HLM=15)")
+    field(DLLM, "$(LLM=-15)")
+    field(MRES, "$(MRES=0.00001)")
+    field(EGU,  "deg")
+    field(PREC, "$(PREC=5)")
+}

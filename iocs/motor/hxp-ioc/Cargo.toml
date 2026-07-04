@@ -1,0 +1,15 @@
+# Newport HXP hexapod controller IOC binary. Wires the motor-newport HXP
+# driver to TCP octet sockets (drvAsynIPPortConfigure) and one motor record per
+# hexapod axis (X, Y, Z, U, V, W). The HXP vendor protocol is text RPC (the
+# hexapod build of the XPS library), so no vendor library is needed — builds on
+# any host.
+
+[package]
+name = "hxp-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-newport = { path = "../../../drivers/motor/newport" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

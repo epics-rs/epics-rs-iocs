@@ -36,6 +36,7 @@ use epics_rs::motor::poll_loop::PollCommand;
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
+use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
@@ -73,6 +74,11 @@ const XPS_MOVE_TIMEOUT: Duration = Duration::from_millis(100);
 /// generous upper bound so a wedged run cannot hang the executor thread forever.
 const XPS_PVT_EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// HXP hexapod poll-socket timeout (C `HXP_POLL_TIMEOUT` = 2 s).
+const HXP_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+/// HXP move-socket timeout (C sets `-0.1` s: fire-and-forget writes).
+const HXP_MOVE_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Default XPS FTP account and trajectory directory. C uses the factory
 /// `Administrator`/`Administrator` login; `/Admin/Public/Trajectories` is the
 /// XPS-C/Q public trajectory folder. Both are overridable on `XPSBuildProfile`.
@@ -98,6 +104,15 @@ struct XpsRegistration {
     idle_poll_ms: u64,
 }
 
+/// A shared HXP hexapod controller registered by `HXPCreateController` (its
+/// six axes are created with it). Keeps a dedicated `Fire`-mode move socket
+/// for the driver-private commands (`HXPMoveAll` blocks until the motion
+/// finishes on a `Query` socket, so it fires like the axis moves do).
+struct HxpRegistration {
+    controller: Arc<Mutex<HxpController>>,
+    move_sock: XpsSocket,
+}
+
 /// Holds Newport motor device-support instances created by the family's
 /// `*CreateController` commands. Each controller is stored under a
 /// `"{PREFIX}_{motor_port}"` DTYP key and consumed once by the dynamic
@@ -111,6 +126,9 @@ pub struct NewportHolder {
     /// XPS controllers keyed by motor port, bridging the two-step
     /// `XPSCreateController` / `XPSCreateAxis` iocsh API.
     xps_controllers: Mutex<HashMap<String, XpsRegistration>>,
+    /// HXP hexapod controllers keyed by motor port, for the driver-private
+    /// commands (`HXPMoveAll`, coordinate-system read/set, move coord-sys).
+    hxp_controllers: Mutex<HashMap<String, HxpRegistration>>,
 }
 
 impl NewportHolder {
@@ -120,6 +138,7 @@ impl NewportHolder {
             poll_senders: Mutex::new(Vec::new()),
             ag_uc_controllers: Mutex::new(HashMap::new()),
             xps_controllers: Mutex::new(HashMap::new()),
+            hxp_controllers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1180,6 +1199,263 @@ impl NewportHolder {
         )
     }
 
+    /// Create the `HXPCreateController` iocsh command.
+    ///
+    /// `HXPCreateController(motorPort, pollPort, movePort, [movingPollMs],
+    /// [idlePollMs])`
+    ///
+    /// Creates a Newport HXP hexapod controller and all six axes
+    /// (X, Y, Z, U, V, W — DTYP `HXP_{motorPort}_{0..5}`) in one step, as the C
+    /// `HXPController` constructor does. `pollPort`/`movePort` are
+    /// `drvAsynIPPort`s to the hexapod (DEVIATION: C opens raw TCP itself from
+    /// an IP address, one move socket per axis; here the six axes share the
+    /// one `movePort` connection for their fire-and-forget moves — hexapod
+    /// moves are whole-group commands, so they never overlap meaningfully).
+    pub fn hxp_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "HXPCreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("pollPort"),
+                arg_str_req("movePort"),
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+            ],
+            "HXPCreateController(motorPort, pollPort, movePort, [movingPollMs], [idlePollMs]) - Create a Newport HXP hexapod controller with its six axes X,Y,Z,U,V,W (DTYP HXP_{motorPort}_{0..5})",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let poll_port = req_string(args, 1, "pollPort")?;
+                let move_port = req_string(args, 2, "movePort")?;
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+                let handle = connect_ip(&poll_port, HXP_POLL_TIMEOUT)?;
+                let poll_sock = XpsSocket::new(handle, SocketMode::Query);
+                // One group poll serves all six axis polls per period: cache
+                // for half the fastest poll interval.
+                let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
+                let controller = Arc::new(Mutex::new(HxpController::new(poll_sock, cache_ttl)));
+
+                for axis_no in 0..NUM_HXP_AXES {
+                    let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
+                    let move_sock = XpsSocket::new(handle, SocketMode::Fire);
+                    let ax = HxpAxis::new(controller.clone(), move_sock, axis_no);
+                    let dtyp_key = format!("HXP_{motor_port}_{axis_no}");
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                }
+
+                let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
+                let move_sock = XpsSocket::new(handle, SocketMode::Fire);
+                holder
+                    .hxp_controllers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        motor_port.clone(),
+                        HxpRegistration {
+                            controller,
+                            move_sock,
+                        },
+                    );
+                println!(
+                    "HXPCreateController: motorPort={motor_port} pollPort={poll_port} movePort={move_port} axes=XYZUVW poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=HXP_{motor_port}_{{0..5}})"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Run `f` with the HXP registration for `motor_port` (the sockets are not
+    /// clonable, so callers borrow the registration under the map lock — every
+    /// hexapod command RPC is a single bounded exchange). Shared by the
+    /// driver-private hexapod commands.
+    fn with_hxp_registration<R>(
+        &self,
+        motor_port: &str,
+        cmd: &str,
+        f: impl FnOnce(&HxpRegistration) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let controllers = self
+            .hxp_controllers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let reg = controllers.get(motor_port).ok_or_else(|| {
+            format!("{cmd}: controller '{motor_port}' not found (call HXPCreateController first)")
+        })?;
+        f(reg)
+    }
+
+    /// Create the `HXPMoveAll` iocsh command.
+    ///
+    /// `HXPMoveAll(motorPort, x, y, z, u, v, w)`
+    ///
+    /// Moves all six hexapod axes to absolute Work-coordinate targets with a
+    /// single `HexapodMoveAbsolute` (C `HXPController::moveAll`, which reads
+    /// the targets from the `HXP_MOVE_ALL_TARGET_*` records; here they are
+    /// arguments). Fire-and-forget on the move socket — poll the motor records
+    /// for completion.
+    pub fn hxp_move_all_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "HXPMoveAll",
+            vec![
+                arg_str_req("motorPort"),
+                arg_double_req("x"),
+                arg_double_req("y"),
+                arg_double_req("z"),
+                arg_double_req("u"),
+                arg_double_req("v"),
+                arg_double_req("w"),
+            ],
+            "HXPMoveAll(motorPort, x, y, z, u, v, w) - Move all six hexapod axes to absolute Work-coordinate targets in one motion (device units)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let mut targets = [0.0; 6];
+                for (i, t) in targets.iter_mut().enumerate() {
+                    *t = req_double(args, i + 1, ["x", "y", "z", "u", "v", "w"][i])?;
+                }
+                holder.with_hxp_registration(&motor_port, "HXPMoveAll", |reg| {
+                    reg.move_sock
+                        .hexapod_move_absolute(HXP_GROUP, "Work", &targets)
+                        .map_err(|e| format!("HXPMoveAll: {e}"))
+                })?;
+                println!(
+                    "HXPMoveAll: motorPort={motor_port} targets={targets:?} (Work coordinates, fire-and-forget)"
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `HXPCoordSysRead` iocsh command.
+    ///
+    /// `HXPCoordSysRead(motorPort)`
+    ///
+    /// Reads and prints the Tool, Work, and Base coordinate-system definitions
+    /// (C `HXPController::readAllCS`, which posts them to the
+    /// `HXP_COORD_SYS_*` records; here they are printed). Runs on the poll
+    /// socket (DEVIATION: C reads over the move socket's 0.1 s best-effort
+    /// read; the `Query` poll socket waits for the reply reliably).
+    pub fn hxp_coord_sys_read_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "HXPCoordSysRead",
+            vec![arg_str_req("motorPort")],
+            "HXPCoordSysRead(motorPort) - Read and print the hexapod Tool/Work/Base coordinate-system definitions",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let controller =
+                    holder.with_hxp_registration(&motor_port, "HXPCoordSysRead", |reg| {
+                        Ok(reg.controller.clone())
+                    })?;
+                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                let sock = ctrl.poll_socket();
+                for cs in ["Tool", "Work", "Base"] {
+                    let p = sock
+                        .hexapod_coordinate_system_get(HXP_GROUP, cs)
+                        .map_err(|e| format!("HXPCoordSysRead: {cs}: {e}"))?;
+                    println!(
+                        "HXPCoordSysRead: {cs:<4} X={:.6} Y={:.6} Z={:.6} U={:.6} V={:.6} W={:.6}",
+                        p[0], p[1], p[2], p[3], p[4], p[5]
+                    );
+                }
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `HXPCoordSysSet` iocsh command.
+    ///
+    /// `HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w)`
+    ///
+    /// Redefines the origin of one hexapod coordinate system
+    /// (`Work`/`Tool`/`Base`, or C's record encoding `1`/`2`/`3`) —
+    /// C `HXPController::setCS`. Runs on the poll socket (same DEVIATION as
+    /// `HXPCoordSysRead`).
+    pub fn hxp_coord_sys_set_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "HXPCoordSysSet",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("coordSystem"),
+                arg_double_req("x"),
+                arg_double_req("y"),
+                arg_double_req("z"),
+                arg_double_req("u"),
+                arg_double_req("v"),
+                arg_double_req("w"),
+            ],
+            "HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w) - Redefine the origin of a hexapod coordinate system (Work/Tool/Base)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let cs_arg = req_string(args, 1, "coordSystem")?;
+                let cs = match cs_arg.to_ascii_lowercase().as_str() {
+                    "work" | "1" => "Work",
+                    "tool" | "2" => "Tool",
+                    "base" | "3" => "Base",
+                    other => {
+                        return Err(format!(
+                            "coordSystem must be Work, Tool or Base, got '{other}'"
+                        ));
+                    }
+                };
+                let mut origin = [0.0; 6];
+                for (i, t) in origin.iter_mut().enumerate() {
+                    *t = req_double(args, i + 2, ["x", "y", "z", "u", "v", "w"][i])?;
+                }
+                let controller =
+                    holder.with_hxp_registration(&motor_port, "HXPCoordSysSet", |reg| {
+                        Ok(reg.controller.clone())
+                    })?;
+                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                ctrl.poll_socket()
+                    .hexapod_coordinate_system_set(HXP_GROUP, cs, &origin)
+                    .map_err(|e| format!("HXPCoordSysSet: {e}"))?;
+                println!("HXPCoordSysSet: motorPort={motor_port} {cs} origin={origin:?}");
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `HXPSetMoveCoordSys` iocsh command.
+    ///
+    /// `HXPSetMoveCoordSys(motorPort, coordSystem)`
+    ///
+    /// Selects the coordinate system motor-record moves use: `Work`/`0`
+    /// (default) or `Tool`/`1` — the C `HXP_MOVE_COORD_SYS` record parameter
+    /// as a command.
+    pub fn hxp_set_move_coord_sys_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "HXPSetMoveCoordSys",
+            vec![arg_str_req("motorPort"), arg_str_req("coordSystem")],
+            "HXPSetMoveCoordSys(motorPort, coordSystem) - Select the coordinate system for motor-record moves: Work/0 (default) or Tool/1",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let cs_arg = req_string(args, 1, "coordSystem")?;
+                let cs = match cs_arg.to_ascii_lowercase().as_str() {
+                    "work" | "0" => MoveCoordSys::Work,
+                    "tool" | "1" => MoveCoordSys::Tool,
+                    other => {
+                        return Err(format!("coordSystem must be Work or Tool, got '{other}'"));
+                    }
+                };
+                let controller =
+                    holder.with_hxp_registration(&motor_port, "HXPSetMoveCoordSys", |reg| {
+                        Ok(reg.controller.clone())
+                    })?;
+                controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_move_coord_sys(cs);
+                println!("HXPSetMoveCoordSys: motorPort={motor_port} coordSystem={cs:?}");
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
     /// Return a dynamic device support factory that dispatches by DTYP name.
     /// Each device support is consumed once (take semantics).
     pub fn device_support_factory(
@@ -1228,6 +1504,22 @@ fn arg_double_opt(name: &'static str) -> ArgDesc {
         name,
         arg_type: ArgType::Double,
         optional: true,
+    }
+}
+
+fn arg_double_req(name: &'static str) -> ArgDesc {
+    ArgDesc {
+        name,
+        arg_type: ArgType::Double,
+        optional: false,
+    }
+}
+
+/// Read a required double arg.
+fn req_double(args: &[ArgValue], i: usize, name: &str) -> Result<f64, String> {
+    match args.get(i) {
+        Some(ArgValue::Double(v)) => Ok(*v),
+        _ => Err(format!("{name} must be a number")),
     }
 }
 
