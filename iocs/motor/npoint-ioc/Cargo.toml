@@ -1,0 +1,14 @@
+# nPoint C300 motor IOC binary. Wires the motor-npoint C300 driver to an asyn IP
+# octet port (drvAsynIPPortConfigure) and one motor record per axis, exposing
+# CA + PVA. No vendor library — builds on any host.
+
+[package]
+name = "npoint-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-npoint = { path = "../../../drivers/motor/npoint" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
