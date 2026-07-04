@@ -3,18 +3,26 @@ use uldaq_sys::*;
 use crate::device::DaqDevice;
 use crate::error::{self, Result};
 
+/// In/out pulse timing for [`DaqDevice::pulse_out_start`]: the driver may
+/// adjust all three to the nearest achievable values (C `ulTmrPulseOutStart`
+/// double pointers).
+#[derive(Clone, Copy, Debug)]
+pub struct PulseTiming {
+    pub frequency: f64,
+    pub duty_cycle: f64,
+    pub initial_delay: f64,
+}
+
 impl DaqDevice {
     /// Start a pulse output on the given timer.
     ///
-    /// `frequency`, `duty_cycle`, and `initial_delay` are in/out: the driver
-    /// may adjust them to the nearest achievable values.
+    /// `timing` is in/out: the driver may adjust it to the nearest achievable
+    /// values.
     pub fn pulse_out_start(
         &self,
         timer: i32,
-        frequency: &mut f64,
-        duty_cycle: &mut f64,
+        timing: &mut PulseTiming,
         pulse_count: u64,
-        initial_delay: &mut f64,
         idle_state: i32,
         options: i32,
     ) -> Result<()> {
@@ -22,10 +30,10 @@ impl DaqDevice {
             ulTmrPulseOutStart(
                 self.handle(),
                 timer,
-                frequency,
-                duty_cycle,
+                &mut timing.frequency,
+                &mut timing.duty_cycle,
                 pulse_count,
-                initial_delay,
+                &mut timing.initial_delay,
                 idle_state,
                 options,
             )

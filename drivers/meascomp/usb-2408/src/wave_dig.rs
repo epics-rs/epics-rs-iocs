@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
@@ -53,22 +54,41 @@ impl WaveDigState {
     }
 }
 
+/// Digitizer settings for [`start_wave_dig`], read from the WaveDig records.
+#[derive(Clone, Copy, Debug)]
+pub struct WaveDigScan {
+    pub first_chan: usize,
+    pub num_chans: usize,
+    pub num_points: usize,
+    pub dwell: f64,
+    pub input_mode: i32,
+    pub range: i32,
+    pub ext_trigger: bool,
+    pub ext_clock: bool,
+    pub continuous: bool,
+    pub retrigger: bool,
+    pub burst_mode: bool,
+}
+
 /// Start the waveform digitizer (analog input scan).
 pub fn start_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
-    first_chan: usize,
-    num_chans: usize,
-    num_points: usize,
-    dwell: f64,
-    input_mode: i32,
-    range: i32,
-    ext_trigger: bool,
-    ext_clock: bool,
-    continuous: bool,
-    retrigger: bool,
-    burst_mode: bool,
+    scan: &WaveDigScan,
 ) -> Result<(), String> {
+    let WaveDigScan {
+        first_chan,
+        num_chans,
+        num_points,
+        dwell,
+        input_mode,
+        range,
+        ext_trigger,
+        ext_clock,
+        continuous,
+        retrigger,
+        burst_mode,
+    } = *scan;
     state.first_chan = first_chan;
     state.num_chans = num_chans;
     state.num_points = num_points;
@@ -87,34 +107,49 @@ pub fn start_wave_dig(
             ..AiQueueElement::default()
         });
     }
-    device.analog_in_load_queue(&queue)
+    device
+        .analog_in_load_queue(&queue)
         .map_err(|e| format!("analog_in_load_queue error: {e}"))?;
 
     let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
 
     let mut options = SO_DEFAULTIO;
-    if ext_trigger { options |= SO_EXTTRIGGER; }
-    if ext_clock { options |= SO_EXTCLOCK; }
-    if continuous { options |= SO_CONTINUOUS; }
-    if retrigger { options |= SO_RETRIGGER; }
-    if burst_mode { options |= SO_BURSTMODE; }
+    if ext_trigger {
+        options |= SO_EXTTRIGGER;
+    }
+    if ext_clock {
+        options |= SO_EXTCLOCK;
+    }
+    if continuous {
+        options |= SO_CONTINUOUS;
+    }
+    if retrigger {
+        options |= SO_RETRIGGER;
+    }
+    if burst_mode {
+        options |= SO_BURSTMODE;
+    }
 
     // Save for auto-restart
     state.input_mode = input_mode;
     state.range = range;
     state.options = options;
 
-    device.analog_in_scan(
-        first_chan as i32,
-        (first_chan + num_chans - 1) as i32,
-        input_mode,
-        range,
-        num_points as i32,
-        &mut rate,
-        options,
-        AINSCAN_FF_DEFAULT,
-        &mut state.scan_buffer,
-    ).map_err(|e| format!("analog_in_scan error: {e}"))?;
+    device
+        .analog_in_scan(
+            &AInScanConfig {
+                low_chan: first_chan as i32,
+                high_chan: (first_chan + num_chans - 1) as i32,
+                input_mode,
+                range,
+                samples_per_chan: num_points as i32,
+                options,
+                flags: AINSCAN_FF_DEFAULT,
+            },
+            &mut rate,
+            &mut state.scan_buffer,
+        )
+        .map_err(|e| format!("analog_in_scan error: {e}"))?;
 
     state.dwell_actual = 1.0 / rate;
     state.running = true;
@@ -146,7 +181,9 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
     }
 
     let n_chans = state.num_chans;
-    if n_chans == 0 || xfer.current_index < 0 { return; }
+    if n_chans == 0 || xfer.current_index < 0 {
+        return;
+    }
 
     let last_point = ((xfer.current_index as usize + 1) / n_chans).min(state.num_points);
     let now = current_time_secs();
@@ -183,19 +220,27 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
                 log::warn!("WaveDig auto-restart: queue reload failed: {e}");
             } else {
                 // Restart scan with saved options
-                let mut rate = if state.dwell_actual > 0.0 { 1.0 / state.dwell_actual } else { 1000.0 };
+                let mut rate = if state.dwell_actual > 0.0 {
+                    1.0 / state.dwell_actual
+                } else {
+                    1000.0
+                };
                 match device.analog_in_scan(
-                    state.first_chan as i32,
-                    (state.first_chan + state.num_chans - 1) as i32,
-                    state.input_mode,
-                    state.range,
-                    state.num_points as i32,
+                    &AInScanConfig {
+                        low_chan: state.first_chan as i32,
+                        high_chan: (state.first_chan + state.num_chans - 1) as i32,
+                        input_mode: state.input_mode,
+                        range: state.range,
+                        samples_per_chan: state.num_points as i32,
+                        options: state.options,
+                        flags: AINSCAN_FF_DEFAULT,
+                    },
                     &mut rate,
-                    state.options,
-                    AINSCAN_FF_DEFAULT,
                     &mut state.scan_buffer,
                 ) {
-                    Ok(()) => { state.running = true; }
+                    Ok(()) => {
+                        state.running = true;
+                    }
                     Err(e) => log::warn!("WaveDig auto-restart: scan failed: {e}"),
                 }
             }

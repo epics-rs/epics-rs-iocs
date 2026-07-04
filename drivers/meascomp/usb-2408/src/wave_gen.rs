@@ -1,3 +1,4 @@
+use meascomp::analog_out::AOutScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
@@ -33,7 +34,7 @@ impl WaveGenState {
 /// Convert voltage waveform to raw 16-bit DAC units for ±10V range.
 /// Matches C++ drvMultiFunction: offset=10.0, scale=65535/20.0
 pub fn volts_to_dac(data: &mut [f64]) {
-    const DAC_OFFSET: f64 = 10.0;       // mid-scale for ±10V
+    const DAC_OFFSET: f64 = 10.0; // mid-scale for ±10V
     const DAC_SCALE: f64 = 65535.0 / 20.0; // 16-bit DAC units per volt
     for v in data.iter_mut() {
         *v = ((*v + DAC_OFFSET) * DAC_SCALE + 0.5).clamp(0.0, 65535.0);
@@ -61,13 +62,13 @@ pub fn generate_waveform(
 
     match wave_type {
         WAVE_TYPE_SIN => {
-            for i in 0..num_points {
-                data[i] = offset + amplitude * (2.0 * std::f64::consts::PI * i as f64 / n).sin();
+            for (i, d) in data.iter_mut().enumerate() {
+                *d = offset + amplitude * (2.0 * std::f64::consts::PI * i as f64 / n).sin();
             }
         }
         WAVE_TYPE_SQUARE => {
-            for i in 0..num_points {
-                data[i] = if i < num_points / 2 {
+            for (i, d) in data.iter_mut().enumerate() {
+                *d = if i < num_points / 2 {
                     offset + amplitude
                 } else {
                     offset - amplitude
@@ -75,14 +76,14 @@ pub fn generate_waveform(
             }
         }
         WAVE_TYPE_SAWTOOTH => {
-            for i in 0..num_points {
-                data[i] = offset + amplitude * (2.0 * i as f64 / n - 1.0);
+            for (i, d) in data.iter_mut().enumerate() {
+                *d = offset + amplitude * (2.0 * i as f64 / n - 1.0);
             }
         }
         WAVE_TYPE_PULSE => {
             let pulse_samples = ((pulse_width * n) as usize).max(1).min(num_points);
-            for i in 0..num_points {
-                data[i] = if i < pulse_samples {
+            for (i, d) in data.iter_mut().enumerate() {
+                *d = if i < pulse_samples {
                     offset + amplitude
                 } else {
                     offset
@@ -92,10 +93,10 @@ pub fn generate_waveform(
         WAVE_TYPE_RANDOM => {
             // Simple pseudo-random using a basic LCG
             let mut seed: u64 = 12345;
-            for i in 0..num_points {
+            for d in &mut data {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let frac = (seed >> 33) as f64 / (1u64 << 31) as f64; // 0..1
-                data[i] = offset + amplitude * (2.0 * frac - 1.0);
+                *d = offset + amplitude * (2.0 * frac - 1.0);
             }
         }
         _ => {
@@ -105,22 +106,39 @@ pub fn generate_waveform(
     data
 }
 
+/// Generation settings for [`start_wave_gen`], read from the WaveGen records.
+#[derive(Clone, Copy, Debug)]
+pub struct WaveGenScan {
+    pub first_chan: i32,
+    pub last_chan: i32,
+    pub num_points: usize,
+    pub freq: f64,
+    pub range: i32,
+    pub ext_trigger: bool,
+    pub ext_clock: bool,
+    pub continuous: bool,
+    pub retrigger: bool,
+}
+
 /// Start the waveform generator (analog output scan).
 pub fn start_wave_gen(
     device: &DaqDevice,
     state: &mut WaveGenState,
-    first_chan: i32,
-    last_chan: i32,
-    num_points: usize,
-    freq: f64,
-    range: i32,
-    ext_trigger: bool,
-    ext_clock: bool,
-    continuous: bool,
-    retrigger: bool,
+    scan: &WaveGenScan,
     waveform_data: &[f64],
     saved_outputs: &[f64],
 ) -> Result<(), String> {
+    let WaveGenScan {
+        first_chan,
+        last_chan,
+        num_points,
+        freq,
+        range,
+        ext_trigger,
+        ext_clock,
+        continuous,
+        retrigger,
+    } = *scan;
     let num_chans = (last_chan - first_chan + 1) as usize;
     state.num_chans = num_chans;
     state.num_points = num_points;
@@ -146,28 +164,38 @@ pub fn start_wave_gen(
     let mut rate = freq * num_points as f64;
 
     let mut options = SO_DEFAULTIO;
-    if ext_trigger { options |= SO_EXTTRIGGER; }
-    if ext_clock { options |= SO_EXTCLOCK; }
-    if continuous { options |= SO_CONTINUOUS; }
-    if retrigger { options |= SO_RETRIGGER; }
+    if ext_trigger {
+        options |= SO_EXTTRIGGER;
+    }
+    if ext_clock {
+        options |= SO_EXTCLOCK;
+    }
+    if continuous {
+        options |= SO_CONTINUOUS;
+    }
+    if retrigger {
+        options |= SO_RETRIGGER;
+    }
 
-    device.analog_out_scan(
-        first_chan,
-        last_chan,
-        range,
-        num_points as i32,
-        &mut rate,
-        options,
-        AOUTSCAN_FF_NOSCALEDATA,
-        &mut state.scan_buffer,
-    ).map_err(|e| format!("analog_out_scan error: {e}"))?;
+    device
+        .analog_out_scan(
+            &AOutScanConfig {
+                low_chan: first_chan,
+                high_chan: last_chan,
+                range,
+                samples_per_chan: num_points as i32,
+                options,
+                flags: AOUTSCAN_FF_NOSCALEDATA,
+            },
+            &mut rate,
+            &mut state.scan_buffer,
+        )
+        .map_err(|e| format!("analog_out_scan error: {e}"))?;
 
     state.dwell_actual = if rate > 0.0 { 1.0 / rate } else { 0.001 };
     state.running = true;
 
-    log::info!(
-        "WaveGen started: ch{first_chan}-{last_chan}, {num_points} pts, rate={rate:.0} Hz"
-    );
+    log::info!("WaveGen started: ch{first_chan}-{last_chan}, {num_points} pts, rate={rate:.0} Hz");
     Ok(())
 }
 
@@ -198,7 +226,12 @@ pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
         }
         // Restore saved outputs
         for ch in 0..MAX_ANALOG_OUT {
-            let _ = device.analog_out(ch as i32, BIP10VOLTS, AOUT_FF_NOSCALEDATA, state.saved_outputs[ch]);
+            let _ = device.analog_out(
+                ch as i32,
+                BIP10VOLTS,
+                AOUT_FF_NOSCALEDATA,
+                state.saved_outputs[ch],
+            );
         }
         state.running = false;
     }

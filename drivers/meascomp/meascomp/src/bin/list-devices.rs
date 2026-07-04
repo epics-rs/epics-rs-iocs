@@ -10,7 +10,10 @@ fn main() {
         }
         Ok(devs) => {
             println!("Found {} device(s):", devs.len());
-            println!("{:<4} {:<30} {:<20} {}", "#", "product_name", "unique_id", "product_id");
+            println!(
+                "{:<4} {:<30} {:<20} product_id",
+                "#", "product_name", "unique_id"
+            );
             for (i, (name, uid, pid)) in devs.iter().enumerate() {
                 println!("{:<4} {:<30} {:<20} 0x{:04x}", i, name, uid, pid);
             }

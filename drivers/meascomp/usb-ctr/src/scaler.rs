@@ -1,3 +1,4 @@
+use meascomp::counter::{CInScanConfig, CounterScanConfig};
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
@@ -13,6 +14,12 @@ pub struct ScalerState {
     pub scan_buffer: Vec<u64>,
 }
 
+impl Default for ScalerState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ScalerState {
     pub fn new() -> Self {
         Self {
@@ -26,58 +33,64 @@ impl ScalerState {
 }
 
 /// Configure counters and start the continuous counter scan for scaler mode.
-pub fn start_scaler(
-    device: &DaqDevice,
-    state: &mut ScalerState,
-) -> Result<(), String> {
+pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), String> {
     let num_counters = MAX_COUNTERS as i32;
 
     // Configure each counter for counting mode
     for i in 0..num_counters {
         let mode = if i == 0 {
             // Counter 0: preset control with gating
-            CMM_OUTPUT_ON | CMM_OUTPUT_INITIAL_STATE_HIGH
-                | CMM_GATING_ON | CMM_INVERT_GATE
-                | CMM_RANGE_LIMIT_ON | CMM_NO_RECYCLE
+            CMM_OUTPUT_ON
+                | CMM_OUTPUT_INITIAL_STATE_HIGH
+                | CMM_GATING_ON
+                | CMM_INVERT_GATE
+                | CMM_RANGE_LIMIT_ON
+                | CMM_NO_RECYCLE
         } else {
-            CMM_OUTPUT_ON | CMM_OUTPUT_INITIAL_STATE_HIGH
-                | CMM_GATING_ON | CMM_INVERT_GATE
+            CMM_OUTPUT_ON | CMM_OUTPUT_INITIAL_STATE_HIGH | CMM_GATING_ON | CMM_INVERT_GATE
         };
 
-        device.counter_config_scan(
-            i,
-            CMT_COUNT,
-            mode,
-            CED_RISING_EDGE,
-            CTS_TICK_20PT83ns,
-            CDM_NONE,
-            CDT_DEBOUNCE_0ns,
-            CF_DEFAULT,
-        ).map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
+        device
+            .counter_config_scan(
+                i,
+                &CounterScanConfig {
+                    measurement_type: CMT_COUNT,
+                    measurement_mode: mode,
+                    edge_detection: CED_RISING_EDGE,
+                    tick_size: CTS_TICK_20PT83ns,
+                    debounce_mode: CDM_NONE,
+                    debounce_time: CDT_DEBOUNCE_0ns,
+                    flags: CF_DEFAULT,
+                },
+            )
+            .map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
     }
 
     // Set presets as max limits
     for i in 0..MAX_COUNTERS {
         if state.presets[i] > 0 {
-            device.counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
+            device
+                .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
                 .map_err(|e| format!("counter_load MAX_LIMIT({i}) error: {e}"))?;
         }
     }
 
     // Start continuous counter scan
     let mut rate = 10000.0; // Will be adjusted by driver
-    let options = SO_CONTINUOUS | SO_SINGLEIO;
-    let flags = CINSCAN_FF_CTR64_BIT;
 
-    device.counter_in_scan(
-        0,
-        num_counters - 1,
-        20, // 20 samples per counter
-        &mut rate,
-        options,
-        flags,
-        &mut state.scan_buffer,
-    ).map_err(|e| format!("counter_in_scan error: {e}"))?;
+    device
+        .counter_in_scan(
+            &CInScanConfig {
+                low_counter: 0,
+                high_counter: num_counters - 1,
+                samples_per_counter: 20,
+                options: SO_CONTINUOUS | SO_SINGLEIO,
+                flags: CINSCAN_FF_CTR64_BIT,
+            },
+            &mut rate,
+            &mut state.scan_buffer,
+        )
+        .map_err(|e| format!("counter_in_scan error: {e}"))?;
 
     state.running = true;
     state.done = false;
@@ -86,10 +99,7 @@ pub fn start_scaler(
 }
 
 /// Read latest counter values from the scan buffer. Check for preset completion.
-pub fn read_scaler(
-    device: &DaqDevice,
-    state: &mut ScalerState,
-) {
+pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState) {
     let (status, xfer) = match device.counter_in_scan_status() {
         Ok(v) => v,
         Err(e) => {

@@ -8,7 +8,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use meascomp::device::DaqDevice;
 
-use crate::mcs::{self, McsState};
+use crate::mcs::{self, McsScan, McsState};
 use crate::params::*;
 use crate::poller::{self, PollerState};
 use crate::pulse_gen;
@@ -63,9 +63,7 @@ impl CtrDriver {
             mcs: McsState::new(max_time_points),
         }));
 
-        println!(
-            "CtrDriver: port={port_name}, model={product_name}, serial={uid}, fw={fw}"
-        );
+        println!("CtrDriver: port={port_name}, model={product_name}, serial={uid}, fw={fw}");
 
         Ok(Self {
             base,
@@ -103,24 +101,42 @@ impl PortDriver for CtrDriver {
                 if reason != self.params.pulse_run {
                     let _ = pulse_gen::stop(&dev, addr);
                 }
-                let period = self.base.get_float64_param(self.params.pulse_period, addr)?;
-                let duty = self.base.get_float64_param(self.params.pulse_duty_cycle, addr)?;
+                let period = self
+                    .base
+                    .get_float64_param(self.params.pulse_period, addr)?;
+                let duty = self
+                    .base
+                    .get_float64_param(self.params.pulse_duty_cycle, addr)?;
                 let delay = self.base.get_float64_param(self.params.pulse_delay, addr)?;
                 let count = self.base.get_int32_param(self.params.pulse_count, addr)? as u64;
-                let idle = self.base.get_int32_param(self.params.pulse_idle_state, addr)?;
+                let idle = self
+                    .base
+                    .get_int32_param(self.params.pulse_idle_state, addr)?;
                 match pulse_gen::start(&dev, addr, period, duty, delay, count, idle) {
                     Ok((actual_period, actual_duty, actual_delay)) => {
                         // Write back actual values from hardware
-                        let _ = self.base.set_float64_param(self.params.pulse_period, addr, actual_period);
-                        let _ = self.base.set_float64_param(self.params.pulse_duty_cycle, addr, actual_duty);
-                        let _ = self.base.set_float64_param(self.params.pulse_delay, addr, actual_delay);
+                        let _ = self.base.set_float64_param(
+                            self.params.pulse_period,
+                            addr,
+                            actual_period,
+                        );
+                        let _ = self.base.set_float64_param(
+                            self.params.pulse_duty_cycle,
+                            addr,
+                            actual_duty,
+                        );
+                        let _ = self.base.set_float64_param(
+                            self.params.pulse_delay,
+                            addr,
+                            actual_delay,
+                        );
                     }
                     Err(e) => log::error!("pulse_gen start error: {e}"),
                 }
-            } else if reason == self.params.pulse_run {
-                if let Err(e) = pulse_gen::stop(&dev, addr) {
-                    log::error!("pulse_gen stop error: {e}");
-                }
+            } else if reason == self.params.pulse_run
+                && let Err(e) = pulse_gen::stop(&dev, addr)
+            {
+                log::error!("pulse_gen stop error: {e}");
             }
         } else if reason == self.params.counter_reset {
             if value != 0 {
@@ -151,7 +167,10 @@ impl PortDriver for CtrDriver {
             // Clear all presets (matches C++ resetScaler behavior)
             for i in 0..MAX_COUNTERS {
                 st.scaler.presets[i] = 0;
-                let _ = self.base.params.set_int32(self.params.scaler_presets, i as i32, 0);
+                let _ = self
+                    .base
+                    .params
+                    .set_int32(self.params.scaler_presets, i as i32, 0);
             }
         } else if reason == self.params.scaler_presets {
             let mut st = self.state.lock().unwrap();
@@ -162,25 +181,52 @@ impl PortDriver for CtrDriver {
             if value != 0 {
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
-                let num_channels = self.base.get_int32_param(self.params.mca_num_channels, 0)? as usize;
+                let num_channels =
+                    self.base.get_int32_param(self.params.mca_num_channels, 0)? as usize;
                 let dwell = self.base.get_float64_param(self.params.mca_dwell_time, 0)?;
-                let ch_adv = self.base.get_int32_param(self.params.mca_ch_advance_source, 0)?;
+                let ch_adv = self
+                    .base
+                    .get_int32_param(self.params.mca_ch_advance_source, 0)?;
                 let prescale = self.base.get_int32_param(self.params.mca_prescale, 0)?;
                 let trigger = self.base.get_int32_param(self.params.trigger_mode, 0)? != 0;
-                let enable = self.base.get_int32_param(self.params.mcs_counter_enable, 0)? as u32;
-                st.mcs.preset_real_time = self.base.get_float64_param(self.params.mca_preset_real, 0)?;
-                let point0_no_clear = self.base.get_int32_param(self.params.mcs_point0_action, 0)? != 0;
-                if let Err(e) = mcs::start_mcs(&dev, &mut st.mcs, num_channels, dwell, enable, ch_adv, prescale, trigger, point0_no_clear) {
+                let enable = self
+                    .base
+                    .get_int32_param(self.params.mcs_counter_enable, 0)?
+                    as u32;
+                st.mcs.preset_real_time = self
+                    .base
+                    .get_float64_param(self.params.mca_preset_real, 0)?;
+                let point0_no_clear = self
+                    .base
+                    .get_int32_param(self.params.mcs_point0_action, 0)?
+                    != 0;
+                if let Err(e) = mcs::start_mcs(
+                    &dev,
+                    &mut st.mcs,
+                    &McsScan {
+                        num_points: num_channels,
+                        dwell_time: dwell,
+                        counter_enable: enable,
+                        ch_advance_source: ch_adv,
+                        prescale,
+                        ext_trigger: trigger,
+                        point0_no_clear,
+                    },
+                ) {
                     log::error!("start_mcs error: {e}");
                 }
-                self.base.params.set_int32(self.params.mca_acquiring, 0, 1)?;
+                self.base
+                    .params
+                    .set_int32(self.params.mca_acquiring, 0, 1)?;
             }
         } else if reason == self.params.mca_stop_acquire {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
             mcs::stop_mcs(&dev, &mut st.mcs);
             st.mcs.acquiring = false;
-            self.base.params.set_int32(self.params.mca_acquiring, 0, 0)?;
+            self.base
+                .params
+                .set_int32(self.params.mca_acquiring, 0, 0)?;
         } else if reason == self.params.mca_erase {
             let mut st = self.state.lock().unwrap();
             mcs::erase_mcs(&mut st.mcs);
@@ -200,20 +246,42 @@ impl PortDriver for CtrDriver {
             || reason == self.params.pulse_duty_cycle
             || reason == self.params.pulse_delay
         {
-            let running = self.base.get_int32_param(self.params.pulse_run, addr).unwrap_or(0) != 0;
+            let running = self
+                .base
+                .get_int32_param(self.params.pulse_run, addr)
+                .unwrap_or(0)
+                != 0;
             if running {
                 let dev = self.device.lock().unwrap();
                 let _ = pulse_gen::stop(&dev, addr);
-                let period = self.base.get_float64_param(self.params.pulse_period, addr)?;
-                let duty = self.base.get_float64_param(self.params.pulse_duty_cycle, addr)?;
+                let period = self
+                    .base
+                    .get_float64_param(self.params.pulse_period, addr)?;
+                let duty = self
+                    .base
+                    .get_float64_param(self.params.pulse_duty_cycle, addr)?;
                 let delay = self.base.get_float64_param(self.params.pulse_delay, addr)?;
                 let count = self.base.get_int32_param(self.params.pulse_count, addr)? as u64;
-                let idle = self.base.get_int32_param(self.params.pulse_idle_state, addr)?;
+                let idle = self
+                    .base
+                    .get_int32_param(self.params.pulse_idle_state, addr)?;
                 match pulse_gen::start(&dev, addr, period, duty, delay, count, idle) {
                     Ok((actual_period, actual_duty, actual_delay)) => {
-                        let _ = self.base.set_float64_param(self.params.pulse_period, addr, actual_period);
-                        let _ = self.base.set_float64_param(self.params.pulse_duty_cycle, addr, actual_duty);
-                        let _ = self.base.set_float64_param(self.params.pulse_delay, addr, actual_delay);
+                        let _ = self.base.set_float64_param(
+                            self.params.pulse_period,
+                            addr,
+                            actual_period,
+                        );
+                        let _ = self.base.set_float64_param(
+                            self.params.pulse_duty_cycle,
+                            addr,
+                            actual_duty,
+                        );
+                        let _ = self.base.set_float64_param(
+                            self.params.pulse_delay,
+                            addr,
+                            actual_delay,
+                        );
                     }
                     Err(e) => log::error!("pulse_gen restart error: {e}"),
                 }
@@ -238,7 +306,9 @@ impl PortDriver for CtrDriver {
             for bit in 0..NUM_IO_BITS {
                 if mask & (1 << bit) != 0 {
                     let bit_val = (value >> bit) & 1;
-                    if let Err(e) = dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0) {
+                    if let Err(e) =
+                        dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0)
+                    {
                         log::error!("digital_bit_out error: {e}");
                     }
                 }

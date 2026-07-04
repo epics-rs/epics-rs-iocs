@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use meascomp::counter::CounterScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
@@ -72,18 +73,31 @@ pub fn compute_times(state: &mut McsState) {
     }
 }
 
+/// Acquisition settings for [`start_mcs`], read from the MCA/MCS records.
+#[derive(Clone, Copy, Debug)]
+pub struct McsScan {
+    pub num_points: usize,
+    pub dwell_time: f64,
+    pub counter_enable: u32,
+    pub ch_advance_source: i32,
+    /// Accepted but not implemented (matches C++ drvUSBCTR, which ignores
+    /// prescale for MCS).
+    pub prescale: i32,
+    pub ext_trigger: bool,
+    pub point0_no_clear: bool,
+}
+
 /// Start MCS acquisition using DaqInScan.
-pub fn start_mcs(
-    device: &DaqDevice,
-    state: &mut McsState,
-    num_points: usize,
-    dwell_time: f64,
-    counter_enable: u32,
-    ch_advance_source: i32,
-    _prescale: i32,
-    ext_trigger: bool,
-    point0_no_clear: bool,
-) -> Result<(), String> {
+pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Result<(), String> {
+    let McsScan {
+        num_points,
+        dwell_time,
+        counter_enable,
+        ch_advance_source,
+        prescale: _,
+        ext_trigger,
+        point0_no_clear,
+    } = *scan;
     state.dwell_time = dwell_time;
     state.counter_enable = counter_enable;
     let max_pts = state.max_points.min(num_points);
@@ -95,19 +109,26 @@ pub fn start_mcs(
     for i in 0..MAX_MCS_COUNTERS {
         if counter_enable & (1 << i) != 0 {
             // Configure counter for MCS (matches C++ drvUSBCTR startMCS)
-            let mode = CMM_OUTPUT_ON | CMM_OUTPUT_INITIAL_STATE_HIGH
-                | CMM_CLEAR_ON_READ | CMM_GATING_ON | CMM_INVERT_GATE;
+            let mode = CMM_OUTPUT_ON
+                | CMM_OUTPUT_INITIAL_STATE_HIGH
+                | CMM_CLEAR_ON_READ
+                | CMM_GATING_ON
+                | CMM_INVERT_GATE;
             if i < MAX_COUNTERS {
-                device.counter_config_scan(
-                    i as i32,
-                    CMT_COUNT,
-                    mode,
-                    CED_RISING_EDGE,
-                    CTS_TICK_20PT83ns,
-                    CDM_NONE,
-                    CDT_DEBOUNCE_0ns,
-                    CF_DEFAULT,
-                ).map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
+                device
+                    .counter_config_scan(
+                        i as i32,
+                        &CounterScanConfig {
+                            measurement_type: CMT_COUNT,
+                            measurement_mode: mode,
+                            edge_detection: CED_RISING_EDGE,
+                            tick_size: CTS_TICK_20PT83ns,
+                            debounce_mode: CDM_NONE,
+                            debounce_time: CDT_DEBOUNCE_0ns,
+                            flags: CF_DEFAULT,
+                        },
+                    )
+                    .map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
             }
 
             let (channel, chan_type) = if i == DIGITAL_IO_COUNTER {
@@ -134,7 +155,11 @@ pub fn start_mcs(
     state.scan_buffer.resize(total_samples, 0.0);
 
     // Rate = 1/dwell
-    let mut rate = if dwell_time > 0.0 { 1.0 / dwell_time } else { 1000.0 };
+    let mut rate = if dwell_time > 0.0 {
+        1.0 / dwell_time
+    } else {
+        1000.0
+    };
 
     let mut options = SO_SINGLEIO;
     if ch_advance_source != 0 {
@@ -154,14 +179,16 @@ pub fn start_mcs(
     let _ = device.counter_load(0, CRT_OUTPUT_VAL0, 0);
     let _ = device.counter_load(0, CRT_OUTPUT_VAL1, 0xFFFFFFFF);
 
-    device.daq_in_scan(
-        &chan_descs,
-        max_pts as i32,
-        &mut rate,
-        options,
-        flags,
-        &mut state.scan_buffer,
-    ).map_err(|e| format!("daq_in_scan error: {e}"))?;
+    device
+        .daq_in_scan(
+            &chan_descs,
+            max_pts as i32,
+            &mut rate,
+            options,
+            flags,
+            &mut state.scan_buffer,
+        )
+        .map_err(|e| format!("daq_in_scan error: {e}"))?;
 
     state.running = true;
     state.acquiring = true;
@@ -171,7 +198,8 @@ pub fn start_mcs(
     compute_times(state);
     log::info!(
         "MCS started: {} counters, {} points, dwell={dwell_time:.6}s, rate={rate:.0}",
-        state.num_counters_enabled, max_pts
+        state.num_counters_enabled,
+        max_pts
     );
     Ok(())
 }
