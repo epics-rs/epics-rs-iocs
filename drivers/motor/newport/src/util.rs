@@ -80,6 +80,13 @@ pub(crate) fn nint(f: f64) -> i32 {
     (if f > 0.0 { f + 0.5 } else { f - 0.5 }) as i32
 }
 
+/// Shared MM4000/PM500 `maxDigits`/`res_decpts`: command decimal precision
+/// from the drive resolution, `(int)(-log10(stepSize)) + 2`, floored at 1.
+pub(crate) fn max_digits(step_size: f64) -> usize {
+    let digits = (-step_size.log10()) as i32 + 2;
+    digits.max(1) as usize
+}
+
 /// Shared ESP300/MM3000 `recv_mess` retry predicate: a reply longer than 3
 /// characters starting with `E` whose number is a hard-travel-limit code
 /// (35..=42) is an unsolicited error message to flush with a re-read.
@@ -90,6 +97,17 @@ pub(crate) fn is_unsolicited_limit_error(reply: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_digits_matches_c_truncation() {
+        // C: (int)(-log10(step)) + 2, floored at 1.
+        assert_eq!(max_digits(0.001), 5);
+        assert_eq!(max_digits(0.0005), 5); // -log10 = 3.30 → (int) 3 → 5
+        assert_eq!(max_digits(0.01), 4); // the PM500 fixed resolution
+        assert_eq!(max_digits(0.1), 3);
+        assert_eq!(max_digits(1.0), 2);
+        assert_eq!(max_digits(100.0), 1); // -2 + 2 = 0 → floored at 1
+    }
 
     #[test]
     fn nint_rounds_away_from_zero() {

@@ -15,6 +15,7 @@ members = [
     "iocs/motor/hxp-ioc",
     "iocs/motor/mm3000-ioc",
     "iocs/motor/mm4000-ioc",
+    "iocs/motor/pm500-ioc",
     "iocs/motor/smc100-ioc",
     "iocs/motor/xps-ioc",
     "iocs/usb-2408-ioc",

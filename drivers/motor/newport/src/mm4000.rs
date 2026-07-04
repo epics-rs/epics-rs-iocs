@@ -43,7 +43,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::util::{atof, atoi};
+use crate::util::{atof, atoi, max_digits};
 
 /// Response buffer size for a single controller reply (C `BUFFER_SIZE` 160).
 const READ_BUF: usize = 256;
@@ -86,13 +86,6 @@ fn detect_model(firmware: &str) -> Option<Mm4000Model> {
         4005 | 4006 => Some(Mm4000Model::Mm4005),
         _ => None,
     }
-}
-
-/// C `maxDigits`: command decimal precision from the `TU` drive resolution,
-/// `(int)(-log10(stepSize)) + 2`, floored at 1.
-fn max_digits(step_size: f64) -> usize {
-    let digits = (-step_size.log10()) as i32 + 2;
-    digits.max(1) as usize
 }
 
 /// Extract axis `axis` (0-based) status byte from the `MS;` reply
@@ -512,16 +505,6 @@ mod tests {
         assert_eq!(detect_model("MM4006"), Some(Mm4000Model::Mm4005));
         assert_eq!(detect_model("MM3000"), None);
         assert_eq!(detect_model("ESP300"), None);
-    }
-
-    #[test]
-    fn max_digits_matches_c_truncation() {
-        // C: (int)(-log10(step)) + 2, floored at 1.
-        assert_eq!(max_digits(0.001), 5);
-        assert_eq!(max_digits(0.0005), 5); // -log10 = 3.30 → (int) 3 → 5
-        assert_eq!(max_digits(0.1), 3);
-        assert_eq!(max_digits(1.0), 2);
-        assert_eq!(max_digits(100.0), 1); // -2 + 2 = 0 → floored at 1
     }
 
     #[test]

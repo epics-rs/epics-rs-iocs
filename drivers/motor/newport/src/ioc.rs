@@ -40,6 +40,7 @@ use crate::esp300::{Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::mm4000::{Mm4000Axis, Mm4000Controller};
+use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
@@ -91,6 +92,9 @@ const MM3000_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// MM4000 serial command timeout (C drvMM4000Asyn `TIMEOUT` 2 s).
 const MM4000_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// PM500 serial command timeout (C drvPM500 `SERIAL_TIMEOUT` 2 s).
+const PM500_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default XPS FTP account and trajectory directory. C uses the factory
 /// `Administrator`/`Administrator` login; `/Admin/Public/Trajectories` is the
@@ -1636,6 +1640,58 @@ impl NewportHolder {
                 }
                 println!(
                     "MM4000CreateController: motorPort={motor_port} serialPort={serial_port} firmware=\"{firmware}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM4000_{motor_port}_{{0..{}}})",
+                    num_axes - 1
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `PM500CreateController` iocsh command.
+    ///
+    /// `PM500CreateController(motorPort, serialPort, [movingPollMs],
+    /// [idlePollMs])`
+    ///
+    /// Creates a Newport PM500 controller on a pre-configured serial (or
+    /// GPIB octet) port, autodiscovers its axes (`{letter}STAT?` scan over
+    /// X Y Z A..I), and creates one motor axis per discovered channel (DTYP
+    /// `PM500_{motorPort}_{0..}`). Replaces the C `PM500Setup`/`PM500Config`
+    /// pair.
+    pub fn pm500_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "PM500CreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("serialPort"),
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+            ],
+            "PM500CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs]) - Create a Newport PM500 controller, autodiscovering axes (DTYP PM500_{motorPort}_{0..})",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let serial_port = req_string(args, 1, "serialPort")?;
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+
+                let handle = connect_serial(&serial_port, PM500_TIMEOUT)?;
+                let controller = Pm500Controller::new(handle)
+                    .map_err(|e| format!("PM500CreateController: {e}"))?;
+                let ident = controller.ident().to_string();
+                let num_axes = controller.num_axes();
+                if num_axes == 0 {
+                    return Err("PM500CreateController: no axes discovered".into());
+                }
+                let controller = Arc::new(Mutex::new(controller));
+
+                for index in 0..num_axes {
+                    let ax = Pm500Axis::new(controller.clone(), index)
+                        .map_err(|e| format!("PM500CreateController: axis {index}: {e}"))?;
+                    let dtyp_key = format!("PM500_{motor_port}_{index}");
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                }
+                println!(
+                    "PM500CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PM500_{motor_port}_{{0..{}}})",
                     num_axes - 1
                 );
                 Ok(CommandOutcome::Continue)
