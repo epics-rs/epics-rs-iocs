@@ -1,0 +1,21 @@
+# SmarAct MCS2: one motor record per channel. Load once per channel with N =
+# 0-based channel index (DTYP MCS2_$(CARD)_$(N)); the channel number equals N.
+#
+# The driver reports positions in nanometres (linear positioners) or
+# micro-degrees (rotary), scaling the controller's picometre/nano-degree units
+# by 1000 to extend the usable range. Positions cross the driver boundary in
+# those units, so MRES = 1 and EGU = nm (or udeg). Done, limit, referenced and
+# power-on status come from the channel status word; POS/POS:TARG give the
+# encoder/target position when a sensor is present.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MCS2_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000000)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=10000000)")
+    field(DLLM, "$(LLM=-10000000)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=nm)")
+    field(PREC, "$(PREC=0)")
+}
