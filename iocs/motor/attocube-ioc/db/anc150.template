@@ -1,0 +1,22 @@
+# attocube ANC150: one motor record per axis. Load once per axis with
+# N = 0-based axis index (DTYP ANC150_$(CARD)_$(N)); the driver maps index
+# 0,1,2,... to controller axes 1,2,3,...
+#
+# The ANC150 is an OPEN-LOOP stepper with no position readback: the driver
+# tracks position in steps and estimates move completion from a timer. Positions
+# travel the driver boundary in steps, so MRES is 1 and EGU is "steps". The
+# record's VELO/ACCL have no effect (there is no velocity command); the step
+# rate is a controller setting the driver reads with 'getf'. Homing and hardware
+# limit switches are not supported.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "ANC150_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=100000.0)")
+    field(DLLM, "$(LLM=-100000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}
