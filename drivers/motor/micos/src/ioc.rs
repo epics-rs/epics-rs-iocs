@@ -20,9 +20,13 @@ use motor_common::iocsh::{
 };
 
 use crate::corvus::{CorvusAxis, CorvusController};
+use crate::hydra::{HydraAxis, HydraController};
 
 /// Command timeout.
 const CORVUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hydra command timeout.
+const HYDRA_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `SMCcorvusCreateController(card, corvusPort, numAxes,
 /// [movingPollMs], [idlePollMs])` command bound to `holder`.
@@ -64,6 +68,53 @@ pub fn corvus_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef
             println!(
                 "SMCcorvusCreateController: card={card} corvusPort={corvus_port} axes={num_axes} \
                  poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=CORVUS_{card}_{{0..{}}})",
+                num_axes - 1
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `SMChydraCreateController(card, hydraPort, numAxes, [movingPollMs],
+/// [idlePollMs])` command bound to `holder`.
+pub fn hydra_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "SMChydraCreateController",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("hydraPort"),
+            arg_int_req("numAxes"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+        ],
+        "SMChydraCreateController(card, hydraPort, numAxes, [movingPollMs], [idlePollMs]) - \
+         Create a Micos SMC hydra controller (DTYP HYDRA_{card}_{index}) with numAxes axes",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("SMChydraCreateController: card must be >= 0".into());
+            }
+            let hydra_port = req_string(args, 1, "hydraPort")?;
+            let num_axes = req_int(args, 2, "numAxes")?;
+            if !(1..=2).contains(&num_axes) {
+                return Err("SMChydraCreateController: numAxes must be 1..=2".into());
+            }
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            let handle = connect_ip(&hydra_port, HYDRA_TIMEOUT)?;
+            let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+
+            for index in 0..num_axes as usize {
+                let ax = HydraAxis::new(controller.clone(), index)
+                    .map_err(|e| format!("SMChydraCreateController: axis {index}: {e}"))?;
+                let dtyp_key = format!("HYDRA_{card}_{index}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            }
+            println!(
+                "SMChydraCreateController: card={card} hydraPort={hydra_port} axes={num_axes} \
+                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=HYDRA_{card}_{{0..{}}})",
                 num_axes - 1
             );
             Ok(CommandOutcome::Continue)
