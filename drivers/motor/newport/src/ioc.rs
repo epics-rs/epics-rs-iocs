@@ -37,7 +37,9 @@ use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
 use crate::smc100::Smc100Axis;
-use crate::xps::{MoveMode, Profile, SocketMode, XpsAxis, XpsController, XpsSocket, ftp};
+use crate::xps::{
+    MoveMode, PcoParams, Profile, SocketMode, XpsAxis, XpsController, XpsSocket, ftp, pco,
+};
 
 /// Default moving/idle poll intervals (ms) when the iocsh args are omitted.
 const DEFAULT_MOVING_POLL_MS: u64 = 100;
@@ -709,6 +711,82 @@ impl NewportHolder {
             })
     }
 
+    /// Create the `XPSPositionCompare` iocsh command.
+    ///
+    /// `XPSPositionCompare(motorPort, positionerName, mode, [minPosition],
+    /// [maxPosition], [positionStep], [pulseWidth], [settlingTime])`
+    ///
+    /// Applies a position-compare-output configuration to one positioner
+    /// (C `XPSAxis::setPositionCompare`): mode 0=Disable, 1=Pulse,
+    /// 2=AquadB-windowed, 3=AquadB-always. Positions/step are device units;
+    /// `pulseWidth`/`settlingTime` are µs (valid widths {0.2,1,2.5,10}, valid
+    /// settling {0.075,1,4,12}), defaulting to the smallest table entries.
+    /// Driver-private: the C base-class PCO API (05b25c1d, motor PR #248) is an
+    /// open, unmerged PR, so PCO is not part of the motor framework.
+    pub fn xps_position_compare_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSPositionCompare",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("positionerName"),
+                ArgDesc {
+                    name: "mode",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                arg_double_opt("minPosition"),
+                arg_double_opt("maxPosition"),
+                arg_double_opt("positionStep"),
+                arg_double_opt("pulseWidth"),
+                arg_double_opt("settlingTime"),
+            ],
+            "XPSPositionCompare(motorPort, positionerName, mode, [minPosition], [maxPosition], [positionStep], [pulseWidth], [settlingTime]) - Configure position-compare output on an XPS positioner (mode 0=Disable 1=Pulse 2=AquadB-windowed 3=AquadB-always; positions in device units, widths/settling in us)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let positioner = req_string(args, 1, "positionerName")?;
+                let mode = match args.get(2) {
+                    Some(ArgValue::Int(v)) => *v as i32,
+                    _ => return Err("mode must be an integer".into()),
+                };
+                let params = PcoParams {
+                    mode,
+                    min_position: opt_double(args, 3, 0.0, "minPosition")?,
+                    max_position: opt_double(args, 4, 0.0, "maxPosition")?,
+                    position_step: opt_double(args, 5, 0.0, "positionStep")?,
+                    pulse_width_us: opt_double(
+                        args,
+                        6,
+                        pco::XPS_PCO_DEFAULT_PULSE_WIDTH,
+                        "pulseWidth",
+                    )?,
+                    settling_time_us: opt_double(
+                        args,
+                        7,
+                        pco::XPS_PCO_DEFAULT_SETTLING_TIME,
+                        "settlingTime",
+                    )?,
+                };
+
+                let controller = holder.xps_controller(&motor_port, "XPSPositionCompare")?;
+                {
+                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                    pco::set_position_compare(ctrl.poll_socket(), &positioner, &params)
+                        .map_err(|e| format!("XPSPositionCompare: {e}"))?;
+                }
+                println!(
+                    "XPSPositionCompare: motorPort={motor_port} positioner={positioner} mode={mode} min={} max={} step={} pw={}us settle={}us",
+                    params.min_position,
+                    params.max_position,
+                    params.position_step,
+                    params.pulse_width_us,
+                    params.settling_time_us,
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
     /// Create the `XPSDefineProfileFromFile` iocsh command.
     ///
     /// `XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode])`
@@ -967,6 +1045,23 @@ fn arg_int_opt(name: &'static str) -> ArgDesc {
         name,
         arg_type: ArgType::Int,
         optional: true,
+    }
+}
+
+fn arg_double_opt(name: &'static str) -> ArgDesc {
+    ArgDesc {
+        name,
+        arg_type: ArgType::Double,
+        optional: true,
+    }
+}
+
+/// Read an optional double arg, defaulting when absent.
+fn opt_double(args: &[ArgValue], i: usize, default: f64, name: &str) -> Result<f64, String> {
+    match args.get(i) {
+        Some(ArgValue::Double(v)) => Ok(*v),
+        None | Some(ArgValue::Missing) => Ok(default),
+        _ => Err(format!("{name} must be a number")),
     }
 }
 

@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PcoSettings, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
 use epics_rs::asyn::user::AsynUser;
 
 use super::controller::XpsController;
@@ -54,61 +54,6 @@ const XPS_REFERENCING_POLL: Duration = Duration::from_millis(200);
 /// that is never reached cannot hang the async worker. 300 × 0.2 s = 60 s.
 const XPS_REFERENCING_MAX_POLLS: u32 = 300;
 
-/// Fallback encoder settling time (µs) for position-compare pulse parameters,
-/// used when the record leaves `PCO_SETTLE` at 0. C's smallest table entry
-/// (`{0.075, 1.0, 4.0, 12.0}`).
-const XPS_PCO_DEFAULT_SETTLING_TIME: f64 = 0.075;
-
-/// XPS position-compare modes (C `XPSPositionCompareMode_t`). The generic
-/// framework passes the mode as an opaque `i32`; the driver interprets it here.
-const XPS_PCO_MODE_DISABLE: i32 = 0;
-const XPS_PCO_MODE_PULSE: i32 = 1;
-const XPS_PCO_MODE_AQUADB_WINDOWED: i32 = 2;
-const XPS_PCO_MODE_AQUADB_ALWAYS: i32 = 3;
-
-/// Latched position-compare configuration (device units), applied on the next
-/// [`enable_pco`](AsynMotor::enable_pco). C splits this across
-/// `setPositionCompare`/`getPositionCompare` driven by XPS-specific asyn params;
-/// the extended `set_pco_config` hook now carries all four modes plus settling.
-#[derive(Clone, Copy, Debug, Default)]
-struct PcoConfig {
-    min_position: f64,
-    max_position: f64,
-    position_step: f64,
-    /// Pulse width (µs). Passed straight through — DEVIATION from C, which
-    /// selects one of `{0.2, 1.0, 2.5, 10.0}` via a table index; the XPS `.db`
-    /// mbbo constrains the record to those values instead.
-    pulse_width_us: f64,
-    /// Encoder settling time (µs). Same raw-µs-vs-index DEVIATION as above.
-    settling_time_us: f64,
-    /// Opaque XPS mode selector (see `XPS_PCO_MODE_*`).
-    mode: i32,
-}
-
-impl PcoConfig {
-    /// Convert record-frame config into device units (C `motorRecPositionToXPS`
-    /// = value * stepSize; the step uses `fabs`).
-    fn from_record(config: PcoSettings, step_size: f64) -> Self {
-        PcoConfig {
-            min_position: config.start * step_size,
-            max_position: config.end * step_size,
-            position_step: (config.increment * step_size).abs(),
-            pulse_width_us: config.pulse_width_us,
-            settling_time_us: config.settling_time_us,
-            mode: config.mode,
-        }
-    }
-
-    /// Settling time to send, falling back to the default when unset.
-    fn settling(&self) -> f64 {
-        if self.settling_time_us > 0.0 {
-            self.settling_time_us
-        } else {
-            XPS_PCO_DEFAULT_SETTLING_TIME
-        }
-    }
-}
-
 /// One XPS positioner as an asyn motor axis.
 pub struct XpsAxis {
     controller: Arc<Mutex<XpsController>>,
@@ -123,8 +68,6 @@ pub struct XpsAxis {
     /// Last group status code seen by [`poll`](AsynMotor::poll); `move` reads it
     /// to decide whether to auto-enable a disabled axis.
     axis_status: i32,
-    /// Latched position-compare config, applied on the next `enable_pco`.
-    pco: PcoConfig,
 }
 
 impl XpsAxis {
@@ -155,7 +98,6 @@ impl XpsAxis {
             min_jerk,
             max_jerk,
             axis_status: 0,
-            pco: PcoConfig::default(),
         })
     }
 
@@ -427,62 +369,6 @@ impl AsynMotor for XpsAxis {
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
         let ctrl = self.lock_controller();
         corrector::set_pid(ctrl.poll_socket(), &self.positioner_name, kind, gain)?;
-        Ok(())
-    }
-
-    fn set_pco_config(&mut self, _user: &AsynUser, config: PcoSettings) -> AsynResult<()> {
-        // Latch the config in device units; applied on the next enable_pco.
-        // C converts via motorRecPositionToXPSPosition (value * stepSize) and
-        // fabs() on the step. DEVIATION: the generic hook has no direction, so
-        // the C min/max swap-on-reverse-DIR is not applied here.
-        self.pco = PcoConfig::from_record(config, self.step_size);
-        Ok(())
-    }
-
-    fn enable_pco(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        // Full C setPositionCompare: disable, set pulse parameters, then dispatch
-        // on the latched mode. All on the poll socket (C uses pollSocket_). A
-        // disable request (enable=false) is a hard off regardless of mode; C has
-        // no separate enable flag (mode=Disable is its "off"), so the framework's
-        // PCO_ENABLE bool gates the whole apply here.
-        let ctrl = self.lock_controller();
-        let sock = ctrl.poll_socket();
-        sock.positioner_position_compare_disable(&self.positioner_name)?;
-        if !enable {
-            return Ok(());
-        }
-        sock.positioner_position_compare_pulse_parameters_set(
-            &self.positioner_name,
-            self.pco.pulse_width_us,
-            self.pco.settling(),
-        )?;
-        match self.pco.mode {
-            XPS_PCO_MODE_PULSE => {
-                sock.positioner_position_compare_set(
-                    &self.positioner_name,
-                    self.pco.min_position,
-                    self.pco.max_position,
-                    self.pco.position_step,
-                )?;
-                sock.positioner_position_compare_enable(&self.positioner_name)?;
-            }
-            XPS_PCO_MODE_AQUADB_WINDOWED => {
-                sock.positioner_position_compare_aquadb_windowed_set(
-                    &self.positioner_name,
-                    self.pco.min_position,
-                    self.pco.max_position,
-                )?;
-                sock.positioner_position_compare_enable(&self.positioner_name)?;
-            }
-            XPS_PCO_MODE_AQUADB_ALWAYS => {
-                sock.positioner_position_compare_aquadb_always_enable(&self.positioner_name)?;
-            }
-            // Disable, and any unrecognised mode: leave it off with the pulse
-            // parameters staged, matching C's `XPSPositionCompareModeDisable`
-            // (whose switch has no action) and C's silent no-op default.
-            XPS_PCO_MODE_DISABLE => {}
-            _ => {}
-        }
         Ok(())
     }
 
@@ -770,55 +656,6 @@ mod tests {
         // Ready and moving states are not a problem.
         assert!(!StatusFlags::from_status(10).problem);
         assert!(!StatusFlags::from_status(43).problem);
-    }
-
-    #[test]
-    fn pco_config_scales_to_device_units() {
-        // step_size = 0.5 device units per motor step; increment negative → fabs.
-        let c = PcoConfig::from_record(
-            PcoSettings {
-                start: 2.0,
-                end: 8.0,
-                increment: -0.25,
-                pulse_width_us: 1.0,
-                settling_time_us: 4.0,
-                mode: XPS_PCO_MODE_PULSE,
-            },
-            0.5,
-        );
-        assert_eq!(c.min_position, 1.0);
-        assert_eq!(c.max_position, 4.0);
-        assert_eq!(c.position_step, 0.125);
-        // Pulse width, settling time (µs) and mode pass straight through.
-        assert_eq!(c.pulse_width_us, 1.0);
-        assert_eq!(c.settling_time_us, 4.0);
-        assert_eq!(c.mode, XPS_PCO_MODE_PULSE);
-    }
-
-    #[test]
-    fn pco_mode_constants_match_c_enum() {
-        // C XPSPositionCompareMode_t declaration order (XPSController.h:30-35).
-        assert_eq!(XPS_PCO_MODE_DISABLE, 0);
-        assert_eq!(XPS_PCO_MODE_PULSE, 1);
-        assert_eq!(XPS_PCO_MODE_AQUADB_WINDOWED, 2);
-        assert_eq!(XPS_PCO_MODE_AQUADB_ALWAYS, 3);
-    }
-
-    #[test]
-    fn pco_settling_falls_back_to_default() {
-        // Unset (0) settling uses the default; a positive value passes through.
-        let mut c = PcoConfig::from_record(
-            PcoSettings {
-                increment: 0.1,
-                pulse_width_us: 1.0,
-                mode: XPS_PCO_MODE_PULSE,
-                ..PcoSettings::default()
-            },
-            1.0,
-        );
-        assert_eq!(c.settling(), XPS_PCO_DEFAULT_SETTLING_TIME);
-        c.settling_time_us = 12.0;
-        assert_eq!(c.settling(), 12.0);
     }
 
     #[test]

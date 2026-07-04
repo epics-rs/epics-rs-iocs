@@ -13,11 +13,13 @@ pub mod commands;
 pub mod controller;
 pub mod corrector;
 pub mod ftp;
+pub mod pco;
 pub mod profile;
 pub mod rpc;
 
 pub use axis::XpsAxis;
 pub use controller::XpsController;
 pub use corrector::{CorrectorType, XpsCorrectorInfo};
+pub use pco::PcoParams;
 pub use profile::{MoveMode, Profile, ProfileAxis, ProfileError, TrajectoryFile};
 pub use rpc::{SocketMode, XPS_TERMINATOR, XpsError, XpsReply, XpsResult, XpsSocket};
