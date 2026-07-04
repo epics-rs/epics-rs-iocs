@@ -1,0 +1,20 @@
+# OMS MAXnet / MXA: one motor record per axis. Load once per axis, matching the
+# omsCreateAxis(controllerName, AXIS) call. DTYP is OMS_$(CTRL)_$(AXIS).
+#
+# The driver reports motor and encoder positions in controller-native steps
+# (there is no resolution factor to cancel), so MRES = 1 and EGU = steps.
+# VELO/ACCL are steps/s and steps/s^2, clamped by the driver to the OMS ranges
+# (velocity 1..4000000, acceleration 1..8000000, position magnitude
+# <= 67000000).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "OMS_$(CTRL)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10000.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=1000000.0)")
+    field(DLLM, "$(LLM=-1000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}

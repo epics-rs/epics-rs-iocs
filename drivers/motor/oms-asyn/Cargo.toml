@@ -1,0 +1,12 @@
+# Pro-Dex OMS MAXnet / MXA motor controllers, ASCII over an asyn octet port. No
+# vendor library — builds on any host.
+
+[package]
+name = "motor-oms-asyn"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

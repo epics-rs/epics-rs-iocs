@@ -1,0 +1,14 @@
+# Pro-Dex OMS MAXnet / MXA motor IOC binary. Wires the motor-oms-asyn driver to
+# an asyn octet port and one motor record per axis, exposing CA + PVA. No vendor
+# library — builds on any host.
+
+[package]
+name = "oms-asyn-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-oms-asyn = { path = "../../../drivers/motor/oms-asyn" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
