@@ -351,4 +351,45 @@ impl XpsSocket {
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }
+
+    // --- PVT trajectory profiles ------------------------------------------
+
+    /// `MultipleAxesPVTVerification(group, file)` — verify an uploaded
+    /// trajectory against the group's dynamics. A non-zero error code carries
+    /// the reason (e.g. -69 acceleration too high, -68 velocity too high,
+    /// -70 final velocity non-zero, -75 negative/null delta time).
+    pub fn multiple_axes_pvt_verification(&self, group: &str, file: &str) -> XpsResult<()> {
+        let cmd = format!("MultipleAxesPVTVerification ({group},{file})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `MultipleAxesPVTVerificationResultGet(positioner, file)` → the verified
+    /// trajectory's dynamic bounds `(minPos, maxPos, maxVel, maxAccel)` for one
+    /// positioner, relative to its start (used for the software-limit check).
+    pub fn multiple_axes_pvt_verification_result_get(
+        &self,
+        positioner: &str,
+        file: &str,
+    ) -> XpsResult<(f64, f64, f64, f64)> {
+        let cmd = format!(
+            "MultipleAxesPVTVerificationResultGet ({positioner},{file},double *,double *,double *,double *)"
+        );
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((r.double(1), r.double(2), r.double(3), r.double(4)))
+    }
+
+    /// `MultipleAxesPVTExecution(group, file, executionNumber)` — run the
+    /// trajectory. The XPS holds the reply until the trajectory finishes, so
+    /// this must run on a socket that is not needed for polling meanwhile.
+    pub fn multiple_axes_pvt_execution(
+        &self,
+        group: &str,
+        file: &str,
+        executions: i32,
+    ) -> XpsResult<()> {
+        let cmd = format!("MultipleAxesPVTExecution ({group},{file},{executions})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
 }
