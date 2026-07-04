@@ -20,6 +20,17 @@ fn g(value: f64) -> String {
     format_g(value, G13)
 }
 
+/// Marshal an extended-event name list: each element is followed by its four
+/// (empty) parameters, elements joined by `,` (C
+/// `EventExtendedConfiguration{Trigger,Action}Set` with empty parameter lists).
+fn join_with_empty_params(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("{n},,,,"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl XpsSocket {
     // --- Controller-level getters -----------------------------------------
 
@@ -389,6 +400,111 @@ impl XpsSocket {
         executions: i32,
     ) -> XpsResult<()> {
         let cmd = format!("MultipleAxesPVTExecution ({group},{file},{executions})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `MultipleAxesPVTPulseOutputSet(group, startElement, endElement, period)`
+    /// — output a pulse train while the trajectory runs, from the start of
+    /// element `startElement` to the end of element `endElement`, one pulse
+    /// every `period` seconds (C `executeProfile` passes user pulses + 1 to
+    /// skip the acceleration element).
+    pub fn multiple_axes_pvt_pulse_output_set(
+        &self,
+        group: &str,
+        start_element: i32,
+        end_element: i32,
+        period: f64,
+    ) -> XpsResult<()> {
+        let cmd = format!(
+            "MultipleAxesPVTPulseOutputSet ({group},{start_element},{end_element},{})",
+            g(period)
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    // --- Gathering + events (trajectory readback) ---------------------------
+
+    /// `GatheringReset()` — empty the in-memory gathering buffer. Required
+    /// before each run because `GatheringOneData` only appends.
+    pub fn gathering_reset(&self) -> XpsResult<()> {
+        self.exec("GatheringReset ()")?.require_ok()?;
+        Ok(())
+    }
+
+    /// `GatheringConfigurationSet(type, type, ...)` — define what each
+    /// `GatheringOneData` event samples. The C wrapper splits its `;`-separated
+    /// list and re-joins with `,` on the wire; we take the list directly.
+    pub fn gathering_configuration_set(&self, types: &[String]) -> XpsResult<()> {
+        let cmd = format!("GatheringConfigurationSet ({})", types.join(","));
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `GatheringCurrentNumberGet` → `(currentSamples, maximumSamples)`.
+    pub fn gathering_current_number_get(&self) -> XpsResult<(i32, i32)> {
+        let r = self
+            .exec("GatheringCurrentNumberGet (int *,int *)")?
+            .require_ok()?;
+        Ok((r.int(1), r.int(2)))
+    }
+
+    /// `GatheringStop()` — stop sampling, leaving the data in memory for
+    /// `GatheringDataMultipleLinesGet`. The caller should tolerate error `-30`
+    /// (gathering never started, e.g. the trajectory was aborted before one
+    /// element completed) like C `executeProfile`.
+    pub fn gathering_stop(&self) -> XpsResult<()> {
+        self.exec("GatheringStop ()")?.require_ok()?;
+        Ok(())
+    }
+
+    /// `GatheringDataMultipleLinesGet(indexPoint, numberOfLines, char *)` →
+    /// the raw multi-line data block (lines of `;`-separated values separated
+    /// by `\n`). The controller rejects requests whose reply would be too
+    /// large; C halves `numberOfLines` and retries on any error.
+    pub fn gathering_data_multiple_lines_get(&self, index: i32, lines: i32) -> XpsResult<String> {
+        let cmd = format!("GatheringDataMultipleLinesGet ({index},{lines},char *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok(r.string(1).to_string())
+    }
+
+    /// `EventExtendedConfigurationTriggerSet(...)` — configure the event
+    /// triggers. Each name is marshalled with its four (empty) parameters, so
+    /// `["Always", "G1.PVT.TrajectoryPulse"]` becomes
+    /// `(Always,,,,,G1.PVT.TrajectoryPulse,,,,)` exactly as the C wrapper
+    /// emits for the driver's empty parameter lists.
+    pub fn event_extended_configuration_trigger_set(&self, events: &[String]) -> XpsResult<()> {
+        let cmd = format!(
+            "EventExtendedConfigurationTriggerSet ({})",
+            join_with_empty_params(events)
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `EventExtendedConfigurationActionSet(...)` — configure the actions run
+    /// on each trigger (same four-empty-parameter marshalling as the trigger
+    /// set; the driver uses `["GatheringOneData"]`).
+    pub fn event_extended_configuration_action_set(&self, actions: &[String]) -> XpsResult<()> {
+        let cmd = format!(
+            "EventExtendedConfigurationActionSet ({})",
+            join_with_empty_params(actions)
+        );
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `EventExtendedStart` → the event ID for `event_extended_remove`.
+    pub fn event_extended_start(&self) -> XpsResult<i32> {
+        let r = self.exec("EventExtendedStart (int *)")?.require_ok()?;
+        Ok(r.int(1))
+    }
+
+    /// `EventExtendedRemove(id)` — remove the event/action configuration
+    /// started by `event_extended_start`.
+    pub fn event_extended_remove(&self, id: i32) -> XpsResult<()> {
+        let cmd = format!("EventExtendedRemove ({id})");
         self.exec(&cmd)?.require_ok()?;
         Ok(())
     }

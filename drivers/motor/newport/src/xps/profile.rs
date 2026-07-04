@@ -290,6 +290,42 @@ impl Profile {
     }
 }
 
+/// Resolve the PVT pulse-output window for `MultipleAxesPVTPulseOutputSet`
+/// (C `executeProfile`, XPSController.cpp:975-1013). `times` is the profile's
+/// per-point time array; `start_pulses`/`end_pulses` are 1-based user elements
+/// (`numElements = times.len() - 1` real elements, `numElements + 1` addresses
+/// the deceleration element); `num_pulses` is the number of pulses to spread
+/// over that window. Returns the wire arguments
+/// `(start_element, end_element, pulse_period)` — the element numbers are the
+/// user values plus one to skip the acceleration element, and the period is
+/// the window's total profile time divided by `num_pulses` (`0` pulses → `0`
+/// period, as C).
+pub fn pulse_output_window(
+    times: &[f64],
+    start_pulses: i32,
+    end_pulses: i32,
+    num_pulses: i32,
+) -> Result<(i32, i32, f64), String> {
+    let num_elements = times.len().saturating_sub(1) as i32;
+    if start_pulses < 1
+        || start_pulses > num_elements + 1
+        || end_pulses < start_pulses
+        || end_pulses > num_elements + 1
+    {
+        return Err("start or end pulses outside valid range".into());
+    }
+    let last_time = end_pulses.min(num_elements);
+    let time: f64 = (start_pulses..=last_time)
+        .map(|i| times[(i - 1) as usize])
+        .sum();
+    let pulse_period = if num_pulses != 0 {
+        time / f64::from(num_pulses)
+    } else {
+        0.0
+    };
+    Ok((start_pulses + 1, end_pulses + 1, pulse_period))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,5 +488,35 @@ mod tests {
         // Element line has one (D, V) pair per axis: X moves 1, Y moves 2.
         assert_eq!(lines[1], "1.000000, 1.000000, 1.000000, 2.000000, 2.000000");
         assert_eq!(out.pre_distance.len(), 2);
+    }
+
+    #[test]
+    fn pulse_window_matches_c_math() {
+        // 5 points -> 4 elements timed by times[0..4].
+        let times = [0.5, 0.5, 1.0, 2.0, 3.0];
+        // Full window, one pulse per element: period = (0.5+0.5+1.0+2.0)/4.
+        let (start, end, period) = pulse_output_window(&times, 1, 4, 4).unwrap();
+        assert_eq!((start, end), (2, 5)); // +1 skips the acceleration element
+        assert!((period - 1.0).abs() < 1e-12);
+        // Sub-window elements 2..3: time = 0.5 + 1.0 over 3 pulses.
+        let (start, end, period) = pulse_output_window(&times, 2, 3, 3).unwrap();
+        assert_eq!((start, end), (3, 4));
+        assert!((period - 0.5).abs() < 1e-12);
+        // endPulses may address the deceleration element (numElements + 1);
+        // its time is not part of the window sum (C caps lastTime).
+        let (start, end, period) = pulse_output_window(&times, 1, 5, 4).unwrap();
+        assert_eq!((start, end), (2, 6));
+        assert!((period - 1.0).abs() < 1e-12);
+        // Zero pulses -> zero period, as C.
+        let (_, _, period) = pulse_output_window(&times, 1, 4, 0).unwrap();
+        assert_eq!(period, 0.0);
+    }
+
+    #[test]
+    fn pulse_window_rejects_out_of_range() {
+        let times = [0.5, 0.5, 1.0];
+        assert!(pulse_output_window(&times, 0, 2, 1).is_err()); // start < 1
+        assert!(pulse_output_window(&times, 1, 4, 1).is_err()); // end > numElements+1
+        assert!(pulse_output_window(&times, 2, 1, 1).is_err()); // end < start
     }
 }

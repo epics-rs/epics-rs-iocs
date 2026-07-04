@@ -38,7 +38,8 @@ use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
 use crate::smc100::Smc100Axis;
 use crate::xps::{
-    MoveMode, PcoParams, Profile, SocketMode, XpsAxis, XpsController, XpsSocket, ftp, pco,
+    ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
+    XpsController, XpsError, XpsSocket, ftp, gathering, pco, profile,
 };
 
 /// Default moving/idle poll intervals (ms) when the iocsh args are omitted.
@@ -920,14 +921,23 @@ impl NewportHolder {
 
     /// Create the `XPSExecuteProfile` iocsh command.
     ///
-    /// `XPSExecuteProfile(motorPort, execPort, [executions])`
+    /// `XPSExecuteProfile(motorPort, execPort, [executions], [startPulses],
+    /// [endPulses], [numPulses])`
     ///
-    /// Moves the group to the trajectory start, then runs the built PVT profile
-    /// with `MultipleAxesPVTExecution`. Both block until the motion finishes, so
-    /// they run on a background thread over a dedicated socket (`execPort`, a
+    /// Moves the group to the trajectory start, configures gathering (each
+    /// trajectory pulse samples every registered positioner's
+    /// `SetpointPosition`+`CurrentPosition` via a `GatheringOneData` event),
+    /// then runs the built PVT profile with `MultipleAxesPVTExecution`. The
+    /// moves and the execution block until the motion finishes, so everything
+    /// runs on a background thread over a dedicated socket (`execPort`, a
     /// `drvAsynIPPort` to the XPS) — the shared poll socket keeps polling
-    /// meanwhile. `executions` (default 1) repeats the trajectory. Ordering the
-    /// start move and execution mirrors C `runProfile`.
+    /// meanwhile (C configures gathering on the poll socket; same RPCs, our
+    /// exec socket keeps the poll socket uncontended). `executions` (default 1)
+    /// repeats the trajectory. `startPulses`/`endPulses` (1-based trajectory
+    /// elements, defaults: the whole profile) window the pulse output and
+    /// `numPulses` (default one per element) spreads that many pulses over it,
+    /// exactly as C `executeProfile`. Read the samples back afterwards with
+    /// `XPSReadbackProfile`.
     pub fn xps_execute_profile_command(self: &Arc<Self>) -> CommandDef {
         let holder = self.clone();
         CommandDef::new(
@@ -936,8 +946,11 @@ impl NewportHolder {
                 arg_str_req("motorPort"),
                 arg_str_req("execPort"),
                 arg_int_opt("executions"),
+                arg_int_opt("startPulses"),
+                arg_int_opt("endPulses"),
+                arg_int_opt("numPulses"),
             ],
-            "XPSExecuteProfile(motorPort, execPort, [executions]) - Move the group to the trajectory start and run the built PVT profile on a background thread over its own socket (execPort: a drvAsynIPPort to the XPS; executions default 1)",
+            "XPSExecuteProfile(motorPort, execPort, [executions], [startPulses], [endPulses], [numPulses]) - Move the group to the trajectory start and run the built PVT profile with gathering on a background thread over its own socket (execPort: a drvAsynIPPort to the XPS; executions default 1; pulse window defaults to one pulse per trajectory element)",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let motor_port = req_string(args, 0, "motorPort")?;
                 let exec_port = req_string(args, 1, "execPort")?;
@@ -957,13 +970,27 @@ impl NewportHolder {
                     "XPSExecuteProfile: no built profile (call XPSBuildProfile first)".to_string()
                 })?;
 
+                // Pulse window: default one pulse per trajectory element over
+                // the whole profile (C reads these from records).
+                let num_elements = plan.times.len().saturating_sub(1) as i64;
+                let start_pulses = opt_int(args, 3, 1, "startPulses")?;
+                let end_pulses = opt_int(args, 4, num_elements, "endPulses")?;
+                let num_pulses = opt_int(args, 5, num_elements, "numPulses")?;
+                let (pulse_start, pulse_end, pulse_period) = profile::pulse_output_window(
+                    &plan.times,
+                    start_pulses as i32,
+                    end_pulses as i32,
+                    num_pulses as i32,
+                )
+                .map_err(|e| format!("XPSExecuteProfile: {e}"))?;
+
                 // A dedicated blocking socket so the seconds-to-minutes-long
                 // execution never contends with the shared poll socket.
                 let handle = connect_ip(&exec_port, XPS_PVT_EXEC_TIMEOUT)?;
                 let exec_sock = XpsSocket::new(handle, SocketMode::Query);
 
                 println!(
-                    "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} (running on background thread)",
+                    "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} pulses={num_pulses} over elements {start_pulses}..{end_pulses} (running on background thread)",
                     plan.group, plan.file_name
                 );
                 thread::spawn(move || {
@@ -983,16 +1010,51 @@ impl NewportHolder {
                             return;
                         }
                     }
-                    match exec_sock.multiple_axes_pvt_execution(
+
+                    // Configure gathering + the per-pulse sampling event
+                    // (C executeProfile order: reset, configure, pulse window,
+                    // trigger, action, start).
+                    let event_id = match Self::xps_start_gathering(
+                        &exec_sock,
+                        &plan,
+                        pulse_start,
+                        pulse_end,
+                        pulse_period,
+                    ) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            eprintln!("XPSExecuteProfile: {e}");
+                            return;
+                        }
+                    };
+
+                    let run = exec_sock.multiple_axes_pvt_execution(
                         &plan.group,
                         &plan.file_name,
                         executions,
-                    ) {
-                        Ok(()) => {
-                            println!(
-                                "XPSExecuteProfile: trajectory '{}' complete",
-                                plan.file_name
-                            )
+                    );
+
+                    // Tear down the event and stop gathering even on a failed
+                    // or aborted run (C removes the event and stops gathering
+                    // unconditionally after MultipleAxesPVTExecution).
+                    if let Err(e) = exec_sock.event_extended_remove(event_id) {
+                        eprintln!("XPSExecuteProfile: EventExtendedRemove failed: {e}");
+                    }
+                    match exec_sock.gathering_stop() {
+                        // -30: gathering never started (aborted before one
+                        // element completed); C tolerates it.
+                        Ok(()) | Err(XpsError::Api(-30)) => {}
+                        Err(e) => eprintln!("XPSExecuteProfile: GatheringStop failed: {e}"),
+                    }
+
+                    match run {
+                        Ok(()) => println!(
+                            "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
+                            plan.file_name
+                        ),
+                        // -27: the trajectory was aborted (C reports it as such).
+                        Err(XpsError::Api(-27)) => {
+                            eprintln!("XPSExecuteProfile: MultipleAxesPVTExecution aborted")
                         }
                         Err(e) => eprintln!(
                             "XPSExecuteProfile: execution of '{}' failed: {e}",
@@ -1000,6 +1062,119 @@ impl NewportHolder {
                         ),
                     }
                 });
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Configure and start gathering for a trajectory run: reset the buffer,
+    /// declare `SetpointPosition`+`CurrentPosition` per registered positioner,
+    /// window the trajectory pulse train, and fire `GatheringOneData` on every
+    /// pulse (C `executeProfile`, XPSController.cpp:935-1060). Returns the
+    /// extended-event ID to remove after the run.
+    fn xps_start_gathering(
+        sock: &XpsSocket,
+        plan: &ExecutionPlan,
+        pulse_start: i32,
+        pulse_end: i32,
+        pulse_period: f64,
+    ) -> Result<i32, String> {
+        sock.gathering_reset()
+            .map_err(|e| format!("GatheringReset failed: {e}"))?;
+        let types: Vec<String> = plan
+            .gathering_positioners
+            .iter()
+            .flat_map(|p| {
+                [
+                    format!("{p}.SetpointPosition"),
+                    format!("{p}.CurrentPosition"),
+                ]
+            })
+            .collect();
+        sock.gathering_configuration_set(&types)
+            .map_err(|e| format!("GatheringConfigurationSet failed: {e}"))?;
+        sock.multiple_axes_pvt_pulse_output_set(&plan.group, pulse_start, pulse_end, pulse_period)
+            .map_err(|e| format!("MultipleAxesPVTPulseOutputSet failed: {e}"))?;
+        let triggers = vec![
+            "Always".to_string(),
+            format!("{}.PVT.TrajectoryPulse", plan.group),
+        ];
+        sock.event_extended_configuration_trigger_set(&triggers)
+            .map_err(|e| format!("EventExtendedConfigurationTriggerSet failed: {e}"))?;
+        sock.event_extended_configuration_action_set(&["GatheringOneData".to_string()])
+            .map_err(|e| format!("EventExtendedConfigurationActionSet failed: {e}"))?;
+        sock.event_extended_start()
+            .map_err(|e| format!("EventExtendedStart failed: {e}"))
+    }
+
+    /// Create the `XPSReadbackProfile` iocsh command.
+    ///
+    /// `XPSReadbackProfile(motorPort, outputFile)`
+    ///
+    /// Reads the gathering samples collected during the last
+    /// `XPSExecuteProfile` run over the shared poll socket
+    /// (`GatheringCurrentNumberGet` + chunked `GatheringDataMultipleLinesGet`,
+    /// halving the request on a controller error exactly as C
+    /// `readbackProfile`) and writes them to `outputFile` as CSV — one row per
+    /// trajectory pulse with `actual, following_error` per registered
+    /// positioner, the file-based counterpart of C posting the readback
+    /// waveforms (positions are device units, like the profile CSV).
+    pub fn xps_readback_profile_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "XPSReadbackProfile",
+            vec![arg_str_req("motorPort"), arg_str_req("outputFile")],
+            "XPSReadbackProfile(motorPort, outputFile) - Read the gathering samples from the last XPSExecuteProfile run and write them to outputFile as CSV (actual position + following error per registered positioner, device units)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let output_file = req_string(args, 1, "outputFile")?;
+
+                let controller = holder.xps_controller(&motor_port, "XPSReadbackProfile")?;
+                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                let positioners = ctrl.registered_positioners();
+                if positioners.is_empty() {
+                    return Err("XPSReadbackProfile: no axes registered".into());
+                }
+                let sock = ctrl.poll_socket();
+
+                let (current_samples, _max_samples) = sock
+                    .gathering_current_number_get()
+                    .map_err(|e| format!("GatheringCurrentNumberGet failed: {e}"))?;
+
+                let mut readback = GatheringReadback::new(positioners.len());
+                let mut num_read = 0i32;
+                while num_read < current_samples {
+                    // Ask for everything left; on a controller error halve the
+                    // request until it fits (C readbackProfile).
+                    let mut lines = current_samples - num_read;
+                    let buffer = loop {
+                        match sock.gathering_data_multiple_lines_get(num_read, lines) {
+                            Ok(buf) => break buf,
+                            Err(_) if lines > 1 => lines /= 2,
+                            Err(e) => {
+                                return Err(format!("GatheringDataMultipleLinesGet failed: {e}"));
+                            }
+                        }
+                    };
+                    let parsed = gathering::parse_gathering_buffer(
+                        &buffer,
+                        positioners.len(),
+                        &mut readback,
+                    )
+                    .map_err(|e| format!("XPSReadbackProfile: {e}"))?;
+                    if parsed == 0 {
+                        return Err("XPSReadbackProfile: gathering returned no lines".into());
+                    }
+                    num_read += parsed as i32;
+                }
+
+                let csv = gathering::readback_csv(&positioners, &readback);
+                std::fs::write(&output_file, csv)
+                    .map_err(|e| format!("XPSReadbackProfile: writing {output_file}: {e}"))?;
+                println!(
+                    "XPSReadbackProfile: wrote {num_read} samples x {} positioners to {output_file}",
+                    positioners.len()
+                );
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -1062,6 +1237,15 @@ fn opt_double(args: &[ArgValue], i: usize, default: f64, name: &str) -> Result<f
         Some(ArgValue::Double(v)) => Ok(*v),
         None | Some(ArgValue::Missing) => Ok(default),
         _ => Err(format!("{name} must be a number")),
+    }
+}
+
+/// Read an optional integer arg, defaulting when absent.
+fn opt_int(args: &[ArgValue], i: usize, default: i64, name: &str) -> Result<i64, String> {
+    match args.get(i) {
+        Some(ArgValue::Int(v)) => Ok(*v),
+        None | Some(ArgValue::Missing) => Ok(default),
+        _ => Err(format!("{name} must be an integer")),
     }
 }
 

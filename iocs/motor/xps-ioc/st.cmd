@@ -79,6 +79,16 @@ iocInit()
 # XPSBuildProfile FTP credentials/dir default to the XPS factory Administrator
 # account and /Admin/Public/Trajectories; override with extra args if changed.
 # Only plain FTP (XPS-C/Q) is supported; XPS-D SFTP is not implemented.
+#
+# Gathering: every execution samples SetpointPosition + CurrentPosition of all
+# registered positioners on each trajectory pulse. The optional trailing args
+#     XPSExecuteProfile(motorPort, execPort, [executions],
+#                       [startPulses], [endPulses], [numPulses])
+# window the pulse train over 1-based trajectory elements (defaults: the whole
+# profile with one pulse per element). After the run completes, read the
+# samples back into a CSV file (actual position + following error per
+# positioner, device units):
+#     XPSReadbackProfile("$(PORT)", "readback.csv")
 
 # Example:
 #   dbl

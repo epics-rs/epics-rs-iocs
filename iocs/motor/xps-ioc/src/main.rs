@@ -49,6 +49,7 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(holder.xps_define_profile_command());
     app = app.register_startup_command(holder.xps_build_profile_command());
     app = app.register_startup_command(holder.xps_execute_profile_command());
+    app = app.register_startup_command(holder.xps_readback_profile_command());
     app = app.register_dynamic_device_support(holder.device_support_factory());
 
     app.startup_script(&script)

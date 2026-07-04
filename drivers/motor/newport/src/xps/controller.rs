@@ -42,6 +42,14 @@ pub struct ExecutionPlan {
     pub group: String,
     pub start_moves: Vec<(String, f64)>,
     pub move_mode: MoveMode,
+    /// The profile's per-point times, for the pulse-output window
+    /// (C `profileTimes_`).
+    pub times: Vec<f64>,
+    /// Every registered positioner in registration order — the gathering
+    /// samples `SetpointPosition`+`CurrentPosition` for each (C
+    /// `executeProfile` builds the gathering list over all `numAxes_` axes,
+    /// not just the profile's).
+    pub gathering_positioners: Vec<String>,
 }
 
 /// Shared controller state for one XPS, owning the poll socket.
@@ -307,13 +315,25 @@ impl XpsController {
 
     /// A snapshot of the latched trajectory for the execute command to run on
     /// its own socket. `None` if nothing has been built+verified since the last
-    /// [`define_profile`].
+    /// [`define_profile`] (which also guarantees `profile` still matches the
+    /// built trajectory: defining a new profile clears it).
     pub fn execution_plan(&self) -> Option<ExecutionPlan> {
-        self.built_trajectory.as_ref().map(|b| ExecutionPlan {
-            file_name: b.file_name.clone(),
-            group: b.group.clone(),
-            start_moves: b.start_moves.clone(),
-            move_mode: b.move_mode,
+        let built = self.built_trajectory.as_ref()?;
+        let profile = self.profile.as_ref()?;
+        Some(ExecutionPlan {
+            file_name: built.file_name.clone(),
+            group: built.group.clone(),
+            start_moves: built.start_moves.clone(),
+            move_mode: built.move_mode,
+            times: profile.times.clone(),
+            gathering_positioners: self.registered_positioners(),
         })
+    }
+
+    /// The number of registered axes and their positioner names in registration
+    /// order — the shape of the gathering data (one
+    /// `SetpointPosition;CurrentPosition` pair per registered axis per sample).
+    pub fn registered_positioners(&self) -> Vec<String> {
+        self.axes.iter().map(|a| a.positioner.clone()).collect()
     }
 }
