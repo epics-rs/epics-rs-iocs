@@ -1,0 +1,14 @@
+# Animatics SmartMotor IOC binary. Wires the motor-smartmotor driver to a
+# serial octet port (drvAsynSerialPortConfigure) and a motor record, exposing
+# CA + PVA. No vendor library — builds on any host.
+
+[package]
+name = "smartmotor-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-smartmotor = { path = "../../../drivers/motor/smartmotor" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

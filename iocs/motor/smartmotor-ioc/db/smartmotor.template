@@ -1,0 +1,19 @@
+# Animatics SmartMotor: one motor record for the single configured motor
+# (DTYP SMARTMOTOR_$(CARD)_0).
+#
+# The SmartMotor is an integrated servo working in encoder counts. Positions
+# travel the driver boundary in counts, so MRES = 1 and EGU = counts. VELO
+# (counts/s) and ACCL feed the V=/A= parameters. Homing is not supported by the
+# SmartMotor; the plus/minus travel-limit switches are reported.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "SMARTMOTOR_$(CARD)_0")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=100000.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=100000000.0)")
+    field(DLLM, "$(LLM=-100000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+}
