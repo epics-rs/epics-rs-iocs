@@ -21,12 +21,16 @@ use motor_common::iocsh::{
 
 use crate::corvus::{CorvusAxis, CorvusController};
 use crate::hydra::{HydraAxis, HydraController};
+use crate::taurus::{TaurusAxis, TaurusController};
 
 /// Command timeout.
 const CORVUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Hydra command timeout.
 const HYDRA_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Taurus command timeout.
+const TAURUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `SMCcorvusCreateController(card, corvusPort, numAxes,
 /// [movingPollMs], [idlePollMs])` command bound to `holder`.
@@ -115,6 +119,53 @@ pub fn hydra_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef 
             println!(
                 "SMChydraCreateController: card={card} hydraPort={hydra_port} axes={num_axes} \
                  poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=HYDRA_{card}_{{0..{}}})",
+                num_axes - 1
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `SMCTaurusCreateController(card, taurusPort, numAxes,
+/// [movingPollMs], [idlePollMs])` command bound to `holder`.
+pub fn taurus_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "SMCTaurusCreateController",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("taurusPort"),
+            arg_int_req("numAxes"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+        ],
+        "SMCTaurusCreateController(card, taurusPort, numAxes, [movingPollMs], [idlePollMs]) - \
+         Create a Micos SMC Taurus controller (DTYP TAURUS_{card}_{index}) with numAxes axes",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("SMCTaurusCreateController: card must be >= 0".into());
+            }
+            let taurus_port = req_string(args, 1, "taurusPort")?;
+            let num_axes = req_int(args, 2, "numAxes")?;
+            if num_axes < 1 {
+                return Err("SMCTaurusCreateController: numAxes must be > 0".into());
+            }
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            let handle = connect_ip(&taurus_port, TAURUS_TIMEOUT)?;
+            let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+
+            for index in 0..num_axes as usize {
+                let ax = TaurusAxis::new(controller.clone(), index)
+                    .map_err(|e| format!("SMCTaurusCreateController: axis {index}: {e}"))?;
+                let dtyp_key = format!("TAURUS_{card}_{index}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            }
+            println!(
+                "SMCTaurusCreateController: card={card} taurusPort={taurus_port} axes={num_axes} \
+                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=TAURUS_{card}_{{0..{}}})",
                 num_axes - 1
             );
             Ok(CommandOutcome::Continue)
