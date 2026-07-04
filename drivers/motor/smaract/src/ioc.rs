@@ -22,6 +22,7 @@ use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 
+use crate::mcs::{McsAxis, McsController};
 use crate::mcs2::{Mcs2Axis, Mcs2Controller};
 use crate::scu::{ScuAxis, ScuController};
 
@@ -30,6 +31,9 @@ const MCS2_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SCU command timeout (C `DEFAULT_TIMEOUT` = 2.0 s).
 const SCU_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// MCS command timeout (C `DEFLT_TIMEOUT` = 2.0 s).
+const MCS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the `MCS2CreateController(card, asynPort, numAxes, [movingPollMs],
 /// [idlePollMs])` command bound to `holder`.
@@ -192,6 +196,124 @@ pub fn scu_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
             println!(
                 "smarActSCUCreateAxis: card={card} axisNo={axis_no} channel={channel} \
                  (DTYP=SCU_{card}_{axis_no})"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// A registered MCS controller plus the poll intervals its axes install with.
+struct McsRegistered {
+    controller: Arc<Mutex<McsController>>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+}
+
+/// MCS controllers registered by `smarActMCSCreateController`, keyed by `card`,
+/// so `smarActMCSCreateAxis` can attach axes.
+fn mcs_registry() -> &'static Mutex<HashMap<i64, McsRegistered>> {
+    static REG: OnceLock<Mutex<HashMap<i64, McsRegistered>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Build `smarActMCSCreateController(card, asynPort, numAxes, [movingPollMs],
+/// [idlePollMs], [disableSpeed])`. `disableSpeed` non-zero suppresses `SCLS`
+/// speed-set commands (C's 6th argument).
+pub fn mcs_create_controller_command() -> CommandDef {
+    CommandDef::new(
+        "smarActMCSCreateController",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("asynPort"),
+            arg_int_req("numAxes"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+            arg_int_opt("disableSpeed"),
+        ],
+        "smarActMCSCreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs], \
+         [disableSpeed]) - Create a SmarAct MCS controller; add axes with smarActMCSCreateAxis",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("smarActMCSCreateController: card must be >= 0".into());
+            }
+            let asyn_port = req_string(args, 1, "asynPort")?;
+            let num_axes = req_int(args, 2, "numAxes")?;
+            if num_axes < 1 {
+                return Err("smarActMCSCreateController: numAxes must be > 0".into());
+            }
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let disable_speed = matches!(args.get(5), Some(ArgValue::Double(d)) if *d != 0.0);
+
+            let handle = connect_ip(&asyn_port, MCS_TIMEOUT)?;
+            let controller = Arc::new(Mutex::new(McsController::new(handle, disable_speed)));
+
+            mcs_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    card,
+                    McsRegistered {
+                        controller,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    },
+                );
+            println!(
+                "smarActMCSCreateController: card={card} asynPort={asyn_port} numAxes={num_axes} \
+                 disableSpeed={disable_speed} poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
+                 (add axes with smarActMCSCreateAxis)"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build `smarActMCSCreateAxis(card, axisNo, channel)` bound to `holder`.
+pub fn mcs_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "smarActMCSCreateAxis",
+        vec![
+            arg_int_req("card"),
+            arg_int_req("axisNo"),
+            arg_int_req("channel"),
+        ],
+        "smarActMCSCreateAxis(card, axisNo, channel) - Add axis axisNo (0-based, \
+         DTYP MCS_{card}_{axisNo}) driving controller channel `channel`, to a \
+         controller created by smarActMCSCreateController",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            let axis_no = req_int(args, 1, "axisNo")?;
+            if axis_no < 0 {
+                return Err("smarActMCSCreateAxis: axisNo must be >= 0".into());
+            }
+            let channel = req_int(args, 2, "channel")?;
+            if channel < 0 {
+                return Err("smarActMCSCreateAxis: channel must be >= 0".into());
+            }
+
+            let (controller, moving_poll_ms, idle_poll_ms) = {
+                let reg = mcs_registry().lock().unwrap_or_else(|e| e.into_inner());
+                let entry = reg.get(&card).ok_or_else(|| {
+                    format!("smarActMCSCreateAxis: no controller for card={card} (call smarActMCSCreateController first)")
+                })?;
+                (
+                    entry.controller.clone(),
+                    entry.moving_poll_ms,
+                    entry.idle_poll_ms,
+                )
+            };
+
+            let ax = McsAxis::new(controller, channel as i32)
+                .map_err(|e| format!("smarActMCSCreateAxis: {e}"))?;
+            let dtyp_key = format!("MCS_{card}_{axis_no}");
+            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+
+            println!(
+                "smarActMCSCreateAxis: card={card} axisNo={axis_no} channel={channel} \
+                 (DTYP=MCS_{card}_{axis_no})"
             );
             Ok(CommandOutcome::Continue)
         },

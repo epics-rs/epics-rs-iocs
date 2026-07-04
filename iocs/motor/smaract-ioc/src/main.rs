@@ -16,7 +16,8 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_common::MotorHolder;
 use motor_smaract::ioc::{
-    mcs2_create_controller_command, scu_create_axis_command, scu_create_controller_command,
+    mcs_create_axis_command, mcs_create_controller_command, mcs2_create_controller_command,
+    scu_create_axis_command, scu_create_controller_command,
 };
 
 #[epics_rs::base::epics_main]
@@ -41,11 +42,13 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // SmarAct iocsh commands (MCS2 + SCU) + motor device support.
+    // SmarAct iocsh commands (MCS2 + SCU + MCS) + motor device support.
     let holder = MotorHolder::new();
     app = app.register_startup_command(mcs2_create_controller_command(&holder));
     app = app.register_startup_command(scu_create_controller_command());
     app = app.register_startup_command(scu_create_axis_command(&holder));
+    app = app.register_startup_command(mcs_create_controller_command());
+    app = app.register_startup_command(mcs_create_axis_command(&holder));
     app = app.register_dynamic_device_support(holder.device_support_factory());
 
     app.startup_script(&script)

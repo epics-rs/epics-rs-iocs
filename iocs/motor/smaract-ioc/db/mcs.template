@@ -1,0 +1,22 @@
+# SmarAct MCS: one motor record per axis. Load once per axis with N = 0-based
+# axis number (DTYP MCS_$(CARD)_$(N)); the controller channel it drives is set
+# separately by smarActMCSCreateAxis.
+#
+# The MCS driver reports the controller's raw integer position in nanometres
+# (linear) / micro-degrees (rotary) with no scaling, so positions cross the
+# driver boundary in those units and MRES sets the record EGU: MRES = 1e-6 reads
+# millimetres (linear) or degrees (rotary). Homed comes from the MCS's
+# persistent physical-position-known bit (GPPK). Post-move hold and auto-zero use
+# the C startup defaults (not exposed as PVs).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MCS_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=100.0)")
+    field(DLLM, "$(LLM=-100.0)")
+    field(MRES, "$(MRES=1e-6)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=4)")
+}
