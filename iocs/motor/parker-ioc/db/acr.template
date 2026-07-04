@@ -1,0 +1,18 @@
+# Parker ACR / Aries: one motor record per axis. Load once per axis with N =
+# 0-based axis index (DTYP ACR_$(CARD)_$(N)); the axis name is AXIS$(N).
+#
+# The driver reports positions in controller counts (the position registers hold
+# pulses; PPU divides the commanded values only), so MRES = 1 and EGU = counts.
+# Done, limit, at-home and drive-power status come from the ?P register reads.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "ACR_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10000)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=10000000)")
+    field(DLLM, "$(LLM=-10000000)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+}

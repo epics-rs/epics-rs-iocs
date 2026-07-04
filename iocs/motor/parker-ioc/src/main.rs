@@ -1,11 +1,12 @@
-//! Parker OEM750 motor IOC.
+//! Parker motor IOC (OEM750 and ACR/Aries).
 //!
-//! Assembles: an asyn IP octet port (`drvAsynIPPortConfigure`), the OEM iocsh
-//! command (`OEMCreateController`), the motor record type, and the CA + PVA
-//! (QSRV) server.
+//! Assembles: an asyn IP octet port (`drvAsynIPPortConfigure`), the OEM and ACR
+//! iocsh commands (`OEMCreateController`, `ACRCreateController`), the motor
+//! record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
-//!   cargo run -p parker-ioc -- st.cmd
+//!   cargo run -p parker-ioc -- st.cmd        # OEM750
+//!   cargo run -p parker-ioc -- st.acr.cmd    # ACR / Aries
 
 use std::sync::Arc;
 
@@ -13,7 +14,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_common::MotorHolder;
-use motor_parker::ioc::oem_create_controller_command;
+use motor_parker::ioc::{acr_create_controller_command, oem_create_controller_command};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -37,9 +38,10 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // OEM iocsh command + motor device support.
+    // OEM750 and ACR iocsh commands share one motor device support.
     let holder = MotorHolder::new();
     app = app.register_startup_command(oem_create_controller_command(&holder));
+    app = app.register_startup_command(acr_create_controller_command(&holder));
     app = app.register_dynamic_device_support(holder.device_support_factory());
 
     app.startup_script(&script)
