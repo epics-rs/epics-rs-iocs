@@ -1,0 +1,13 @@
+# Simulated motor IOC binary. Wires the motor-motorsim driver to one motor
+# record per axis, exposing CA + PVA. No hardware, no vendor library — builds
+# and runs on any host (useful as a motor-record test/demo target).
+
+[package]
+name = "motorsim-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-motorsim = { path = "../../../drivers/motor/motorsim" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

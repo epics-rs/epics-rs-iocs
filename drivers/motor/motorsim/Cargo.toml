@@ -1,0 +1,13 @@
+# Simulated motor controller driver, ported from epics-modules/motor
+# motorMotorSim (motorSimDriver.cpp + route.c). Software-only trajectory
+# simulation — no vendor library, builds and tests on any host.
+
+[package]
+name = "motor-motorsim"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

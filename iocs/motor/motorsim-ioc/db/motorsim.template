@@ -1,0 +1,17 @@
+# Simulated motor: one motor record per axis. Load once per axis with
+# N = 0-based axis index (DTYP motorSim_$(PORT)_$(N)). The simulator is
+# unitless — positions and velocities are dimensionless record EGU, so MRES
+# is 1 and EGU is arbitrary. VELO/ACCL map straight onto the trajectory's
+# Vmax/Amax.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "motorSim_$(PORT)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=5.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=100.0)")
+    field(DLLM, "$(LLM=-100.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=4)")
+}
