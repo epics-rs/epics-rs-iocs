@@ -42,6 +42,24 @@ epics-rs-iocs/
 2. Create `iocs/<device>-ioc/` with a binary crate that depends on the driver
 3. Add both to the workspace `members` in the root `Cargo.toml`
 
+### Vendor SDKs and workspace-wide checks
+
+Some driver crates link vendor SDKs, so `cargo clippy --workspace` /
+`cargo nextest run --workspace` only pass on a machine with those SDKs
+installed:
+
+- **d435i / d435i-ioc** need [librealsense2](https://github.com/IntelRealSense/librealsense)
+  (`realsense-sys`'s build script fails without `realsense2.pc` on
+  `PKG_CONFIG_PATH`, which fails even `cargo clippy --workspace`).
+  Ubuntu: `sudo apt install librealsense2-dev`.
+- **meascomp / usb-ctr / usb-2408** (and their IOCs) need
+  [libuldaq](https://github.com/mccdaq/uldaq). `clippy`/`check` pass
+  without it, but building test or IOC binaries fails at link
+  (`-luldaq`).
+
+On a machine without the SDKs, scope checks to the crates you touched,
+e.g. `cargo clippy -p motor-newport -p xps-ioc --all-targets -- -D warnings`.
+
 ---
 
 # USB-CTR08 Counter/Timer IOC
