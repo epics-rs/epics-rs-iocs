@@ -1,0 +1,21 @@
+# Faulhaber MCDC2805: one motor record per node. Load once per node with
+# N = 0-based node number (DTYP MCDC2805_$(CARD)_$(N)); the driver prefixes the
+# node number to each command.
+#
+# The MCDC2805 is a DC servo positioner working in encoder counts. Positions
+# travel the driver boundary in counts, so MRES = 1 and EGU = counts. VELO (in
+# counts/s) and ACCL are converted to the controller's rev/min and rev/s^2 using
+# the countsPerRev given to MCDC2805Config. Done is derived from the actual
+# velocity being zero; limit and home switches are reported from the controller.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MCDC2805_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=5000.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=1000000.0)")
+    field(DLLM, "$(LLM=-1000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+}
