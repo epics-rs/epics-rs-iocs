@@ -1,0 +1,14 @@
+# Kohzu SC-200/400/800 motor IOC binary. Wires the motor-kohzu driver to a
+# serial octet port (drvAsynSerialPortConfigure) and one motor record per axis,
+# exposing CA + PVA. No vendor library — builds on any host.
+
+[package]
+name = "kohzu-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-kohzu = { path = "../../../drivers/motor/kohzu" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

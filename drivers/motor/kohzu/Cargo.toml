@@ -1,0 +1,13 @@
+# Kohzu SC-200/400/800 stepper motor controller driver, ported from
+# epics-modules/motor motorKohzu (drvSC800.cc + devSC800.cc). Pure serial ASCII
+# protocol — no vendor library, so this crate builds/tests on any host.
+
+[package]
+name = "motor-kohzu"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

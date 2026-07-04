@@ -1,0 +1,20 @@
+# Kohzu SC-200/400/800: one motor record per axis. Load once per axis with
+# N = 0-based axis index (DTYP SC800_$(CARD)_$(N)); the driver maps index
+# 0,1,2,... to controller axes 1,2,3,...
+#
+# The SC-800 is a stepper controller working in motor steps. Positions travel
+# the driver boundary in steps, so MRES = 1 and EGU = steps. VELO (steps/s) and
+# ACCL feed the controller's base/slew/accel parameters. Done is taken directly
+# from the controller status; CW/CCW limit switches are reported.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "SC800_$(CARD)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10000.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=10000000.0)")
+    field(DLLM, "$(LLM=-10000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}
