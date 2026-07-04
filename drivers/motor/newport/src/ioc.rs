@@ -41,6 +41,7 @@ use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::mm4000::{Mm4000Axis, Mm4000Controller};
 use crate::pm500::{Pm500Axis, Pm500Controller};
+use crate::pmnc::{PmncAxis, PmncController};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
@@ -95,6 +96,10 @@ const MM4000_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// PM500 serial command timeout (C drvPM500 `SERIAL_TIMEOUT` 2 s).
 const PM500_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// PMNC (New Focus 8750/8752) command timeout (C drvPMNC87xx
+/// `PMNC_TIMEOUT` 3 s).
+const PMNC_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Default XPS FTP account and trajectory directory. C uses the factory
 /// `Administrator`/`Administrator` login; `/Admin/Public/Trajectories` is the
@@ -1693,6 +1698,59 @@ impl NewportHolder {
                 println!(
                     "PM500CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PM500_{motor_port}_{{0..{}}})",
                     num_axes - 1
+                );
+                Ok(CommandOutcome::Continue)
+            },
+        )
+    }
+
+    /// Create the `PMNC87xxCreateController` iocsh command.
+    ///
+    /// `PMNC87xxCreateController(motorPort, asynPort, [movingPollMs],
+    /// [idlePollMs])`
+    ///
+    /// Creates a Newport New Focus PMNC 8750/8752 picomotor network
+    /// controller on a pre-configured octet port (typically a TCP port from
+    /// `drvAsynIPPortConfigure`), autodiscovers its driver modules and
+    /// channels (`MPV` for the 8750, `DRT` for the 8752), and creates one
+    /// motor axis per discovered channel (DTYP `PMNC_{motorPort}_{0..}`).
+    /// The port input EOS must be the `>` prompt
+    /// (`asynOctetSetInputEos(port, 0, ">")`). Replaces the C
+    /// `PMNC87xxSetup`/`PMNC87xxConfig` pair.
+    pub fn pmnc87xx_create_controller_command(self: &Arc<Self>) -> CommandDef {
+        let holder = self.clone();
+        CommandDef::new(
+            "PMNC87xxCreateController",
+            vec![
+                arg_str_req("motorPort"),
+                arg_str_req("asynPort"),
+                arg_int_opt("movingPollMs"),
+                arg_int_opt("idlePollMs"),
+            ],
+            "PMNC87xxCreateController(motorPort, asynPort, [movingPollMs], [idlePollMs]) - Create a Newport New Focus PMNC 8750/8752 picomotor controller, autodiscovering axes (DTYP PMNC_{motorPort}_{0..})",
+            move |args: &[ArgValue], ctx: &CommandContext| {
+                let motor_port = req_string(args, 0, "motorPort")?;
+                let asyn_port = req_string(args, 1, "asynPort")?;
+                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+
+                let handle = connect_ip(&asyn_port, PMNC_TIMEOUT)?;
+                let controller = PmncController::new(handle)
+                    .map_err(|e| format!("PMNC87xxCreateController: {e}"))?;
+                let ident = controller.ident().to_string();
+                let model = controller.model();
+                let num_axes = controller.num_axes();
+                let controller = Arc::new(Mutex::new(controller));
+
+                for index in 0..num_axes {
+                    let ax = PmncAxis::new(controller.clone(), index)
+                        .map_err(|e| format!("PMNC87xxCreateController: axis {index}: {e}"))?;
+                    let dtyp_key = format!("PMNC_{motor_port}_{index}");
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                }
+                println!(
+                    "PMNC87xxCreateController: motorPort={motor_port} asynPort={asyn_port} ident=\"{ident}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PMNC_{motor_port}_{{0..{}}})",
+                    num_axes.saturating_sub(1)
                 );
                 Ok(CommandOutcome::Continue)
             },
