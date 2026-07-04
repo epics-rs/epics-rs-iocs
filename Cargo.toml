@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "drivers/d435i",
+    "drivers/motor/common",
     "drivers/motor/newport",
     "drivers/meascomp/meascomp",
     "drivers/meascomp/uldaq-sys",
