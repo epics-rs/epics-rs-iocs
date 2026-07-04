@@ -45,10 +45,26 @@ async fn main() -> CaResult<()> {
         app = app.register_startup_command(CommandDef::new(
             "MultiFunctionConfig",
             vec![
-                ArgDesc { name: "portName", arg_type: ArgType::String, optional: false },
-                ArgDesc { name: "uniqueID", arg_type: ArgType::String, optional: false },
-                ArgDesc { name: "maxInputPoints", arg_type: ArgType::Int, optional: true },
-                ArgDesc { name: "maxOutputPoints", arg_type: ArgType::Int, optional: true },
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "uniqueID",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "maxInputPoints",
+                    arg_type: ArgType::Int,
+                    optional: true,
+                },
+                ArgDesc {
+                    name: "maxOutputPoints",
+                    arg_type: ArgType::Int,
+                    optional: true,
+                },
             ],
             "MultiFunctionConfig portName uniqueID [maxInputPoints] [maxOutputPoints]",
             move |args: &[ArgValue], _ctx: &CommandContext| {

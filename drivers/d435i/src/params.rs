@@ -87,7 +87,8 @@ impl D435iParams {
             rs_last_error: base.create_param("RS_LAST_ERROR", ParamType::Octet)?,
 
             rs_decimation_enable: base.create_param("RS_DECIMATION_ENABLE", ParamType::Int32)?,
-            rs_decimation_magnitude: base.create_param("RS_DECIMATION_MAGNITUDE", ParamType::Int32)?,
+            rs_decimation_magnitude: base
+                .create_param("RS_DECIMATION_MAGNITUDE", ParamType::Int32)?,
             rs_spatial_enable: base.create_param("RS_SPATIAL_ENABLE", ParamType::Int32)?,
             rs_spatial_alpha: base.create_param("RS_SPATIAL_ALPHA", ParamType::Float64)?,
             rs_spatial_delta: base.create_param("RS_SPATIAL_DELTA", ParamType::Int32)?,
@@ -175,20 +176,61 @@ impl D435iConfigSnapshot {
                 .unwrap_or(0)
                 != 0,
 
-            decimation_enable: handle.read_int32(rs.rs_decimation_enable, 0).await.unwrap_or(0) != 0,
-            decimation_magnitude: handle.read_int32(rs.rs_decimation_magnitude, 0).await.unwrap_or(2),
-            spatial_enable: handle.read_int32(rs.rs_spatial_enable, 0).await.unwrap_or(0) != 0,
-            spatial_alpha: handle.read_float64(rs.rs_spatial_alpha, 0).await.unwrap_or(0.5),
-            spatial_delta: handle.read_int32(rs.rs_spatial_delta, 0).await.unwrap_or(20),
-            spatial_magnitude: handle.read_int32(rs.rs_spatial_magnitude, 0).await.unwrap_or(2),
-            temporal_enable: handle.read_int32(rs.rs_temporal_enable, 0).await.unwrap_or(0) != 0,
-            temporal_alpha: handle.read_float64(rs.rs_temporal_alpha, 0).await.unwrap_or(0.4),
-            temporal_delta: handle.read_int32(rs.rs_temporal_delta, 0).await.unwrap_or(20),
-            hole_fill_enable: handle.read_int32(rs.rs_hole_fill_enable, 0).await.unwrap_or(0) != 0,
-            hole_fill_mode: handle.read_int32(rs.rs_hole_fill_mode, 0).await.unwrap_or(1),
+            decimation_enable: handle
+                .read_int32(rs.rs_decimation_enable, 0)
+                .await
+                .unwrap_or(0)
+                != 0,
+            decimation_magnitude: handle
+                .read_int32(rs.rs_decimation_magnitude, 0)
+                .await
+                .unwrap_or(2),
+            spatial_enable: handle
+                .read_int32(rs.rs_spatial_enable, 0)
+                .await
+                .unwrap_or(0)
+                != 0,
+            spatial_alpha: handle
+                .read_float64(rs.rs_spatial_alpha, 0)
+                .await
+                .unwrap_or(0.5),
+            spatial_delta: handle
+                .read_int32(rs.rs_spatial_delta, 0)
+                .await
+                .unwrap_or(20),
+            spatial_magnitude: handle
+                .read_int32(rs.rs_spatial_magnitude, 0)
+                .await
+                .unwrap_or(2),
+            temporal_enable: handle
+                .read_int32(rs.rs_temporal_enable, 0)
+                .await
+                .unwrap_or(0)
+                != 0,
+            temporal_alpha: handle
+                .read_float64(rs.rs_temporal_alpha, 0)
+                .await
+                .unwrap_or(0.4),
+            temporal_delta: handle
+                .read_int32(rs.rs_temporal_delta, 0)
+                .await
+                .unwrap_or(20),
+            hole_fill_enable: handle
+                .read_int32(rs.rs_hole_fill_enable, 0)
+                .await
+                .unwrap_or(0)
+                != 0,
+            hole_fill_mode: handle
+                .read_int32(rs.rs_hole_fill_mode, 0)
+                .await
+                .unwrap_or(1),
 
             align_enable: handle.read_int32(rs.rs_align_enable, 0).await.unwrap_or(0) != 0,
-            pointcloud_enable: handle.read_int32(rs.rs_pointcloud_enable, 0).await.unwrap_or(0) != 0,
+            pointcloud_enable: handle
+                .read_int32(rs.rs_pointcloud_enable, 0)
+                .await
+                .unwrap_or(0)
+                != 0,
         })
     }
 }

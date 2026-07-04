@@ -200,19 +200,14 @@ fn poller_loop(
         } else {
             for ch in 0..MAX_ANALOG_IN {
                 if let Some(raw) = snapshot.ai_raw[ch] {
-                    let _ =
-                        handle.write_int32_blocking(params.analog_in_value, ch as i32, raw);
+                    let _ = handle.write_int32_blocking(params.analog_in_value, ch as i32, raw);
                 }
                 if let Some(v) = snapshot.ai_volts[ch] {
-                    let _ =
-                        handle.write_float64_blocking(params.voltage_in_value, ch as i32, v);
+                    let _ = handle.write_float64_blocking(params.voltage_in_value, ch as i32, v);
                 }
                 if let Some(t) = snapshot.ai_temp[ch] {
-                    let _ = handle.write_float64_blocking(
-                        params.temperature_in_value,
-                        ch as i32,
-                        t,
-                    );
+                    let _ =
+                        handle.write_float64_blocking(params.temperature_in_value, ch as i32, t);
                 }
             }
         }
@@ -222,11 +217,8 @@ fn poller_loop(
         }
 
         let elapsed = start.elapsed();
-        let _ = handle.write_float64_blocking(
-            params.poll_time_ms,
-            0,
-            elapsed.as_secs_f64() * 1000.0,
-        );
+        let _ =
+            handle.write_float64_blocking(params.poll_time_ms, 0, elapsed.as_secs_f64() * 1000.0);
 
         let poll_ms = handle
             .read_float64_blocking(params.poll_sleep_ms, 0)

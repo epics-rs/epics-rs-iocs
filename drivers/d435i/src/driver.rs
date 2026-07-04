@@ -15,7 +15,7 @@ use epics_rs::ad_core::runtime as rt;
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
-use crate::types::{AcqCommand, DirtyFlags, STREAM_MODES, DEFAULT_STREAM_MODE};
+use crate::types::{AcqCommand, DEFAULT_STREAM_MODE, DirtyFlags, STREAM_MODES};
 
 // ============================================================================
 // Color Driver (main)
@@ -45,7 +45,11 @@ impl D435iColorDriver {
         base.set_string_param(ad.params.base.model, 0, "RealSense D435i".into())?;
         base.set_string_param(ad.params.base.serial_number, 0, "Not connected".into())?;
         base.set_string_param(ad.params.base.firmware_version, 0, "Unknown".into())?;
-        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION").into())?;
+        base.set_string_param(
+            ad.params.base.sdk_version,
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+        )?;
 
         // Default stream config
         let default_mode = &STREAM_MODES[DEFAULT_STREAM_MODE as usize];
@@ -130,7 +134,11 @@ impl PortDriver for D435iColorDriver {
         let acquire_idx = self.ad.params.acquire;
 
         if reason == acquire_idx {
-            let acquiring = self.ad.port_base.get_int32_param(acquire_idx, 0).unwrap_or(0);
+            let acquiring = self
+                .ad
+                .port_base
+                .get_int32_param(acquire_idx, 0)
+                .unwrap_or(0);
             if value != 0 && acquiring == 0 {
                 self.ad.port_base.set_string_param(
                     self.ad.params.status_message,
@@ -140,7 +148,11 @@ impl PortDriver for D435iColorDriver {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Start).is_err() {
                     log::error!("D435i: acquisition task is not running");
-                    self.ad.port_base.set_string_param(self.ad.params.status_message, 0, "Acquisition task crashed".into())?;
+                    self.ad.port_base.set_string_param(
+                        self.ad.params.status_message,
+                        0,
+                        "Acquisition task crashed".into(),
+                    )?;
                     self.ad.port_base.set_int32_param(acquire_idx, 0, 0)?;
                 }
             } else if value == 0 && acquiring != 0 {
@@ -159,20 +171,48 @@ impl PortDriver for D435iColorDriver {
         } else if reason == self.rs_params.rs_stream_mode {
             // Validate mode index and apply
             if let Some(mode) = STREAM_MODES.get(value as usize) {
-                self.ad.port_base.params.set_int32(reason, user.addr, value)?;
-                self.ad.port_base.params.set_int32(self.rs_params.rs_res_x, 0, mode.width)?;
-                self.ad.port_base.params.set_int32(self.rs_params.rs_res_y, 0, mode.height)?;
-                self.ad.port_base.params.set_int32(self.rs_params.rs_frame_rate, 0, mode.fps)?;
+                self.ad
+                    .port_base
+                    .params
+                    .set_int32(reason, user.addr, value)?;
+                self.ad
+                    .port_base
+                    .params
+                    .set_int32(self.rs_params.rs_res_x, 0, mode.width)?;
+                self.ad
+                    .port_base
+                    .params
+                    .set_int32(self.rs_params.rs_res_y, 0, mode.height)?;
+                self.ad
+                    .port_base
+                    .params
+                    .set_int32(self.rs_params.rs_frame_rate, 0, mode.fps)?;
                 // Update AD params to match
-                self.ad.port_base.params.set_int32(self.ad.params.size_x, 0, mode.width)?;
-                self.ad.port_base.params.set_int32(self.ad.params.size_y, 0, mode.height)?;
-                self.ad.port_base.params.set_float64(self.ad.params.acquire_time, 0, 1.0 / mode.fps as f64)?;
+                self.ad
+                    .port_base
+                    .params
+                    .set_int32(self.ad.params.size_x, 0, mode.width)?;
+                self.ad
+                    .port_base
+                    .params
+                    .set_int32(self.ad.params.size_y, 0, mode.height)?;
+                self.ad.port_base.params.set_float64(
+                    self.ad.params.acquire_time,
+                    0,
+                    1.0 / mode.fps as f64,
+                )?;
                 self.dirty.lock().reconfigure_pipeline = true;
             } else {
-                log::warn!("D435i: invalid stream mode index {value}, max is {}", STREAM_MODES.len() - 1);
+                log::warn!(
+                    "D435i: invalid stream mode index {value}, max is {}",
+                    STREAM_MODES.len() - 1
+                );
             }
         } else {
-            self.ad.port_base.params.set_int32(reason, user.addr, value)?;
+            self.ad
+                .port_base
+                .params
+                .set_int32(reason, user.addr, value)?;
 
             // Dirty flag routing
             if reason == self.rs_params.rs_auto_exposure
@@ -200,7 +240,10 @@ impl PortDriver for D435iColorDriver {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad.port_base.params.set_float64(reason, user.addr, value)?;
+        self.ad
+            .port_base
+            .params
+            .set_float64(reason, user.addr, value)?;
 
         let mut dirty = self.dirty.lock();
         if reason == self.rs_params.rs_exposure
@@ -249,7 +292,11 @@ impl D435iDepthDriver {
         base.set_string_param(ad.params.base.model, 0, "RealSense D435i (Depth)".into())?;
         base.set_string_param(ad.params.base.serial_number, 0, "Not connected".into())?;
         base.set_string_param(ad.params.base.firmware_version, 0, "Unknown".into())?;
-        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION").into())?;
+        base.set_string_param(
+            ad.params.base.sdk_version,
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+        )?;
 
         // Image size and ROI (use default stream mode)
         let default_mode = &STREAM_MODES[DEFAULT_STREAM_MODE as usize];
@@ -383,7 +430,12 @@ pub fn create_d435i_detector(
 
     // --- Color port ---
     let color_det = D435iColorDriver::new(
-        port_name, max_size_x, max_size_y, max_memory, acq_tx, dirty.clone(),
+        port_name,
+        max_size_x,
+        max_size_y,
+        max_memory,
+        acq_tx,
+        dirty.clone(),
     )?;
     let color_ad_params = color_det.ad.params;
     let color_rs_params = color_det.rs_params;

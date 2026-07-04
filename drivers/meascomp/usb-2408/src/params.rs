@@ -136,14 +136,17 @@ impl MultiFunctionParams {
 
             temperature_in_value: base.create_param("TEMPERATURE_IN_VALUE", ParamType::Float64)?,
             thermocouple_type: base.create_param("THERMOCOUPLE_TYPE", ParamType::Int32)?,
-            thermocouple_open_detect: base.create_param("THERMOCOUPLE_OPEN_DETECT", ParamType::Int32)?,
+            thermocouple_open_detect: base
+                .create_param("THERMOCOUPLE_OPEN_DETECT", ParamType::Int32)?,
             temperature_scale: base.create_param("TEMPERATURE_SCALE", ParamType::Int32)?,
             temperature_filter: base.create_param("TEMPERATURE_FILTER", ParamType::Int32)?,
 
             analog_out_value: base.create_param("ANALOG_OUT_VALUE", ParamType::Int32)?,
             analog_out_range: base.create_param("ANALOG_OUT_RANGE", ParamType::Int32)?,
-            analog_out_sync_master: base.create_param("ANALOG_OUT_SYNC_MASTER", ParamType::Int32)?,
-            analog_out_sync_enable: base.create_param("ANALOG_OUT_SYNC_ENABLE", ParamType::Int32)?,
+            analog_out_sync_master: base
+                .create_param("ANALOG_OUT_SYNC_MASTER", ParamType::Int32)?,
+            analog_out_sync_enable: base
+                .create_param("ANALOG_OUT_SYNC_ENABLE", ParamType::Int32)?,
             analog_out_sync_write: base.create_param("ANALOG_OUT_SYNC_WRITE", ParamType::Int32)?,
 
             wave_dig_dwell: base.create_param("WAVEDIG_DWELL", ParamType::Float64)?,
@@ -162,7 +165,8 @@ impl MultiFunctionParams {
             wave_dig_burst_mode: base.create_param("WAVEDIG_BURST_MODE", ParamType::Int32)?,
             wave_dig_run: base.create_param("WAVEDIG_RUN", ParamType::Int32)?,
             wave_dig_time_wf: base.create_param("WAVEDIG_TIME_WF", ParamType::Float32Array)?,
-            wave_dig_abs_time_wf: base.create_param("WAVEDIG_ABS_TIME_WF", ParamType::Float64Array)?,
+            wave_dig_abs_time_wf: base
+                .create_param("WAVEDIG_ABS_TIME_WF", ParamType::Float64Array)?,
             wave_dig_read_wf: base.create_param("WAVEDIG_READ_WF", ParamType::Int32)?,
             wave_dig_volt_wf: base.create_param("WAVEDIG_VOLT_WF", ParamType::Float32Array)?,
 
@@ -174,16 +178,20 @@ impl MultiFunctionParams {
             wave_gen_current_point: base.create_param("WAVEGEN_CURRENT_POINT", ParamType::Int32)?,
             wave_gen_int_dwell: base.create_param("WAVEGEN_INT_DWELL", ParamType::Float64)?,
             wave_gen_user_dwell: base.create_param("WAVEGEN_USER_DWELL", ParamType::Float64)?,
-            wave_gen_int_num_points: base.create_param("WAVEGEN_INT_NUM_POINTS", ParamType::Int32)?,
-            wave_gen_user_num_points: base.create_param("WAVEGEN_USER_NUM_POINTS", ParamType::Int32)?,
+            wave_gen_int_num_points: base
+                .create_param("WAVEGEN_INT_NUM_POINTS", ParamType::Int32)?,
+            wave_gen_user_num_points: base
+                .create_param("WAVEGEN_USER_NUM_POINTS", ParamType::Int32)?,
             wave_gen_ext_trigger: base.create_param("WAVEGEN_EXT_TRIGGER", ParamType::Int32)?,
             wave_gen_ext_clock: base.create_param("WAVEGEN_EXT_CLOCK", ParamType::Int32)?,
             wave_gen_continuous: base.create_param("WAVEGEN_CONTINUOUS", ParamType::Int32)?,
             wave_gen_retrigger: base.create_param("WAVEGEN_RETRIGGER", ParamType::Int32)?,
             wave_gen_trigger_count: base.create_param("WAVEGEN_TRIGGER_COUNT", ParamType::Int32)?,
             wave_gen_run: base.create_param("WAVEGEN_RUN", ParamType::Int32)?,
-            wave_gen_user_time_wf: base.create_param("WAVEGEN_USER_TIME_WF", ParamType::Float32Array)?,
-            wave_gen_int_time_wf: base.create_param("WAVEGEN_INT_TIME_WF", ParamType::Float32Array)?,
+            wave_gen_user_time_wf: base
+                .create_param("WAVEGEN_USER_TIME_WF", ParamType::Float32Array)?,
+            wave_gen_int_time_wf: base
+                .create_param("WAVEGEN_INT_TIME_WF", ParamType::Float32Array)?,
             wave_gen_wave_type: base.create_param("WAVEGEN_WAVE_TYPE", ParamType::Int32)?,
             wave_gen_enable: base.create_param("WAVEGEN_ENABLE", ParamType::Int32)?,
             wave_gen_amplitude: base.create_param("WAVEGEN_AMPLITUDE", ParamType::Float64)?,

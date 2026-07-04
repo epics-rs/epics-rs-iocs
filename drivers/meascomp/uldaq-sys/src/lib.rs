@@ -475,17 +475,9 @@ unsafe extern "C" {
 
     // -- Digital I/O --
 
-    pub fn ulDIn(
-        handle: DaqDeviceHandle,
-        port_type: i32,
-        data: *mut u64,
-    ) -> UlError;
+    pub fn ulDIn(handle: DaqDeviceHandle, port_type: i32, data: *mut u64) -> UlError;
 
-    pub fn ulDOut(
-        handle: DaqDeviceHandle,
-        port_type: i32,
-        data: u64,
-    ) -> UlError;
+    pub fn ulDOut(handle: DaqDeviceHandle, port_type: i32, data: u64) -> UlError;
 
     pub fn ulDBitOut(
         handle: DaqDeviceHandle,
@@ -494,11 +486,7 @@ unsafe extern "C" {
         bit_value: u32,
     ) -> UlError;
 
-    pub fn ulDConfigPort(
-        handle: DaqDeviceHandle,
-        port_type: i32,
-        direction: i32,
-    ) -> UlError;
+    pub fn ulDConfigPort(handle: DaqDeviceHandle, port_type: i32, direction: i32) -> UlError;
 
     pub fn ulDConfigBit(
         handle: DaqDeviceHandle,
@@ -509,11 +497,7 @@ unsafe extern "C" {
 
     // -- Counter --
 
-    pub fn ulCIn(
-        handle: DaqDeviceHandle,
-        counter_num: i32,
-        data: *mut u64,
-    ) -> UlError;
+    pub fn ulCIn(handle: DaqDeviceHandle, counter_num: i32, data: *mut u64) -> UlError;
 
     pub fn ulCLoad(
         handle: DaqDeviceHandle,
@@ -522,10 +506,7 @@ unsafe extern "C" {
         load_value: u64,
     ) -> UlError;
 
-    pub fn ulCClear(
-        handle: DaqDeviceHandle,
-        counter_num: i32,
-    ) -> UlError;
+    pub fn ulCClear(handle: DaqDeviceHandle, counter_num: i32) -> UlError;
 
     pub fn ulCConfigScan(
         handle: DaqDeviceHandle,
@@ -571,10 +552,7 @@ unsafe extern "C" {
         options: i32,
     ) -> UlError;
 
-    pub fn ulTmrPulseOutStop(
-        handle: DaqDeviceHandle,
-        timer_num: i32,
-    ) -> UlError;
+    pub fn ulTmrPulseOutStop(handle: DaqDeviceHandle, timer_num: i32) -> UlError;
 
     // -- Analog input --
 

@@ -108,7 +108,8 @@ impl CtrParams {
             mcs_max_points: base.create_param("MCS_MAX_POINTS", ParamType::Int32)?,
             mcs_time_wf: base.create_param("MCS_TIME_WF", ParamType::Float32Array)?,
             mcs_abs_time_wf: base.create_param("MCS_ABS_TIME_WF", ParamType::Float64Array)?,
-            mcs_counter_enable: base.create_param("MCS_COUNTER_ENABLE", ParamType::UInt32Digital)?,
+            mcs_counter_enable: base
+                .create_param("MCS_COUNTER_ENABLE", ParamType::UInt32Digital)?,
             mcs_prescale_counter: base.create_param("MCS_PRESCALE_COUNTER", ParamType::Int32)?,
             mcs_point0_action: base.create_param("MCS_POINT0_ACTION", ParamType::Int32)?,
 

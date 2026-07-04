@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use epics_rs::asyn::port_handle::PortHandle;
 
+use epics_rs::ad_core::attributes::NDAttributeList;
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::attributes::NDAttributeList;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
@@ -14,18 +14,18 @@ use epics_rs::ad_core::runtime as rt;
 
 use realsense_rust::config::Config;
 use realsense_rust::context::Context;
-use realsense_rust::frame::{ColorFrame, DepthFrame, AccelFrame, GyroFrame, CompositeFrame};
+use realsense_rust::frame::{AccelFrame, ColorFrame, CompositeFrame, DepthFrame, GyroFrame};
 use realsense_rust::kind::{Rs2CameraInfo, Rs2Format, Rs2Option, Rs2StreamKind};
 use realsense_rust::pipeline::InactivePipeline;
 use realsense_rust::processing_blocks::align::Align;
 use realsense_rust::processing_blocks::decimation::Decimation;
+use realsense_rust::processing_blocks::hole_filling::HoleFillingFilter;
+use realsense_rust::processing_blocks::options::{
+    DecimationOptions, HoleFillingOptions, SpatialFilterOptions, TemporalFilterOptions,
+};
+use realsense_rust::processing_blocks::pointcloud::PointCloud;
 use realsense_rust::processing_blocks::spatial_filter::SpatialFilter;
 use realsense_rust::processing_blocks::temporal_filter::TemporalFilter;
-use realsense_rust::processing_blocks::hole_filling::HoleFillingFilter;
-use realsense_rust::processing_blocks::pointcloud::PointCloud;
-use realsense_rust::processing_blocks::options::{
-    DecimationOptions, SpatialFilterOptions, TemporalFilterOptions, HoleFillingOptions,
-};
 
 use epics_rs::asyn::request::ParamSetValue;
 
@@ -37,10 +37,16 @@ const MAX_CONNECT_RETRIES: u32 = 10;
 
 /// Helper: update a single string param via the notify path.
 async fn write_string(handle: &PortHandle, reason: usize, addr: i32, value: String) {
-    let _ = handle.set_params_and_notify(
-        addr,
-        vec![ParamSetValue::Octet { reason, addr, value }],
-    ).await;
+    let _ = handle
+        .set_params_and_notify(
+            addr,
+            vec![ParamSetValue::Octet {
+                reason,
+                addr,
+                value,
+            }],
+        )
+        .await;
 }
 
 /// Bundled state for the acquisition task thread.
@@ -73,12 +79,34 @@ impl AcquisitionContext {
             self.color_queued.wait_until_zero(Duration::from_secs(5));
             self.depth_queued.wait_until_zero(Duration::from_secs(5));
         }
-        let _ = self.color_handle.set_params_and_notify(0, vec![
-            ParamSetValue::Int32 { reason: self.color_ad.acquire_busy, addr: 0, value: 0 },
-            ParamSetValue::Int32 { reason: self.color_ad.status,       addr: 0, value: ADStatus::Idle as i32 },
-            ParamSetValue::Int32 { reason: self.color_ad.acquire,      addr: 0, value: 0 },
-            ParamSetValue::Int32 { reason: self.rs_params.rs_connected, addr: 0, value: 0 },
-        ]).await;
+        let _ = self
+            .color_handle
+            .set_params_and_notify(
+                0,
+                vec![
+                    ParamSetValue::Int32 {
+                        reason: self.color_ad.acquire_busy,
+                        addr: 0,
+                        value: 0,
+                    },
+                    ParamSetValue::Int32 {
+                        reason: self.color_ad.status,
+                        addr: 0,
+                        value: ADStatus::Idle as i32,
+                    },
+                    ParamSetValue::Int32 {
+                        reason: self.color_ad.acquire,
+                        addr: 0,
+                        value: 0,
+                    },
+                    ParamSetValue::Int32 {
+                        reason: self.rs_params.rs_connected,
+                        addr: 0,
+                        value: 0,
+                    },
+                ],
+            )
+            .await;
     }
 }
 
@@ -148,14 +176,32 @@ async fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame
             if let Ok(device) = sensor.device() {
                 if let Some(serial) = device.info(Rs2CameraInfo::SerialNumber) {
                     let s = serial.to_string_lossy().into_owned();
-                    write_string(&ctx.color_handle, ctx.color_ad.base.serial_number, 0, s.clone()).await;
+                    write_string(
+                        &ctx.color_handle,
+                        ctx.color_ad.base.serial_number,
+                        0,
+                        s.clone(),
+                    )
+                    .await;
                     write_string(&ctx.color_handle, ctx.rs_params.rs_serial, 0, s).await;
                 }
                 if let Some(fw) = device.info(Rs2CameraInfo::FirmwareVersion) {
-                    write_string(&ctx.color_handle, ctx.color_ad.base.firmware_version, 0, fw.to_string_lossy().into_owned()).await;
+                    write_string(
+                        &ctx.color_handle,
+                        ctx.color_ad.base.firmware_version,
+                        0,
+                        fw.to_string_lossy().into_owned(),
+                    )
+                    .await;
                 }
                 if let Some(name) = device.info(Rs2CameraInfo::Name) {
-                    write_string(&ctx.color_handle, ctx.color_ad.base.model, 0, name.to_string_lossy().into_owned()).await;
+                    write_string(
+                        &ctx.color_handle,
+                        ctx.color_ad.base.model,
+                        0,
+                        name.to_string_lossy().into_owned(),
+                    )
+                    .await;
                 }
             }
         }
@@ -193,7 +239,11 @@ async fn publish_array(
     let n_dims = array.dims.len();
     let (size_x, size_y, size_z) = match n_dims {
         2 => (array.dims[0].size as i32, array.dims[1].size as i32, 0),
-        3 => (array.dims[1].size as i32, array.dims[2].size as i32, array.dims[0].size as i32),
+        3 => (
+            array.dims[1].size as i32,
+            array.dims[2].size as i32,
+            array.dims[0].size as i32,
+        ),
         _ => (0, 0, 0),
     };
     let data_type = array.data.data_type();
@@ -204,19 +254,68 @@ async fn publish_array(
         .saturating_mul(data_type.element_size() as i64)
         .min(i32::MAX as i64) as i32;
 
-    let _ = handle.set_params_and_notify(0, vec![
-        ParamSetValue::Int32   { reason: base_params.array_counter, addr: 0, value: array.unique_id },
-        ParamSetValue::Float64 { reason: base_params.timestamp_rbv, addr: 0, value: ts.as_f64() },
-        ParamSetValue::Int32   { reason: base_params.epics_ts_sec,  addr: 0, value: ts.sec as i32 },
-        ParamSetValue::Int32   { reason: base_params.epics_ts_nsec, addr: 0, value: ts.nsec as i32 },
-        ParamSetValue::Int32   { reason: base_params.array_size_x,  addr: 0, value: size_x },
-        ParamSetValue::Int32   { reason: base_params.array_size_y,  addr: 0, value: size_y },
-        ParamSetValue::Int32   { reason: base_params.array_size_z,  addr: 0, value: size_z },
-        ParamSetValue::Int32   { reason: base_params.array_size,    addr: 0, value: array_size },
-        ParamSetValue::Int32   { reason: base_params.n_dimensions,  addr: 0, value: n_dims as i32 },
-        ParamSetValue::Int32   { reason: base_params.color_mode,    addr: 0, value: color_mode as i32 },
-        ParamSetValue::Int32   { reason: base_params.data_type,     addr: 0, value: data_type as u8 as i32 },
-    ]).await;
+    let _ = handle
+        .set_params_and_notify(
+            0,
+            vec![
+                ParamSetValue::Int32 {
+                    reason: base_params.array_counter,
+                    addr: 0,
+                    value: array.unique_id,
+                },
+                ParamSetValue::Float64 {
+                    reason: base_params.timestamp_rbv,
+                    addr: 0,
+                    value: ts.as_f64(),
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.epics_ts_sec,
+                    addr: 0,
+                    value: ts.sec as i32,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.epics_ts_nsec,
+                    addr: 0,
+                    value: ts.nsec as i32,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.array_size_x,
+                    addr: 0,
+                    value: size_x,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.array_size_y,
+                    addr: 0,
+                    value: size_y,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.array_size_z,
+                    addr: 0,
+                    value: size_z,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.array_size,
+                    addr: 0,
+                    value: array_size,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.n_dimensions,
+                    addr: 0,
+                    value: n_dims as i32,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.color_mode,
+                    addr: 0,
+                    value: color_mode as i32,
+                },
+                ParamSetValue::Int32 {
+                    reason: base_params.data_type,
+                    addr: 0,
+                    value: data_type as u8 as i32,
+                },
+            ],
+        )
+        .await;
 
     // Hold the parking_lot guard across .await: safe on a current-thread runtime
     // with no concurrent tasks — no other task will try to re-acquire the lock.
@@ -265,7 +364,8 @@ async fn process_color_frame(
             &ctx.color_ad.base,
             array,
             NDColorMode::RGB1,
-        ).await;
+        )
+        .await;
     }
 }
 
@@ -298,10 +398,7 @@ async fn process_depth_frame(
 
     let data = NDDataBuffer::U16(pixels);
     // Mono layout: [width, height]
-    let dims = vec![
-        NDDimension::new(w),
-        NDDimension::new(h),
-    ];
+    let dims = vec![NDDimension::new(w), NDDimension::new(h)];
 
     let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
     let array = NDArray {
@@ -322,7 +419,8 @@ async fn process_depth_frame(
         &ctx.depth_ad.base,
         array,
         NDColorMode::Mono,
-    ).await;
+    )
+    .await;
 }
 
 async fn process_pointcloud(
@@ -344,7 +442,8 @@ async fn process_pointcloud(
         }
 
         // Flatten vertices [N][3] → Vec<f32>
-        let data: Vec<f32> = vertices.iter()
+        let data: Vec<f32> = vertices
+            .iter()
             .take(count)
             .flat_map(|v| v.xyz.iter().copied())
             .collect();
@@ -372,7 +471,8 @@ async fn process_pointcloud(
             &ctx.color_ad.base,
             array,
             NDColorMode::Mono,
-        ).await;
+        )
+        .await;
     }
 }
 
@@ -382,17 +482,41 @@ async fn process_imu(composite: &CompositeFrame, ctx: &AcquisitionContext) {
     let accel_frames: Vec<AccelFrame> = composite.frames_of_type();
     if let Some(accel) = accel_frames.first() {
         let a = accel.acceleration();
-        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_accel_x, addr: 0, value: a[0] as f64 });
-        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_accel_y, addr: 0, value: a[1] as f64 });
-        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_accel_z, addr: 0, value: a[2] as f64 });
+        updates.push(ParamSetValue::Float64 {
+            reason: ctx.rs_params.rs_accel_x,
+            addr: 0,
+            value: a[0] as f64,
+        });
+        updates.push(ParamSetValue::Float64 {
+            reason: ctx.rs_params.rs_accel_y,
+            addr: 0,
+            value: a[1] as f64,
+        });
+        updates.push(ParamSetValue::Float64 {
+            reason: ctx.rs_params.rs_accel_z,
+            addr: 0,
+            value: a[2] as f64,
+        });
     }
 
     let gyro_frames: Vec<GyroFrame> = composite.frames_of_type();
     if let Some(gyro) = gyro_frames.first() {
         let g = gyro.rotational_velocity();
-        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_gyro_x, addr: 0, value: g[0] as f64 });
-        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_gyro_y, addr: 0, value: g[1] as f64 });
-        updates.push(ParamSetValue::Float64 { reason: ctx.rs_params.rs_gyro_z, addr: 0, value: g[2] as f64 });
+        updates.push(ParamSetValue::Float64 {
+            reason: ctx.rs_params.rs_gyro_x,
+            addr: 0,
+            value: g[0] as f64,
+        });
+        updates.push(ParamSetValue::Float64 {
+            reason: ctx.rs_params.rs_gyro_y,
+            addr: 0,
+            value: g[1] as f64,
+        });
+        updates.push(ParamSetValue::Float64 {
+            reason: ctx.rs_params.rs_gyro_z,
+            addr: 0,
+            value: g[2] as f64,
+        });
     }
 
     if !updates.is_empty() {
@@ -449,9 +573,12 @@ impl DepthFilterChain {
             ($filter:expr, $name:expr, $enable:expr) => {
                 if $enable {
                     $filter.queue(f).ok()?;
-                    f = $filter.wait(timeout).map_err(|e| {
-                        log::warn!("D435i: {} wait failed: {e}", $name);
-                    }).ok()?;
+                    f = $filter
+                        .wait(timeout)
+                        .map_err(|e| {
+                            log::warn!("D435i: {} wait failed: {e}", $name);
+                        })
+                        .ok()?;
                 }
             };
         }
@@ -470,10 +597,24 @@ async fn try_connect_pipeline(
     ctx: &mut AcquisitionContext,
     config: &D435iConfigSnapshot,
 ) -> Option<realsense_rust::pipeline::ActivePipeline> {
-    let _ = ctx.color_handle.set_params_and_notify(0, vec![
-        ParamSetValue::Octet { reason: ctx.color_ad.status_message, addr: 0, value: "Connecting to camera...".into() },
-        ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 0 },
-    ]).await;
+    let _ = ctx
+        .color_handle
+        .set_params_and_notify(
+            0,
+            vec![
+                ParamSetValue::Octet {
+                    reason: ctx.color_ad.status_message,
+                    addr: 0,
+                    value: "Connecting to camera...".into(),
+                },
+                ParamSetValue::Int32 {
+                    reason: ctx.rs_params.rs_connected,
+                    addr: 0,
+                    value: 0,
+                },
+            ],
+        )
+        .await;
 
     let mut retry_count = 0u32;
     loop {
@@ -498,8 +639,13 @@ async fn try_connect_pipeline(
                 }
                 if retry_count >= MAX_CONNECT_RETRIES {
                     log::error!("D435i: giving up after {retry_count} connection attempts");
-                    write_string(&ctx.color_handle, ctx.color_ad.status_message, 0,
-                        format!("Connection failed: {e}")).await;
+                    write_string(
+                        &ctx.color_handle,
+                        ctx.color_ad.status_message,
+                        0,
+                        format!("Connection failed: {e}"),
+                    )
+                    .await;
                     return None;
                 }
                 // Exponential backoff: 1s, 2s, 4s, ... max 10s, interruptible by Stop.
@@ -525,18 +671,38 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         }
 
         // Initialize counters
-        let _ = ctx.color_handle.set_params_and_notify(0, vec![
-            ParamSetValue::Int32 { reason: ctx.color_ad.num_images_counter, addr: 0, value: 0 },
-            ParamSetValue::Int32 { reason: ctx.color_ad.status,             addr: 0, value: ADStatus::Acquire as i32 },
-            ParamSetValue::Int32 { reason: ctx.color_ad.acquire_busy,       addr: 0, value: 1 },
-        ]).await;
+        let _ = ctx
+            .color_handle
+            .set_params_and_notify(
+                0,
+                vec![
+                    ParamSetValue::Int32 {
+                        reason: ctx.color_ad.num_images_counter,
+                        addr: 0,
+                        value: 0,
+                    },
+                    ParamSetValue::Int32 {
+                        reason: ctx.color_ad.status,
+                        addr: 0,
+                        value: ADStatus::Acquire as i32,
+                    },
+                    ParamSetValue::Int32 {
+                        reason: ctx.color_ad.acquire_busy,
+                        addr: 0,
+                        value: 1,
+                    },
+                ],
+            )
+            .await;
 
         let mut num_counter = 0i32;
-        let mut color_array_counter = ctx.color_handle
+        let mut color_array_counter = ctx
+            .color_handle
             .read_int32(ctx.color_ad.base.array_counter, 0)
             .await
             .unwrap_or(0);
-        let mut depth_array_counter = ctx.depth_handle
+        let mut depth_array_counter = ctx
+            .depth_handle
             .read_int32(ctx.depth_ad.base.array_counter, 0)
             .await
             .unwrap_or(0);
@@ -551,7 +717,9 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             &ctx.color_ad,
             &ctx.rs_params,
             &ctx.serial,
-        ).await {
+        )
+        .await
+        {
             Ok(cfg) => cfg,
             Err(e) => {
                 log::error!("D435i: failed to read config: {e}");
@@ -570,10 +738,24 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         };
 
         // Mark connected
-        let _ = ctx.color_handle.set_params_and_notify(0, vec![
-            ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 1 },
-            ParamSetValue::Octet { reason: ctx.color_ad.status_message, addr: 0, value: "Acquiring data".into() },
-        ]).await;
+        let _ = ctx
+            .color_handle
+            .set_params_and_notify(
+                0,
+                vec![
+                    ParamSetValue::Int32 {
+                        reason: ctx.rs_params.rs_connected,
+                        addr: 0,
+                        value: 1,
+                    },
+                    ParamSetValue::Octet {
+                        reason: ctx.color_ad.status_message,
+                        addr: 0,
+                        value: "Acquiring data".into(),
+                    },
+                ],
+            )
+            .await;
 
         // Create processing blocks
         let mut depth_filters = match DepthFilterChain::new() {
@@ -620,7 +802,9 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     &ctx.color_ad,
                     &ctx.rs_params,
                     &ctx.serial,
-                ).await {
+                )
+                .await
+                {
                     Ok(cfg) => cfg,
                     Err(_) => break,
                 };
@@ -649,7 +833,9 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     &ctx.color_ad,
                     &ctx.rs_params,
                     &ctx.serial,
-                ).await {
+                )
+                .await
+                {
                     Ok(cfg) => cfg,
                     Err(_) => break,
                 };
@@ -668,30 +854,49 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     consecutive_errors += 1;
                     frames_dropped += 1;
                     total_errors += 1;
-                    let _ = ctx.color_handle.set_params_and_notify(0, vec![
-                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_frames_dropped, addr: 0, value: frames_dropped },
-                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_error_count,    addr: 0, value: total_errors },
-                    ]).await;
-                    write_string(&ctx.color_handle, ctx.rs_params.rs_last_error, 0,
-                        format!("Frame wait: {e}")).await;
+                    let _ = ctx
+                        .color_handle
+                        .set_params_and_notify(
+                            0,
+                            vec![
+                                ParamSetValue::Int32 {
+                                    reason: ctx.rs_params.rs_frames_dropped,
+                                    addr: 0,
+                                    value: frames_dropped,
+                                },
+                                ParamSetValue::Int32 {
+                                    reason: ctx.rs_params.rs_error_count,
+                                    addr: 0,
+                                    value: total_errors,
+                                },
+                            ],
+                        )
+                        .await;
+                    write_string(
+                        &ctx.color_handle,
+                        ctx.rs_params.rs_last_error,
+                        0,
+                        format!("Frame wait: {e}"),
+                    )
+                    .await;
 
                     // Log first error, then every 10th to avoid spam
                     if consecutive_errors == 1 || consecutive_errors.is_multiple_of(10) {
-                        log::warn!(
-                            "D435i: frame wait error ({consecutive_errors}x): {e}"
-                        );
+                        log::warn!("D435i: frame wait error ({consecutive_errors}x): {e}");
                     }
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        log::error!(
-                            "D435i: {} consecutive frame errors",
-                            consecutive_errors
-                        );
+                        log::error!("D435i: {} consecutive frame errors", consecutive_errors);
 
                         // Continuous mode: attempt reconnection
                         if config.image_mode == ImageMode::Continuous {
                             log::info!("D435i: attempting reconnection...");
-                            write_string(&ctx.color_handle, ctx.color_ad.status_message, 0,
-                                "Reconnecting...".into()).await;
+                            write_string(
+                                &ctx.color_handle,
+                                ctx.color_ad.status_message,
+                                0,
+                                "Reconnecting...".into(),
+                            )
+                            .await;
                             drop(pipeline);
 
                             match try_connect_pipeline(&mut ctx, &config).await {
@@ -700,18 +905,39 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                                     consecutive_errors = 0;
                                     first_frame = true;
                                     sensor_options_applied = false;
-                                    let _ = ctx.color_handle.set_params_and_notify(0, vec![
-                                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_connected, addr: 0, value: 1 },
-                                    ]).await;
+                                    let _ = ctx
+                                        .color_handle
+                                        .set_params_and_notify(
+                                            0,
+                                            vec![ParamSetValue::Int32 {
+                                                reason: ctx.rs_params.rs_connected,
+                                                addr: 0,
+                                                value: 1,
+                                            }],
+                                        )
+                                        .await;
                                     continue;
                                 }
                                 None => {
                                     total_errors += 1;
-                                    let _ = ctx.color_handle.set_params_and_notify(0, vec![
-                                        ParamSetValue::Int32 { reason: ctx.rs_params.rs_error_count, addr: 0, value: total_errors },
-                                    ]).await;
-                                    write_string(&ctx.color_handle, ctx.rs_params.rs_last_error, 0,
-                                        "Reconnection failed".into()).await;
+                                    let _ = ctx
+                                        .color_handle
+                                        .set_params_and_notify(
+                                            0,
+                                            vec![ParamSetValue::Int32 {
+                                                reason: ctx.rs_params.rs_error_count,
+                                                addr: 0,
+                                                value: total_errors,
+                                            }],
+                                        )
+                                        .await;
+                                    write_string(
+                                        &ctx.color_handle,
+                                        ctx.rs_params.rs_last_error,
+                                        0,
+                                        "Reconnection failed".into(),
+                                    )
+                                    .await;
                                     break;
                                 }
                             }
@@ -724,9 +950,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         break;
                     }
                     // Backoff: sleep up to 2 seconds based on error count
-                    let backoff = Duration::from_millis(
-                        100 * (consecutive_errors as u64).min(20)
-                    );
+                    let backoff = Duration::from_millis(100 * (consecutive_errors as u64).min(20));
                     rt::sleep(backoff).await;
                     continue;
                 }
@@ -762,9 +986,17 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             color_array_counter += 1;
             depth_array_counter += 1;
 
-            let _ = ctx.color_handle.set_params_and_notify(0, vec![
-                ParamSetValue::Int32 { reason: ctx.color_ad.num_images_counter, addr: 0, value: num_counter },
-            ]).await;
+            let _ = ctx
+                .color_handle
+                .set_params_and_notify(
+                    0,
+                    vec![ParamSetValue::Int32 {
+                        reason: ctx.color_ad.num_images_counter,
+                        addr: 0,
+                        value: num_counter,
+                    }],
+                )
+                .await;
 
             if config.array_callbacks {
                 process_color_frame(&composite, &ctx, color_array_counter).await;
@@ -774,18 +1006,34 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 if let Some(depth_frame) = depth_frames.into_iter().next() {
                     // Read depth units from the original frame before filtering
                     if let Ok(units) = depth_frame.depth_units() {
-                        let _ = ctx.color_handle.set_params_and_notify(0, vec![
-                            ParamSetValue::Float64 { reason: ctx.rs_params.rs_depth_units, addr: 0, value: units as f64 },
-                        ]).await;
+                        let _ = ctx
+                            .color_handle
+                            .set_params_and_notify(
+                                0,
+                                vec![ParamSetValue::Float64 {
+                                    reason: ctx.rs_params.rs_depth_units,
+                                    addr: 0,
+                                    value: units as f64,
+                                }],
+                            )
+                            .await;
                     }
-                    process_depth_frame(depth_frame, &ctx, depth_array_counter, &mut depth_filters, &config).await;
+                    process_depth_frame(
+                        depth_frame,
+                        &ctx,
+                        depth_array_counter,
+                        &mut depth_filters,
+                        &config,
+                    )
+                    .await;
                 }
 
                 if config.pointcloud_enable {
                     // Get another owned depth frame for pointcloud processing
                     let depth_frames: Vec<DepthFrame> = composite.frames_of_type();
                     if let Some(depth_frame) = depth_frames.into_iter().next() {
-                        process_pointcloud(depth_frame, &ctx, &mut pc_block, depth_array_counter).await;
+                        process_pointcloud(depth_frame, &ctx, &mut pc_block, depth_array_counter)
+                            .await;
                     }
                 }
             }

@@ -40,8 +40,7 @@ impl DaqDevice {
             descriptors[..num_devs as usize]
                 .iter()
                 .find(|d| {
-                    let id = unsafe { CStr::from_ptr(d.unique_id.as_ptr()) }
-                        .to_string_lossy();
+                    let id = unsafe { CStr::from_ptr(d.unique_id.as_ptr()) }.to_string_lossy();
                     id == unique_id
                 })
                 .cloned()
@@ -106,9 +105,7 @@ impl DaqDevice {
     pub fn ul_version() -> Result<String> {
         let mut buf = [0i8; 256];
         let mut len = buf.len() as u32;
-        error::check(unsafe {
-            ulGetInfoStr(UL_INFO_VER_STR, 0, buf.as_mut_ptr(), &mut len)
-        })?;
+        error::check(unsafe { ulGetInfoStr(UL_INFO_VER_STR, 0, buf.as_mut_ptr(), &mut len) })?;
         Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }
             .to_string_lossy()
             .into_owned())
