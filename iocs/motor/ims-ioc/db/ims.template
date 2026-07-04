@@ -1,0 +1,18 @@
+# IMS MDrivePlus: one motor record for the controller's single axis. DTYP is the
+# motorPort string passed to ImsMDrivePlusCreateController.
+#
+# MCode positions/velocities/accelerations are integer motor steps (no
+# resolution scaling), so MRES = 1 and EGU is "steps". VELO/ACCL are in
+# steps/second and steps/second^2.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "$(MPORT)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=1000000)")
+    field(DLLM, "$(LLM=-1000000)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}
