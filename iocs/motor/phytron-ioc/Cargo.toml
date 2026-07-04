@@ -1,0 +1,14 @@
+# Phytron motor IOC binary. Wires the motor-phytron driver to an asyn octet port
+# and one motor record per axis, exposing CA + PVA. No vendor library — builds on
+# any host.
+
+[package]
+name = "phytron-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-phytron = { path = "../../../drivers/motor/phytron" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

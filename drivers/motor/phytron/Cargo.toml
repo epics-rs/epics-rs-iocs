@@ -1,0 +1,12 @@
+# Phytron motor controllers (phyMOTION MCM and MCC-1/MCC-2), ASCII over an asyn
+# octet port with STX/ETX framing. No vendor library — builds on any host.
+
+[package]
+name = "motor-phytron"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }
