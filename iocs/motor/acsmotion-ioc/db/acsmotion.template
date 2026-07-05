@@ -1,0 +1,19 @@
+# ACS SPiiPlus: one motor record per axis. DTYP is ACSMOTION_$(CTRL)_$(AXIS),
+# the key registered by AcsMotionConfig (card + 0-based axis index).
+#
+# Positions/velocities/accelerations are the controller's native user units
+# (ACSPL+ APOS/PTP/VEL), with no resolution scaling in the driver, so MRES = 1
+# and EGU is the controller unit (typically mm). VELO/ACCL are in units/second
+# and units/second^2.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "ACSMOTION_$(CTRL)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=100)")
+    field(DLLM, "$(LLM=-100)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=4)")
+}

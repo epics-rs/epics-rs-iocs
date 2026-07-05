@@ -1,0 +1,15 @@
+# ACS SPiiPlus motion controller driver, ported from epics-modules/motor
+# motorAcsMotion (SPiiPlusDriver.cpp + SPiiPlusCommDriver.cpp). Pure serial/TCP
+# ASCII ACSPL+ protocol over an asyn octet port — no ACSC vendor library, so
+# this crate builds/tests on any host. Distinct from motorAcsTech80 (older
+# model-1 driver, crate motor-acstech80) and motorAcs (SDK-based, not ported).
+
+[package]
+name = "motor-acsmotion"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }
