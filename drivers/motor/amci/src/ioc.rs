@@ -193,6 +193,12 @@ pub fn ang1_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let in_port = req_string(args, 1, "inPort")?;
             let out_port = req_string(args, 2, "outPort")?;
             let num_axes = req_int(args, 3, "numAxes")?;
+            // Stricter than C by design: C's axis loop (ANG1Driver.cpp:94)
+            // simply doesn't execute for numAxes<=0, silently creating a
+            // zero-axis controller with no error. A zero-axis controller is a
+            // no-op in practice, so rejecting numAxes < 1 here only surfaces a
+            // likely startup-script mistake earlier rather than diverging in
+            // any runtime behavior.
             if num_axes < 1 {
                 return Err("ANG1CreateController: numAxes must be > 0".into());
             }
