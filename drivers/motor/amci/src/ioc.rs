@@ -109,6 +109,11 @@ pub fn anf2_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 .strip_prefix("0x")
                 .or_else(|| hex_config.strip_prefix("0X"))
                 .unwrap_or(&hex_config);
+            // Stricter than C by design: C parses with strtoul(hexConfig,
+            // NULL, 16) and never checks errno, so a malformed string silently
+            // yields config = 0. Reject an unparseable hexConfig with an
+            // explicit error rather than programming a garbage axis with a
+            // zero configuration.
             let config = u32::from_str_radix(hex_digits, 16)
                 .map_err(|_| format!("ANF2CreateAxis: invalid hexConfig={hex_config}"))?
                 as i32;
