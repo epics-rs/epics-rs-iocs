@@ -109,7 +109,9 @@ impl Ang1Controller {
     /// calls, so this issues two 10ms delays).
     fn write32(&self, reg: i32, value: i32) -> AsynResult<()> {
         let (upper, lower) = pack1000(value);
-        self.write16(reg, upper)?;
+        // C's writeReg32 issues both halves unconditionally and returns the
+        // second's status; a failed MSW write does not suppress the LSW write.
+        let _ = self.write16(reg, upper);
         self.write16(reg + 1, lower)
     }
 
@@ -121,6 +123,10 @@ impl Ang1Controller {
 /// One ANG1 axis. Implements [`AsynMotor`].
 pub struct Ang1Axis {
     controller: Arc<Mutex<Ang1Controller>>,
+    /// Last published status. C's poll reuses a single stale `read_val` on a
+    /// failed read and always publishes; this carries forward the last value
+    /// field-by-field for any read that fails in a cycle (see [`Self::poll`]).
+    last: MotorStatus,
 }
 
 impl Ang1Axis {
@@ -132,7 +138,13 @@ impl Ang1Axis {
     /// ignores its status, so a transient link error at IOC boot cannot abort
     /// `ANG1CreateController` (which C always returns `asynSuccess` from).
     pub fn new(controller: Arc<Mutex<Ang1Controller>>, _axis_no: i32) -> Self {
-        let mut ax = Self { controller };
+        let mut ax = Self {
+            controller,
+            last: MotorStatus {
+                gain_support: true,
+                ..MotorStatus::default()
+            },
+        };
         let _ = ax.set_position(&AsynUser::new(0), 0.0);
         ax
     }
@@ -151,10 +163,12 @@ impl Ang1Axis {
         acceleration: f64,
         velocity: f64,
     ) -> AsynResult<()> {
-        ctrl.write32(SPD_UPR, nint(velocity))?;
+        // C attempts each write and returns the last status (the intermediate
+        // ones are never checked).
+        let _ = ctrl.write32(SPD_UPR, nint(velocity));
 
         let accel_steps_per_ms = nint(acceleration.clamp(1000.0, 5_000_000.0) / 1000.0);
-        ctrl.write16(ACCEL, accel_steps_per_ms)?;
+        let _ = ctrl.write16(ACCEL, accel_steps_per_ms);
         ctrl.write16(DECEL, accel_steps_per_ms)
     }
 
@@ -170,15 +184,17 @@ impl Ang1Axis {
         // sequence so the poller (which takes the same lock for a full cycle,
         // incl. limit-recovery CMD_MSW writes) cannot interleave mid-move.
         let ctrl = self.lock();
-        self.send_accel_and_velocity(&ctrl, acceleration, velocity)?;
+        // C attempts every write and returns the last (CMD_MSW=move_bit)
+        // status, never short-circuiting on an intermediate failure.
+        let _ = self.send_accel_and_velocity(&ctrl, acceleration, velocity);
 
         let distance = nint(position);
-        ctrl.write32(POS_WR_UPR, distance)?;
-        ctrl.write16(CMD_MSW, 0x0)?;
-        ctrl.write16(CMD_MSW, move_bit)?;
+        let _ = ctrl.write32(POS_WR_UPR, distance);
+        let _ = ctrl.write16(CMD_MSW, 0x0);
+        let result = ctrl.write16(CMD_MSW, move_bit);
         drop(ctrl);
         sleep(Duration::from_millis(50));
-        Ok(())
+        result
     }
 
     /// C `setClosedLoop`. Takes the already-locked controller so `poll`'s
@@ -186,9 +202,10 @@ impl Ang1Axis {
     /// matching C) doesn't re-lock.
     fn do_set_closed_loop(&self, ctrl: &Ang1Controller, enable: bool) -> AsynResult<()> {
         if enable {
-            ctrl.write16(CMD_MSW, 0x0)?;
-            ctrl.write16(CMD_MSW, 0x400)?;
-            ctrl.write16(CMD_MSW, 0x0)?;
+            // C attempts all four writes, returning only the last status.
+            let _ = ctrl.write16(CMD_MSW, 0x0);
+            let _ = ctrl.write16(CMD_MSW, 0x400);
+            let _ = ctrl.write16(CMD_MSW, 0x0);
             ctrl.write16(CMD_LSW, 0x8000)
         } else {
             ctrl.write16(CMD_LSW, 0x0)
@@ -198,8 +215,9 @@ impl Ang1Axis {
     /// C `setPosition`. Takes the already-locked controller — see
     /// [`Self::do_set_closed_loop`].
     fn do_set_position(&self, ctrl: &Ang1Controller, position: f64) -> AsynResult<()> {
-        ctrl.write32(POS_WR_UPR, nint(position))?;
-        ctrl.write16(CMD_MSW, 0x200)?;
+        // C attempts all writes and returns the last status.
+        let _ = ctrl.write32(POS_WR_UPR, nint(position));
+        let _ = ctrl.write16(CMD_MSW, 0x200);
         ctrl.write16(CMD_MSW, 0x0)
     }
 }
@@ -236,7 +254,7 @@ impl AsynMotor for Ang1Axis {
     ) -> AsynResult<()> {
         // Single lock section across accel/velocity + move writes (see do_move).
         let ctrl = self.lock();
-        self.send_accel_and_velocity(&ctrl, acceleration, velocity.abs())?;
+        let _ = self.send_accel_and_velocity(&ctrl, acceleration, velocity.abs());
 
         // ANG1 has no jog command: simulate one with a million-step move.
         let distance = if velocity > 0.0 {
@@ -244,12 +262,13 @@ impl AsynMotor for Ang1Axis {
         } else {
             -1_000_000
         };
-        ctrl.write32(POS_WR_UPR, distance)?;
-        ctrl.write16(CMD_MSW, 0x0)?;
-        ctrl.write16(CMD_MSW, 0x2)?;
+        // C attempts every write and returns the last status.
+        let _ = ctrl.write32(POS_WR_UPR, distance);
+        let _ = ctrl.write16(CMD_MSW, 0x0);
+        let result = ctrl.write16(CMD_MSW, 0x2);
         drop(ctrl);
         sleep(Duration::from_millis(50));
-        Ok(())
+        result
     }
 
     fn home(
@@ -267,7 +286,8 @@ impl AsynMotor for Ang1Axis {
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write16(CMD_MSW, 0x0)?;
+        // C attempts both writes and returns the last status.
+        let _ = ctrl.write16(CMD_MSW, 0x0);
         ctrl.write16(CMD_MSW, 0x4) // Hold move
     }
 
@@ -287,35 +307,47 @@ impl AsynMotor for Ang1Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        // C presses on through every read and always publishes: each read's
+        // status is discarded (the base poller ignores poll()'s return) and
+        // callParamCallbacks fires unconditionally. Mirror that — attempt each
+        // read, carry forward the last published value for any field whose read
+        // fails this cycle, and always return Ok so the framework publishes.
+        // (C reuses a single stale `read_val` on failure; last-known is the
+        // defined, safe equivalent.)
+        let last = self.last.clone();
+
         let ctrl = self.lock();
-        ctrl.force_read()?;
+        let _ = ctrl.force_read();
 
-        let position = ctrl.read32(POS_RD_UPR)? as f64;
+        let position = ctrl.read32(POS_RD_UPR).map_or(last.position, |v| v as f64);
 
-        let status1 = ctrl.read16(STATUS_1)?;
         // Status word 1 bit 3 set to 1 when the motor is not in motion.
-        let done = (status1 & 0x8) != 0;
+        let done = ctrl.read16(STATUS_1).map_or(last.done, |v| v & 0x8 != 0);
 
-        let status2 = ctrl.read16(STATUS_2)?;
+        let (high_limit, low_limit, powered) = match ctrl.read16(STATUS_2) {
+            Ok(status2) => (
+                status2 & 0x1 != 0,
+                status2 & 0x2 != 0,
+                status2 & 0x8000 != 0,
+            ),
+            Err(_) => (last.high_limit, last.low_limit, last.powered),
+        };
 
         // A CW limit reached: reset the error and set position so the axis
-        // can move off the limit.
-        let high_limit = status2 & 0x1 != 0;
+        // can move off the limit (errors discarded, matching C).
         if high_limit {
-            self.do_set_closed_loop(&ctrl, true)?;
-            self.do_set_position(&ctrl, position)?;
+            let _ = self.do_set_closed_loop(&ctrl, true);
+            let _ = self.do_set_position(&ctrl, position);
         }
 
         // A CCW limit reached: same reset.
-        let low_limit = status2 & 0x2 != 0;
         if low_limit {
-            self.do_set_closed_loop(&ctrl, true)?;
-            self.do_set_position(&ctrl, position)?;
+            let _ = self.do_set_closed_loop(&ctrl, true);
+            let _ = self.do_set_position(&ctrl, position);
         }
+        drop(ctrl);
 
-        let powered = status2 & 0x8000 != 0;
-
-        Ok(MotorStatus {
+        let status = MotorStatus {
             position,
             done,
             moving: !done,
@@ -324,7 +356,9 @@ impl AsynMotor for Ang1Axis {
             powered,
             gain_support: true,
             ..MotorStatus::default()
-        })
+        };
+        self.last = status.clone();
+        Ok(status)
     }
 }
 
