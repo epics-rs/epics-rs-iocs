@@ -26,6 +26,7 @@ members = [
     "drivers/motor/phytron",
     "drivers/motor/newport",
     "drivers/motor/pi-gcs2",
+    "drivers/motor/pi",
     "drivers/meascomp/meascomp",
     "drivers/meascomp/uldaq-sys",
     "drivers/meascomp/usb-2408",
@@ -64,6 +65,7 @@ members = [
     "iocs/motor/smc100-ioc",
     "iocs/motor/xps-ioc",
     "iocs/motor/pigcs2-ioc",
+    "iocs/motor/pi-ioc",
     "iocs/usb-2408-ioc",
     "iocs/usb-ctr-ioc",
 ]

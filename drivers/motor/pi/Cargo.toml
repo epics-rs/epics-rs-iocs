@@ -1,0 +1,17 @@
+# PI (Physik Instrumente) legacy per-model motor controllers, ported from
+# epics-modules/motor's motorPI module — the MODEL-1 drv*/dev* pair for each
+# of the 10 controllers (C-630, C-662, C-663, C-844, C-848, C-862, E-516,
+# E-517, E-710, E-816), NOT the already-ported GCS2 generic stage-controller
+# path (see `motor-pi-gcs2`). These are distinct, older PI command sets.
+# Module-per-controller: `c862.rs`, ... (one module per controller, added
+# incrementally). Pure ASCII-over-asyn-octet protocol (serial/IP), no PI SDK.
+
+[package]
+name = "motor-pi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }
