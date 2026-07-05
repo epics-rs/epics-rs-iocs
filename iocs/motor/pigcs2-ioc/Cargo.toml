@@ -1,0 +1,14 @@
+# PI GCS2 motor IOC binary. Wires the motor-pi-gcs2 driver to a serial/TCP
+# octet port and one motor record per axis, exposing CA + PVA. No vendor SDK
+# — builds on any host.
+
+[package]
+name = "pigcs2-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-pi-gcs2 = { path = "../../../drivers/motor/pi-gcs2" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

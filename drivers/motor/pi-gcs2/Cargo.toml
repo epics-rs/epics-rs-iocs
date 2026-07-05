@@ -1,0 +1,15 @@
+# PI (Physik Instrumente) GCS2 stage-controller driver, ported from
+# epics-modules/motor motorPIGCS2 (PIGCSController + PIGCSMotorController
+# only). Pure ASCII-over-asyn-octet protocol — no PI GCS SDK, so this crate
+# builds/tests on any host. Hexapod, piezo, per-model (E517/E727/E755/C702/
+# C885) controllers are not ported; see drivers/motor/pi-gcs2/src/gcs2.rs.
+
+[package]
+name = "motor-pi-gcs2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

@@ -1,0 +1,20 @@
+# PI GCS2: one motor record per axis. DTYP is PIGCS2_$(CTRL)_$(AXIS), the key
+# registered by PIGCS2CreateController (card + GCS axis name string, e.g.
+# "1" — not a bare index).
+#
+# Positions/velocities/accelerations are the controller's native physical
+# units (GCS2 POS/MOV/VEL are already EGU on the controller), with no
+# resolution scaling in the driver, so MRES = 1 and EGU is the controller
+# unit (typically mm). VELO/ACCL are in units/second and units/second^2.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PIGCS2_$(CTRL)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=25)")
+    field(DLLM, "$(LLM=-25)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=4)")
+}
