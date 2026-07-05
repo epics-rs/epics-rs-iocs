@@ -138,9 +138,15 @@ impl Ang1Axis {
     }
 
     /// C `sendAccelAndVelocity`: velocity is sent unclamped; acceleration is
-    /// clamped to the ANG1's wire range and converted to steps/ms/s.
-    fn send_accel_and_velocity(&self, acceleration: f64, velocity: f64) -> AsynResult<()> {
-        let ctrl = self.lock();
+    /// clamped to the ANG1's wire range and converted to steps/ms/s. Takes the
+    /// already-locked controller so a move's accel/velocity writes and its
+    /// position/command writes stay in one lock section (see [`Self::do_move`]).
+    fn send_accel_and_velocity(
+        &self,
+        ctrl: &Ang1Controller,
+        acceleration: f64,
+        velocity: f64,
+    ) -> AsynResult<()> {
         ctrl.write32(SPD_UPR, nint(velocity))?;
 
         let accel_steps_per_ms = nint(acceleration.clamp(1000.0, 5_000_000.0) / 1000.0);
@@ -155,10 +161,14 @@ impl Ang1Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.send_accel_and_velocity(acceleration, velocity)?;
+        // C runs sendAccelAndVelocity + the position/command writes under one
+        // continuous asyn-port lock; hold the controller lock across the whole
+        // sequence so the poller (which takes the same lock for a full cycle,
+        // incl. limit-recovery CMD_MSW writes) cannot interleave mid-move.
+        let ctrl = self.lock();
+        self.send_accel_and_velocity(&ctrl, acceleration, velocity)?;
 
         let distance = nint(position);
-        let ctrl = self.lock();
         ctrl.write32(POS_WR_UPR, distance)?;
         ctrl.write16(CMD_MSW, 0x0)?;
         ctrl.write16(CMD_MSW, move_bit)?;
@@ -220,7 +230,9 @@ impl AsynMotor for Ang1Axis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        self.send_accel_and_velocity(acceleration, velocity.abs())?;
+        // Single lock section across accel/velocity + move writes (see do_move).
+        let ctrl = self.lock();
+        self.send_accel_and_velocity(&ctrl, acceleration, velocity.abs())?;
 
         // ANG1 has no jog command: simulate one with a million-step move.
         let distance = if velocity > 0.0 {
@@ -228,7 +240,6 @@ impl AsynMotor for Ang1Axis {
         } else {
             -1_000_000
         };
-        let ctrl = self.lock();
         ctrl.write32(POS_WR_UPR, distance)?;
         ctrl.write16(CMD_MSW, 0x0)?;
         ctrl.write16(CMD_MSW, 0x2)?;
