@@ -361,7 +361,7 @@ impl AsynMotor for PIC663Axis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
         let target = if velocity > 0.0 {
             self.high_limit
@@ -369,8 +369,15 @@ impl AsynMotor for PIC663Axis {
             self.low_limit
         }
         .ok_or_else(|| pic663_err("PIC663: jog needs the record soft limits (none set yet)"))?;
-        self.lock()
-            .send(&format!("SV{},MA{}", velocity.abs() as i32, target as i32))
+        // C's jog path issues SET_ACCEL unconditionally before the move
+        // (shared motorRecord.cc jog kickoff, no accel>0 guard), so the jog
+        // acceleration is always on the wire: `SA,SV,MA`.
+        self.lock().send(&format!(
+            "SA{},SV{},MA{}",
+            acceleration as i32,
+            velocity.abs() as i32,
+            target as i32
+        ))
     }
 
     fn home(

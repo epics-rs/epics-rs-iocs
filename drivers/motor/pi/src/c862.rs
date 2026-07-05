@@ -450,7 +450,7 @@ impl AsynMotor for PIC862Axis {
         _user: &AsynUser,
         _min_velocity: f64,
         velocity: f64,
-        _acceleration: f64,
+        acceleration: f64,
     ) -> AsynResult<()> {
         // C-862 has no jog command: set the (unsigned) jog speed, then move
         // absolute to whichever record soft limit the velocity sign selects.
@@ -460,8 +460,15 @@ impl AsynMotor for PIC862Axis {
             self.low_limit
         }
         .ok_or_else(|| pic862_err("PIC862: jog needs the record soft limits (none set yet)"))?;
-        self.lock()
-            .send(&format!("SV{},MA{}", velocity.abs() as i32, target as i32))
+        // C's jog path issues SET_ACCEL unconditionally before the move
+        // (motorRecord.cc:2141, no accel>0 guard — unlike the ordinary move
+        // path), so the jog acceleration is always on the wire: `SA,SV,MA`.
+        self.lock().send(&format!(
+            "SA{},SV{},MA{}",
+            acceleration as i32,
+            velocity.abs() as i32,
+            target as i32
+        ))
     }
 
     fn home(
