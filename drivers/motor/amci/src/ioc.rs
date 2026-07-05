@@ -53,6 +53,12 @@ pub fn anf2_create_controller_command() -> CommandDef {
             let port_name = req_string(args, 0, "portName")?;
             let in_port = req_string(args, 1, "inPort")?;
             let out_port = req_string(args, 2, "outPort")?;
+            // Stricter than C by design: C (ANF2Driver.cpp:88-97) clamps only
+            // the upper bound and lets a negative/zero numAxes through. Clamp
+            // the lower bound to 0 as well. This is a defensive narrowing, not
+            // a behavioral divergence — the only runtime use of num_axes is the
+            // `axes_created != num_axes` poll gate, which a zero-clamped value
+            // and a negative C value both leave permanently un-satisfied.
             let num_axes = req_int(args, 3, "numAxes")?.clamp(0, MAX_AXES as i64) as usize;
 
             let controller = Anf2Controller::new(&in_port, &out_port, num_axes)
