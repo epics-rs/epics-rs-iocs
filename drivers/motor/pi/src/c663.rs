@@ -337,8 +337,10 @@ impl AsynMotor for PIC663Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.lock().send(&format!(
-            "SV{},SA{},MA{}",
-            velocity as i32, acceleration as i32, position as i32
+            "SV{},{}MA{}",
+            velocity as i32,
+            crate::accel_field(acceleration),
+            position as i32
         ))
     }
 
@@ -351,8 +353,10 @@ impl AsynMotor for PIC663Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         self.lock().send(&format!(
-            "SV{},SA{},MR{}",
-            velocity as i32, acceleration as i32, distance as i32
+            "SV{},{}MR{}",
+            velocity as i32,
+            crate::accel_field(acceleration),
+            distance as i32
         ))
     }
 
@@ -390,8 +394,9 @@ impl AsynMotor for PIC663Axis {
     ) -> AsynResult<()> {
         let cmd = if forward { "FE0" } else { "FE1" };
         self.lock().send(&format!(
-            "SV{},SA{},{cmd}",
-            velocity as i32, acceleration as i32
+            "SV{},{}{cmd}",
+            velocity as i32,
+            crate::accel_field(acceleration)
         ))
     }
 
