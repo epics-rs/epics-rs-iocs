@@ -168,6 +168,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "amci-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-modbus-rs",
+ "epics-rs",
+ "motor-amci",
+ "motor-common",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -986,6 +996,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "epics-modbus-rs"
+version = "0.22.0"
+dependencies = [
+ "asyn-rs 0.22.0",
+ "epics-base-rs 0.22.0",
+ "epics-ca-rs 0.22.0",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "epics-pva-rs"
 version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1644,6 +1666,14 @@ dependencies = [
 
 [[package]]
 name = "motor-aerotech"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "motor-common",
+]
+
+[[package]]
+name = "motor-amci"
 version = "0.1.0"
 dependencies = [
  "epics-rs",

@@ -1,0 +1,16 @@
+# AMCI ANF2 / ANG1 stepper motor controller drivers, ported from
+# epics-modules/motor motorAMCI. Both talk Modbus/TCP registers rather than an
+# asyn-octet ASCII protocol — register I/O goes through a modbus-rs port found
+# by name in the asyn-rs port registry (the in-process analogue of
+# pasynInt32SyncIO / pasynInt32ArraySyncIO connect+read/write by offset), so
+# this crate depends only on asyn-rs (via epics-rs), not on modbus-rs directly.
+
+[package]
+name = "motor-amci"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "drivers/d435i",
+    "drivers/motor/amci",
     "drivers/motor/common",
     "drivers/motor/micronix",
     "drivers/motor/motorsim",
@@ -58,6 +59,7 @@ members = [
     "iocs/motor/aerotech-ioc",
     "iocs/motor/ims-ioc",
     "iocs/motor/acsmotion-ioc",
+    "iocs/motor/amci-ioc",
     "iocs/motor/micos-ioc",
     "iocs/motor/oms-asyn-ioc",
     "iocs/motor/phytron-ioc",
@@ -80,3 +82,6 @@ members = [
 epics-rs = { path = "../epics-rs/crates/epics-rs" }
 asyn-rs = { version = "0.21.0" }
 ad-plugins-rs = { version = "0.21.0" }
+# Modbus TCP/RTU/ASCII driver (drvModbusAsyn port) — same sibling checkout as
+# epics-rs, so it shares that workspace's asyn-rs instance.
+modbus-rs = { path = "../epics-rs/crates/modbus-rs", package = "epics-modbus-rs" }

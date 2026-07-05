@@ -1,0 +1,21 @@
+# AMCI ANF2: one motor record per axis. Load once per axis with N = 0-based
+# axis index (DTYP $(PORT)_$(N)); PORT is the controller's asyn port name
+# passed to ANF2CreateController/ANF2CreateAxis.
+#
+# The controller works in motor steps, so MRES = 1 and EGU = steps. VELO/ACCL
+# feed the SPEED/ACCEL_DECEL registers (the driver corrects the acceleration
+# so the record's ACCL time holds despite the fixed base speed set at axis
+# creation — see motor-amci::anf2::Anf2Axis::correct_accel).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "$(PORT)_$(N)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10000.0)")
+    field(VBAS, "$(VBAS=100.0)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=10000000.0)")
+    field(DLLM, "$(LLM=-10000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}
