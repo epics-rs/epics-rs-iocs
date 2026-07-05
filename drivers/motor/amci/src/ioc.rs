@@ -203,8 +203,9 @@ pub fn ang1_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
-                let ax = Ang1Axis::new(controller.clone(), axis as i32)
-                    .map_err(|e| format!("ANG1CreateController: {e}"))?;
+                // Infallible, matching C: axis construction ignores the
+                // initial setPosition status and never aborts this command.
+                let ax = Ang1Axis::new(controller.clone(), axis as i32);
                 let dtyp_key = format!("{port_name}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);

@@ -127,10 +127,14 @@ impl Ang1Axis {
     /// C `ANG1Axis::ANG1Axis`: zero the position. `axis_no` is accepted for
     /// parity with the multi-axis C constructor signature but is otherwise
     /// unused — see the module doc on the shared, non-offset register block.
-    pub fn new(controller: Arc<Mutex<Ang1Controller>>, _axis_no: i32) -> AsynResult<Self> {
+    ///
+    /// Infallible, matching C: the constructor calls `setPosition(0)` and
+    /// ignores its status, so a transient link error at IOC boot cannot abort
+    /// `ANG1CreateController` (which C always returns `asynSuccess` from).
+    pub fn new(controller: Arc<Mutex<Ang1Controller>>, _axis_no: i32) -> Self {
         let mut ax = Self { controller };
-        ax.set_position(&AsynUser::new(0), 0.0)?;
-        Ok(ax)
+        let _ = ax.set_position(&AsynUser::new(0), 0.0);
+        ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Ang1Controller> {
