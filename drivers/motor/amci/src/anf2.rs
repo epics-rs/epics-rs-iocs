@@ -129,6 +129,10 @@ pub struct Anf2Axis {
     /// C `motorStatusDirection_`, persisted across polls (only updated while
     /// moving) and used to gate the high/low limit bits.
     direction: bool,
+    /// Last published status. C's poll reuses a single stale `read_val` on a
+    /// failed read and always publishes; this carries forward the last value
+    /// field-by-field for any read that fails in a cycle (see [`Self::poll`]).
+    last: MotorStatus,
 }
 
 impl Anf2Axis {
@@ -148,6 +152,10 @@ impl Anf2Axis {
             jogging: false,
             has_encoder: false,
             direction: true,
+            last: MotorStatus {
+                gain_support: true,
+                ..MotorStatus::default()
+            },
         };
 
         sleep(Duration::from_millis(100));
@@ -368,47 +376,69 @@ impl AsynMotor for Anf2Axis {
             });
         }
 
-        ctrl.force_read()?;
+        // C presses on through every read and always publishes: each read's
+        // status is discarded (the base poller ignores poll()'s return) and
+        // callParamCallbacks fires unconditionally. Mirror that — attempt each
+        // read, carry forward the last published value for any field whose read
+        // fails this cycle (defined, safe equivalent of C reusing a stale
+        // `read_val`), and always return Ok so the framework publishes.
+        let last = self.last.clone();
 
-        let position = ctrl.read32(self.axis_no, POS_RD_UPR)? as f64;
-        let encoder_position = ctrl.read32(self.axis_no, EN_POS_UPR)? as f64;
+        let _ = ctrl.force_read();
 
-        let status1 = ctrl.read16(self.axis_no, STATUS_1)?;
-        // Status word 1 bit 3 set to 1 when the motor is not in motion.
-        let done = (status1 & 0x8) != 0;
+        let position = ctrl
+            .read32(self.axis_no, POS_RD_UPR)
+            .map_or(last.position, |v| v as f64);
+        let encoder_position = ctrl
+            .read32(self.axis_no, EN_POS_UPR)
+            .map_or(last.encoder_position, |v| v as f64);
 
         // Direction is only updated while moving; otherwise keep the last
         // polled value (it gates the limit bits below either way).
         let mut direction = self.direction;
-        if !done {
-            if status1 & 0x1 != 0 {
-                direction = true;
+        // STATUS_1: done / direction / command-error / powered. On a read
+        // failure carry forward last-known done/powered and treat command-error
+        // as clear (avoid a spurious reset from a stale read_val).
+        let (done, cmd_error, powered) = match ctrl.read16(self.axis_no, STATUS_1) {
+            Ok(status1) => {
+                // Status word 1 bit 3 set to 1 when the motor is not in motion.
+                let done = (status1 & 0x8) != 0;
+                if !done {
+                    if status1 & 0x1 != 0 {
+                        direction = true;
+                    }
+                    if status1 & 0x2 != 0 {
+                        direction = false;
+                    }
+                }
+                // Enable/disable (not actually the torque status) — determined
+                // by the configuration; it isn't obvious why one would disable
+                // an axis.
+                (done, status1 & 0x1000 != 0, status1 & 0x4000 != 0)
             }
-            if status1 & 0x2 != 0 {
-                direction = false;
-            }
-        }
+            Err(_) => (last.done, false, last.powered),
+        };
 
-        let cmd_error = status1 & 0x1000 != 0;
-        // Enable/disable (not actually the torque status) — determined by
-        // the configuration; it isn't obvious why one would disable an axis.
-        let powered = status1 & 0x4000 != 0;
-
-        let status2 = ctrl.read16(self.axis_no, STATUS_2)?;
         // High limit reported only while moving positively, low limit only
         // while moving negatively.
-        let high_limit = (status2 & 0x8 != 0) && direction;
-        let low_limit = (status2 & 0x10 != 0) && !direction;
+        let (high_limit, low_limit) = match ctrl.read16(self.axis_no, STATUS_2) {
+            Ok(status2) => (
+                (status2 & 0x8 != 0) && direction,
+                (status2 & 0x10 != 0) && !direction,
+            ),
+            Err(_) => (last.high_limit, last.low_limit),
+        };
 
-        // Clear command errors so we can attempt to move again.
+        // Clear command errors so we can attempt to move again (error
+        // discarded, matching C).
         if cmd_error {
-            self.reset_errors(&ctrl)?;
+            let _ = self.reset_errors(&ctrl);
         }
 
         drop(ctrl);
         self.direction = direction;
 
-        Ok(MotorStatus {
+        let status = MotorStatus {
             position,
             encoder_position,
             done,
@@ -420,7 +450,9 @@ impl AsynMotor for Anf2Axis {
             has_encoder: self.has_encoder,
             gain_support: true,
             ..MotorStatus::default()
-        })
+        };
+        self.last = status.clone();
+        Ok(status)
     }
 }
 
