@@ -60,6 +60,68 @@ PIC663Config($(CARD), "$(PORT)", $(ADDR663), 100, 1000)
 
 dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 
+# ---- PI C-630 stepper chain (separate port — different protocol/framing) ----
+# The C-630 is NOT a C-862 clone: it uses a per-command 1-digit axis address
+# (1-9), echoes every command, and frames both directions with LF ("\n"). It
+# therefore needs its own asyn port. Uncomment and point TTY630 at real
+# hardware to enable. (Its C motor_init sets both EOS to "\n", overriding the
+# reference iocsh's transient "\r"; this port mirrors the "\n" final state.)
+#
+#drvAsynSerialPortConfigure("serial630", "/dev/ttyUSB1", 0, 0, 0)
+#asynSetOption("serial630", -1, "baud", "19200")
+#asynOctetSetOutputEos("serial630", 0, "\n")
+#asynOctetSetInputEos("serial630", 0, "\n")
+#PIC630Setup(8, 9, 10)
+# PIC630Config(card, asynPort, numAxes, [cur1..cur9], [movingPollMs], [idlePollMs])
+#PIC630Config(1, "serial630", 3, 5, 3, 0, 0, 0, 0, 0, 0, 0, 100, 1000)
+#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_1,CARD=1,AXIS=0")
+#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_2,CARD=1,AXIS=1")
+#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_3,CARD=1,AXIS=2")
+
+# ---- PI E-662 piezo controller (separate port — SCPI protocol, LF framing) --
+# Single-axis SCPI-like piezo controller (*IDN?, *ESR?, POS?, POS). No address,
+# no echo, both EOS = "\n". Needs its own asyn port. Uncomment for real
+# hardware.
+#drvAsynSerialPortConfigure("serial662", "/dev/ttyUSB2", 0, 0, 0)
+#asynSetOption("serial662", -1, "baud", "9600")
+#asynOctetSetOutputEos("serial662", 0, "\n")
+#asynOctetSetInputEos("serial662", 0, "\n")
+#PIC662Setup(8, 10)
+# PIC662Config(card, asynPort, [movingPollMs], [idlePollMs])
+#PIC662Config(2, "serial662", 100, 1000)
+#dbLoadRecords("db/pic662.template", "P=$(P),M=c662,CARD=2")
+
+# ---- PI C-844 4-axis DC-servo controller (separate port — SCPI protocol) ----
+# Single-device, 4 axes selected by an "AXIS n;" prefix. *IDN?, no echo, both
+# EOS = "\n". Needs its own asyn port. addr is accepted for parity but unused
+# on the wire. Uncomment for real hardware.
+#drvAsynSerialPortConfigure("serial844", "/dev/ttyUSB3", 0, 0, 0)
+#asynSetOption("serial844", -1, "baud", "9600")
+#asynOctetSetOutputEos("serial844", 0, "\n")
+#asynOctetSetInputEos("serial844", 0, "\n")
+#PIC844Setup(8, 10)
+# PIC844Config(card, asynPort, addr, [movingPollMs], [idlePollMs])
+#PIC844Config(3, "serial844", 0, 100, 1000)
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_1,CARD=3,AXIS=0")
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_2,CARD=3,AXIS=1")
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_3,CARD=3,AXIS=2")
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_4,CARD=3,AXIS=3")
+
+# ---- PI C-848 multi-axis DC-servo controller (separate port) ----------------
+# Up to 4 axes, selected by byte 5 of each command (letters A-D). Axis count is
+# probed at connect via CST?; load one record per present axis. *IDN?, no echo,
+# both EOS = "\n". addr is accepted for parity but unused on the wire.
+# Uncomment for real hardware.
+#drvAsynSerialPortConfigure("serial848", "/dev/ttyUSB4", 0, 0, 0)
+#asynSetOption("serial848", -1, "baud", "9600")
+#asynOctetSetOutputEos("serial848", 0, "\n")
+#asynOctetSetInputEos("serial848", 0, "\n")
+#PIC848Setup(8, 10)
+# PIC848Config(card, asynPort, addr, [movingPollMs], [idlePollMs])
+#PIC848Config(4, "serial848", 0, 100, 1000)
+#dbLoadRecords("db/pic848.template", "P=$(P),M=c848_1,CARD=4,AXIS=0")
+#dbLoadRecords("db/pic848.template", "P=$(P),M=c848_2,CARD=4,AXIS=1")
+
 iocInit()
 
 # Example:
