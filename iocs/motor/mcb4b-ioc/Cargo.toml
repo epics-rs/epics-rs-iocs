@@ -1,0 +1,14 @@
+# ACS MCB-4B motor IOC binary. Wires the motor-acs driver to a serial octet
+# port and one motor record per axis, exposing CA + PVA. No vendor SDK — builds
+# on any host.
+
+[package]
+name = "mcb4b-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-acs = { path = "../../../drivers/motor/acs" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

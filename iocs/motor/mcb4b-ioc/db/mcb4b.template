@@ -1,0 +1,19 @@
+# ACS MCB-4B: one motor record per axis. DTYP is MCB4B_$(CARD)_$(AXIS), the key
+# registered by MCB4BCreateController (axes are 0-based, matching the C "#%02d"
+# wire prefix).
+#
+# The MCB-4B works in raw controller steps (#..G/#..I take signed step counts,
+# #..P returns a signed step count, no separate EGU scaling in the driver), so
+# MRES = 1 and EGU = steps.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "MCB4B_$(CARD)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=1000000.0)")
+    field(DLLM, "$(LLM=-1000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}

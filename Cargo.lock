@@ -6,7 +6,7 @@ version = 4
 name = "acsmotion-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-acsmotion",
  "motor-common",
 ]
@@ -15,34 +15,20 @@ dependencies = [
 name = "acstech80-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-acstech80",
  "motor-common",
 ]
 
 [[package]]
 name = "ad-core-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6df283a7f000d40fa4fbc3df7582ab56a28c1a90d7bc8d9cee1f27501585e19"
+checksum = "0b0a1436c310895e948d52df05608485dc9e2e317beecf2379e45841552ad32c"
 dependencies = [
- "asyn-rs 0.21.0",
- "epics-base-rs 0.21.0",
- "epics-ca-rs 0.21.0",
- "futures-util",
- "parking_lot",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ad-core-rs"
-version = "0.22.0"
-dependencies = [
- "asyn-rs 0.22.0",
- "epics-base-rs 0.22.0",
- "epics-ca-rs 0.22.0",
+ "asyn-rs 0.19.2",
+ "epics-base-rs 0.19.2",
+ "epics-ca-rs 0.19.2",
  "futures-util",
  "parking_lot",
  "thiserror 2.0.18",
@@ -52,41 +38,16 @@ dependencies = [
 
 [[package]]
 name = "ad-plugins-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba5eacb8d9d2aa12b3d24aecfe2fff94a5423d1e6ba2816db2ab0aee2ea65753"
+checksum = "f8a749f3139b6ba3fdbfd424b0d65deadf8c863716344829ce15d63ea72b51f5"
 dependencies = [
- "ad-core-rs 0.21.0",
- "asyn-rs 0.21.0",
- "epics-base-rs 0.21.0",
- "epics-bridge-rs 0.21.0",
- "epics-ca-rs 0.21.0",
- "epics-pva-rs 0.21.0",
- "flate2",
- "image",
- "jpeg-decoder",
- "jpeg-encoder",
- "lz4_flex",
- "netcdf3",
- "parking_lot",
- "rayon",
- "rust-hdf5",
- "rustfft",
- "serde",
- "serde_json",
- "tiff 0.9.1",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ad-plugins-rs"
-version = "0.22.0"
-dependencies = [
- "ad-core-rs 0.22.0",
- "asyn-rs 0.22.0",
- "epics-base-rs 0.22.0",
- "epics-ca-rs 0.22.0",
+ "ad-core-rs",
+ "asyn-rs 0.19.2",
+ "epics-base-rs 0.19.2",
+ "epics-bridge-rs 0.19.2",
+ "epics-ca-rs 0.19.2",
+ "epics-pva-rs 0.19.2",
  "flate2",
  "image",
  "jpeg-decoder",
@@ -114,7 +75,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "aerotech-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-aerotech",
  "motor-common",
 ]
@@ -134,7 +95,7 @@ dependencies = [
 name = "ag-uc-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -142,7 +103,7 @@ dependencies = [
 name = "agap-conex-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -172,7 +133,7 @@ name = "amci-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-modbus-rs",
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-amci",
  "motor-common",
 ]
@@ -292,12 +253,12 @@ dependencies = [
 
 [[package]]
 name = "asyn-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0abe059d0fd2a1082c864e54d4203bb8797a9aaf68611e1dafe52f6c644e5d53"
+checksum = "6ea020fd5c4e05a687ad414a6646b3763eebc223977d3cbcca0fe72772a5d8cf"
 dependencies = [
  "bitflags",
- "epics-base-rs 0.21.0",
+ "epics-base-rs 0.19.2",
  "libc",
  "parking_lot",
  "serde",
@@ -306,7 +267,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -341,7 +301,7 @@ dependencies = [
 name = "attocube-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-attocube",
  "motor-common",
 ]
@@ -594,7 +554,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 name = "conex-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -707,7 +667,7 @@ name = "d435i"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "epics-rs",
+ "epics-rs 0.19.2",
  "log",
  "parking_lot",
  "realsense-rust",
@@ -717,9 +677,9 @@ dependencies = [
 name = "d435i-ioc"
 version = "0.1.0"
 dependencies = [
- "ad-plugins-rs 0.21.0",
+ "ad-plugins-rs",
  "d435i",
- "epics-rs",
+ "epics-rs 0.19.2",
  "tokio",
 ]
 
@@ -845,14 +805,14 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4846787402dafd405b6b6d6919ce84cb9d6880aaf230bfb0bc23b69f99af3a73"
+checksum = "cad404cf22f5ff7da3e864bc77c85e59c468d143e173f87385a3b4633022a760"
 dependencies = [
  "bytes",
  "chrono",
  "clap",
- "epics-macros-rs 0.21.0",
+ "epics-macros-rs 0.19.2",
  "hostname",
  "if-addrs",
  "libc",
@@ -887,17 +847,17 @@ dependencies = [
 
 [[package]]
 name = "epics-bridge-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4529ba48696ef379a301e49db2adf59c95347db4177e33a3163aca625f227c3d"
+checksum = "26fe846aa23b98600de465d9c7ebef687b1145e69a7f6180b322f3da2db5a0d0"
 dependencies = [
  "arc-swap",
  "bytes",
  "chrono",
  "clap",
- "epics-base-rs 0.21.0",
- "epics-ca-rs 0.21.0",
- "epics-pva-rs 0.21.0",
+ "epics-base-rs 0.19.2",
+ "epics-ca-rs 0.19.2",
+ "epics-pva-rs 0.19.2",
  "parking_lot",
  "regex",
  "serde",
@@ -931,16 +891,16 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64e9de4d6b37f20a53a3ac2cf8ee6e6f475d74b1a014718b9e7b31b4dd964e0c"
+checksum = "11c68e16e7e3df79cd85ad18f89b02ecb49cf7be551adaa9192b95c58c8e0f39"
 dependencies = [
  "arc-swap",
  "async-trait",
  "chrono",
  "clap",
  "dashmap",
- "epics-base-rs 0.21.0",
+ "epics-base-rs 0.19.2",
  "futures-util",
  "if-addrs",
  "libc",
@@ -975,9 +935,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d9330891025158f77fa7af42a6a92a444d138368e0e0c85f48d6365f11ecc2"
+checksum = "0e5d326e50fbbd06fb00d18ca09679d384cf7bf3b88ae74efe8b7f724a436775"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1009,17 +969,17 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.21.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38b8921e46a4f0d9fba74e078715b1faecb7776d538ab61c66b6aa7cbb0fce15"
+checksum = "bf30e4868cb14919fd03bf83d6d96e0c4e9d715bd77174e92922af3183174664"
 dependencies = [
  "bytes",
  "chrono",
  "clap",
  "dashmap",
  "der",
- "epics-base-rs 0.21.0",
- "epics-macros-rs 0.21.0",
+ "epics-base-rs 0.19.2",
+ "epics-macros-rs 0.19.2",
  "futures-util",
  "hmac 0.13.0",
  "hostname",
@@ -1085,17 +1045,30 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3d256312b43ae59bc15add3c721eeac663247d2f621d592107003b7bf189f84"
+dependencies = [
+ "ad-core-rs",
+ "ad-plugins-rs",
+ "asyn-rs 0.19.2",
+ "epics-base-rs 0.19.2",
+ "epics-bridge-rs 0.19.2",
+ "epics-ca-rs 0.19.2",
+ "epics-pva-rs 0.19.2",
+ "scaler-rs",
+]
+
+[[package]]
+name = "epics-rs"
 version = "0.22.0"
 dependencies = [
- "ad-core-rs 0.22.0",
- "ad-plugins-rs 0.22.0",
  "asyn-rs 0.22.0",
  "epics-base-rs 0.22.0",
  "epics-bridge-rs 0.22.0",
  "epics-ca-rs 0.22.0",
  "epics-pva-rs 0.22.0",
  "motor-rs",
- "scaler-rs",
 ]
 
 [[package]]
@@ -1124,7 +1097,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 name = "esp300-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -1132,7 +1105,7 @@ dependencies = [
 name = "faulhaber-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-faulhaber",
 ]
@@ -1326,7 +1299,7 @@ dependencies = [
 name = "hxp-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -1395,7 +1368,7 @@ dependencies = [
 name = "ims-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-ims",
 ]
@@ -1471,7 +1444,7 @@ dependencies = [
 name = "kohzu-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-kohzu",
 ]
@@ -1545,10 +1518,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcb4b-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs 0.22.0",
+ "motor-acs",
+ "motor-common",
+]
+
+[[package]]
 name = "mclennan-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-mclennan",
 ]
@@ -1582,7 +1564,7 @@ dependencies = [
 name = "micos-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-micos",
 ]
@@ -1591,7 +1573,7 @@ dependencies = [
 name = "micromo-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-micromo",
 ]
@@ -1600,7 +1582,7 @@ dependencies = [
 name = "micronix-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-micronix",
 ]
@@ -1636,7 +1618,7 @@ dependencies = [
 name = "mm3000-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -1644,15 +1626,23 @@ dependencies = [
 name = "mm4000-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
+]
+
+[[package]]
+name = "motor-acs"
+version = "0.1.0"
+dependencies = [
+ "epics-rs 0.22.0",
+ "motor-common",
 ]
 
 [[package]]
 name = "motor-acsmotion"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1660,7 +1650,7 @@ dependencies = [
 name = "motor-acstech80"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1668,7 +1658,7 @@ dependencies = [
 name = "motor-aerotech"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1676,7 +1666,7 @@ dependencies = [
 name = "motor-amci"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1684,7 +1674,7 @@ dependencies = [
 name = "motor-attocube"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1692,7 +1682,7 @@ dependencies = [
 name = "motor-common"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "tokio",
 ]
 
@@ -1700,7 +1690,7 @@ dependencies = [
 name = "motor-faulhaber"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1708,7 +1698,7 @@ dependencies = [
 name = "motor-ims"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1716,7 +1706,7 @@ dependencies = [
 name = "motor-kohzu"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1724,7 +1714,7 @@ dependencies = [
 name = "motor-mclennan"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1732,7 +1722,7 @@ dependencies = [
 name = "motor-micos"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1740,7 +1730,7 @@ dependencies = [
 name = "motor-micromo"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1748,7 +1738,7 @@ dependencies = [
 name = "motor-micronix"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1756,7 +1746,7 @@ dependencies = [
 name = "motor-motorsim"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1764,7 +1754,7 @@ dependencies = [
 name = "motor-newport"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "suppaftp",
  "tokio",
 ]
@@ -1773,7 +1763,7 @@ dependencies = [
 name = "motor-npoint"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1781,7 +1771,7 @@ dependencies = [
 name = "motor-oms-asyn"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1789,7 +1779,7 @@ dependencies = [
 name = "motor-oriel"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1797,7 +1787,7 @@ dependencies = [
 name = "motor-parker"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1805,7 +1795,7 @@ dependencies = [
 name = "motor-phytron"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1813,7 +1803,7 @@ dependencies = [
 name = "motor-pi"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1821,7 +1811,7 @@ dependencies = [
 name = "motor-pi-gcs2"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1829,7 +1819,7 @@ dependencies = [
 name = "motor-pijena"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1849,7 +1839,7 @@ dependencies = [
 name = "motor-smaract"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1857,7 +1847,7 @@ dependencies = [
 name = "motor-smartmotor"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1865,7 +1855,7 @@ dependencies = [
 name = "motor-thorlabs"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
 ]
 
@@ -1873,7 +1863,7 @@ dependencies = [
 name = "motorsim-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-motorsim",
 ]
 
@@ -1901,7 +1891,7 @@ dependencies = [
 name = "newfocus-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -1940,7 +1930,7 @@ dependencies = [
 name = "npoint-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-npoint",
 ]
@@ -2021,7 +2011,7 @@ dependencies = [
 name = "oms-asyn-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-oms-asyn",
 ]
@@ -2042,7 +2032,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "oriel-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-oriel",
 ]
@@ -2068,7 +2058,7 @@ dependencies = [
 name = "parker-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-parker",
 ]
@@ -2110,7 +2100,7 @@ dependencies = [
 name = "phytron-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-phytron",
 ]
@@ -2119,7 +2109,7 @@ dependencies = [
 name = "pi-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-pi",
 ]
@@ -2128,7 +2118,7 @@ dependencies = [
 name = "pigcs2-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-pi-gcs2",
 ]
@@ -2137,7 +2127,7 @@ dependencies = [
 name = "pijena-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-pijena",
 ]
@@ -2173,7 +2163,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 name = "pm500-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -2365,14 +2355,13 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.3.2"
+version = "0.2.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76d9a3a248d812fc26bb6342fa6c978bf08ff3c801418608854678d462b7c52c"
+checksum = "29fdee252e1681973e737d12c31f4edcaf30c4a9a1e3a7af4d12cbfdc60ff43d"
 dependencies = [
  "bzip2",
  "flate2",
  "lz4_flex",
- "rayon",
  "rust-zstd",
  "snap",
 ]
@@ -2488,10 +2477,12 @@ dependencies = [
 
 [[package]]
 name = "scaler-rs"
-version = "0.22.0"
+version = "0.19.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04302245831ddc64275fc26fdf9998e636173866459ca5154c3c7a9895b91eca"
 dependencies = [
- "asyn-rs 0.22.0",
- "epics-base-rs 0.22.0",
+ "asyn-rs 0.19.2",
+ "epics-base-rs 0.19.2",
  "tokio",
  "tracing",
 ]
@@ -2638,7 +2629,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 name = "smaract-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-smaract",
 ]
@@ -2647,7 +2638,7 @@ dependencies = [
 name = "smartmotor-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-smartmotor",
 ]
@@ -2656,7 +2647,7 @@ dependencies = [
 name = "smc100-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
@@ -2792,7 +2783,7 @@ dependencies = [
 name = "thorlabs-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-common",
  "motor-thorlabs",
 ]
@@ -3062,7 +3053,7 @@ name = "usb-2408"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "epics-rs",
+ "epics-rs 0.19.2",
  "log",
  "meascomp",
  "parking_lot",
@@ -3073,8 +3064,8 @@ dependencies = [
 name = "usb-2408-ioc"
 version = "0.1.0"
 dependencies = [
- "asyn-rs 0.21.0",
- "epics-rs",
+ "asyn-rs 0.19.2",
+ "epics-rs 0.19.2",
  "tokio",
  "usb-2408",
 ]
@@ -3084,7 +3075,7 @@ name = "usb-ctr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "epics-rs",
+ "epics-rs 0.19.2",
  "log",
  "meascomp",
  "parking_lot",
@@ -3095,8 +3086,8 @@ dependencies = [
 name = "usb-ctr-ioc"
 version = "0.1.0"
 dependencies = [
- "asyn-rs 0.21.0",
- "epics-rs",
+ "asyn-rs 0.19.2",
+ "epics-rs 0.19.2",
  "tokio",
  "usb-ctr",
 ]
@@ -3356,7 +3347,7 @@ dependencies = [
 name = "xps-ioc"
 version = "0.1.0"
 dependencies = [
- "epics-rs",
+ "epics-rs 0.22.0",
  "motor-newport",
 ]
 
