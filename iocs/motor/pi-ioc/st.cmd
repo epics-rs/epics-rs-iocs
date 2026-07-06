@@ -60,6 +60,24 @@ PIC663Config($(CARD), "$(PORT)", $(ADDR663), 100, 1000)
 
 dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 
+# ---- PI C-630 stepper chain (separate port — different protocol/framing) ----
+# The C-630 is NOT a C-862 clone: it uses a per-command 1-digit axis address
+# (1-9), echoes every command, and frames both directions with LF ("\n"). It
+# therefore needs its own asyn port. Uncomment and point TTY630 at real
+# hardware to enable. (Its C motor_init sets both EOS to "\n", overriding the
+# reference iocsh's transient "\r"; this port mirrors the "\n" final state.)
+#
+#drvAsynSerialPortConfigure("serial630", "/dev/ttyUSB1", 0, 0, 0)
+#asynSetOption("serial630", -1, "baud", "19200")
+#asynOctetSetOutputEos("serial630", 0, "\n")
+#asynOctetSetInputEos("serial630", 0, "\n")
+#PIC630Setup(8, 9, 10)
+# PIC630Config(card, asynPort, numAxes, [cur1..cur9], [movingPollMs], [idlePollMs])
+#PIC630Config(1, "serial630", 3, 5, 3, 0, 0, 0, 0, 0, 0, 0, 100, 1000)
+#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_1,CARD=1,AXIS=0")
+#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_2,CARD=1,AXIS=1")
+#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_3,CARD=1,AXIS=2")
+
 iocInit()
 
 # Example:
