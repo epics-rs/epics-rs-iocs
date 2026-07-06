@@ -78,6 +78,19 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #dbLoadRecords("db/pic630.template", "P=$(P),M=c630_2,CARD=1,AXIS=1")
 #dbLoadRecords("db/pic630.template", "P=$(P),M=c630_3,CARD=1,AXIS=2")
 
+# ---- PI E-662 piezo controller (separate port — SCPI protocol, LF framing) --
+# Single-axis SCPI-like piezo controller (*IDN?, *ESR?, POS?, POS). No address,
+# no echo, both EOS = "\n". Needs its own asyn port. Uncomment for real
+# hardware.
+#drvAsynSerialPortConfigure("serial662", "/dev/ttyUSB2", 0, 0, 0)
+#asynSetOption("serial662", -1, "baud", "9600")
+#asynOctetSetOutputEos("serial662", 0, "\n")
+#asynOctetSetInputEos("serial662", 0, "\n")
+#PIC662Setup(8, 10)
+# PIC662Config(card, asynPort, [movingPollMs], [idlePollMs])
+#PIC662Config(2, "serial662", 100, 1000)
+#dbLoadRecords("db/pic662.template", "P=$(P),M=c662,CARD=2")
+
 iocInit()
 
 # Example:

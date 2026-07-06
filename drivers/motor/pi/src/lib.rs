@@ -3,11 +3,13 @@
 //! controller path (`motor-pi-gcs2`). Module-per-controller.
 
 pub mod c630;
+pub mod c662;
 pub mod c663;
 pub mod c862;
 pub mod ioc;
 
 pub use c630::{PIC630Axis, PIC630Controller};
+pub use c662::{PIC662Axis, PIC662Controller};
 pub use c663::{PIC663Axis, PIC663Controller};
 pub use c862::{PIC862Axis, PIC862Controller};
 

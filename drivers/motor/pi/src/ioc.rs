@@ -13,11 +13,15 @@ use motor_common::iocsh::{
 };
 
 use crate::c630::{PIC630_NUM_AXIS, PIC630Axis, PIC630Controller};
+use crate::c662::{PIC662Axis, PIC662Controller};
 use crate::c663::{PIC663Axis, PIC663Controller};
 use crate::c862::{PIC862Axis, PIC862Controller};
 
 /// Command timeout (C `drvPIC630.h` `COMM_TIMEOUT` 2 s).
 const PIC630_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Command timeout (C `drvPIC662.h` `COMM_TIMEOUT` 2 s).
+const PIC662_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIC862.h` `COMM_TIMEOUT` 2.0 s).
 const PIC862_TIMEOUT: Duration = Duration::from_secs(2);
@@ -263,6 +267,67 @@ pub fn pic630_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 "PIC630Config: card={card} asynPort={asyn_port} numAxes={num_axes} \
                  poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PIC630_{card}_0..{})",
                 num_axes - 1
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIC662Setup(maxCards, [scanRate])` no-op command (startup-script
+/// parity; the asyn-rs port allocates per `PIC662Config` call).
+pub fn pic662_setup_command() -> CommandDef {
+    CommandDef::new(
+        "PIC662Setup",
+        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
+        "PIC662Setup(maxCards, [scanRate]) - Accepted for parity; PIC662Config allocates per call",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let max = req_int(args, 0, "maxCards")?;
+            if max < 1 {
+                return Err("PIC662Setup: maxCards must be > 0".into());
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIC662Config(card, asynPort, [movingPollMs], [idlePollMs])`
+/// command bound to `holder`. The E-662 is a single-axis SCPI-like piezo
+/// controller with no protocol address.
+pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "PIC662Config",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("asynPort"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+        ],
+        "PIC662Config(card, asynPort, [movingPollMs], [idlePollMs]) - \
+         Create a PI E-662 piezo controller (DTYP PIC662_{card}_0)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("PIC662Config: card must be >= 0".into());
+            }
+            let asyn_port = req_string(args, 1, "asynPort")?;
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+
+            let handle = connect_serial(&asyn_port, PIC662_TIMEOUT)?;
+            let controller =
+                PIC662Controller::new(handle).map_err(|e| format!("PIC662Config: {e}"))?;
+            let ident = controller.ident().to_string();
+            let controller = Arc::new(Mutex::new(controller));
+
+            let axis = PIC662Axis::new(controller).map_err(|e| format!("PIC662Config: {e}"))?;
+            let dtyp_key = format!("PIC662_{card}_0");
+            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+
+            println!(
+                "PIC662Config: card={card} asynPort={asyn_port} \
+                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
+                 (DTYP=PIC662_{card}_0)"
             );
             Ok(CommandOutcome::Continue)
         },
