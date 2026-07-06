@@ -4,10 +4,37 @@
 
 pub mod c663;
 pub mod c862;
+pub mod e516;
 pub mod ioc;
 
 pub use c663::{PIC663Axis, PIC663Controller};
 pub use c862::{PIC862Axis, PIC862Controller};
+pub use e516::{PIE516Axis, PIE516Controller};
+
+/// C `sscanf(s, "%d", &out)` success semantics for the E-series piezo status
+/// reads: `Some(int)` when a leading (optionally signed) decimal integer is
+/// present, `None` when the field has no digits. The E-516/E-517/E-816
+/// `set_status` chains gate every step on `recv_mess(...) && sscanf(buff,
+/// "%d", &x)`, so a reply with no parseable integer must fail the read (drop
+/// to the comm-debounce path) rather than silently reading `0` — which is why
+/// this returns `Option` instead of reusing `util::atoi` (which yields `0` on
+/// junk and cannot distinguish "parsed 0" from "no digits").
+pub(crate) fn scan_int(s: &str) -> Option<i32> {
+    let t = s.trim_start();
+    let b = t.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return None; // no digit after the optional sign: C sscanf returns 0.
+    }
+    t.get(..i).and_then(|p| p.parse::<i32>().ok())
+}
 
 /// The `SA{accel},` wire fragment for a move, or an empty string when the
 /// acceleration is not strictly positive.

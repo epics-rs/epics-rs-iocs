@@ -60,6 +60,24 @@ PIC663Config($(CARD), "$(PORT)", $(ADDR663), 100, 1000)
 
 dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 
+# ---- PI E-516 piezo controller (separate serial port) ----
+# The E-516 is a 3-axis closed-loop piezo. Framing is port-owned, LF both ways
+# (C's motor_init() sets both EOS itself; this port has no equivalent hook, so
+# both are set here). PIE516Config probes the axes and installs one motor per
+# responding axis (DTYP PIE516_$(CARD)_{0,1,2} = letters A/B/C).
+#drvAsynSerialPortConfigure("piezo1", "/dev/ttyUSB1", 0, 0, 0)
+#asynSetOption("piezo1", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo1", 0, "\n")
+#asynOctetSetInputEos("piezo1", 0, "\n")
+# PIE516Setup(maxCards, [scanRate]) is accepted for startup-script parity.
+#PIE516Setup(10, 10)
+# PIE516Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# accepted for parity but ignored (axes select by the A/B/C command letter).
+#PIE516Config($(CARD), "piezo1", 0, 100, 1000)
+#dbLoadRecords("db/pie516.template", "P=$(P),M=e516a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie516.template", "P=$(P),M=e516b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie516.template", "P=$(P),M=e516c,CARD=$(CARD),AXIS=2")
+
 iocInit()
 
 # Example:

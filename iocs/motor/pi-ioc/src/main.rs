@@ -16,6 +16,7 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 use motor_common::MotorHolder;
 use motor_pi::ioc::{
     pic663_config_command, pic663_setup_command, pic862_config_command, pic862_setup_command,
+    pie516_config_command, pie516_setup_command,
 };
 
 #[epics_rs::base::epics_main]
@@ -46,6 +47,8 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(pic862_config_command(&holder));
     app = app.register_startup_command(pic663_setup_command());
     app = app.register_startup_command(pic663_config_command(&holder));
+    app = app.register_startup_command(pie516_setup_command());
+    app = app.register_startup_command(pie516_config_command(&holder));
     app = app.register_dynamic_device_support(holder.device_support_factory());
 
     app.startup_script(&script)
