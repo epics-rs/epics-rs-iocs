@@ -122,6 +122,74 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #dbLoadRecords("db/pic848.template", "P=$(P),M=c848_1,CARD=4,AXIS=0")
 #dbLoadRecords("db/pic848.template", "P=$(P),M=c848_2,CARD=4,AXIS=1")
 
+# ---- PI E-516 piezo controller (separate serial port) ----
+# The E-516 is a 3-axis closed-loop piezo. Framing is port-owned, LF both ways
+# (C's motor_init() sets both EOS itself; this port has no equivalent hook, so
+# both are set here). PIE516Config probes the axes and installs one motor per
+# responding axis (DTYP PIE516_$(CARD)_{0,1,2} = letters A/B/C).
+#drvAsynSerialPortConfigure("piezo1", "/dev/ttyUSB1", 0, 0, 0)
+#asynSetOption("piezo1", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo1", 0, "\n")
+#asynOctetSetInputEos("piezo1", 0, "\n")
+# PIE516Setup(maxCards, [scanRate]) is accepted for startup-script parity.
+#PIE516Setup(10, 10)
+# PIE516Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# accepted for parity but ignored (axes select by the A/B/C command letter).
+#PIE516Config($(CARD), "piezo1", 0, 100, 1000)
+#dbLoadRecords("db/pie516.template", "P=$(P),M=e516a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie516.template", "P=$(P),M=e516b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie516.template", "P=$(P),M=e516c,CARD=$(CARD),AXIS=2")
+
+# ---- PI E-517 piezo controller (separate serial port) ----
+# The E-517 is a 3-axis closed-loop piezo (digit-addressed axes 1/2/3), same
+# port-owned LF framing as the E-516. Replies are '='-delimited (handled in the
+# driver). PIE517Config probes the axes and installs one motor per responder.
+#drvAsynSerialPortConfigure("piezo2", "/dev/ttyUSB2", 0, 0, 0)
+#asynSetOption("piezo2", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo2", 0, "\n")
+#asynOctetSetInputEos("piezo2", 0, "\n")
+#PIE517Setup(10, 10)
+# PIE517Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# accepted for parity but ignored.
+#PIE517Config($(CARD), "piezo2", 0, 100, 1000)
+#dbLoadRecords("db/pie517.template", "P=$(P),M=e517a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie517.template", "P=$(P),M=e517b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie517.template", "P=$(P),M=e517c,CARD=$(CARD),AXIS=2")
+
+# ---- PI E-710 DC-servo controller (separate serial port) ----
+# The E-710 is a closed-loop DC servo with up to 6 digit-addressed axes (1..6),
+# finer resolution (1 step = 0.0001 um), same port-owned LF framing. It reports
+# a 16-bit status word (#GI8) and has no stop command (stop is a zero relative
+# move). PIE710Config identifies (GI) and probes the axes.
+#drvAsynSerialPortConfigure("piezo4", "/dev/ttyUSB4", 0, 0, 0)
+#asynSetOption("piezo4", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo4", 0, "\n")
+#asynOctetSetInputEos("piezo4", 0, "\n")
+#PIE710Setup(10, 10)
+# PIE710Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# the asyn/GPIB address, accepted for parity but unused on serial.
+#PIE710Config($(CARD), "piezo4", 0, 100, 1000)
+#dbLoadRecords("db/pie710.template", "P=$(P),M=e710a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie710.template", "P=$(P),M=e710b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie710.template", "P=$(P),M=e710c,CARD=$(CARD),AXIS=2")
+
+# ---- PI E-816 piezo controller (separate serial port) ----
+# The E-816 is a piezo controller with up to 12 letter-addressed axes (A..L),
+# finer resolution (1 step = 0.0001 um), same port-owned LF framing. It has no
+# stop command (stop is a zero relative move) and identifies via *IDN?.
+# PIE816Config probes the axes and installs one motor per responder.
+#drvAsynSerialPortConfigure("piezo5", "/dev/ttyUSB5", 0, 0, 0)
+#asynSetOption("piezo5", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo5", 0, "\n")
+#asynOctetSetInputEos("piezo5", 0, "\n")
+#PIE816Setup(10, 10)
+# PIE816Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# accepted for parity but ignored (axes select by the A..L command letter).
+#PIE816Config($(CARD), "piezo5", 0, 100, 1000)
+#dbLoadRecords("db/pie816.template", "P=$(P),M=e816a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie816.template", "P=$(P),M=e816b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie816.template", "P=$(P),M=e816c,CARD=$(CARD),AXIS=2")
+
 iocInit()
 
 # Example:

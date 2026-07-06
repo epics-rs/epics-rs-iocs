@@ -1,0 +1,19 @@
+# PI E-710: one motor record per axis. DTYP is PIE710_$(CARD)_$(AXIS) — the
+# per-axis key registered by PIE710Config (axis 0..5 = command digits 1..6, in
+# the order they responded to the connect-time #TP probe).
+#
+# The E-710 is a closed-loop DC servo working in POS_RES-sized steps (1 step =
+# 0.0001 um), so MRES = 1 and EGU is steps. Closed-loop device (NTM=No); it has
+# no stop command (stop is a zero relative move) and supports #GH homing.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PIE710_$(CARD)_$(AXIS=0)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=1000000.0)")
+    field(DLLM, "$(LLM=-1000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}
