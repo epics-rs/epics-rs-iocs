@@ -1,0 +1,18 @@
+# PI C-848: one motor record per axis. DTYP is PIC848_$(CARD)_$(AXIS) (the
+# per-axis key registered by PIC848Config; wire letter is 'A'+$(AXIS), i.e.
+# A-D, placed at byte 5 of each command). Load once per probed axis.
+#
+# Every wire value is the dial value scaled by POS_RES (1e-6) and printed with
+# 5 decimals, so MRES = 1 and EGU = counts (the record works in raw counts).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PIC848_$(CARD)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000000.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=10000000.0)")
+    field(DLLM, "$(LLM=-10000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=0)")
+}

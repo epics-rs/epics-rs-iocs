@@ -107,6 +107,21 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #dbLoadRecords("db/pic844.template", "P=$(P),M=c844_3,CARD=3,AXIS=2")
 #dbLoadRecords("db/pic844.template", "P=$(P),M=c844_4,CARD=3,AXIS=3")
 
+# ---- PI C-848 multi-axis DC-servo controller (separate port) ----------------
+# Up to 4 axes, selected by byte 5 of each command (letters A-D). Axis count is
+# probed at connect via CST?; load one record per present axis. *IDN?, no echo,
+# both EOS = "\n". addr is accepted for parity but unused on the wire.
+# Uncomment for real hardware.
+#drvAsynSerialPortConfigure("serial848", "/dev/ttyUSB4", 0, 0, 0)
+#asynSetOption("serial848", -1, "baud", "9600")
+#asynOctetSetOutputEos("serial848", 0, "\n")
+#asynOctetSetInputEos("serial848", 0, "\n")
+#PIC848Setup(8, 10)
+# PIC848Config(card, asynPort, addr, [movingPollMs], [idlePollMs])
+#PIC848Config(4, "serial848", 0, 100, 1000)
+#dbLoadRecords("db/pic848.template", "P=$(P),M=c848_1,CARD=4,AXIS=0")
+#dbLoadRecords("db/pic848.template", "P=$(P),M=c848_2,CARD=4,AXIS=1")
+
 iocInit()
 
 # Example:

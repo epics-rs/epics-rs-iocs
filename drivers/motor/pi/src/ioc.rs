@@ -16,6 +16,7 @@ use crate::c630::{PIC630_NUM_AXIS, PIC630Axis, PIC630Controller};
 use crate::c662::{PIC662Axis, PIC662Controller};
 use crate::c663::{PIC663Axis, PIC663Controller};
 use crate::c844::{PIC844_NUM_AXES, PIC844Axis, PIC844Controller};
+use crate::c848::{PIC848Axis, PIC848Controller};
 use crate::c862::{PIC862Axis, PIC862Controller};
 
 /// Command timeout (C `drvPIC630.h` `COMM_TIMEOUT` 2 s).
@@ -26,6 +27,9 @@ const PIC662_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPI.h` `COMM_TIMEOUT` 2 s).
 const PIC844_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Command timeout (C `drvPIC848.h` `COMM_TIMEOUT` 2 s).
+const PIC848_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIC862.h` `COMM_TIMEOUT` 2.0 s).
 const PIC862_TIMEOUT: Duration = Duration::from_secs(2);
@@ -402,6 +406,86 @@ pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 "PIC844Config: card={card} asynPort={asyn_port} \
                  ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
                  (DTYP=PIC844_{card}_0..3)"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIC848Setup(maxCards, [scanRate])` no-op command (startup-script
+/// parity; the asyn-rs port allocates per `PIC848Config` call).
+pub fn pic848_setup_command() -> CommandDef {
+    CommandDef::new(
+        "PIC848Setup",
+        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
+        "PIC848Setup(maxCards, [scanRate]) - Accepted for parity; PIC848Config allocates per call",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let max = req_int(args, 0, "maxCards")?;
+            if max < 1 {
+                return Err("PIC848Setup: maxCards must be > 0".into());
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIC848Config(card, asynPort, addr, [movingPollMs], [idlePollMs])`
+/// command bound to `holder`. The axis count is probed at connect (`CST?` until
+/// `NOSTAGE`); one axis is installed per present stage (DTYP
+/// `PIC848_{card}_{axis}`, `axis` 0-3, wire letter `A`+`axis`). `addr` is the C
+/// `asyn_address` (GPIB), stored for signature parity but unused on the wire
+/// (the axis is selected by byte 5 of each command; the transport connects at
+/// asyn sub-address 0).
+pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "PIC848Config",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("asynPort"),
+            arg_int_req("addr"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+        ],
+        "PIC848Config(card, asynPort, addr, [movingPollMs], [idlePollMs]) - \
+         Create a PI C-848 controller; axes are probed via CST? (DTYP \
+         PIC848_{card}_0..N); addr is accepted for parity but unused on the wire",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("PIC848Config: card must be >= 0".into());
+            }
+            let asyn_port = req_string(args, 1, "asynPort")?;
+            let _addr = req_int(args, 2, "addr")?; // parity only; unused on wire
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            let handle = connect_serial(&asyn_port, PIC848_TIMEOUT)?;
+            let controller =
+                PIC848Controller::new(handle).map_err(|e| format!("PIC848Config: {e}"))?;
+            let ident = controller.ident().to_string();
+            let num_axes = controller.num_axes();
+            if num_axes == 0 {
+                return Err(format!(
+                    "PIC848Config: card={card} asynPort={asyn_port} reported no stages \
+                     (CST? => NOSTAGE on axis A)"
+                ));
+            }
+            let controller = Arc::new(Mutex::new(controller));
+
+            for signal in 0..num_axes {
+                let axis = PIC848Axis::new(controller.clone(), signal)
+                    .map_err(|e| format!("PIC848Config: {e}"))?;
+                let dtyp_key = format!("PIC848_{card}_{signal}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            }
+
+            println!(
+                "PIC848Config: card={card} asynPort={asyn_port} \
+                 ident=\"{ident}\" numAxes={num_axes} \
+                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
+                 (DTYP=PIC848_{card}_0..{})",
+                num_axes - 1
             );
             Ok(CommandOutcome::Continue)
         },
