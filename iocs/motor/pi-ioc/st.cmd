@@ -111,6 +111,23 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #dbLoadRecords("db/pie710.template", "P=$(P),M=e710b,CARD=$(CARD),AXIS=1")
 #dbLoadRecords("db/pie710.template", "P=$(P),M=e710c,CARD=$(CARD),AXIS=2")
 
+# ---- PI E-816 piezo controller (separate serial port) ----
+# The E-816 is a piezo controller with up to 12 letter-addressed axes (A..L),
+# finer resolution (1 step = 0.0001 um), same port-owned LF framing. It has no
+# stop command (stop is a zero relative move) and identifies via *IDN?.
+# PIE816Config probes the axes and installs one motor per responder.
+#drvAsynSerialPortConfigure("piezo5", "/dev/ttyUSB5", 0, 0, 0)
+#asynSetOption("piezo5", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo5", 0, "\n")
+#asynOctetSetInputEos("piezo5", 0, "\n")
+#PIE816Setup(10, 10)
+# PIE816Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# accepted for parity but ignored (axes select by the A..L command letter).
+#PIE816Config($(CARD), "piezo5", 0, 100, 1000)
+#dbLoadRecords("db/pie816.template", "P=$(P),M=e816a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie816.template", "P=$(P),M=e816b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie816.template", "P=$(P),M=e816c,CARD=$(CARD),AXIS=2")
+
 iocInit()
 
 # Example:

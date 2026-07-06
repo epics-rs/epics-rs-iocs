@@ -17,6 +17,7 @@ use crate::c862::{PIC862Axis, PIC862Controller};
 use crate::e516::{PIE516Axis, PIE516Controller};
 use crate::e517::{PIE517Axis, PIE517Controller};
 use crate::e710::{PIE710Axis, PIE710Controller};
+use crate::e816::{PIE816Axis, PIE816Controller};
 
 /// Command timeout (C `drvPIC862.h` `COMM_TIMEOUT` 2.0 s).
 const PIC862_TIMEOUT: Duration = Duration::from_secs(2);
@@ -29,6 +30,9 @@ const PIE517_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIE710.h` `COMM_TIMEOUT` 2.0 s).
 const PIE710_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Command timeout (C `drvPIE816.h` `COMM_TIMEOUT` 2.0 s).
+const PIE816_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIC663.h` `COMM_TIMEOUT` 2.0 s — C-663 is a C-862
 /// clone and shares the same 2.0 s value).
@@ -382,6 +386,78 @@ pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 "PIE710Config: card={card} asynPort={asyn_port} axes={num_axes} \
                  ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
                  (DTYP=PIE710_{card}_0..{})",
+                num_axes.saturating_sub(1)
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIE816Setup(maxCards, [scanRate])` no-op command (startup-script
+/// parity; the asyn-rs port allocates per `PIE816Config` call).
+pub fn pie816_setup_command() -> CommandDef {
+    CommandDef::new(
+        "PIE816Setup",
+        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
+        "PIE816Setup(maxCards, [scanRate]) - Accepted for parity; PIE816Config allocates per call",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let max = req_int(args, 0, "maxCards")?;
+            if max < 1 {
+                return Err("PIE816Setup: maxCards must be > 0".into());
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIE816Config(card, asynPort, [addr], [movingPollMs],
+/// [idlePollMs])` command bound to `holder`. The E-816 is a piezo controller
+/// with up to 12 letter-addressed axes (A..L); the axis count is probed at
+/// connect time and one motor device support is installed per responding axis
+/// (`DTYP PIE816_{card}_{axis}`, axis = 0..n). `addr` is accepted for C
+/// signature parity but ignored.
+pub fn pie816_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "PIE816Config",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("asynPort"),
+            arg_int_opt("addr"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+        ],
+        "PIE816Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - \
+         Create a PI E-816 piezo controller; probes up to 12 axes (A..L) and \
+         installs one motor per axis (DTYP PIE816_{card}_{axis}). addr is \
+         accepted for parity but ignored.",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("PIE816Config: card must be >= 0".into());
+            }
+            let asyn_port = req_string(args, 1, "asynPort")?;
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            let handle = connect_serial(&asyn_port, PIE816_TIMEOUT)?;
+            let controller =
+                PIE816Controller::new(handle).map_err(|e| format!("PIE816Config: {e}"))?;
+            let num_axes = controller.num_axes();
+            let ident = controller.ident().to_owned();
+            let controller = Arc::new(Mutex::new(controller));
+
+            for axis in 0..num_axes {
+                let axis_obj = PIE816Axis::new(controller.clone(), axis)
+                    .map_err(|e| format!("PIE816Config: {e}"))?;
+                let dtyp_key = format!("PIE816_{card}_{axis}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            }
+
+            println!(
+                "PIE816Config: card={card} asynPort={asyn_port} axes={num_axes} \
+                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
+                 (DTYP=PIE816_{card}_0..{})",
                 num_axes.saturating_sub(1)
             );
             Ok(CommandOutcome::Continue)
