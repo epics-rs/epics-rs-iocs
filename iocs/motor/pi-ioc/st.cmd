@@ -78,6 +78,22 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #dbLoadRecords("db/pie516.template", "P=$(P),M=e516b,CARD=$(CARD),AXIS=1")
 #dbLoadRecords("db/pie516.template", "P=$(P),M=e516c,CARD=$(CARD),AXIS=2")
 
+# ---- PI E-517 piezo controller (separate serial port) ----
+# The E-517 is a 3-axis closed-loop piezo (digit-addressed axes 1/2/3), same
+# port-owned LF framing as the E-516. Replies are '='-delimited (handled in the
+# driver). PIE517Config probes the axes and installs one motor per responder.
+#drvAsynSerialPortConfigure("piezo2", "/dev/ttyUSB2", 0, 0, 0)
+#asynSetOption("piezo2", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo2", 0, "\n")
+#asynOctetSetInputEos("piezo2", 0, "\n")
+#PIE517Setup(10, 10)
+# PIE517Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# accepted for parity but ignored.
+#PIE517Config($(CARD), "piezo2", 0, 100, 1000)
+#dbLoadRecords("db/pie517.template", "P=$(P),M=e517a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie517.template", "P=$(P),M=e517b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie517.template", "P=$(P),M=e517c,CARD=$(CARD),AXIS=2")
+
 iocInit()
 
 # Example:

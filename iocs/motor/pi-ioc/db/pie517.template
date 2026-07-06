@@ -1,0 +1,19 @@
+# PI E-517: one motor record per axis. DTYP is PIE517_$(CARD)_$(AXIS) — the
+# per-axis key registered by PIE517Config (axis 0/1/2 = command digits 1/2/3,
+# in the order they responded to the connect-time POS? probe).
+#
+# Like the E-516 the driver works in POS_RES-sized steps (1 step = 0.001 um),
+# so MRES = 1 and EGU is steps. Closed-loop piezo (NTM=No, no home, no
+# set-position).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PIE517_$(CARD)_$(AXIS=0)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=1000000.0)")
+    field(DLLM, "$(LLM=-1000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}

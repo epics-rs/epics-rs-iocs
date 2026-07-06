@@ -5,11 +5,13 @@
 pub mod c663;
 pub mod c862;
 pub mod e516;
+pub mod e517;
 pub mod ioc;
 
 pub use c663::{PIC663Axis, PIC663Controller};
 pub use c862::{PIC862Axis, PIC862Controller};
 pub use e516::{PIE516Axis, PIE516Controller};
+pub use e517::{PIE517Axis, PIE517Controller};
 
 /// C `sscanf(s, "%d", &out)` success semantics for the E-series piezo status
 /// reads: `Some(int)` when a leading (optionally signed) decimal integer is
