@@ -1,0 +1,18 @@
+# PI C-844: one motor record per axis. DTYP is PIC844_$(CARD)_$(AXIS) (the
+# per-axis key registered by PIC844Config; wire axis is $(AXIS)+1, i.e. 1-4,
+# selected by an "AXIS n;" command prefix). Load once per axis.
+#
+# The record dial value is the wire value with two decimals; readback rounds to
+# the nearest integer count, so MRES = 1 and EGU = counts.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PIC844_$(CARD)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=10.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=100000.0)")
+    field(DLLM, "$(LLM=-100000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=2)")
+}

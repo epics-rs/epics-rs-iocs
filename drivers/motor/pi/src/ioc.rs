@@ -15,6 +15,7 @@ use motor_common::iocsh::{
 use crate::c630::{PIC630_NUM_AXIS, PIC630Axis, PIC630Controller};
 use crate::c662::{PIC662Axis, PIC662Controller};
 use crate::c663::{PIC663Axis, PIC663Controller};
+use crate::c844::{PIC844_NUM_AXES, PIC844Axis, PIC844Controller};
 use crate::c862::{PIC862Axis, PIC862Controller};
 
 /// Command timeout (C `drvPIC630.h` `COMM_TIMEOUT` 2 s).
@@ -22,6 +23,9 @@ const PIC630_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIC662.h` `COMM_TIMEOUT` 2 s).
 const PIC662_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Command timeout (C `drvPI.h` `COMM_TIMEOUT` 2 s).
+const PIC844_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIC862.h` `COMM_TIMEOUT` 2.0 s).
 const PIC862_TIMEOUT: Duration = Duration::from_secs(2);
@@ -328,6 +332,76 @@ pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 "PIC662Config: card={card} asynPort={asyn_port} \
                  ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
                  (DTYP=PIC662_{card}_0)"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIC844Setup(maxCards, [scanRate])` no-op command (startup-script
+/// parity; the asyn-rs port allocates per `PIC844Config` call).
+pub fn pic844_setup_command() -> CommandDef {
+    CommandDef::new(
+        "PIC844Setup",
+        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
+        "PIC844Setup(maxCards, [scanRate]) - Accepted for parity; PIC844Config allocates per call",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let max = req_int(args, 0, "maxCards")?;
+            if max < 1 {
+                return Err("PIC844Setup: maxCards must be > 0".into());
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIC844Config(card, asynPort, addr, [movingPollMs], [idlePollMs])`
+/// command bound to `holder`. Installs all four axes (DTYP
+/// `PIC844_{card}_{axis}`, `axis` 0-3; wire axis is `axis + 1`). `addr` is the
+/// C `asyn_address` (GPIB); like the C driver it is stored for signature parity
+/// but never used on the wire (the axis is selected by an `AXIS n;` prefix, and
+/// the transport connects at asyn sub-address 0).
+pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "PIC844Config",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("asynPort"),
+            arg_int_req("addr"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+        ],
+        "PIC844Config(card, asynPort, addr, [movingPollMs], [idlePollMs]) - \
+         Create a PI C-844 4-axis controller (DTYP PIC844_{card}_0..3); addr is \
+         accepted for parity but unused on the wire",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("PIC844Config: card must be >= 0".into());
+            }
+            let asyn_port = req_string(args, 1, "asynPort")?;
+            let _addr = req_int(args, 2, "addr")?; // parity only; unused on wire
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            let handle = connect_serial(&asyn_port, PIC844_TIMEOUT)?;
+            let controller =
+                PIC844Controller::new(handle).map_err(|e| format!("PIC844Config: {e}"))?;
+            let ident = controller.ident().to_string();
+            let controller = Arc::new(Mutex::new(controller));
+
+            for signal in 0..PIC844_NUM_AXES {
+                let axis = PIC844Axis::new(controller.clone(), signal)
+                    .map_err(|e| format!("PIC844Config: {e}"))?;
+                let dtyp_key = format!("PIC844_{card}_{signal}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            }
+
+            println!(
+                "PIC844Config: card={card} asynPort={asyn_port} \
+                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
+                 (DTYP=PIC844_{card}_0..3)"
             );
             Ok(CommandOutcome::Continue)
         },

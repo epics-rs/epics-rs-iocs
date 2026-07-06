@@ -91,6 +91,22 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #PIC662Config(2, "serial662", 100, 1000)
 #dbLoadRecords("db/pic662.template", "P=$(P),M=c662,CARD=2")
 
+# ---- PI C-844 4-axis DC-servo controller (separate port — SCPI protocol) ----
+# Single-device, 4 axes selected by an "AXIS n;" prefix. *IDN?, no echo, both
+# EOS = "\n". Needs its own asyn port. addr is accepted for parity but unused
+# on the wire. Uncomment for real hardware.
+#drvAsynSerialPortConfigure("serial844", "/dev/ttyUSB3", 0, 0, 0)
+#asynSetOption("serial844", -1, "baud", "9600")
+#asynOctetSetOutputEos("serial844", 0, "\n")
+#asynOctetSetInputEos("serial844", 0, "\n")
+#PIC844Setup(8, 10)
+# PIC844Config(card, asynPort, addr, [movingPollMs], [idlePollMs])
+#PIC844Config(3, "serial844", 0, 100, 1000)
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_1,CARD=3,AXIS=0")
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_2,CARD=3,AXIS=1")
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_3,CARD=3,AXIS=2")
+#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_4,CARD=3,AXIS=3")
+
 iocInit()
 
 # Example:
