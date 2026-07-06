@@ -16,6 +16,7 @@ use crate::c663::{PIC663Axis, PIC663Controller};
 use crate::c862::{PIC862Axis, PIC862Controller};
 use crate::e516::{PIE516Axis, PIE516Controller};
 use crate::e517::{PIE517Axis, PIE517Controller};
+use crate::e710::{PIE710Axis, PIE710Controller};
 
 /// Command timeout (C `drvPIC862.h` `COMM_TIMEOUT` 2.0 s).
 const PIC862_TIMEOUT: Duration = Duration::from_secs(2);
@@ -25,6 +26,9 @@ const PIE516_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIE517.h` `COMM_TIMEOUT` 2.0 s).
 const PIE517_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Command timeout (C `drvPIE710.h` `COMM_TIMEOUT` 2.0 s).
+const PIE710_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Command timeout (C `drvPIC663.h` `COMM_TIMEOUT` 2.0 s — C-663 is a C-862
 /// clone and shares the same 2.0 s value).
@@ -305,6 +309,79 @@ pub fn pie517_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             println!(
                 "PIE517Config: card={card} asynPort={asyn_port} axes={num_axes} \
                  poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PIE517_{card}_0..{})",
+                num_axes.saturating_sub(1)
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIE710Setup(maxCards, [scanRate])` no-op command (startup-script
+/// parity; the asyn-rs port allocates per `PIE710Config` call).
+pub fn pie710_setup_command() -> CommandDef {
+    CommandDef::new(
+        "PIE710Setup",
+        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
+        "PIE710Setup(maxCards, [scanRate]) - Accepted for parity; PIE710Config allocates per call",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let max = req_int(args, 0, "maxCards")?;
+            if max < 1 {
+                return Err("PIE710Setup: maxCards must be > 0".into());
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `PIE710Config(card, asynPort, [addr], [movingPollMs],
+/// [idlePollMs])` command bound to `holder`. The E-710 is a closed-loop
+/// DC-servo controller with up to 6 digit-addressed axes (1..6); the axis count
+/// is probed at connect time and one motor device support is installed per
+/// responding axis (`DTYP PIE710_{card}_{axis}`, axis = 0..n). `addr` is the C
+/// `PIE710Config` GPIB/asyn address argument, accepted for signature parity but
+/// not used by the serial transport.
+pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
+    let holder = holder.clone();
+    CommandDef::new(
+        "PIE710Config",
+        vec![
+            arg_int_req("card"),
+            arg_str_req("asynPort"),
+            arg_int_opt("addr"),
+            arg_int_opt("movingPollMs"),
+            arg_int_opt("idlePollMs"),
+        ],
+        "PIE710Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - \
+         Create a PI E-710 DC-servo controller; probes up to 6 axes (1..6) and \
+         installs one motor per axis (DTYP PIE710_{card}_{axis}). addr is the \
+         asyn/GPIB address, accepted for parity but unused on serial.",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = req_int(args, 0, "card")?;
+            if card < 0 {
+                return Err("PIE710Config: card must be >= 0".into());
+            }
+            let asyn_port = req_string(args, 1, "asynPort")?;
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            let handle = connect_serial(&asyn_port, PIE710_TIMEOUT)?;
+            let controller =
+                PIE710Controller::new(handle).map_err(|e| format!("PIE710Config: {e}"))?;
+            let num_axes = controller.num_axes();
+            let ident = controller.ident().to_owned();
+            let controller = Arc::new(Mutex::new(controller));
+
+            for axis in 0..num_axes {
+                let axis_obj = PIE710Axis::new(controller.clone(), axis)
+                    .map_err(|e| format!("PIE710Config: {e}"))?;
+                let dtyp_key = format!("PIE710_{card}_{axis}");
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
+                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            }
+
+            println!(
+                "PIE710Config: card={card} asynPort={asyn_port} axes={num_axes} \
+                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
+                 (DTYP=PIE710_{card}_0..{})",
                 num_axes.saturating_sub(1)
             );
             Ok(CommandOutcome::Continue)

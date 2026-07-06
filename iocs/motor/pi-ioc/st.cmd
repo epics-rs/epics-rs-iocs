@@ -94,6 +94,23 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #dbLoadRecords("db/pie517.template", "P=$(P),M=e517b,CARD=$(CARD),AXIS=1")
 #dbLoadRecords("db/pie517.template", "P=$(P),M=e517c,CARD=$(CARD),AXIS=2")
 
+# ---- PI E-710 DC-servo controller (separate serial port) ----
+# The E-710 is a closed-loop DC servo with up to 6 digit-addressed axes (1..6),
+# finer resolution (1 step = 0.0001 um), same port-owned LF framing. It reports
+# a 16-bit status word (#GI8) and has no stop command (stop is a zero relative
+# move). PIE710Config identifies (GI) and probes the axes.
+#drvAsynSerialPortConfigure("piezo4", "/dev/ttyUSB4", 0, 0, 0)
+#asynSetOption("piezo4", -1, "baud", "115200")
+#asynOctetSetOutputEos("piezo4", 0, "\n")
+#asynOctetSetInputEos("piezo4", 0, "\n")
+#PIE710Setup(10, 10)
+# PIE710Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
+# the asyn/GPIB address, accepted for parity but unused on serial.
+#PIE710Config($(CARD), "piezo4", 0, 100, 1000)
+#dbLoadRecords("db/pie710.template", "P=$(P),M=e710a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("db/pie710.template", "P=$(P),M=e710b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("db/pie710.template", "P=$(P),M=e710c,CARD=$(CARD),AXIS=2")
+
 iocInit()
 
 # Example:
