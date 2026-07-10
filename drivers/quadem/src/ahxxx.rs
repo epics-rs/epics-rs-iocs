@@ -2,11 +2,16 @@
 //! 4-channel picoammeters, reached over TCP or serial through an asyn octet
 //! port.
 //!
-//! Ported models: AH401B, AH401D. The AH501 series shares this driver
-//! upstream but uses a different data encoding and status block; it is not
-//! ported yet, and [`create_ahxxx`] rejects its model names.
+//! Ported models: AH401B, AH401D, AH501, AH501BE, AH501C, AH501D.
+//!
+//! One combination is refused rather than approximated: an AH501BE in
+//! external-gate trigger mode. Upstream recognises the meter's `ACK\r\n`
+//! preamble partly through a *timed-out* binary read that returned five bytes,
+//! and `asyn-rs` 0.22.1 discards a timed-out read's partial bytes. Accepting
+//! the mode would silently drop the trigger callbacks that path fires.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -56,8 +61,9 @@ pub struct AhxxxDriver {
     io: OctetIo,
     shared: Arc<QuadEmShared>,
     model: QeModel,
-    /// C++ `AH401Series_`, set by `reset()` once the model is known.
-    ah401_series: bool,
+    /// C++ `AH401Series_` / `AH501Series_`, set by `reset()` once the model is
+    /// known. Shared with the read thread, which decodes accordingly.
+    ah401_series: Arc<AtomicBool>,
     firmware_version: String,
 }
 
@@ -68,6 +74,7 @@ impl AhxxxDriver {
         max_memory: usize,
         model: QeModel,
         shared: Arc<QuadEmShared>,
+        ah401_series: Arc<AtomicBool>,
     ) -> AsynResult<Self> {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
         let io = connect_octet(qe_port_name, proto::AHXXX_TIMEOUT)?;
@@ -89,7 +96,7 @@ impl AhxxxDriver {
             io,
             shared,
             model,
-            ah401_series: false,
+            ah401_series,
             firmware_version: String::new(),
         };
 
@@ -107,6 +114,11 @@ impl AhxxxDriver {
 
     fn acquire_param(&self) -> usize {
         self.base.nd_params.acquire
+    }
+
+    /// C++ `AH401Series_`.
+    fn is_ah401(&self) -> bool {
+        self.ah401_series.load(Ordering::Acquire)
     }
 
     // --- I/O helpers (C++ writeReadMeter / sendCommand) ---
@@ -166,17 +178,12 @@ impl AhxxxDriver {
                 }
             }
         }
-        self.ah401_series = matches!(self.model, QeModel::Ah401b | QeModel::Ah401d);
-        if !self.ah401_series {
-            return Err(error(format!(
-                "AHxxx: model {:?} is not ported (AH501 series)",
-                self.model
-            )));
-        }
+        self.ah401_series
+            .store(proto::is_ah401_series(self.model), Ordering::Release);
         self.base_reset()
     }
 
-    /// C++ `drvAHxxx::readStatus`, AH401 branch.
+    /// C++ `drvAHxxx::readStatus`.
     ///
     /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
     /// restore, so a status read that fails leaves the meter stopped.
@@ -188,8 +195,10 @@ impl AhxxxDriver {
         let range = proto::parse_range(&resp).ok_or_else(|| bad("RNG", &resp))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
-        let mut sample_time = 0.0;
-        if self.ah401_series {
+        let read_format =
+            QeReadFormat::from_i32(self.base.port_base.get_int32_param(p.read_format, 0)?);
+        let mut sample_time;
+        if self.is_ah401() {
             let resp = self.write_read_meter("HLF ?")?;
             let ping_pong = proto::parse_hlf(&resp).ok_or_else(|| bad("HLF", &resp))?;
             self.base
@@ -202,6 +211,35 @@ impl AhxxxDriver {
                 .port_base
                 .set_float64_param(p.integration_time, 0, integration_time)?;
             sample_time = proto::sample_time_ah401(ping_pong, integration_time);
+        } else {
+            let resp = self.write_read_meter("CHN ?")?;
+            let num_channels = proto::parse_chn(&resp).ok_or_else(|| bad("CHN", &resp))?;
+            self.base
+                .port_base
+                .set_int32_param(p.num_channels, 0, num_channels)?;
+            self.shared.acq.lock().num_channels = num_channels;
+
+            let resp = self.write_read_meter("RES ?")?;
+            let resolution = proto::parse_res(&resp).ok_or_else(|| bad("RES", &resp))?;
+            self.base
+                .port_base
+                .set_int32_param(p.resolution, 0, resolution)?;
+            self.shared.acq.lock().resolution = resolution;
+
+            sample_time = proto::sample_time_ah501(read_format, resolution, num_channels);
+        }
+
+        if proto::reads_bias_status(self.model) {
+            let resp = self.write_read_meter("HVS ?")?;
+            match proto::parse_hvs(&resp).ok_or_else(|| bad("HVS", &resp))? {
+                None => self.base.port_base.set_int32_param(p.bias_state, 0, 0)?,
+                Some(volts) => {
+                    self.base.port_base.set_int32_param(p.bias_state, 0, 1)?;
+                    self.base
+                        .port_base
+                        .set_float64_param(p.bias_voltage, 0, volts)?;
+                }
+            }
         }
 
         // The sample times computed above don't include valuesPerRead.
@@ -286,22 +324,40 @@ impl QuadEmDevice for AhxxxDriver {
             return Ok(());
         }
 
+        // See the module docs: this combination needs the partial bytes of a
+        // timed-out read, which the framework does not surface.
+        if self.model == QeModel::Ah501be && trigger_mode == QeTriggerMode::ExtGate {
+            return Err(error(
+                "AHxxx: AH501BE in external-gate trigger mode is not supported",
+            ));
+        }
+
         self.base_set_acquire(1)?;
 
+        let num_acquire = proto::naq_value(acquire_mode, num_average);
+        let is_ah401 = self.is_ah401();
+        let model = self.model;
         let result = (|| -> AsynResult<()> {
             // Put the device in the appropriate mode.
             self.write_read_meter(proto::cmd_read_format(read_format))?;
 
             // In one-shot mode ask the meter for a specific number of samples.
-            let num_acquire = proto::naq_value(acquire_mode, num_average);
-            self.write_read_meter(&proto::cmd_naq(num_acquire))?;
+            // On the AH501BE the NAQ command starts the acquisition and is not
+            // echoed, so it is sent below instead.
+            if model != QeModel::Ah501be {
+                self.write_read_meter(&proto::cmd_naq(num_acquire))?;
+            }
 
             if trigger_mode == QeTriggerMode::ExtTrigger || trigger_mode == QeTriggerMode::ExtGate {
                 // External trigger mode: the meter waits for the trigger.
                 self.write_read_meter("TRG ON")?;
-            } else {
-                // The AH401 series echoes an ACK after ACQ ON.
+            } else if is_ah401 {
+                // The AH401 series echoes an ACK after ACQ ON; the AH501s do not.
                 self.write_read_meter("ACQ ON")?;
+            } else if acquire_mode == QeAcquireMode::Single && model == QeModel::Ah501be {
+                self.io.write(&proto::cmd_naq(num_acquire))?;
+            } else {
+                self.io.write("ACQ ON")?;
             }
             Ok(())
         })();
@@ -332,19 +388,59 @@ impl QuadEmDevice for AhxxxDriver {
         self.send_command(&proto::cmd_range(value))
     }
 
-    /// C++ `drvAHxxx::setPingPong`: `"HLF ON"`/`"HLF OFF"`.
+    /// C++ `drvAHxxx::setPingPong`: `"HLF ON"`/`"HLF OFF"`, AH401 series only.
     fn set_ping_pong(&mut self, value: i32) -> AsynResult<()> {
+        if !self.is_ah401() {
+            return Ok(());
+        }
         self.send_command(proto::cmd_ping_pong(value))
     }
 
     /// C++ `drvAHxxx::setIntegrationTime`: clamp, write back, `"ITM %d"`.
+    /// AH401 series only.
     fn set_integration_time(&mut self, value: f64) -> AsynResult<()> {
+        if !self.is_ah401() {
+            return Ok(());
+        }
         let (clamped, cmd) = proto::cmd_integration_time(value);
         if clamped != value {
             let idx = self.params().integration_time;
             self.base.port_base.set_float64_param(idx, 0, clamped)?;
         }
         self.send_command(&cmd)
+    }
+
+    /// C++ `drvAHxxx::setNumChannels`: `"CHN %d"`, AH501 series only.
+    fn set_num_channels(&mut self, value: i32) -> AsynResult<()> {
+        if self.is_ah401() {
+            return Ok(());
+        }
+        self.send_command(&proto::cmd_num_channels(value))
+    }
+
+    /// C++ `drvAHxxx::setResolution`: `"RES %d"`, AH501 series only.
+    fn set_resolution(&mut self, value: i32) -> AsynResult<()> {
+        if self.is_ah401() {
+            return Ok(());
+        }
+        self.send_command(&proto::cmd_resolution(value))
+    }
+
+    /// C++ `drvAHxxx::setBiasState`: `"HVS ON"`/`"HVS OFF"`. The AH401 series
+    /// and the plain AH501 have no bias supply.
+    fn set_bias_state(&mut self, value: i32) -> AsynResult<()> {
+        if !proto::has_bias_supply(self.model) {
+            return Ok(());
+        }
+        self.send_command(proto::cmd_bias_state(value != 0))
+    }
+
+    /// C++ `drvAHxxx::setBiasVoltage`: `"HVS %f"`.
+    fn set_bias_voltage(&mut self, value: f64) -> AsynResult<()> {
+        if !proto::has_bias_supply(self.model) {
+            return Ok(());
+        }
+        self.send_command(&proto::cmd_bias_voltage(value))
     }
 
     /// C++ `drvAHxxx::setReadFormat`: `"BIN ON"`/`"BIN OFF"`.
@@ -367,10 +463,6 @@ impl QuadEmDevice for AhxxxDriver {
         }
         Ok(())
     }
-
-    // setNumChannels, setBiasState, setBiasVoltage and setResolution all
-    // return asynSuccess without touching the meter on the AH401 series, which
-    // is what the trait defaults do.
 }
 
 // ===========================================================================
@@ -412,16 +504,21 @@ impl PortDriver for AhxxxDriver {
             self.read_status()?;
         } else if reason == p.geometry {
             self.shared.pos.lock().geometry = value;
-        } else if reason == p.bias_state
-            || reason == p.bias_interlock
-            || reason == p.num_channels
-            || reason == p.resolution
+        } else if reason == p.bias_state {
+            self.set_bias_state(value)?;
+            self.read_status()?;
+        } else if reason == p.num_channels {
+            self.set_num_channels(value)?;
+            self.read_status()?;
+        } else if reason == p.resolution {
+            self.set_resolution(value)?;
+            self.read_status()?;
+        } else if reason == p.bias_interlock
             || reason == p.trigger_mode
             || reason == p.trigger_polarity
         {
-            // setBiasState, setBiasInterlock, setNumChannels and setResolution
-            // return asynSuccess without touching an AH401; setTriggerMode and
-            // setTriggerPolarity are drvQuadEM dummies. Only readStatus runs.
+            // setBiasInterlock, setTriggerMode and setTriggerPolarity are
+            // drvQuadEM dummies for this driver: only readStatus runs.
             self.read_status()?;
         } else if reason == p.num_acquire {
             self.shared.acq.lock().num_acquire = value;
@@ -476,7 +573,7 @@ impl PortDriver for AhxxxDriver {
             self.shared.ring.lock().flush();
             self.read_status()?;
         } else if reason == p.bias_voltage {
-            // drvAHxxx::setBiasVoltage is a no-op on the AH401 series.
+            self.set_bias_voltage(value)?;
             self.read_status()?;
         } else if reason == p.integration_time {
             self.set_integration_time(value)?;
@@ -525,9 +622,10 @@ struct ReadContext {
     handle: PortHandle,
     params: QuadEmParams,
     shared: Arc<QuadEmShared>,
+    ah401_series: Arc<AtomicBool>,
 }
 
-/// C++ `drvAHxxx::readThread`, AH401 series.
+/// C++ `drvAHxxx::readThread`.
 fn read_thread(ctx: ReadContext) {
     let mut read_format = QeReadFormat::Binary;
 
@@ -539,6 +637,8 @@ fn read_thread(ctx: ReadContext) {
             ctx.shared.set_reading_active(true);
         }
 
+        let ah401_series = ctx.ah401_series.load(Ordering::Acquire);
+
         // C++ `if (valuesPerRead_ < 1) valuesPerRead_ = 1;` — the clamp is
         // written back to the driver's member, not to the parameter library.
         let values_per_read = {
@@ -549,12 +649,29 @@ fn read_thread(ctx: ReadContext) {
             acq.values_per_read
         };
 
+        let (resolution, num_channels) = {
+            let acq = ctx.shared.acq.lock();
+            (
+                acq.resolution,
+                (acq.num_channels as usize).clamp(1, QE_MAX_INPUTS),
+            )
+        };
+        // C++ forces numChannels_ = 4 for the AH401 series in the binary path.
+        let num_channels = if ah401_series {
+            proto::AH401_NUM_CHANNELS
+        } else {
+            num_channels
+        };
+
         let mut raw = [0.0f64; QE_MAX_INPUTS];
 
         match read_format {
             QeReadFormat::Binary => {
-                // The AH401 series is fixed at 4 channels of 3 bytes.
-                let n_requested = proto::ah401_read_len(values_per_read as usize);
+                let n_requested = if ah401_series {
+                    proto::ah401_read_len(values_per_read as usize)
+                } else {
+                    proto::ah501_read_len(resolution, num_channels, values_per_read as usize)
+                };
                 let outcome = match ctx.io.read_binary(n_requested) {
                     Ok(o) => o,
                     Err(e) => {
@@ -574,9 +691,17 @@ fn read_thread(ctx: ReadContext) {
                     thread::sleep(READ_ERROR_BACKOFF);
                     continue;
                 }
-                let Some(values) =
+                let decoded = if ah401_series {
                     proto::accumulate_binary_ah401(&outcome.data, values_per_read as usize)
-                else {
+                } else {
+                    proto::accumulate_binary_ah501(
+                        &outcome.data,
+                        resolution,
+                        num_channels,
+                        values_per_read as usize,
+                    )
+                };
+                let Some(values) = decoded else {
                     continue;
                 };
                 raw = values;
@@ -596,8 +721,25 @@ fn read_thread(ctx: ReadContext) {
                     if !outcome.eom.contains(EomReason::EOS) {
                         continue;
                     }
-                    let values =
-                        proto::parse_ascii_ah401(&outcome.as_str(), proto::AH401_NUM_CHANNELS);
+                    let line = outcome.as_str();
+                    let values = if ah401_series {
+                        proto::parse_ascii_ah401(&line, proto::AH401_NUM_CHANNELS)
+                    } else {
+                        // The meter answers ACK once the requested number of
+                        // trigger samples has been delivered.
+                        if line.contains("ACK") {
+                            break;
+                        }
+                        let n_expected = proto::ah501_ascii_expected_len(resolution, num_channels);
+                        if outcome.data.len() != n_expected {
+                            log::error!(
+                                "drvAHxxx: error reading meter nRead={}, expected {n_expected}, input={line}",
+                                outcome.data.len()
+                            );
+                            continue;
+                        }
+                        proto::parse_ascii_ah501(&line, resolution, num_channels)
+                    };
                     for (acc, v) in raw.iter_mut().zip(values) {
                         *acc += v;
                     }
@@ -605,7 +747,7 @@ fn read_thread(ctx: ReadContext) {
             }
         }
 
-        proto::average_over_values_per_read(&mut raw, proto::AH401_NUM_CHANNELS, values_per_read);
+        proto::average_over_values_per_read(&mut raw, num_channels, values_per_read);
         ctx.shared.compute_positions(&ctx.handle, &ctx.params, &raw);
     }
 }
@@ -634,8 +776,8 @@ impl AhxxxRuntime {
 /// C++ `drvAHxxxConfigure(portName, QEPortName, ringBufferSize, modelName)`.
 ///
 /// `max_memory` has no C++ analogue (the C++ pool is unbounded); it bounds the
-/// Rust `NDArrayPool`. `model_name` must name a ported model: `AH401B` or
-/// `AH401D`.
+/// Rust `NDArrayPool`. `model_name` is one of `AH401B`, `AH401D`, `AH501`,
+/// `AH501BE`, `AH501C`, `AH501D`.
 pub fn create_ahxxx(
     port_name: &str,
     qe_port_name: &str,
@@ -646,13 +788,22 @@ pub fn create_ahxxx(
     let model = proto::model_from_name(model_name);
     if model == QeModel::Unknown {
         return Err(error(format!(
-            "drvAHxxxConfigure: model '{model_name}' is not ported; use AH401B or AH401D"
+            "drvAHxxxConfigure: unknown model '{model_name}'; use one of \
+             AH401B, AH401D, AH501, AH501BE, AH501C, AH501D"
         )));
     }
 
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
+    let ah401_series = Arc::new(AtomicBool::new(proto::is_ah401_series(model)));
 
-    let driver = AhxxxDriver::new(port_name, qe_port_name, max_memory, model, shared.clone())?;
+    let driver = AhxxxDriver::new(
+        port_name,
+        qe_port_name,
+        max_memory,
+        model,
+        shared.clone(),
+        ah401_series.clone(),
+    )?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
     let pool = driver.base.pool.clone();
@@ -668,6 +819,7 @@ pub fn create_ahxxx(
         handle: handle.clone(),
         params,
         shared: shared.clone(),
+        ah401_series,
     };
     let read_thread_handle = thread::Builder::new()
         .name("drvAHxxxTask".into())
