@@ -7,12 +7,10 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::ioc::GenericDriverContext;
 use epics_rs::ad_plugins::ioc::AdIoc;
 use epics_rs::base::server::iocsh::registry::*;
 
-use quadem::drv_quad_em::QE_ADDR_ALL;
-use quadem::iocsh::octet_port_commands;
+use quadem::iocsh::{octet_port_commands, register_quadem_port};
 use quadem::{TetrAmmRuntime, create_tetramm};
 
 fn tetramm_configure_command(
@@ -69,26 +67,14 @@ fn tetramm_configure_command(
             let rt = create_tetramm(&port_name, &qe_port_name, ring_buffer_size, max_memory)
                 .map_err(|e| format!("drvTetrAMMConfigure: {e}"))?;
 
-            epics_rs::asyn::asyn_record::register_port(
+            register_quadem_port(
+                &mgr,
+                &trace,
                 &port_name,
                 rt.port_handle().clone(),
-                trace.clone(),
-            );
-
-            // Address 0 (Current1 time series) is the port's default NDArray
-            // source; addresses 1..=10 are the remaining data items and
-            // address 11 is the full 2-D [11 x numAverage] array. Each has its
-            // own fan-out, selected downstream by NDArrayAddr.
-            mgr.set_driver(Arc::new(GenericDriverContext::new(
                 rt.pool.clone(),
-                rt.outputs[0].clone(),
-                &port_name,
-                mgr.wiring(),
-            )));
-            for addr in 1..=QE_ADDR_ALL {
-                mgr.wiring()
-                    .register_output(&format!("{port_name}:{addr}"), rt.outputs[addr].clone());
-            }
+                &rt.outputs,
+            );
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)

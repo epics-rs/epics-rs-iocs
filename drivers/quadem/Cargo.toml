@@ -10,6 +10,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-epics-rs = { workspace = true, features = ["asyn", "ad"] }
+epics-rs = { workspace = true, features = ["asyn", "ad", "ioc"] }
+# `ioc` is needed for `ad_core::ioc::{PluginManager, GenericDriverContext}`, which
+# `iocsh::register_quadem_port` uses to publish a port's twelve NDArray fan-outs.
 parking_lot = "0.12"
 log = "0.4"
