@@ -8,15 +8,19 @@
 //! Ported devices:
 //!
 //! - [`tetramm`] — CaenEls TetrAMM (`caenSrc/drvTetrAMM.cpp`)
+//! - [`ahxxx`] — Elettra/CaenEls AH401B and AH401D (`caenSrc/drvAHxxx.cpp`)
 //!
 //! Only devices reachable over a byte stream (TCP/UDP/serial) are in scope.
 //! `nslsSrc/drvNSLS2_EM` and `nslsSrc/drvNSLS2_IC` drive memory-mapped FPGA
 //! registers and I²C respectively and are out of scope.
 
+pub mod ahxxx;
+pub mod ahxxx_proto;
 pub mod drv_quad_em;
 pub mod iocsh;
 pub mod octet;
 pub mod tetramm;
 pub mod tetramm_proto;
 
+pub use ahxxx::{AhxxxRuntime, create_ahxxx};
 pub use tetramm::{TetrAmmRuntime, create_tetramm};

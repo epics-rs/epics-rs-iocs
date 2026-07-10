@@ -36,6 +36,7 @@ members = [
     "drivers/meascomp/usb-ctr",
     "iocs/d435i-ioc",
     "iocs/quadem/tetramm-ioc",
+    "iocs/quadem/ah401-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
     "iocs/motor/conex-ioc",
