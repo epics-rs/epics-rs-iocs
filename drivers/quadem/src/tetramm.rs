@@ -269,19 +269,22 @@ impl QuadEmDevice for TetrAmmDriver {
     }
 
     /// C++ `drvTetrAMM::readStatus`.
+    ///
+    /// An unparseable response takes C++'s `goto error`, which jumps past the
+    /// `setAcquire(1)` restore: a failed status read leaves the meter stopped.
     fn read_status(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
             self.set_acquire(0)?;
         }
-        let result = self.read_status_inner();
-        if result.is_err() {
-            log::error!("drvTetrAMM: readStatus failed");
+        if let Err(e) = self.read_status_inner() {
+            log::error!("drvTetrAMM: readStatus failed: {e}");
+            return Err(e);
         }
         if prev_acquiring {
             self.set_acquire(1)?;
         }
-        result
+        Ok(())
     }
 }
 
