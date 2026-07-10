@@ -53,8 +53,11 @@ pub fn atoi(s: &str) -> i32 {
     t.get(..i).and_then(|p| p.parse::<i32>().ok()).unwrap_or(0)
 }
 
-/// Mimic C `atof`: parse the leading numeric prefix as `f64`, `0.0` on junk.
-pub fn atof(s: &str) -> f64 {
+/// Extract the leading numeric token (sign, digits, optional `.digits`,
+/// optional exponent) that C `atof`/`sscanf("%e", ...)` would consume,
+/// shared by [`atof`] and [`atof_f32`] since they differ only in which
+/// float width parses that token.
+fn leading_float_token(s: &str) -> &str {
     let t = s.trim_start();
     let b = t.as_bytes();
     let mut i = 0;
@@ -83,9 +86,21 @@ pub fn atof(s: &str) -> f64 {
             i = j;
         }
     }
-    t.get(..i)
-        .and_then(|p| p.parse::<f64>().ok())
-        .unwrap_or(0.0)
+    t.get(..i).unwrap_or("")
+}
+
+/// Mimic C `atof`: parse the leading numeric prefix as `f64`, `0.0` on junk.
+pub fn atof(s: &str) -> f64 {
+    leading_float_token(s).parse::<f64>().unwrap_or(0.0)
+}
+
+/// Mimic C `sscanf(s, "%e", &float_var)`: parse the leading numeric prefix
+/// directly into a 32-bit `float`, `0.0` on junk. Distinct from [`atof`] —
+/// callers that store the result in a C `float` (single rounding,
+/// ASCII-to-`f32`) must use this rather than `atof(s) as f32` (which would
+/// round twice: ASCII-to-`f64`, then `f64`-to-`f32`).
+pub fn atof_f32(s: &str) -> f32 {
+    leading_float_token(s).parse::<f32>().unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -105,5 +120,11 @@ mod tests {
         assert!((atof("3.25") - 3.25).abs() < 1e-12);
         assert!((atof("-1.5e-3 extra") - (-1.5e-3)).abs() < 1e-15);
         assert_eq!(atof("junk"), 0.0);
+    }
+
+    #[test]
+    fn atof_f32_parses_scientific_notation_and_ignores_junk() {
+        assert!((atof_f32("5.000000E-09") - 5E-9_f32).abs() < 1e-15);
+        assert_eq!(atof_f32("junk"), 0.0);
     }
 }

@@ -2,6 +2,7 @@
 //! `epics-modules/delaygen` (`drvAsynDG645.cpp`, `drvAsynColby.cpp`,
 //! `drvAsynCoherentSDG.cpp`).
 
+pub mod colby;
 pub mod connect;
 pub mod dg645;
 pub mod wire;

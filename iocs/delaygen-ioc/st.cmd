@@ -42,5 +42,17 @@ DG645Config("DG1", "serial1", -1)
 
 dbLoadRecords("$(DELAYGEN)/db/dg645.template", "P=delaygen:,R=DG1:,PORT=DG1")
 
+# ---- Colby PDL-100A (commented -- pick only one device block) ----
+# EOS is port-owned (colby.cmd's own values): the device's serial replies
+# are colon-terminated, and the driver additionally strips a command-echo
+# preamble on top of that framing (see drivers/delaygen/src/colby.rs).
+# asynOctetSetInputEos("serial1", -1, ":")
+# asynOctetSetOutputEos("serial1", -1, "\r\n")
+#
+# ColbyConfig(myport,ioport,addr,units,iface)
+# ColbyConfig("COL", "serial1", -1, "ns", 1)
+#
+# dbLoadRecords("$(DELAYGEN)/db/colbyPDL100A.template", "P=delaygen:,R=Colby:,PREC=3,A=Colby,PORT=COL")
+
 #------------------------------------------------------------------------------
 iocInit()

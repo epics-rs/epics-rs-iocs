@@ -14,6 +14,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
+use delaygen::colby::ColbyDriver;
 use delaygen::connect::connect_octet;
 use delaygen::dg645::Dg645Driver;
 
@@ -197,6 +198,80 @@ async fn main() -> CaResult<()> {
                     .map_err(|e| format!("DG645Config: {e}"))?;
                 let driver = Dg645Driver::new(&my_port, handle)
                     .map_err(|e| format!("DG645Config: failed to initialize {my_port}: {e}"))?;
+
+                let (runtime_handle, _actor_jh) =
+                    create_port_runtime(driver, RuntimeConfig::default());
+                epics_rs::asyn::asyn_record::register_port(
+                    &my_port,
+                    runtime_handle.port_handle().clone(),
+                    trace_c.clone(),
+                );
+
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // ColbyConfig(myport,ioport,addr,units,iface) -- C
+    // drvAsynColby(myport,ioport,addr,units,iface)
+    {
+        let trace_c = trace.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "ColbyConfig",
+            vec![
+                ArgDesc {
+                    name: "myport",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "ioport",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "addr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "units",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "iface",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "ColbyConfig myport ioport addr units iface",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let my_port = match &args[0] {
+                    ArgValue::String(s) => s.clone(),
+                    _ => return Err("myport required".into()),
+                };
+                let io_port = match &args[1] {
+                    ArgValue::String(s) => s.clone(),
+                    _ => return Err("ioport required".into()),
+                };
+                let io_addr = match &args[2] {
+                    ArgValue::Int(n) => *n as i32,
+                    _ => return Err("addr required".into()),
+                };
+                let units = match &args[3] {
+                    ArgValue::String(s) => s.clone(),
+                    _ => return Err("units required".into()),
+                };
+                let iface = match &args[4] {
+                    ArgValue::Int(n) => *n as i32,
+                    _ => return Err("iface required".into()),
+                };
+
+                let handle = connect_octet(&io_port, io_addr, COMMAND_TIMEOUT)
+                    .map_err(|e| format!("ColbyConfig: {e}"))?;
+                let driver = ColbyDriver::new(&my_port, handle, &units, iface)
+                    .map_err(|e| format!("ColbyConfig: failed to initialize {my_port}: {e}"))?;
 
                 let (runtime_handle, _actor_jh) =
                     create_port_runtime(driver, RuntimeConfig::default());
