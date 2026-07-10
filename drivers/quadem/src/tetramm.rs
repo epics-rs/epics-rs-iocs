@@ -16,7 +16,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat,
-    QeTriggerMode, QeTriggerPolarity, QuadEmBase, QuadEmParams, QuadEmShared,
+    QeTriggerMode, QeTriggerPolarity, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared,
 };
 use crate::octet::{OctetIo, connect_octet};
 use crate::tetramm_proto as proto;
@@ -140,7 +140,23 @@ impl TetrAmmDriver {
         Ok(())
     }
 
-    // --- Acquisition control ---
+    fn acquire_param(&self) -> usize {
+        self.base.nd_params.acquire
+    }
+}
+
+// ===========================================================================
+// drvQuadEM virtuals
+// ===========================================================================
+
+impl QuadEmDevice for TetrAmmDriver {
+    fn qe_base(&mut self) -> &mut QuadEmBase {
+        &mut self.base
+    }
+
+    fn qe_shared(&self) -> &Arc<QuadEmShared> {
+        &self.shared
+    }
 
     /// C++ `drvTetrAMM::setAcquire`.
     fn set_acquire(&mut self, value: i32) -> AsynResult<()> {
@@ -195,17 +211,81 @@ impl TetrAmmDriver {
         Ok(())
     }
 
-    /// C++ `drvQuadEM::setAcquire`.
-    fn base_set_acquire(&mut self, value: i32) -> AsynResult<()> {
-        if value == 1 {
-            self.shared.acq.lock().num_acquired = 0;
-            let idx = self.params().num_acquired;
-            self.base.port_base.set_int32_param(idx, 0, 0)?;
-            self.base.port_base.call_param_callbacks(0)?;
+    /// C++ `drvTetrAMM::setRange` writes the range to all four channels.
+    fn set_range(&mut self, value: i32) -> AsynResult<()> {
+        for i in 0..QE_MAX_INPUTS {
+            let idx = self.params().range;
+            self.base
+                .port_base
+                .set_int32_param(idx, i as i32 + 1, value)?;
+        }
+        self.set_acquire_params()
+    }
+
+    fn set_values_per_read(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_averaging_time(&mut self, _value: f64) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_trigger_mode(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_num_channels(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_read_format(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+
+    /// C++ `setBiasState`: reset latched faults, switch the supply, and
+    /// re-send the voltage (it is rejected while the bias is off).
+    fn set_bias_state(&mut self, value: i32) -> AsynResult<()> {
+        self.send_command("STATUS:RESET")?;
+        self.send_command(proto::cmd_bias_state(value != 0))?;
+        if value != 0 {
+            let bv = self
+                .base
+                .port_base
+                .get_float64_param(self.params().bias_voltage, 0)?;
+            self.set_bias_voltage(bv)?;
         }
         Ok(())
     }
 
+    fn set_bias_voltage(&mut self, value: f64) -> AsynResult<()> {
+        let bias_state = self
+            .base
+            .port_base
+            .get_int32_param(self.params().bias_state, 0)?;
+        if bias_state == 0 {
+            return Ok(());
+        }
+        self.send_command(&proto::cmd_bias_voltage(value))
+    }
+
+    fn set_bias_interlock(&mut self, value: i32) -> AsynResult<()> {
+        self.send_command(proto::cmd_bias_interlock(value != 0))
+    }
+
+    /// C++ `drvTetrAMM::readStatus`.
+    fn read_status(&mut self) -> AsynResult<()> {
+        let prev_acquiring = self.shared.is_acquiring();
+        if prev_acquiring {
+            self.set_acquire(0)?;
+        }
+        let result = self.read_status_inner();
+        if result.is_err() {
+            log::error!("drvTetrAMM: readStatus failed");
+        }
+        if prev_acquiring {
+            self.set_acquire(1)?;
+        }
+        result
+    }
+}
+
+impl TetrAmmDriver {
     /// C++ `drvTetrAMM::setAcquireParams`.
     fn set_acquire_params(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
@@ -285,117 +365,6 @@ impl TetrAmmDriver {
             log::error!("drvTetrAMM: no response from meter after {RESET_WAIT_LOOPS} seconds");
         }
         self.base_reset()
-    }
-
-    /// C++ `drvQuadEM::reset`: push every cached EPICS setting back to the
-    /// meter, then re-read the status and restore the acquire state.
-    fn base_reset(&mut self) -> AsynResult<()> {
-        let p = self.params();
-        let range = self.base.port_base.get_int32_param(p.range, 0)?;
-        self.set_range_all(range)?;
-        let vpr = self.base.port_base.get_int32_param(p.values_per_read, 0)?;
-        self.set_values_per_read(vpr)?;
-        let avg = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
-        self.set_averaging_time(avg)?;
-        let tm = self.base.port_base.get_int32_param(p.trigger_mode, 0)?;
-        self.set_trigger_mode(tm)?;
-        let nch = self.base.port_base.get_int32_param(p.num_channels, 0)?;
-        self.set_num_channels(nch)?;
-        let bs = self.base.port_base.get_int32_param(p.bias_state, 0)?;
-        let _ = self.set_bias_state(bs);
-        let bi = self.base.port_base.get_int32_param(p.bias_interlock, 0)?;
-        let _ = self.set_bias_interlock(bi);
-        let bv = self.base.port_base.get_float64_param(p.bias_voltage, 0)?;
-        let _ = self.set_bias_voltage(bv);
-        // setResolution and setIntegrationTime are no-ops on the TetrAMM.
-        let rf = self.base.port_base.get_int32_param(p.read_format, 0)?;
-        self.set_read_format(rf)?;
-
-        let _ = self.read_status();
-
-        let acquire = self
-            .base
-            .port_base
-            .get_int32_param(self.acquire_param(), 0)?;
-        self.set_acquire(acquire)
-    }
-
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
-    }
-
-    // --- Setters (each one re-sends the whole acquire block, as in C++) ---
-
-    fn set_range_all(&mut self, value: i32) -> AsynResult<()> {
-        for i in 0..QE_MAX_INPUTS {
-            let idx = self.params().range;
-            self.base
-                .port_base
-                .set_int32_param(idx, i as i32 + 1, value)?;
-        }
-        self.set_acquire_params()
-    }
-
-    fn set_values_per_read(&mut self, _value: i32) -> AsynResult<()> {
-        self.set_acquire_params()
-    }
-    fn set_averaging_time(&mut self, _value: f64) -> AsynResult<()> {
-        self.set_acquire_params()
-    }
-    fn set_trigger_mode(&mut self, _value: i32) -> AsynResult<()> {
-        self.set_acquire_params()
-    }
-    fn set_num_channels(&mut self, _value: i32) -> AsynResult<()> {
-        self.set_acquire_params()
-    }
-    fn set_read_format(&mut self, _value: i32) -> AsynResult<()> {
-        self.set_acquire_params()
-    }
-
-    /// C++ `setBiasState`: reset latched faults, switch the supply, and
-    /// re-send the voltage (it is rejected while the bias is off).
-    fn set_bias_state(&mut self, value: i32) -> AsynResult<()> {
-        self.send_command("STATUS:RESET")?;
-        self.send_command(proto::cmd_bias_state(value != 0))?;
-        if value != 0 {
-            let bv = self
-                .base
-                .port_base
-                .get_float64_param(self.params().bias_voltage, 0)?;
-            self.set_bias_voltage(bv)?;
-        }
-        Ok(())
-    }
-
-    fn set_bias_voltage(&mut self, value: f64) -> AsynResult<()> {
-        let bias_state = self
-            .base
-            .port_base
-            .get_int32_param(self.params().bias_state, 0)?;
-        if bias_state == 0 {
-            return Ok(());
-        }
-        self.send_command(&proto::cmd_bias_voltage(value))
-    }
-
-    fn set_bias_interlock(&mut self, value: i32) -> AsynResult<()> {
-        self.send_command(proto::cmd_bias_interlock(value != 0))
-    }
-
-    /// C++ `drvTetrAMM::readStatus`.
-    fn read_status(&mut self) -> AsynResult<()> {
-        let prev_acquiring = self.shared.is_acquiring();
-        if prev_acquiring {
-            self.set_acquire(0)?;
-        }
-        let result = self.read_status_inner();
-        if result.is_err() {
-            log::error!("drvTetrAMM: readStatus failed");
-        }
-        if prev_acquiring {
-            self.set_acquire(1)?;
-        }
-        result
     }
 
     fn read_status_inner(&mut self) -> AsynResult<()> {
@@ -559,7 +528,7 @@ impl PortDriver for TetrAmmDriver {
             self.read_status()?;
         } else if reason == p.range {
             if channel == 0 {
-                self.set_range_all(value)?;
+                self.set_range(value)?;
             } else {
                 self.set_acquire_params()?;
             }

@@ -663,6 +663,116 @@ impl QuadEmShared {
 }
 
 // ===========================================================================
+// Device hooks
+// ===========================================================================
+
+/// The `virtual` surface of `drvQuadEM` that each electrometer overrides.
+///
+/// The defaults are C++'s "dummy implementations of set functions ... called
+/// when a derived class does not implement a function" (`drvQuadEM.cpp`), so a
+/// device only implements what its meter supports. [`Self::base_reset`] and
+/// [`Self::base_set_acquire`] are `drvQuadEM::reset` and
+/// `drvQuadEM::setAcquire`.
+pub trait QuadEmDevice {
+    fn qe_base(&mut self) -> &mut QuadEmBase;
+    fn qe_shared(&self) -> &Arc<QuadEmShared>;
+
+    /// `drvQuadEM::setAcquire` is pure virtual — every device implements it.
+    fn set_acquire(&mut self, value: i32) -> AsynResult<()>;
+
+    fn set_range(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_values_per_read(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_averaging_time(&mut self, _value: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_trigger_mode(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_num_channels(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_bias_state(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_bias_interlock(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_bias_voltage(&mut self, _value: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_resolution(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_read_format(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_integration_time(&mut self, _value: f64) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_ping_pong(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn read_status(&mut self) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// `drvQuadEM::setAcquire`: starting an acquisition clears `NumAcquired`.
+    fn base_set_acquire(&mut self, value: i32) -> AsynResult<()> {
+        if value == 1 {
+            self.qe_shared().acq.lock().num_acquired = 0;
+            let idx = self.qe_base().params.num_acquired;
+            self.qe_base().port_base.set_int32_param(idx, 0, 0)?;
+            self.qe_base().port_base.call_param_callbacks(0)?;
+        }
+        Ok(())
+    }
+
+    /// `drvQuadEM::reset`: push every cached EPICS setting back to the meter,
+    /// re-read the status, then restore the acquire state. C++ discards each
+    /// setter's status, so the port keeps resetting even when the meter
+    /// rejects one command.
+    fn base_reset(&mut self) -> AsynResult<()> {
+        let p = self.qe_base().params;
+        let acquire_param = self.qe_base().nd_params.acquire;
+        let base = &mut self.qe_base().port_base;
+
+        let range = base.get_int32_param(p.range, 0)?;
+        let values_per_read = base.get_int32_param(p.values_per_read, 0)?;
+        let averaging_time = base.get_float64_param(p.averaging_time, 0)?;
+        let trigger_mode = base.get_int32_param(p.trigger_mode, 0)?;
+        let num_channels = base.get_int32_param(p.num_channels, 0)?;
+        let bias_state = base.get_int32_param(p.bias_state, 0)?;
+        let bias_interlock = base.get_int32_param(p.bias_interlock, 0)?;
+        let bias_voltage = base.get_float64_param(p.bias_voltage, 0)?;
+        let resolution = base.get_int32_param(p.resolution, 0)?;
+        let read_format = base.get_int32_param(p.read_format, 0)?;
+        let integration_time = base.get_float64_param(p.integration_time, 0)?;
+        let acquire = base.get_int32_param(acquire_param, 0)?;
+
+        let _ = self.set_range(range);
+        let _ = self.set_values_per_read(values_per_read);
+        let _ = self.set_averaging_time(averaging_time);
+        let _ = self.set_trigger_mode(trigger_mode);
+        let _ = self.set_num_channels(num_channels);
+        let _ = self.set_bias_state(bias_state);
+        let _ = self.set_bias_interlock(bias_interlock);
+        let _ = self.set_bias_voltage(bias_voltage);
+        let _ = self.set_resolution(resolution);
+        let _ = self.set_read_format(read_format);
+        let _ = self.set_integration_time(integration_time);
+        let _ = self.read_status();
+        self.set_acquire(acquire)
+    }
+}
+
+// ===========================================================================
 // Port base
 // ===========================================================================
 
