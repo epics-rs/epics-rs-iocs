@@ -14,6 +14,7 @@
 //! registers and I²C respectively and are out of scope.
 
 pub mod drv_quad_em;
+pub mod iocsh;
 pub mod octet;
 pub mod tetramm;
 pub mod tetramm_proto;
