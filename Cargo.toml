@@ -78,12 +78,11 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# Local path dependency on the epics-rs library workspace (sibling checkout).
-# Switched from the published 0.21.0 crate to consume in-progress framework
-# changes (motor-rs profile/PCO/gathering extensions) needed for XPS full parity.
-epics-rs = { path = "../epics-rs/crates/epics-rs" }
-asyn-rs = { version = "0.21.0" }
-ad-plugins-rs = { version = "0.21.0" }
-# Modbus TCP/RTU/ASCII driver (drvModbusAsyn port) — same sibling checkout as
-# epics-rs, so it shares that workspace's asyn-rs instance.
-modbus-rs = { path = "../epics-rs/crates/modbus-rs", package = "epics-modbus-rs" }
+# Published epics-rs release from crates.io. The sibling checkout keeps
+# moving, so ports are baselined against the released crate, not the path dep.
+epics-rs = { version = "0.22.1" }
+asyn-rs = { version = "0.22.1" }
+ad-core-rs = { version = "0.22.1" }
+ad-plugins-rs = { version = "0.22.1" }
+# Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
+modbus-rs = { version = "0.22.1", package = "epics-modbus-rs" }

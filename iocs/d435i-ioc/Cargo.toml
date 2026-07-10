@@ -6,9 +6,9 @@ publish = false
 
 [dependencies]
 d435i = { path = "../../drivers/d435i" }
-epics-rs = { version = "0.19.2", features = ["asyn", "ad", "ioc", "pva", "bridge"] }
+epics-rs = { workspace = true, features = ["asyn", "ad", "ioc", "pva", "bridge"] }
 # Direct dep with the `pva` feature: the umbrella crate's `ioc` feature only
 # pulls `ad-plugins-rs/ioc`, so we add this here to also enable
 # `ad-plugins-rs/pva` (which is what gates `AdIoc::run_from_args_with_pva`).
-ad-plugins-rs = { version = "0.19.2", features = ["ioc", "pva"] }
+ad-plugins-rs = { workspace = true, features = ["ioc", "pva"] }
 tokio = { version = "1", features = ["full"] }
