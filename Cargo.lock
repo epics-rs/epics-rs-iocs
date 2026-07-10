@@ -66,6 +66,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ad-simdetector"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "ad-simdetector-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "ad-simdetector",
+ "epics-rs",
+ "tokio",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
