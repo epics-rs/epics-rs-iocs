@@ -1,0 +1,396 @@
+# quadEM_TimeSeries.template
+# Author:  Mark Rivers
+# Date:    Nov. 12, 2003
+# This is a database for TimeSeries and FFTs quadEM.  There are 22 total:
+# TimeSeries1  = diode current 1
+# TimeSeries2  = diode current 2
+# TimeSeries3  = diode current 3
+# TimeSeries4  = diode current 4
+# TimeSeries5  = sum X
+# TimeSeries6  = sum Y
+# TimeSeries7  = sum All
+# TimeSeries8  = difference X
+# TimeSeries9  = difference Y
+# TimeSeries10 = position X
+# TimeSeries11 = position Y
+
+record(bi,"$(P)$(R)SNL_Connected") {
+  field(ZNAM, "Not connected")
+  field(ZSV,  "MAJOR")
+  field(ONAM, "Connected")
+  field(OSV,  "NO_ALARM")
+}
+
+record(bo,"$(P)$(R)EraseAll") {
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),0)MCA_ERASE")
+  field(ZNAM, "Done")
+  field(ONAM, "Erase")
+  field(VAL,  "1")
+  field(FLNK, "$(P)$(R)ReadAllOnce")
+}
+
+record(bo,"$(P)$(R)EraseStart") {
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),0)MCA_ERASE")
+  field(ZNAM, "Done")
+  field(ONAM, "Erase")
+  field(VAL,  "1")
+  field(FLNK, "$(P)$(R)StartAll.PROC")
+}
+
+record(bo,"$(P)$(R)StartAll") {
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),0)MCA_START_ACQUIRE")
+  field(ZNAM, "Done")
+  field(ONAM, "Start")
+  field(VAL,  "1")
+  field(FLNK, "$(P)$(R)SetAcquiring.PROC")
+}
+
+record(bo,"$(P)$(R)SetAcquiring") {
+  field(OUT,  "$(P)$(R)Acquiring PP MS")
+  field(ZNAM, "Done")
+  field(ONAM, "Set")
+  field(VAL,  "1")
+  field(FLNK, "$(P)$(R)SetClientWait.PROC")
+}
+
+record(busy,"$(P)$(R)Acquiring") {
+  field(ZNAM, "Done")
+  field(ONAM, "Acquiring")
+}
+
+record(bo,"$(P)$(R)StopAll") {
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),0)MCA_STOP_ACQUIRE")
+  field(ZNAM, "Done")
+  field(ONAM, "Stop")
+  field(VAL,  "1")
+}
+
+record(ao,"$(P)$(R)PresetReal") {
+  field(PINI, "YES")
+  field(DTYP, "asynFloat64")
+  field(OUT,  "@asyn($(PORT),0)MCA_PRESET_REAL")
+  field(VAL,  "0.0")
+  field(PREC, "2")
+}
+
+record(bi,"$(P)$(R)HardwareAcquiring") {
+  field(DTYP, "asynInt32")
+  field(INP,  "@asyn($(PORT),0)MCA_ACQUIRING")
+  field(ZNAM, "Done")
+  field(ONAM, "Acquiring")
+  field(SCAN, "I/O Intr")
+}
+
+record(ai,"$(P)$(R)ElapsedReal") {
+  field(DTYP, "asynFloat64")
+  field(INP,  "@asyn($(PORT),0)MCA_ELAPSED_REAL")
+  field(PREC, "2")
+  field(SCAN, "I/O Intr")
+}
+
+record(bo,"$(P)$(R)ReadAll") {
+  field(SCAN, "1 second")
+  field(DISV, "0")
+  field(SDIS, "$(P)$(R)Acquiring NPP NMS")
+  field(ZNAM, "Done")
+  field(ONAM, "Read")
+  field(FLNK, "$(P)$(R)ReadAllOnce")
+}
+
+record(bo,"$(P)$(R)ReadAllOnce") {
+  field(VAL,  "1")
+  field(OUT,  "$(P)$(R)DoReadAll.VAL PP MS")
+}
+
+record(bo,"$(P)$(R)DoReadAll") {
+  field(ZNAM, "Done")
+  field(ONAM, "Read")
+}
+
+record(longout,"$(P)$(R)NuseAll") {
+  field(PINI, "YES")
+  field(DTYP, "asynInt32")
+  field(VAL,  "$(NUM_TS)")
+  field(OUT,  "@asyn($(PORT),0)MCA_NUM_CHANNELS")
+}
+
+record(longin,"$(P)$(R)CurrentChannel") {
+  field(DTYP, "asynInt32")
+  field(INP,  "@asyn($(PORT),0)FAST_SWEEP_CURRENT_CHANNEL")
+  field(SCAN, "I/O Intr")
+}
+
+record(longin,"$(P)$(R)MaxChannels") {
+  field(PINI, "YES")
+  field(DTYP, "asynInt32")
+  field(INP,  "@asyn($(PORT),0)FAST_SWEEP_MAX_CHANNELS")
+}
+
+record(ao,"$(P)$(R)Dwell") {
+  field(PINI, "YES")
+  field(DTYP, "asynFloat64")
+  field(OUT,  "@asyn($(PORT),0)MCA_DWELL_TIME")
+  field(VAL,  "0.1")
+  field(PREC, "3")
+}
+
+record(ai,"$(P)$(R)Dwell_RBV") {
+  field(DTYP, "asynFloat64")
+  field(INP,  "@asyn($(PORT),0)MCA_DWELL_TIME")
+  field(PREC, "3")
+  field(SCAN, "I/O Intr")
+}
+
+record(ao,"$(P)$(R)PresetReal") {
+  field(PINI, "YES")
+  field(DTYP, "asynFloat64")
+  field(OUT,  "@asyn($(PORT),0)MCA_PRESET_REAL")
+  field(VAL,  "0")
+  field(PREC, "3")
+}
+
+record(bo,"$(P)$(R)AutoRestartTS")
+{
+    field(DESC, "Auto restart time series")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+}
+
+record(waveform,"$(P)$(R)Current1TS")
+{
+    field(DESC, "Current 1")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 0)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)Current2TS")
+{
+    field(DESC, "Current 2")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 1)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)Current3TS")
+{
+    field(DESC, "Current 3")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 2)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)Current4TS")
+{
+    field(DESC, "Current 4")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 3)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)SumXTS")
+{
+    field(DESC, "Sum X")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 4)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)SumYTS")
+{
+    field(DESC, "Sum Y")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 5)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)SumAllTS")
+{
+    field(DESC, "Sum All")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 6)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)DiffXTS")
+{
+    field(DESC, "Difference X")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 7)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)DiffYTS")
+{
+    field(DESC, "Difference Y")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 8)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)PositionXTS")
+{
+    field(DESC, "Position X")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 9)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)PositionYTS")
+{
+    field(DESC, "Position Y")
+    field(DTYP, "asynInt32ArrayIn")
+    field(PINI, "YES")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "LONG")
+    field(INP,  "@asyn($(PORT) 10)MCA_DATA")
+}
+
+record(waveform,"$(P)$(R)TimeAxis")
+{
+    field(DESC, "Time axis data")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "FLOAT")
+    field(PREC, "3")
+}
+
+# FFT records
+record(bo,"$(P)$(R)ComputeFFT")
+{
+    field(DESC, "Compute FFTs")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+}
+
+record(waveform,"$(P)$(R)Current1FFT")
+{
+    field(DESC, "Current 1 FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)Current2FFT")
+{
+    field(DESC, "Current 2 FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)Current3FFT")
+{
+    field(DESC, "Current 3 FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)Current4FFT")
+{
+    field(DESC, "Current 4 FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)SumXFFT")
+{
+    field(DESC, "Sum X FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)SumYFFT")
+{
+    field(DESC, "Sum Y FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)SumAllFFT")
+{
+    field(DESC, "Sum All FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)DiffXFFT")
+{
+    field(DESC, "Difference X FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)DiffYFFT")
+{
+    field(DESC, "Difference Y FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)PositionXFFT")
+{
+    field(DESC, "Position X FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)PositionYFFT")
+{
+    field(DESC, "Position Y FFT")
+    field(NELM, "$(NUM_FREQ)")
+    field(FTVL, "FLOAT")
+}
+
+record(waveform,"$(P)$(R)FreqAxis")
+{
+    field(DESC, "Frequency axis data")
+    field(NELM, "$(NUM_TS)")
+    field(FTVL, "FLOAT")
+    field(PREC, "3")
+}
+
+record(bo,"$(P)$(R)EnableClientWait") {
+  field(PINI, "YES")
+  field(ZNAM, "Disable")
+  field(ONAM, "Enable")
+}
+
+record(bo,"$(P)$(R)SetClientWait") {
+  field(DISV, "0")
+  field(SDIS, "$(P)$(R)EnableClientWait NPP NMS")
+  field(OMSL, "closed_loop")
+  field(DOL,  "1")
+  field(OUT,  "$(P)$(R)ClientWait PP MS")
+  field(ONAM, "SetClientWait")
+  field(ZNAM, "Done")
+}
+
+record(busy,"$(P)$(R)ClientWait") {
+}
+
+# asyn record for debugging
+record(asyn, "$(P)$(R)Asyn") {
+  field(PORT, "$(PORT)")
+}
