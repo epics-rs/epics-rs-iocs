@@ -34,6 +34,7 @@ members = [
     "drivers/meascomp/usb-2408",
     "drivers/meascomp/usb-ctr",
     "drivers/delaygen",
+    "drivers/love",
     "iocs/d435i-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
@@ -74,6 +75,7 @@ members = [
     "iocs/usb-2408-ioc",
     "iocs/usb-ctr-ioc",
     "iocs/delaygen-ioc",
+    "iocs/love-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC

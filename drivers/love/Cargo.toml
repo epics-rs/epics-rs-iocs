@@ -1,0 +1,12 @@
+# Love PID controller asyn port driver, ported from epics-modules/love
+# (drvLove.c). Pure serial ASCII/checksum protocol — no vendor library, so
+# this crate builds/tests on any host.
+
+[package]
+name = "love"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn"] }
