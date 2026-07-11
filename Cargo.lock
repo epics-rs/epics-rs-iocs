@@ -37,6 +37,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ad-csimdetector"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "ad-csimdetector-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-csimdetector",
+ "ad-plugins-rs",
+ "epics-rs",
+ "tokio",
+]
+
+[[package]]
 name = "ad-plugins-rs"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
