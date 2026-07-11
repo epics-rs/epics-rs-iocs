@@ -1470,6 +1470,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "microepsilon"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+]
+
+[[package]]
+name = "microepsilon-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "microepsilon",
+ "tokio",
+]
+
+[[package]]
 name = "micromo-ioc"
 version = "0.1.0"
 dependencies = [
