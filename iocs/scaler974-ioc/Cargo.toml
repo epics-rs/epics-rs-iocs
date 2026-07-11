@@ -1,0 +1,11 @@
+[package]
+name = "scaler974-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+scaler974 = { path = "../../drivers/scaler974" }
+epics-rs = { workspace = true, features = ["asyn", "scaler", "bridge"] }
+asyn-rs = { workspace = true, features = ["epics"] }
+tokio = { version = "1", features = ["full"] }

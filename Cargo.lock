@@ -2391,6 +2391,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "scaler974"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+]
+
+[[package]]
+name = "scaler974-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "scaler974",
+ "tokio",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

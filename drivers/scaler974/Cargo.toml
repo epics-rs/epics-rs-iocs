@@ -1,0 +1,15 @@
+# Ortec 974 counter/timer asyn port driver, ported from epics-modules/scaler
+# (drvScaler974.cpp). Implements scaler-rs's `ScalerDriver` trait directly --
+# no asynInt32/asynInt32Array PortDriver registration is needed here, since
+# scaler-rs's `ScalerAsynDeviceSupport` calls the driver's Rust methods
+# directly, collapsing what devScalerAsyn.c plus Scaler974's own
+# asynPortDriver interface did in C into one trait.
+
+[package]
+name = "scaler974"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "scaler"] }
