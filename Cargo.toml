@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "drivers/ad/simdetector",
     "drivers/ad/csimdetector",
+    "drivers/ad/std-arrays-driver",
     "drivers/d435i",
     "drivers/motor/amci",
     "drivers/motor/common",
@@ -37,6 +38,7 @@ members = [
     "drivers/meascomp/usb-ctr",
     "iocs/ad/simdetector-ioc",
     "iocs/ad/csimdetector-ioc",
+    "iocs/ad/std-arrays-driver-ioc",
     "iocs/d435i-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
