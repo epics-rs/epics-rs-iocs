@@ -54,5 +54,16 @@ dbLoadRecords("$(DELAYGEN)/db/dg645.template", "P=delaygen:,R=DG1:,PORT=DG1")
 #
 # dbLoadRecords("$(DELAYGEN)/db/colbyPDL100A.template", "P=delaygen:,R=Colby:,PREC=3,A=Colby,PORT=COL")
 
+# ---- Coherent SDG (commented -- pick only one device block) ----
+# EOS is port-owned (coherentSDG.cmd's own values): both directions are
+# CR-terminated.
+# asynOctetSetInputEos("serial1", 0, "\r")
+# asynOctetSetOutputEos("serial1", 0, "\r")
+#
+# CoherentSdgConfig(myport,ioport,ioaddr)
+# CoherentSdgConfig("SDG", "serial1", -1)
+#
+# dbLoadRecords("$(DELAYGEN)/db/coherentSDG.template", "P=delaygen:,R=sdg:,PORT=SDG")
+
 #------------------------------------------------------------------------------
 iocInit()

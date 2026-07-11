@@ -14,13 +14,19 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
+use delaygen::coherent_sdg::CoherentSdgDriver;
 use delaygen::colby::ColbyDriver;
 use delaygen::connect::connect_octet;
 use delaygen::dg645::Dg645Driver;
 
-/// C `TIMEOUT` (`drvAsynDG645.cpp:104`, also used by the Colby/CoherentSDG
-/// drivers) — the `pasynOctetSyncIO` command timeout.
+/// C `TIMEOUT` (`drvAsynDG645.cpp:104`, also `drvAsynColby.cpp:124`) — the
+/// `pasynOctetSyncIO` command timeout for DG645 and Colby. Coherent SDG uses
+/// a distinct, longer timeout — see [`COHERENT_SDG_COMMAND_TIMEOUT`].
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// C `TIMEOUT` (`drvAsynCoherentSDG.cpp:87`) — `10.0`, not the `3.0` used by
+/// DG645/Colby.
+const COHERENT_SDG_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -272,6 +278,63 @@ async fn main() -> CaResult<()> {
                     .map_err(|e| format!("ColbyConfig: {e}"))?;
                 let driver = ColbyDriver::new(&my_port, handle, &units, iface)
                     .map_err(|e| format!("ColbyConfig: failed to initialize {my_port}: {e}"))?;
+
+                let (runtime_handle, _actor_jh) =
+                    create_port_runtime(driver, RuntimeConfig::default());
+                epics_rs::asyn::asyn_record::register_port(
+                    &my_port,
+                    runtime_handle.port_handle().clone(),
+                    trace_c.clone(),
+                );
+
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // CoherentSdgConfig(myport,ioport,ioaddr) -- C
+    // drvAsynCoherentSDG(myport,ioport,ioaddr)
+    {
+        let trace_c = trace.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "CoherentSdgConfig",
+            vec![
+                ArgDesc {
+                    name: "myport",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "ioport",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "ioaddr",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "CoherentSdgConfig myport ioport ioaddr",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let my_port = match &args[0] {
+                    ArgValue::String(s) => s.clone(),
+                    _ => return Err("myport required".into()),
+                };
+                let io_port = match &args[1] {
+                    ArgValue::String(s) => s.clone(),
+                    _ => return Err("ioport required".into()),
+                };
+                let io_addr = match &args[2] {
+                    ArgValue::Int(n) => *n as i32,
+                    _ => return Err("ioaddr required".into()),
+                };
+
+                let handle = connect_octet(&io_port, io_addr, COHERENT_SDG_COMMAND_TIMEOUT)
+                    .map_err(|e| format!("CoherentSdgConfig: {e}"))?;
+                let driver = CoherentSdgDriver::new(&my_port, handle).map_err(|e| {
+                    format!("CoherentSdgConfig: failed to initialize {my_port}: {e}")
+                })?;
 
                 let (runtime_handle, _actor_jh) =
                     create_port_runtime(driver, RuntimeConfig::default());
