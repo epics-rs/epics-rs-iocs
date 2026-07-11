@@ -1,0 +1,16 @@
+# Rust port of epics-modules/vac: the `vs` vacuum-gauge record + `devVacSen`
+# device support (GP307/GP350/MM200/CC10/MX200) and the `digitel` ion-pump
+# record + `devDigitelPump` device support (MPC/D500/D1500/QPC).
+#
+# Both families talk raw asyn octet; EOS is owned by the startup script
+# (`asynOctetSetInputEos`/`asynOctetSetOutputEos`) exactly as in the C module,
+# which never calls setInputEos/setOutputEos itself.
+
+[package]
+name = "vac"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn"] }
