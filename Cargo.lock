@@ -37,6 +37,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ad-mar345"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
 name = "ad-marccd"
 version = "0.1.0"
 dependencies = [
@@ -1418,6 +1427,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 dependencies = [
  "twox-hash",
+]
+
+[[package]]
+name = "mar345-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-mar345",
+ "ad-plugins-rs",
+ "epics-rs",
+ "tokio",
 ]
 
 [[package]]

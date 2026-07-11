@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "drivers/ad/pilatus",
     "drivers/ad/marccd",
+    "drivers/ad/mar345",
     "drivers/d435i",
     "drivers/motor/amci",
     "drivers/motor/common",
@@ -37,6 +38,7 @@ members = [
     "drivers/meascomp/usb-ctr",
     "iocs/ad/pilatus-ioc",
     "iocs/ad/marccd-ioc",
+    "iocs/ad/mar345-ioc",
     "iocs/d435i-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
