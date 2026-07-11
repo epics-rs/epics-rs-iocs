@@ -1,0 +1,13 @@
+# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/aiFloat64.template.
+# Copied rather than referenced via a `$(MODBUS)` iocsh macro: unlike classic
+# EPICS support modules, a crates.io dependency has no installed, runtime-
+# resolvable path to its own bundled db/ directory. See st.cmd's header
+# comment for the full ISCO/Vindum wiring rationale.
+record(ai, "$(P)$(R)") {
+    field(DTYP,"asynFloat64")
+    field(INP,"@asyn($(PORT) $(OFFSET))$(DATA_TYPE)")
+    field(HOPR,"$(HOPR=0)")
+    field(LOPR,"$(LOPR=0)")
+    field(PREC,"$(PREC=0)")
+    field(SCAN,"$(SCAN=I/O Intr)")
+}

@@ -1,0 +1,16 @@
+# Local substitute for a plain `mbbo.template` -- see vindumMbbi.template's
+# header comment for why this is needed (epics-modbus-rs 0.22.1 only bundles
+# the bit-packed `mbboDirect.template`).
+record(mbbo, "$(P)$(R)") {
+    field(DTYP,"asynUInt32Digital")
+    field(OUT,"@asynMask($(PORT) $(OFFSET) 0xFFFF)MODBUS_DATA")
+    field(ZRST,"$(ZRST)")
+    field(ZRVL,"$(ZRVL)")
+    field(ONST,"$(ONST)")
+    field(ONVL,"$(ONVL)")
+    field(TWST,"$(TWST)")
+    field(TWVL,"$(TWVL)")
+    field(THST,"$(THST)")
+    field(THVL,"$(THVL)")
+    field(PINI,"$(PINI)")
+}

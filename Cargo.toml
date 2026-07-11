@@ -36,6 +36,7 @@ members = [
     "drivers/delaygen",
     "drivers/love",
     "drivers/scaler974",
+    "drivers/syringepump",
     "iocs/d435i-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
@@ -78,6 +79,7 @@ members = [
     "iocs/delaygen-ioc",
     "iocs/love-ioc",
     "iocs/scaler974-ioc",
+    "iocs/syringepump-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC

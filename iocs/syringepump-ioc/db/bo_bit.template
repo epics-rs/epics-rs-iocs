@@ -1,0 +1,9 @@
+# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/bo_bit.template.
+# See aiFloat64.template's header comment for why this is a local copy
+# rather than a `$(MODBUS)`-macro reference.
+record(bo,"$(P)$(R)") {
+    field(DTYP,"asynUInt32Digital")
+    field(OUT,"@asynMask($(PORT) $(OFFSET) 0x1)")
+    field(ZNAM,"$(ZNAM)")
+    field(ONAM,"$(ONAM)")
+}

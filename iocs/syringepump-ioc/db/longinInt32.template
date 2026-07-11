@@ -1,0 +1,8 @@
+# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/longinInt32.template.
+# See aiFloat64.template's header comment for why this is a local copy
+# rather than a `$(MODBUS)`-macro reference.
+record(longin,"$(P)$(R)") {
+    field(DTYP,"asynInt32")
+    field(INP,"@asyn($(PORT) $(OFFSET))$(DATA_TYPE)")
+    field(SCAN, "$(SCAN)")
+}

@@ -1,0 +1,15 @@
+# Teledyne ISCO D/H-series syringe pump asyn port driver, ported from
+# epics-modules/SyringePump's teled_d.proto / teled_h.proto (StreamDevice
+# protocol files translated to native asyn command tables -- no StreamDevice
+# engine in epics-rs 0.22.1). ISCO/Vindum families are Modbus-only upstream
+# and are wired in iocs/syringepump-ioc directly against epics-modbus-rs;
+# no driver code for them lives here (see iocs/syringepump-ioc's module doc).
+
+[package]
+name = "syringepump"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn"] }

@@ -1,0 +1,21 @@
+# Local substitute for a plain `mbbi.template` -- epics-modbus-rs 0.22.1's
+# bundled db/ only ships the bit-packed `mbbiDirect.template`, not a
+# 4-state enumerated-register `mbbi.template` (the shape
+# VindumReadHoldingRegisters.substitutions needs for Direction/PressureUnits/
+# RateUnits). Field wiring follows the same `@asynMask(...)MODBUS_DATA`
+# convention as the bundled `ai.template`, with a full 0xFFFF mask so RVAL
+# is the raw 16-bit register value (asyn's UInt32Digital interface, matching
+# real asyn's devMbbiUInt32Digital).
+record(mbbi, "$(P)$(R)") {
+    field(DTYP,"asynUInt32Digital")
+    field(INP,"@asynMask($(PORT) $(OFFSET) 0xFFFF)MODBUS_DATA")
+    field(ZRST,"$(ZRST)")
+    field(ZRVL,"$(ZRVL)")
+    field(ONST,"$(ONST)")
+    field(ONVL,"$(ONVL)")
+    field(TWST,"$(TWST)")
+    field(TWVL,"$(TWVL)")
+    field(THST,"$(THST)")
+    field(THVL,"$(THVL)")
+    field(SCAN,"$(SCAN)")
+}
