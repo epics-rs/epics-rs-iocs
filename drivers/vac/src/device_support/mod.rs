@@ -15,6 +15,7 @@
 //! exchange helpers here emit bare command bytes and rely on the port's
 //! configured terminators.
 
+pub mod digitel_pump;
 pub mod vac_sen;
 
 use std::time::Duration;

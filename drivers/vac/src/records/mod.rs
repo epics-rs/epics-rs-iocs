@@ -8,6 +8,7 @@
 //! declare falls through to `dbCommon` — which is how `INP`, `SCAN` and the
 //! alarm-severity fields reach the record instance.
 
+pub mod digitel;
 pub mod vs;
 
 /// Declare a record's scalar fields once, generating the `FieldDesc` table and

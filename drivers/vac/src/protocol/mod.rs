@@ -4,6 +4,7 @@
 //! and fixed-offset response decoding. No I/O, no records — so every format
 //! and parse path is unit-testable against fixture strings.
 
+pub mod digitel;
 pub mod scan;
 pub mod vac_sen;
 

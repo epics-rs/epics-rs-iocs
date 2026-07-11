@@ -765,6 +765,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "digitel-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "vac",
+]
+
+[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
