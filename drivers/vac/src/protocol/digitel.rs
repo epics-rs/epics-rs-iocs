@@ -512,12 +512,14 @@ pub fn check_control_reply(dev: DevType, reply: &[u8]) -> Result<(), ReplyError>
 
 /// C's `char pvalue[30]` decode scratch.
 ///
-/// `strncpy(dst, src, n)` copies at most `n` bytes, stops at the source NUL,
-/// and NUL-pads the rest of `dst[..n]` — but leaves `dst[n..]` alone. The
-/// decoder relies on that: after `strncpy(pvalue, &recBuf[139], 2)` the bytes
-/// past index 1 still hold the previous copy's tail, and the following
-/// `sscanf(pvalue, "%lf", ...)` may run into them. Modelling the whole buffer
-/// keeps that behaviour instead of guessing at it.
+/// `strncpy(dst, src, n)` copies at most `n` bytes and stops at the source NUL.
+///
+/// Fixes doc/upstream-c-defects.md #24: C's `strncpy(pvalue, &recBuf[139], 2)`
+/// wrote exactly two bytes and no terminator, so the following
+/// `sscanf(pvalue, "%lf", &s3tr)` ran past them into the tail left by the prior
+/// 18-byte copy — S3TR picked up "12" plus stray exponent digits instead of the
+/// bakeout time. Every copy now zeroes the remainder of the buffer, so the
+/// scratch string ends at the copied field and S3TR reads only its two digits.
 struct Scratch([u8; 30]);
 
 impl Scratch {
@@ -530,7 +532,9 @@ impl Scratch {
         let src = cstr(src);
         let m = src.len().min(n);
         self.0[..m].copy_from_slice(&src[..m]);
-        self.0[m..n].fill(0);
+        // Zero the whole tail, not just `[m..n]`: a short copy must not leave a
+        // longer prior copy's bytes for the next parse to run into.
+        self.0[m..].fill(0);
     }
 
     /// The buffer as C's string functions see it.
@@ -1678,14 +1682,13 @@ mod tests {
     }
 
     #[test]
-    fn digitel_bakeout_time_reads_past_its_two_digits_into_the_scratch_tail() {
-        // C: `strncpy(pvalue, &recBuf[139], 2); sscanf(pvalue, "%lf", &s3tr);`
-        // `strncpy` writes exactly two bytes and no terminator, so `sscanf` runs
-        // straight into what the previous 18-byte copy left at pvalue[2..]. For
-        // the reply "3.0E-6 3.6E-6 1011 12" that tail is "0E-6 ...", so the two
-        // hours "12" are read as "120E-6". Upstream defect, reproduced.
+    fn digitel_bakeout_time_reads_only_its_two_digits() {
+        // Regression for doc/upstream-c-defects.md #24: the two bakeout hours at
+        // recBuf[139..141] ("12" in "3.0E-6 3.6E-6 1011 12") are parsed alone.
+        // Pre-fix the unterminated 2-byte copy let the parse run into the prior
+        // copy's "0E-6 ..." tail, yielding 1.2e-4 instead of 12.
         let r = decode(&digitel(3), &digitel_buf(), &Readings::default());
-        assert!((r.s3tr - 1.2e-4).abs() < 1e-10, "s3tr = {}", r.s3tr);
+        assert!((r.s3tr - 12.0).abs() < 1e-10, "s3tr = {}", r.s3tr);
     }
 
     #[test]
