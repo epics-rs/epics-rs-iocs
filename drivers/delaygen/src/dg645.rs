@@ -31,14 +31,14 @@
 //!   so this was a label-only typo in the driver's own tag, not a DG645
 //!   wire command string — and no db template in this workspace referenced
 //!   the old spelling. Corrected to `T0_OFFSET_STEP`.
+//! - **#34 `cvtErrorText`'s "ckecking" typo**: a display-only status string
+//!   (not a DG645 wire command), fixed to "checking" — see [`status_text`].
 //!
 //! # Preserved upstream quirks (not "fixed")
 //! - `cvtErrorCode`'s dead branch (`if(!check_errors) *outBuf=-1;` with no
 //!   `return`, unconditionally overwritten by `*outBuf=pport->error` on
 //!   the next line): STATUS_CODE always reads back `error`, regardless of
 //!   check_errors state. See [`Dg645Driver::error`] usage in `read_int32`.
-//! - `cvtErrorText`'s typo `"Status ckecking disabled"` (sic) — see
-//!   [`status_text`].
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
@@ -447,10 +447,12 @@ fn chan_delay_text(reply: &str) -> String {
     format!("{name} + {delay:.12}")
 }
 
-/// C `cvtErrorText`. Preserves the upstream typo `"ckecking"` verbatim.
+/// C `cvtErrorText`. doc/upstream-c-defects.md #34: upstream's
+/// disabled-checking message misspelled "checking" as "ckecking" -- a
+/// display-only status string (not a DG645 wire command), fixed here.
 fn status_text(error: i32, check_errors: bool) -> &'static str {
     if !check_errors {
-        return "Status ckecking disabled";
+        return "Status checking disabled";
     }
     STATUS_MSG
         .iter()
@@ -829,8 +831,9 @@ mod tests {
     }
 
     #[test]
-    fn status_text_preserves_disabled_checking_typo() {
-        // sic: upstream cvtErrorText spells this "ckecking".
-        assert_eq!(status_text(0, false), "Status ckecking disabled");
+    fn status_text_fixes_disabled_checking_typo() {
+        // doc/upstream-c-defects.md #34: upstream cvtErrorText spelled
+        // this "ckecking".
+        assert_eq!(status_text(0, false), "Status checking disabled");
     }
 }
