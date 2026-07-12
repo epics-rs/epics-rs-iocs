@@ -2,8 +2,9 @@
 # Mark Rivers
 # October 31, 2008
 #
-# Ported verbatim from ADmarCCD/marCCDApp/Db/marCCD.template. The duplicated
-# MarState_RBV record (below) is an upstream defect preserved deliberately.
+# Ported from ADmarCCD/marCCDApp/Db/marCCD.template. The upstream template
+# defines MarState_RBV twice (identical records); the duplicate was removed as a
+# retro-fixed upstream defect (doc/upstream-c-defects.md #15).
 
 include "ADBase.template"
 include "NDFile.template"
@@ -152,13 +153,6 @@ record(longin, "$(P)$(R)SeriesFileFirst_RBV")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))MAR_SERIES_FILE_FIRST")
     field(SCAN, "I/O Intr")
     field(DESC, "Series file first")
-}
-
-record(longin,"$(P)$(R)MarState_RBV") {
-    field(DTYP,"asynInt32")
-    field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))MAR_STATE")
-    field(SCAN, "I/O Intr")
-    field(DESC,"Task state")
 }
 
 # State word

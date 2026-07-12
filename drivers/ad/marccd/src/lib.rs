@@ -59,12 +59,12 @@
 //!   retry loop expired; now returns an error so no image is published.
 //! * #14 — `getImageData` published the NDArray even when the read failed; it
 //!   now propagates the error and does not publish.
+//! * #15 — `marCCD.template` defined `MarState_RBV` twice (identical records);
+//!   the duplicate is removed.
 //!
-//! Upstream defects still reproduced deliberately and marked in the source:
-//! the duplicated `MarState_RBV` record in `marCCD.template`. One latent C bug
-//! is *not* reproduced: `collectSeries` returning early on a file-template
-//! error (which spins the acquisition task); this port cleans up and stops
-//! instead.
+//! One latent C bug is *not* reproduced: `collectSeries` returning early on a
+//! file-template error (which spins the acquisition task); this port cleans up
+//! and stops instead.
 
 pub mod driver;
 pub mod file_name;
