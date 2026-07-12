@@ -57,12 +57,14 @@
 //! source per user policy; see `doc/upstream-c-defects.md`):
 //! * #13 — `readTiff` returned `asynSuccess` with an unwritten buffer when its
 //!   retry loop expired; now returns an error so no image is published.
+//! * #14 — `getImageData` published the NDArray even when the read failed; it
+//!   now propagates the error and does not publish.
 //!
 //! Upstream defects still reproduced deliberately and marked in the source:
-//! `getImageData` publishing that buffer even on a read error, and the
-//! duplicated `MarState_RBV` record in `marCCD.template`. One latent C bug is
-//! *not* reproduced: `collectSeries` returning early on a file-template error
-//! (which spins the acquisition task); this port cleans up and stops instead.
+//! the duplicated `MarState_RBV` record in `marCCD.template`. One latent C bug
+//! is *not* reproduced: `collectSeries` returning early on a file-template
+//! error (which spins the acquisition task); this port cleans up and stops
+//! instead.
 
 pub mod driver;
 pub mod file_name;

@@ -367,13 +367,12 @@ impl Worker {
             srv.callbacks().await;
         }
 
-        let result = self.read_tiff(&full_file_name, nx, ny).await;
-        let (data, status) = match result {
-            Ok(d) => (d, CamStatus::Success),
-            // On a read error C still runs the callback below with whatever was
-            // (or was not) written into the buffer; this port publishes a
-            // zero-filled buffer rather than uninitialised pool memory.
-            Err(s) => (vec![0u16; nx * ny], s),
+        let data = match self.read_tiff(&full_file_name, nx, ny).await {
+            Ok(d) => d,
+            // Fixed (upstream-c-defects.md #14): on a read error C still runs
+            // doCallbacksGenericPointer with the unfilled buffer, publishing
+            // garbage as a frame. Propagate the error and do not publish.
+            Err(s) => return s,
         };
 
         if array_callbacks != 0 {
@@ -388,7 +387,7 @@ impl Worker {
             array.time_stamp = self.load_acq_start();
             self.output.publish(Arc::new(array)).await;
         }
-        status
+        CamStatus::Success
     }
 
     /// C `readTiff` — wait for a new file, then retry the decode until the
