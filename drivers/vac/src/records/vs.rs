@@ -457,9 +457,16 @@ impl Record for VsRecord {
     /// C `vsRecord.c::process`'s tail: `monitor()` latches the previous-value
     /// shadows, then `chgc` is cleared.
     ///
-    /// `monitor()`'s own `pvs->chgc & IGn_FIELD` tests are dead — `readWrite_vs`
-    /// zeroed `chgc` during the `pact == 0` pass, before `monitor()` ever runs —
-    /// so the shadow latch is unconditional here, exactly as it is there.
+    /// doc/upstream-c-defects.md #18 — not applicable in this framework. C's
+    /// `monitor()` posted the `IG1S`/`IG2S`/`DGSS` setting fields via
+    /// `pvs->chgc & IGn_FIELD`, because EPICS base does not auto-post a field on
+    /// `dbPutField`. Those branches were already dead in C: `readWrite_vs` zeroed
+    /// `chgc` during the `pact == 0` pass, before `monitor()` ever runs. And
+    /// here there is no observable to restore even if they fired: `IG1S`/`IG2S`/
+    /// `DGSS` are `pp(TRUE)` non-primary fields, so the framework posts them at
+    /// caput time (and again on value change via the shadow), by construction.
+    /// The port therefore keeps the unconditional shadow latch below and adds no
+    /// change-flag-gated posts.
     fn process(&mut self) -> CaResult<ProcessOutcome> {
         self.pval = self.val;
         self.ppre = self.pres;
