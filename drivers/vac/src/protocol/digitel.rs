@@ -431,15 +431,14 @@ pub fn read_slot(cfg: &Config, i: usize) -> ReadSlot {
         }
         (DevType::Qpc, 6..=8) => ReadSlot::ReuseLast,
 
-        // MPC: odd pumps read odd setpoints. C guards the `sprintf` with
-        // `if (i < 8)` but not the send, so slot 8 re-sends slot 7's command
-        // and `sp4r` ends up mirroring `sp3r`. Ported as written.
-        (DevType::Mpc, 5..=7) => ReadSlot::Send(
+        // MPC: odd pumps read odd setpoints. Fixes doc/upstream-c-defects.md
+        // #23 (MPC half): C guarded the setpoint `sprintf` with `if (i < 8)`
+        // but not the send, so slot 8 re-sent slot 7's command and `sp4r`
+        // mirrored `sp3r`. Slot 8 now reads its own setpoint number
+        // `(8-5)*2 + pump_no`, symmetric with slots 5..=7.
+        (DevType::Mpc, 5..=8) => ReadSlot::Send(
             format!(" {} {}", READ_CMD_MPC[i], (i as i32 - 5) * 2 + cfg.pump_no).into_bytes(),
         ),
-        (DevType::Mpc, 8) => {
-            ReadSlot::Send(format!(" {} {}", READ_CMD_MPC[7], 4 + cfg.pump_no).into_bytes())
-        }
 
         (_, 9..=10) => ReadSlot::Send(format!(" {}", READ_CMD_MPC[i]).into_bytes()),
         _ => ReadSlot::Skip,
@@ -1382,9 +1381,16 @@ mod tests {
     }
 
     #[test]
-    fn mpc_slot_eight_repeats_slot_seven_because_c_leaves_pvalue_stale() {
+    fn mpc_slot_eight_reads_its_own_setpoint() {
+        // Regression for doc/upstream-c-defects.md #23 (MPC half): slot 8 sends
+        // setpoint number `(8-5)*2 + pump` instead of re-sending slot 7's
+        // command, so SP4R no longer mirrors SP3R.
         let c = mpc(1);
-        assert_eq!(read_slot(&c, 8), read_slot(&c, 7));
+        assert_eq!(read_slot(&c, 7), ReadSlot::Send(b" 3C 5".to_vec()));
+        assert_eq!(read_slot(&c, 8), ReadSlot::Send(b" 3C 7".to_vec()));
+        assert_ne!(read_slot(&c, 8), read_slot(&c, 7));
+        let c = mpc(2);
+        assert_eq!(read_slot(&c, 8), ReadSlot::Send(b" 3C 8".to_vec()));
     }
 
     #[test]
