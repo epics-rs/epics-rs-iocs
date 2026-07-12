@@ -37,12 +37,16 @@
 //!   arrays; C calls `getAttributes(pImage->pAttributeList)`. The
 //!   `TIFFImageDescription` attribute read from the file *is* attached.
 //!
-//! Upstream defects are reproduced deliberately and marked in the source:
-//! `readTiff` returning success with an unwritten buffer when its retry loop
-//! expires, `readBadPixelFile`'s `ygood * ny + xgood` replacement index, the
-//! `thread` reply's channel 3 overwriting channel 0, `averageFlatField` being
-//! NaN when no pixel reaches `MinFlatField`, and `pilatusStatus` reusing one
-//! `temp` / `humid` pair across all channels.
+//! Retro-fixed upstream defects (were reproduced for wire parity, now fixed at
+//! source per user policy; see `doc/upstream-c-defects.md`):
+//! * #8 — `readTiff` returned `asynSuccess` with an unwritten buffer when its
+//!   retry loop expired; now returns an error so no image is published.
+//!
+//! Upstream defects still reproduced deliberately and marked in the source:
+//! `readBadPixelFile`'s `ygood * ny + xgood` replacement index, the `thread`
+//! reply's channel 3 overwriting channel 0, `averageFlatField` being NaN when
+//! no pixel reaches `MinFlatField`, and `pilatusStatus` reusing one `temp` /
+//! `humid` pair across all channels.
 
 pub mod camserver;
 pub mod driver;

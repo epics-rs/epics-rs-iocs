@@ -544,9 +544,11 @@ async fn wait_for_file_to_exist(
 /// C `readTiff()` — wait for the file, then retry the decode until the writer
 /// has finished, and finally apply the bad-pixel map.
 ///
-/// Upstream behaviour preserved: when the retry loop exhausts `timeout` C falls
-/// through and returns `asynSuccess` with a buffer it never filled. This
-/// returns a zero-filled buffer in that case rather than uninitialised memory.
+/// Fixed (upstream-c-defects.md #8): when the retry loop exhausts `timeout`
+/// without a successful decode, C falls through and returns `asynSuccess` with
+/// a buffer it never filled — the caller then publishes stale/garbage pixels.
+/// That is a failed read, so this returns [`CamStatus::Error`] and the caller
+/// does not publish.
 async fn read_tiff(
     ctx: &mut Ctx,
     file: &Path,
@@ -587,10 +589,16 @@ async fn read_tiff(
         delta_time = t_start.elapsed().as_secs_f64();
     }
 
-    let (mut data, description) = match decoded {
-        Some(img) => (img.data, img.description),
-        None => (vec![0i32; nx * ny], None),
+    let Some(img) = decoded else {
+        // Fixed (upstream-c-defects.md #8): the retry loop timed out without a
+        // valid frame. Do not fabricate a buffer or publish it.
+        log::error!(
+            "pilatus: timeout reading TIFF file {}; image not published",
+            file.display()
+        );
+        return Err(CamStatus::Error);
     };
+    let (mut data, description) = (img.data, img.description);
     correct_bad_pixels(&mut data, bad_pixels);
     Ok((data, description))
 }
