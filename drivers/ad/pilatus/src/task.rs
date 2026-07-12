@@ -366,17 +366,13 @@ async fn pilatus_status(
             ctx.set_f64(ctx.p.th_temp_2, temp as f64);
             ctx.set_f64(ctx.p.th_humid_2, humid as f64);
         }
-        // Upstream defect preserved: channel 3 overwrites channel 0's params.
-        if let Some((t, h)) = parse_thread_channel(&reply, 3) {
-            if let Some(v) = t {
-                temp = v;
-            }
-            if let Some(v) = h {
-                humid = v;
-            }
-            ctx.set_f64(ctx.p.th_temp_0, temp as f64);
-            ctx.set_f64(ctx.p.th_humid_0, humid as f64);
-        }
+        // Fixed (upstream-c-defects.md #10): C has a fourth block that parses a
+        // "Channel 3" line and writes its temperature/humidity into ThTemp0 /
+        // ThHumid0 — a copy-paste of the channel-0 targets that silently
+        // corrupts channel 0's readings. The camserver `thread` reply defines
+        // only channels 0-2 and there is no channel-3 parameter, so the block
+        // is removed rather than remapped (a channel-3 parameter would be
+        // fabricated hardware).
     } else {
         ctx.set_i32(ctx.ad.status, ADStatus::Error as i32);
     }

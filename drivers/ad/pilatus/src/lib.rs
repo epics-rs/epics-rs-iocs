@@ -43,11 +43,13 @@
 //!   retry loop expired; now returns an error so no image is published.
 //! * #9 — `readBadPixelFile`'s replacement index used the image height as the
 //!   row stride (`ygood * ny + xgood`); now uses the width (`ygood * nx`).
+//! * #10 — `pilatusStatus`'s `thread` reply parser wrote a "Channel 3" line's
+//!   temperature/humidity into channel 0's parameters; the spurious channel-3
+//!   block is removed (no channel-3 parameter exists).
 //!
 //! Upstream defects still reproduced deliberately and marked in the source:
-//! the `thread` reply's channel 3 overwriting channel 0, `averageFlatField`
-//! being NaN when no pixel reaches `MinFlatField`, and `pilatusStatus` reusing
-//! one `temp` / `humid` pair across all channels.
+//! `averageFlatField` being NaN when no pixel reaches `MinFlatField`, and
+//! `pilatusStatus` reusing one `temp` / `humid` pair across all channels.
 
 pub mod camserver;
 pub mod driver;
