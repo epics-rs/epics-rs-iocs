@@ -46,9 +46,11 @@
 //! * #10 — `pilatusStatus`'s `thread` reply parser wrote a "Channel 3" line's
 //!   temperature/humidity into channel 0's parameters; the spurious channel-3
 //!   block is removed (no channel-3 parameter exists).
+//! * #11 — `averageFlatField` was `0/0 = NaN` when no pixel reached
+//!   `MinFlatField`, poisoning every corrected pixel; the flat-field read now
+//!   skips normalization with an error (`FlatFieldValid` stays 0, no publish).
 //!
 //! Upstream defects still reproduced deliberately and marked in the source:
-//! `averageFlatField` being NaN when no pixel reaches `MinFlatField`, and
 //! `pilatusStatus` reusing one `temp` / `humid` pair across all channels.
 
 pub mod camserver;

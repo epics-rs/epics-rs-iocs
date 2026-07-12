@@ -432,7 +432,18 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
         }
     };
 
-    let average = flat_field_average(&data, min_flat_field);
+    let Some(average) = flat_field_average(&data, min_flat_field) else {
+        // Fixed (upstream-c-defects.md #11): no pixel reached MinFlatField, so
+        // the average would be 0/0 = NaN and would poison every corrected
+        // pixel. Skip normalization: leave FlatFieldValid = 0 (set above) and
+        // do not publish a NaN-based flat field.
+        log::error!(
+            "pilatus: flat field file {file} has no pixel >= MinFlatField \
+             {min_flat_field}; flat field not applied"
+        );
+        w.ctx.callbacks().await;
+        return;
+    };
     apply_flat_field_floor(&mut data, min_flat_field, average);
     {
         let mut s = w.shared.lock();

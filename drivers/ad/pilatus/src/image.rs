@@ -160,11 +160,14 @@ pub fn correct_bad_pixels(data: &mut [i32], map: &[BadPixel]) {
 // ---------------------------------------------------------------------------
 
 /// C `readFlatFieldFile` averaging step: the mean of every element `>=
-/// min_flat_field`.
+/// min_flat_field`, or `None` when no element qualifies.
 ///
-/// Upstream behaviour preserved: with no element at or above the threshold C
-/// evaluates `0.0 / 0` and stores NaN, which this returns too.
-pub fn flat_field_average(data: &[i32], min_flat_field: i32) -> f64 {
+/// Fixed (upstream-c-defects.md #11): with no element at or above the threshold
+/// C evaluates `0.0 / 0` and stores NaN as `averageFlatField`, which then
+/// poisons every flat-field-corrected pixel (each becomes `(NaN * raw)/flat`).
+/// Returning `None` lets the caller skip normalization with an error instead of
+/// applying a NaN gain.
+pub fn flat_field_average(data: &[i32], min_flat_field: i32) -> Option<f64> {
     let mut sum = 0.0f64;
     let mut ngood = 0i64;
     for &v in data {
@@ -174,14 +177,19 @@ pub fn flat_field_average(data: &[i32], min_flat_field: i32) -> f64 {
         ngood += 1;
         sum += v as f64;
     }
-    sum / ngood as f64
+    if ngood == 0 {
+        None
+    } else {
+        Some(sum / ngood as f64)
+    }
 }
 
 /// C `readFlatFieldFile` second pass: every element below the threshold is
 /// replaced by the average.
 ///
 /// Rust-only change: C's `(epicsInt32)averageFlatField` is undefined when the
-/// value does not fit (in particular for the NaN above); `as i32` saturates.
+/// value does not fit the integer range; `as i32` saturates. (The NaN case is
+/// no longer reachable — see [`flat_field_average`], fixed defect #11.)
 pub fn apply_flat_field_floor(data: &mut [i32], min_flat_field: i32, average: f64) {
     let fill = average as i32;
     for v in data.iter_mut() {
@@ -393,18 +401,19 @@ mod tests {
     #[test]
     fn flat_field_average_ignores_values_below_threshold() {
         let data = vec![50, 100, 200, 300];
-        assert_eq!(flat_field_average(&data, 100), 200.0);
+        assert_eq!(flat_field_average(&data, 100), Some(200.0));
     }
 
     #[test]
-    fn flat_field_average_is_nan_when_nothing_qualifies() {
-        assert!(flat_field_average(&[1, 2, 3], 100).is_nan());
+    fn flat_field_average_is_none_when_nothing_qualifies() {
+        // Fixed (#11): no qualifying pixel yields None, not a NaN average.
+        assert_eq!(flat_field_average(&[1, 2, 3], 100), None);
     }
 
     #[test]
     fn flat_field_floor_replaces_low_values() {
         let mut data = vec![50, 100, 200, 300];
-        let avg = flat_field_average(&data, 100);
+        let avg = flat_field_average(&data, 100).unwrap();
         apply_flat_field_floor(&mut data, 100, avg);
         assert_eq!(data, vec![200, 100, 200, 300]);
     }
