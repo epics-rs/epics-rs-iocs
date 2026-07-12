@@ -15,6 +15,7 @@
 //! | `devTPG261.c` | [`tpg261`] | Pfeiffer TPG261 / TPG262 gauge controller |
 //! | `devTelevac.c` | [`televac`] | Televac vacuum gauge controller |
 //! | `devAiMKS.c` | [`mks`] | MKS / HPS SensaVac 937 gauge controller |
+//! | `devAiHeidND261.c` | [`nd261`] | Heidenhain ND261 display unit |
 //!
 //! All device I/O runs on a plain `std::thread` worker owned by the port (see
 //! [`worker`]); the asyn write handlers only enqueue onto it. That keeps
@@ -25,6 +26,7 @@ pub mod connect;
 pub mod fmt;
 pub mod mks;
 pub mod mpc;
+pub mod nd261;
 pub mod runtime;
 pub mod televac;
 pub mod tpg261;

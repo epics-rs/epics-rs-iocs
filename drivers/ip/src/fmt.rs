@@ -19,9 +19,36 @@ pub fn exp_c(value: f64, precision: usize) -> String {
     format!("{mantissa}E{sign}{:02}", exponent.abs())
 }
 
+/// Read the leading number of `text` as C's `sscanf("%lf")` does: skip leading
+/// whitespace, take the longest prefix that is a number, ignore the rest.
+/// `None` when there is no number at all (C: the conversion fails).
+pub fn scan_f64(text: &str) -> Option<f64> {
+    let text = text.trim_start();
+    let mut value = None;
+    for (end, _) in text.char_indices().skip(1) {
+        match text[..end].parse::<f64>() {
+            Ok(parsed) => value = Some(parsed),
+            // Keep going: "1e" does not parse but "1e-3" does.
+            Err(_) => continue,
+        }
+    }
+    text.parse::<f64>().ok().or(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scans_the_leading_number_like_sscanf() {
+        assert_eq!(scan_f64("12.3456"), Some(12.3456));
+        assert_eq!(scan_f64("  12.3456 mm"), Some(12.3456));
+        assert_eq!(scan_f64("1.2E-06 Torr"), Some(1.2e-6));
+        assert_eq!(scan_f64("-4.5"), Some(-4.5));
+        assert_eq!(scan_f64("0.0"), Some(0.0));
+        assert_eq!(scan_f64("mm"), None);
+        assert_eq!(scan_f64(""), None);
+    }
 
     #[test]
     fn matches_c_percent_e() {

@@ -81,3 +81,19 @@ dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=cc1,PORT=MKS1,ADDR=
 dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=cc2,PORT=MKS1,ADDR=1")
 dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=pr1,PORT=MKS1,ADDR=3")
 dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=pr2,PORT=MKS1,ADDR=4")
+
+# --- Heidenhain ND261 display unit ------------------------------------------
+# devAiHeidND261.c set the input EOS to "\n\n" itself; the port carries it here.
+# The readout request is the two bytes ^B LF, written by the driver, so the port
+# must NOT append an output EOS.
+drvAsynSerialPortConfigure("SerialND261", "/dev/ttyS4", 0, 0, 0)
+asynSetOption("SerialND261", 0, "baud", "9600")
+asynSetOption("SerialND261", 0, "bits", "8")
+asynSetOption("SerialND261", 0, "parity", "none")
+asynSetOption("SerialND261", 0, "stop", "1")
+asynOctetSetInputEos("SerialND261", 0, "\n\n")
+
+# ND261Config(portName, octetPort, pollPeriodSeconds)
+ND261Config("ND261", "SerialND261", 1.0)
+
+dbLoadRecords("iocs/ip/ip-ioc/db/nd261.db", "P=$(PREFIX),AXIS=nd1,PORT=ND261")
