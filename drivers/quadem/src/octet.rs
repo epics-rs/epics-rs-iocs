@@ -21,8 +21,11 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
+use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::runtime::config::RuntimeConfig;
+use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
 /// asyn subaddress of a single-device octet port.
@@ -150,6 +153,36 @@ impl OctetIo {
         self.handle.submit_blocking(RequestOp::Flush, self.user())?;
         Ok(())
     }
+}
+
+/// Build an IP port the way `drvAsynIPPortConfigure` does and wrap it for
+/// blocking use.
+///
+/// `drvNSLS_EM`, `drvT4U_EM` and `drvT4UDirect_EM` all build their own
+/// transports in their constructors instead of taking a pre-configured port
+/// name, so each of them calls this rather than [`connect_octet`].
+///
+/// `process_eos` installs the EOS interpose; leave it off for raw datagram or
+/// binary-framed reads, where an EOS scan would read past the frame.
+pub fn create_ip_port(
+    port_name: &str,
+    host_info: &str,
+    timeout: Duration,
+    no_auto_connect: bool,
+    process_eos: bool,
+) -> AsynResult<(OctetIo, PortRuntimeHandle)> {
+    let mut driver = epics_rs::asyn::drivers::ip_port::DrvAsynIPPort::new(port_name, host_info)?;
+    if no_auto_connect {
+        driver.base_mut().auto_connect = false;
+    }
+    if process_eos {
+        driver.push_interpose(Box::new(
+            epics_rs::asyn::interpose::eos::EosInterpose::default(),
+        ));
+    }
+    let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let io = OctetIo::new(runtime.port_handle().clone(), timeout);
+    Ok((io, runtime))
 }
 
 /// Look up a pre-configured octet port (created by `drvAsynIPPortConfigure` or

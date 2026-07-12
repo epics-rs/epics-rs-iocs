@@ -22,6 +22,7 @@ use crate::ahxxx::{AhxxxRuntime, create_ahxxx};
 use crate::drv_quad_em::QE_ADDR_ALL;
 use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
+use crate::t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};
 
 /// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`),
 /// restricted to the escapes an octet EOS can carry.
@@ -386,6 +387,193 @@ pub fn pcr4_configure_command(
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// C++ `drvT4U_EMConfigure(portName, qtHostAddress, ringBufferSize,
+/// basePortNum)`.
+///
+/// The T4U drivers build their own asyn IP ports, so no
+/// `drvAsynIPPortConfigure` precedes this verb. The trailing `maxMemory`
+/// argument has no C++ analogue and bounds the Rust `NDArrayPool`.
+pub fn t4u_em_configure_command(
+    mgr: Arc<PluginManager>,
+    trace: Arc<TraceManager>,
+    runtime: Arc<Mutex<Option<T4uRuntime>>>,
+) -> CommandDef {
+    CommandDef::new(
+        "drvT4U_EMConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "qtHostAddress",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "ringBufferSize",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "basePortNum",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "maxMemory",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvT4U_EMConfigure portName qtHostAddress ringBufferSize basePortNum [maxMemory]",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = match args.first() {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("portName required".into()),
+            };
+            let qt_host_address = match args.get(1) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("qtHostAddress required".into()),
+            };
+            let ring_buffer_size = match args.get(2) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 0,
+            };
+            let base_port_num = port_number(args.get(3), "basePortNum")?;
+            let max_memory = match args.get(4) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 100_000_000,
+            };
+
+            let rt = create_t4u_em(
+                &port_name,
+                &qt_host_address,
+                ring_buffer_size,
+                base_port_num,
+                max_memory,
+            )
+            .map_err(|e| format!("drvT4U_EMConfigure: {e}"))?;
+
+            register_quadem_port(
+                &mgr,
+                &trace,
+                &port_name,
+                rt.port_handle().clone(),
+                rt.pool.clone(),
+                &rt.outputs,
+            );
+
+            *runtime.lock().unwrap() = Some(rt);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// C++ `drvT4UDirect_EMConfigure(portName, T4UAddress, ringBufferSize,
+/// basePortNum, cfgFileName)`.
+pub fn t4u_direct_em_configure_command(
+    mgr: Arc<PluginManager>,
+    trace: Arc<TraceManager>,
+    runtime: Arc<Mutex<Option<T4uRuntime>>>,
+) -> CommandDef {
+    CommandDef::new(
+        "drvT4UDirect_EMConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "T4UAddress",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "ringBufferSize",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "basePortNum",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "cfgFileName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "maxMemory",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvT4UDirect_EMConfigure portName T4UAddress ringBufferSize basePortNum cfgFileName \
+         [maxMemory]",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = match args.first() {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("portName required".into()),
+            };
+            let t4u_address = match args.get(1) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("T4UAddress required".into()),
+            };
+            let ring_buffer_size = match args.get(2) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 0,
+            };
+            let base_port_num = port_number(args.get(3), "basePortNum")?;
+            let cfg_file_name = match args.get(4) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("cfgFileName required".into()),
+            };
+            let max_memory = match args.get(5) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 100_000_000,
+            };
+
+            let rt = create_t4u_direct_em(
+                &port_name,
+                &t4u_address,
+                ring_buffer_size,
+                base_port_num,
+                &cfg_file_name,
+                max_memory,
+            )
+            .map_err(|e| format!("drvT4UDirect_EMConfigure: {e}"))?;
+
+            register_quadem_port(
+                &mgr,
+                &trace,
+                &port_name,
+                rt.port_handle().clone(),
+                rt.pool.clone(),
+                &rt.outputs,
+            );
+
+            *runtime.lock().unwrap() = Some(rt);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// C++ takes the base port number as an `int` and passes it to `%d`; a value
+/// outside the TCP/UDP port range is a typo in `st.cmd`, so it is rejected here
+/// rather than wrapped.
+fn port_number(arg: Option<&ArgValue>, name: &str) -> Result<u16, String> {
+    match arg {
+        Some(ArgValue::Int(n)) => {
+            u16::try_from(*n).map_err(|_| format!("{name}: {n} is not a valid port number"))
+        }
+        _ => Err(format!("{name} required")),
+    }
 }
 
 #[cfg(test)]

@@ -34,7 +34,7 @@ use crate::drv_quad_em::{
     QuadEmParams, QuadEmShared, num_average_from,
 };
 use crate::nsls_em_proto::{self as proto, PingPong};
-use crate::octet::OctetIo;
+use crate::octet::{OctetIo, create_ip_port};
 
 /// C++ `epicsThreadSleep(0.01)` handshake poll.
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
@@ -92,18 +92,13 @@ fn ip_port(
     no_auto_connect: bool,
     process_eos: bool,
 ) -> AsynResult<(OctetIo, PortRuntimeHandle)> {
-    let mut driver = epics_rs::asyn::drivers::ip_port::DrvAsynIPPort::new(port_name, host_info)?;
-    if no_auto_connect {
-        driver.base_mut().auto_connect = false;
-    }
-    if process_eos {
-        driver.push_interpose(Box::new(
-            epics_rs::asyn::interpose::eos::EosInterpose::default(),
-        ));
-    }
-    let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default());
-    let io = OctetIo::new(runtime.port_handle().clone(), proto::NSLS_EM_TIMEOUT);
-    Ok((io, runtime))
+    create_ip_port(
+        port_name,
+        host_info,
+        proto::NSLS_EM_TIMEOUT,
+        no_auto_connect,
+        process_eos,
+    )
 }
 
 /// C++ `drvNSLS_EM::findModule`: broadcast `i`, collect the replies for
