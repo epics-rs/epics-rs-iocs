@@ -1,0 +1,23 @@
+# GM10 VarConst channel — address family "W" (W1-W100).
+# Macros: P, DAU, HANDLE, ADDRESS (bare "W"-prefixed address, e.g. W1).
+# Port of yokogawaDasApp/Db/GM10_varconstant_channel.db.
+
+record(ai,"$(P)$(DAU):$(ADDRESS)")
+{
+    field(DTYP, "Yokogawa GM10")
+    field(INP, "@$(HANDLE) VAL:$(ADDRESS)")
+    field(SCAN, "I/O Intr")
+    field(PREC, "3")
+    field(PINI, "YES")
+}
+record(ao,"$(P)$(DAU):$(ADDRESS):Set")
+{
+    field(DTYP, "Yokogawa GM10")
+    field(PREC, "3")
+    field(OUT,  "@$(HANDLE) VAL:$(ADDRESS)")
+}
+record(stringout,"$(P)$(DAU):$(ADDRESS):Label")
+{
+    field(PINI, "YES")
+    field( OUT, "$(P)$(DAU):$(ADDRESS).DESC PP")
+}

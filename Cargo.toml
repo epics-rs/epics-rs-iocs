@@ -34,6 +34,7 @@ members = [
     "drivers/meascomp/uldaq-sys",
     "drivers/meascomp/usb-2408",
     "drivers/meascomp/usb-ctr",
+    "drivers/yokogawa-gm10",
     "iocs/ad/specs-analyser-ioc",
     "iocs/d435i-ioc",
     "iocs/motor/ag-uc-ioc",
@@ -74,6 +75,7 @@ members = [
     "iocs/motor/mcb4b-ioc",
     "iocs/usb-2408-ioc",
     "iocs/usb-ctr-ioc",
+    "iocs/yokogawa-gm10-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC

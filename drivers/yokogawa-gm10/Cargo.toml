@@ -1,0 +1,11 @@
+[package]
+name = "yokogawa-gm10"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+log = "0.4"

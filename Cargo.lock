@@ -3246,6 +3246,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
 
 [[package]]
+name = "yokogawa-gm10"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "yokogawa-gm10-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "yokogawa-gm10",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
