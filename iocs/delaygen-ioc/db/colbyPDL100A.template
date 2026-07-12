@@ -94,32 +94,21 @@ record(stringin,"$(P)$(R)mac")
     field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),13)")
 }
-record(sseq,"$(P)$(R)disconnect")
-{
-    field(SCAN,  "Passive")
-    field(PREC,  "3")
-    field(DOL1,  "0")
-    field(DLY1,  "0.1")
-    field(LNK1,  "$(P)$(A).CNCT NPP NMS")
-    field(WAIT1, "Wait")
-    field(DOL2,  "0")
-    field(DLY2,  "0.1")
-    field(LNK2,  "$(P)$(A).PCNCT NPP NMS")
-    field(WAIT2, "Wait")
-}
-record(sseq,"$(P)$(R)connect")
-{
-    field(SCAN,  "Passive")
-    field(PREC,  "3")
-    field(DOL1,  "1")
-    field(DLY1,  "0.1")
-    field(LNK1,  "$(P)$(A).CNCT NPP NMS")
-    field(WAIT1, "Wait")
-    field(DOL2,  "1")
-    field(DLY2,  "0.1")
-    field(LNK2,  "$(P)$(A).PCNCT NPP NMS")
-    field(WAIT2, "Wait")
-}
+# Removed upstream defect (doc/upstream-c-defects.md #36): upstream's
+# "connect"/"disconnect" sseq records referenced $(P)$(A).CNCT/.PCNCT, an
+# asynRecord instance the real upstream st.cmd never actually loads under
+# that name -- iocdelaygen/st.cmd loads asynRecord.db with a hardcoded
+# R=asyn_1 for every device, unrelated to colbyPDL100A.db's own per-device
+# A= macro (A=Colby here), so $(P)$(A) ("delaygen:Colby") never resolves to
+# a real record; confirmed byte-for-byte against the real upstream
+# colbyPDL100A.db (same dangling reference exists there). No unambiguous
+# in-file target exists to repoint to (this template neither loads nor
+# defines any asynRecord instance itself, and neither record is
+# referenced by anything else in this file), so both dead records were
+# removed rather than repointed. PV-surface change: "$(P)$(R)connect" and
+# "$(P)$(R)disconnect" no longer exist; they never functioned (writing
+# them was a no-op past the first dangling link) so no working behavior is
+# lost.
 record(fanout,"$(P)$(R)update")
 {
     field(DESC, "Update network params")
