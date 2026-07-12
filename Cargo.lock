@@ -1291,6 +1291,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ip-devices"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ip-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "ip-devices",
+ "tokio",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
