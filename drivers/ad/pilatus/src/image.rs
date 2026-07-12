@@ -98,12 +98,14 @@ pub fn decode_tiff(path: &Path) -> Result<TiffImage, String> {
 /// C `readBadPixelFile` inner loop: `fscanf(file, " %d,%d %d,%d", ...)` up to
 /// `MAX_BAD_PIXELS` times, stopping at EOF and failing on a short conversion.
 ///
-/// `nx` is `NDArraySizeX` and `ny` is `NDArraySizeY` at the time of the call.
+/// `nx` is `NDArraySizeX` at the time of the call — the row-major row stride.
 ///
-/// Upstream defect preserved: the replacement index is `ygood * ny + xgood`,
-/// which should be `ygood * nx + xgood`. It only agrees with the bad index's
-/// stride on a square detector.
-pub fn parse_bad_pixel_file(text: &str, nx: i32, ny: i32) -> Result<Vec<BadPixel>, String> {
+/// Fixed (upstream-c-defects.md #9): C computes the replacement index as
+/// `ygood * ny + xgood`, using the image *height* (`NDArraySizeY`) as the row
+/// stride. Row-major addressing uses the *width*, matching the bad index's
+/// `ybad * nx + xbad`; the two only agreed on a square detector. This uses
+/// `ygood * nx + xgood`, so the height is no longer a parameter.
+pub fn parse_bad_pixel_file(text: &str, nx: i32) -> Result<Vec<BadPixel>, String> {
     let mut rest = text;
     let mut out = Vec::new();
 
@@ -127,7 +129,7 @@ pub fn parse_bad_pixel_file(text: &str, nx: i32, ny: i32) -> Result<Vec<BadPixel
         };
         out.push(BadPixel {
             bad_index: ybad as i64 * nx as i64 + xbad as i64,
-            replace_index: ygood as i64 * ny as i64 + xgood as i64,
+            replace_index: ygood as i64 * nx as i64 + xgood as i64,
         });
     }
 
@@ -316,19 +318,20 @@ mod tests {
 
     #[test]
     fn bad_pixel_file_parses_c_format() {
-        // nx = 487, ny = 195 (Pilatus 100K)
-        let map = parse_bad_pixel_file("10,20 11,20\n 30,40   31,41 \n", 487, 195).unwrap();
+        // nx = 487 (Pilatus 100K, a non-square detector so the fixed row stride
+        // is observable): both indices use nx, not ny.
+        let map = parse_bad_pixel_file("10,20 11,20\n 30,40   31,41 \n", 487).unwrap();
         assert_eq!(
             map,
             vec![
                 BadPixel {
                     bad_index: 20 * 487 + 10,
-                    // Upstream defect: ny, not nx.
-                    replace_index: 20 * 195 + 11,
+                    // Fixed (#9): nx row stride, matching bad_index.
+                    replace_index: 20 * 487 + 11,
                 },
                 BadPixel {
                     bad_index: 40 * 487 + 30,
-                    replace_index: 41 * 195 + 31,
+                    replace_index: 41 * 487 + 31,
                 },
             ]
         );
@@ -336,22 +339,22 @@ mod tests {
 
     #[test]
     fn bad_pixel_file_empty_yields_no_entries() {
-        assert_eq!(parse_bad_pixel_file("", 10, 10).unwrap(), vec![]);
-        assert_eq!(parse_bad_pixel_file("  \n\t ", 10, 10).unwrap(), vec![]);
+        assert_eq!(parse_bad_pixel_file("", 10).unwrap(), vec![]);
+        assert_eq!(parse_bad_pixel_file("  \n\t ", 10).unwrap(), vec![]);
     }
 
     #[test]
     fn bad_pixel_file_short_record_is_an_error() {
-        assert!(parse_bad_pixel_file("10,20 11", 10, 10).is_err());
-        assert!(parse_bad_pixel_file("10,20 11,", 10, 10).is_err());
+        assert!(parse_bad_pixel_file("10,20 11", 10).is_err());
+        assert!(parse_bad_pixel_file("10,20 11,", 10).is_err());
         // The literal ',' does not skip whitespace, matching fscanf.
-        assert!(parse_bad_pixel_file("10 ,20 11,20", 10, 10).is_err());
+        assert!(parse_bad_pixel_file("10 ,20 11,20", 10).is_err());
     }
 
     #[test]
     fn bad_pixel_file_stops_at_max_bad_pixels() {
         let text = "1,1 2,2\n".repeat(MAX_BAD_PIXELS + 5);
-        let map = parse_bad_pixel_file(&text, 10, 10).unwrap();
+        let map = parse_bad_pixel_file(&text, 10).unwrap();
         assert_eq!(map.len(), MAX_BAD_PIXELS);
     }
 

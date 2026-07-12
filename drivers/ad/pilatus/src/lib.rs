@@ -41,12 +41,13 @@
 //! source per user policy; see `doc/upstream-c-defects.md`):
 //! * #8 — `readTiff` returned `asynSuccess` with an unwritten buffer when its
 //!   retry loop expired; now returns an error so no image is published.
+//! * #9 — `readBadPixelFile`'s replacement index used the image height as the
+//!   row stride (`ygood * ny + xgood`); now uses the width (`ygood * nx`).
 //!
 //! Upstream defects still reproduced deliberately and marked in the source:
-//! `readBadPixelFile`'s `ygood * ny + xgood` replacement index, the `thread`
-//! reply's channel 3 overwriting channel 0, `averageFlatField` being NaN when
-//! no pixel reaches `MinFlatField`, and `pilatusStatus` reusing one `temp` /
-//! `humid` pair across all channels.
+//! the `thread` reply's channel 3 overwriting channel 0, `averageFlatField`
+//! being NaN when no pixel reaches `MinFlatField`, and `pilatusStatus` reusing
+//! one `temp` / `humid` pair across all channels.
 
 pub mod camserver;
 pub mod driver;

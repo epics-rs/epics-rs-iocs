@@ -386,7 +386,6 @@ async fn pilatus_status(
 /// C `readBadPixelFile()`.
 async fn read_bad_pixel_file(w: &mut Worker, file: &str) {
     let nx = w.ctx.get_i32(w.ctx.ad.base.array_size_x).await.unwrap_or(0);
-    let ny = w.ctx.get_i32(w.ctx.ad.base.array_size_y).await.unwrap_or(0);
     let reason = w.ctx.p.num_bad_pixels;
     w.ctx.set_i32(reason, 0);
     w.shared.lock().bad_pixels.clear();
@@ -403,7 +402,7 @@ async fn read_bad_pixel_file(w: &mut Worker, file: &str) {
             return;
         }
     };
-    match parse_bad_pixel_file(&text, nx, ny) {
+    match parse_bad_pixel_file(&text, nx) {
         Ok(map) => {
             let n = map.len() as i32;
             w.shared.lock().bad_pixels = map;
