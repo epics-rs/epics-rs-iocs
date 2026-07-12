@@ -1,0 +1,214 @@
+#=================================================================#
+# Template file: Dashboard.template
+# Serval Dashboard status.
+# Copyright (c) 2022 Brookhaven Science Associates, Brookhaven National Laboratory
+# Copyright (c) 2022-2026 UT-Battelle, LLC, Oak Ridge National Laboratory
+# SPDX-License-Identifier: MIT
+# Author: K. Gofron
+# Date: 2023/7/6
+# Last update: 2024/12/5
+#=================================================================#
+
+##################################################################
+# Define dashboard status PV records here.
+#
+##################################################################
+
+record(bi, "$(P)$(R)ServalConnected_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT))TPX3_SERVAL_CONNECTED")
+    field(ZNAM, "false")
+    field(ONAM, "true")
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)$(R)DetConnected_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT))TPX3_DETECTOR_CONNECTED")
+    field(ZNAM, "false")
+    field(ONAM, "true")
+    field(SCAN, "I/O Intr")
+}
+
+# CONNECT/DISCONNECT: trigger lightweight connection check (updates ServalConnected_RBV, DetConnected_RBV, ADStatusMessage)
+record(bo, "$(P)$(R)RefreshConnection")
+{
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_REFRESH_CONNECTION")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(DESC, "Refresh connection status")
+}
+
+# On-demand: GET PixelConfig per chip from SERVAL; compare to BPC file (BPCFilePath/BPCFileName)
+record(bo, "$(P)$(R)RefreshPixelConfig")
+{
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_REFRESH_PIXEL_CONFIG")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(DESC, "Refresh PixelConfig vs BPC file")
+    # Same pattern as BPC/MaskBPC: after driver fills buffer, process waveform so VAL/NORD update (caget, Phoebus).
+    field(FLNK, "$(P)$(R)PixelConfigDiff.PROC CA")
+}
+
+# Detector init single source of truth: push current PV config to SERVAL (fileWriter + getServer), same effect as WriteData=1
+record(bo, "$(P)$(R)ApplyConfig")
+{
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_APPLY_CONFIG")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(DESC, "Apply current PV config to SERVAL")
+}
+
+record(int64in, "$(P)$(R)FreeSpace_RBV"){
+  field(DTYP, "asynInt64")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_FREE_SPACE")
+  field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)$(R)DiskLimReach_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_LLIM_REACH")
+    field(ZNAM, "false")
+    field(ONAM, "true")
+    field(SCAN, "I/O Intr")
+}
+
+#record(int64out, "$(P)$(R)DiskLowLimit"){
+#  field(DTYP, "asynInt64")
+#  field(OUT, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_LLIM_SPACE")
+#  info(autosaveFields, "VAL")
+#}
+record(int64in, "$(P)$(R)DiskLowLimit_RBV"){
+  field(DTYP, "asynInt64")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_LLIM_SPACE")
+  field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)WriteSpeed_RBV"){
+  field(DTYP, "asynFloat64")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_WRITE_SPEED")
+  field(SCAN, "I/O Intr")
+}
+
+# # TODO: Detector calibration and initialization completed
+# record(calcout, "$(P)$(R)DetCalibratedCalc") {
+#     field(DESC, "Detector calibration status")
+#   #  field(CALC, "((A=0)||(B=0))?1:0")
+#     field(CALC, "(B=0)?1:0")
+#     field(INPA, "$(P)$(R)ServalConnected_RBV CP")
+#     field(INPB, "$(P)$(R)DetConnected_RBV CP")
+#     field(OOPT, "Transition To Zero")
+#   #  field(OOPT, "When Zero")
+#     field(DOPT, "Use CALC")
+# }
+
+# Compare Serval streams and what is in EPICS streams
+record(calcout, "$(P)$(R)FileWriterCalc1") {
+    field(DESC, "File writer status")
+    field(CALC, "(A!=B||C!=D||E!=F||G!=H||I!=J||K!=L)?1:0")
+    field(INPA, "$(P)$(R)WriteRaw CP")
+    field(INPB, "$(P)$(R)WriteRaw_RBV CP")
+    field(INPC, "$(P)$(R)WriteRaw1 CP")
+    field(INPD, "$(P)$(R)WriteRaw1_RBV CP")
+    field(INPE, "$(P)$(R)WriteImg CP")
+    field(INPF, "$(P)$(R)WriteImg_RBV CP")
+    field(INPG, "$(P)$(R)WriteImg1 CP")
+    field(INPH, "$(P)$(R)WriteImg1_RBV CP")
+    field(INPI, "$(P)$(R)WritePrvImg CP")
+    field(INPJ, "$(P)$(R)WritePrvImg_RBV CP")
+    field(INPK, "$(P)$(R)WritePrvImg1 CP")
+    field(INPL, "$(P)$(R)WritePrvImg1_RBV CP")
+    field(OOPT, "Every Time")
+    field(DOPT, "Use CALC")
+  #  field(OUT, "$(P)$(R)FileWriterCalc PP")
+}
+
+# Additional file writer status for Preview Histogram
+record(calcout, "$(P)$(R)FileWriterCalc2") {
+    field(DESC, "File writer status 2")
+    field(CALC, "(A!=B)?1:0")
+    field(INPA, "$(P)$(R)WritePrvHst CP")
+    field(INPB, "$(P)$(R)WritePrvHst_RBV CP")
+    field(OOPT, "Every Time")
+    field(DOPT, "Use CALC")
+}
+
+# Combined file writer status
+record(calc, "$(P)$(R)FileWriterCalc") {
+    field(DESC, "Combined file writer status")
+    field(CALC, "A||B")
+    field(INPA, "$(P)$(R)FileWriterCalc1 CP")
+    field(INPB, "$(P)$(R)FileWriterCalc2 CP")
+}
+
+# Hot pixel: neutron specific
+record(calcout, "$(P)$(R)HotPixelCalc") {
+    field(DESC, "Hot pixel status")
+    field(CALC, "((A>65534)||((A>1000)&&(A>(30*B+C))))?1:0")
+    field(INPA, "$(P)$(S)MaxValue_RBV CP")
+    field(INPB, "$(P)$(S)MeanValue_RBV CP")
+    field(INPC, "$(P)$(S)Sigma_RBV CP")
+    field(OOPT, "Every Time")
+    field(DOPT, "Use CALC")
+}
+
+# TDC present if TDC1 and TDC2 event rates are 0 and detector is in running state
+record(calcout, "$(P)$(R)TdcCalc") {
+    field(DESC, "TDC present")
+    field(CALC, "(((A+B)=0)&&(C=1))?1:0")
+    field(INPA, "$(P)$(R)Tdc1EvtRate_RBV CP")
+    field(INPB, "$(P)$(R)Tdc2EvtRate_RBV CP")
+    field(INPC, "$(P)$(R)DetectorState_RBV CP")
+    field(OOPT, "Every Time")
+    field(DOPT, "Use CALC")
+}
+
+# PEL present if PEL event rate is 0 and detector is in running state
+record(calcout, "$(P)$(R)PelEvtCalc") {
+    field(DESC, "Pel Event present")
+    field(CALC, "((A=0)&&(B=1))?1:0")
+    field(INPA, "$(P)$(R)PelEvtRate_RBV CP")
+    field(INPB, "$(P)$(R)DetectorState_RBV CP")
+    field(OOPT, "Every Time")
+    field(DOPT, "Use CALC")
+}
+
+# Alarms: Tpx3 detector status
+record(calcout, "$(P)$(R)Tpx3StatusCalc") {
+    field(DESC, "Tpx3 status")
+    field(CALC, "((A=0)||(B=0)||(C=1)||(D=1)||(E=1)||(F=1))?1:0")
+    field(INPA, "$(P)$(R)ServalConnected_RBV CP")
+    field(INPB, "$(P)$(R)DetConnected_RBV CP")
+    field(INPC, "$(P)$(R)FileWriterCalc CP")
+    field(INPD, "$(P)$(R)HotPixelCalc CP")
+    field(INPE, "$(P)$(R)TdcCalc CP")
+    field(INPF, "$(P)$(R)PelEvtCalc CP")
+    field(OOPT, "Every Time")
+    field(DOPT, "Use CALC")
+}
+
+#Alarm
+record(bi, "$(P)$(R)AlarmDisable"){
+  field(ZSV, "MINOR")
+  field(OSV, "NO_ALARM")
+  field(PINI, "YES")
+  field(VAL, "1")
+  field(ONAM, "AlarmEnabled")
+  field(ZNAM, "AlarmDisabled")
+  info(archive, "Monitor, 00:00:01, VAL")
+}
+
+record(calc, "$(P)$(R)Alarm"){
+  field(INPA, "$(P)$(R)AlarmDisable CP NMS")
+  field(INPB, "$(P)$(R)Tpx3StatusCalc CP NMS")
+  field(CALC, "A&&(B!=0)")
+  field(HHSV, "MAJOR")
+  field(HIHI, "1")
+  info(archive, "Monitor, 00:00:01, VAL INPB INPC")
+}
