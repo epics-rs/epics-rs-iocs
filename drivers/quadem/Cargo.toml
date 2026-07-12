@@ -1,0 +1,17 @@
+# quadEM electrometer drivers (epics-modules/quadEM port).
+#
+# `drv_quad_em` is the shared base (parameter library, ring buffer, averaging,
+# position computation, NDArray callbacks); one module per device sits on top.
+
+[package]
+name = "quadem"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "ad", "ioc"] }
+# `ioc` is needed for `ad_core::ioc::{PluginManager, GenericDriverContext}`, which
+# `iocsh::register_quadem_port` uses to publish a port's twelve NDArray fan-outs.
+parking_lot = "0.12"
+log = "0.4"

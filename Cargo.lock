@@ -108,6 +108,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ah401-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "quadem",
+ "tokio",
+]
+
+[[package]]
+name = "ah501-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "quadem",
+ "tokio",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2134,6 +2154,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
+name = "quadem"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2646,6 +2675,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tetramm-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "quadem",
+ "tokio",
 ]
 
 [[package]]
