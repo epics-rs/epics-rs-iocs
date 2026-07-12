@@ -152,20 +152,18 @@ impl PortDriver for SimDetector {
                     0,
                     "Acquisition stopped".into(),
                 )?;
-                // Upstream computes Idle/Aborted and then unconditionally
-                // overwrites it with ADStatusAcquire on the next line
-                // (simDetector.cpp:913-918). Ported as written.
-                let interim = if image_mode == ImageMode::Continuous {
+                // FIXED (doc/upstream-c-defects.md #1): upstream computes
+                // Idle/Aborted and then unconditionally overwrites it with
+                // ADStatusAcquire on the next line (simDetector.cpp:913-918),
+                // discarding the real stopped status. Keep the computed status.
+                let stopped = if image_mode == ImageMode::Continuous {
                     ADStatus::Idle
                 } else {
                     ADStatus::Aborted
                 };
                 self.ad
                     .port_base
-                    .set_int32_param(p.status, 0, interim as i32)?;
-                self.ad
-                    .port_base
-                    .set_int32_param(p.status, 0, ADStatus::Acquire as i32)?;
+                    .set_int32_param(p.status, 0, stopped as i32)?;
             }
         }
         self.ad.port_base.call_param_callbacks(0)?;
@@ -435,20 +433,42 @@ mod tests {
     }
 
     #[test]
-    fn stopping_acquisition_signals_the_task_and_leaves_status_acquire() {
+    fn stopping_a_non_continuous_acquisition_leaves_status_aborted() {
         let mut f = Fixture::new();
         let acquire = f.det.ad.params.acquire;
+        // The driver defaults to Continuous; pick a non-continuous mode.
+        f.write_i32(f.det.ad.params.image_mode, ImageMode::Single as i32);
         f.write_i32(acquire, 1);
         let _ = f.start_rx.try_recv();
 
         f.write_i32(acquire, 0);
         assert_eq!(f.get_i32(acquire), 0);
         assert_eq!(f.get_i32(f.det.ad.params.acquire_busy), 0);
-        // Upstream overwrites the Idle/Aborted it just wrote with Acquire.
+        // FIXED (doc/upstream-c-defects.md #1): the computed stopped status is
+        // kept, no longer overwritten by ADStatusAcquire.
         assert_eq!(
             f.get_i32(f.det.ad.params.status),
-            ADStatus::Acquire as i32,
-            "simDetector.cpp:918 unconditionally sets ADStatusAcquire"
+            ADStatus::Aborted as i32,
+            "non-continuous stop reports Aborted"
+        );
+        assert!(f.stop_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn stopping_a_continuous_acquisition_leaves_status_idle() {
+        let mut f = Fixture::new();
+        let acquire = f.det.ad.params.acquire;
+        f.write_i32(f.det.ad.params.image_mode, ImageMode::Continuous as i32);
+        f.write_i32(acquire, 1);
+        let _ = f.start_rx.try_recv();
+
+        f.write_i32(acquire, 0);
+        assert_eq!(f.get_i32(acquire), 0);
+        // FIXED (doc/upstream-c-defects.md #1): continuous mode reports Idle.
+        assert_eq!(
+            f.get_i32(f.det.ad.params.status),
+            ADStatus::Idle as i32,
+            "continuous stop reports Idle"
         );
         assert!(f.stop_rx.try_recv().is_ok());
     }
