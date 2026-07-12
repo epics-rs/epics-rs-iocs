@@ -59,6 +59,29 @@ impl OctetIo {
         self.handle.port_name()
     }
 
+    /// The underlying port, for the asynCommon operations (`connect`,
+    /// `disconnect`, `setOutputEos`) that have no `asynOctetSyncIO` wrapper.
+    pub fn handle(&self) -> &PortHandle {
+        &self.handle
+    }
+
+    /// The same port at another timeout — `drvNSLS_EM` reads the discovery
+    /// datagrams with a shorter one than it uses for commands.
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            timeout,
+        }
+    }
+
+    /// `asynOctetSyncIO->write` of raw bytes.
+    pub fn write_bytes(&self, out: &[u8]) -> AsynResult<usize> {
+        let result = self
+            .handle
+            .submit_blocking(RequestOp::OctetWrite { data: out.to_vec() }, self.user())?;
+        Ok(result.nbytes)
+    }
+
     fn user(&self) -> AsynUser {
         AsynUser::new(OCTET_REASON)
             .with_addr(OCTET_ADDR)

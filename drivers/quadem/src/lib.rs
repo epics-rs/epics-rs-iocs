@@ -9,6 +9,7 @@
 //!
 //! - [`tetramm`] — CaenEls TetrAMM (`caenSrc/drvTetrAMM.cpp`)
 //! - [`ahxxx`] — Elettra/CaenEls AH401B and AH401D (`caenSrc/drvAHxxx.cpp`)
+//! - [`nsls_em`] — NSLS Precision Integrator (`nslsSrc/drvNSLS_EM.cpp`)
 //!
 //! Only devices reachable over a byte stream (TCP/UDP/serial) are in scope.
 //! `nslsSrc/drvNSLS2_EM` and `nslsSrc/drvNSLS2_IC` drive memory-mapped FPGA
@@ -18,9 +19,12 @@ pub mod ahxxx;
 pub mod ahxxx_proto;
 pub mod drv_quad_em;
 pub mod iocsh;
+pub mod nsls_em;
+pub mod nsls_em_proto;
 pub mod octet;
 pub mod tetramm;
 pub mod tetramm_proto;
 
 pub use ahxxx::{AhxxxRuntime, create_ahxxx};
+pub use nsls_em::{NslsEmRuntime, create_nsls_em};
 pub use tetramm::{TetrAmmRuntime, create_tetramm};
