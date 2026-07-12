@@ -394,10 +394,10 @@ impl Worker {
     /// C `readTiff` — wait for a new file, then retry the decode until the
     /// writer has finished.
     ///
-    /// Upstream behaviour preserved: when the retry loop exhausts `timeout`
+    /// Fixed (upstream-c-defects.md #13): when the retry loop exhausts `timeout`
     /// without a successful decode, C falls through and returns `asynSuccess`
-    /// with a buffer it never filled. This returns a zero-filled buffer in that
-    /// case rather than uninitialised memory.
+    /// with a buffer it never filled — the caller then publishes stale pixels.
+    /// This returns [`CamStatus::Error`] instead so no image is published.
     async fn read_tiff(&self, file: &str, nx: usize, ny: usize) -> Result<Vec<u16>, CamStatus> {
         let timeout = {
             let mut guard = self.server.lock().await;
@@ -472,7 +472,14 @@ impl Worker {
             delta_time = t_start.elapsed().as_secs_f64();
         }
 
-        Ok(decoded.unwrap_or_else(|| vec![0u16; nx * ny]))
+        let Some(data) = decoded else {
+            // Fixed (upstream-c-defects.md #13): the retry loop timed out
+            // without a valid frame. Do not fabricate a buffer or return it as
+            // success.
+            log::error!("marccd: timeout reading TIFF file {file}; image not published");
+            return Err(CamStatus::Error);
+        };
+        Ok(data)
     }
 }
 

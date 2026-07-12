@@ -53,9 +53,12 @@
 //!   `asynNDArrayDriver::setIntegerParam`'s side effect for the common
 //!   `ADWaitForPlugins == 0` case; the plugin-wait interaction is not modelled.
 //!
-//! Upstream defects are reproduced deliberately and marked in the source:
-//! `readTiff` returning success with an unwritten buffer when its retry loop
-//! expires (this port zero-fills rather than publishing uninitialised memory),
+//! Retro-fixed upstream defects (were reproduced for wire parity, now fixed at
+//! source per user policy; see `doc/upstream-c-defects.md`):
+//! * #13 — `readTiff` returned `asynSuccess` with an unwritten buffer when its
+//!   retry loop expired; now returns an error so no image is published.
+//!
+//! Upstream defects still reproduced deliberately and marked in the source:
 //! `getImageData` publishing that buffer even on a read error, and the
 //! duplicated `MarState_RBV` record in `marCCD.template`. One latent C bug is
 //! *not* reproduced: `collectSeries` returning early on a file-template error
