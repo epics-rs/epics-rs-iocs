@@ -345,6 +345,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bruker"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "bruker-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "bruker",
+ "epics-rs",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
