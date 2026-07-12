@@ -2025,6 +2025,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcr4-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "quadem",
+ "tokio",
+]
+
+[[package]]
 name = "phytron-ioc"
 version = "0.1.0"
 dependencies = [

@@ -20,6 +20,7 @@ use epics_rs::base::server::iocsh::registry::{
 
 use crate::ahxxx::{AhxxxRuntime, create_ahxxx};
 use crate::drv_quad_em::QE_ADDR_ALL;
+use crate::pcr4::{Pcr4Runtime, create_pcr4};
 
 /// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`),
 /// restricted to the escapes an octet EOS can carry.
@@ -213,6 +214,76 @@ pub fn ahxxx_configure_command(
                 &model_name,
             )
             .map_err(|e| format!("drvAHxxxConfigure: {e}"))?;
+
+            register_quadem_port(
+                &mgr,
+                &trace,
+                &port_name,
+                rt.port_handle().clone(),
+                rt.pool.clone(),
+                &rt.outputs,
+            );
+
+            *runtime.lock().unwrap() = Some(rt);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// C++ `drvPCR4Configure(portName, QEPortName, ringBufferSize)`.
+///
+/// The trailing `maxMemory` argument has no C++ analogue (the C++ `NDArrayPool`
+/// is unbounded) and bounds the Rust pool.
+pub fn pcr4_configure_command(
+    mgr: Arc<PluginManager>,
+    trace: Arc<TraceManager>,
+    runtime: Arc<Mutex<Option<Pcr4Runtime>>>,
+) -> CommandDef {
+    CommandDef::new(
+        "drvPCR4Configure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "QEPortName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "ringBufferSize",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "maxMemory",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvPCR4Configure portName QEPortName ringBufferSize [maxMemory]",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = match args.first() {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("portName required".into()),
+            };
+            let qe_port_name = match args.get(1) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("QEPortName required".into()),
+            };
+            let ring_buffer_size = match args.get(2) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 0,
+            };
+            let max_memory = match args.get(3) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 100_000_000,
+            };
+
+            let rt = create_pcr4(&port_name, &qe_port_name, ring_buffer_size, max_memory)
+                .map_err(|e| format!("drvPCR4Configure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
