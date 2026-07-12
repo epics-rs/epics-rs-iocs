@@ -30,9 +30,16 @@ record(calcout,"$(P)$(R)dec")
     field(CALC, "A-B")
     field(OUT,  "$(P)$(R)delay PP NMS")
 }
+# Fixed upstream defect (doc/upstream-c-defects.md #35): upstream's "step"
+# ao record had no DTYP/OUT (dead wiring) -- ColbyDriver's addr 4 ("Write
+# step" per colby.rs's developer-notes table) is the unambiguous wire
+# command this record's own name/DESC describe, so it is wired here rather
+# than removed.
 record(ao,"$(P)$(R)step")
 {
     field(DESC, "Colby step")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),4)")
     field(PREC, "$(PREC)")
 }
 record(ai,"$(P)$(R)step_rbk")
