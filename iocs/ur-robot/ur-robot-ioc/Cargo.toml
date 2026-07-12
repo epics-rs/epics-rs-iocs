@@ -1,0 +1,11 @@
+[package]
+name = "ur-robot-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ur-robot = { path = "../../../drivers/ur-robot" }
+epics-rs = { workspace = true, features = ["asyn", "bridge"] }
+asyn-rs = { workspace = true, features = ["epics"] }
+tokio = { version = "1", features = ["full"] }
