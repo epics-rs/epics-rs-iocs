@@ -60,3 +60,24 @@ dbLoadRecords("iocs/ip/ip-ioc/db/televac.db", "P=$(PREFIX),GAUGE=tv1,PORT=TVAC1,
 dbLoadRecords("iocs/ip/ip-ioc/db/televac.db", "P=$(PREFIX),GAUGE=tv2,PORT=TVAC1,ADDR=1")
 dbLoadRecords("iocs/ip/ip-ioc/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly1,PORT=TVAC1,ADDR=0")
 dbLoadRecords("iocs/ip/ip-ioc/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly2,PORT=TVAC1,ADDR=1")
+
+# --- MKS / HPS SensaVac 937 gauge controller --------------------------------
+# devAiMKS.c: "set the serial port settings ... to use the correct baud rate and
+# even parity", and it relied on the port EOS for the reply terminator.
+drvAsynSerialPortConfigure("SerialMKS", "/dev/ttyS3", 0, 0, 0)
+asynSetOption("SerialMKS", 0, "baud", "9600")
+asynSetOption("SerialMKS", 0, "bits", "7")
+asynSetOption("SerialMKS", 0, "parity", "even")
+asynSetOption("SerialMKS", 0, "stop", "1")
+asynOctetSetInputEos("SerialMKS", 0, "\r")
+asynOctetSetOutputEos("SerialMKS", 0, "\r")
+
+# MKSConfig(portName, octetPort, numGauges, pollPeriodSeconds)
+MKSConfig("MKS1", "SerialMKS", 5, 1.0)
+
+# ipApp/Db/MKS.db: gauges 1 and 2 are cold cathodes, 4 and 5 Piranis. asyn
+# addresses are 0-based here, so gauge n is address n-1.
+dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=cc1,PORT=MKS1,ADDR=0")
+dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=cc2,PORT=MKS1,ADDR=1")
+dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=pr1,PORT=MKS1,ADDR=3")
+dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=pr2,PORT=MKS1,ADDR=4")

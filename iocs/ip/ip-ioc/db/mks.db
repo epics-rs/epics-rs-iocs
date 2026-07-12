@@ -1,0 +1,74 @@
+# MKS / HPS SensaVac 937 gauge controller, one instance per gauge.
+#
+#   $(P)      PV prefix
+#   $(GAUGE)  this gauge's name, e.g. "cc1"
+#   $(PORT)   asyn port created by MKSConfig
+#   $(ADDR)   gauge index, 0-based (gauge 1 -> 0). ipApp/Db/MKS.db numbered the
+#             gauges 1..5 in the link instead; the port numbers its asyn
+#             addresses from 0 like every other port in this crate.
+#
+# devAiMKS.c set EGU/LOPR/HOPR of the ai record from the controller's SU and SG
+# replies inside init_record. A port driver cannot write record fields, so the
+# units, the gauge type and the gauge's range are published as parameters
+# (:UNITS, :TYPE, :LOW, :HIGH) and left for the display to use.
+
+record(ai, "$(P)$(GAUGE):PRES") {
+    field(DESC, "Pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))MKS_PRESSURE")
+}
+
+# devAiMKS.c raised these alarms from device support; they are record alarms now.
+record(mbbi, "$(P)$(GAUGE):STATUS") {
+    field(DESC, "Reading status")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))MKS_STATUS")
+    field(ZRVL, "0")
+    field(ZRST, "OK")
+    field(ONVL, "1")
+    field(ONST, "Above range")
+    field(ONSV, "MINOR")
+    field(TWVL, "2")
+    field(TWST, "Below range")
+    field(TWSV, "MINOR")
+    field(THVL, "3")
+    field(THST, "No gauge")
+    field(THSV, "MAJOR")
+    field(FRVL, "4")
+    field(FRST, "Unknown reply")
+    field(FRSV, "MAJOR")
+    field(UNSV, "MAJOR")
+}
+
+record(stringin, "$(P)$(GAUGE):UNITS") {
+    field(DESC, "Pressure units")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))MKS_UNITS")
+}
+
+record(stringin, "$(P)$(GAUGE):TYPE") {
+    field(DESC, "Gauge type")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))MKS_GAUGE_TYPE")
+}
+
+record(ai, "$(P)$(GAUGE):LOW") {
+    field(DESC, "Low limit of the gauge")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))MKS_LOW_LIMIT")
+}
+
+record(ai, "$(P)$(GAUGE):HIGH") {
+    field(DESC, "High limit of the gauge")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))MKS_HIGH_LIMIT")
+}

@@ -11,6 +11,7 @@
 //! MPCConfig(port, octetPort, address, [pollPeriod])
 //! TPG261Config(port, octetPort, [pollPeriod])
 //! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
+//! MKSConfig(port, octetPort, numGauges, [pollPeriod])
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
+use ip_devices::mks::create_mks;
 use ip_devices::mpc::create_mpc;
 use ip_devices::runtime::IpPortRuntime;
 use ip_devices::televac::create_televac;
@@ -210,6 +212,51 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 4, 1.0)?;
                 let port = create_televac(&name, &octet, stations, relays, poll)
                     .map_err(|e| format!("TelevacConfig failed: {e}"))?;
+                register(&ports, &name, &trace, port);
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // MKSConfig(port, octetPort, numGauges, [pollPeriod])
+    {
+        let ports = ports.clone();
+        let trace = trace.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "MKSConfig",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "octetPort",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "numGauges",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "pollPeriod",
+                    arg_type: ArgType::Double,
+                    optional: true,
+                },
+            ],
+            "MKSConfig portName octetPort numGauges [pollPeriod] - MKS/HPS SensaVac 937 \
+             gauge controller",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let name = string_arg(args, 0)?;
+                let octet = string_arg(args, 1)?;
+                let gauges = int_arg(args, 2)?;
+                let gauges = u8::try_from(gauges)
+                    .map_err(|_| format!("MKSConfig: numGauges {gauges} is not 1..5"))?;
+                let poll = poll_arg(args, 3, 1.0)?;
+                let port = create_mks(&name, &octet, gauges, poll)
+                    .map_err(|e| format!("MKSConfig failed: {e}"))?;
                 register(&ports, &name, &trace, port);
                 Ok(CommandOutcome::Continue)
             },
