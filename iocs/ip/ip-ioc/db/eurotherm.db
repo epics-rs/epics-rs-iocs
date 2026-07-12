@@ -1,0 +1,36 @@
+# Eurotherm 800/2000 temperature controller, one instance per controller.
+#
+#   $(P)      PV prefix
+#   $(ET)     this controller's name, e.g. "et1"
+#   $(PORT)   asyn port created by EurothermConfig
+#   $(LADDR)  the controller's local address on the line (the C link's LAD=)
+#
+# The parameter name in the link IS the payload format the C carried in FMT=,
+# so the mnemonic (SL, SP, ...) is the literal part of it. Derived from the
+# Eurotherm records of ipApp/Db/Eurotherm.db, which the module ships with
+# DTYP "<none>" — that database drives its reads through devXxStrParm, which is
+# not ported, so only the write half is here.
+
+record(ao, "$(P)$(ET):Setpoint") {
+    field(DESC, "Setpoint")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(LADDR=0),$(TIMEOUT=3))SL%4.0lf")
+    field(PREC, "0")
+}
+
+record(ao, "$(P)$(ET):RampRate") {
+    field(DESC, "Ramp rate")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(LADDR=0),$(TIMEOUT=3))RR%4.0lf")
+    field(PREC, "0")
+}
+
+# The C's stringout path: VAL is the mnemonic to read, and the driver sends
+# EOT G G L L <mnemonic> ENQ. Nothing collects the controller's answer — the C
+# left that to a devXxStrParm record, which is not ported.
+record(stringout, "$(P)$(ET):ReadRequest") {
+    field(DESC, "Send a read request")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT),$(LADDR=0),$(TIMEOUT=3))EURO_READ")
+    field(VAL,  "SP")
+}

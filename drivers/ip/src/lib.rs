@@ -16,6 +16,7 @@
 //! | `devTelevac.c` | [`televac`] | Televac vacuum gauge controller |
 //! | `devAiMKS.c` | [`mks`] | MKS / HPS SensaVac 937 gauge controller |
 //! | `devAiHeidND261.c` | [`nd261`] | Heidenhain ND261 display unit |
+//! | `devXxEurotherm.c` | [`eurotherm`] | Eurotherm 800/2000 temperature controller |
 //!
 //! All device I/O runs on a plain `std::thread` worker owned by the port (see
 //! [`worker`]); the asyn write handlers only enqueue onto it. That keeps
@@ -23,6 +24,7 @@
 //! path is not usable.
 
 pub mod connect;
+pub mod eurotherm;
 pub mod fmt;
 pub mod mks;
 pub mod mpc;

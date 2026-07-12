@@ -13,6 +13,7 @@
 //! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
 //! MKSConfig(port, octetPort, numGauges, [pollPeriod])
 //! ND261Config(port, octetPort, [pollPeriod])
+//! EurothermConfig(port, octetPort, groupAddress)
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
+use ip_devices::eurotherm::create_eurotherm;
 use ip_devices::mks::create_mks;
 use ip_devices::mpc::create_mpc;
 use ip_devices::nd261::create_nd261;
@@ -295,6 +297,45 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 1.0)?;
                 let port = create_nd261(&name, &octet, poll)
                     .map_err(|e| format!("ND261Config failed: {e}"))?;
+                register(&ports, &name, &trace, port);
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // EurothermConfig(port, octetPort, groupAddress)
+    {
+        let ports = ports.clone();
+        let trace = trace.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "EurothermConfig",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "octetPort",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "groupAddress",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+            ],
+            "EurothermConfig portName octetPort groupAddress - Eurotherm 800/2000 \
+             temperature controller (the asyn address is the local address)",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let name = string_arg(args, 0)?;
+                let octet = string_arg(args, 1)?;
+                let group = int_arg(args, 2)?;
+                let group = u8::try_from(group)
+                    .map_err(|_| format!("EurothermConfig: groupAddress {group} is not 0..9"))?;
+                let port = create_eurotherm(&name, &octet, group)
+                    .map_err(|e| format!("EurothermConfig failed: {e}"))?;
                 register(&ports, &name, &trace, port);
                 Ok(CommandOutcome::Continue)
             },
