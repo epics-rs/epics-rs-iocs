@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "drivers/ad/eiger",
     "drivers/d435i",
     "drivers/motor/amci",
     "drivers/motor/common",
@@ -33,6 +34,7 @@ members = [
     "drivers/meascomp/uldaq-sys",
     "drivers/meascomp/usb-2408",
     "drivers/meascomp/usb-ctr",
+    "iocs/ad/eiger-ioc",
     "iocs/d435i-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",

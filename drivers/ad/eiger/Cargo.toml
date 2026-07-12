@@ -1,0 +1,29 @@
+[package]
+name = "eiger"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "ad"] }
+# The SIMPLON stream and the FileWriter HDF5 files are both bslz4/lz4 encoded.
+# ad-plugins-rs owns the NDArray-level codec descriptors we attach when the
+# driver passes compressed frames through undecoded.
+ad-plugins-rs = { workspace = true }
+parking_lot = "0.12"
+log = "0.4"
+serde_json = "1.0"
+# Plain-HTTP only: the SIMPLON REST API is served over http on port 80, so no
+# TLS stack is pulled in.
+ureq = { version = "3.3", default-features = false }
+# Pure-Rust ZeroMQ (zmq.rs). The C driver links libzmq; this is the pure-Rust
+# PULL socket the stream interface needs.
+zeromq = { version = "0.6", default-features = false, features = [
+    "tokio-runtime",
+    "tcp-transport",
+] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+# Pure-Rust read-only HDF5 decoder: the FileWriter path parses detector-written
+# .h5 files in memory, as the C driver does with H5LTopen_file_image.
+hdf5-reader = { version = "0.8", default-features = false, features = ["lz4"] }
