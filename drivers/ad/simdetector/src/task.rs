@@ -241,9 +241,24 @@ async fn sim_task(mut ctx: SimTaskContext) {
         let mut image = match ctx.compute_image(&mut engine).await {
             Ok(image) => image,
             Err(e) => {
-                // C: `status = computeImage(); if (status) continue;` — the task
-                // stays in the acquiring state and retries on the next pass.
+                // FIXED (doc/upstream-c-defects.md #2): upstream does
+                // `status = computeImage(); if (status) continue;` with ADAcquire
+                // still set, so a persistently failing computeImage spins the
+                // task hot, recomputing with no delay. Instead report the failure
+                // via ADStatusError and end the acquisition, so the task returns
+                // to waiting for the next start event rather than busy-looping.
                 log::error!("simDetector: {e}");
+                notify(
+                    &ctx.handle,
+                    vec![
+                        int32(ctx.ad.status, ADStatus::Error as i32),
+                        octet(ctx.ad.status_message, "Image computation failed"),
+                    ],
+                )
+                .await;
+                ctx.set_shutter(false).await;
+                acquire = false;
+                ctx.clear_acquire_busy(true).await;
                 continue;
             }
         };
