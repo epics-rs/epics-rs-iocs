@@ -354,14 +354,15 @@ impl VsRecord {
     /// C `vsRecord.c::checkAlarms`, minus the leading `udf` branch, which the
     /// framework's `rec_gbl_check_udf` owns.
     ///
-    /// Note that C loads `val = pvs->val` and then immediately overwrites it
-    /// with `val = pvs->pres`, so `PRES` — not `VAL` — is what is alarm-checked.
-    /// `readWrite_vs` assigns `pres = val` at the end of every successful decode,
-    /// so the two agree except on the error returns, where `PRES` still holds the
-    /// last good pressure. Reproduced as written.
+    /// Fixes doc/upstream-c-defects.md #19: `checkAlarms` loaded `val = pvs->val`
+    /// then immediately overwrote it with `val = pvs->pres` (marked
+    /// `/* need to be removed someday */` in `vsRecord.c:347`), so `PRES` — not
+    /// `VAL` — was alarm-checked. `VAL` is the field the `.dbd` documents as the
+    /// gauge pressure the alarm limits guard, so the limits are now applied to
+    /// `VAL`.
     fn limit_alarms(&mut self, common: &mut CommonFields) {
         let (hihi, lolo, high, low) = (self.hihi, self.lolo, self.high, self.low);
-        let val = self.pres;
+        let val = self.val;
         let hyst = self.hyst;
         let lalm = self.lalm;
 
@@ -632,13 +633,16 @@ mod tests {
     }
 
     #[test]
-    fn alarms_are_checked_against_pres_not_val() {
+    fn alarms_are_checked_against_val_not_pres() {
+        // Regression for doc/upstream-c-defects.md #19: VAL above HIHI trips the
+        // alarm even though PRES sits below every limit. Pre-fix (PRES-checked)
+        // this stayed NO_ALARM.
         let mut r = VsRecord {
             dev_ran: true,
             hhsv: 2, // MAJOR
             hihi: 1e-6,
-            val: 1e-12, // below every limit
-            pres: 1e-5, // above HIHI
+            val: 1e-5,   // above HIHI
+            pres: 1e-12, // below every limit
             ..Default::default()
         };
         let mut c = common();
@@ -649,12 +653,29 @@ mod tests {
     }
 
     #[test]
+    fn pres_no_longer_drives_the_alarm() {
+        // The old defect alarmed on PRES; verify a high PRES with a safe VAL now
+        // stays clear.
+        let mut r = VsRecord {
+            dev_ran: true,
+            hhsv: 2, // MAJOR
+            hihi: 1e-6,
+            val: 1e-12, // below every limit
+            pres: 1e-5, // above HIHI, but PRES is not checked anymore
+            ..Default::default()
+        };
+        let mut c = common();
+        r.check_alarms(&mut c);
+        assert_eq!(c.nsev, AlarmSeverity::NoAlarm);
+    }
+
+    #[test]
     fn a_zero_severity_disables_its_limit() {
         let mut r = VsRecord {
             dev_ran: true,
             hhsv: 0,
             hihi: 1e-6,
-            pres: 1e-5,
+            val: 1e-5,
             ..Default::default()
         };
         let mut c = common();
@@ -671,20 +692,20 @@ mod tests {
             hhsv: 1, // MINOR
             hihi: 1e-6,
             hyst: 5e-7,
-            pres: 2e-6,
+            val: 2e-6,
             ..Default::default()
         };
         r.check_alarms(&mut common());
         assert_eq!(r.lalm, 1e-6f32 as f64);
 
         // 7e-7 is below HIHI but within HYST of it, and LALM == HIHI.
-        r.pres = 7e-7;
+        r.val = 7e-7;
         let mut c = common();
         r.check_alarms(&mut c);
         assert_eq!(c.nsta, alarm_status::HIHI_ALARM);
 
         // 4e-7 clears HIHI - HYST.
-        r.pres = 4e-7;
+        r.val = 4e-7;
         let mut c = common();
         r.check_alarms(&mut c);
         assert_eq!(c.nsev, AlarmSeverity::NoAlarm);
@@ -699,7 +720,7 @@ mod tests {
             hsv: 2,
             hihi: 1e-6,
             high: 1e-7,
-            pres: 1e-5,
+            val: 1e-5,
             ..Default::default()
         };
         let mut c = common();
@@ -716,7 +737,7 @@ mod tests {
             read_alarm: true,
             hhsv: 1,
             hihi: 1e-6,
-            pres: 1e-5,
+            val: 1e-5,
             ..Default::default()
         };
         let mut c = common();
@@ -730,7 +751,7 @@ mod tests {
         let mut r = VsRecord {
             hhsv: 1,
             hihi: 1e-6,
-            pres: 1e-5,
+            val: 1e-5,
             ..Default::default()
         };
         let mut c = common();
