@@ -107,15 +107,16 @@ record(waveform, "$(P)$(R)URL_RBV")
 # mbbo record to select 1 of the 10 URLs.
 # The strings can be changed at run-time and are in save/restore.
 #
-# Ported verbatim from upstream, INCLUDING a pre-existing upstream typo:
-# EIST ("URL9") has no EIVL set (defaults to 0, colliding with the record's
-# unset-RVAL default), and NIST ("URL10")'s NIVL is "8" instead of a unique
-# value (colliding with SVST/"URL8"'s SVVL="8") because the SVVL line is
-# duplicated instead of an EIVL line. Selecting "URL10" therefore drives the
-# same seq link as "URL8", and "URL9" cannot be distinguished from an unset
-# selector. This is not introduced by this port -- it is present verbatim in
-# areaDetector ADURL urlApp/Db/URLDriver.template and reproduced here for
-# wire parity.
+# Retro-fixed (doc/upstream-c-defects.md #7): upstream areaDetector ADURL
+# urlApp/Db/URLDriver.template has EIST ("URL9") with no EIVL set (defaults
+# to 0, colliding with the record's unset-RVAL default), and NIST
+# ("URL10")'s NIVL is "8" instead of a unique value (colliding with
+# SVST/"URL8"'s SVVL="8") because the SVVL line is duplicated instead of an
+# EIVL line -- so selecting "URL10" drove the same seq link as "URL8", and
+# "URL9" was indistinguishable from an unset selector. Fixed here by
+# assigning EIVL="9" and NIVL="10", continuing the record's own 1..10 RVAL
+# progression (ZRVL=1 .. SVVL=8) so each URLn string maps to its own
+# seq link (DOL9/LNK9 for URL9, DOLA/LNKA for URL10).
 record (mbbo, "$(P)$(R)URLSelect")
 {
     field(PINI, "YES")
@@ -136,9 +137,9 @@ record (mbbo, "$(P)$(R)URLSelect")
     field(SVST, "URL8")
     field(SVVL, "8")
     field(EIST, "URL9")
-    field(SVVL, "8")
+    field(EIVL, "9")
     field(NIST, "URL10")
-    field(NIVL, "8")
+    field(NIVL, "10")
     field(FLNK, "$(P)$(R)URLSeq.PROC PP MS")
     info(autosaveFields, "VAL ZRST ONST TWST THST FRST FVST SXST SVST EIST NIST")
 }
