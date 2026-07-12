@@ -23,10 +23,18 @@
 # exists; it never functioned (OUT was left unwired) so no working
 # behavior is lost.
 #
+# Removed upstream defect (doc/upstream-c-defects.md #38, both D and H):
+# AlarmI.INPA referenced "$(s):$(ta):$(ss):BDetStatus", never defined
+# anywhere in the module -- no in-file target exists to repoint to, so
+# the dangling INPA link is removed. AlarmI itself stays: INPB/INPC/INPD
+# (Vol/Pressure/Flow .SEVR, all real links) keep it functional, so the
+# record is not removed, only the dead term. PV-surface change: CALC's
+# "(A==3)||" leading disjunct is dropped (A defaulted to 0 with INPA
+# unlinked, so this term was already always-false; behavior is
+# unchanged, only the dead input link and its no-op CALC term are gone).
+#
 # UNFIXED (upstream defects preserved as-is -- no fix target exists, or
 # preservation was explicitly directed):
-#   - AlarmI.INPA references "$(s):$(ta):$(ss):BDetStatus", never defined
-#     anywhere in the module (approved: port as-is).
 #   - The five "*PARSE" aSub records (Vol/Pressure/PressSet_RBV/Flow/
 #     MaxFlow_RBV) all name a subroutine, "shiftleftpressSet", that does
 #     not exist anywhere in the shipped module source (confirmed by
@@ -347,14 +355,14 @@ record(waveform, "$(s):$(ta):$(ss):CmdReply") {
 
 record(calc, "$(s):$(ta):$(ss):AlarmI") {
    field(DESC, "Immediate Alarm")
-   # UPSTREAM DEFECT (preserved, no fix target): INPA references
-   # "$(s):$(ta):$(ss):BDetStatus", which is never defined anywhere in
-   # the module. Approved: port as-is.
-   field(INPA, "$(s):$(ta):$(ss):BDetStatus")
+   # Removed upstream defect (doc/upstream-c-defects.md #38): INPA
+   # referenced "$(s):$(ta):$(ss):BDetStatus", never defined anywhere in
+   # the module -- dangling link removed, CALC's "(A==3)||" term dropped
+   # with it (see this file's header comment).
    field(INPB, "$(s):$(ta):$(ss):Vol.SEVR")
    field(INPC, "$(s):$(ta):$(ss):Pressure.SEVR")
    field(INPD, "$(s):$(ta):$(ss):Flow.SEVR")
-   field(CALC, "(A==3)||B||C||D")
+   field(CALC, "B||C||D")
    field(HIHI, "0.5")
    field(HHSV, "MAJOR")
    info(archive, "Monitor, 00:00:01, VAL")
