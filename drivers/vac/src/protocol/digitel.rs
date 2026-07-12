@@ -829,14 +829,17 @@ pub fn decode(cfg: &Config, buf: &ResponseBuf, prev: &Readings) -> Readings {
             } else {
                 r.bkin = 1;
                 scan_two_floats(pv.s(), &mut r.spr[2], &mut r.shr[2]);
-                // C writes `s2mr`/`s2vr` here where it means `s3mr`/`s3vr`;
-                // the case-2 fall-through then overwrites both. Ported as
-                // written — see the crate docs.
+                // Fixes doc/upstream-c-defects.md #22: C's `switch (noSPT)`
+                // case 3 wrote the setpoint-3 mode/vent readbacks into
+                // `s2mr`/`s2vr` (setpoint 2), and the case-2 fall-through then
+                // overwrote them from the setpoint-2 data — so the setpoint-3
+                // mode/vent flags were lost. They now land in `smr[2]`/`svr[2]`,
+                // which case 2 no longer touches.
                 if pv.at(14) == b'1' {
-                    r.smr[1] = 1;
+                    r.smr[2] = 1;
                 }
                 if pv.at(16) == b'1' {
-                    r.svr[1] = 0;
+                    r.svr[2] = 0;
                 }
                 if pv.at(17) == b'1' {
                     r.s3br = 1;
@@ -1687,10 +1690,12 @@ mod tests {
         assert_eq!(r.svr[0], 0);
         assert_eq!(r.smr[1], 1);
         assert_eq!(r.svr[1], 0);
-        // Upstream never writes s3mr/s3vr: the case-3 block writes s2mr/s2vr
-        // and the case-2 fall-through overwrites them.
-        assert_eq!(r.smr[2], 0);
-        assert_eq!(r.svr[2], 1);
+        // Regression for doc/upstream-c-defects.md #22: setpoint 3's mode/vent
+        // readbacks now land in smr[2]/svr[2] (columns 14/16 of the offset-120
+        // block are both '1'), instead of being written to smr[1]/svr[1] and
+        // clobbered by the setpoint-2 fall-through as upstream did.
+        assert_eq!(r.smr[2], 1);
+        assert_eq!(r.svr[2], 0);
     }
 
     #[test]
