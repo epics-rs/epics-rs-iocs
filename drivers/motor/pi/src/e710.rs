@@ -32,19 +32,19 @@
 //! errors the connect when it is not. Axis count is then probed by `#TP` over
 //! `1..=6`, stopping at the first silent axis.
 //!
-//! ## Firmware-version status shift — the `2^8` C bug (reproduced)
+//! ## Firmware-version status shift — the `2^8` C bug (fixed here)
 //! Older E-710 revisions return a 1-byte status that C intends to shift into
 //! the high byte. The version test picks who needs the shift:
 //! ```text
 //! statusShift = !((version >= 5000 || version == 4019 || version == 4020)
 //!                 && version != 5018)
 //! ```
-//! But the shift itself is written `mstat.All = statusInt * (2^8)`, and in C
-//! `2^8` is the bitwise-XOR `2 ^ 8 == 10`, **not** `256`. So a "shifted" status
-//! is multiplied by ten (then truncated to 16 bits), never actually reaching
-//! the high byte where the meaningful bits live. [`decode_status`] reproduces
-//! this byte-faithfully (`wrapping_mul(10)`), with this comment as the record
-//! of the upstream defect. **Not fixed** — reproduced verbatim.
+//! But upstream writes the shift as `mstat.All = statusInt * (2^8)`, and in C
+//! `2^8` is the bitwise-XOR `2 ^ 8 == 10`, **not** `256` — so C multiplies a
+//! "shifted" status by ten and its bits never reach the high byte where the
+//! meaningful bits live. [`decode_status`] implements the intended `* 256`
+//! (`<< 8`) instead (upstream defect register `doc/upstream-c-defects.md`
+//! #45, retro-fixed per the fix-at-source policy).
 //!
 //! ## Status word decode (`E710_Status_Reg`, C `set_status`)
 //! Meaningful bits (LSB-numbered) in the 16-bit word: bit 8 `torque`
@@ -177,13 +177,14 @@ struct StatusBits {
     minus_ls: bool,
 }
 
-/// Decode the 16-bit status word (C `set_status`), applying the `statusShift`
-/// `2^8`-is-XOR-10 reproduction and the done-gated limit-switch read.
+/// Decode the 16-bit status word (C `set_status`), applying the intended
+/// high-byte `statusShift` and the done-gated limit-switch read.
 fn decode_status(status_int: u32, status_shift: bool) -> StatusBits {
-    // C: `mstat.All = statusInt * (2^8)` where `2^8 == 10` (XOR), truncated to
-    // 16 bits; else `mstat.All = statusInt`.
+    // C intends `mstat.All = statusInt * 256` but writes `statusInt * (2^8)`
+    // (XOR = 10), so the shifted bits never reach the high byte. Implement the
+    // intent (`<< 8`, truncated to 16 bits); upstream defect register #45.
     let mstat: u16 = if status_shift {
-        status_int.wrapping_mul(10) as u16
+        status_int.wrapping_mul(256) as u16
     } else {
         status_int as u16
     };
@@ -611,14 +612,24 @@ mod tests {
     }
 
     #[test]
-    fn status_shift_multiplies_by_ten_not_256_c_xor_bug() {
-        // Reproduce the `2^8 == 10` XOR bug: a small statusInt "shifted" is
-        // multiplied by 10, so its bits never reach the high byte (>= bit 8).
-        // statusInt = 25 -> 250 (0xFA), all bits in the low byte -> done, no LS.
-        let bits = decode_status(25, true);
-        assert!(bits.done); // no moving bit reached bit 10
-        assert!(bits.powered); // no torque bit reached bit 8
-        assert!(!bits.plus_ls);
+    fn status_shift_moves_low_byte_into_high_byte() {
+        // Upstream defect register #45 (retro-fixed): C's `2^8` XOR typo
+        // multiplied by 10; the intended shift is `* 256`. A 1-byte status
+        // must land in the high byte where the meaningful bits live.
+        // statusInt bit 0 -> torque (bit 8): powered cleared, done forced.
+        let bits = decode_status(1 << 0, true);
+        assert!(bits.done);
+        assert!(!bits.powered);
+
+        // statusInt bit 2 -> moving (bit 10), no torque -> not done.
+        let bits = decode_status(1 << 2, true);
+        assert!(!bits.done);
+        assert!(bits.powered);
+
+        // statusInt bits 3/4 -> minus/plus LS (bits 11/12), read once done.
+        let bits = decode_status(1 << 4, true);
+        assert!(bits.done);
+        assert!(bits.plus_ls);
         assert!(!bits.minus_ls);
     }
 
