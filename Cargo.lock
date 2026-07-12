@@ -968,6 +968,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ether-ip"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "ether-ip-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "ether-ip",
+ "log",
+ "tokio",
+]
+
+[[package]]
 name = "faulhaber-ioc"
 version = "0.1.0"
 dependencies = [
