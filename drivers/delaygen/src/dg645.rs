@@ -25,6 +25,12 @@
 //!   difference (the SPLA/SPLO argument has one fixed wire meaning across
 //!   every channel). Corrected here to the T0/AB/CD/EF convention; see
 //!   `commands_use_consistent_step_polarity_convention` below.
+//! - **#33 `T0_OFSET_STEP` tag typo** (`drvAsynDG645.cpp:436`; missing the
+//!   second F, every other output uses `*_OFFSET_STEP`): the wire commands
+//!   themselves (`SSLO?0`/`SSLO 0,%-.2f`) never spell "offset" out at all,
+//!   so this was a label-only typo in the driver's own tag, not a DG645
+//!   wire command string — and no db template in this workspace referenced
+//!   the old spelling. Corrected to `T0_OFFSET_STEP`.
 //!
 //! # Preserved upstream quirks (not "fixed")
 //! - `cvtErrorCode`'s dead branch (`if(!check_errors) *outBuf=-1;` with no
@@ -33,9 +39,6 @@
 //!   check_errors state. See [`Dg645Driver::error`] usage in `read_int32`.
 //! - `cvtErrorText`'s typo `"Status ckecking disabled"` (sic) — see
 //!   [`status_text`].
-//! - The `T0_OFSET_STEP` tag is itself missing an `F` (`drvAsynDG645.cpp:436`;
-//!   every other output uses `*_OFFSET_STEP`). Preserved verbatim since a
-//!   `.template` link must match the driver's registered tag exactly.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
@@ -267,9 +270,14 @@ static COMMANDS: &[CommandSpec] = &[
     cmd("T0_AMP_STEP", "SSLA?0", "SSLA 0,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
     cmd("T0_OFFSET_STEP_NEG", "", "SPLO 0,0", Conv::Sink, WriteKind::CommandOnly),
     cmd("T0_OFFSET_STEP_POS", "", "SPLO 0,1", Conv::Sink, WriteKind::CommandOnly),
-    // sic: upstream tag is "OFSET" (missing the second F), not "OFFSET" —
-    // preserved verbatim, see module doc.
-    cmd("T0_OFSET_STEP", "SSLO?0", "SSLO 0,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
+    // Fixed upstream defect (doc/upstream-c-defects.md #33): upstream's tag
+    // was "T0_OFSET_STEP" (missing the second F, drvAsynDG645.cpp:436).
+    // The wire commands themselves ("SSLO?0"/"SSLO 0,%-.2f") never spell
+    // out "offset" at all -- this is a label-only typo in the driver's own
+    // internal tag, not a DG645 wire command string, and no db template in
+    // this workspace references the old spelling. Corrected to match every
+    // other output's "*_OFFSET_STEP" naming.
+    cmd("T0_OFFSET_STEP", "SSLO?0", "SSLO 0,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
 
     // AB output commands
     cmd("AB_AMP", "LAMP?1", "LAMP 1,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
@@ -732,9 +740,10 @@ mod tests {
     }
 
     #[test]
-    fn command_table_preserves_ofset_typo() {
-        assert!(COMMANDS.iter().any(|c| c.tag == "T0_OFSET_STEP"));
-        assert!(!COMMANDS.iter().any(|c| c.tag == "T0_OFFSET_STEP"));
+    fn command_table_fixes_ofset_typo() {
+        // doc/upstream-c-defects.md #33: tag corrected to T0_OFFSET_STEP.
+        assert!(!COMMANDS.iter().any(|c| c.tag == "T0_OFSET_STEP"));
+        assert!(COMMANDS.iter().any(|c| c.tag == "T0_OFFSET_STEP"));
     }
 
     #[test]
