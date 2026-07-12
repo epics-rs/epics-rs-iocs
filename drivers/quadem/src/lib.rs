@@ -13,14 +13,18 @@
 //! - [`pcr4`] — SenSiC PCR4 (`sensicSrc/drvPCR4.cpp`)
 //! - [`t4u`] — Sydor T4U, both the middle-layer and the direct driver
 //!   (`sydorSrc/drvT4U_EM.cpp`, `sydorSrc/drvT4UDirect_EM.cpp`)
+//! - [`fx4`] — Pyramid FX4, a JSON WebSocket meter (`FX4Src/drvFX4.cpp`)
 //!
-//! Only devices reachable over a byte stream (TCP/UDP/serial) are in scope.
+//! Only devices reachable over a byte stream (TCP/UDP/serial) or a WebSocket
+//! are in scope.
 //! `nslsSrc/drvNSLS2_EM` and `nslsSrc/drvNSLS2_IC` drive memory-mapped FPGA
 //! registers and I²C respectively and are out of scope.
 
 pub mod ahxxx;
 pub mod ahxxx_proto;
 pub mod drv_quad_em;
+pub mod fx4;
+pub mod fx4_proto;
 pub mod iocsh;
 pub mod nsls_em;
 pub mod nsls_em_proto;
@@ -33,6 +37,7 @@ pub mod tetramm;
 pub mod tetramm_proto;
 
 pub use ahxxx::{AhxxxRuntime, create_ahxxx};
+pub use fx4::{Fx4Runtime, create_fx4};
 pub use nsls_em::{NslsEmRuntime, create_nsls_em};
 pub use pcr4::{Pcr4Runtime, create_pcr4};
 pub use t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};

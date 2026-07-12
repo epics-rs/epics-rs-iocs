@@ -20,6 +20,7 @@ use epics_rs::base::server::iocsh::registry::{
 
 use crate::ahxxx::{AhxxxRuntime, create_ahxxx};
 use crate::drv_quad_em::QE_ADDR_ALL;
+use crate::fx4::{Fx4Runtime, create_fx4};
 use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
 use crate::t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};
@@ -303,6 +304,77 @@ pub fn nsls_em_configure_command(
                 max_memory,
             )
             .map_err(|e| format!("drvNSLS_EMConfigure: {e}"))?;
+
+            register_quadem_port(
+                &mgr,
+                &trace,
+                &port_name,
+                rt.port_handle().clone(),
+                rt.pool.clone(),
+                &rt.outputs,
+            );
+
+            *runtime.lock().unwrap() = Some(rt);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// C++ `drvFX4Configure(portName, FX4_IP, ringBufferSize)`.
+///
+/// The FX4 driver opens its own WebSocket, so no `drvAsynIPPortConfigure`
+/// precedes this verb. The trailing `maxMemory` argument has no C++ analogue
+/// and bounds the Rust `NDArrayPool`.
+pub fn fx4_configure_command(
+    mgr: Arc<PluginManager>,
+    trace: Arc<TraceManager>,
+    runtime: Arc<Mutex<Option<Fx4Runtime>>>,
+) -> CommandDef {
+    CommandDef::new(
+        "drvFX4Configure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "FX4_IP",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "ringBufferSize",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "maxMemory",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvFX4Configure portName FX4_IP ringBufferSize [maxMemory]",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = match args.first() {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("portName required".into()),
+            };
+            let fx4_ip = match args.get(1) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("FX4_IP required".into()),
+            };
+            let ring_buffer_size = match args.get(2) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 0,
+            };
+            let max_memory = match args.get(3) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 100_000_000,
+            };
+
+            let rt = create_fx4(&port_name, &fx4_ip, ring_buffer_size, max_memory)
+                .map_err(|e| format!("drvFX4Configure: {e}"))?;
 
             register_quadem_port(
                 &mgr,

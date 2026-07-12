@@ -48,6 +48,7 @@ members = [
     "iocs/quadem/nsls-em-ioc",
     "iocs/quadem/t4u-em-ioc",
     "iocs/quadem/t4u-direct-em-ioc",
+    "iocs/quadem/fx4-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
     "iocs/motor/conex-ioc",
