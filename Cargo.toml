@@ -80,9 +80,9 @@ members = [
 [workspace.dependencies]
 # Published epics-rs release from crates.io. The sibling checkout keeps
 # moving, so ports are baselined against the released crate, not the path dep.
-epics-rs = { version = "0.22.1" }
-asyn-rs = { version = "0.22.1" }
-ad-core-rs = { version = "0.22.1" }
-ad-plugins-rs = { version = "0.22.1" }
+epics-rs = { version = "0.23.0" }
+asyn-rs = { version = "0.23.0" }
+ad-core-rs = { version = "0.23.0" }
+ad-plugins-rs = { version = "0.23.0" }
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.22.1", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.23.0", package = "epics-modbus-rs" }
