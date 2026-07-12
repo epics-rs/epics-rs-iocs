@@ -12,17 +12,25 @@
 # verbatim (including PressSeq's own upstream-commented-out LNK1/LNK2
 # steps, preserved as comments below).
 #
+# Removed upstream defect (doc/upstream-c-defects.md #37): upstream's
+# PistonUp OUT referenced "setPistonUp($(u=6),$(p=A))", a command that
+# does not exist anywhere in teled_h.proto's command table (confirmed by
+# search, same absence as BDetStatus/shiftleftpressSet below). Unlike
+# Colby's #35 (an unambiguous alternate address existed to wire to), no
+# derivable wire command exists here, so the dead
+# "$(s):$(ta):$(ss):PistonUp" bo record is removed rather than
+# fabricating a Teledyne command. PV-surface change: that PV no longer
+# exists; it never functioned (OUT was left unwired) so no working
+# behavior is lost.
+#
 # UNFIXED (upstream defects preserved as-is -- no fix target exists, or
 # preservation was explicitly directed):
-#   - PistonUp's OUT references a "setPistonUp" command that does not
-#     exist in teled_h.proto at all -- approved: ported structurally with
-#     OUT left unwired (see inline comment).
 #   - AlarmI.INPA references "$(s):$(ta):$(ss):BDetStatus", never defined
 #     anywhere in the module (approved: port as-is).
 #   - The five "*PARSE" aSub records (Vol/Pressure/PressSet_RBV/Flow/
 #     MaxFlow_RBV) all name a subroutine, "shiftleftpressSet", that does
 #     not exist anywhere in the shipped module source (confirmed by
-#     search, same as PistonUp/BDetStatus -- no reference implementation
+#     search, same as BDetStatus -- no reference implementation
 #     to port, so none is fabricated). Ported as-is: the SNAM reference
 #     is preserved unresolved: the raw stringin readback above each PARSE
 #     record (already wired to `GetVol`/`GetPress`/etc via asynOctet) is
@@ -52,17 +60,6 @@ record(bo, "$(s):$(ta):$(ss):Run") {
     info(autosaveFields, "VAL")
     info(archive, "Monitor, 00:00:01, VAL")
 }
-
-# UPSTREAM DEFECT (preserved, no fix target): upstream's OUT referenced
-# "setPistonUp($(u=6),$(p=A))", a command that does not exist anywhere in
-# teled_h.proto's command table. Approved: port the record structurally
-# with OUT left unwired rather than fabricate a command.
-record(bo, "$(s):$(ta):$(ss):PistonUp") {
-    info(autosaveFields, "VAL")
-    info(archive, "Monitor, 00:00:01, VAL")
-}
-
-
 
 record(bo, "$(s):$(ta):$(ss):Stop") {
     field(DTYP, "asynInt32")
