@@ -291,15 +291,14 @@ fn digitel_setpoint_command(cfg: &Config, f: &ControlFields) -> Vec<u8> {
             // and control falls straight into level 2.
             continue;
         }
-        // C reads `sp3s` for both the S31 and the S32 command; the S22/S12
-        // analogues read `s2hs`/`s1hs`. Upstream bug, ported as written — see
-        // the crate docs.
-        let off_pressure = if level == 3 { f.sps[2] } else { f.shs[i] };
-
+        // Fixes doc/upstream-c-defects.md #20: C's `S32` read `sp3s` (the
+        // on-pressure) instead of `s3hs`, where the `S22`/`S12` analogues
+        // correctly read `s2hs`/`s1hs`. The off-pressure command is now
+        // symmetric across all three setpoints: `SnHS` sends `shs[i]`.
         if f.spfg & MOD_SPNS[i] != 0 {
             return snm_pressure(n, 1, f.sps[i]);
         } else if f.spfg & MOD_SNHS[i] != 0 {
-            return snm_pressure(n, 2, off_pressure);
+            return snm_pressure(n, 2, f.shs[i]);
         } else if f.spfg & MOD_SNMS[i] != 0 {
             return format!("S{n}3{}0{}0", f.sms[i], 1 - f.svr[i]).into_bytes();
         } else if f.spfg & MOD_SNVS[i] != 0 {
@@ -1154,17 +1153,41 @@ mod tests {
     }
 
     #[test]
-    fn digitel_off_pressure_for_setpoint_three_reads_the_on_pressure_field() {
-        // Upstream `sprintf(pvalue, "S32%.0e", pr->sp3s)` — s3hs is ignored.
+    fn digitel_off_pressure_for_setpoint_three_reads_s3hs() {
+        // Regression for doc/upstream-c-defects.md #20: `S32` sends the
+        // setpoint-3 off-pressure `s3hs` (`shs[2]`), symmetric with S22/S12.
+        // The on-pressure `sp3s` (`sps[2]`) is a distinct value here to prove
+        // it is no longer read; pre-fix this produced "S3217".
         let c = digitel(3);
         let mut f = ControlFields {
             spfg: MOD_SNHS[2],
             bkin: 1,
             ..Default::default()
         };
-        f.sps[2] = 1e-7;
-        f.shs[2] = 1e-4;
-        assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S3217");
+        f.sps[2] = 1e-7; // on-pressure — must NOT be read
+        f.shs[2] = 1e-4; // off-pressure — the value S32 carries
+        assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S3214");
+    }
+
+    #[test]
+    fn digitel_off_pressure_is_symmetric_across_all_three_setpoints() {
+        // Regression for doc/upstream-c-defects.md #20: `SnHS` reads `shs[i]`
+        // for every level. Each setpoint's on-pressure is set to a distinct,
+        // never-read value to prove only the off-pressure drives the command.
+        let c = digitel(3);
+        let mut f = ControlFields {
+            bkin: 1,
+            ..Default::default()
+        };
+        f.sps = [1e-7, 1e-7, 1e-7, 0.0];
+        f.shs = [1e-9, 1e-8, 1e-4, 0.0];
+
+        f.spfg = MOD_SNHS[0];
+        assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S1219");
+        f.spfg = MOD_SNHS[1];
+        assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S2218");
+        f.spfg = MOD_SNHS[2];
+        assert_eq!(control_command(&c, MOD_SETP, &f).payload, b"S3214");
     }
 
     #[test]
