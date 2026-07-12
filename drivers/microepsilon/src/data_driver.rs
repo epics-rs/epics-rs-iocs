@@ -40,18 +40,14 @@
 //!    read address in this db is positive, so the gate can never actually
 //!    fire for a db-driven read. Reproduced verbatim as inert dead code
 //!    (matching the C source), not removed as "unreachable cleanup".
-//! 7. **Inert `IPport` configure argument** (`capaNCDT6200Sup.c:698-707`):
-//!    validated non-empty but never read -- the TCP port is hardcoded to
-//!    [`PROTOCOL_TCP_PORT`] regardless of what string is passed. Reproduced
-//!    in [`configure`].
-//! 8. **Uninitialized reader-thread priority** (`capaNCDT6200Sup.c:577-600`):
+//! 7. **Uninitialized reader-thread priority** (`capaNCDT6200Sup.c:577-600`):
 //!    `int32Write`'s `A_NUM_MEAS_CHANNELS` handler passes a never-assigned
 //!    local `priority` to `epicsThreadLowestPriorityLevelAbove` -- undefined
 //!    behavior upstream. `std::thread::spawn` has no priority-relative-to
 //!    parameter to replicate this onto in the first place, so the reader
 //!    thread is simply spawned at the default OS thread priority; this is a
 //!    platform-level divergence, not a silently dropped feature.
-//! 9. **Per-iteration reconnect bookkeeping collapses to "once per outcome"
+//! 8. **Per-iteration reconnect bookkeeping collapses to "once per outcome"
 //!    here**: C re-runs the `badPacketCount`/`isCommunicating`/maybe-disconnect
 //!    block (`capaNCDT6200Sup.c:434-459`) on *every* inner-loop pass,
 //!    including a partial read that completed no packet. The only case where
@@ -64,6 +60,15 @@
 //!    [`reader_thread`], matching [`packet::apply_read_outcome`]'s calling
 //!    convention) is therefore behaviorally equivalent here, not an
 //!    observable simplification.
+//!
+//! # Fixed upstream defects (doc/upstream-c-defects.md)
+//!
+//! - **#43 -- Inert `IPport` configure argument** (`capaNCDT6200Sup.c:698-707`):
+//!   upstream validated the argument non-empty but never read it -- the TCP
+//!   port was always hardcoded to [`PROTOCOL_TCP_PORT`] regardless of what
+//!   string was passed. [`configure`] now honors it: parsed as the TCP port
+//!   number, defaulting to [`PROTOCOL_TCP_PORT`] (10001) when omitted (`""`)
+//!   or `"0"`.
 //!
 //! # Framework gaps (documented, not silently worked around)
 //!
@@ -160,7 +165,10 @@ const TRANSPORT_REASON: usize = 0;
 /// `pdpvt->cbuf[200]` (`capaNCDT6200Sup.c:93`).
 const READ_CHUNK_BUF_LEN: usize = 200;
 
-/// `capaNCDT6200Protocol.h`: `capaNCDT6200_PROTOCOL_TCP_PORT (10001)`.
+/// `capaNCDT6200Protocol.h`: `capaNCDT6200_PROTOCOL_TCP_PORT (10001)`. Used
+/// by [`configure`] as the default when its `ip_port` argument is omitted or
+/// `"0"` (doc/upstream-c-defects.md #43 -- upstream hardcoded this
+/// unconditionally instead).
 const PROTOCOL_TCP_PORT: u16 = 10001;
 
 /// Internal-only asyn reason: never resolved by [`DataDriver::drv_user_create`]
@@ -582,6 +590,20 @@ fn reader_thread(
     }
 }
 
+/// Fixed upstream defect (doc/upstream-c-defects.md #43): upstream validated
+/// `IPport` non-empty but never read it, always connecting to hardcoded
+/// [`PROTOCOL_TCP_PORT`]. Honor the argument: `""` or `"0"` defaults to
+/// [`PROTOCOL_TCP_PORT`], anything else must parse as a `u16` TCP port.
+fn resolve_tcp_port(ip_port: &str) -> AsynResult<u16> {
+    match ip_port {
+        "" | "0" => Ok(PROTOCOL_TCP_PORT),
+        other => other.parse().map_err(|_| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("Invalid IPport '{other}'"),
+        }),
+    }
+}
+
 /// `capaNCDT6200Configure` + `setLink` (`capaNCDT6200Sup.c:467-496,682-791`):
 /// build the internal `_RBK` transport port (`noAutoConnect=1,
 /// noProcessEos=1`) and this driver's own outer port, wire the late-bound
@@ -594,16 +616,15 @@ pub fn configure(
     ip_port: &str,
     trace: Arc<TraceManager>,
 ) -> AsynResult<()> {
-    if port_name.is_empty() || ip_address.is_empty() || ip_port.is_empty() {
+    if port_name.is_empty() || ip_address.is_empty() {
         return Err(AsynError::Status {
             status: AsynStatus::Error,
             message: "Required argument not present".into(),
         });
     }
-    // Quirk 7 (see module doc): validated above, never used below.
-    let _ = ip_port;
+    let tcp_port = resolve_tcp_port(ip_port)?;
 
-    let host = format!("{ip_address}:{PROTOCOL_TCP_PORT} TCP");
+    let host = format!("{ip_address}:{tcp_port} TCP");
     let rbk_port_name = format!("{port_name}_RBK");
     let mut rbk_driver = DrvAsynIPPort::new(&rbk_port_name, &host)?;
     // `drvAsynIPPortConfigure(link->portName, link->hostInfo, priority, 1, 1)`
@@ -649,6 +670,26 @@ mod tests {
         assert_eq!(A_MISSED_DATA_PACKET_COUNT, 26);
         assert_eq!(A_MEASURED_COUNT, 27);
         assert_eq!(A_NUM_MEAS_CHANNELS, 40);
+    }
+
+    #[test]
+    fn resolve_tcp_port_defaults_on_empty_or_zero() {
+        assert_eq!(resolve_tcp_port("").unwrap(), PROTOCOL_TCP_PORT);
+        assert_eq!(resolve_tcp_port("0").unwrap(), PROTOCOL_TCP_PORT);
+    }
+
+    #[test]
+    fn resolve_tcp_port_honors_explicit_value() {
+        assert_eq!(resolve_tcp_port("10002").unwrap(), 10002);
+        assert_eq!(resolve_tcp_port("1").unwrap(), 1);
+        assert_eq!(resolve_tcp_port("65535").unwrap(), 65535);
+    }
+
+    #[test]
+    fn resolve_tcp_port_rejects_unparsable_value() {
+        assert!(resolve_tcp_port("not-a-port").is_err());
+        assert!(resolve_tcp_port("70000").is_err());
+        assert!(resolve_tcp_port("-1").is_err());
     }
 
     #[test]
