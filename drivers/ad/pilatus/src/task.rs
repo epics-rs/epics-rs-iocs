@@ -35,8 +35,8 @@ use crate::protocol::{
 };
 use crate::protocol::{
     cmd_exposure, cmd_header_string, cmd_imgpath, cmd_mx_f64, cmd_reset_module_power,
-    cmd_set_threshold, gain_index, parse_energy_setting, parse_thread_channel, parse_threshold_ev,
-    parse_version,
+    cmd_set_threshold, gain_index, parse_energy_setting, parse_threshold_ev, parse_version,
+    thread_channel_values,
 };
 use crate::types::{
     BadPixel, CAMSERVER_ACQUIRE_TIMEOUT, CAMSERVER_DEFAULT_TIMEOUT, CAMSERVER_RESET_POWER_TIMEOUT,
@@ -329,50 +329,26 @@ async fn pilatus_status(
 
     let status = ctx.cam_write_read("thread", 1.0).await;
     if !status.is_err() {
-        // C reuses the same `temp` / `humid` locals for every channel, so a
-        // partial `sscanf` leaves the previous channel's value in place.
-        let mut temp = 0.0f32;
-        let mut humid = 0.0f32;
+        // Fixed (upstream-c-defects.md #12): resolve each channel independently
+        // so a partial reply for one channel never leaks another channel's
+        // value (C shared one `temp` / `humid` pair across all channels).
         let reply = ctx.from().to_string();
 
-        if let Some((t, h)) = parse_thread_channel(&reply, 0) {
-            if let Some(v) = t {
-                temp = v;
-            }
-            if let Some(v) = h {
-                humid = v;
-            }
-            ctx.set_f64(ctx.p.th_temp_0, temp as f64);
-            ctx.set_f64(ctx.p.th_humid_0, humid as f64);
-            ctx.set_f64(ctx.ad.temperature, temp as f64);
+        if let Some((temp, humid)) = thread_channel_values(&reply, 0) {
+            ctx.set_f64(ctx.p.th_temp_0, temp);
+            ctx.set_f64(ctx.p.th_humid_0, humid);
+            ctx.set_f64(ctx.ad.temperature, temp);
         }
-        if let Some((t, h)) = parse_thread_channel(&reply, 1) {
-            if let Some(v) = t {
-                temp = v;
-            }
-            if let Some(v) = h {
-                humid = v;
-            }
-            ctx.set_f64(ctx.p.th_temp_1, temp as f64);
-            ctx.set_f64(ctx.p.th_humid_1, humid as f64);
+        if let Some((temp, humid)) = thread_channel_values(&reply, 1) {
+            ctx.set_f64(ctx.p.th_temp_1, temp);
+            ctx.set_f64(ctx.p.th_humid_1, humid);
         }
-        if let Some((t, h)) = parse_thread_channel(&reply, 2) {
-            if let Some(v) = t {
-                temp = v;
-            }
-            if let Some(v) = h {
-                humid = v;
-            }
-            ctx.set_f64(ctx.p.th_temp_2, temp as f64);
-            ctx.set_f64(ctx.p.th_humid_2, humid as f64);
+        if let Some((temp, humid)) = thread_channel_values(&reply, 2) {
+            ctx.set_f64(ctx.p.th_temp_2, temp);
+            ctx.set_f64(ctx.p.th_humid_2, humid);
         }
-        // Fixed (upstream-c-defects.md #10): C has a fourth block that parses a
-        // "Channel 3" line and writes its temperature/humidity into ThTemp0 /
-        // ThHumid0 — a copy-paste of the channel-0 targets that silently
-        // corrupts channel 0's readings. The camserver `thread` reply defines
-        // only channels 0-2 and there is no channel-3 parameter, so the block
-        // is removed rather than remapped (a channel-3 parameter would be
-        // fabricated hardware).
+        // Channel 3 handling removed as fixed defect #10 — the `thread` reply
+        // defines only channels 0-2 and there is no channel-3 parameter.
     } else {
         ctx.set_i32(ctx.ad.status, ADStatus::Error as i32);
     }

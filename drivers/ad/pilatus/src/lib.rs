@@ -49,9 +49,10 @@
 //! * #11 — `averageFlatField` was `0/0 = NaN` when no pixel reached
 //!   `MinFlatField`, poisoning every corrected pixel; the flat-field read now
 //!   skips normalization with an error (`FlatFieldValid` stays 0, no publish).
-//!
-//! Upstream defects still reproduced deliberately and marked in the source:
-//! `pilatusStatus` reusing one `temp` / `humid` pair across all channels.
+//! * #12 — `pilatusStatus` shared one `temp` / `humid` local across all
+//!   channels, so a partial `thread` reply leaked one channel's reading into
+//!   another; each channel is now resolved independently
+//!   ([`protocol::thread_channel_values`], missing field defaults to 0.0).
 
 pub mod camserver;
 pub mod driver;

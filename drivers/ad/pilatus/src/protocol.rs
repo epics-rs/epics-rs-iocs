@@ -316,6 +316,22 @@ pub fn parse_thread_channel(reply: &str, channel: u8) -> Option<(Option<f32>, Op
     Some(scan())
 }
 
+/// Resolve one thermistor channel's `(temperature, humidity)` from a `thread`
+/// reply for storing in that channel's own parameters. Returns `None` when the
+/// channel line is absent (as [`parse_thread_channel`] does).
+///
+/// Fixed (upstream-c-defects.md #12): C's `pilatusStatus` uses a single `temp`
+/// / `humid` local pair for every channel, so a `Channel N` line that parses
+/// only the temperature (humidity truncated or malformed) leaves the *previous*
+/// channel's humidity in place and writes it to channel N's parameter. Each
+/// channel is resolved independently here, with a missing field defaulting to
+/// `0.0` — the value these parameters are initialised to — so no channel can
+/// leak into another.
+pub fn thread_channel_values(reply: &str, channel: u8) -> Option<(f64, f64)> {
+    parse_thread_channel(reply, channel)
+        .map(|(temp, humid)| (temp.unwrap_or(0.0) as f64, humid.unwrap_or(0.0) as f64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +601,37 @@ mod tests {
             parse_thread_channel("Channel 0: Temperature = -1.5C, Rel. Humidity = 10.0%", 0),
             Some((Some(-1.5), Some(10.0)))
         );
+    }
+
+    #[test]
+    fn thread_channel_values_defaults_missing_field_to_zero() {
+        // Fixed (#12): humidity truncated -> 0.0, both present -> parsed pair,
+        // absent channel -> None.
+        assert_eq!(
+            thread_channel_values("Channel 0: Temperature = 31.4C, Rel. Humidity = ", 0),
+            Some((31.4f32 as f64, 0.0))
+        );
+        assert_eq!(
+            thread_channel_values("Channel 1: Temperature = 25.8C, Rel. Humidity = 33.5%", 1),
+            Some((25.8f32 as f64, 33.5f32 as f64))
+        );
+        assert_eq!(
+            thread_channel_values("Channel 0: Temperature = 31.4C", 2),
+            None
+        );
+    }
+
+    #[test]
+    fn thread_channel_values_no_cross_channel_leak() {
+        // Channel 0 has full data; channel 1 parses temperature only. Channel
+        // 1's humidity must be 0.0, never channel 0's 22.1 (the C defect).
+        let reply = "Channel 0: Temperature = 31.4C, Rel. Humidity = 22.1%;\n\
+                     Channel 1: Temperature = 25.8C, Rel. Humidity = ";
+        assert_eq!(
+            thread_channel_values(reply, 0),
+            Some((31.4f32 as f64, 22.1f32 as f64))
+        );
+        assert_eq!(thread_channel_values(reply, 1), Some((25.8f32 as f64, 0.0)));
     }
 
     #[test]
