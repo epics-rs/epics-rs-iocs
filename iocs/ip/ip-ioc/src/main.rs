@@ -9,6 +9,7 @@
 //!
 //! ```text
 //! MPCConfig(port, octetPort, address, [pollPeriod])
+//! TPG261Config(port, octetPort, [pollPeriod])
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 
 use ip_devices::mpc::create_mpc;
 use ip_devices::runtime::IpPortRuntime;
+use ip_devices::tpg261::create_tpg261;
 
 /// Every port the startup script creates, kept alive for the life of the IOC.
 type Ports = Arc<Mutex<Vec<IpPortRuntime>>>;
@@ -117,6 +119,42 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 1.0)?;
                 let port = create_mpc(&name, &octet, address, poll)
                     .map_err(|e| format!("MPCConfig failed: {e}"))?;
+                register(&ports, &name, &trace, port);
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // TPG261Config(port, octetPort, [pollPeriod])
+    {
+        let ports = ports.clone();
+        let trace = trace.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "TPG261Config",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "octetPort",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "pollPeriod",
+                    arg_type: ArgType::Double,
+                    optional: true,
+                },
+            ],
+            "TPG261Config portName octetPort [pollPeriod] - Pfeiffer TPG261/TPG262 gauge controller",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let name = string_arg(args, 0)?;
+                let octet = string_arg(args, 1)?;
+                let poll = poll_arg(args, 2, 2.0)?;
+                let port = create_tpg261(&name, &octet, poll)
+                    .map_err(|e| format!("TPG261Config failed: {e}"))?;
                 register(&ports, &name, &trace, port);
                 Ok(CommandOutcome::Continue)
             },

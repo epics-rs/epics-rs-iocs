@@ -25,3 +25,19 @@ MPCConfig("MPC1", "SerialMPC", 5, 1.0)
 dbLoadRecords("iocs/ip/ip-ioc/db/mpc.db", "P=$(PREFIX),PUMP=ip1,PORT=MPC1,ADDR=0")
 dbLoadRecords("iocs/ip/ip-ioc/db/mpc.db", "P=$(PREFIX),PUMP=ip2,PORT=MPC1,ADDR=1")
 dbLoadRecords("iocs/ip/ip-ioc/db/tsp.db", "P=$(PREFIX),TSP=tsp1,PORT=MPC1")
+
+# --- Pfeiffer TPG261 / TPG262 gauge controller ------------------------------
+# 9600 8N1; the controller frames every line with CR/LF and expects a bare CR.
+drvAsynSerialPortConfigure("SerialTPG", "/dev/ttyS1", 0, 0, 0)
+asynSetOption("SerialTPG", 0, "baud", "9600")
+asynSetOption("SerialTPG", 0, "bits", "8")
+asynSetOption("SerialTPG", 0, "parity", "none")
+asynSetOption("SerialTPG", 0, "stop", "1")
+asynOctetSetInputEos("SerialTPG", 0, "\r\n")
+
+# TPG261Config(portName, octetPort, pollPeriodSeconds). The <ENQ> byte and the
+# command CR are written by the driver, so the port has no output EOS.
+TPG261Config("TPG1", "SerialTPG", 2.0)
+
+dbLoadRecords("iocs/ip/ip-ioc/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=TPG1,ADDR=0")
+dbLoadRecords("iocs/ip/ip-ioc/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=TPG1,ADDR=1")
