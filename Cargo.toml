@@ -45,6 +45,7 @@ members = [
     "iocs/quadem/ah401-ioc",
     "iocs/quadem/ah501-ioc",
     "iocs/quadem/pcr4-ioc",
+    "iocs/quadem/nsls-em-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
     "iocs/motor/conex-ioc",

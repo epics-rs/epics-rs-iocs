@@ -20,6 +20,7 @@ use epics_rs::base::server::iocsh::registry::{
 
 use crate::ahxxx::{AhxxxRuntime, create_ahxxx};
 use crate::drv_quad_em::QE_ADDR_ALL;
+use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
 
 /// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`),
@@ -214,6 +215,93 @@ pub fn ahxxx_configure_command(
                 &model_name,
             )
             .map_err(|e| format!("drvAHxxxConfigure: {e}"))?;
+
+            register_quadem_port(
+                &mgr,
+                &trace,
+                &port_name,
+                rt.port_handle().clone(),
+                rt.pool.clone(),
+                &rt.outputs,
+            );
+
+            *runtime.lock().unwrap() = Some(rt);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// C++ `drvNSLS_EMConfigure(portName, broadcastAddress, moduleID,
+/// ringBufferSize)`.
+///
+/// Unlike the other quadEM devices the NSLS_EM builds its own three asyn IP
+/// ports (UDP discovery, TCP command, TCP data), so no `drvAsynIPPortConfigure`
+/// precedes this verb.
+pub fn nsls_em_configure_command(
+    mgr: Arc<PluginManager>,
+    trace: Arc<TraceManager>,
+    runtime: Arc<Mutex<Option<NslsEmRuntime>>>,
+) -> CommandDef {
+    CommandDef::new(
+        "drvNSLS_EMConfigure",
+        vec![
+            ArgDesc {
+                name: "portName",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "broadcastAddress",
+                arg_type: ArgType::String,
+                optional: false,
+            },
+            ArgDesc {
+                name: "moduleID",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "ringBufferSize",
+                arg_type: ArgType::Int,
+                optional: false,
+            },
+            ArgDesc {
+                name: "maxMemory",
+                arg_type: ArgType::Int,
+                optional: true,
+            },
+        ],
+        "drvNSLS_EMConfigure portName broadcastAddress moduleID ringBufferSize [maxMemory]",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = match args.first() {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("portName required".into()),
+            };
+            let broadcast_address = match args.get(1) {
+                Some(ArgValue::String(s)) => s.clone(),
+                _ => return Err("broadcastAddress required".into()),
+            };
+            let module_id = match args.get(2) {
+                Some(ArgValue::Int(n)) => *n as i32,
+                _ => return Err("moduleID required".into()),
+            };
+            let ring_buffer_size = match args.get(3) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 0,
+            };
+            let max_memory = match args.get(4) {
+                Some(ArgValue::Int(n)) if *n > 0 => *n as usize,
+                _ => 100_000_000,
+            };
+
+            let rt = create_nsls_em(
+                &port_name,
+                &broadcast_address,
+                module_id,
+                ring_buffer_size,
+                max_memory,
+            )
+            .map_err(|e| format!("drvNSLS_EMConfigure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
