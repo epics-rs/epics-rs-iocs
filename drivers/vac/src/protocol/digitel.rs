@@ -327,10 +327,12 @@ fn mpc_setpoint_command(cfg: &Config, f: &ControlFields) -> Vec<u8> {
     let qpc = cfg.dev == DevType::Qpc;
     let (mut t1, mut val1, mut val2) = (0i32, 0.0f32, 0.0f32);
 
-    // C's range guards are `v < 1e-4 || v > 1e-11`, which is true for every
-    // finite non-negative v: `||` where `&&` was meant. Ported as written —
-    // the only value it rejects is 0, via the `val1 != 0` test below.
-    let in_range = |v: f64| v < 1e-4 || v > 1e-11;
+    // Fixes doc/upstream-c-defects.md #21: C's guard `v < 1e-4 || v > 1e-11`
+    // is true for every finite non-negative v (`||` where `&&` was meant), so
+    // it never rejected an out-of-range pressure. The intended check accepts
+    // only pressures within the device's [1e-11, 1e-4] Torr span; a value
+    // outside it leaves `val1 == 0` and suppresses the command.
+    let in_range = |v: f64| (1e-11..=1e-4).contains(&v);
 
     if f.spfg & MOD_SPNS[0] != 0 {
         t1 = cfg.pump_no;
@@ -1322,6 +1324,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(control_command(&mpc(1), MOD_SETP, &f).payload, b"");
+    }
+
+    #[test]
+    fn a_pressure_outside_the_device_span_suppresses_the_setpoint_command() {
+        // Regression for doc/upstream-c-defects.md #21: pressures outside
+        // [1e-11, 1e-4] Torr are rejected, leaving val1 == 0 so no command is
+        // sent. Pre-fix the guard passed every value.
+        let mut f = ControlFields {
+            spfg: MOD_SPNS[0],
+            ..Default::default()
+        };
+        f.sps[0] = 1e-3; // above the 1e-4 ceiling
+        f.shr[0] = 1e-6;
+        assert_eq!(control_command(&mpc(1), MOD_SETP, &f).payload, b"");
+
+        f.sps[0] = 1e-13; // below the 1e-11 floor
+        assert_eq!(control_command(&mpc(1), MOD_SETP, &f).payload, b"");
+
+        // An off-pressure out of range likewise suppresses the command even
+        // though val1 would come from the in-range on-pressure readback.
+        let mut g = ControlFields {
+            spfg: MOD_SNHS[0],
+            ..Default::default()
+        };
+        g.spr[0] = 1e-6;
+        g.shs[0] = 1e-3;
+        assert_eq!(control_command(&mpc(1), MOD_SETP, &g).payload, b"");
     }
 
     // ---- read slots -------------------------------------------------------
