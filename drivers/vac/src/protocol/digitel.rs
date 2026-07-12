@@ -403,12 +403,9 @@ fn mpc_setpoint_command(cfg: &Config, f: &ControlFields) -> Vec<u8> {
 pub enum ReadSlot {
     /// Build and send this payload, then store the stripped reply at `30*i`.
     Send(Vec<u8>),
-    /// C performs no I/O for this slot but still stores `pstartdata`, which
-    /// still points into the previous slot's `readBuffer` — the previous
-    /// reply is duplicated into this slot. QPC slots 6, 7 and 8.
-    ReuseLast,
-    /// C `continue`s: the slot is not visited at all. Digitel slots beyond
-    /// `noSPT + 1`.
+    /// The slot is not visited: no I/O and nothing is stored at `30*i`, so the
+    /// fields decoded from it keep their previous values. Digitel slots beyond
+    /// `noSPT + 1`, and QPC setpoint slots 6..=8 (one setpoint per pump).
     Skip,
 }
 
@@ -424,12 +421,17 @@ pub fn read_slot(cfg: &Config, i: usize) -> ReadSlot {
     match (cfg.dev, i) {
         (_, 0..=4) => ReadSlot::Send(format!(" {} {}", READ_CMD_MPC[i], cfg.pump_no).into_bytes()),
 
-        // The QPC has one setpoint per pump, so only slot 5 is issued. C's send
-        // guard `(i < 6) || (i > 8)` then skips 6..=8 outright.
+        // The QPC has one setpoint per pump, so only slot 5 is issued. Fixes
+        // doc/upstream-c-defects.md #23 (QPC half): C's send guard
+        // `(i < 6) || (i > 8)` left slots 6..=8 unsent but the loop still
+        // `strcpy`d the stale slot-5 reply into their buffers, so SP2R/SP3R/SP4R
+        // re-parsed setpoint 0 and mirrored SP1R. They are now skipped outright
+        // (and `decode` reads a single QPC setpoint), leaving SP2R/SP3R/SP4R at
+        // their previous values.
         (DevType::Qpc, 5) => {
             ReadSlot::Send(format!(" {} {}", READ_CMD_MPC[5], cfg.pump_no).into_bytes())
         }
-        (DevType::Qpc, 6..=8) => ReadSlot::ReuseLast,
+        (DevType::Qpc, 6..=8) => ReadSlot::Skip,
 
         // MPC: odd pumps read odd setpoints. Fixes doc/upstream-c-defects.md
         // #23 (MPC half): C guarded the setpoint `sprintf` with `if (i < 8)`
@@ -916,7 +918,14 @@ pub fn decode(cfg: &Config, buf: &ResponseBuf, prev: &Readings) -> Readings {
             _ => 5,
         };
 
-        for n in 0..4 {
+        // Fixes doc/upstream-c-defects.md #23 (QPC half): the QPC has one
+        // setpoint per pump, so only slot 5 (setpoint 0) is read. Decoding the
+        // other three slots would re-duplicate setpoint 0 into SP2R/SP3R/SP4R,
+        // because their buffers are empty and `scan_setpoint` leaves the
+        // retained `val1`/`val2` in place. They are skipped so those fields keep
+        // their previous values. The MPC still decodes all four.
+        let n_setpoints = if cfg.dev == DevType::Qpc { 1 } else { 4 };
+        for n in 0..n_setpoints {
             pv.strncpy(buf.slice(150 + 30 * n, 25), 25);
             scan_setpoint(pv.s(), &mut t, &mut val1, &mut val2);
             r.spr[n] = val1 as f64;
@@ -1399,11 +1408,14 @@ mod tests {
 
     #[test]
     fn qpc_issues_one_setpoint_read_and_skips_the_other_three() {
+        // Regression for doc/upstream-c-defects.md #23 (QPC half): slots 6-8 are
+        // skipped entirely (no I/O, nothing stored) rather than duplicating
+        // slot 5's reply.
         let c = qpc(3);
         assert_eq!(read_slot(&c, 5), ReadSlot::Send(b" 3C 3".to_vec()));
-        assert_eq!(read_slot(&c, 6), ReadSlot::ReuseLast);
-        assert_eq!(read_slot(&c, 7), ReadSlot::ReuseLast);
-        assert_eq!(read_slot(&c, 8), ReadSlot::ReuseLast);
+        assert_eq!(read_slot(&c, 6), ReadSlot::Skip);
+        assert_eq!(read_slot(&c, 7), ReadSlot::Skip);
+        assert_eq!(read_slot(&c, 8), ReadSlot::Skip);
         assert_eq!(read_slot(&c, 9), ReadSlot::Send(b" 01".to_vec()));
     }
 
@@ -1548,6 +1560,29 @@ mod tests {
         assert!((r.shr[0] - 1.2e-6f32 as f64).abs() < 1e-12);
         assert!((r.spr[3] - 4.0e-6f32 as f64).abs() < 1e-12);
         assert_eq!(r.set, [1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn qpc_decodes_only_its_single_setpoint_and_leaves_the_rest() {
+        // Regression for doc/upstream-c-defects.md #23 (QPC half): the QPC reads
+        // one setpoint (slot 5 -> SP1R). SP2R/SP3R/SP4R are not decoded and keep
+        // their previous values instead of mirroring SP1R. mpc_buf() carries
+        // four distinct setpoint replies, but only the first reaches the record.
+        let prev = Readings {
+            spr: [9.0e-9, 9.1e-9, 9.2e-9, 9.3e-9],
+            shr: [8.0e-9, 8.1e-9, 8.2e-9, 8.3e-9],
+            ..Readings::default()
+        };
+        let r = decode(&qpc(1), &mpc_buf(), &prev);
+        assert!((r.spr[0] - 1.0e-6f32 as f64).abs() < 1e-12);
+        assert_eq!(r.spr[1], prev.spr[1]);
+        assert_eq!(r.spr[2], prev.spr[2]);
+        assert_eq!(r.spr[3], prev.spr[3]);
+        assert_eq!(r.shr[1], prev.shr[1]);
+        assert_eq!(r.shr[3], prev.shr[3]);
+        // The MPC still decodes all four setpoints from the same buffer.
+        let m = decode(&mpc(1), &mpc_buf(), &prev);
+        assert!((m.spr[3] - 4.0e-6f32 as f64).abs() < 1e-12);
     }
 
     #[test]

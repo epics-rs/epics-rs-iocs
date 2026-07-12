@@ -202,16 +202,14 @@ impl DeviceSupport for DigitelPump {
 
         // The eleven-slot read loop. Each stored reply lands at `30*i`. A
         // short reply or a device-flagged error increments `errCount` and jumps
-        // to `finish`; a clean sweep resets it to zero. QPC slots 6-8 do no I/O
-        // and duplicate slot 5's reply (`ReuseLast`).
+        // to `finish`; a clean sweep resets it to zero. Unvisited slots (Digitel
+        // beyond `noSPT + 1`, QPC setpoint slots 6-8) store nothing.
         let mut loop_completed = false;
         if run_loop {
             loop_completed = true;
-            let mut last_payload: Vec<u8> = Vec::new();
             for i in 0..digitel::READ_SLOTS {
                 match read_slot(&cfg, i) {
                     ReadSlot::Skip => continue,
-                    ReadSlot::ReuseLast => response.strcpy_at(30 * i, &last_payload),
                     ReadSlot::Send(payload) => {
                         let sendbuf = build_command(&cfg, &payload);
                         let reply = Self::process_dg(io, &cfg, &sendbuf);
@@ -223,7 +221,6 @@ impl DeviceSupport for DigitelPump {
                         match strip_read_reply(dev, i, &reply) {
                             Ok(stripped) => {
                                 response.strcpy_at(30 * i, &stripped);
-                                last_payload = stripped;
                             }
                             Err(_) => {
                                 self.err_count += 1;
