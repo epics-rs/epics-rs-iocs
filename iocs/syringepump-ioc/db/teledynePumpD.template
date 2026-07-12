@@ -44,12 +44,17 @@
 # target to repoint to, so it was removed. See where it used to sit
 # (before RefillRateTweak below) for the PV-surface-change note.
 #
+# Removed upstream defect (doc/upstream-c-defects.md #42): the
+# RefillRateTweak/RefillRateTweakDown/RefillRateTweakUp block referenced
+# "$(P)$(PUMP)RefillRateSP", never defined anywhere in this module for
+# the D family (only the sibling ISCO family's templates define a
+# same-named record -- an apparent copy-paste artifact). D-series has no
+# refill wire command at all (teled_d.proto defines none), so the block
+# had no in-file target to repoint to. See where it used to sit below
+# for the PV-surface-change note.
+#
 # UNFIXED (upstream defects preserved as-is -- no fix target exists, or
 # preservation was explicitly directed):
-#   - RefillRateTweakDown/Up reference "$(P)$(PUMP)RefillRateSP", never
-#     defined anywhere in this module for the D family (only the sibling
-#     ISCO family defines a same-named record) -- D's own teled_d.proto
-#     has no refill command at all. See inline comment.
 #   - Every OUT/INP link below except SetRun hardcodes addr 0 (pump "A"),
 #     reproducing upstream's own `$(p=A)` hardcoding on every command but
 #     D's setRun (`$(p=$(PUMP))`) -- see `syringepump::driver` module doc.
@@ -96,28 +101,17 @@ record(calcout,"$(P)$(PUMP)PressureTweakUp") {
 # "$(P)$(PUMP)FlowRateTweakDown", and "$(P)$(PUMP)FlowRateTweakUp" no
 # longer exist; none of them ever functioned.
 
-# These records are for tweaking the refill rate.
-# UPSTREAM DEFECT (preserved, no fix target): INPB/OUT reference
-# "$(P)$(PUMP)RefillRateSP", never defined anywhere in this module for
-# the D family (only the sibling ISCO family's templates define a
-# same-named record -- an apparent copy-paste artifact). D-series has no
-# refill wire command at all (teled_d.proto defines none). Ported as-is.
-record(ao,"$(P)$(PUMP)RefillRateTweak") {
-    field(VAL, "1")
-    field(PREC,"3")
-}
-record(calcout,"$(P)$(PUMP)RefillRateTweakDown") {
-    field(INPA,"$(P)$(PUMP)RefillRateTweak.VAL NPP NMS")
-    field(INPB,"$(P)$(PUMP)RefillRateSP NPP NMS")
-    field(CALC,"B-A")
-    field(OUT, "$(P)$(PUMP)RefillRateSP PP NMS")
-}
-record(calcout,"$(P)$(PUMP)RefillRateTweakUp") {
-    field(INPA,"$(P)$(PUMP)RefillRateTweak.VAL NPP NMS")
-    field(INPB,"$(P)$(PUMP)RefillRateSP NPP NMS")
-    field(CALC,"B+A")
-    field(OUT, "$(P)$(PUMP)RefillRateSP PP NMS")
-}
+# Removed upstream defect (doc/upstream-c-defects.md #42): this block's
+# RefillRateTweak/RefillRateTweakDown/RefillRateTweakUp INPB/OUT
+# referenced "$(P)$(PUMP)RefillRateSP", never defined anywhere in this
+# module for the D family (only the sibling ISCO family's templates
+# define a same-named record -- an apparent copy-paste artifact).
+# D-series has no refill wire command at all (teled_d.proto defines
+# none), so the entire block was permanently non-functional upstream and
+# had no in-file target to repoint to; it is removed rather than
+# repointed. PV-surface change: "$(P)$(PUMP)RefillRateTweak",
+# "$(P)$(PUMP)RefillRateTweakDown", and "$(P)$(PUMP)RefillRateTweakUp"
+# no longer exist; none of them ever functioned.
 
 # Only SetRun is genuinely pump-parameterized upstream ($(p=$(PUMP)));
 # every other command below hardcodes pump "A" (addr 0). See this file's
