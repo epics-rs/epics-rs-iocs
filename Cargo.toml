@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "drivers/ad/eiger",
+    "drivers/ad/mythen",
     "drivers/d435i",
     "drivers/motor/amci",
     "drivers/motor/common",
@@ -35,6 +36,7 @@ members = [
     "drivers/meascomp/usb-2408",
     "drivers/meascomp/usb-ctr",
     "iocs/ad/eiger-ioc",
+    "iocs/ad/mythen-ioc",
     "iocs/d435i-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",

@@ -1963,6 +1963,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mythen"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "mythen-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "mythen",
+ "tokio",
+]
+
+[[package]]
 name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
