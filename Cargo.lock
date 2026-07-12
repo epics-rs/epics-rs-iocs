@@ -2045,6 +2045,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pixirad"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+ "socket2 0.6.3",
+]
+
+[[package]]
+name = "pixirad-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "pixirad",
+ "tokio",
+]
+
+[[package]]
 name = "pkcs5"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
