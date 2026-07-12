@@ -15,16 +15,18 @@
 //! (`asynOctetSetInputEos`/`asynOctetSetOutputEos`), which the IOC's
 //! `st.cmd` must reproduce.
 //!
-//! # Preserved upstream quirks (not "fixed")
-//! - **GH output tag/wire-command inversion** (`drvAsynDG645.cpp:475-479`):
+//! # Fixed upstream defects (doc/upstream-c-defects.md)
+//! - **#32 GH output tag/wire-command inversion** (`drvAsynDG645.cpp:475-479`):
 //!   for every other output (T0/AB/CD/EF) `*_STEP_NEG` maps to wire
-//!   suffix `,0` and `*_STEP_POS` to `,1`. For GH only this is inverted:
-//!   `GH_AMP_STEP_POS` -> `"SPLA 4,0"`, `GH_AMP_STEP_NEG` -> `"SPLA 4,1"`
-//!   (ditto `GH_OFFSET_STEP_{POS,NEG}` -> `"SPLO 4,{0,1}"`). The C
-//!   source's own inline comments ("minus"/"plus") describe the wire
-//!   value, not the tag name, confirming this is a genuine upstream
-//!   copy-paste bug rather than an intentional inversion. Reproduced
-//!   verbatim; see `commands_preserve_gh_output_inversion_bug` below.
+//!   suffix `,0` and `*_STEP_POS` to `,1`. The C table swapped this for GH
+//!   only, while its own trailing "minus"/"plus" comments still read arg 0
+//!   = minus, arg 1 = plus — confirming a copy-paste bug in the driver's
+//!   own tag<->wire-value table, not a DG645-defined per-channel
+//!   difference (the SPLA/SPLO argument has one fixed wire meaning across
+//!   every channel). Corrected here to the T0/AB/CD/EF convention; see
+//!   `commands_use_consistent_step_polarity_convention` below.
+//!
+//! # Preserved upstream quirks (not "fixed")
 //! - `cvtErrorCode`'s dead branch (`if(!check_errors) *outBuf=-1;` with no
 //!   `return`, unconditionally overwritten by `*outBuf=pport->error` on
 //!   the next line): STATUS_CODE always reads back `error`, regardless of
@@ -306,14 +308,21 @@ static COMMANDS: &[CommandSpec] = &[
     cmd("GH_AMP", "LAMP?4", "LAMP 4,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
     cmd("GH_OFFSET", "LOFF?4", "LOFF 4,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
     cmd("GH_POLARITY", "LPOL?4", "LPOL 4,%d", Conv::StrInt, WriteKind::Int),
-    // Upstream bug (drvAsynDG645.cpp:475-476): POS/NEG wire values are
-    // swapped here relative to every other output above. Preserved
-    // verbatim — see module doc and `commands_preserve_gh_output_inversion_bug`.
-    cmd("GH_AMP_STEP_POS", "", "SPLA 4,0", Conv::Sink, WriteKind::CommandOnly),
-    cmd("GH_AMP_STEP_NEG", "", "SPLA 4,1", Conv::Sink, WriteKind::CommandOnly),
+    // Fixed upstream defect (doc/upstream-c-defects.md #32,
+    // drvAsynDG645.cpp:475-479): the C table's tag<->wire-value mapping was
+    // swapped for GH only (POS bound to wire arg 0, NEG to arg 1), while its
+    // own trailing "minus"/"plus" comments still read arg 0 = minus, arg 1 =
+    // plus -- the same convention every other output (T0/AB/CD/EF) uses.
+    // The SPLA/SPLO wire command's argument value has one fixed meaning
+    // across every channel; this was a copy-paste bug in the driver's own
+    // table, not a DG645-defined per-channel difference. Corrected to match
+    // the T0/AB/CD/EF convention (NEG->0, POS->1); see
+    // `commands_use_consistent_step_polarity_convention`.
+    cmd("GH_AMP_STEP_NEG", "", "SPLA 4,0", Conv::Sink, WriteKind::CommandOnly),
+    cmd("GH_AMP_STEP_POS", "", "SPLA 4,1", Conv::Sink, WriteKind::CommandOnly),
     cmd("GH_AMP_STEP", "SSLA?4", "SSLA 4,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
-    cmd("GH_OFFSET_STEP_POS", "", "SPLO 4,0", Conv::Sink, WriteKind::CommandOnly),
-    cmd("GH_OFFSET_STEP_NEG", "", "SPLO 4,1", Conv::Sink, WriteKind::CommandOnly),
+    cmd("GH_OFFSET_STEP_NEG", "", "SPLO 4,0", Conv::Sink, WriteKind::CommandOnly),
+    cmd("GH_OFFSET_STEP_POS", "", "SPLO 4,1", Conv::Sink, WriteKind::CommandOnly),
     cmd("GH_OFFSET_STEP", "SSLO?4", "SSLO 4,%-.2f", Conv::StrFloat, WriteKind::Float(FloatFmt::F2)),
 ];
 
@@ -708,13 +717,14 @@ mod tests {
     }
 
     #[test]
-    fn commands_preserve_gh_output_inversion_bug() {
+    fn commands_use_consistent_step_polarity_convention() {
+        // doc/upstream-c-defects.md #32: GH now follows the same
+        // NEG->0/POS->1 wire-value convention as every other output.
         let get = |tag: &str| COMMANDS.iter().find(|c| c.tag == tag).unwrap();
-        assert_eq!(get("GH_AMP_STEP_POS").write_cmd, "SPLA 4,0");
-        assert_eq!(get("GH_AMP_STEP_NEG").write_cmd, "SPLA 4,1");
-        assert_eq!(get("GH_OFFSET_STEP_POS").write_cmd, "SPLO 4,0");
-        assert_eq!(get("GH_OFFSET_STEP_NEG").write_cmd, "SPLO 4,1");
-        // Every other output follows the non-inverted convention.
+        assert_eq!(get("GH_AMP_STEP_NEG").write_cmd, "SPLA 4,0");
+        assert_eq!(get("GH_AMP_STEP_POS").write_cmd, "SPLA 4,1");
+        assert_eq!(get("GH_OFFSET_STEP_NEG").write_cmd, "SPLO 4,0");
+        assert_eq!(get("GH_OFFSET_STEP_POS").write_cmd, "SPLO 4,1");
         assert_eq!(get("T0_AMP_STEP_NEG").write_cmd, "SPLA 0,0");
         assert_eq!(get("T0_AMP_STEP_POS").write_cmd, "SPLA 0,1");
         assert_eq!(get("AB_OFFSET_STEP_NEG").write_cmd, "SPLO 1,0");
