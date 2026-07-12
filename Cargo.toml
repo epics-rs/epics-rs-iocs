@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "drivers/d435i",
+    "drivers/ad/merlin",
     "drivers/motor/amci",
     "drivers/motor/common",
     "drivers/motor/micronix",
@@ -34,6 +35,7 @@ members = [
     "drivers/meascomp/usb-2408",
     "drivers/meascomp/usb-ctr",
     "iocs/d435i-ioc",
+    "iocs/ad/merlin-ioc",
     "iocs/motor/ag-uc-ioc",
     "iocs/motor/agap-conex-ioc",
     "iocs/motor/conex-ioc",
