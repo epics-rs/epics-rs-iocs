@@ -1,0 +1,17 @@
+# Televac vacuum gauge controller. devTelevac.c ships no database in the ip
+# module, so this one is derived from the device support's command set.
+#
+#   $(P)      PV prefix
+#   $(GAUGE)  this station's name, e.g. "tv1"
+#   $(PORT)   asyn port created by TelevacConfig
+#   $(ADDR)   station index, 0-based (station 1 -> 0)
+#
+# Load the relay records separately (televac_relay.db), one per relay.
+
+record(ai, "$(P)$(GAUGE):PRES") {
+    field(DESC, "Pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TVAC_PRESSURE")
+}

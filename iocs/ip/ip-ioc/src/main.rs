@@ -10,6 +10,7 @@
 //! ```text
 //! MPCConfig(port, octetPort, address, [pollPeriod])
 //! TPG261Config(port, octetPort, [pollPeriod])
+//! TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
 //! ```
 
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 
 use ip_devices::mpc::create_mpc;
 use ip_devices::runtime::IpPortRuntime;
+use ip_devices::televac::create_televac;
 use ip_devices::tpg261::create_tpg261;
 
 /// Every port the startup script creates, kept alive for the life of the IOC.
@@ -155,6 +157,59 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 2.0)?;
                 let port = create_tpg261(&name, &octet, poll)
                     .map_err(|e| format!("TPG261Config failed: {e}"))?;
+                register(&ports, &name, &trace, port);
+                Ok(CommandOutcome::Continue)
+            },
+        ));
+    }
+
+    // TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
+    {
+        let ports = ports.clone();
+        let trace = trace.clone();
+        app = app.register_startup_command(CommandDef::new(
+            "TelevacConfig",
+            vec![
+                ArgDesc {
+                    name: "portName",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "octetPort",
+                    arg_type: ArgType::String,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "numStations",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "numRelays",
+                    arg_type: ArgType::Int,
+                    optional: false,
+                },
+                ArgDesc {
+                    name: "pollPeriod",
+                    arg_type: ArgType::Double,
+                    optional: true,
+                },
+            ],
+            "TelevacConfig portName octetPort numStations numRelays [pollPeriod] - \
+             Televac vacuum gauge controller",
+            move |args: &[ArgValue], _ctx: &CommandContext| {
+                let name = string_arg(args, 0)?;
+                let octet = string_arg(args, 1)?;
+                let stations = int_arg(args, 2)?;
+                let relays = int_arg(args, 3)?;
+                let stations = u8::try_from(stations)
+                    .map_err(|_| format!("TelevacConfig: numStations {stations} is not 1..9"))?;
+                let relays = u8::try_from(relays)
+                    .map_err(|_| format!("TelevacConfig: numRelays {relays} is not 0..8"))?;
+                let poll = poll_arg(args, 4, 1.0)?;
+                let port = create_televac(&name, &octet, stations, relays, poll)
+                    .map_err(|e| format!("TelevacConfig failed: {e}"))?;
                 register(&ports, &name, &trace, port);
                 Ok(CommandOutcome::Continue)
             },

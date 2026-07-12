@@ -13,6 +13,7 @@
 //! |---|---|---|
 //! | `devMPC.c` | [`mpc`] | MPC / Digitel ion-pump controller |
 //! | `devTPG261.c` | [`tpg261`] | Pfeiffer TPG261 / TPG262 gauge controller |
+//! | `devTelevac.c` | [`televac`] | Televac vacuum gauge controller |
 //!
 //! All device I/O runs on a plain `std::thread` worker owned by the port (see
 //! [`worker`]); the asyn write handlers only enqueue onto it. That keeps
@@ -23,6 +24,7 @@ pub mod connect;
 pub mod fmt;
 pub mod mpc;
 pub mod runtime;
+pub mod televac;
 pub mod tpg261;
 pub mod worker;
 
