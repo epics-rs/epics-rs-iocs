@@ -1,0 +1,156 @@
+# Example database for the OPC UA device support.
+#
+# Modelled on the C module's example databases
+# (exampleTop/DeviceDbApp/UaDemoServerDb/Demo.Static.Scalar.db and
+# Demo.WorkOrderVariable.template): one record per data type, monitored through
+# a subscription, plus a structured item whose data elements are their own
+# records.
+#
+# Macros:
+#   P     record name prefix
+#   SESS  session name  (from opcuaSession)
+#   SUBS  subscription name (from opcuaSubscription)
+#
+# A link is "@<session-or-subscription> <node> [key=value ...]". Naming the
+# subscription makes the item monitored; naming the session makes it read on
+# demand (SCAN, or the item record's READ).
+
+# --- scalars, monitored -----------------------------------------------------
+
+record(bi, "$(P)bibool") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Boolean")
+    field(ZNAM, "false")
+    field(ONAM, "true")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+}
+
+record(bo, "$(P)bobool") {
+    field(DTYP, "OPCUA")
+    field(OUT,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Boolean")
+    field(ZNAM, "false")
+    field(ONAM, "true")
+    field(TSE,  "-2")
+}
+
+record(longin, "$(P)liint32") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Int32")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+}
+
+record(longout, "$(P)loint32") {
+    field(DTYP, "OPCUA")
+    field(OUT,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Int32")
+    field(TSE,  "-2")
+}
+
+record(int64in, "$(P)i64iint64") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Int64")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+}
+
+record(ai, "$(P)aidouble") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Double")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+    field(PREC, "3")
+}
+
+record(ao, "$(P)aodouble") {
+    field(DTYP, "OPCUA")
+    field(OUT,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Double")
+    field(TSE,  "-2")
+    field(PREC, "3")
+}
+
+record(stringin, "$(P)sistring") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.String")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+}
+
+# An unmonitored input: read once at init, then whenever the record is
+# processed (`monitor=n` puts it on the session, not on the subscription).
+record(ai, "$(P)aidoublex") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Double monitor=n")
+    field(SCAN, "1 second")
+    field(TSE,  "-2")
+    field(PREC, "3")
+}
+
+# --- an enumerated node -----------------------------------------------------
+#
+# NOBT/SHFT put the mask over the node's bit window; without NOBT the mask is
+# every bit (`opcua_init_mask_read`, devOpcua.cpp:143-157).
+
+record(mbbi, "$(P)mbbienum") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Scalar.Byte")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+    field(NOBT, "2")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(THVL, "3")
+    field(ZRST, "Off")
+    field(ONST, "Starting")
+    field(TWST, "Running")
+    field(THST, "Fault")
+}
+
+# --- an array ---------------------------------------------------------------
+
+record(waveform, "$(P)wfdouble") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.Arrays.Double")
+    field(FTVL, "DOUBLE")
+    field(NELM, "10")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+}
+
+# --- a structured node ------------------------------------------------------
+#
+# The item record holds the whole structure; each element record links to the
+# item by *record name* and names its element. The item record must be loaded
+# before its element records.
+#
+# DEFACTN says what processing the item does with no other reason (read or
+# write); WOC=manual writes the item only when the item record's WRITE field is
+# put, WOC=immediate as soon as an element record has put a value.
+
+record(opcuaItem, "$(P)item") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(SUBS) ns=2;s=Demo.Static.UserScalar.WorkOrder")
+    field(TSE,  "-2")
+    field(DEFACTN, "read")
+    field(WOC,  "immediate")
+}
+
+record(stringout, "$(P)assetid") {
+    field(DTYP, "OPCUA")
+    field(OUT,  "@$(P)item element=AssetID")
+    field(TSE,  "-2")
+}
+
+record(stringin, "$(P)assetidRBK") {
+    field(DTYP, "OPCUA")
+    field(INP,  "@$(P)item element=AssetID")
+    field(SCAN, "I/O Intr")
+    field(TSE,  "-2")
+}
+
+record(longout, "$(P)priority") {
+    field(DTYP, "OPCUA")
+    field(OUT,  "@$(P)item element=Priority")
+    field(TSE,  "-2")
+}

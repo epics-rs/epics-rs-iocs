@@ -1,0 +1,13 @@
+# OPC UA IOC binary: EPICS device support for OPC UA (`epics-modules/opcua`),
+# on the pure-Rust `async-opcua` client. Exposes CA + PVA. No vendor SDK.
+
+[package]
+name = "opcua-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+opcua = { path = "../../drivers/opcua" }
+epics-rs = { workspace = true, features = ["bridge"] }
+log = "0.4"
