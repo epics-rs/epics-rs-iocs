@@ -1,0 +1,172 @@
+#=================================================================#
+# Template file: Measurement.template
+# Serval Measurement status.
+# Copyright (c) 2022 Brookhaven Science Associates, Brookhaven National Laboratory
+# Copyright (c) 2022-2026 UT-Battelle, LLC, Oak Ridge National Laboratory
+# SPDX-License-Identifier: MIT
+# Author: K. Gofron
+# Date: 2025/7/20
+#=================================================================#
+
+##################################################################
+# Define measurement status PV records here.
+#
+##################################################################
+
+record(longin, "$(P)$(R)PelEvtRate_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_PEL_RATE")
+  field(SCAN, "I/O Intr")
+  info(archive, "Monitor, 00:00:01, VAL")
+}
+record(longin, "$(P)$(R)Tdc1EvtRate_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TDC1_RATE")
+  field(SCAN, "I/O Intr")
+  info(archive, "Monitor, 00:00:01, VAL")
+}
+record(longin, "$(P)$(R)Tdc2EvtRate_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TDC2_RATE")
+  field(SCAN, "I/O Intr")
+}
+record(int64in, "$(P)$(R)StartTime_RBV"){
+  field(DTYP, "asynInt64")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_START_TIME")
+  field(SCAN, "I/O Intr")
+}
+record(ai, "$(P)$(R)ElapsedTime_RBV"){
+  field(DTYP, "asynFloat64")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_ELAPSED_TIME")
+  field(SCAN, "I/O Intr")
+}
+record(ai, "$(P)$(R)TimeLeft_RBV"){
+  field(DTYP, "asynFloat64")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TIME_LEFT")
+  field(SCAN, "I/O Intr")
+}
+record(longin, "$(P)$(R)FrameCnt_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_FRAME_COUNT")
+  field(SCAN, "I/O Intr")
+}
+record(longin, "$(P)$(R)DroppedFrames_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_DROPPED_FRAMES")
+  field(SCAN, "I/O Intr")
+  info(archive, "Monitor, 00:00:01, VAL")
+}
+record(stringin, "$(P)$(R)Status_RBV"){
+  field(DTYP, "asynOctetRead")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_MSMT_STATUS")
+  field(SCAN, "I/O Intr")
+}
+
+##################################################################
+# Measurement.Config (SERVAL 4.1.x): Stem (4D-STEM), TimeOfFlight
+##################################################################
+record(longout, "$(P)$(R)StemScanWidth"){
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_SCAN_WIDTH")
+  field(DESC, "Stem scan width")
+}
+record(longin, "$(P)$(R)StemScanWidth_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_SCAN_WIDTH")
+  field(SCAN, "I/O Intr")
+  field(DESC, "Stem scan width RBV")
+}
+record(longout, "$(P)$(R)StemScanHeight"){
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_SCAN_HEIGHT")
+  field(DESC, "Stem scan height")
+}
+record(longin, "$(P)$(R)StemScanHeight_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_SCAN_HEIGHT")
+  field(SCAN, "I/O Intr")
+  field(DESC, "Stem scan height RBV")
+}
+record(ao, "$(P)$(R)StemDwellTime"){
+  field(DTYP, "asynFloat64")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_DWELL_TIME")
+  field(PREC, "6")
+  field(DESC, "Stem dwell time [s]")
+}
+record(ai, "$(P)$(R)StemDwellTime_RBV"){
+  field(DTYP, "asynFloat64")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_DWELL_TIME")
+  field(SCAN, "I/O Intr")
+  field(PREC, "6")
+  field(DESC, "Stem dwell time RBV [s]")
+}
+record(longout, "$(P)$(R)StemRadiusOuter"){
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_RADIUS_OUTER")
+  field(DESC, "Stem virtual detector outer radius")
+}
+record(longin, "$(P)$(R)StemRadiusOuter_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_RADIUS_OUTER")
+  field(SCAN, "I/O Intr")
+  field(DESC, "Stem virtual detector outer radius RBV")
+}
+record(longout, "$(P)$(R)StemRadiusInner"){
+  field(DTYP, "asynInt32")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_RADIUS_INNER")
+  field(DESC, "Stem virtual detector inner radius")
+}
+record(longin, "$(P)$(R)StemRadiusInner_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_RADIUS_INNER")
+  field(SCAN, "I/O Intr")
+  field(DESC, "Stem virtual detector inner radius RBV")
+}
+record(stringout, "$(P)$(R)TofTdcReference"){
+  field(DTYP, "asynOctetWrite")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_TDC_REFERENCE")
+  field(DESC, "ToF TDC reference (comma-sep)")
+}
+record(stringin, "$(P)$(R)TofTdcReference_RBV"){
+  field(DTYP, "asynOctetRead")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_TDC_REFERENCE")
+  field(SCAN, "I/O Intr")
+  field(DESC, "ToF TDC reference RBV")
+}
+record(ao, "$(P)$(R)TofMin"){
+  field(DTYP, "asynFloat64")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_MIN")
+  field(PREC, "6")
+  field(DESC, "ToF min")
+}
+record(ai, "$(P)$(R)TofMin_RBV"){
+  field(DTYP, "asynFloat64")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_MIN")
+  field(SCAN, "I/O Intr")
+  field(PREC, "6")
+  field(DESC, "ToF min RBV")
+}
+record(ao, "$(P)$(R)TofMax"){
+  field(DTYP, "asynFloat64")
+  field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_MAX")
+  field(PREC, "6")
+  field(DESC, "ToF max")
+}
+record(ai, "$(P)$(R)TofMax_RBV"){
+  field(DTYP, "asynFloat64")
+  field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_MAX")
+  field(SCAN, "I/O Intr")
+  field(PREC, "6")
+  field(DESC, "ToF max RBV")
+}
+
+#record(mbbi, "$(P)$(R)Status_RBV")
+#{
+#   field(DTYP, "asynInt32")
+#   field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_MSMT_STATUS") 
+#   field(ZRST, "DA_IDLE") 
+#   field(ZRVL, "0")
+#   field(ONST, "DA_RECORDING") 
+#   field(ONVL, "1")
+#   field(SCAN, "I/O Intr")
+#}
