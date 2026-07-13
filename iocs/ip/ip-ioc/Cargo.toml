@@ -1,0 +1,11 @@
+[package]
+name = "ip-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ip-devices = { path = "../../../drivers/ip" }
+epics-rs = { workspace = true, features = ["asyn", "bridge"] }
+asyn-rs = { workspace = true, features = ["epics"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

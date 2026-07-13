@@ -1,0 +1,248 @@
+# MPC / Digitel ion-pump controller. Port of ipApp/Db/MPC.db.
+#
+#   $(P)     PV prefix, e.g. "13IDA:"
+#   $(PUMP)  this pump's name, e.g. "ip1"
+#   $(PORT)  asyn port created by MPCConfig
+#   $(PN)    supply (pump) number, 1 or 2 -> asyn address 0 or 1
+#
+# The controller address ($(PA) in the C database) moved into MPCConfig: it
+# belongs to the port, not to each record.
+#
+# The C device support wrote the units the controller reported into each ai
+# record's EGU field. A port driver cannot write EGU, so the units are published
+# as their own stringin records (:PRES.EGU stays static, :PRESEGU carries what
+# the controller said).
+
+record(stringin, "$(P)$(PUMP):STAT") {
+    field(DESC, "Pump status")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_STATUS")
+}
+
+record(ai, "$(P)$(PUMP):PRES") {
+    field(DESC, "Pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "1")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_PRESSURE")
+}
+
+record(stringin, "$(P)$(PUMP):PRESEGU") {
+    field(DESC, "Pressure units reported")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_PRESSURE_EGU")
+}
+
+record(ai, "$(P)$(PUMP):CUR") {
+    field(DESC, "Pump current")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "1")
+    field(EGU,  "AMPS")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_CURRENT")
+}
+
+record(ai, "$(P)$(PUMP):VOLT") {
+    field(DESC, "Pump voltage")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "0")
+    field(EGU,  "VOLTS")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_VOLTAGE")
+}
+
+record(ai, "$(P)$(PUMP):SIZE") {
+    field(DESC, "Pump size")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "0")
+    field(EGU,  "L/S")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SIZE")
+}
+
+record(ai, "$(P)$(PUMP):SP1V") {
+    field(DESC, "Setpoint 1 pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "1")
+    field(EGU,  "TORR")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP1_VAL")
+}
+
+record(bi, "$(P)$(PUMP):SP1S") {
+    field(DESC, "Setpoint 1 relay")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP1_STATE")
+}
+
+record(ai, "$(P)$(PUMP):SP2V") {
+    field(DESC, "Setpoint 2 pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "1")
+    field(EGU,  "TORR")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP2_VAL")
+}
+
+record(bi, "$(P)$(PUMP):SP2S") {
+    field(DESC, "Setpoint 2 relay")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP2_STATE")
+}
+
+record(ai, "$(P)$(PUMP):SP3V") {
+    field(DESC, "Setpoint 3 pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "1")
+    field(EGU,  "TORR")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP3_VAL")
+}
+
+record(bi, "$(P)$(PUMP):SP3S") {
+    field(DESC, "Setpoint 3 relay")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP3_STATE")
+}
+
+record(ai, "$(P)$(PUMP):SP4V") {
+    field(DESC, "Setpoint 4 pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "1")
+    field(EGU,  "TORR")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP4_VAL")
+}
+
+record(bi, "$(P)$(PUMP):SP4S") {
+    field(DESC, "Setpoint 4 relay")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP4_STATE")
+}
+
+record(bi, "$(P)$(PUMP):GAUTOS") {
+    field(DESC, "Auto-restart readback")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(OSV,  "MAJOR")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_AUTO_RESTART")
+}
+
+record(stringin, "$(P)$(PUMP):TSPSTAT") {
+    field(DESC, "TSP status")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_TSP_STATUS")
+}
+
+record(mbbo, "$(P)$(PUMP):DIS") {
+    field(DESC, "Front-panel display")
+    field(DTYP, "asynInt32")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(ZRST, "Pressure")
+    field(ONST, "Current")
+    field(TWST, "Voltage")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SET_DISPLAY")
+}
+
+record(mbbo, "$(P)$(PUMP):UNIT") {
+    field(DESC, "Pressure units")
+    field(DTYP, "asynInt32")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(ZRST, "Pressure")
+    field(ONST, "Current")
+    field(TWST, "Voltage")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SET_UNIT")
+}
+
+record(ao, "$(P)$(PUMP):SSIZE") {
+    field(DESC, "Set pump size")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "supervisory")
+    field(PREC, "0")
+    field(VAL,  "30")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SET_SIZE")
+}
+
+record(ao, "$(P)$(PUMP):SET1") {
+    field(DESC, "Set setpoint 1")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "supervisory")
+    field(PREC, "1")
+    field(VAL,  "1.0E-06")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP1_SET")
+}
+
+record(ao, "$(P)$(PUMP):SET2") {
+    field(DESC, "Set setpoint 2")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "supervisory")
+    field(PREC, "1")
+    field(VAL,  "1.0E-06")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP2_SET")
+}
+
+record(ao, "$(P)$(PUMP):SET3") {
+    field(DESC, "Set setpoint 3")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "supervisory")
+    field(PREC, "1")
+    field(VAL,  "1.0E-06")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP3_SET")
+}
+
+record(ao, "$(P)$(PUMP):SET4") {
+    field(DESC, "Set setpoint 4")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "supervisory")
+    field(PREC, "1")
+    field(VAL,  "1.0E-06")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SP4_SET")
+}
+
+record(bo, "$(P)$(PUMP):STOP") {
+    field(DESC, "Start / stop the pump")
+    field(DTYP, "asynInt32")
+    field(OSV,  "MAJOR")
+    field(ZNAM, "START")
+    field(ONAM, "STOP")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_START")
+}
+
+record(bo, "$(P)$(PUMP):ULCK") {
+    field(DESC, "Keyboard lock")
+    field(DTYP, "asynInt32")
+    field(OSV,  "MAJOR")
+    field(ZNAM, "LOCK")
+    field(ONAM, "UNLOCK")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_LOCK")
+}
+
+record(bo, "$(P)$(PUMP):SAUTOS") {
+    field(DESC, "Set auto-restart")
+    field(DTYP, "asynInt32")
+    field(OSV,  "MAJOR")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=3))MPC_SET_AUTO_RESTART")
+}

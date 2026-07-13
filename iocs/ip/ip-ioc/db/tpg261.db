@@ -1,0 +1,136 @@
+# Pfeiffer TPG261 / TPG262 gauge controller. Port of ipApp/Db/TPG261.db.
+#
+#   $(P)      PV prefix
+#   $(GAUGE)  this gauge's name, e.g. "gauge1"
+#   $(PORT)   asyn port created by TPG261Config
+#   $(ADDR)   0 for gauge 1, 1 for gauge 2 (the C's $(ADDR) was the same number,
+#             one-based; here it is the asyn address)
+
+record(stringin, "$(P)$(GAUGE):ID") {
+    field(DESC, "Gauge identification")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_ID")
+}
+
+record(mbbi, "$(P)$(GAUGE):UNIT") {
+    field(DESC, "Pressure units")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(ZRST, "bar")
+    field(ONST, "Torr")
+    field(TWST, "Pascal")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_UNITS")
+}
+
+record(ai, "$(P)$(GAUGE):PRES") {
+    field(DESC, "Pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_PRESSURE")
+}
+
+# devTPG261.c:337-345 alarmed the pressure record from inside device support:
+# status 0 no alarm, status 4 MINOR, any other status INVALID. A port driver
+# cannot raise a record alarm, so the status code is published here and the same
+# severities are attached to it. The code numbers other than 0 and 4 are not
+# named: the C never says what they mean and no manual was available.
+record(mbbi, "$(P)$(GAUGE):GSTATUS") {
+    field(DESC, "Gauge measurement status")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZRVL, "0")
+    field(FRVL, "4")
+    field(ZRST, "OK")
+    field(FRST, "Status 4")
+    field(FRSV, "MINOR")
+    field(UNSV, "MAJOR")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_GAUGE_STATUS")
+}
+
+record(bi, "$(P)$(GAUGE):STATUS") {
+    field(DESC, "Sensor on/off")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZSV,  "MAJOR")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SENSOR")
+}
+
+record(bi, "$(P)$(GAUGE):SP1S") {
+    field(DESC, "Setpoint 1 relay")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZSV,  "MAJOR")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SP1_STATE")
+}
+
+record(bi, "$(P)$(GAUGE):SP2S") {
+    field(DESC, "Setpoint 2 relay")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZSV,  "MAJOR")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SP2_STATE")
+}
+
+record(ai, "$(P)$(GAUGE):SP1V") {
+    field(DESC, "Setpoint 1 pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SP1_VAL")
+}
+
+record(ai, "$(P)$(GAUGE):SP2V") {
+    field(DESC, "Setpoint 2 pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SP2_VAL")
+}
+
+record(bo, "$(P)$(GAUGE):START") {
+    field(DESC, "Switch the gauge on/off")
+    field(DTYP, "asynInt32")
+    field(ZSV,  "MAJOR")
+    field(ZNAM, "STOP")
+    field(ONAM, "START")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SET_SENSOR")
+}
+
+record(mbbo, "$(P)$(GAUGE):SUNIT") {
+    field(DESC, "Set pressure units")
+    field(DTYP, "asynInt32")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(ZRST, "bar")
+    field(ONST, "Torr")
+    field(TWST, "Pascal")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SET_UNITS")
+}
+
+record(ao, "$(P)$(GAUGE):SET1") {
+    field(DESC, "Set setpoint 1")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "supervisory")
+    field(PREC, "2")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SP1_SET")
+}
+
+record(ao, "$(P)$(GAUGE):SET2") {
+    field(DESC, "Set setpoint 2")
+    field(DTYP, "asynFloat64")
+    field(OMSL, "supervisory")
+    field(PREC, "2")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=2))TPG_SP2_SET")
+}

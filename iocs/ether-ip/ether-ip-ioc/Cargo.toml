@@ -1,0 +1,11 @@
+[package]
+name = "ether-ip-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ether-ip = { path = "../../../drivers/ether-ip" }
+log = "0.4"
+epics-rs = { workspace = true, features = ["bridge"] }
+tokio = { version = "1", features = ["full"] }

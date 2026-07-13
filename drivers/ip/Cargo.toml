@@ -1,0 +1,10 @@
+[package]
+name = "ip-devices"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn"] }
+log = "0.4"
+thiserror = "2"

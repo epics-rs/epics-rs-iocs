@@ -1,0 +1,203 @@
+record(bi, "$(P)RobotiqGripper:Connected")
+{
+    field(DESC, "Connection status")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_CONNECTED")
+    field(VAL, 0)
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)RobotiqGripper:Calibrated")
+{
+    field(DESC, "Calibration status")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_CALIBRATED")
+    field(VAL, 0)
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)RobotiqGripper:IsActive")
+{
+    field(DESC, "Gripper active status")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_ACTIVE")
+    field(VAL, 0)
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)RobotiqGripper:IsOpen")
+{
+    field(DESC, "Gripper open status")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_OPEN")
+    field(VAL, 0)
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)RobotiqGripper:IsClosed")
+{
+    field(DESC, "Gripper closed status")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_CLOSED")
+    field(VAL, 0)
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)RobotiqGripper:IsStoppedInner")
+{
+    field(DESC, "Stopped on inner object")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_STOPPED_INNER")
+    field(VAL, 0)
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)RobotiqGripper:IsStoppedOuter")
+{
+    field(DESC, "Stopped on outer object")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_STOPPED_OUTER")
+    field(VAL, 0)
+    field(SCAN, "I/O Intr")
+}
+
+record(bo, "$(P)RobotiqGripper:Connect")
+{
+    field(DESC, "Connects to Robotiq gripper")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CONNECT")
+}
+
+record(bo, "$(P)RobotiqGripper:Activate")
+{
+    field(DESC, "Activates Robotiq gripper")
+    field(DTYP, "asynInt32")
+    field(PINI, "$(AUTO_ACTIVATE=YES)")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ACTIVATE")
+}
+
+record(bo, "$(P)RobotiqGripper:AutoCalibrate")
+{
+    field(DESC, "Calibrates open/close positions")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))AUTO_CALIBRATE")
+}
+
+record(bo, "$(P)RobotiqGripper:Open")
+{
+    field(DESC, "Opens Robotiq gripper")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))OPEN")
+}
+
+record(bo, "$(P)RobotiqGripper:Close")
+{
+    field(DESC, "Close Robotiq gripper")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CLOSE")
+}
+
+record(longout, "$(P)RobotiqGripper:MinPosition")
+{
+    field(DTYP, "asynInt32")
+    field(PINI, "1")
+    field(VAL, "$(MIN_POS=0)")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MIN_POSITION")
+    field(FLNK, "$(P)RobotiqGripper:SetPositionRange.PROC")
+}
+
+record(longout, "$(P)RobotiqGripper:MaxPosition")
+{
+    field(DTYP, "asynInt32")
+    field(PINI, "1")
+    field(VAL, "$(MAX_POS=255)")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MAX_POSITION")
+    field(FLNK, "$(P)RobotiqGripper:SetPositionRange.PROC")
+}
+
+record(bo, "$(P)RobotiqGripper:SetPositionRange")
+{
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))SET_POSITION_RANGE")
+}
+
+record(mbbo, "$(P)RobotiqGripper:PositionUnit")
+{
+    field(ZRST, "Device")
+    field(ONST, "Normalized")
+    field(TWST, "Percent")
+    field(THST, "mm")
+    field(VAL, "1")
+    field(OUT, "$(P)RobotiqGripper:PositionUnitRaw PP")
+}
+
+record(longout, "$(P)RobotiqGripper:PositionUnitRaw")
+{
+    field(DTYP, "asynInt32")
+    field(VAL, "1")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))POSITION_UNIT")
+}
+
+record(mbbi, "$(P)RobotiqGripper:MoveStatus")
+{
+    field(INP, "$(P)RobotiqGripper:MoveStatusRaw CP")
+    field(ZRST, "Moving")
+    field(ONST, "Stopped outer object")
+    field(TWST, "Stopped inner object")
+    field(THST, "At target destination")
+}
+
+record(longin, "$(P)RobotiqGripper:MoveStatusRaw")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MOVE_STATUS")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)RobotiqGripper:CurrentPosition")
+{
+    field(DESC, "Current position of gripper")
+    field(PREC, "4")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CURRENT_POSITION")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)RobotiqGripper:OpenPosition")
+{
+    field(DESC, "Open position of gripper")
+    field(PREC, "4")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))OPEN_POSITION")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)RobotiqGripper:ClosedPosition")
+{
+    field(DESC, "Closed position of gripper")
+    field(PREC, "4")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CLOSED_POSITION")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)RobotiqGripper:SetSpeed")
+{
+    field(DESC, "Default gripper speed")
+    field(DTYP, "asynFloat64")
+    field(PREC, "4")
+    field(PINI, "1")
+    field(VAL, "0.5")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))SET_SPEED")
+}
+
+record(ao, "$(P)RobotiqGripper:SetForce")
+{
+    field(DESC, "Default gripper force")
+    field(DTYP, "asynFloat64")
+    field(PREC, "4")
+    field(PINI, "1")
+    field(VAL, "0.5")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))SET_FORCE")
+}
+

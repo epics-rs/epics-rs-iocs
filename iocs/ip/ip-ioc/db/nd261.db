@@ -1,0 +1,26 @@
+# Heidenhain ND261 display unit. devAiHeidND261.c ships no database in the ip
+# module, so this one is derived from the device support.
+#
+#   $(P)     PV prefix
+#   $(AXIS)  this readout's name, e.g. "x"
+#   $(PORT)  asyn port created by ND261Config
+
+record(ai, "$(P)$(AXIS):POS") {
+    field(DESC, "ND261 readout")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "4")
+    field(INP,  "@asyn($(PORT),0,$(TIMEOUT=1))ND261_POSITION")
+}
+
+# devAiHeidND261.c set VAL = 99999.0 and UDF = 1 when the read failed; the ai
+# record above carries the 99999.0 and this record carries the alarm.
+record(bi, "$(P)$(AXIS):STATUS") {
+    field(DESC, "Readout status")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,$(TIMEOUT=1))ND261_STATUS")
+    field(ZNAM, "OK")
+    field(ONAM, "Read error")
+    field(OSV,  "MAJOR")
+}

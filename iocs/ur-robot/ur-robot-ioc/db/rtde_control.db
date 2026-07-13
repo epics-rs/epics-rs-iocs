@@ -1,0 +1,1057 @@
+
+#======================
+# Status/Connection
+#======================
+
+record(bi, "$(P)Control:Connected")
+{
+    field(DESC, "RTDE Connection status")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_CONNECTED")
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)Control:Steady")
+{
+    field(DESC, "Is robot fully at rest")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))IS_STEADY")
+    field(SCAN, "I/O Intr")
+}
+
+record(calcout, "$(P)Control:dash_trig_disconnect")
+{
+    field(INPA, "$(P)Dashboard:IsInRemoteControl.RVAL CP")
+    field(CALC, "A")
+    field(OOPT, "Transition To Zero")
+    field(DOPT, "Use OCAL")
+    field(OCAL, "1")
+    field(OUT, "$(P)Control:Disconnect.PROC")
+}
+
+record(bo, "$(P)Control:Disconnect")
+{
+    field(DESC, "Disconnects from the RTDE interface")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))DISCONNECT")
+}
+
+record(bo, "$(P)Control:Reconnect")
+{
+    field(DESC, "Tries reconnecting to the RTDE interface")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))RECONNECT")
+    field(FLNK, "$(P)IO:SpeedSlider.PROC")
+}
+
+record(bo, "$(P)Control:ReuploadControlScript")
+{
+    field(DESC, "Reuploads control script to controller")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))REUPLOAD_CONTROL_SCRIPT")
+}
+
+record(bo, "$(P)Control:StopControlScript")
+{
+    field(DESC, "Stops the control script")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))STOP_CONTROL_SCRIPT")
+}
+
+#======================
+# Misc
+#======================
+
+record(bi, "$(P)Control:AsyncMoveDone")
+{
+    field(DESC, "1 if asynchronous motion complete")
+    field(DTYP, "asynInt32")
+    field(VAL, 1)
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ASYNC_MOVE_DONE")
+    field(SCAN, "I/O Intr")
+}
+
+record(calcout, "$(P)Control:moving_calc")
+{
+    field(INPA, "$(P)Control:Steady.VAL CP")
+    field(INPB, "$(P)Control:AsyncMoveDone.VAL CP")
+    field(INPC, "$(P)Receive:RuntimeState.VAL CP")
+    field(CALC, "(!A || !B) && (C=2)")
+}
+
+record(bi, "$(P)Control:Moving")
+{
+    field(INP, "$(P)Control:moving_calc.VAL CP")
+    field(ZNAM, "Done")
+    field(ONAM, "Moving")
+}
+
+record(bi, "$(P)Control:WaypointActionAsyn")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))RUN_WAYPOINT_ACTION")
+    field(SCAN, "I/O Intr")
+    field(FLNK, "$(P)Control:WaypointAction.PROC")
+}
+
+record(bo, "$(P)Control:WaypointAction")
+{
+    field(FLNK, "") # set by waypoint
+}
+
+record(calcout, "$(P)Control:WaypointActionDoneCalc")
+{
+    field(INPA, "") # set by waypoint
+    field(CALC, "A")
+    field(OUT, "$(P)Control:WaypointActionDone PP")
+}
+
+record(bo, "$(P)Control:WaypointActionDone")
+{
+    field(DESC, "1 if waypoint action done, otherwise 0")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))WAYPOINT_ACTION_DONE")
+}
+
+record(bo, "$(P)Control:TeachMode")
+{
+    field(DESC, "Enabled teach/freedrive mode")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Off")
+    field(ONAM, "On")
+    field(VAL, 0)
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TEACH_MODE")
+}
+
+record(bo, "$(P)Control:TriggerProtectiveStop")
+{
+    field(DESC, "Triggers a protective stop")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TRIGGER_PROT_STOP")
+}
+
+record(bo, "$(P)Control:stop_path")
+{
+    field(DESC, "Stops all path motion when 1")
+    field(VAL, 0)
+}
+
+record(calcout, "$(P)Control:calc_stop_on_safety")
+{
+    field(INPA, "$(P)Receive:SafetyStatusBits CP")
+    field(CALC, "A=1")
+    field(OOPT, "Transition To Zero")
+    field(OUT, "$(P)Control:stop_on_safety.PROC")
+}
+
+record(fanout, "$(P)Control:stop_on_safety")
+{
+    field(LNK0, "$(P)Control:Stop")
+    field(LNK1, "$(P)Dashboard:Stop")
+}
+
+record(dfanout, "$(P)Control:Stop")
+{
+    field(DOL, 1)
+    field(OUTA, "$(P)Control:stopL.PROC")
+    field(OUTB, "$(P)Control:stop_path.VAL PP")
+    field(OUTC, "$(P)Control:sync_both_cmd.PROC")
+}
+
+record(calcout, "$(P)Control:auto_sync_steady")
+{
+    field(INPA, "$(P)Control:Steady.VAL CP NMS")
+    field(CALC, "A")
+    field(OOPT, "Transition To Non-zero")
+    field(OUT, "$(P)Control:sync_both_cmd.PROC")
+}
+
+record(calcout, "$(P)Control:auto_sync_automovej")
+{
+    field(INPA, "$(P)Control:AutoMoveJ.VAL CP NMS")
+    field(CALC, "A")
+    field(OOPT, "Transition To Non-zero")
+    field(OUT, "$(P)Control:sync_joint_cmd.PROC")
+}
+
+record(calcout, "$(P)Control:auto_sync_automovel")
+{
+    field(INPA, "$(P)Control:AutoMoveL.VAL CP NMS")
+    field(CALC, "A")
+    field(OOPT, "Transition To Non-zero")
+    field(OUT, "$(P)Control:sync_pose_cmd.PROC")
+}
+
+record(calcout, "$(P)Control:startup_sync_cmds")
+{
+    field(PINI, 1)
+    field(CALC, 1)
+    field(ODLY, 1.0)
+    field(OUT, "$(P)Control:sync_both_cmd.PROC PP")
+}
+
+record(fanout, "$(P)Control:sync_both_cmd")
+{
+    field(LNK0, "$(P)Control:sync_joint_cmd")
+    field(LNK1, "$(P)Control:sync_pose_cmd")
+}
+
+record(calcout, "$(P)Control:reset_after_async_move")
+{
+    field(INPA, "$(P)Control:AsyncMoveDone CP")
+    field(CALC, "A")
+    field(OOPT, "Transition To Non-zero")
+    field(OUT, "$(P)Control:sync_both_cmd.PROC")
+}
+
+#======================
+# Joint control
+#======================
+
+record(bo, "$(P)Control:moveJ")
+{
+    field(DESC, "Moves joints to commanded values")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MOVEJ")
+}
+
+record(bo, "$(P)Control:waypoint_move")
+{
+    # driver resets this to 0 automatically after each use
+    field(DESC, "If 1, moveJ/moveL will run action")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(VAL, 0)
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))WAYPOINT_MOVE")
+}
+
+record(ao, "$(P)Control:JointSpeed")
+{
+    field(DESC, "Joint speeds for moveJ")
+    field(DTYP, "asynFloat64")
+    field(PREC, 2)
+    field(VAL, 50.0)
+    field(EGU, "deg/s")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))JOINT_SPEED")
+}
+
+record(ao, "$(P)Control:JointAcceleration")
+{
+    field(DESC, "Joint accelerations for moveJ")
+    field(DTYP, "asynFloat64")
+    field(PREC, 2)
+    field(VAL, 100.0)
+    field(EGU, "deg/s/s")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))JOINT_ACCELERATION")
+}
+
+record(ao, "$(P)Control:JointBlend")
+{
+    field(DESC, "Blend radius for joint paths")
+    field(DTYP, "asynFloat64")
+    field(PREC, 2)
+    field(VAL, 0.0)
+    field(EGU, "mm")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))JOINT_BLEND")
+}
+
+record(bo, "$(P)Control:stopJ")
+{
+    field(DESC, "Moves joints to commanded values")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))STOPJ")
+    field(FLNK, "$(P)Control:sync_both_cmd.PROC")
+}
+
+record(bo, "$(P)Control:AutoMoveJ")
+{
+    field(DESC, "If 1, moveJ runs when JxCmd changes")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(VAL, 0)
+}
+
+record(calcout, "$(P)Control:auto_moveJ_calc")
+{
+    field(INPA, "$(P)Control:AutoMoveJ")
+    field(CALC, "A")
+    field(DISV, 1)
+    field(OOPT, "When Non-zero")
+    field(OUT, "$(P)Control:moveJ.PROC")
+}
+
+record(sseq, "$(P)Control:sync_joint_cmd")
+{
+    field(PINI, 0)
+
+    field(LNK1, "$(P)Control:auto_moveJ_calc.DISA CA")
+    field(STR1, "1")
+
+    field(DOL2, "$(P)Receive:Joint1")
+    field(LNK2, "$(P)Control:J1Cmd CA")
+    field(WAIT2, "After1")
+
+    field(DOL3, "$(P)Receive:Joint2")
+    field(LNK3, "$(P)Control:J2Cmd CA")
+    field(WAIT3, "After1")
+
+    field(DOL4, "$(P)Receive:Joint3")
+    field(LNK4, "$(P)Control:J3Cmd CA")
+    field(WAIT4, "After1")
+
+    field(DOL5, "$(P)Receive:Joint4")
+    field(LNK5, "$(P)Control:J4Cmd CA")
+    field(WAIT5, "After1")
+
+    field(DOL6, "$(P)Receive:Joint5")
+    field(LNK6, "$(P)Control:J5Cmd CA")
+    field(WAIT6, "After1")
+
+    field(DOL7, "$(P)Receive:Joint6")
+    field(LNK7, "$(P)Control:J6Cmd CA")
+    field(WAIT7, "After1")
+
+    field(LNK8, "$(P)Control:auto_moveJ_calc.DISA CA")
+    field(STR8, "0")
+    field(WAIT8, "After7")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:J1Cmd")
+{
+    field(DESC, "Commanded angle for joint 1")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))JOINT_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveJ_calc.PROC")
+}
+record(ao, "$(P)Control:J1TweakVal")
+{
+    field(DESC, "Joint 1 tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+}
+record(bo, "$(P)Control:J1TweakFwd")
+{
+    field(DESC, "Tweak joint 1 forward")
+    field(FLNK, "$(P)Control:J1TweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:J1TweakRev")
+{
+    field(DESC, "Tweak joint 1 backward")
+    field(FLNK, "$(P)Control:J1TweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:J1TweakCalcFwd")
+{
+    field(INPA, "$(P)Control:J1Cmd")
+    field(INPB, "$(P)Control:J1TweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:J1Cmd PP")
+}
+record(calcout, "$(P)Control:J1TweakCalcRev")
+{
+    field(INPA, "$(P)Control:J1Cmd")
+    field(INPB, "$(P)Control:J1TweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:J1Cmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:J2Cmd")
+{
+    field(DESC, "Commanded angle for joint 2")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),1,$(TIMEOUT=1))JOINT_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveJ_calc.PROC")
+}
+record(ao, "$(P)Control:J2TweakVal")
+{
+    field(DESC, "Joint 2 tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+}
+record(bo, "$(P)Control:J2TweakFwd")
+{
+    field(DESC, "Tweak joint 2 forward")
+    field(FLNK, "$(P)Control:J2TweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:J2TweakRev")
+{
+    field(DESC, "Tweak joint 2 backward")
+    field(FLNK, "$(P)Control:J2TweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:J2TweakCalcFwd")
+{
+    field(INPA, "$(P)Control:J2Cmd")
+    field(INPB, "$(P)Control:J2TweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:J2Cmd PP")
+}
+record(calcout, "$(P)Control:J2TweakCalcRev")
+{
+    field(INPA, "$(P)Control:J2Cmd")
+    field(INPB, "$(P)Control:J2TweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:J2Cmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:J3Cmd")
+{
+    field(DESC, "Commanded angle for joint 3")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),2,$(TIMEOUT=1))JOINT_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveJ_calc.PROC")
+}
+record(ao, "$(P)Control:J3TweakVal")
+{
+    field(DESC, "Joint 3 tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+}
+record(bo, "$(P)Control:J3TweakFwd")
+{
+    field(DESC, "Tweak joint 3 forward")
+    field(FLNK, "$(P)Control:J3TweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:J3TweakRev")
+{
+    field(DESC, "Tweak joint 3 backward")
+    field(FLNK, "$(P)Control:J3TweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:J3TweakCalcFwd")
+{
+    field(INPA, "$(P)Control:J3Cmd")
+    field(INPB, "$(P)Control:J3TweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:J3Cmd PP")
+}
+record(calcout, "$(P)Control:J3TweakCalcRev")
+{
+    field(INPA, "$(P)Control:J3Cmd")
+    field(INPB, "$(P)Control:J3TweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:J3Cmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:J4Cmd")
+{
+    field(DESC, "Commanded angle for joint 4")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),3,$(TIMEOUT=1))JOINT_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveJ_calc.PROC")
+}
+record(ao, "$(P)Control:J4TweakVal")
+{
+    field(DESC, "Joint 4 tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+}
+record(bo, "$(P)Control:J4TweakFwd")
+{
+    field(DESC, "Tweak joint 4 forward")
+    field(FLNK, "$(P)Control:J4TweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:J4TweakRev")
+{
+    field(DESC, "Tweak joint 4 backward")
+    field(FLNK, "$(P)Control:J4TweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:J4TweakCalcFwd")
+{
+    field(INPA, "$(P)Control:J4Cmd")
+    field(INPB, "$(P)Control:J4TweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:J4Cmd PP")
+}
+record(calcout, "$(P)Control:J4TweakCalcRev")
+{
+    field(INPA, "$(P)Control:J4Cmd")
+    field(INPB, "$(P)Control:J4TweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:J4Cmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:J5Cmd")
+{
+    field(DESC, "Commanded angle for joint 5")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),4,$(TIMEOUT=1))JOINT_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveJ_calc.PROC")
+}
+record(ao, "$(P)Control:J5TweakVal")
+{
+    field(DESC, "Joint 5 tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+}
+record(bo, "$(P)Control:J5TweakFwd")
+{
+    field(DESC, "Tweak joint 5 forward")
+    field(FLNK, "$(P)Control:J5TweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:J5TweakRev")
+{
+    field(DESC, "Tweak joint 5 backward")
+    field(FLNK, "$(P)Control:J5TweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:J5TweakCalcFwd")
+{
+    field(INPA, "$(P)Control:J5Cmd")
+    field(INPB, "$(P)Control:J5TweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:J5Cmd PP")
+}
+record(calcout, "$(P)Control:J5TweakCalcRev")
+{
+    field(INPA, "$(P)Control:J5Cmd")
+    field(INPB, "$(P)Control:J5TweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:J5Cmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:J6Cmd")
+{
+    field(DESC, "Commanded angle for joint 6")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),5,$(TIMEOUT=1))JOINT_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveJ_calc.PROC")
+}
+record(ao, "$(P)Control:J6TweakVal")
+{
+    field(DESC, "Joint 6 tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+}
+record(bo, "$(P)Control:J6TweakFwd")
+{
+    field(DESC, "Tweak joint 6 forward")
+    field(FLNK, "$(P)Control:J6TweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:J6TweakRev")
+{
+    field(DESC, "Tweak joint 6 backward")
+    field(FLNK, "$(P)Control:J6TweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:J6TweakCalcFwd")
+{
+    field(INPA, "$(P)Control:J6Cmd")
+    field(INPB, "$(P)Control:J6TweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:J6Cmd PP")
+}
+record(calcout, "$(P)Control:J6TweakCalcRev")
+{
+    field(INPA, "$(P)Control:J6Cmd")
+    field(INPB, "$(P)Control:J6TweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:J6Cmd PP")
+}
+
+#======================
+# TCP pose control
+#======================
+
+record(bo, "$(P)Control:moveL")
+{
+    field(DESC, "Move to TCP pose linearly")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MOVEL")
+}
+
+
+record(ao, "$(P)Control:LinearSpeed")
+{
+    field(DESC, "Linear speed for moveL")
+    field(DTYP, "asynFloat64")
+    field(PREC, 3)
+    field(VAL, 100.0)
+    field(EGU, "mm/s")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LINEAR_SPEED")
+}
+
+record(ao, "$(P)Control:LinearAcceleration")
+{
+    field(DESC, "Linear acceleration for moveL")
+    field(DTYP, "asynFloat64")
+    field(PREC, 3)
+    field(VAL, 200.0)
+    field(EGU, "mm/s/s")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LINEAR_ACCELERATION")
+}
+
+record(ao, "$(P)Control:LinearBlend")
+{
+    field(DESC, "Linear blend for moveL paths")
+    field(DTYP, "asynFloat64")
+    field(PREC, 3)
+    field(EGU, "mm")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))LINEAR_BLEND")
+}
+
+record(bo, "$(P)Control:stopL")
+{
+    field(DESC, "Stop linear move to TCP pose")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))STOPL")
+    field(FLNK, "$(P)Control:sync_both_cmd.PROC")
+}
+
+record(bo, "$(P)Control:AutoMoveL")
+{
+    field(DESC, "If 1, moveL runs when Cmd changes")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(VAL, 0)
+}
+
+record(calcout, "$(P)Control:auto_moveL_calc")
+{
+    field(INPA, "$(P)Control:AutoMoveL")
+    field(CALC, "A")
+    field(DISV, 1)
+    field(OOPT, "When Non-zero")
+    field(OUT, "$(P)Control:moveL.PROC")
+}
+
+record(sseq, "$(P)Control:sync_pose_cmd")
+{
+    field(PINI, 0)
+
+    field(LNK1, "$(P)Control:auto_moveL_calc.DISA CA")
+    field(STR1, "1")
+
+    field(DOL2, "$(P)Receive:PoseX")
+    field(LNK2, "$(P)Control:PoseXCmd CA")
+    field(WAIT2, "After1")
+
+    field(DOL3, "$(P)Receive:PoseY")
+    field(LNK3, "$(P)Control:PoseYCmd CA")
+    field(WAIT3, "After1")
+
+    field(DOL4, "$(P)Receive:PoseZ")
+    field(LNK4, "$(P)Control:PoseZCmd CA")
+    field(WAIT4, "After1")
+
+    field(DOL5, "$(P)Receive:PoseRoll")
+    field(LNK5, "$(P)Control:PoseRollCmd CA")
+    field(WAIT5, "After1")
+
+    field(DOL6, "$(P)Receive:PosePitch")
+    field(LNK6, "$(P)Control:PosePitchCmd CA")
+    field(WAIT6, "After1")
+
+    field(DOL7, "$(P)Receive:PoseYaw")
+    field(LNK7, "$(P)Control:PoseYawCmd CA")
+    field(WAIT7, "After1")
+
+    field(LNK8, "$(P)Control:auto_moveL_calc.DISA CA")
+    field(STR8, "0")
+    field(WAIT8, "After7")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:PoseXCmd")
+{
+    field(DESC, "X")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))POSE_CMD")
+    field(EGU, "mm")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveL_calc.PROC")
+}
+record(ao, "$(P)Control:PoseXTweakVal")
+{
+    field(DESC, "X TCP pose tweak step size")
+    field(EGU, "mm")
+    field(PREC, 4)
+    field(DRVH, "100.0")
+    field(DRVL, "0.0")
+}
+record(bo, "$(P)Control:PoseXTweakFwd")
+{
+    field(DESC, "Tweak X TCP pose forward")
+    field(FLNK, "$(P)Control:PoseXTweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:PoseXTweakRev")
+{
+    field(DESC, "Tweak X TCP pose backward")
+    field(FLNK, "$(P)Control:PoseXTweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:PoseXTweakCalcFwd")
+{
+    field(INPA, "$(P)Control:PoseXCmd")
+    field(INPB, "$(P)Control:PoseXTweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:PoseXCmd PP")
+}
+record(calcout, "$(P)Control:PoseXTweakCalcRev")
+{
+    field(INPA, "$(P)Control:PoseXCmd")
+    field(INPB, "$(P)Control:PoseXTweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:PoseXCmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:PoseYCmd")
+{
+    field(DESC, "Commanded TCP Y")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),1,$(TIMEOUT=1))POSE_CMD")
+    field(EGU, "mm")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveL_calc.PROC")
+}
+record(ao, "$(P)Control:PoseYTweakVal")
+{
+    field(DESC, "Y TCP pose tweak step size")
+    field(EGU, "mm")
+    field(PREC, 4)
+    field(DRVH, "100")
+    field(DRVL, "0.0")
+}
+record(bo, "$(P)Control:PoseYTweakFwd")
+{
+    field(DESC, "Tweak Y TCP pose forward")
+    field(FLNK, "$(P)Control:PoseYTweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:PoseYTweakRev")
+{
+    field(DESC, "Tweak Y TCP pose backward")
+    field(FLNK, "$(P)Control:PoseYTweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:PoseYTweakCalcFwd")
+{
+    field(INPA, "$(P)Control:PoseYCmd")
+    field(INPB, "$(P)Control:PoseYTweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:PoseYCmd PP")
+}
+record(calcout, "$(P)Control:PoseYTweakCalcRev")
+{
+    field(INPA, "$(P)Control:PoseYCmd")
+    field(INPB, "$(P)Control:PoseYTweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:PoseYCmd PP")
+}
+
+# -----------------------------------------------------------
+
+
+record(ao, "$(P)Control:PoseZCmd")
+{
+    field(DESC, "Commanded TCP Z")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),2,$(TIMEOUT=1))POSE_CMD")
+    field(EGU, "mm")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveL_calc.PROC")
+}
+record(ao, "$(P)Control:PoseZTweakVal")
+{
+    field(DESC, "TCP Z tweak step size")
+    field(EGU, "mm")
+    field(PREC, 4)
+    field(DRVH, "100")
+    field(DRVL, "0.0")
+}
+record(bo, "$(P)Control:PoseZTweakFwd")
+{
+    field(DESC, "Tweak TCP Z forward")
+    field(FLNK, "$(P)Control:PoseZTweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:PoseZTweakRev")
+{
+    field(DESC, "Tweak TCP Z backward")
+    field(FLNK, "$(P)Control:PoseZTweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:PoseZTweakCalcFwd")
+{
+    field(INPA, "$(P)Control:PoseZCmd")
+    field(INPB, "$(P)Control:PoseZTweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:PoseZCmd PP")
+}
+record(calcout, "$(P)Control:PoseZTweakCalcRev")
+{
+    field(INPA, "$(P)Control:PoseZCmd")
+    field(INPB, "$(P)Control:PoseZTweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:PoseZCmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:PoseRollCmd")
+{
+    field(DESC, "Commanded TCP roll")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),3,$(TIMEOUT=1))POSE_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveL_calc.PROC")
+}
+record(ao, "$(P)Control:PoseRollTweakVal")
+{
+    field(DESC, "TCP roll tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+    field(DRVL, "0.0")
+}
+record(bo, "$(P)Control:PoseRollTweakFwd")
+{
+    field(DESC, "Tweak TCP roll forward")
+    field(FLNK, "$(P)Control:PoseRollTweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:PoseRollTweakRev")
+{
+    field(DESC, "Tweak TCP roll backward")
+    field(FLNK, "$(P)Control:PoseRollTweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:PoseRollTweakCalcFwd")
+{
+    field(INPA, "$(P)Control:PoseRollCmd")
+    field(INPB, "$(P)Control:PoseRollTweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:PoseRollCmd PP")
+}
+record(calcout, "$(P)Control:PoseRollTweakCalcRev")
+{
+    field(INPA, "$(P)Control:PoseRollCmd")
+    field(INPB, "$(P)Control:PoseRollTweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:PoseRollCmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:PosePitchCmd")
+{
+    field(DESC, "Commanded TCP pitch")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),4,$(TIMEOUT=1))POSE_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveL_calc.PROC")
+}
+record(ao, "$(P)Control:PosePitchTweakVal")
+{
+    field(DESC, "TCP pitch tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+    field(DRVL, "0.0")
+}
+record(bo, "$(P)Control:PosePitchTweakFwd")
+{
+    field(DESC, "Tweak TCP pitch forward")
+    field(FLNK, "$(P)Control:PosePitchTweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:PosePitchTweakRev")
+{
+    field(DESC, "Tweak TCP pitch backward")
+    field(FLNK, "$(P)Control:PosePitchTweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:PosePitchTweakCalcFwd")
+{
+    field(INPA, "$(P)Control:PosePitchCmd")
+    field(INPB, "$(P)Control:PosePitchTweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:PosePitchCmd PP")
+}
+record(calcout, "$(P)Control:PosePitchTweakCalcRev")
+{
+    field(INPA, "$(P)Control:PosePitchCmd")
+    field(INPB, "$(P)Control:PosePitchTweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:PosePitchCmd PP")
+}
+
+# -----------------------------------------------------------
+
+record(ao, "$(P)Control:PoseYawCmd")
+{
+    field(DESC, "Commanded TCP yaw")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),5,$(TIMEOUT=1))POSE_CMD")
+    field(EGU, "deg")
+    field(PINI, 1)
+    field(PREC, 4)
+    field(FLNK, "$(P)Control:auto_moveL_calc.PROC")
+}
+record(ao, "$(P)Control:PoseYawTweakVal")
+{
+    field(DESC, "TCP yaw tweak step size")
+    field(EGU, "deg")
+    field(PREC, 4)
+    field(DRVL, "0.0")
+}
+record(bo, "$(P)Control:PoseYawTweakFwd")
+{
+    field(DESC, "Tweak TCP yaw forward")
+    field(FLNK, "$(P)Control:PoseYawTweakCalcFwd.PROC")
+}
+record(bo, "$(P)Control:PoseYawTweakRev")
+{
+    field(DESC, "Tweak TCP yaw backward")
+    field(FLNK, "$(P)Control:PoseYawTweakCalcRev.PROC")
+}
+record(calcout, "$(P)Control:PoseYawTweakCalcFwd")
+{
+    field(INPA, "$(P)Control:PoseYawCmd")
+    field(INPB, "$(P)Control:PoseYawTweakVal")
+    field(CALC, "A + B")
+    field(OUT, "$(P)Control:PoseYawCmd PP")
+}
+record(calcout, "$(P)Control:PoseYawTweakCalcRev")
+{
+    field(INPA, "$(P)Control:PoseYawCmd")
+    field(INPB, "$(P)Control:PoseYawTweakVal")
+    field(CALC, "A - B")
+    field(OUT, "$(P)Control:PoseYawCmd PP")
+}
+
+record(ao, "$(P)Control:TCPOffset_X")
+{
+    field(DESC, "X TCP offset")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))TCP_OFFSET")
+    field(EGU, "mm")
+    field(PINI, 1)
+    field(PREC, 4)
+}
+record(ao, "$(P)Control:TCPOffset_Y")
+{
+    field(DESC, "Y TCP offset")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),1,$(TIMEOUT=1))TCP_OFFSET")
+    field(EGU, "mm")
+    field(PINI, 1)
+    field(PREC, 4)
+}
+record(ao, "$(P)Control:TCPOffset_Z")
+{
+    field(DESC, "Z TCP offset")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),2,$(TIMEOUT=1))TCP_OFFSET")
+    field(EGU, "mm")
+    field(PINI, 1)
+    field(PREC, 4)
+}
+record(ao, "$(P)Control:TCPOffset_Roll")
+{
+    field(DESC, "Roll TCP offset")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),3,$(TIMEOUT=1))TCP_OFFSET")
+    field(EGU, "rad")
+    field(PINI, 1)
+    field(PREC, 4)
+}
+record(ao, "$(P)Control:TCPOffset_Pitch")
+{
+    field(DESC, "Pitch TCP offset")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),4,$(TIMEOUT=1))TCP_OFFSET")
+    field(EGU, "rad")
+    field(PINI, 1)
+    field(PREC, 4)
+}
+record(ao, "$(P)Control:TCPOffset_Yaw")
+{
+    field(DESC, "Yaw TCP offset")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),5,$(TIMEOUT=1))TCP_OFFSET")
+    field(EGU, "rad")
+    field(PINI, 1)
+    field(PREC, 4)
+}
+
+#======================
+# Custom URScripts
+#======================
+record(lso, "$(P)Control:CustomScriptFile")
+{
+    field(DESC, "Path to URScript")
+    field(DTYP, "asynOctetWrite")
+    field(SIZV, 1024)
+    field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))CUSTOM_SCRIPT_FILE")
+}
+
+record(lso, "$(P)Control:CustomInlineScript")
+{
+    field(DESC, "Inline URScript")
+    field(DTYP, "asynOctetWrite")
+    field(SIZV, 1024)
+    field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))CUSTOM_INLINE_SCRIPT")
+}
+
+record(bo, "$(P)Control:RunCustomScriptFile")
+{
+    field(DESC, "Runs custom URScript on controller")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))RUN_CUSTOM_SCRIPT_FILE")
+}
+
+record(ao, "$(P)Control:CustomScriptTimeout")
+{
+    field(DESC, "Timeout for script to signal done")
+    field(DTYP, "asynFloat64")
+    field(VAL, 10.0)
+    field(EGU, "sec")
+    field(PINI, 1)
+    field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))CUSTOM_SCRIPT_TIMEOUT")
+}
+
+record(bi, "$(P)Control:CustomScriptRunning")
+{
+    field(DESC, "1 if custom script running, else 0")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CUSTOM_SCRIPT_RUNNING")
+    field(ZNAM, "Done")
+    field(ONAM, "Running")
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)Control:CustomScriptError")
+{
+    field(DESC, "0 if okay, 1 if script error")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CUSTOM_SCRIPT_ERROR")
+    field(ZNAM, "Okay")
+    field(ONAM, "Error")
+    field(SCAN, "I/O Intr")
+}

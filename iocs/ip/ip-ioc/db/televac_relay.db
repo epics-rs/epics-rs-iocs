@@ -1,0 +1,31 @@
+# One Televac setpoint relay.
+#
+#   $(P)      PV prefix
+#   $(RELAY)  this relay's name, e.g. "tvrly1"
+#   $(PORT)   asyn port created by TelevacConfig
+#   $(ADDR)   relay index, 0-based (relay 1 -> 0)
+
+record(ai, "$(P)$(RELAY):ON") {
+    field(DESC, "Relay ON pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TVAC_RELAY_ON")
+}
+
+record(ai, "$(P)$(RELAY):OFF") {
+    field(DESC, "Relay OFF pressure")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynFloat64")
+    field(PREC, "2")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TVAC_RELAY_OFF")
+}
+
+record(bi, "$(P)$(RELAY):STATE") {
+    field(DESC, "Relay state")
+    field(SCAN, "I/O Intr")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Open")
+    field(ONAM, "Closed")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TVAC_RELAY_STATE")
+}
