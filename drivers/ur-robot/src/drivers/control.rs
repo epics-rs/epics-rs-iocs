@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -246,16 +247,16 @@ impl ControlInner {
         self.motion_status = MotionStatus::Done;
         self.pending_motion = None;
         self.motion_done_count += 1;
-        out.push(ParamSetValue::Int32 {
-            reason: p.async_move_done,
-            addr: 0,
-            value: 1,
-        });
-        out.push(ParamSetValue::Int32 {
-            reason: p.motion_done_count,
-            addr: 0,
-            value: self.motion_done_count,
-        });
+        out.push(ParamSetValue::new(
+            p.async_move_done,
+            0,
+            ParamValue::Int32(1),
+        ));
+        out.push(ParamSetValue::new(
+            p.motion_done_count,
+            0,
+            ParamValue::Int32(self.motion_done_count),
+        ));
     }
 }
 
@@ -570,11 +571,11 @@ impl PortDriver for ControlDriver {
                 let action = inner.waypoint_move;
                 inner.pending_motion = Some(MotionTask { motion, action });
                 inner.waypoint_move = false;
-                updates.push(ParamSetValue::Int32 {
-                    reason: p.async_move_done,
-                    addr: 0,
-                    value: 0,
-                });
+                updates.push(ParamSetValue::new(
+                    p.async_move_done,
+                    0,
+                    ParamValue::Int32(0),
+                ));
                 return Ok(());
             }
 
@@ -603,28 +604,20 @@ impl PortDriver for ControlDriver {
                     inner.iface_mut()?.speed_l(&speeds, accel, 0.01)?;
                     inner.new_jog = false;
                 }
-                updates.push(ParamSetValue::Int32 {
-                    reason: p.jogging,
-                    addr: 0,
-                    value: 1,
-                });
+                updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(1)));
             } else if reason == p.jog_stop {
                 inner.iface_mut()?.speed_stop(10.0)?;
-                updates.push(ParamSetValue::Int32 {
-                    reason: p.jogging,
-                    addr: 0,
-                    value: 0,
-                });
+                updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(0)));
             }
             Ok(())
         })();
         drop(inner);
 
         for u in updates {
-            if let ParamSetValue::Int32 {
+            if let ParamSetValue::Value {
                 reason,
                 addr,
-                value,
+                value: ParamValue::Int32(value),
             } = u
             {
                 self.base.params.set_int32(reason, addr, value)?;
@@ -695,18 +688,10 @@ pub fn poll_once(
     let mut updates = Vec::new();
 
     if !inner.connected() {
-        updates.push(ParamSetValue::Int32 {
-            reason: p.is_connected,
-            addr: 0,
-            value: 0,
-        });
+        updates.push(ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(0)));
         return updates;
     }
-    updates.push(ParamSetValue::Int32 {
-        reason: p.is_connected,
-        addr: 0,
-        value: 1,
-    });
+    updates.push(ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(1)));
 
     let is_steady = if inner.custom_script.is_some() {
         false
@@ -719,11 +704,11 @@ pub fn poll_once(
             }
         }
     };
-    updates.push(ParamSetValue::Int32 {
-        reason: p.is_steady,
-        addr: 0,
-        value: i32::from(is_steady),
-    });
+    updates.push(ParamSetValue::new(
+        p.is_steady,
+        0,
+        ParamValue::Int32(i32::from(is_steady)),
+    ));
 
     // A safety event aborts whatever motion is in flight.
     if receive.get().safety_status_bits != SAFETY_NORMAL {
@@ -788,16 +773,16 @@ fn drive_motion(
                 // Toggle so the action record always processes.
                 inner.run_action_val ^= 1;
                 inner.waypoint_action_done = false;
-                updates.push(ParamSetValue::Int32 {
-                    reason: p.waypoint_action_done,
-                    addr: 0,
-                    value: 0,
-                });
-                updates.push(ParamSetValue::Int32 {
-                    reason: p.run_waypoint_action,
-                    addr: 0,
-                    value: inner.run_action_val,
-                });
+                updates.push(ParamSetValue::new(
+                    p.waypoint_action_done,
+                    0,
+                    ParamValue::Int32(0),
+                ));
+                updates.push(ParamSetValue::new(
+                    p.run_waypoint_action,
+                    0,
+                    ParamValue::Int32(inner.run_action_val),
+                ));
                 inner.motion_status = MotionStatus::WaitingAction;
             } else {
                 inner.motion_task_done(p, updates);
@@ -831,11 +816,11 @@ fn poll_custom_script(
 
     if finished {
         inner.custom_script = None;
-        updates.push(ParamSetValue::Int32 {
-            reason: p.custom_script_running,
-            addr: 0,
-            value: 0,
-        });
+        updates.push(ParamSetValue::new(
+            p.custom_script_running,
+            0,
+            ParamValue::Int32(0),
+        ));
         // The custom script replaced the control script on the controller; put
         // the control script back.
         if let Err(e) = inner
@@ -851,16 +836,16 @@ fn poll_custom_script(
             "ur-robot: the URScript timed out after {:.1} s",
             script.timeout.as_secs_f64()
         );
-        updates.push(ParamSetValue::Int32 {
-            reason: p.custom_script_running,
-            addr: 0,
-            value: 0,
-        });
-        updates.push(ParamSetValue::Int32 {
-            reason: p.custom_script_error,
-            addr: 0,
-            value: 1,
-        });
+        updates.push(ParamSetValue::new(
+            p.custom_script_running,
+            0,
+            ParamValue::Int32(0),
+        ));
+        updates.push(ParamSetValue::new(
+            p.custom_script_error,
+            0,
+            ParamValue::Int32(1),
+        ));
     }
 }
 
@@ -935,7 +920,11 @@ mod tests {
 
     fn int_update(updates: &[ParamSetValue], want: usize) -> Option<i32> {
         updates.iter().find_map(|u| match u {
-            ParamSetValue::Int32 { reason, value, .. } if *reason == want => Some(*value),
+            ParamSetValue::Value {
+                reason,
+                value: ParamValue::Int32(value),
+                ..
+            } if *reason == want => Some(*value),
             _ => None,
         })
     }

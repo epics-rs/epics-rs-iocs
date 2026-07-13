@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -109,29 +110,29 @@ impl DeviceWorker for Nd261Worker {
         let mut values = Vec::new();
         match reply {
             Ok(position) => {
-                values.push(ParamSetValue::Float64 {
-                    reason: p.position,
-                    addr: 0,
-                    value: position,
-                });
-                values.push(ParamSetValue::Int32 {
-                    reason: p.status,
-                    addr: 0,
-                    value: status::OK,
-                });
+                values.push(ParamSetValue::new(
+                    p.position,
+                    0,
+                    ParamValue::Float64(position),
+                ));
+                values.push(ParamSetValue::new(
+                    p.status,
+                    0,
+                    ParamValue::Int32(status::OK),
+                ));
             }
             Err(e) => {
                 log::error!("ND261: read failed: {e}");
-                values.push(ParamSetValue::Float64 {
-                    reason: p.position,
-                    addr: 0,
-                    value: protocol::INVALID_VALUE,
-                });
-                values.push(ParamSetValue::Int32 {
-                    reason: p.status,
-                    addr: 0,
-                    value: status::READ_ERROR,
-                });
+                values.push(ParamSetValue::new(
+                    p.position,
+                    0,
+                    ParamValue::Float64(protocol::INVALID_VALUE),
+                ));
+                values.push(ParamSetValue::new(
+                    p.status,
+                    0,
+                    ParamValue::Int32(status::READ_ERROR),
+                ));
             }
         }
         if let Err(e) = self.handle.set_params_and_notify_blocking(0, values) {

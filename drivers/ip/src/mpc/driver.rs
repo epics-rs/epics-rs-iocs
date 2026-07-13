@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -299,11 +300,11 @@ impl MpcWorker {
         let mut values: Vec<ParamSetValue> = Vec::new();
 
         match self.transact(cmd::READ_STATUS, &s) {
-            Ok(payload) => values.push(ParamSetValue::Octet {
-                reason: p.status,
+            Ok(payload) => values.push(ParamSetValue::new(
+                p.status,
                 addr,
-                value: payload,
-            }),
+                ParamValue::Octet(payload),
+            )),
             Err(e) => log::error!("MPC: read status failed: {e}"),
         }
         match self
@@ -311,16 +312,16 @@ impl MpcWorker {
             .and_then(|payload| protocol::parse_pressure(&payload).map_err(|e| e.to_string()))
         {
             Ok(reading) => {
-                values.push(ParamSetValue::Float64 {
-                    reason: p.pressure,
+                values.push(ParamSetValue::new(
+                    p.pressure,
                     addr,
-                    value: reading.value,
-                });
-                values.push(ParamSetValue::Octet {
-                    reason: p.pressure_egu,
+                    ParamValue::Float64(reading.value),
+                ));
+                values.push(ParamSetValue::new(
+                    p.pressure_egu,
                     addr,
-                    value: reading.egu,
-                });
+                    ParamValue::Octet(reading.egu),
+                ));
             }
             Err(e) => log::error!("MPC: read pressure failed: {e}"),
         }
@@ -328,33 +329,33 @@ impl MpcWorker {
             .transact(cmd::READ_CURRENT, &s)
             .and_then(|payload| protocol::parse_current(&payload).map_err(|e| e.to_string()))
         {
-            Ok(reading) => values.push(ParamSetValue::Float64 {
-                reason: p.current,
+            Ok(reading) => values.push(ParamSetValue::new(
+                p.current,
                 addr,
-                value: reading.value,
-            }),
+                ParamValue::Float64(reading.value),
+            )),
             Err(e) => log::error!("MPC: read current failed: {e}"),
         }
         match self
             .transact(cmd::READ_VOLTAGE, &s)
             .and_then(|payload| protocol::parse_voltage(&payload).map_err(|e| e.to_string()))
         {
-            Ok(reading) => values.push(ParamSetValue::Float64 {
-                reason: p.voltage,
+            Ok(reading) => values.push(ParamSetValue::new(
+                p.voltage,
                 addr,
-                value: reading.value,
-            }),
+                ParamValue::Float64(reading.value),
+            )),
             Err(e) => log::error!("MPC: read voltage failed: {e}"),
         }
         match self
             .transact(cmd::READ_SIZE, &s)
             .and_then(|payload| protocol::parse_size(&payload).map_err(|e| e.to_string()))
         {
-            Ok(reading) => values.push(ParamSetValue::Float64 {
-                reason: p.size,
+            Ok(reading) => values.push(ParamSetValue::new(
+                p.size,
                 addr,
-                value: reading.value,
-            }),
+                ParamValue::Float64(reading.value),
+            )),
             Err(e) => log::error!("MPC: read pump size failed: {e}"),
         }
         for pair in 0..NUM_SETPOINT_PAIRS {
@@ -362,19 +363,19 @@ impl MpcWorker {
             match self.transact(cmd::READ_SETPOINT, &number.to_string()) {
                 Ok(payload) => {
                     match protocol::parse_setpoint_value(&payload) {
-                        Ok(reading) => values.push(ParamSetValue::Float64 {
-                            reason: p.setpoint_value[pair],
+                        Ok(reading) => values.push(ParamSetValue::new(
+                            p.setpoint_value[pair],
                             addr,
-                            value: reading.value,
-                        }),
+                            ParamValue::Float64(reading.value),
+                        )),
                         Err(e) => log::error!("MPC: setpoint {number} value: {e}"),
                     }
                     match protocol::parse_setpoint_state(&payload) {
-                        Ok(state) => values.push(ParamSetValue::Int32 {
-                            reason: p.setpoint_state[pair],
+                        Ok(state) => values.push(ParamSetValue::new(
+                            p.setpoint_state[pair],
                             addr,
-                            value: state,
-                        }),
+                            ParamValue::Int32(state),
+                        )),
                         Err(e) => log::error!("MPC: setpoint {number} state: {e}"),
                     }
                 }
@@ -382,19 +383,19 @@ impl MpcWorker {
             }
         }
         match self.transact(cmd::READ_AUTO_RESTART, "") {
-            Ok(payload) => values.push(ParamSetValue::Int32 {
-                reason: p.auto_restart,
+            Ok(payload) => values.push(ParamSetValue::new(
+                p.auto_restart,
                 addr,
-                value: protocol::parse_auto_restart(&payload),
-            }),
+                ParamValue::Int32(protocol::parse_auto_restart(&payload)),
+            )),
             Err(e) => log::error!("MPC: read auto-restart failed: {e}"),
         }
         match self.transact(cmd::READ_TSP_STATUS, "") {
-            Ok(payload) => values.push(ParamSetValue::Octet {
-                reason: p.tsp_status,
+            Ok(payload) => values.push(ParamSetValue::new(
+                p.tsp_status,
                 addr,
-                value: payload,
-            }),
+                ParamValue::Octet(payload),
+            )),
             Err(e) => log::error!("MPC: read TSP status failed: {e}"),
         }
 

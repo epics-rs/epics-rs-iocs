@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -164,31 +165,23 @@ impl MksWorker {
             let code = protocol::gauge_type_field(&types, gauge).unwrap_or("");
             let gauge_type = GaugeType::from_code(code);
             let mut values = vec![
-                ParamSetValue::Octet {
-                    reason: p.units,
-                    addr,
-                    value: units.clone(),
-                },
-                ParamSetValue::Octet {
-                    reason: p.gauge_type,
-                    addr,
-                    value: code.to_string(),
-                },
+                ParamSetValue::new(p.units, addr, ParamValue::Octet(units.clone())),
+                ParamSetValue::new(p.gauge_type, addr, ParamValue::Octet(code.to_string())),
             ];
             match gauge_type {
                 Some(gauge_type) => {
                     let (low, high) = gauge_type.limits();
                     let (low, high) = (low * multiplier, high * multiplier);
-                    values.push(ParamSetValue::Float64 {
-                        reason: p.low_limit,
+                    values.push(ParamSetValue::new(
+                        p.low_limit,
                         addr,
-                        value: low,
-                    });
-                    values.push(ParamSetValue::Float64 {
-                        reason: p.high_limit,
+                        ParamValue::Float64(low),
+                    ));
+                    values.push(ParamSetValue::new(
+                        p.high_limit,
                         addr,
-                        value: high,
-                    });
+                        ParamValue::Float64(high),
+                    ));
                     config.push(Some(GaugeConfig { low, high }));
                 }
                 None => {
@@ -242,17 +235,13 @@ impl DeviceWorker for MksWorker {
                 }
             };
 
-            let mut values = vec![ParamSetValue::Int32 {
-                reason: p.status,
-                addr,
-                value: code,
-            }];
+            let mut values = vec![ParamSetValue::new(p.status, addr, ParamValue::Int32(code))];
             if let Some(value) = value {
-                values.push(ParamSetValue::Float64 {
-                    reason: p.pressure,
+                values.push(ParamSetValue::new(
+                    p.pressure,
                     addr,
-                    value,
-                });
+                    ParamValue::Float64(value),
+                ));
             }
             self.publish(addr, values);
         }

@@ -22,6 +22,7 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::user::AsynUser;
@@ -95,35 +96,29 @@ impl Worker {
     // -----------------------------------------------------------------------
 
     fn set_i32(&mut self, reason: usize, value: i32) {
-        self.batch.push(ParamSetValue::Int32 {
-            reason,
-            addr: 0,
-            value,
-        });
+        self.batch
+            .push(ParamSetValue::new(reason, 0, ParamValue::Int32(value)));
     }
 
     fn set_f64(&mut self, reason: usize, value: f64) {
-        self.batch.push(ParamSetValue::Float64 {
-            reason,
-            addr: 0,
-            value,
-        });
+        self.batch
+            .push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
     }
 
     fn set_str(&mut self, reason: usize, value: impl Into<String>) {
-        self.batch.push(ParamSetValue::Octet {
+        self.batch.push(ParamSetValue::new(
             reason,
-            addr: 0,
-            value: value.into(),
-        });
+            0,
+            ParamValue::Octet(value.into()),
+        ));
     }
 
     fn set_f64_array(&mut self, reason: usize, value: Vec<f64>) {
-        self.batch.push(ParamSetValue::Float64Array {
+        self.batch.push(ParamSetValue::new(
             reason,
-            addr: 0,
-            value,
-        });
+            0,
+            ParamValue::Float64Array(value.into()),
+        ));
     }
 
     async fn callbacks(&mut self) {

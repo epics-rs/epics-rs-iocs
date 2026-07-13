@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 
@@ -40,21 +41,9 @@ impl AcquisitionContext {
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::Int32 {
-                        reason: self.ad.acquire_busy,
-                        addr: 0,
-                        value: 0,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: self.ad.status,
-                        addr: 0,
-                        value: ADStatus::Idle as i32,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: self.ad.acquire,
-                        addr: 0,
-                        value: 0,
-                    },
+                    ParamSetValue::new(self.ad.acquire_busy, 0, ParamValue::Int32(0)),
+                    ParamSetValue::new(self.ad.status, 0, ParamValue::Int32(ADStatus::Idle as i32)),
+                    ParamSetValue::new(self.ad.acquire, 0, ParamValue::Int32(0)),
                 ],
             )
             .await;
@@ -87,11 +76,11 @@ async fn set_shutter_via_handle(handle: &PortHandle, ad: &ADBaseParams, open: bo
             let _ = handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ad.shutter_control_epics,
-                        addr: 0,
-                        value: if open { 1 } else { 0 },
-                    }],
+                    vec![ParamSetValue::new(
+                        ad.shutter_control_epics,
+                        0,
+                        ParamValue::Int32(if open { 1 } else { 0 }),
+                    )],
                 )
                 .await;
             // C++: epicsThreadSleep(shutterOpenDelay - shutterCloseDelay), applied
@@ -181,51 +170,31 @@ async fn acquire_one_image(
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.size_x,
-                    addr: 0,
-                    value: ncols,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_size_x,
-                    addr: 0,
-                    value: ncols,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.size_y,
-                    addr: 0,
-                    value: nrows,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_size_y,
-                    addr: 0,
-                    value: nrows,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_size,
-                    addr: 0,
-                    value: array_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.data_type,
-                    addr: 0,
-                    value: data_type as u8 as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.color_mode,
-                    addr: 0,
-                    value: color_mode as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_counter,
-                    addr: 0,
-                    value: image_counter,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.num_images_counter,
-                    addr: 0,
-                    value: num_images_counter,
-                },
+                ParamSetValue::new(ctx.ad.size_x, 0, ParamValue::Int32(ncols)),
+                ParamSetValue::new(ctx.ad.base.array_size_x, 0, ParamValue::Int32(ncols)),
+                ParamSetValue::new(ctx.ad.size_y, 0, ParamValue::Int32(nrows)),
+                ParamSetValue::new(ctx.ad.base.array_size_y, 0, ParamValue::Int32(nrows)),
+                ParamSetValue::new(ctx.ad.base.array_size, 0, ParamValue::Int32(array_size)),
+                ParamSetValue::new(
+                    ctx.ad.base.data_type,
+                    0,
+                    ParamValue::Int32(data_type as u8 as i32),
+                ),
+                ParamSetValue::new(
+                    ctx.ad.base.color_mode,
+                    0,
+                    ParamValue::Int32(color_mode as i32),
+                ),
+                ParamSetValue::new(
+                    ctx.ad.base.array_counter,
+                    0,
+                    ParamValue::Int32(image_counter),
+                ),
+                ParamSetValue::new(
+                    ctx.ad.num_images_counter,
+                    0,
+                    ParamValue::Int32(num_images_counter),
+                ),
             ],
         )
         .await;
@@ -243,11 +212,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .handle
             .set_params_and_notify(
                 0,
-                vec![ParamSetValue::Int32 {
-                    reason: ctx.ad.status,
-                    addr: 0,
-                    value: ADStatus::Idle as i32,
-                }],
+                vec![ParamSetValue::new(
+                    ctx.ad.status,
+                    0,
+                    ParamValue::Int32(ADStatus::Idle as i32),
+                )],
             )
             .await;
         let _ = ctx.handle.call_param_callbacks(0).await;
@@ -263,16 +232,8 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::Int32 {
-                        reason: ctx.ad.num_images_counter,
-                        addr: 0,
-                        value: 0,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: ctx.ad.acquire_busy,
-                        addr: 0,
-                        value: 1,
-                    },
+                    ParamSetValue::new(ctx.ad.num_images_counter, 0, ParamValue::Int32(0)),
+                    ParamSetValue::new(ctx.ad.acquire_busy, 0, ParamValue::Int32(1)),
                 ],
             )
             .await;
@@ -296,11 +257,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.ad.status,
-                        addr: 0,
-                        value: ADStatus::Acquire as i32,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Acquire as i32),
+                    )],
                 )
                 .await;
 
@@ -349,11 +310,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     .handle
                     .set_params_and_notify(
                         0,
-                        vec![ParamSetValue::Int32 {
-                            reason: ctx.ad.acquire,
-                            addr: 0,
-                            value: 0,
-                        }],
+                        vec![ParamSetValue::new(ctx.ad.acquire, 0, ParamValue::Int32(0))],
                     )
                     .await;
             }
@@ -375,11 +332,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.ad.status,
-                        addr: 0,
-                        value: ADStatus::Waiting as i32,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Waiting as i32),
+                    )],
                 )
                 .await;
             let _ = ctx.handle.call_param_callbacks(0).await;

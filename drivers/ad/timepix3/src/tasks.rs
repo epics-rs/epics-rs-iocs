@@ -14,6 +14,7 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::user::AsynUser;
@@ -64,11 +65,7 @@ impl Ctx {
     async fn set_int(&self, reason: usize, addr: i32, value: i32) {
         self.set(
             addr,
-            vec![ParamSetValue::Int32 {
-                reason,
-                addr,
-                value,
-            }],
+            vec![ParamSetValue::new(reason, addr, ParamValue::Int32(value))],
         )
         .await;
     }
@@ -201,30 +198,18 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
     };
 
     let mut updates = vec![
-        ParamSetValue::Int32 {
-            reason: p.http_code,
-            addr: 0,
-            value: code,
-        },
-        ParamSetValue::Int32 {
-            reason: p.serval_connected,
-            addr: 0,
-            value: i32::from(serval_ok),
-        },
-        ParamSetValue::Int32 {
-            reason: p.det_connected,
-            addr: 0,
-            value: i32::from(det_ok),
-        },
-        ParamSetValue::Octet {
-            reason: p.det_type,
-            addr: 0,
-            value: det_type.clone(),
-        },
-        ParamSetValue::Int32 {
-            reason: ctx.ad.status,
-            addr: 0,
-            value: if serval_ok && det_ok {
+        ParamSetValue::new(p.http_code, 0, ParamValue::Int32(code)),
+        ParamSetValue::new(
+            p.serval_connected,
+            0,
+            ParamValue::Int32(i32::from(serval_ok)),
+        ),
+        ParamSetValue::new(p.det_connected, 0, ParamValue::Int32(i32::from(det_ok))),
+        ParamSetValue::new(p.det_type, 0, ParamValue::Octet(det_type.clone())),
+        ParamSetValue::new(
+            ctx.ad.status,
+            0,
+            ParamValue::Int32(if serval_ok && det_ok {
                 if ctx.shared.acquiring() {
                     ADStatus::Acquire as i32
                 } else {
@@ -232,15 +217,15 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
                 }
             } else {
                 ADStatus::Disconnected as i32
-            },
-        },
+            }),
+        ),
     ];
     if det_ok {
-        updates.push(ParamSetValue::Octet {
-            reason: ctx.ad.base.model,
-            addr: 0,
-            value: det_type,
-        });
+        updates.push(ParamSetValue::new(
+            ctx.ad.base.model,
+            0,
+            ParamValue::Octet(det_type),
+        ));
     }
     if let Ok(dashboard) = &reply {
         disk_space(ctx, dashboard, &mut updates);
@@ -257,18 +242,10 @@ fn disk_space(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue
         return;
     };
     if let Some(v) = disk.get("WriteSpeed").and_then(Value::as_f64) {
-        updates.push(ParamSetValue::Float64 {
-            reason: p.write_speed,
-            addr: 0,
-            value: v,
-        });
+        updates.push(ParamSetValue::new(p.write_speed, 0, ParamValue::Float64(v)));
     }
     if let Some(v) = disk.get("DiskLimitReached").and_then(as_bool_or_int) {
-        updates.push(ParamSetValue::Int32 {
-            reason: p.l_lim_reached,
-            addr: 0,
-            value: v,
-        });
+        updates.push(ParamSetValue::new(p.l_lim_reached, 0, ParamValue::Int32(v)));
     }
 }
 
@@ -307,11 +284,11 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
     let mut updates = Vec::new();
     let mut octet = |reason: usize, v: Option<&Value>| {
         if let Some(v) = v {
-            updates.push(ParamSetValue::Octet {
+            updates.push(ParamSetValue::new(
                 reason,
-                addr: 0,
-                value: serval::json_to_string(v),
-            });
+                0,
+                ParamValue::Octet(serval::json_to_string(v)),
+            ));
         }
     };
     octet(p.iface_name, detector.pointer("/Info/IfaceName"));
@@ -359,11 +336,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
 
     let mut int = |reason: usize, v: Option<&Value>| {
         if let Some(v) = v.and_then(as_bool_or_int) {
-            updates.push(ParamSetValue::Int32 {
-                reason,
-                addr: 0,
-                value: v,
-            });
+            updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(v)));
         }
     };
     let pix_count = detector
@@ -400,25 +373,21 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
     // reports `NumberOfRows: 0` (or omits it, which nlohmann turns into 0)
     // raises SIGFPE and takes the IOC down.
     if rows > 0 {
-        updates.push(ParamSetValue::Int32 {
-            reason: ctx.ad.max_size_x,
-            addr: 0,
-            value: i32::try_from(pix_count / rows).unwrap_or(0),
-        });
-        updates.push(ParamSetValue::Int32 {
-            reason: ctx.ad.max_size_y,
-            addr: 0,
-            value: i32::try_from(rows).unwrap_or(0),
-        });
+        updates.push(ParamSetValue::new(
+            ctx.ad.max_size_x,
+            0,
+            ParamValue::Int32(i32::try_from(pix_count / rows).unwrap_or(0)),
+        ));
+        updates.push(ParamSetValue::new(
+            ctx.ad.max_size_y,
+            0,
+            ParamValue::Int32(i32::try_from(rows).unwrap_or(0)),
+        ));
     }
 
     let mut float = |reason: usize, v: Option<&Value>| {
         if let Some(v) = v.and_then(Value::as_f64) {
-            updates.push(ParamSetValue::Float64 {
-                reason,
-                addr: 0,
-                value: v,
-            });
+            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
         }
     };
     float(p.clock_readout, detector.pointer("/Info/ClockReadout"));
@@ -452,11 +421,11 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
         .and_then(serval::orientation_index)
     {
         ctx.shared.set_orientation(o);
-        updates.push(ParamSetValue::Int32 {
-            reason: p.detector_orientation,
-            addr: 0,
-            value: o,
-        });
+        updates.push(ParamSetValue::new(
+            p.detector_orientation,
+            0,
+            ParamValue::Int32(o),
+        ));
     }
 
     health(ctx, &detector, &mut updates);
@@ -478,42 +447,42 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
         if let Some(c) = chips.and_then(|c| c.get(chip)) {
             for (name, index) in crate::driver::dac_params(&p) {
                 if let Some(v) = c.pointer(&format!("/DACs/{name}")).and_then(Value::as_i64) {
-                    updates.push(ParamSetValue::Int32 {
-                        reason: index,
+                    updates.push(ParamSetValue::new(
+                        index,
                         addr,
-                        value: i32::try_from(v).unwrap_or(0),
-                    });
+                        ParamValue::Int32(i32::try_from(v).unwrap_or(0)),
+                    ));
                 }
             }
-            updates.push(ParamSetValue::Int32 {
-                reason: p.adjust,
+            updates.push(ParamSetValue::new(
+                p.adjust,
                 addr,
-                value: adjust_code(c),
-            });
-            updates.push(ParamSetValue::Int32 {
-                reason: p.chip_n_temperature,
+                ParamValue::Int32(adjust_code(c)),
+            ));
+            updates.push(ParamSetValue::new(
+                p.chip_n_temperature,
                 addr,
-                value: temps.get(chip).copied().unwrap_or(0),
-            });
+                ParamValue::Int32(temps.get(chip).copied().unwrap_or(0)),
+            ));
         }
         if let Some(c) = layout.and_then(|l| l.get(chip)) {
-            updates.push(ParamSetValue::Octet {
-                reason: p.layout,
+            updates.push(ParamSetValue::new(
+                p.layout,
                 addr,
-                value: serval::json_to_string(c),
-            });
+                ParamValue::Octet(serval::json_to_string(c)),
+            ));
         }
         if let Some(&(vdd, avdd)) = rails.get(chip) {
-            updates.push(ParamSetValue::Float64 {
-                reason: p.chip_nv_dd,
+            updates.push(ParamSetValue::new(
+                p.chip_nv_dd,
                 addr,
-                value: vdd,
-            });
-            updates.push(ParamSetValue::Float64 {
-                reason: p.chip_na_vd_d,
+                ParamValue::Float64(vdd),
+            ));
+            updates.push(ParamSetValue::new(
+                p.chip_na_vd_d,
                 addr,
-                value: avdd,
-            });
+                ParamValue::Float64(avdd),
+            ));
         }
         if !updates.is_empty() {
             ctx.set(addr, updates).await;
@@ -594,19 +563,15 @@ fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
         ("BiasVoltage", p.bias_voltage),
     ] {
         if let Some(v) = h.get(key).and_then(Value::as_f64) {
-            updates.push(ParamSetValue::Float64 {
-                reason,
-                addr: 0,
-                value: v,
-            });
+            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
         }
     }
     if let Some(v) = h.get("Humidity").and_then(Value::as_i64) {
-        updates.push(ParamSetValue::Int32 {
-            reason: p.humidity,
-            addr: 0,
-            value: i32::try_from(v).unwrap_or(0),
-        });
+        updates.push(ParamSetValue::new(
+            p.humidity,
+            0,
+            ParamValue::Int32(i32::try_from(v).unwrap_or(0)),
+        ));
     }
     // The JSON arrays, verbatim: one string per rail set, and one for the chip
     // temperatures, merged across boards.
@@ -618,11 +583,7 @@ fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
             } else {
                 serval::json_to_string(first)
             };
-            updates.push(ParamSetValue::Octet {
-                reason,
-                addr: 0,
-                value,
-            });
+            updates.push(ParamSetValue::new(reason, 0, ParamValue::Octet(value)));
         }
     }
     let temps: Vec<Value> = chip_temperatures(detector)
@@ -630,11 +591,11 @@ fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
         .map(Value::from)
         .collect();
     if !temps.is_empty() {
-        updates.push(ParamSetValue::Octet {
-            reason: p.chip_temperature,
-            addr: 0,
-            value: serval::json_to_string(&Value::Array(temps)),
-        });
+        updates.push(ParamSetValue::new(
+            p.chip_temperature,
+            0,
+            ParamValue::Octet(serval::json_to_string(&Value::Array(temps))),
+        ));
     }
 }
 
@@ -648,16 +609,12 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
         ctx.set(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.status,
-                    addr: 0,
-                    value: ADStatus::Acquire as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.acquire,
-                    addr: 0,
-                    value: 1,
-                },
+                ParamSetValue::new(
+                    ctx.ad.status,
+                    0,
+                    ParamValue::Int32(ADStatus::Acquire as i32),
+                ),
+                ParamSetValue::new(ctx.ad.acquire, 0, ParamValue::Int32(1)),
             ],
         )
         .await;
@@ -667,11 +624,11 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
                 Ok(m) => {
                     let mut updates = Vec::new();
                     if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
-                        updates.push(ParamSetValue::Octet {
-                            reason: p.status,
-                            addr: 0,
-                            value: v.to_string(),
-                        });
+                        updates.push(ParamSetValue::new(
+                            p.status,
+                            0,
+                            ParamValue::Octet(v.to_string()),
+                        ));
                     }
                     for (ptr, reason) in [
                         ("/Info/ElapsedTime", p.elapsed_time),
@@ -680,11 +637,7 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
                         ("/Info/TdcEventRate", p.tdc1_rate),
                     ] {
                         if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
-                            updates.push(ParamSetValue::Float64 {
-                                reason,
-                                addr: 0,
-                                value: v,
-                            });
+                            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
                         }
                     }
                     for (ptr, reason) in [
@@ -692,19 +645,19 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
                         ("/Info/DroppedFrames", p.dropped_frames),
                     ] {
                         if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
-                            updates.push(ParamSetValue::Int32 {
+                            updates.push(ParamSetValue::new(
                                 reason,
-                                addr: 0,
-                                value: i32::try_from(v).unwrap_or(i32::MAX),
-                            });
+                                0,
+                                ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
+                            ));
                         }
                     }
                     if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
-                        updates.push(ParamSetValue::Octet {
-                            reason: p.start_time,
-                            addr: 0,
-                            value: v.to_string(),
-                        });
+                        updates.push(ParamSetValue::new(
+                            p.start_time,
+                            0,
+                            ParamValue::Octet(v.to_string()),
+                        ));
                     }
                     ctx.set(0, updates).await;
 
@@ -726,16 +679,8 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
         ctx.set(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.acquire,
-                    addr: 0,
-                    value: 0,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.status,
-                    addr: 0,
-                    value: ADStatus::Idle as i32,
-                },
+                ParamSetValue::new(ctx.ad.acquire, 0, ParamValue::Int32(0)),
+                ParamSetValue::new(ctx.ad.status, 0, ParamValue::Int32(ADStatus::Idle as i32)),
             ],
         )
         .await;
@@ -850,16 +795,16 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             ctx.set(
                 ADDR,
                 vec![
-                    ParamSetValue::Int32 {
-                        reason: p.prv_img_frame_number,
-                        addr: ADDR,
-                        value: f.frame_number,
-                    },
-                    ParamSetValue::Float64 {
-                        reason: p.prv_img_time_at_frame,
-                        addr: ADDR,
-                        value: f.time_at_frame,
-                    },
+                    ParamSetValue::new(
+                        p.prv_img_frame_number,
+                        ADDR,
+                        ParamValue::Int32(f.frame_number),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_img_time_at_frame,
+                        ADDR,
+                        ParamValue::Float64(f.time_at_frame),
+                    ),
                 ],
             )
             .await;
@@ -873,21 +818,23 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             ctx.set(
                 ADDR,
                 vec![
-                    ParamSetValue::Int32 {
-                        reason: p.img_frame_number,
-                        addr: ADDR,
-                        value: f.frame_number,
-                    },
-                    ParamSetValue::Float64 {
-                        reason: p.img_time_at_frame,
-                        addr: ADDR,
-                        value: f.time_at_frame,
-                    },
-                    ParamSetValue::Int32Array {
-                        reason: p.img_image_frame,
-                        addr: ADDR,
-                        value: f.pixels.iter().map(|&v| v as i32).collect(),
-                    },
+                    ParamSetValue::new(p.img_frame_number, ADDR, ParamValue::Int32(f.frame_number)),
+                    ParamSetValue::new(
+                        p.img_time_at_frame,
+                        ADDR,
+                        ParamValue::Float64(f.time_at_frame),
+                    ),
+                    ParamSetValue::new(
+                        p.img_image_frame,
+                        ADDR,
+                        ParamValue::Int32Array(
+                            f.pixels
+                                .iter()
+                                .map(|&v| v as i32)
+                                .collect::<Vec<i32>>()
+                                .into(),
+                        ),
+                    ),
                 ],
             )
             .await;
@@ -920,46 +867,52 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             ctx.set(
                 ADDR,
                 vec![
-                    ParamSetValue::Float64 {
-                        reason: p.prv_hst_time_at_frame,
-                        addr: ADDR,
-                        value: h.time_at_frame,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: p.prv_hst_frame_bin_size,
-                        addr: ADDR,
-                        value: i32::try_from(h.counts.len()).unwrap_or(i32::MAX),
-                    },
-                    ParamSetValue::Int32 {
-                        reason: p.prv_hst_frame_bin_width,
-                        addr: ADDR,
-                        value: h.bin_width,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: p.prv_hst_frame_bin_offset,
-                        addr: ADDR,
-                        value: h.bin_offset,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: p.prv_hst_frame_count,
-                        addr: ADDR,
-                        value: i32::try_from(frames).unwrap_or(i32::MAX),
-                    },
-                    ParamSetValue::Int32Array {
-                        reason: p.prv_hst_histogram_frame,
-                        addr: ADDR,
-                        value: h.counts.iter().map(|&v| v as i32).collect(),
-                    },
+                    ParamSetValue::new(
+                        p.prv_hst_time_at_frame,
+                        ADDR,
+                        ParamValue::Float64(h.time_at_frame),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_hst_frame_bin_size,
+                        ADDR,
+                        ParamValue::Int32(i32::try_from(h.counts.len()).unwrap_or(i32::MAX)),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_hst_frame_bin_width,
+                        ADDR,
+                        ParamValue::Int32(h.bin_width),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_hst_frame_bin_offset,
+                        ADDR,
+                        ParamValue::Int32(h.bin_offset),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_hst_frame_count,
+                        ADDR,
+                        ParamValue::Int32(i32::try_from(frames).unwrap_or(i32::MAX)),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_hst_histogram_frame,
+                        ADDR,
+                        ParamValue::Int32Array(
+                            h.counts
+                                .iter()
+                                .map(|&v| v as i32)
+                                .collect::<Vec<i32>>()
+                                .into(),
+                        ),
+                    ),
                 ],
             )
             .await;
             ctx.set(
                 ADDR,
-                vec![ParamSetValue::Float64Array {
-                    reason: p.prv_hst_histogram_time_ms,
-                    addr: ADDR,
-                    value: h.time_axis_ms(),
-                }],
+                vec![ParamSetValue::new(
+                    p.prv_hst_histogram_time_ms,
+                    ADDR,
+                    ParamValue::Float64Array(h.time_axis_ms().into()),
+                )],
             )
             .await;
             ctx.set_int64(

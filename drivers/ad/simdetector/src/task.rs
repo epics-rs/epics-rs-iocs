@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 
@@ -67,19 +68,11 @@ async fn notify(handle: &PortHandle, updates: Vec<ParamSetValue>) {
 }
 
 fn int32(reason: usize, value: i32) -> ParamSetValue {
-    ParamSetValue::Int32 {
-        reason,
-        addr: 0,
-        value,
-    }
+    ParamSetValue::new(reason, 0, ParamValue::Int32(value))
 }
 
 fn octet(reason: usize, value: &str) -> ParamSetValue {
-    ParamSetValue::Octet {
-        reason,
-        addr: 0,
-        value: value.to_string(),
-    }
+    ParamSetValue::new(reason, 0, ParamValue::Octet(value.to_string()))
 }
 
 impl SimTaskContext {

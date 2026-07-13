@@ -13,6 +13,7 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 
@@ -39,11 +40,7 @@ impl Shared {
             .handle
             .set_params_and_notify(
                 0,
-                vec![ParamSetValue::Int32 {
-                    reason,
-                    addr: 0,
-                    value,
-                }],
+                vec![ParamSetValue::new(reason, 0, ParamValue::Int32(value))],
             )
             .await;
     }

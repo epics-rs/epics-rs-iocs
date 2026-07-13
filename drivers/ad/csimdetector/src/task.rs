@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 
@@ -42,19 +43,11 @@ pub(crate) fn start_sim_task(ctx: CSimTaskContext) -> std::thread::JoinHandle<()
 }
 
 fn int32(reason: usize, addr: i32, value: i32) -> ParamSetValue {
-    ParamSetValue::Int32 {
-        reason,
-        addr,
-        value,
-    }
+    ParamSetValue::new(reason, addr, ParamValue::Int32(value))
 }
 
 fn float64(reason: usize, addr: i32, value: f64) -> ParamSetValue {
-    ParamSetValue::Float64 {
-        reason,
-        addr,
-        value,
-    }
+    ParamSetValue::new(reason, addr, ParamValue::Float64(value))
 }
 
 impl CSimTaskContext {

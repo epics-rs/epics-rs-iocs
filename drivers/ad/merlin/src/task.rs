@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -84,11 +85,11 @@ async fn status_loop(handle: PortHandle, ad: ADBaseParams, init_param: usize) {
             let _ = handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Octet {
-                        reason: ad.status_message,
-                        addr: 0,
-                        value: "Waiting for acquire command".into(),
-                    }],
+                    vec![ParamSetValue::new(
+                        ad.status_message,
+                        0,
+                        ParamValue::Octet("Waiting for acquire command".into()),
+                    )],
                 )
                 .await;
         }
@@ -120,11 +121,11 @@ async fn data_loop(ctx: AcquisitionContext) {
                     .handle
                     .set_params_and_notify(
                         0,
-                        vec![ParamSetValue::Octet {
-                            reason: ctx.ad_params.status_message,
-                            addr: 0,
-                            value: "Error in Labview data channel response".into(),
-                        }],
+                        vec![ParamSetValue::new(
+                            ctx.ad_params.status_message,
+                            0,
+                            ParamValue::Octet("Error in Labview data channel response".into()),
+                        )],
                     )
                     .await;
                 rt::sleep(ERROR_BACKOFF).await;
@@ -154,11 +155,11 @@ async fn data_loop(ctx: AcquisitionContext) {
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.ad_params.num_images_counter,
-                        addr: 0,
-                        value: images,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.ad_params.num_images_counter,
+                        0,
+                        ParamValue::Int32(images),
+                    )],
                 )
                 .await;
         }
@@ -197,11 +198,11 @@ async fn data_loop(ctx: AcquisitionContext) {
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.params.software_trigger,
-                        addr: 0,
-                        value: 0,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.params.software_trigger,
+                        0,
+                        ParamValue::Int32(0),
+                    )],
                 )
                 .await;
         }
@@ -212,16 +213,12 @@ async fn data_loop(ctx: AcquisitionContext) {
                 .set_params_and_notify(
                     0,
                     vec![
-                        ParamSetValue::Int32 {
-                            reason: ctx.ad_params.acquire,
-                            addr: 0,
-                            value: 0,
-                        },
-                        ParamSetValue::Int32 {
-                            reason: ctx.ad_params.status,
-                            addr: 0,
-                            value: ADStatus::Idle as i32,
-                        },
+                        ParamSetValue::new(ctx.ad_params.acquire, 0, ParamValue::Int32(0)),
+                        ParamSetValue::new(
+                            ctx.ad_params.status,
+                            0,
+                            ParamValue::Int32(ADStatus::Idle as i32),
+                        ),
                     ],
                 )
                 .await;
@@ -284,11 +281,11 @@ async fn publish_image(
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Octet {
-                        reason: ctx.ad_params.status_message,
-                        addr: 0,
-                        value: "Error: unsupported frame".into(),
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.ad_params.status_message,
+                        0,
+                        ParamValue::Octet("Error: unsupported frame".into()),
+                    )],
                 )
                 .await;
             return;
@@ -356,16 +353,16 @@ async fn publish_profiles(
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32Array {
-                    reason: ctx.params.profile_x,
-                    addr: 0,
-                    value: profiles.x,
-                },
-                ParamSetValue::Int32Array {
-                    reason: ctx.params.profile_y,
-                    addr: 0,
-                    value: profiles.y,
-                },
+                ParamSetValue::new(
+                    ctx.params.profile_x,
+                    0,
+                    ParamValue::Int32Array(profiles.x.into()),
+                ),
+                ParamSetValue::new(
+                    ctx.params.profile_y,
+                    0,
+                    ParamValue::Int32Array(profiles.y.into()),
+                ),
             ],
         )
         .await;
@@ -405,56 +402,20 @@ async fn publish(ctx: &AcquisitionContext, array: NDArray) {
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: base.array_counter,
-                    addr: 0,
-                    value: array.unique_id,
-                },
-                ParamSetValue::Float64 {
-                    reason: base.timestamp_rbv,
-                    addr: 0,
-                    value: ts.as_f64(),
-                },
-                ParamSetValue::Int32 {
-                    reason: base.epics_ts_sec,
-                    addr: 0,
-                    value: ts.sec as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: base.epics_ts_nsec,
-                    addr: 0,
-                    value: ts.nsec as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: base.array_size_x,
-                    addr: 0,
-                    value: size_x,
-                },
-                ParamSetValue::Int32 {
-                    reason: base.array_size_y,
-                    addr: 0,
-                    value: size_y,
-                },
-                ParamSetValue::Int32 {
-                    reason: base.array_size,
-                    addr: 0,
-                    value: array_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: base.n_dimensions,
-                    addr: 0,
-                    value: 2,
-                },
-                ParamSetValue::Int32 {
-                    reason: base.color_mode,
-                    addr: 0,
-                    value: NDColorMode::Mono as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: base.data_type,
-                    addr: 0,
-                    value: data_type as u8 as i32,
-                },
+                ParamSetValue::new(base.array_counter, 0, ParamValue::Int32(array.unique_id)),
+                ParamSetValue::new(base.timestamp_rbv, 0, ParamValue::Float64(ts.as_f64())),
+                ParamSetValue::new(base.epics_ts_sec, 0, ParamValue::Int32(ts.sec as i32)),
+                ParamSetValue::new(base.epics_ts_nsec, 0, ParamValue::Int32(ts.nsec as i32)),
+                ParamSetValue::new(base.array_size_x, 0, ParamValue::Int32(size_x)),
+                ParamSetValue::new(base.array_size_y, 0, ParamValue::Int32(size_y)),
+                ParamSetValue::new(base.array_size, 0, ParamValue::Int32(array_size)),
+                ParamSetValue::new(base.n_dimensions, 0, ParamValue::Int32(2)),
+                ParamSetValue::new(
+                    base.color_mode,
+                    0,
+                    ParamValue::Int32(NDColorMode::Mono as i32),
+                ),
+                ParamSetValue::new(base.data_type, 0, ParamValue::Int32(data_type as u8 as i32)),
             ],
         )
         .await;

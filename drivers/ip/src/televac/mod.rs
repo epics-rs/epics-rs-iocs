@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -125,11 +126,11 @@ impl DeviceWorker for TelevacWorker {
             match self.transact(&protocol::read_pressure(station)) {
                 Ok(raw) => self.publish(
                     addr,
-                    vec![ParamSetValue::Float64 {
-                        reason: p.pressure,
+                    vec![ParamSetValue::new(
+                        p.pressure,
                         addr,
-                        value: protocol::parse_pressure(&raw),
-                    }],
+                        ParamValue::Float64(protocol::parse_pressure(&raw)),
+                    )],
                 ),
                 // The C published a stale buffer on a read error; here the
                 // parameter simply keeps its last good value.
@@ -152,27 +153,27 @@ impl DeviceWorker for TelevacWorker {
             let addr = i32::from(relay) - 1;
             let mut values = Vec::new();
             match self.transact(&protocol::read_relay_on(relay)) {
-                Ok(raw) => values.push(ParamSetValue::Float64 {
-                    reason: p.relay_on,
+                Ok(raw) => values.push(ParamSetValue::new(
+                    p.relay_on,
                     addr,
-                    value: protocol::parse_pressure(&raw),
-                }),
+                    ParamValue::Float64(protocol::parse_pressure(&raw)),
+                )),
                 Err(e) => log::error!("Televac: read relay {relay} ON failed: {e}"),
             }
             match self.transact(&protocol::read_relay_off(relay)) {
-                Ok(raw) => values.push(ParamSetValue::Float64 {
-                    reason: p.relay_off,
+                Ok(raw) => values.push(ParamSetValue::new(
+                    p.relay_off,
                     addr,
-                    value: protocol::parse_pressure(&raw),
-                }),
+                    ParamValue::Float64(protocol::parse_pressure(&raw)),
+                )),
                 Err(e) => log::error!("Televac: read relay {relay} OFF failed: {e}"),
             }
             if let Some(states) = states {
-                values.push(ParamSetValue::Int32 {
-                    reason: p.relay_state,
+                values.push(ParamSetValue::new(
+                    p.relay_state,
                     addr,
-                    value: i32::from(protocol::relay_is_set(states, relay)),
-                });
+                    ParamValue::Int32(i32::from(protocol::relay_is_set(states, relay))),
+                ));
             }
             self.publish(addr, values);
         }

@@ -15,6 +15,7 @@ use std::time::Instant;
 use epics_rs::ad_core::driver::{ADStatus, ShutterMode};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::user::AsynUser;
@@ -99,29 +100,25 @@ impl Ctx {
 
     /// C `setIntegerParam`.
     pub fn set_i32(&mut self, reason: usize, value: i32) {
-        self.batch.updates.push(ParamSetValue::Int32 {
-            reason,
-            addr: 0,
-            value,
-        });
+        self.batch
+            .updates
+            .push(ParamSetValue::new(reason, 0, ParamValue::Int32(value)));
     }
 
     /// C `setDoubleParam`.
     pub fn set_f64(&mut self, reason: usize, value: f64) {
-        self.batch.updates.push(ParamSetValue::Float64 {
-            reason,
-            addr: 0,
-            value,
-        });
+        self.batch
+            .updates
+            .push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
     }
 
     /// C `setStringParam`.
     pub fn set_str(&mut self, reason: usize, value: impl Into<String>) {
-        self.batch.updates.push(ParamSetValue::Octet {
+        self.batch.updates.push(ParamSetValue::new(
             reason,
-            addr: 0,
-            value: value.into(),
-        });
+            0,
+            ParamValue::Octet(value.into()),
+        ));
     }
 
     /// C `callParamCallbacks()` — applies the pending writes and posts monitors

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 
@@ -183,11 +184,11 @@ async fn handle_command(
                         .handle
                         .set_params_and_notify(
                             0,
-                            vec![ParamSetValue::Octet {
-                                reason: ctx.pva.pv_name,
-                                addr: 0,
-                                value: current_pv_name.clone(),
-                            }],
+                            vec![ParamSetValue::new(
+                                ctx.pva.pv_name,
+                                0,
+                                ParamValue::Octet(current_pv_name.clone()),
+                            )],
                         )
                         .await;
                 }
@@ -205,11 +206,11 @@ async fn handle_event(ctx: &MonitorContext, conn: Option<&Connection>, ev: PvaEv
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.pva.pv_connection_status,
-                        addr: 0,
-                        value: 1,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.pva.pv_connection_status,
+                        0,
+                        ParamValue::Int32(1),
+                    )],
                 )
                 .await;
         }
@@ -218,11 +219,11 @@ async fn handle_event(ctx: &MonitorContext, conn: Option<&Connection>, ev: PvaEv
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.pva.pv_connection_status,
-                        addr: 0,
-                        value: 0,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.pva.pv_connection_status,
+                        0,
+                        ParamValue::Int32(0),
+                    )],
                 )
                 .await;
         }
@@ -256,11 +257,11 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.pva.overrun_counter,
-                        addr: 0,
-                        value: overrun + squash as i32,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.pva.overrun_counter,
+                        0,
+                        ParamValue::Int32(overrun + squash as i32),
+                    )],
                 )
                 .await;
         }
@@ -307,86 +308,22 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.max_size_x,
-                    addr: 0,
-                    value: x_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.max_size_y,
-                    addr: 0,
-                    value: y_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.size_x,
-                    addr: 0,
-                    value: x_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.size_y,
-                    addr: 0,
-                    value: y_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_size_x,
-                    addr: 0,
-                    value: x_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_size_y,
-                    addr: 0,
-                    value: y_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_size_z,
-                    addr: 0,
-                    value: color_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.min_x,
-                    addr: 0,
-                    value: min_x,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.min_y,
-                    addr: 0,
-                    value: min_y,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.bin_x,
-                    addr: 0,
-                    value: bin_x,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.bin_y,
-                    addr: 0,
-                    value: bin_y,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.reverse_x,
-                    addr: 0,
-                    value: reverse_x,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.reverse_y,
-                    addr: 0,
-                    value: reverse_y,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_size,
-                    addr: 0,
-                    value: total_bytes,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.data_type,
-                    addr: 0,
-                    value: data_type,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.color_mode,
-                    addr: 0,
-                    value: color_mode,
-                },
+                ParamSetValue::new(ctx.ad.max_size_x, 0, ParamValue::Int32(x_size)),
+                ParamSetValue::new(ctx.ad.max_size_y, 0, ParamValue::Int32(y_size)),
+                ParamSetValue::new(ctx.ad.size_x, 0, ParamValue::Int32(x_size)),
+                ParamSetValue::new(ctx.ad.size_y, 0, ParamValue::Int32(y_size)),
+                ParamSetValue::new(ctx.ad.base.array_size_x, 0, ParamValue::Int32(x_size)),
+                ParamSetValue::new(ctx.ad.base.array_size_y, 0, ParamValue::Int32(y_size)),
+                ParamSetValue::new(ctx.ad.base.array_size_z, 0, ParamValue::Int32(color_size)),
+                ParamSetValue::new(ctx.ad.min_x, 0, ParamValue::Int32(min_x)),
+                ParamSetValue::new(ctx.ad.min_y, 0, ParamValue::Int32(min_y)),
+                ParamSetValue::new(ctx.ad.bin_x, 0, ParamValue::Int32(bin_x)),
+                ParamSetValue::new(ctx.ad.bin_y, 0, ParamValue::Int32(bin_y)),
+                ParamSetValue::new(ctx.ad.reverse_x, 0, ParamValue::Int32(reverse_x)),
+                ParamSetValue::new(ctx.ad.reverse_y, 0, ParamValue::Int32(reverse_y)),
+                ParamSetValue::new(ctx.ad.base.array_size, 0, ParamValue::Int32(total_bytes)),
+                ParamSetValue::new(ctx.ad.base.data_type, 0, ParamValue::Int32(data_type)),
+                ParamSetValue::new(ctx.ad.base.color_mode, 0, ParamValue::Int32(color_mode)),
             ],
         )
         .await;
@@ -423,16 +360,16 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.base.array_counter,
-                    addr: 0,
-                    value: array_counter,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad.num_images_counter,
-                    addr: 0,
-                    value: num_images_counter,
-                },
+                ParamSetValue::new(
+                    ctx.ad.base.array_counter,
+                    0,
+                    ParamValue::Int32(array_counter),
+                ),
+                ParamSetValue::new(
+                    ctx.ad.num_images_counter,
+                    0,
+                    ParamValue::Int32(num_images_counter),
+                ),
             ],
         )
         .await;
@@ -467,11 +404,7 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
             .handle
             .set_params_and_notify(
                 0,
-                vec![ParamSetValue::Int32 {
-                    reason: ctx.ad.acquire,
-                    addr: 0,
-                    value: 0,
-                }],
+                vec![ParamSetValue::new(ctx.ad.acquire, 0, ParamValue::Int32(0))],
             )
             .await;
     }

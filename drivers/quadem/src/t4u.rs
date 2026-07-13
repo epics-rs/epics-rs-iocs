@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -727,16 +728,10 @@ impl RegSink {
             return;
         };
 
-        let set_int = |reason: usize, value: i32| ParamSetValue::Int32 {
-            reason,
-            addr: 0,
-            value,
-        };
-        let set_f64 = |reason: usize, value: f64| ParamSetValue::Float64 {
-            reason,
-            addr: 0,
-            value,
-        };
+        let set_int =
+            |reason: usize, value: i32| ParamSetValue::new(reason, 0, ParamValue::Int32(value));
+        let set_f64 =
+            |reason: usize, value: f64| ParamSetValue::new(reason, 0, ParamValue::Float64(value));
 
         let values = match update {
             Pid { index, value } => vec![set_f64(self.t4u.pid[index], value)],

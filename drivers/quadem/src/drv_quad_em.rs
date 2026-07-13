@@ -33,6 +33,7 @@ use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -625,11 +626,11 @@ impl QuadEmShared {
             log::warn!("quadEM: ring buffer overflow");
             let _ = handle.set_params_and_notify_blocking(
                 0,
-                vec![ParamSetValue::Int32 {
-                    reason: params.ring_overflows,
-                    addr: 0,
-                    value: ring_overflows,
-                }],
+                vec![ParamSetValue::new(
+                    params.ring_overflows,
+                    0,
+                    ParamValue::Int32(ring_overflows),
+                )],
             );
         }
 
@@ -643,21 +644,21 @@ impl QuadEmShared {
         for (addr, value) in sample.iter().enumerate() {
             let _ = handle.set_params_and_notify_blocking(
                 addr as i32,
-                vec![ParamSetValue::Float64 {
-                    reason: params.double_data,
-                    addr: addr as i32,
-                    value: *value,
-                }],
+                vec![ParamSetValue::new(
+                    params.double_data,
+                    addr as i32,
+                    ParamValue::Float64(*value),
+                )],
             );
         }
         let int_data: Vec<i32> = sample.iter().map(|v| *v as i32).collect();
         let _ = handle.set_params_and_notify_blocking(
             0,
-            vec![ParamSetValue::Int32Array {
-                reason: params.int_array_data,
-                addr: 0,
-                value: int_data,
-            }],
+            vec![ParamSetValue::new(
+                params.int_array_data,
+                0,
+                ParamValue::Int32Array(int_data.into()),
+            )],
         );
     }
 }
@@ -975,21 +976,13 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.nd_params.array_counter,
-                    addr: 0,
-                    value: counter,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.params.num_averaged,
-                    addr: 0,
-                    value: num_read as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.params.ring_overflows,
-                    addr: 0,
-                    value: 0,
-                },
+                ParamSetValue::new(ctx.nd_params.array_counter, 0, ParamValue::Int32(counter)),
+                ParamSetValue::new(
+                    ctx.params.num_averaged,
+                    0,
+                    ParamValue::Int32(num_read as i32),
+                ),
+                ParamSetValue::new(ctx.params.ring_overflows, 0, ParamValue::Int32(0)),
             ],
         )
         .await;
@@ -1024,11 +1017,11 @@ pub async fn callback_loop(mut ctx: CallbackContext) {
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.params.num_acquired,
-                        addr: 0,
-                        value: n,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.params.num_acquired,
+                        0,
+                        ParamValue::Int32(n),
+                    )],
                 )
                 .await;
         } else if num_acquired < num_acquire {
@@ -1044,11 +1037,11 @@ pub async fn callback_loop(mut ctx: CallbackContext) {
                 .handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.params.num_acquired,
-                        addr: 0,
-                        value: n,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.params.num_acquired,
+                        0,
+                        ParamValue::Int32(n),
+                    )],
                 )
                 .await;
             if n == num_acquire {

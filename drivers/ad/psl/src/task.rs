@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -57,16 +58,16 @@ async fn task_loop(mut ctx: AcquisitionContext) {
         set_params(
             &ctx,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad_params.status,
-                    addr: 0,
-                    value: ADStatus::Idle as i32,
-                },
-                ParamSetValue::Octet {
-                    reason: ctx.ad_params.status_message,
-                    addr: 0,
-                    value: "Waiting for acquire command".into(),
-                },
+                ParamSetValue::new(
+                    ctx.ad_params.status,
+                    0,
+                    ParamValue::Int32(ADStatus::Idle as i32),
+                ),
+                ParamSetValue::new(
+                    ctx.ad_params.status_message,
+                    0,
+                    ParamValue::Octet("Waiting for acquire command".into()),
+                ),
             ],
         )
         .await;
@@ -86,21 +87,17 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
     set_params(
         ctx,
         vec![
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.num_images_counter,
-                addr: 0,
-                value: 0,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.status,
-                addr: 0,
-                value: ADStatus::Acquire as i32,
-            },
-            ParamSetValue::Octet {
-                reason: ctx.ad_params.status_message,
-                addr: 0,
-                value: "Waiting for the detector".into(),
-            },
+            ParamSetValue::new(ctx.ad_params.num_images_counter, 0, ParamValue::Int32(0)),
+            ParamSetValue::new(
+                ctx.ad_params.status,
+                0,
+                ParamValue::Int32(ADStatus::Acquire as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.status_message,
+                0,
+                ParamValue::Octet("Waiting for the detector".into()),
+            ),
         ],
     )
     .await;
@@ -151,16 +148,16 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
         set_params(
             ctx,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad_params.base.array_counter,
-                    addr: 0,
-                    value: array_counter,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad_params.num_images_counter,
-                    addr: 0,
-                    value: images_taken,
-                },
+                ParamSetValue::new(
+                    ctx.ad_params.base.array_counter,
+                    0,
+                    ParamValue::Int32(array_counter),
+                ),
+                ParamSetValue::new(
+                    ctx.ad_params.num_images_counter,
+                    0,
+                    ParamValue::Int32(images_taken),
+                ),
             ],
         )
         .await;
@@ -279,51 +276,51 @@ async fn publish_frame(
     set_params(
         ctx,
         vec![
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.array_size_x,
-                addr: 0,
-                value: header.width as i32,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.array_size_y,
-                addr: 0,
-                value: header.height as i32,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.array_size,
-                addr: 0,
-                value: array.data_size as i32,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.n_dimensions,
-                addr: 0,
-                value: n_dims as i32,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.data_type,
-                addr: 0,
-                value: header.data_type as u8 as i32,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.color_mode,
-                addr: 0,
-                value: header.color_mode as i32,
-            },
-            ParamSetValue::Float64 {
-                reason: ctx.ad_params.base.timestamp_rbv,
-                addr: 0,
-                value: ts.as_f64(),
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.epics_ts_sec,
-                addr: 0,
-                value: ts.sec as i32,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.epics_ts_nsec,
-                addr: 0,
-                value: ts.nsec as i32,
-            },
+            ParamSetValue::new(
+                ctx.ad_params.base.array_size_x,
+                0,
+                ParamValue::Int32(header.width as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.array_size_y,
+                0,
+                ParamValue::Int32(header.height as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.array_size,
+                0,
+                ParamValue::Int32(array.data_size as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.n_dimensions,
+                0,
+                ParamValue::Int32(n_dims as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.data_type,
+                0,
+                ParamValue::Int32(header.data_type as u8 as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.color_mode,
+                0,
+                ParamValue::Int32(header.color_mode as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.timestamp_rbv,
+                0,
+                ParamValue::Float64(ts.as_f64()),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.epics_ts_sec,
+                0,
+                ParamValue::Int32(ts.sec as i32),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.epics_ts_nsec,
+                0,
+                ParamValue::Int32(ts.nsec as i32),
+            ),
         ],
     )
     .await;
@@ -335,34 +332,30 @@ async fn publish_frame(
 /// reported.
 async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
     let mut updates = vec![
-        ParamSetValue::Int32 {
-            reason: ctx.ad_params.acquire,
-            addr: 0,
-            value: 0,
-        },
-        ParamSetValue::Int32 {
-            reason: ctx.ad_params.status,
-            addr: 0,
-            value: match abort {
+        ParamSetValue::new(ctx.ad_params.acquire, 0, ParamValue::Int32(0)),
+        ParamSetValue::new(
+            ctx.ad_params.status,
+            0,
+            ParamValue::Int32(match abort {
                 Some(Abort::Error(_)) => ADStatus::Error as i32,
                 _ => ADStatus::Idle as i32,
-            },
-        },
+            }),
+        ),
     ];
     match &abort {
         None => {}
-        Some(Abort::Stopped) => updates.push(ParamSetValue::Octet {
-            reason: ctx.ad_params.status_message,
-            addr: 0,
-            value: "Acquisition aborted".into(),
-        }),
+        Some(Abort::Stopped) => updates.push(ParamSetValue::new(
+            ctx.ad_params.status_message,
+            0,
+            ParamValue::Octet("Acquisition aborted".into()),
+        )),
         Some(Abort::Error(message)) => {
             log::error!("psl: {message}");
-            updates.push(ParamSetValue::Octet {
-                reason: ctx.ad_params.status_message,
-                addr: 0,
-                value: message.clone(),
-            });
+            updates.push(ParamSetValue::new(
+                ctx.ad_params.status_message,
+                0,
+                ParamValue::Octet(message.clone()),
+            ));
         }
     }
     set_params(ctx, updates).await;

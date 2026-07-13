@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -296,20 +297,20 @@ pub fn start_poller(
                             Err(e) => {
                                 log::error!("ur-robot: gripper poll error: {e}");
                                 g.disconnect();
-                                vec![ParamSetValue::Int32 {
-                                    reason: params.is_connected,
-                                    addr: 0,
-                                    value: 0,
-                                }]
+                                vec![ParamSetValue::new(
+                                    params.is_connected,
+                                    0,
+                                    ParamValue::Int32(0),
+                                )]
                             }
                         }
                     } else {
                         g.disconnect();
-                        vec![ParamSetValue::Int32 {
-                            reason: params.is_connected,
-                            addr: 0,
-                            value: 0,
-                        }]
+                        vec![ParamSetValue::new(
+                            params.is_connected,
+                            0,
+                            ParamValue::Int32(0),
+                        )]
                     }
                 };
                 let _ = handle.set_params_and_notify_blocking(0, updates);
@@ -329,56 +330,20 @@ pub fn poll_once(p: GripperParams, g: &mut RobotiqGripper) -> UrResult<Vec<Param
     let (inner, outer) = stopped_flags(move_status);
 
     Ok(vec![
-        ParamSetValue::Int32 {
-            reason: p.is_connected,
-            addr: 0,
-            value: 1,
-        },
-        ParamSetValue::Int32 {
-            reason: p.is_active,
-            addr: 0,
-            value: i32::from(is_active),
-        },
-        ParamSetValue::Int32 {
-            reason: p.is_open,
-            addr: 0,
-            value: i32::from(is_open),
-        },
-        ParamSetValue::Int32 {
-            reason: p.is_closed,
-            addr: 0,
-            value: i32::from(is_closed),
-        },
-        ParamSetValue::Float64 {
-            reason: p.current_position,
-            addr: 0,
-            value: current,
-        },
-        ParamSetValue::Float64 {
-            reason: p.open_position,
-            addr: 0,
-            value: g.open_position(),
-        },
-        ParamSetValue::Float64 {
-            reason: p.closed_position,
-            addr: 0,
-            value: g.closed_position(),
-        },
-        ParamSetValue::Int32 {
-            reason: p.move_status,
-            addr: 0,
-            value: move_status.raw(),
-        },
-        ParamSetValue::Int32 {
-            reason: p.is_stopped_inner,
-            addr: 0,
-            value: i32::from(inner),
-        },
-        ParamSetValue::Int32 {
-            reason: p.is_stopped_outer,
-            addr: 0,
-            value: i32::from(outer),
-        },
+        ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(1)),
+        ParamSetValue::new(p.is_active, 0, ParamValue::Int32(i32::from(is_active))),
+        ParamSetValue::new(p.is_open, 0, ParamValue::Int32(i32::from(is_open))),
+        ParamSetValue::new(p.is_closed, 0, ParamValue::Int32(i32::from(is_closed))),
+        ParamSetValue::new(p.current_position, 0, ParamValue::Float64(current)),
+        ParamSetValue::new(p.open_position, 0, ParamValue::Float64(g.open_position())),
+        ParamSetValue::new(
+            p.closed_position,
+            0,
+            ParamValue::Float64(g.closed_position()),
+        ),
+        ParamSetValue::new(p.move_status, 0, ParamValue::Int32(move_status.raw())),
+        ParamSetValue::new(p.is_stopped_inner, 0, ParamValue::Int32(i32::from(inner))),
+        ParamSetValue::new(p.is_stopped_outer, 0, ParamValue::Int32(i32::from(outer))),
     ])
 }
 

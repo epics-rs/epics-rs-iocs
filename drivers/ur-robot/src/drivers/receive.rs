@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -293,11 +294,11 @@ pub fn start_poller(
                         let mut state = shared.get();
                         state.connected = false;
                         shared.set(state);
-                        vec![ParamSetValue::Int32 {
-                            reason: params.is_connected,
-                            addr: 0,
-                            value: 0,
-                        }]
+                        vec![ParamSetValue::new(
+                            params.is_connected,
+                            0,
+                            ParamValue::Int32(0),
+                        )]
                     }
                 };
 
@@ -316,11 +317,7 @@ fn deg(rad: f64) -> f64 {
 fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
     let mut updates = Vec::new();
     let mut int32 = |reason: usize, value: i32| {
-        updates.push(ParamSetValue::Int32 {
-            reason,
-            addr: 0,
-            value,
-        })
+        updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(value)))
     };
 
     int32(p.is_connected, 1);
@@ -350,11 +347,7 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
     }
 
     let mut float64 = |reason: usize, value: f64| {
-        updates.push(ParamSetValue::Float64 {
-            reason,
-            addr: 0,
-            value,
-        })
+        updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)))
     };
     for (reason, name) in [
         (p.controller_timestamp, "timestamp"),
@@ -393,37 +386,37 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
         (p.actual_tool_accel, "actual_tool_accelerometer"),
     ] {
         if let Some(v) = snap.doubles(name) {
-            updates.push(ParamSetValue::Float64Array {
+            updates.push(ParamSetValue::new(
                 reason,
-                addr: 0,
-                value: v.to_vec(),
-            });
+                0,
+                ParamValue::Float64Array(v.to_vec().into()),
+            ));
         }
     }
 
     if let Some(v) = snap.ints("joint_mode") {
-        updates.push(ParamSetValue::Int32Array {
-            reason: p.joint_modes,
-            addr: 0,
-            value: v.to_vec(),
-        });
+        updates.push(ParamSetValue::new(
+            p.joint_modes,
+            0,
+            ParamValue::Int32Array(v.to_vec().into()),
+        ));
     }
 
     // Joint positions: radians on the wire, degrees on the PVs.
     if let Some(q) = snap.doubles("actual_q") {
         let degrees: Vec<f64> = q.iter().copied().map(deg).collect();
         for (i, v) in degrees.iter().enumerate() {
-            updates.push(ParamSetValue::Float64 {
-                reason: p.actual_joint_pos,
-                addr: i as i32,
-                value: *v,
-            });
+            updates.push(ParamSetValue::new(
+                p.actual_joint_pos,
+                i as i32,
+                ParamValue::Float64(*v),
+            ));
         }
-        updates.push(ParamSetValue::Float64Array {
-            reason: p.actual_joint_pos_arr,
-            addr: 0,
-            value: degrees,
-        });
+        updates.push(ParamSetValue::new(
+            p.actual_joint_pos_arr,
+            0,
+            ParamValue::Float64Array(degrees.into()),
+        ));
     }
 
     // TCP pose: x,y,z in metres -> mm; rx,ry,rz in radians -> degrees.
@@ -434,17 +427,17 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
             .map(|(i, v)| if i < 3 { v * 1000.0 } else { deg(*v) })
             .collect();
         for (i, v) in converted.iter().enumerate() {
-            updates.push(ParamSetValue::Float64 {
-                reason: p.actual_tcp_pose,
-                addr: i as i32,
-                value: *v,
-            });
+            updates.push(ParamSetValue::new(
+                p.actual_tcp_pose,
+                i as i32,
+                ParamValue::Float64(*v),
+            ));
         }
-        updates.push(ParamSetValue::Float64Array {
-            reason: p.actual_tcp_pose_arr,
-            addr: 0,
-            value: converted,
-        });
+        updates.push(ParamSetValue::new(
+            p.actual_tcp_pose_arr,
+            0,
+            ParamValue::Float64Array(converted.into()),
+        ));
     }
 
     updates
@@ -528,10 +521,10 @@ mod tests {
         let per_addr: Vec<(i32, f64)> = updates
             .iter()
             .filter_map(|u| match u {
-                ParamSetValue::Float64 {
+                ParamSetValue::Value {
                     reason,
                     addr,
-                    value,
+                    value: ParamValue::Float64(value),
                 } if *reason == p.actual_joint_pos => Some((*addr, *value)),
                 _ => None,
             })
@@ -543,11 +536,11 @@ mod tests {
         let arr = updates
             .iter()
             .find_map(|u| match u {
-                ParamSetValue::Float64Array { reason, value, .. }
-                    if *reason == p.actual_joint_pos_arr =>
-                {
-                    Some(value.clone())
-                }
+                ParamSetValue::Value {
+                    reason,
+                    value: ParamValue::Float64Array(value),
+                    ..
+                } if *reason == p.actual_joint_pos_arr => Some(value.clone()),
                 _ => None,
             })
             .expect("joint position array");
@@ -567,11 +560,11 @@ mod tests {
         let arr = updates
             .iter()
             .find_map(|u| match u {
-                ParamSetValue::Float64Array { reason, value, .. }
-                    if *reason == p.actual_tcp_pose_arr =>
-                {
-                    Some(value.clone())
-                }
+                ParamSetValue::Value {
+                    reason,
+                    value: ParamValue::Float64Array(value),
+                    ..
+                } if *reason == p.actual_tcp_pose_arr => Some(value.clone()),
                 _ => None,
             })
             .expect("TCP pose array");
@@ -593,9 +586,11 @@ mod tests {
         let bits = updates
             .iter()
             .find_map(|u| match u {
-                ParamSetValue::Int32 { reason, value, .. } if *reason == p.safety_status_bits => {
-                    Some(*value)
-                }
+                ParamSetValue::Value {
+                    reason,
+                    value: ParamValue::Int32(value),
+                    ..
+                } if *reason == p.safety_status_bits => Some(*value),
                 _ => None,
             })
             .expect("safety status bits");
@@ -610,13 +605,13 @@ mod tests {
         let updates = publish(p, &Snapshot::new(values));
         assert!(updates.iter().any(|u| matches!(
             u,
-            ParamSetValue::Float64 { reason, value, .. }
+            ParamSetValue::Value { reason, value: ParamValue::Float64(value), .. }
                 if *reason == p.controller_timestamp && (*value - 3.5).abs() < 1e-9
         )));
         // OUTPUT_INTEGER_REG12 is simply absent, not published as 0.
         assert!(!updates.iter().any(|u| matches!(
             u,
-            ParamSetValue::Int32 { reason, .. } if *reason == p.output_integer_reg12
+            ParamSetValue::Value { reason, value: ParamValue::Int32(_), .. } if *reason == p.output_integer_reg12
         )));
     }
 }

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -309,25 +310,25 @@ pub fn start_poller(
                                 log::error!("ur-robot: dashboard poll failed: {e}");
                                 c.disconnect();
                                 state.connected = false;
-                                updates.push(ParamSetValue::Int32 {
-                                    reason: params.is_connected,
-                                    addr: 0,
-                                    value: 0,
-                                });
-                                updates.push(ParamSetValue::Int32 {
-                                    reason: params.is_in_remote_control,
-                                    addr: 0,
-                                    value: 0,
-                                });
+                                updates.push(ParamSetValue::new(
+                                    params.is_connected,
+                                    0,
+                                    ParamValue::Int32(0),
+                                ));
+                                updates.push(ParamSetValue::new(
+                                    params.is_in_remote_control,
+                                    0,
+                                    ParamValue::Int32(0),
+                                ));
                             }
                         }
                     } else {
                         state.connected = false;
-                        updates.push(ParamSetValue::Int32 {
-                            reason: params.is_connected,
-                            addr: 0,
-                            value: 0,
-                        });
+                        updates.push(ParamSetValue::new(
+                            params.is_connected,
+                            0,
+                            ParamValue::Int32(0),
+                        ));
                     }
                 }
 
@@ -354,46 +355,22 @@ fn poll_once(
     let remote = client.is_in_remote_control(polyscope)?;
 
     let updates = vec![
-        ParamSetValue::Int32 {
-            reason: params.is_connected,
-            addr: 0,
-            value: 1,
-        },
-        ParamSetValue::Int32 {
-            reason: params.is_running,
-            addr: 0,
-            value: i32::from(running),
-        },
-        ParamSetValue::Octet {
-            reason: params.program_state,
-            addr: 0,
-            value: program_state,
-        },
-        ParamSetValue::Octet {
-            reason: params.robot_mode,
-            addr: 0,
-            value: robot_mode.clone(),
-        },
-        ParamSetValue::Octet {
-            reason: params.loaded_program,
-            addr: 0,
-            value: loaded_program,
-        },
-        ParamSetValue::Octet {
-            reason: params.safety_status,
-            addr: 0,
-            value: safety_status,
-        },
-        ParamSetValue::Int32 {
-            reason: params.is_program_saved,
-            addr: 0,
-            value: i32::from(program_saved),
-        },
-        ParamSetValue::Int32 {
-            reason: params.is_in_remote_control,
-            addr: 0,
-            value: i32::from(remote),
-        },
+        ParamSetValue::new(params.is_connected, 0, ParamValue::Int32(1)),
+        ParamSetValue::new(params.is_running, 0, ParamValue::Int32(i32::from(running))),
+        ParamSetValue::new(params.program_state, 0, ParamValue::Octet(program_state)),
+        ParamSetValue::new(params.robot_mode, 0, ParamValue::Octet(robot_mode.clone())),
+        ParamSetValue::new(params.loaded_program, 0, ParamValue::Octet(loaded_program)),
+        ParamSetValue::new(params.safety_status, 0, ParamValue::Octet(safety_status)),
+        ParamSetValue::new(
+            params.is_program_saved,
+            0,
+            ParamValue::Int32(i32::from(program_saved)),
+        ),
+        ParamSetValue::new(
+            params.is_in_remote_control,
+            0,
+            ParamValue::Int32(i32::from(remote)),
+        ),
     ];
     Ok((updates, robot_mode))
 }

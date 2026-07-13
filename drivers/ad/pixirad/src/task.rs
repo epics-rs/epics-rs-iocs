@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -173,26 +174,28 @@ async fn data_loop(ctx: DataContext) {
         colors_collected += 1;
 
         let udp_updates = vec![
-            ParamSetValue::Int32 {
-                reason: ctx.params.udp_buffers_read,
-                addr: 0,
-                value: ctx.shared.udp_buffers_read.load(Ordering::Acquire),
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.params.udp_buffers_free,
-                addr: 0,
-                value: ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire),
-            },
-            ParamSetValue::Float64 {
-                reason: ctx.params.udp_speed,
-                addr: 0,
-                value: ctx.shared.speed(),
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.params.colors_collected,
-                addr: 0,
-                value: (colors_collected % num_colors) as i32,
-            },
+            ParamSetValue::new(
+                ctx.params.udp_buffers_read,
+                0,
+                ParamValue::Int32(ctx.shared.udp_buffers_read.load(Ordering::Acquire)),
+            ),
+            ParamSetValue::new(
+                ctx.params.udp_buffers_free,
+                0,
+                ParamValue::Int32(
+                    ctx.shared.max_buffers - ctx.shared.queued_frames.load(Ordering::Acquire),
+                ),
+            ),
+            ParamSetValue::new(
+                ctx.params.udp_speed,
+                0,
+                ParamValue::Float64(ctx.shared.speed()),
+            ),
+            ParamSetValue::new(
+                ctx.params.colors_collected,
+                0,
+                ParamValue::Int32((colors_collected % num_colors) as i32),
+            ),
         ];
         let _ = ctx.handle.set_params_and_notify(0, udp_updates).await;
 
@@ -220,35 +223,35 @@ async fn data_loop(ctx: DataContext) {
         let colors = image.colors;
 
         let mut updates = vec![
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.array_counter,
-                addr: 0,
-                value: unique_id,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.num_images_counter,
-                addr: 0,
-                value: images_taken,
-            },
-            ParamSetValue::Int32 {
-                reason: ctx.ad_params.base.array_size,
-                addr: 0,
-                value: (taken.len() * 2) as i32,
-            },
+            ParamSetValue::new(
+                ctx.ad_params.base.array_counter,
+                0,
+                ParamValue::Int32(unique_id),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.num_images_counter,
+                0,
+                ParamValue::Int32(images_taken),
+            ),
+            ParamSetValue::new(
+                ctx.ad_params.base.array_size,
+                0,
+                ParamValue::Int32((taken.len() * 2) as i32),
+            ),
         ];
         if images_taken >= num_images {
-            updates.push(ParamSetValue::Int32 {
-                reason: ctx.ad_params.acquire,
-                addr: 0,
-                value: 0,
-            });
+            updates.push(ParamSetValue::new(
+                ctx.ad_params.acquire,
+                0,
+                ParamValue::Int32(0),
+            ));
         }
         if auto_calibrate {
-            updates.push(ParamSetValue::Int32 {
-                reason: ctx.params.auto_calibrate,
-                addr: 0,
-                value: 0,
-            });
+            updates.push(ParamSetValue::new(
+                ctx.params.auto_calibrate,
+                0,
+                ParamValue::Int32(0),
+            ));
         }
         let _ = ctx.handle.set_params_and_notify(0, updates).await;
 
@@ -301,26 +304,26 @@ async fn publish(
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: ctx.ad_params.base.n_dimensions,
-                    addr: 0,
-                    value: n_dims as i32,
-                },
-                ParamSetValue::Float64 {
-                    reason: ctx.ad_params.base.timestamp_rbv,
-                    addr: 0,
-                    value: ts.as_f64(),
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad_params.base.epics_ts_sec,
-                    addr: 0,
-                    value: ts.sec as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.ad_params.base.epics_ts_nsec,
-                    addr: 0,
-                    value: ts.nsec as i32,
-                },
+                ParamSetValue::new(
+                    ctx.ad_params.base.n_dimensions,
+                    0,
+                    ParamValue::Int32(n_dims as i32),
+                ),
+                ParamSetValue::new(
+                    ctx.ad_params.base.timestamp_rbv,
+                    0,
+                    ParamValue::Float64(ts.as_f64()),
+                ),
+                ParamSetValue::new(
+                    ctx.ad_params.base.epics_ts_sec,
+                    0,
+                    ParamValue::Int32(ts.sec as i32),
+                ),
+                ParamSetValue::new(
+                    ctx.ad_params.base.epics_ts_nsec,
+                    0,
+                    ParamValue::Int32(ts.nsec as i32),
+                ),
             ],
         )
         .await;
@@ -392,11 +395,7 @@ async fn status_loop(ctx: StatusContext) {
                 "READ_BOX_HUM" => humidity = Some(value),
                 _ => {}
             }
-            updates.push(ParamSetValue::Float64 {
-                reason,
-                addr: 0,
-                value,
-            });
+            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
         }
 
         // C computed the dew point from whatever was last in the parameter
@@ -411,22 +410,22 @@ async fn status_loop(ctx: StatusContext) {
 
         let dew_point = protocol::dew_point(humidity, box_temp);
         let cooling_status = protocol::cooling_status(cold_temp, hot_temp, dew_point);
-        updates.push(ParamSetValue::Float64 {
-            reason: ctx.params.dew_point,
-            addr: 0,
-            value: dew_point,
-        });
-        updates.push(ParamSetValue::Int32 {
-            reason: ctx.params.cooling_status,
-            addr: 0,
-            value: cooling_status as i32,
-        });
+        updates.push(ParamSetValue::new(
+            ctx.params.dew_point,
+            0,
+            ParamValue::Float64(dew_point),
+        ));
+        updates.push(ParamSetValue::new(
+            ctx.params.cooling_status,
+            0,
+            ParamValue::Int32(cooling_status as i32),
+        ));
         if cooling_status.is_error() {
-            updates.push(ParamSetValue::Int32 {
-                reason: ctx.params.cooling_state,
-                addr: 0,
-                value: 0,
-            });
+            updates.push(ParamSetValue::new(
+                ctx.params.cooling_state,
+                0,
+                ParamValue::Int32(0),
+            ));
         }
         let _ = ctx.handle.set_params_and_notify(0, updates).await;
 

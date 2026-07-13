@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -192,21 +193,21 @@ impl TpgWorker {
             .and_then(|raw| protocol::parse_pressure(&raw).map_err(|e| e.to_string()))
         {
             Ok((status, pressure)) => {
-                values.push(ParamSetValue::Float64 {
-                    reason: p.pressure,
+                values.push(ParamSetValue::new(
+                    p.pressure,
                     addr,
-                    value: pressure,
-                });
+                    ParamValue::Float64(pressure),
+                ));
                 let code = match status {
                     GaugeStatus::Ok => 0,
                     GaugeStatus::NoSensor => 4,
                     GaugeStatus::Error(other) => other,
                 };
-                values.push(ParamSetValue::Int32 {
-                    reason: p.gauge_status,
+                values.push(ParamSetValue::new(
+                    p.gauge_status,
                     addr,
-                    value: code,
-                });
+                    ParamValue::Int32(code),
+                ));
             }
             Err(e) => log::error!("TPG261: read pressure of gauge {gauge} failed: {e}"),
         }
@@ -216,20 +217,20 @@ impl TpgWorker {
                 .transact(&protocol::read_setpoint(gauge, index))
                 .and_then(|raw| protocol::parse_setpoint(&raw).map_err(|e| e.to_string()))
             {
-                Ok(value) => values.push(ParamSetValue::Float64 {
-                    reason: p.setpoint_value[index],
+                Ok(value) => values.push(ParamSetValue::new(
+                    p.setpoint_value[index],
                     addr,
-                    value,
-                }),
+                    ParamValue::Float64(value),
+                )),
                 Err(e) => log::error!("TPG261: read setpoint {index} of gauge {gauge}: {e}"),
             }
             if let Some(states) = states {
                 let relay = usize::from(protocol::setpoint_number(gauge, index)) - 1;
-                values.push(ParamSetValue::Int32 {
-                    reason: p.setpoint_state[index],
+                values.push(ParamSetValue::new(
+                    p.setpoint_state[index],
                     addr,
-                    value: states[relay],
-                });
+                    ParamValue::Int32(states[relay]),
+                ));
             }
         }
 
@@ -285,26 +286,20 @@ impl DeviceWorker for TpgWorker {
             let addr = i32::from(gauge) - 1;
             let mut shared: Vec<ParamSetValue> = Vec::new();
             if let Some(sensors) = sensors {
-                shared.push(ParamSetValue::Int32 {
-                    reason: p.sensor,
+                shared.push(ParamSetValue::new(
+                    p.sensor,
                     addr,
-                    value: sensors[usize::from(gauge - 1)],
-                });
+                    ParamValue::Int32(sensors[usize::from(gauge - 1)]),
+                ));
             }
             if let Some(units) = units {
-                shared.push(ParamSetValue::Int32 {
-                    reason: p.units,
-                    addr,
-                    value: units,
-                });
+                shared.push(ParamSetValue::new(p.units, addr, ParamValue::Int32(units)));
             }
             if let Some(raw) = ids.as_deref() {
                 match protocol::parse_gauge_id(raw, gauge) {
-                    Ok(id) => shared.push(ParamSetValue::Octet {
-                        reason: p.gauge_id,
-                        addr,
-                        value: id,
-                    }),
+                    Ok(id) => {
+                        shared.push(ParamSetValue::new(p.gauge_id, addr, ParamValue::Octet(id)))
+                    }
                     Err(e) => log::error!("TPG261: gauge {gauge} id: {e}"),
                 }
             }
