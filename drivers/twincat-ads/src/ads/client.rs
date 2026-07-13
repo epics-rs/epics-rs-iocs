@@ -24,6 +24,7 @@ use super::defs::*;
 use super::error::{AdsError, check};
 use super::frame::*;
 use super::notification::{NotificationSample, decode_notification};
+use super::sumup::{self, SumEntry};
 use super::symbol::{SymbolEntry, decode_symbol_entry};
 
 /// Called on the reader thread for every notified sample.
@@ -256,6 +257,22 @@ impl AdsClient {
         // A sum-up read returns *fewer* bytes than requested when a sub-request
         // fails, so this decoder must not demand the full count.
         decode_read_response_lenient(&resp)
+    }
+
+    /// Sum-up read: fetch many variables in one round trip.
+    ///
+    /// Returns the raw response; split it with [`sumup::decode_response`] using
+    /// the same `entries` slice. The bytes are returned rather than the decoded
+    /// slices because the results borrow from them.
+    pub fn sum_up_read(&self, ams_port: u16, entries: &[SumEntry]) -> Result<Vec<u8>, AdsError> {
+        let req = sumup::build_request(entries);
+        self.read_write(
+            ams_port,
+            req.index_group,
+            req.index_offset,
+            req.read_length,
+            &req.payload,
+        )
     }
 
     /// ADS ReadState → (ads state, device state).
@@ -751,6 +768,55 @@ mod tests {
         assert_eq!(r.u32().unwrap(), 4, "readLength");
         assert_eq!(r.u32().unwrap(), 10, "writeLength");
         assert_eq!(r.bytes(10).unwrap(), b"Main.fTest");
+    }
+
+    /// The sum-up path end to end: the request the PLC sees, and a response
+    /// shorter than `read_length` because one sub-request failed — which the
+    /// lenient READ_WRITE decoder must accept rather than calling a short read.
+    #[test]
+    fn sum_up_read_round_trips_through_read_write() {
+        let entries = vec![
+            SumEntry {
+                index_group: ADSIGRP_SYM_VALBYHND,
+                index_offset: 11,
+                size: 4,
+            },
+            SumEntry {
+                index_group: ADSIGRP_SYM_VALBYHND,
+                index_offset: 22,
+                size: 4,
+            },
+        ];
+
+        let (client, reqs, _) = harness(|mut plc| {
+            let r = plc.read_request().unwrap();
+            // status[0] = ok, status[1] = SYMBOLNOTFOUND; compacted data area.
+            let mut data = 0u32.to_le_bytes().to_vec();
+            data.extend_from_slice(&0x0710u32.to_le_bytes());
+            data.extend_from_slice(&7i32.to_le_bytes());
+            plc.reply(&r.header, 0, &ok_read_payload(&data));
+        });
+
+        let raw = client.sum_up_read(851, &entries).unwrap();
+        let (out, layout) = sumup::decode_response(&raw, &entries).unwrap();
+        assert_eq!(layout, sumup::DataLayout::Compacted);
+        assert_eq!(out[0].as_ref().unwrap(), &7i32.to_le_bytes());
+        assert_eq!(out[1].as_ref().unwrap_err().code(), Some(0x0710));
+
+        let req = reqs.recv().unwrap();
+        assert_eq!(req.header.cmd_id, CMD_READ_WRITE);
+        let mut r = Reader::new(&req.payload);
+        assert_eq!(r.u32().unwrap(), ADSIGRP_SUMUP_READ);
+        assert_eq!(
+            r.u32().unwrap(),
+            2,
+            "sub-request count rides in indexOffset"
+        );
+        assert_eq!(r.u32().unwrap(), 2 * 4 + 8, "readLength");
+        assert_eq!(r.u32().unwrap(), 24, "writeLength = 2 triples");
+        assert_eq!(r.u32().unwrap(), ADSIGRP_SYM_VALBYHND);
+        assert_eq!(r.u32().unwrap(), 11);
+        assert_eq!(r.u32().unwrap(), 4);
     }
 
     #[test]

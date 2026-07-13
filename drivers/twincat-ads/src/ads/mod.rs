@@ -10,10 +10,12 @@ pub mod defs;
 pub mod error;
 pub mod frame;
 pub mod notification;
+pub mod sumup;
 pub mod symbol;
 
 pub use client::AdsClient;
 pub use defs::{AdsState, AdsType, AdsVersion, AmsAddr, AmsNetId};
 pub use error::AdsError;
 pub use notification::NotificationSample;
+pub use sumup::{SumEntry, SumUpRequest};
 pub use symbol::SymbolEntry;
