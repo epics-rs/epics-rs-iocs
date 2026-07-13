@@ -1,0 +1,131 @@
+# Ported verbatim from epics-modules/SyringePump/SPApp/Db/VindumController.template.
+# Pure DB-logic (calcout/mbbi/mbbo "Raw Soft Channel"/seq records); no
+# protocol/DTYP wiring of its own, so no translation was needed. "Raw Soft
+# Channel" DTYP is supported by epics-base-rs 0.22.1's device_support module.
+###########################
+# Status readback records #
+###########################
+
+record(calcout, "$(P)A:PumpModeRBVCalc") {
+    field(INPA, "$(P)A:PumpModeRaw CP")
+    field(CALC, "A&0x10?0:A")
+    field(OUT, "$(P)A:PumpMode_RBV.RVAL PP")
+}
+
+record(calcout, "$(P)B:PumpModeRBVCalc") {
+    field(INPA, "$(P)B:PumpModeRaw CP")
+    field(CALC, "A&0x10?0:A")
+    field(OUT, "$(P)B:PumpMode_RBV.RVAL PP")
+}
+
+record(calcout, "$(P)PumpModeRBVCalc") {
+    field(INPA, "$(P)A:PumpModeRaw CP")
+    field(CALC, "A&0x10?A:0")
+    field(OUT, "$(P)PumpMode_RBV.RVAL PP")
+}
+
+record(mbbi, "$(P)PumpMode_RBV") {
+    field(DTYP, "Raw Soft Channel")
+    field(ZRST, "Independent")
+    field(ZRVL, "0")
+    field(ONST, "Geared Rate Deliver")
+    field(ONVL, "16")
+    field(TWST, "Paired Rate Deliver")
+    field(TWVL, "17")
+    field(THST, "Paired Press Deliver")
+    field(THVL, "18")
+    field(FRST, "Paired Rate Receive")
+    field(FRVL, "19")
+    field(FVST, "Paired Press Receive")
+    field(FVVL, "20")
+    field(SXST, "Paired Press Bi-Dir")
+    field(SXVL, "21")
+    field(SVST, "Paired Delta Press Dlvr")
+    field(SVVL, "22")
+}
+
+
+###############################
+# Pump control output records #
+###############################
+
+record(ao, "$(P)TotalVolumeSP") {
+    field(PREC, "3")
+    field(OUT, "$(P)TotalVolumeSPCalc.A PP")
+}
+
+record(calcout, "$(P)TotalVolumeSPCalc") {
+    field(CALC, "A*1000")
+    field(OUT, "$(P)VolumeStartRaw PP")
+}
+
+record(bo, "$(P)A:ResetVolume") {
+    field(FLNK, "$(P)A:ResetVolumeCalc")
+}
+
+record(calcout, "$(P)A:ResetVolumeCalc") {
+    field(CALC, "0x01")
+    field(OUT,  "$(P)ResetVolumesRaw PP")
+}
+
+record(bo, "$(P)B:ResetVolume") {
+    field(FLNK, "$(P)B:ResetVolumeCalc")
+}
+
+record(calcout, "$(P)B:ResetVolumeCalc") {
+    field(CALC, "0x02")
+    field(OUT,  "$(P)ResetVolumesRaw PP")
+}
+
+record(bo, "$(P)ResetTotalVolume") {
+    field(FLNK, "$(P)ResetTotalVolumeCalc")
+}
+
+record(calcout, "$(P)ResetTotalVolumeCalc") {
+    field(CALC, "0x04")
+    field(OUT,  "$(P)ResetVolumesRaw PP")
+}
+
+record(mbbo, "$(P)PumpMode") {
+    field(DTYP, "Raw Soft Channel")
+    field(ZRST, "Independent")
+    field(ZRVL, "0")
+    field(ONST, "Geared Rate Deliver")
+    field(ONVL, "16")
+    field(TWST, "Paired Rate Deliver")
+    field(TWVL, "17")
+    field(THST, "Paired Press Deliver")
+    field(THVL, "18")
+    field(FRST, "Paired Rate Receive")
+    field(FRVL, "19")
+    field(FVST, "Paired Press Receive")
+    field(FVVL, "20")
+    field(SXST, "Paired Press Bi-Dir")
+    field(SXVL, "21")
+    field(SVST, "Paired Delta Press Dlvr")
+    field(SVVL, "22")
+    field(FLNK, "$(P)PumpModeSeq")
+}
+
+record(seq,"$(P)PumpModeSeq") {
+    field(DLY1,"0")
+    field(DOL1,"1")
+    field(LNK1,"$(P)PumpModeCalcA.PROC")
+    field(DLY2,"2")
+    field(DOL2,"1")
+    field(LNK2,"$(P)PumpModeCalcB.PROC")
+}
+
+record(calcout, "$(P)PumpModeCalcA") {
+    field(INPA, "$(P)PumpMode.RVAL NPP")
+    field(INPB, "$(P)A:PumpMode.RVAL NPP")
+    field(CALC, "A?A:B")
+    field(OUT,  "$(P)A:PumpModeRaw PP")
+}
+
+record(calcout, "$(P)PumpModeCalcB") {
+    field(INPA, "$(P)PumpMode.RVAL NPP")
+    field(INPB, "$(P)B:PumpMode.RVAL NPP")
+    field(CALC, "A?A:B")
+    field(OUT,  "$(P)B:PumpModeRaw PP")
+}

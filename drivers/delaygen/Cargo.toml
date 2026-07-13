@@ -1,0 +1,12 @@
+# Delay/pulse generator asyn port drivers, ported from epics-modules/delaygen
+# (drvAsynDG645.cpp, drvAsynColby.cpp, drvAsynCoherentSDG.cpp). Pure serial
+# ASCII protocols — no vendor library, so this crate builds/tests on any host.
+
+[package]
+name = "delaygen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn"] }

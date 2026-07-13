@@ -744,6 +744,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "delaygen"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+]
+
+[[package]]
+name = "delaygen-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "delaygen",
+ "epics-rs",
+ "tokio",
+]
+
+[[package]]
 name = "der"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1425,6 +1442,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "love"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+]
+
+[[package]]
+name = "love-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "love",
+ "tokio",
+]
+
+[[package]]
 name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1492,6 +1526,23 @@ dependencies = [
  "epics-rs",
  "motor-common",
  "motor-micos",
+]
+
+[[package]]
+name = "microepsilon"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+]
+
+[[package]]
+name = "microepsilon-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "microepsilon",
+ "tokio",
 ]
 
 [[package]]
@@ -2414,6 +2465,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "scaler974"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+]
+
+[[package]]
+name = "scaler974-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "scaler974",
+ "tokio",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2663,6 +2731,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "syringepump"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+]
+
+[[package]]
+name = "syringepump-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-modbus-rs",
+ "epics-rs",
+ "syringepump",
 ]
 
 [[package]]

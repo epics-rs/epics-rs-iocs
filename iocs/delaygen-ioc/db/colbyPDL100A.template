@@ -1,0 +1,129 @@
+record(ao,"$(P)$(R)delay")
+{
+    field(DESC, "Colby delay")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0)")
+    field(PREC, "$(PREC)")
+    field(FLNK, "$(P)$(R)delay_rbk")
+}
+record(ai,"$(P)$(R)delay_rbk")
+{
+    field(DESC, "Colby delay readback")
+    field(SCAN, "Passive")
+    field(PREC, "$(PREC)")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),1)")
+}
+record(calcout,"$(P)$(R)inc")
+{
+    field(DESC, "Colby increment step")
+    field(INPA, "$(P)$(R)delay NPP NMS")
+    field(INPB, "$(P)$(R)step NPP NMS")
+    field(CALC, "A+B")
+    field(OUT,  "$(P)$(R)delay PP NMS")
+}
+record(calcout,"$(P)$(R)dec")
+{
+    field(DESC, "Increment calc")
+    field(INPA, "$(P)$(R)delay NPP NMS")
+    field(INPB, "$(P)$(R)step NPP NMS")
+    field(CALC, "A-B")
+    field(OUT,  "$(P)$(R)delay PP NMS")
+}
+# Fixed upstream defect (doc/upstream-c-defects.md #35): upstream's "step"
+# ao record had no DTYP/OUT (dead wiring) -- ColbyDriver's addr 4 ("Write
+# step" per colby.rs's developer-notes table) is the unambiguous wire
+# command this record's own name/DESC describe, so it is wired here rather
+# than removed.
+record(ao,"$(P)$(R)step")
+{
+    field(DESC, "Colby step")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),4)")
+    field(PREC, "$(PREC)")
+}
+record(ai,"$(P)$(R)step_rbk")
+{
+    field(DESC, "Colby step readback")
+    field(SCAN, "Passive")
+    field(PREC, "$(PREC)")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),5)")
+}
+record(bo,"$(P)$(R)units")
+{
+    field(DESC, "Colby units")
+    field(DTYP, "asynUInt32Digital")
+    field(OUT,  "@asynMask($(PORT),6,0x01)")
+    field(ZNAM, "nS")
+    field(ONAM, "pS")
+}
+record(stringin,"$(P)$(R)ip")
+{
+    field(DESC, "Colby IP address")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),8)")
+}
+record(stringin,"$(P)$(R)gw")
+{
+    field(DESC, "Colby gateway address")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),9)")
+}
+record(stringin,"$(P)$(R)nm")
+{
+    field(DESC, "Colby netmask")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),10)")
+}
+record(stringin,"$(P)$(R)tcp")
+{
+    field(DESC, "Colby port number")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),11)")
+}
+record(stringin,"$(P)$(R)dhcp")
+{
+    field(DESC, "Colby DHCP status")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),12)")
+}
+record(stringin,"$(P)$(R)mac")
+{
+    field(DESC, "Colby MAC address")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),13)")
+}
+# Removed upstream defect (doc/upstream-c-defects.md #36): upstream's
+# "connect"/"disconnect" sseq records referenced $(P)$(A).CNCT/.PCNCT, an
+# asynRecord instance the real upstream st.cmd never actually loads under
+# that name -- iocdelaygen/st.cmd loads asynRecord.db with a hardcoded
+# R=asyn_1 for every device, unrelated to colbyPDL100A.db's own per-device
+# A= macro (A=Colby here), so $(P)$(A) ("delaygen:Colby") never resolves to
+# a real record; confirmed byte-for-byte against the real upstream
+# colbyPDL100A.db (same dangling reference exists there). No unambiguous
+# in-file target exists to repoint to (this template neither loads nor
+# defines any asynRecord instance itself, and neither record is
+# referenced by anything else in this file), so both dead records were
+# removed rather than repointed. PV-surface change: "$(P)$(R)connect" and
+# "$(P)$(R)disconnect" no longer exist; they never functioned (writing
+# them was a no-op past the first dangling link) so no working behavior is
+# lost.
+record(fanout,"$(P)$(R)update")
+{
+    field(DESC, "Update network params")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)ip")
+    field(LNK2, "$(P)$(R)gw")
+    field(LNK3, "$(P)$(R)nm")
+    field(LNK4, "$(P)$(R)tcp")
+    field(LNK5, "$(P)$(R)dhcp")
+    field(LNK6, "$(P)$(R)mac")
+}
+record(fanout,"$(P)$(R)init")
+{
+    field(DESC, "Colby initialization")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)units")
+    field(LNK2, "$(P)$(R)delay")
+}

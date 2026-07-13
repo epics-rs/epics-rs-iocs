@@ -1,0 +1,152 @@
+# Ported verbatim from epics-modules/SyringePump/SPApp/Db/VindumPumpN.template.
+# Pure DB-logic (calcout tweak pairs, mbbo/mbbi "Raw Soft Channel"-free plain
+# menu records, dfanout HOPR/LOPR sync); no protocol/DTYP wiring of its own,
+# so no translation was needed.
+# These records are for tweaking the pressure
+record(ao,"$(P)$(PUMP)PressureTweak") {
+    field(VAL, "1")
+    field(PREC,"1")
+}
+
+record(calcout,"$(P)$(PUMP)PressureTweakDown") {
+    field(INPA,"$(P)$(PUMP)PressureTweak.VAL NPP NMS")
+    field(INPB,"$(P)$(PUMP)SetPressure NPP NMS")
+    field(CALC,"B-A")
+    field(OUT, "$(P)$(PUMP)SetPressure PP NMS")
+}
+
+record(calcout,"$(P)$(PUMP)PressureTweakUp") {
+    field(INPA,"$(P)$(PUMP)PressureTweak.VAL NPP NMS")
+    field(INPB,"$(P)$(PUMP)SetPressure NPP NMS")
+    field(CALC,"B+A")
+    field(OUT, "$(P)$(PUMP)SetPressure PP NMS")
+}
+
+# These records are for tweaking the flow rate
+record(ao,"$(P)$(PUMP)FlowRateTweak") {
+    field(VAL, "1")
+    field(PREC,"3")
+}
+
+record(calcout,"$(P)$(PUMP)FlowRateTweakDown") {
+    field(INPA,"$(P)$(PUMP)FlowRateTweak.VAL NPP NMS")
+    field(INPB,"$(P)$(PUMP)SetFlowRate NPP NMS")
+    field(CALC,"B-A")
+    field(OUT, "$(P)$(PUMP)SetFlowRate PP NMS")
+}
+
+record(calcout,"$(P)$(PUMP)FlowRateTweakUp") {
+    field(INPA,"$(P)$(PUMP)FlowRateTweak.VAL NPP NMS")
+    field(INPB,"$(P)$(PUMP)SetFlowRate NPP NMS")
+    field(CALC,"B+A")
+    field(OUT, "$(P)$(PUMP)SetFlowRate PP NMS")
+}
+
+record(mbbo, "$(P)$(PUMP)PumpMode") {
+    field(ZRST, "Manual Rate")
+    field(ZRVL, "1")
+    field(ONST, "Man. Press Deliver")
+    field(ONVL, "2")
+    field(TWST, "Cycled Rate Deliver")
+    field(TWVL, "3")
+    field(THST, "Cycled Press Deliver")
+    field(THVL, "4")
+    field(FRST, "Cycled Rate Receive")
+    field(FRVL, "5")
+    field(FVST, "Cycled Press Receive")
+    field(FVVL, "7")
+    field(FLNK, "$(P)PumpMode")
+}
+
+record(mbbi, "$(P)$(PUMP)PumpMode_RBV") {
+    field(DTYP, "Raw Soft Channel")
+    field(ZRST, "Manual Rate")
+    field(ZRVL, "1")
+    field(ONST, "Man. Press Deliver")
+    field(ONVL, "2")
+    field(TWST, "Cycled Rate Deliver")
+    field(TWVL, "3")
+    field(THST, "Cycled Press Deliver")
+    field(THVL, "4")
+    field(FRST, "Cycled Rate Receive")
+    field(FRVL, "5")
+    field(FVST, "Cycled Press Receive")
+    field(FVVL, "7")
+}
+
+record(bo, "$(P)$(PUMP)AutofillMode") {
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+}
+
+record(bo, "$(P)$(PUMP)VolumeMode") {
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+}
+
+record(bo, "$(P)$(PUMP)Run") {
+    field(ZNAM, "Done")
+    field(ONAM, "Run")
+    field(FLNK, "$(P)$(PUMP)StartNormalCalc")
+}
+
+record(calcout, "$(P)$(PUMP)StartNormalCalc") {
+    field(INPA, "$(P)$(PUMP)VolumeMode")
+    field(INPB, "$(P)$(PUMP)AutofillMode")
+    field(CALC, "!A & !B")
+    field(OOPT, "When Non-zero")
+    field(OUT,  "$(P)$(PUMP)Start.PROC PP")
+    field(FLNK, "$(P)$(PUMP)StartVolumeCalc")
+}
+
+record(calcout, "$(P)$(PUMP)StartVolumeCalc") {
+    field(INPA, "$(P)$(PUMP)VolumeMode")
+    field(INPB, "$(P)$(PUMP)AutofillMode")
+    field(CALC, "A & !B")
+    field(OOPT, "When Non-zero")
+    field(OUT,  "$(P)$(PUMP)StartVolume.PROC PP")
+    field(FLNK, "$(P)$(PUMP)StartAutofillCalc")
+}
+
+record(calcout, "$(P)$(PUMP)StartAutofillCalc") {
+    field(INPA, "$(P)$(PUMP)VolumeMode")
+    field(INPB, "$(P)$(PUMP)AutofillMode")
+    field(CALC, "!A & B")
+    field(OOPT, "When Non-zero")
+    field(OUT,  "$(P)$(PUMP)StartAuto.PROC PP")
+    field(FLNK, "$(P)$(PUMP)StartAutoVolumeCalc")
+}
+
+record(calcout, "$(P)$(PUMP)StartAutoVolumeCalc") {
+    field(INPA, "$(P)$(PUMP)VolumeMode")
+    field(INPB, "$(P)$(PUMP)AutofillMode")
+    field(CALC, "A & B")
+    field(OOPT, "When Non-zero")
+    field(OUT,  "$(P)$(PUMP)StartAutoVolume.PROC PP")
+}
+
+# This record converts the pump position in % to volume remaining in %
+record(calcout, "$(P)$(PUMP)VolRemaining") {
+    field(INPA, "$(P)$(PUMP)Position CP")
+    field(CALC, "100.-A")
+    field(LOPR, "0.")
+    field(HOPR, "100.")
+    field(PREC, "1")
+}
+
+# This record is the pump description, used to label displays
+record(stringin, "$(P)$(PUMP)Description") {
+    field(VAL,  "Pump $(PUMP)")
+}
+
+# These records set the HOPR and LOPR to the same values for Pressure and SetPressure_RBV
+# This simplifies the plot configuration
+record(dfanout, "$(P)$(PUMP)PressureLOPR") {
+    field(OUTA, "$(P)$(PUMP)SetPressure_RBV.LOPR")
+    field(OUTB, "$(P)$(PUMP)Pressure.LOPR")
+}
+
+record(dfanout, "$(P)$(PUMP)PressureHOPR") {
+    field(OUTA, "$(P)$(PUMP)SetPressure_RBV.HOPR")
+    field(OUTB, "$(P)$(PUMP)Pressure.HOPR")
+}

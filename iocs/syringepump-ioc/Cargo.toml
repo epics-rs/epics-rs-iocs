@@ -1,0 +1,17 @@
+# SyringePump IOC binary. Wires up all three pump families from
+# epics-modules/SyringePump: Teledyne ISCO D/H-series (native asyn port
+# driver, drivers/syringepump) plus ISCO and Vindum (Modbus-only upstream,
+# wired directly against epics-modbus-rs's drvModbusAsynConfigure + ported
+# db templates -- no driver code of their own). See src/main.rs's module
+# doc for the full scope-split rationale.
+
+[package]
+name = "syringepump-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+syringepump = { path = "../../drivers/syringepump" }
+epics-rs = { workspace = true, features = ["asyn", "bridge"] }
+modbus-rs = { workspace = true, features = ["ioc"] }

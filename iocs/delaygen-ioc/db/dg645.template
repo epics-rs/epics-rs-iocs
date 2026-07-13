@@ -1,0 +1,2442 @@
+## Instrument management related PVs
+record(stringout,"$(P)$(R)Label")
+{
+    field(DESC, "Unit Label")
+}
+record(stringin,"$(P)$(R)IdentSI")
+{
+    field(PINI, "YES")
+    field(DESC, "Ident")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT)) IDENT")
+}
+
+record(longin,"$(P)$(R)StatusLI")
+{
+    field(PINI, "YES")
+    field(DESC, "Status value")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) STATUS_CODE")
+    field(SCAN, "I/O Intr")
+    field(FLNK, "$(P)$(R)StatusSI")
+}
+record(stringin,"$(P)$(R)StatusSI")
+{
+    field(PINI, "YES")
+    field(DESC, "Status text")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT)) STATUS")
+}
+record(bo,"$(P)$(R)StatusClearBO")
+{
+    field(DESC, "Status Clear")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) STATUS_CLEAR")
+}
+record(bo,"$(P)$(R)StatusCheckingBO")
+{
+    field(DESC, "Status Checking")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(DOL,  "1")
+    field(OUT,  "@asyn($(PORT)) STATUS_CHECKING")
+}
+
+
+record(bo,"$(P)$(R)ResetBO")
+{
+    field(DESC, "Reset")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) RESET")
+}
+record(bo,"$(P)$(R)GotoLocalBO")
+{
+    field(DESC, "Goto Local")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) LOCAL")
+}
+record(bo,"$(P)$(R)GotoRemoteBO")
+{
+    field(DESC, "Goto Remote")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) REMOTE")
+}
+
+## Instrument event status related PVs
+record(longin,"$(P)$(R)EventStatusLI")
+{
+    field(DESC, "Event Status")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) EVENT_STATUS")
+    field(SCAN, "Passive")
+    field(FLNK, "$(P)$(R)EventStatusMBBID")
+}
+record(mbbiDirect,"$(P)$(R)EventStatusMBBID")
+{
+    field(DESC, "Event Status Bits")
+    field(DTYP, "Soft Channel")
+    field(INP,  "$(P)$(R)EventStatusLI")
+}
+
+## Input trigger related PVs
+record(ai,"$(P)$(R)TriggerRateAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Trigger Rate")
+    field(SCAN, "Passive")
+    field(PREC, "6")
+    field(EGU,  "Hz")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) TRIG_RATE")
+}
+record(ao,"$(P)$(R)TriggerRateAO")
+{
+    field(DESC, "Trigger Rate")
+    field(PREC, "6")
+    field(EGU,  "Hz")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) TRIG_RATE")
+    field(FLNK, "$(P)$(R)TriggerRateAI")
+}
+record(ai,"$(P)$(R)TriggerLevelAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Trigger Level")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) TRIG_LEVEL")
+}
+record(ao,"$(P)$(R)TriggerLevelAO")
+{
+    field(DESC, "Trigger Level")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) TRIG_LEVEL")
+    field(FLNK, "$(P)$(R)TriggerLevelAI")
+}
+record(mbbi,"$(P)$(R)TriggerSourceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Trigger Source")
+    field(SCAN, "Passive")
+    field(ZRST, "Internal")
+    field(ONST, "Ext rising edge")
+    field(TWST, "Ext falling edge")
+    field(THST, "SS ext rise edge")
+    field(FRST, "SS ext fall edge")
+    field(FVST, "Single shot")
+    field(SXST, "Line")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(THVL, "3")
+    field(FRVL, "4")
+    field(FVVL, "5")
+    field(SXVL, "6")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_SOURCE")
+}
+record(mbbo,"$(P)$(R)TriggerSourceMO")
+{
+    field(DESC, "Trigger Source")
+    field(SCAN, "Passive")
+    field(ZRST, "Internal")
+    field(ONST, "Ext rising edge")
+    field(TWST, "Ext falling edge")
+    field(THST, "SS ext rise edge")
+    field(FRST, "SS ext fall edge")
+    field(FVST, "Single shot")
+    field(SXST, "Line")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(THVL, "3")
+    field(FRVL, "4")
+    field(FVVL, "5")
+    field(SXVL, "6")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_SOURCE")
+    field(FLNK, "$(P)$(R)TriggerSourceMI")
+}
+record(mbbi,"$(P)$(R)TriggerInhibitMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Trigger Inhibit")
+    field(SCAN, "Passive")
+    field(ZRST, "Off")
+    field(ONST, "Triggers")
+    field(TWST, "AB")
+    field(THST, "AB,CD")
+    field(FRST, "AB,CD,EF")
+    field(FVST, "AB,CD,EF,GH")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(THVL, "3")
+    field(FRVL, "4")
+    field(FVVL, "5")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_INHIBIT")
+}
+record(mbbo,"$(P)$(R)TriggerInhibitMO")
+{
+    field(DESC, "Trigger Inhibit")
+    field(SCAN, "Passive")
+    field(ZRST, "Off")
+    field(ONST, "Triggers")
+    field(TWST, "AB")
+    field(THST, "AB,CD")
+    field(FRST, "AB,CD,EF")
+    field(FVST, "AB,CD,EF,GH")
+    field(ZRVL, "0")
+    field(ONVL, "1")
+    field(TWVL, "2")
+    field(THVL, "3")
+    field(FRVL, "4")
+    field(FVVL, "5")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_INHIBIT")
+    field(FLNK, "$(P)$(R)TriggerInhibitMI")
+}
+record(bo,"$(P)$(R)TriggerDelayBO")
+{
+    field(DESC, "Trigger Delay")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_DELAY")
+}
+
+record(bi,"$(P)$(R)TriggerAdvancedModeBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Trigger Advanced Mode")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_ADV_MODE")
+}
+record(bo,"$(P)$(R)TriggerAdvancedModeBO")
+{
+    field(DESC, "Trigger Advanced Mode")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) TRIG_ADV_MODE")
+    field(FLNK, "$(P)$(R)TriggerAdvancedModeBI")
+}
+record(ai,"$(P)$(R)TriggerHoldoffAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Burst Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) TRIG_HOLDOFF")
+}
+record(ao,"$(P)$(R)TriggerHoldoffAO")
+{
+    field(DESC, "Trigger Holdoff")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) TRIG_HOLDOFF")
+    field(FLNK, "$(P)$(R)TriggerHoldoffAI")
+}
+record(longin,"$(P)$(R)TriggerPrescaleLI")
+{
+    field(PINI, "YES")
+    field(DESC, "Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_PRESCALE")
+}
+record(longout,"$(P)$(R)TriggerPrescaleLO")
+{
+    field(DESC, "Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_PRESCALE")
+    field(FLNK, "$(P)$(R)TriggerPrescaleLI")
+}
+
+record(longin,"$(P)$(R)ABTriggerPrescaleLI")
+{
+    field(PINI, "YES")
+    field(DESC, "AB Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_AB_PRESCALE")
+}
+record(longout,"$(P)$(R)ABTriggerPrescaleLO")
+{
+   field(DESC, "AB Trigger Prescale")
+   field(DTYP, "asynInt32")
+   field(OUT,  "@asyn($(PORT)) TRIG_AB_PRESCALE")
+   field(FLNK, "$(P)$(R)ABTriggerPrescaleLI")
+}
+record(longin,"$(P)$(R)CDTriggerPrescaleLI")
+{
+    field(PINI, "YES")
+    field(DESC, "CD Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_CD_PRESCALE")
+}
+record(longout,"$(P)$(R)CDTriggerPrescaleLO")
+{
+    field(DESC, "CD Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_CD_PRESCALE")
+    field(FLNK, "$(P)$(R)CDTriggerPrescaleLI")
+}
+record(longin,"$(P)$(R)EFTriggerPrescaleLI")
+{
+    field(PINI, "YES")
+    field(DESC, "EF Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_EF_PRESCALE")
+}
+record(longout,"$(P)$(R)EFTriggerPrescaleLO")
+{
+    field(DESC, "EF Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_EF_PRESCALE")
+    field(FLNK, "$(P)$(R)EFTriggerPrescaleLI")
+}
+record(longin,"$(P)$(R)GHTriggerPrescaleLI")
+{
+    field(PINI, "YES")
+    field(DESC, "GH Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_GH_PRESCALE")
+}
+record(longout,"$(P)$(R)GHTriggerPrescaleLO")
+{
+    field(DESC, "GH Trigger Prescale")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_GH_PRESCALE")
+    field(FLNK, "$(P)$(R)GHTriggerPrescaleLI")
+}
+
+record(longin,"$(P)$(R)ABTriggerPhaseLI")
+{
+    field(PINI, "YES")
+    field(DESC, "AB Trigger Phase")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_AB_PHASE")
+}
+record(longout,"$(P)$(R)ABTriggerPhaseLO")
+{
+   field(DESC, "AB Trigger Phase")
+   field(DTYP, "asynInt32")
+   field(OUT,  "@asyn($(PORT)) TRIG_AB_PHASE")
+   field(FLNK, "$(P)$(R)ABTriggerPhaseLI")
+}
+record(longin,"$(P)$(R)CDTriggerPhaseLI")
+{
+    field(PINI, "YES")
+    field(DESC, "CD Trigger Phase")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_CD_PHASE")
+}
+record(longout,"$(P)$(R)CDTriggerPhaseLO")
+{
+    field(DESC, "CD Trigger Phase")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_CD_PHASE")
+    field(FLNK, "$(P)$(R)CDTriggerPhaseLI")
+}
+record(longin,"$(P)$(R)EFTriggerPhaseLI")
+{
+    field(PINI, "YES")
+    field(DESC, "EF Trigger Phase")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_EF_PHASE")
+}
+record(longout,"$(P)$(R)EFTriggerPhaseLO")
+{
+    field(DESC, "EF Trigger Phase")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_EF_PHASE")
+    field(FLNK, "$(P)$(R)EFTriggerPhaseLI")
+}
+record(longin,"$(P)$(R)GHTriggerPhaseLI")
+{
+    field(PINI, "YES")
+    field(DESC, "GH Trigger Phase")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TRIG_GH_PHASE")
+}
+record(longout,"$(P)$(R)GHTriggerPhaseLO")
+{
+    field(DESC, "GH Trigger Phase")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TRIG_GH_PHASE")
+    field(FLNK, "$(P)$(R)GHTriggerPhaseLI")
+}
+
+## Burst mode related PVs
+record(bi,"$(P)$(R)BurstModeBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Burst Mode")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) BURST_MODE")
+}
+record(bo,"$(P)$(R)BurstModeBO")
+{
+    field(DESC, "Burst Mode")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) BURST_MODE")
+    field(FLNK, "$(P)$(R)BurstModeBI")
+}
+record(longin,"$(P)$(R)BurstCountLI")
+{
+    field(PINI, "YES")
+    field(DESC, "Burst Count")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) BURST_COUNT")
+}
+record(longout,"$(P)$(R)BurstCountLO")
+{
+    field(DESC, "Burst Count")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) BURST_COUNT")
+    field(FLNK, "$(P)$(R)BurstCountLI")
+}
+record(bi,"$(P)$(R)BurstConfigBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Burst T0 Config")
+    field(SCAN, "Passive")
+    field(ZNAM, "All Cycles")
+    field(ONAM, "1st Cycle")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) BURST_T0")
+}
+record(bo,"$(P)$(R)BurstConfigBO")
+{
+    field(DESC, "Burst T0 Config")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "All Cycles")
+    field(ONAM, "1st Cycle")
+    field(OUT,  "@asyn($(PORT)) BURST_T0")
+    field(FLNK, "$(P)$(R)BurstConfigBI")
+}
+record(ai,"$(P)$(R)BurstDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Burst Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) BURST_DELAY")
+}
+record(ao,"$(P)$(R)BurstDelayAO")
+{
+    field(DESC, "Burst Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) BURST_DELAY")
+    field(FLNK, "$(P)$(R)BurstDelayAI")
+}
+record(ai,"$(P)$(R)BurstPeriodAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Burst Period")
+    field(PREC, "8")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) BURST_PERIOD")
+}
+record(ao,"$(P)$(R)BurstPeriodAO")
+{
+    field(DESC, "Burst Period")
+    field(PREC, "8")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) BURST_PERIOD")
+    field(FLNK, "$(P)$(R)BurstPeriodAI")
+}
+
+
+## Interface configuration related PVs
+record(bi,"$(P)$(R)IfaceSerialStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Serial State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) RS232")
+}
+record(bo,"$(P)$(R)IfaceSerialStateBO")
+{
+    field(DESC, "Serial State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) RS232")
+    field(FLNK, "$(P)$(R)IfaceSerialStateBI")
+}
+record(mbbi,"$(P)$(R)IfaceSerialBaudMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Serial Baud")
+    field(SCAN, "Passive")
+    field(ZRST, "4800")
+    field(ONST, "9600")
+    field(TWST, "19200")
+    field(THST, "38400")
+    field(FRST, "57600")
+    field(FVST, "115200")
+    field(ZRVL, "4800")
+    field(ONVL, "9600")
+    field(TWVL, "19200")
+    field(THVL, "38400")
+    field(FRVL, "57600")
+    field(FVVL, "115200")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) RS232_BAUD")
+}
+record(mbbo,"$(P)$(R)IfaceSerialBaudMO")
+{
+    field(DESC, "Serial Baud")
+    field(SCAN, "Passive")
+    field(ZRST, "4800")
+    field(ONST, "9600")
+    field(TWST, "19200")
+    field(THST, "38400")
+    field(FRST, "57600")
+    field(FVST, "115200")
+    field(ZRVL, "4800")
+    field(ONVL, "9600")
+    field(TWVL, "19200")
+    field(THVL, "38400")
+    field(FRVL, "57600")
+    field(FVVL, "115200")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) RS232_BAUD")
+    field(FLNK, "$(P)$(R)IfaceSerialBaudMI")
+}
+
+record(bi,"$(P)$(R)IfaceGpibStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "GPIB State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) GPIB")
+}
+record(bo,"$(P)$(R)IfaceGpibStateBO")
+{
+    field(DESC, "GPIB State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) GPIB")
+    field(FLNK, "$(P)$(R)IfaceGpibStateBI")
+}
+record(longin,"$(P)$(R)IfaceGpibAddrLI")
+{
+    field(PINI, "YES")
+    field(DESC, "GPIB Address")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) GPIB_ADDRESS")
+}
+
+record(longout,"$(P)$(R)IfaceGpibAddrLO")
+{
+    field(DESC, "GPIB Address")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) GPIB_ADDRESS")
+    field(FLNK, "$(P)$(R)IfaceGpibAddrLI")
+}
+record(bi,"$(P)$(R)IfaceLanStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "LAN State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TCPIP")
+}
+record(bo,"$(P)$(R)IfaceLanStateBO")
+{
+    field(DESC, "LAN State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) TCPIP")
+    field(FLNK, "$(P)$(R)IfaceLanStateBI")
+}
+record(bi,"$(P)$(R)IfaceDhcpStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "DHCP State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) DHCP")
+}
+record(bo,"$(P)$(R)IfaceDhcpStateBO")
+{
+    field(DESC, "DHCP State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) DHCP")
+    field(FLNK, "$(P)$(R)IfaceDhcpStateBI")
+}
+record(bi,"$(P)$(R)IfaceAutoIpStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Auto-IP State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) AUTO_IP")
+}
+record(bo,"$(P)$(R)IfaceAutoIpStateBO")
+{
+    field(DESC, "Auto-IP State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) AUTO_IP")
+    field(FLNK, "$(P)$(R)IfaceAutoIpStateBI")
+}
+record(bi,"$(P)$(R)IfaceStaticIpStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Static IP State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) STATIC_IP")
+}
+record(bo,"$(P)$(R)IfaceStaticIpStateBO")
+{
+    field(DESC, "Static IP State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) STATIC_IP")
+    field(FLNK, "$(P)$(R)IfaceStaticIpStateBI")
+}
+record(bi,"$(P)$(R)IfaceBareSocketStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Bare Socket State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) BARE_SOCKET")
+}
+record(bo,"$(P)$(R)IfaceBareSocketStateBO")
+{
+    field(DESC, "Bare Socket State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) BARE_SOCKET")
+    field(FLNK, "$(P)$(R)IfaceBareSocketStateBI")
+}
+record(bi,"$(P)$(R)IfaceTelnetStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Telnet State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) TELNET")
+}
+record(bo,"$(P)$(R)IfaceTelnetStateBO")
+{
+    field(DESC, "Telnet State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) TELNET")
+    field(FLNK, "$(P)$(R)IfaceTelnetStateBI")
+}
+record(bi,"$(P)$(R)IfaceVxiStateBI")
+{
+    field(PINI, "YES")
+    field(DESC, "VXI-11 State")
+    field(SCAN, "Passive")
+    field(ZNAM, "Disabled")
+    field(ONAM, "Enabled")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) VXI11")
+}
+record(bo,"$(P)$(R)IfaceVxiStateBO")
+{
+    field(DESC, "VXI-11 State")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(OUT,  "@asyn($(PORT)) VXI11")
+    field(FLNK, "$(P)$(R)IfaceVxiStateBI")
+}
+record(stringin,"$(P)$(R)IfaceIpAddrSI")
+{
+    field(PINI, "YES")
+    field(DESC, "IP Address")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT)) IP_ADDRESS")
+}
+record(stringout,"$(P)$(R)IfaceIpAddrSO")
+{
+    field(DESC, "IP Address")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT)) IP_ADDRESS")
+    field(FLNK, "$(P)$(R)IfaceIpAddrSI")
+}
+record(stringin,"$(P)$(R)IfaceNetMaskSI")
+{
+    field(PINI, "YES")
+    field(DESC, "Network Mask")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT)) NET_MASK")
+}
+record(stringout,"$(P)$(R)IfaceNetMaskSO")
+{
+    field(DESC, "Network Mask")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT)) NET_MASK")
+    field(FLNK, "$(P)$(R)IfaceNetMaskSI")
+}
+record(stringin,"$(P)$(R)IfaceGatewaySI")
+{
+    field(PINI, "YES")
+    field(DESC, "Gateway Address")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT)) GATEWAY")
+}
+record(stringout,"$(P)$(R)IfaceGatewaySO")
+{
+    field(DESC, "Gateway Address")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT)) GATEWAY")
+    field(FLNK, "$(P)$(R)IfaceGatewaySI")
+}
+record(bo,"$(P)$(R)IfaceSerialResetBO")
+{
+    field(DESC, "Serial Reset")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) RS232_RESET")
+}
+record(bo,"$(P)$(R)IfaceGpibResetBO")
+{
+    field(DESC, "GPIB Reset")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) GPIB_RESET")
+}
+record(bo,"$(P)$(R)IfaceLanResetBO")
+{
+    field(DESC, "LAN Reset")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) TCPIP_RESET")
+}
+record(stringin,"$(P)$(R)IfaceMacAddrSI")
+{
+    field(PINI, "YES")
+    field(DESC, "MAC Address")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT)) MAC_ADDRESS")
+}
+
+
+## Delay channel A related PVs
+record(mbbi,"$(P)$(R)AReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan A Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) A_REF")
+}
+record(mbbo,"$(P)$(R)AReferenceMO")
+{
+    field(DESC, "Chan A Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) A_REF")
+    field(FLNK, "$(P)$(R)AReferenceFO")
+}
+record(fanout,"$(P)$(R)AReferenceFO")
+{
+    field(LNK1, "$(P)$(R)AReferenceMI")
+    field(LNK2, "$(P)$(R)ADelayAI")
+}
+record(ai,"$(P)$(R)ADelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan A Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) A_DELAY")
+    field(FLNK, "$(P)$(R)ADelaySeq")
+}
+record(seq,"$(P)$(R)ADelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)ADelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)ADelayAI")
+    field(LNK2, "$(P)$(R)ADelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)ADelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)ADelayAO")
+{
+    field(DESC, "Chan A Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)ADelayWriteAO PP")
+}
+record(ao,"$(P)$(R)ADelayWriteAO")
+{
+    field(DESC, "Chan A Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) A_DELAY")
+    field(FLNK, "$(P)$(R)ADelayAI")
+}
+record(ai,"$(P)$(R)ADelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan A Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) A_DELAY_STEP")
+}
+record(ao,"$(P)$(R)ADelayTweakAO")
+{
+    field(DESC, "Chan A Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) A_DELAY_STEP")
+    field(FLNK, "$(P)$(R)ADelayTweakAI")
+}
+record(bo,"$(P)$(R)ADelayTweakIncBO")
+{
+    field(DESC, "Chan A Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) A_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)ADelayAI")
+}
+record(bo,"$(P)$(R)ADelayTweakDecBO")
+{
+    field(DESC, "Chan A Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) A_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)ADelayAI")
+}
+
+## Delay channel B related PVs
+record(mbbi,"$(P)$(R)BReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan B Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) B_REF")
+}
+record(mbbo,"$(P)$(R)BReferenceMO")
+{
+    field(DESC, "Chan B Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) B_REF")
+    field(FLNK, "$(P)$(R)BReferenceFO")
+}
+record(fanout,"$(P)$(R)BReferenceFO")
+{
+    field(LNK1, "$(P)$(R)BReferenceMI")
+    field(LNK2, "$(P)$(R)BDelayAI")
+}
+record(ai,"$(P)$(R)BDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan B Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) B_DELAY")
+    field(FLNK, "$(P)$(R)BDelaySeq")
+}
+record(seq,"$(P)$(R)BDelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)BDelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)BDelayAI")
+    field(LNK2, "$(P)$(R)BDelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)BDelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)BDelayAO")
+{
+    field(DESC, "Chan B Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)BDelayWriteAO PP")
+}
+record(ao,"$(P)$(R)BDelayWriteAO")
+{
+    field(DESC, "Chan B Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) B_DELAY")
+    field(FLNK, "$(P)$(R)BDelayAI")
+}
+record(ai,"$(P)$(R)BDelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan B Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) B_DELAY_STEP")
+}
+record(ao,"$(P)$(R)BDelayTweakAO")
+{
+    field(DESC, "Chan B Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) B_DELAY_STEP")
+    field(FLNK, "$(P)$(R)BDelayTweakAI")
+}
+record(bo,"$(P)$(R)BDelayTweakIncBO")
+{
+    field(DESC, "Chan B Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) B_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)BDelayAI")
+}
+record(bo,"$(P)$(R)BDelayTweakDecBO")
+{
+    field(DESC, "Chan B Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) B_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)BDelayAI")
+}
+
+## Delay channel C related PVs
+record(mbbi,"$(P)$(R)CReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan C Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) C_REF")
+}
+record(mbbo,"$(P)$(R)CReferenceMO")
+{
+    field(DESC, "Chan C Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) C_REF")
+    field(FLNK, "$(P)$(R)CReferenceFO")
+}
+record(fanout,"$(P)$(R)CReferenceFO")
+{
+    field(LNK1, "$(P)$(R)CReferenceMI")
+    field(LNK2, "$(P)$(R)CDelayAI")
+}
+record(ai,"$(P)$(R)CDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan C Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) C_DELAY")
+    field(FLNK, "$(P)$(R)CDelaySeq")
+}
+record(seq,"$(P)$(R)CDelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)CDelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)CDelayAI")
+    field(LNK2, "$(P)$(R)CDelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)CDelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)CDelayAO")
+{
+    field(DESC, "Chan C Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)CDelayWriteAO PP")
+}
+record(ao,"$(P)$(R)CDelayWriteAO")
+{
+    field(DESC, "Chan C Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) C_DELAY")
+    field(FLNK, "$(P)$(R)CDelayAI")
+}
+record(ai,"$(P)$(R)CDelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan C Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) C_DELAY_STEP")
+}
+record(ao,"$(P)$(R)CDelayTweakAO")
+{
+    field(DESC, "Chan C Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) C_DELAY_STEP")
+    field(FLNK, "$(P)$(R)CDelayTweakAI")
+}
+record(bo,"$(P)$(R)CDelayTweakIncBO")
+{
+    field(DESC, "Chan C Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) C_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)CDelayAI")
+}
+record(bo,"$(P)$(R)CDelayTweakDecBO")
+{
+    field(DESC, "Chan C Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) C_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)CDelayAI")
+}
+
+## Delay channel D related PVs
+record(mbbi,"$(P)$(R)DReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan D Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) D_REF")
+}
+record(mbbo,"$(P)$(R)DReferenceMO")
+{
+    field(DESC, "Chan D Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) D_REF")
+    field(FLNK, "$(P)$(R)DReferenceFO")
+}
+record(fanout,"$(P)$(R)DReferenceFO")
+{
+    field(LNK1, "$(P)$(R)DReferenceMI")
+    field(LNK2, "$(P)$(R)DDelayAI")
+}
+record(ai,"$(P)$(R)DDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan D Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) D_DELAY")
+    field(FLNK, "$(P)$(R)DDelaySeq")
+}
+record(seq,"$(P)$(R)DDelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)DDelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)DDelayAI")
+    field(LNK2, "$(P)$(R)DDelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)DDelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)DDelayAO")
+{
+    field(DESC, "Chan D Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)DDelayWriteAO PP")
+}
+record(ao,"$(P)$(R)DDelayWriteAO")
+{
+    field(DESC, "Chan D Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) D_DELAY")
+    field(FLNK, "$(P)$(R)DDelayAI")
+}
+record(ai,"$(P)$(R)DDelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan D Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) D_DELAY_STEP")
+}
+record(ao,"$(P)$(R)DDelayTweakAO")
+{
+    field(DESC, "Chan D Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) D_DELAY_STEP")
+    field(FLNK, "$(P)$(R)DDelayTweakAI")
+}
+record(bo,"$(P)$(R)DDelayTweakIncBO")
+{
+    field(DESC, "Chan D Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) D_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)DDelayAI")
+}
+record(bo,"$(P)$(R)DDelayTweakDecBO")
+{
+    field(DESC, "Chan D Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) D_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)DDelayAI")
+}
+
+## Delay channel E related PVs
+record(mbbi,"$(P)$(R)EReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan E Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) E_REF")
+}
+record(mbbo,"$(P)$(R)EReferenceMO")
+{
+    field(DESC, "Chan E Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) E_REF")
+    field(FLNK, "$(P)$(R)EReferenceFO")
+}
+record(fanout,"$(P)$(R)EReferenceFO")
+{
+    field(LNK1, "$(P)$(R)EReferenceMI")
+    field(LNK2, "$(P)$(R)EDelayAI")
+}
+record(ai,"$(P)$(R)EDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan E Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) E_DELAY")
+    field(FLNK, "$(P)$(R)EDelaySeq")
+}
+record(seq,"$(P)$(R)EDelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)EDelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)EDelayAI")
+    field(LNK2, "$(P)$(R)EDelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)EDelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)EDelayAO")
+{
+    field(DESC, "Chan E Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)EDelayWriteAO PP")
+}
+record(ao,"$(P)$(R)EDelayWriteAO")
+{
+    field(DESC, "Chan E Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) E_DELAY")
+    field(FLNK, "$(P)$(R)EDelayAI")
+}
+record(ai,"$(P)$(R)EDelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan E Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) E_DELAY_STEP")
+}
+record(ao,"$(P)$(R)EDelayTweakAO")
+{
+    field(DESC, "Chan E Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) E_DELAY_STEP")
+    field(FLNK, "$(P)$(R)EDelayTweakAI")
+}
+record(bo,"$(P)$(R)EDelayTweakIncBO")
+{
+    field(DESC, "Chan E Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) E_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)EDelayAI")
+}
+record(bo,"$(P)$(R)EDelayTweakDecBO")
+{
+    field(DESC, "Chan E Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) E_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)EDelayAI")
+}
+
+## Delay channel F related PVs
+record(mbbi,"$(P)$(R)FReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan F Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) F_REF")
+}
+record(mbbo,"$(P)$(R)FReferenceMO")
+{
+    field(DESC, "Chan F Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) F_REF")
+    field(FLNK, "$(P)$(R)FReferenceFO")
+}
+record(fanout,"$(P)$(R)FReferenceFO")
+{
+    field(LNK1, "$(P)$(R)FReferenceMI")
+    field(LNK2, "$(P)$(R)FDelayAI")
+}
+record(ai,"$(P)$(R)FDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan F Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) F_DELAY")
+    field(FLNK, "$(P)$(R)FDelaySeq")
+}
+record(seq,"$(P)$(R)FDelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)FDelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)FDelayAI")
+    field(LNK2, "$(P)$(R)FDelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)FDelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)FDelayAO")
+{
+    field(DESC, "Chan F Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)FDelayWriteAO PP")
+}
+record(ao,"$(P)$(R)FDelayWriteAO")
+{
+    field(DESC, "Chan F Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) F_DELAY")
+    field(FLNK, "$(P)$(R)FDelayAI")
+}
+record(ai,"$(P)$(R)FDelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan F Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) F_DELAY_STEP")
+}
+record(ao,"$(P)$(R)FDelayTweakAO")
+{
+    field(DESC, "Chan F Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) F_DELAY_STEP")
+    field(FLNK, "$(P)$(R)FDelayTweakAI")
+}
+record(bo,"$(P)$(R)FDelayTweakIncBO")
+{
+    field(DESC, "Chan F Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) F_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)FDelayAI")
+}
+record(bo,"$(P)$(R)FDelayTweakDecBO")
+{
+    field(DESC, "Chan F Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) F_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)FDelayAI")
+}
+
+## Delay channel G related PVs
+record(mbbi,"$(P)$(R)GReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan G Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) G_REF")
+}
+record(mbbo,"$(P)$(R)GReferenceMO")
+{
+    field(DESC, "Chan G Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) G_REF")
+    field(FLNK, "$(P)$(R)GReferenceFO")
+}
+record(fanout,"$(P)$(R)GReferenceFO")
+{
+    field(LNK1, "$(P)$(R)GReferenceMI")
+    field(LNK2, "$(P)$(R)GDelayAI")
+}
+record(ai,"$(P)$(R)GDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan G Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) G_DELAY")
+    field(FLNK, "$(P)$(R)GDelaySeq")
+}
+record(seq,"$(P)$(R)GDelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)GDelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)GDelayAI")
+    field(LNK2, "$(P)$(R)GDelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)GDelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)GDelayAO")
+{
+    field(DESC, "Chan G Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)GDelayWriteAO PP")
+}
+record(ao,"$(P)$(R)GDelayWriteAO")
+{
+    field(DESC, "Chan G Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) G_DELAY")
+    field(FLNK, "$(P)$(R)GDelayAI")
+}
+record(ai,"$(P)$(R)GDelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan G Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) G_DELAY_STEP")
+}
+record(ao,"$(P)$(R)GDelayTweakAO")
+{
+    field(DESC, "Chan G Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) G_DELAY_STEP")
+    field(FLNK, "$(P)$(R)GDelayTweakAI")
+}
+record(bo,"$(P)$(R)GDelayTweakIncBO")
+{
+    field(DESC, "Chan G Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) G_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)GDelayAI")
+}
+record(bo,"$(P)$(R)GDelayTweakDecBO")
+{
+    field(DESC, "Chan G Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) G_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)GDelayAI")
+}
+
+## Delay channel H related PVs
+record(mbbi,"$(P)$(R)HReferenceMI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan H Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) H_REF")
+}
+record(mbbo,"$(P)$(R)HReferenceMO")
+{
+    field(DESC, "Chan H Ref")
+    field(SCAN, "Passive")
+    field(ZRST, "T0")
+    field(ONST, "A")
+    field(TWST, "B")
+    field(THST, "C")
+    field(FRST, "D")
+    field(FVST, "E")
+    field(SXST, "F")
+    field(SVST, "G")
+    field(EIST, "H")
+    field(ZRVL, "0")
+    field(ONVL, "2")
+    field(TWVL, "3")
+    field(THVL, "4")
+    field(FRVL, "5")
+    field(FVVL, "6")
+    field(SXVL, "7")
+    field(SVVL, "8")
+    field(EIVL, "9")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) H_REF")
+    field(FLNK, "$(P)$(R)HReferenceFO")
+}
+record(fanout,"$(P)$(R)HReferenceFO")
+{
+    field(LNK1, "$(P)$(R)HReferenceMI")
+    field(LNK2, "$(P)$(R)HDelayAI")
+}
+record(ai,"$(P)$(R)HDelayAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan H Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) H_DELAY")
+    field(FLNK, "$(P)$(R)HDelaySeq")
+}
+record(seq,"$(P)$(R)HDelaySeq")
+{
+    field(DOL1, "1")
+    field(LNK1, "$(P)$(R)HDelayWriteAO.DISA")
+    field(DOL2, "$(P)$(R)HDelayAI")
+    field(LNK2, "$(P)$(R)HDelayAO PP")
+    field(DOL3, "0")
+    field(LNK3, "$(P)$(R)HDelayWriteAO.DISA")
+}
+record(ao,"$(P)$(R)HDelayAO")
+{
+    field(DESC, "Chan H Delay")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(OUT,  "$(P)$(R)HDelayWriteAO PP")
+}
+record(ao,"$(P)$(R)HDelayWriteAO")
+{
+    field(DESC, "Chan H Delay Writer")
+    field(DISV, "1")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) H_DELAY")
+    field(FLNK, "$(P)$(R)HDelayAI")
+}
+record(ai,"$(P)$(R)HDelayTweakAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Chan H Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) H_DELAY_STEP")
+}
+record(ao,"$(P)$(R)HDelayTweakAO")
+{
+    field(DESC, "Chan H Delay Tweak")
+    field(PREC, "12")
+    field(EGU,  "Sec")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) H_DELAY_STEP")
+    field(FLNK, "$(P)$(R)HDelayTweakAI")
+}
+record(bo,"$(P)$(R)HDelayTweakIncBO")
+{
+    field(DESC, "Chan H Delay Tweak Inc")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) H_DELAY_STEP_POS")
+    field(FLNK, "$(P)$(R)HDelayAI")
+}
+record(bo,"$(P)$(R)HDelayTweakDecBO")
+{
+    field(DESC, "Chan H Delay Tweak Dec")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT)) H_DELAY_STEP_NEG")
+    field(FLNK, "$(P)$(R)HDelayAI")
+}
+
+
+## T0 output related PVs
+record(ai,"$(P)$(R)T0OutputAmpAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Amplitude")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) T0_AMP")
+}
+record(ao,"$(P)$(R)T0OutputAmpAO")
+{
+    field(DESC, "Output Amplitude")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) T0_AMP")
+    field(FLNK, "$(P)$(R)T0OutputAmpAI")
+}
+record(calcout,"$(P)$(R)T0OutputAmpTweakIncCO")
+{
+    field(DESC, "Output Amplitude Inc")
+    field(INPA, "$(P)$(R)T0OutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)T0OutputAmpTweakAO NPP NMS")
+    field(CALC, "(A+B)<=5.00?(A+B):0")
+    field(OUT,  "$(P)$(R)T0OutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)T0OutputAmpTweakDecCO")
+{
+    field(DESC, "Output Amplitude Dec")
+    field(INPA, "$(P)$(R)T0OutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)T0OutputAmpTweakAO NPP NMS")
+    field(CALC, "(A-B)>=0.50?(A-B):0")
+    field(OUT,  "$(P)$(R)T0OutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)T0OutputAmpTweakAO")
+{
+    field(DESC, "Output Amplitude Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ai,"$(P)$(R)T0OutputOffsetAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Offset")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) T0_OFFSET")
+}
+record(ao,"$(P)$(R)T0OutputOffsetAO")
+{
+    field(DESC, "Output Offset")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) T0_OFFSET")
+    field(FLNK, "$(P)$(R)T0OutputOffsetAI")
+}
+record(calcout,"$(P)$(R)T0OutputOffsetTweakIncCO")
+{
+    field(DESC, "Output Offset Inc")
+    field(INPA, "$(P)$(R)T0OutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)T0OutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A+B)<=2.00?(A+B):0")
+    field(OUT,  "$(P)$(R)T0OutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)T0OutputOffsetTweakDecCO")
+{
+    field(DESC, "Output Offset Dec")
+    field(INPA, "$(P)$(R)T0OutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)T0OutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A-B)>=-2.00?(A-B):0")
+    field(OUT,  "$(P)$(R)T0OutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)T0OutputOffsetTweakAO")
+{
+    field(DESC, "Output Offset Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(bi,"$(P)$(R)T0OutputPolarityBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Polarity")
+    field(SCAN, "Passive")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) T0_POLARITY")
+}
+record(bo,"$(P)$(R)T0OutputPolarityBO")
+{
+    field(DESC, "Status Clear")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(OUT,  "@asyn($(PORT)) T0_POLARITY")
+    field(FLNK, "$(P)$(R)T0OutputPolarityBI")
+}
+record(seq,"$(P)$(R)T0OutputModeTtlSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)T0OutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)T0OutputOffsetAO PP NMS")
+    field(DO1,  "4.00")
+    field(DO2,  "0.00")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+record(seq,"$(P)$(R)T0OutputModeNimSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)T0OutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)T0OutputOffsetAO PP NMS")
+    field(DO1,  "0.80")
+    field(DO2,  "-0.80")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+## AB output related PVs
+record(ai,"$(P)$(R)ABOutputAmpAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Amplitude")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) AB_AMP")
+}
+record(ao,"$(P)$(R)ABOutputAmpAO")
+{
+    field(DESC, "Output Amplitude")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) AB_AMP")
+    field(FLNK, "$(P)$(R)ABOutputAmpAI")
+}
+record(calcout,"$(P)$(R)ABOutputAmpTweakIncCO")
+{
+    field(DESC, "Output Amplitude Inc")
+    field(INPA, "$(P)$(R)ABOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)ABOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A+B)<=5.00?(A+B):0")
+    field(OUT,  "$(P)$(R)ABOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)ABOutputAmpTweakDecCO")
+{
+    field(DESC, "Output Amplitude Dec")
+    field(INPA, "$(P)$(R)ABOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)ABOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A-B)>=0.50?(A-B):0")
+    field(OUT,  "$(P)$(R)ABOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)ABOutputAmpTweakAO")
+{
+    field(DESC, "Output Amplitude Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ai,"$(P)$(R)ABOutputOffsetAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Offset")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) AB_OFFSET")
+}
+record(ao,"$(P)$(R)ABOutputOffsetAO")
+{
+    field(DESC, "Output Offset")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) AB_OFFSET")
+    field(FLNK, "$(P)$(R)ABOutputOffsetAI")
+}
+record(calcout,"$(P)$(R)ABOutputOffsetTweakIncCO")
+{
+    field(DESC, "Output Offset Inc")
+    field(INPA, "$(P)$(R)ABOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)ABOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A+B)<=2.00?(A+B):0")
+    field(OUT,  "$(P)$(R)ABOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)ABOutputOffsetTweakDecCO")
+{
+    field(DESC, "Output Offset Dec")
+    field(INPA, "$(P)$(R)ABOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)ABOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A-B)>=-2.00?(A-B):0")
+    field(OUT,  "$(P)$(R)ABOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)ABOutputOffsetTweakAO")
+{
+    field(DESC, "Output Offset Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(bi,"$(P)$(R)ABOutputPolarityBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Polarity")
+    field(SCAN, "Passive")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) AB_POLARITY")
+}
+record(bo,"$(P)$(R)ABOutputPolarityBO")
+{
+    field(DESC, "Status Clear")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(OUT,  "@asyn($(PORT)) AB_POLARITY")
+    field(FLNK, "$(P)$(R)ABOutputPolarityBI")
+}
+record(seq,"$(P)$(R)ABOutputModeTtlSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)ABOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)ABOutputOffsetAO PP NMS")
+    field(DO1,  "4.00")
+    field(DO2,  "0.00")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+record(seq,"$(P)$(R)ABOutputModeNimSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)ABOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)ABOutputOffsetAO PP NMS")
+    field(DO1,  "0.80")
+    field(DO2,  "-0.80")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+## CD output related PVs
+record(ai,"$(P)$(R)CDOutputAmpAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Amplitude")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) CD_AMP")
+}
+record(ao,"$(P)$(R)CDOutputAmpAO")
+{
+    field(DESC, "Output Amplitude")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) CD_AMP")
+    field(FLNK, "$(P)$(R)CDOutputAmpAI")
+}
+record(calcout,"$(P)$(R)CDOutputAmpTweakIncCO")
+{
+    field(DESC, "Output Amplitude Inc")
+    field(INPA, "$(P)$(R)CDOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)CDOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A+B)<=5.00?(A+B):0")
+    field(OUT,  "$(P)$(R)CDOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)CDOutputAmpTweakDecCO")
+{
+    field(DESC, "Output Amplitude Dec")
+    field(INPA, "$(P)$(R)CDOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)CDOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A-B)>=0.50?(A-B):0")
+    field(OUT,  "$(P)$(R)CDOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)CDOutputAmpTweakAO")
+{
+    field(DESC, "Output Amplitude Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ai,"$(P)$(R)CDOutputOffsetAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Offset")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) CD_OFFSET")
+}
+record(ao,"$(P)$(R)CDOutputOffsetAO")
+{
+    field(DESC, "Output Offset")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) CD_OFFSET")
+    field(FLNK, "$(P)$(R)CDOutputOffsetAI")
+}
+record(calcout,"$(P)$(R)CDOutputOffsetTweakIncCO")
+{
+    field(DESC, "Output Offset Inc")
+    field(INPA, "$(P)$(R)CDOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)CDOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A+B)<=2.00?(A+B):0")
+    field(OUT,  "$(P)$(R)CDOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)CDOutputOffsetTweakDecCO")
+{
+    field(DESC, "Output Offset Dec")
+    field(INPA, "$(P)$(R)CDOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)CDOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A-B)>=-2.00?(A-B):0")
+    field(OUT,  "$(P)$(R)CDOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)CDOutputOffsetTweakAO")
+{
+    field(DESC, "Output Offset Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(bi,"$(P)$(R)CDOutputPolarityBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Polarity")
+    field(SCAN, "Passive")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) CD_POLARITY")
+}
+record(bo,"$(P)$(R)CDOutputPolarityBO")
+{
+    field(DESC, "Status Clear")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(OUT,  "@asyn($(PORT)) CD_POLARITY")
+    field(FLNK, "$(P)$(R)CDOutputPolarityBI")
+}
+record(seq,"$(P)$(R)CDOutputModeTtlSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)CDOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)CDOutputOffsetAO PP NMS")
+    field(DO1,  "4.00")
+    field(DO2,  "0.00")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+record(seq,"$(P)$(R)CDOutputModeNimSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)CDOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)CDOutputOffsetAO PP NMS")
+    field(DO1,  "0.80")
+    field(DO2,  "-0.80")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+## EF output related PVs
+record(ai,"$(P)$(R)EFOutputAmpAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Amplitude")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) EF_AMP")
+}
+record(ao,"$(P)$(R)EFOutputAmpAO")
+{
+    field(DESC, "Output Amplitude")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) EF_AMP")
+    field(FLNK, "$(P)$(R)EFOutputAmpAI")
+}
+record(calcout,"$(P)$(R)EFOutputAmpTweakIncCO")
+{
+    field(DESC, "Output Amplitude Inc")
+    field(INPA, "$(P)$(R)EFOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)EFOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A+B)<=5.00?(A+B):0")
+    field(OUT,  "$(P)$(R)EFOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)EFOutputAmpTweakDecCO")
+{
+    field(DESC, "Output Amplitude Dec")
+    field(INPA, "$(P)$(R)EFOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)EFOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A-B)>=0.50?(A-B):0")
+    field(OUT,  "$(P)$(R)EFOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)EFOutputAmpTweakAO")
+{
+    field(DESC, "Output Amplitude Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ai,"$(P)$(R)EFOutputOffsetAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Offset")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) EF_OFFSET")
+}
+record(ao,"$(P)$(R)EFOutputOffsetAO")
+{
+    field(DESC, "Output Offset")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) EF_OFFSET")
+    field(FLNK, "$(P)$(R)EFOutputOffsetAI")
+}
+record(calcout,"$(P)$(R)EFOutputOffsetTweakIncCO")
+{
+    field(DESC, "Output Offset Inc")
+    field(INPA, "$(P)$(R)EFOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)EFOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A+B)<=2.00?(A+B):0")
+    field(OUT,  "$(P)$(R)EFOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)EFOutputOffsetTweakDecCO")
+{
+    field(DESC, "Output Offset Dec")
+    field(INPA, "$(P)$(R)EFOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)EFOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A-B)>=-2.00?(A-B):0")
+    field(OUT,  "$(P)$(R)EFOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)EFOutputOffsetTweakAO")
+{
+    field(DESC, "Output Offset Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(bi,"$(P)$(R)EFOutputPolarityBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Polarity")
+    field(SCAN, "Passive")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) EF_POLARITY")
+}
+record(bo,"$(P)$(R)EFOutputPolarityBO")
+{
+    field(DESC, "Status Clear")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(OUT,  "@asyn($(PORT)) EF_POLARITY")
+    field(FLNK, "$(P)$(R)EFOutputPolarityBI")
+}
+record(seq,"$(P)$(R)EFOutputModeTtlSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)EFOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)EFOutputOffsetAO PP NMS")
+    field(DO1,  "4.00")
+    field(DO2,  "0.00")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+record(seq,"$(P)$(R)EFOutputModeNimSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)EFOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)EFOutputOffsetAO PP NMS")
+    field(DO1,  "0.80")
+    field(DO2,  "-0.80")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+## GH output related PVs
+record(ai,"$(P)$(R)GHOutputAmpAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Amplitude")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) GH_AMP")
+}
+record(ao,"$(P)$(R)GHOutputAmpAO")
+{
+    field(DESC, "Output Amplitude")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) GH_AMP")
+    field(FLNK, "$(P)$(R)GHOutputAmpAI")
+}
+record(calcout,"$(P)$(R)GHOutputAmpTweakIncCO")
+{
+    field(DESC, "Output Amplitude Inc")
+    field(INPA, "$(P)$(R)GHOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)GHOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A+B)<=5.00?(A+B):0")
+    field(OUT,  "$(P)$(R)GHOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)GHOutputAmpTweakDecCO")
+{
+    field(DESC, "Output Amplitude Dec")
+    field(INPA, "$(P)$(R)GHOutputAmpAO NPP NMS")
+    field(INPB, "$(P)$(R)GHOutputAmpTweakAO NPP NMS")
+    field(CALC, "(A-B)>=0.50?(A-B):0")
+    field(OUT,  "$(P)$(R)GHOutputAmpAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)GHOutputAmpTweakAO")
+{
+    field(DESC, "Output Amplitude Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ai,"$(P)$(R)GHOutputOffsetAI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Offset")
+    field(SCAN, "Passive")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT)) GH_OFFSET")
+}
+record(ao,"$(P)$(R)GHOutputOffsetAO")
+{
+    field(DESC, "Output Offset")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT)) GH_OFFSET")
+    field(FLNK, "$(P)$(R)GHOutputOffsetAI")
+}
+record(calcout,"$(P)$(R)GHOutputOffsetTweakIncCO")
+{
+    field(DESC, "Output Offset Inc")
+    field(INPA, "$(P)$(R)GHOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)GHOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A+B)<=2.00?(A+B):0")
+    field(OUT,  "$(P)$(R)GHOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(calcout,"$(P)$(R)GHOutputOffsetTweakDecCO")
+{
+    field(DESC, "Output Offset Dec")
+    field(INPA, "$(P)$(R)GHOutputOffsetAO NPP NMS")
+    field(INPB, "$(P)$(R)GHOutputOffsetTweakAO NPP NMS")
+    field(CALC, "(A-B)>=-2.00?(A-B):0")
+    field(OUT,  "$(P)$(R)GHOutputOffsetAO PP NMS")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(ao,"$(P)$(R)GHOutputOffsetTweakAO")
+{
+    field(DESC, "Output Offset Tweak")
+    field(PREC, "2")
+    field(EGU,  "Volt")
+}
+record(bi,"$(P)$(R)GHOutputPolarityBI")
+{
+    field(PINI, "YES")
+    field(DESC, "Output Polarity")
+    field(SCAN, "Passive")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT)) GH_POLARITY")
+}
+record(bo,"$(P)$(R)GHOutputPolarityBO")
+{
+    field(DESC, "Status Clear")
+    field(DTYP, "asynInt32")
+    field(ZNAM, "NEG")
+    field(ONAM, "POS")
+    field(OUT,  "@asyn($(PORT)) GH_POLARITY")
+    field(FLNK, "$(P)$(R)GHOutputPolarityBI")
+}
+record(seq,"$(P)$(R)GHOutputModeTtlSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)GHOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)GHOutputOffsetAO PP NMS")
+    field(DO1,  "4.00")
+    field(DO2,  "0.00")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}
+record(seq,"$(P)$(R)GHOutputModeNimSS")
+{
+    field(DESC, "Output Mode")
+    field(SCAN, "Passive")
+    field(LNK1, "$(P)$(R)GHOutputAmpAO PP NMS")
+    field(LNK2, "$(P)$(R)GHOutputOffsetAO PP NMS")
+    field(DO1,  "0.80")
+    field(DO2,  "-0.80")
+    field(DLY1, "0")
+    field(DLY2, "0")
+}

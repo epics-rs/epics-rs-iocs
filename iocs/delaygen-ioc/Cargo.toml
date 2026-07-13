@@ -1,0 +1,11 @@
+[package]
+name = "delaygen-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+delaygen = { path = "../../drivers/delaygen" }
+epics-rs = { workspace = true, features = ["asyn", "bridge"] }
+asyn-rs = { workspace = true, features = ["epics"] }
+tokio = { version = "1", features = ["full"] }

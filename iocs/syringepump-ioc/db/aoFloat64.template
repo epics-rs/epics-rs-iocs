@@ -1,0 +1,10 @@
+# Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/aoFloat64.template.
+# See aiFloat64.template's header comment for why this is a local copy
+# rather than a `$(MODBUS)`-macro reference.
+record(ao, "$(P)$(R)") {
+    field(DTYP,"asynFloat64")
+    field(OUT,"@asyn($(PORT) $(OFFSET))$(DATA_TYPE)")
+    field(HOPR,"$(HOPR=0)")
+    field(LOPR,"$(LOPR=0)")
+    field(PREC,"$(PREC=0)")
+}

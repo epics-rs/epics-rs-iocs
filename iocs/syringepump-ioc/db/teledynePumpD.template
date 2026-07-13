@@ -1,0 +1,273 @@
+# Ported from upstream `SPApp/Db/teledynePumpD.template` (StreamDevice
+# `field(DTYP,"stream")` + `@teled_d.proto <command>(...)` links) to asyn
+# Int32/Float64/Octet device support against `syringepump`'s
+# `TeledyneDriver` (`Family::D`, see `syringepump::driver`). PV names and
+# instantiation macros ($(P), $(PUMP), $(s), $(ta), $(ss)) are unchanged
+# from upstream -- only DTYP/INP/OUT wiring changed, from a StreamDevice
+# protocol call to `@asyn($(PORT),<addr>) <CommandName>`.
+#
+# Upstream unit ($(u=6)) is no longer a per-link macro: `TeledyneDInit`
+# fixes it once per driver instance (mirrors a real RS-485 controller's
+# fixed unit-number DIP switch -- see `TeledyneDriver::unit`'s doc).
+#
+# ---------------------------------------------------------------------
+# Fixed (upstream defect, unambiguous in-file target -- naming-scheme
+# typo, not a missing symbol; repointed per explicit approval):
+#   1. PressSeq/MaxFlowSeq's LNK2 (upstream teledynePumpD.template:83,104)
+#      read "$(s):$(ta):$(ss):Run.PROC CA" -- never defined under that
+#      scheme in this file. The Run record this file actually defines is
+#      "$(P)$(PUMP)Run" (below). Repointed to it.
+#   2. PressSeq's DOL3 (upstream teledynePumpD.template:85) read
+#      "$(s):$(ta):$(ss):PressSet" -- never defined. The record actually
+#      wired to setPress/PressSend is "$(P)$(PUMP)PressureSP" (below).
+#      Repointed to it.
+#   Both defects broke D's PressSeq/MaxFlowSeq orchestration (Remote ->
+#   Run -> send-setpoint never actually fired Run or read a real
+#   setpoint). H-series does not share this defect (its Run/PressSet
+#   consistently use the $(s):$(ta):$(ss) scheme upstream).
+#
+# Removed upstream defect (doc/upstream-c-defects.md #38, both D and H):
+# AlarmI.INPA referenced "$(s):$(ta):$(ss):BDetStatus", never defined
+# anywhere in the module -- no in-file target exists to repoint to, so
+# the dangling INPA link is removed. AlarmI itself stays: INPB/INPC/INPD
+# (Vol/Pressure/Flow .SEVR, all real links) keep it functional, so the
+# record is not removed, only the dead term. PV-surface change: CALC's
+# "(A==3)||" leading disjunct is dropped (A defaulted to 0 with INPA
+# unlinked, so this term was already always-false; behavior is
+# unchanged, only the dead input link and its no-op CALC term are gone).
+#
+# Removed upstream defect (doc/upstream-c-defects.md #41): the
+# FlowRateTweak/FlowRateTweakDown/FlowRateTweakUp block referenced
+# "$(P)$(PUMP)FlowRateSP", never defined anywhere in this file (D's real
+# flow setpoint record is "$(s):$(ta):$(ss):MaxFlow", a different
+# scheme). The block was permanently non-functional and had no in-file
+# target to repoint to, so it was removed. See where it used to sit
+# (before RefillRateTweak below) for the PV-surface-change note.
+#
+# Removed upstream defect (doc/upstream-c-defects.md #42): the
+# RefillRateTweak/RefillRateTweakDown/RefillRateTweakUp block referenced
+# "$(P)$(PUMP)RefillRateSP", never defined anywhere in this module for
+# the D family (only the sibling ISCO family's templates define a
+# same-named record -- an apparent copy-paste artifact). D-series has no
+# refill wire command at all (teled_d.proto defines none), so the block
+# had no in-file target to repoint to. See where it used to sit below
+# for the PV-surface-change note.
+#
+# UNFIXED (upstream defects preserved as-is -- no fix target exists, or
+# preservation was explicitly directed):
+#   - Every OUT/INP link below except SetRun hardcodes addr 0 (pump "A"),
+#     reproducing upstream's own `$(p=A)` hardcoding on every command but
+#     D's setRun (`$(p=$(PUMP))`) -- see `syringepump::driver` module doc.
+#
+# Deviation (not a defect-fix; substitutes a wire-protocol-derivable
+# implementation for a symbol that does not exist anywhere in the shipped
+# module source): upstream's Command/CmdProc pairing used an `aSub`
+# subroutine named "formatCmd" (SNAM) to compute a 2-hex-digit length
+# prefix client-side before writing into CmdReply -- "formatCmd" is not
+# registered or defined anywhere in SyringePump's own source tree
+# (confirmed by search). Its role is nonetheless fully specified by
+# teled_d.proto's sendCmd command envelope (a 2-hex-digit length prefix
+# ahead of the raw text), so `TeledyneDriver::write_octet` computes it
+# directly and CmdProc is dropped -- the same bytes reach the wire either
+# way. See `syringepump::driver` module doc's "SendCmd" section.
+
+# These records are for tweaking the pressure
+record(ao,"$(P)$(PUMP)PressureTweak") {
+    field(VAL, "1")
+    field(PREC,"3")
+}
+record(calcout,"$(P)$(PUMP)PressureTweakDown") {
+    field(INPA,"$(P)$(PUMP)PressureTweak.VAL NPP NMS")
+    field(INPB,"$(P)$(PUMP)PressureSP NPP NMS")
+    field(CALC,"B-A")
+    field(OUT, "$(P)$(PUMP)PressureSP PP NMS")
+}
+record(calcout,"$(P)$(PUMP)PressureTweakUp") {
+    field(INPA,"$(P)$(PUMP)PressureTweak.VAL NPP NMS")
+    field(INPB,"$(P)$(PUMP)PressureSP NPP NMS")
+    field(CALC,"B+A")
+    field(OUT, "$(P)$(PUMP)PressureSP PP NMS")
+}
+
+# Removed upstream defect (doc/upstream-c-defects.md #41): this block's
+# FlowRateTweak/FlowRateTweakDown/FlowRateTweakUp INPB/OUT referenced
+# "$(P)$(PUMP)FlowRateSP", never defined anywhere in this file or module
+# for the D family (D's real flow setpoint record is
+# "$(s):$(ta):$(ss):MaxFlow" below, a different naming scheme). The
+# entire block was permanently non-functional upstream (every write
+# through it targeted a record that does not exist) and no in-file
+# target exists to repoint to, so it is removed rather than repointed.
+# PV-surface change: "$(P)$(PUMP)FlowRateTweak",
+# "$(P)$(PUMP)FlowRateTweakDown", and "$(P)$(PUMP)FlowRateTweakUp" no
+# longer exist; none of them ever functioned.
+
+# Removed upstream defect (doc/upstream-c-defects.md #42): this block's
+# RefillRateTweak/RefillRateTweakDown/RefillRateTweakUp INPB/OUT
+# referenced "$(P)$(PUMP)RefillRateSP", never defined anywhere in this
+# module for the D family (only the sibling ISCO family's templates
+# define a same-named record -- an apparent copy-paste artifact).
+# D-series has no refill wire command at all (teled_d.proto defines
+# none), so the entire block was permanently non-functional upstream and
+# had no in-file target to repoint to; it is removed rather than
+# repointed. PV-surface change: "$(P)$(PUMP)RefillRateTweak",
+# "$(P)$(PUMP)RefillRateTweakDown", and "$(P)$(PUMP)RefillRateTweakUp"
+# no longer exist; none of them ever functioned.
+
+# Only SetRun is genuinely pump-parameterized upstream ($(p=$(PUMP)));
+# every other command below hardcodes pump "A" (addr 0). See this file's
+# header comment and `syringepump::driver`'s module doc.
+record(bo, "$(P)$(PUMP)Run") {
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT),$(ADDR)) SetRun")
+}
+record(bo, "$(s):$(ta):$(ss):Stop") {
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT),0) SetStop")
+}
+
+record(bo, "$(s):$(ta):$(ss):Remote") {
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT),0) SetRem")
+    info(autosaveFields, "VAL")
+    info(archive, "Monitor, 00:00:01, VAL")
+}
+record(bo, "$(s):$(ta):$(ss):Local") {
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT),0) SetLoc")
+}
+
+record(ao, "$(P)$(PUMP)PressureSP") {
+    field(PREC, "4")
+    field(FLNK, "$(s):$(ta):$(ss):PressSeq")
+}
+
+record(sseq, "$(s):$(ta):$(ss):PressSeq") {
+    field(LNK1, "$(s):$(ta):$(ss):Remote.PROC CA")
+    field(WAIT1, "Wait")
+    # Fixed (upstream defect, unambiguous in-file target): was
+    # "$(s):$(ta):$(ss):Run.PROC CA" (teledynePumpD.template:83), which is
+    # never defined under that scheme -- repointed to this file's actual
+    # Run record.
+    field(LNK2, "$(P)$(PUMP)Run.PROC CA")
+    field(WAIT2, "Wait")
+    # Fixed (upstream defect, unambiguous in-file target): was
+    # "$(s):$(ta):$(ss):PressSet" (teledynePumpD.template:85), never
+    # defined -- repointed to this file's actual pressure-setpoint record.
+    field(DOL3, "$(P)$(PUMP)PressureSP")
+    field(LNK3, "$(s):$(ta):$(ss):PressSend PP")
+}
+
+record(ao, "$(s):$(ta):$(ss):PressSend") {
+    field(DTYP, "asynFloat64")
+    field(EGU, "bar")
+    field(OUT, "@asyn($(PORT),0) SetPress")
+    field(PREC, "3")
+}
+
+record(ao,"$(s):$(ta):$(ss):MaxFlow") {
+    field(EGU, "ml/min")
+    field(PREC, "3")
+    field(FLNK, "$(s):$(ta):$(ss):MaxFlowSeq")
+}
+record(sseq, "$(s):$(ta):$(ss):MaxFlowSeq") {
+    field(LNK1, "$(s):$(ta):$(ss):Remote.PROC CA")
+    field(WAIT1, "Wait")
+    # Fixed (upstream defect, unambiguous in-file target): was
+    # "$(s):$(ta):$(ss):Run.PROC CA" (teledynePumpD.template:104), same
+    # defect as PressSeq's LNK2 above -- repointed the same way.
+    field(LNK2, "$(P)$(PUMP)Run.PROC CA")
+    field(WAIT2, "Wait")
+    field(DOL3, "$(s):$(ta):$(ss):MaxFlow")
+    field(LNK3, "$(s):$(ta):$(ss):MaxFlowSend PP")
+}
+record(ao,"$(s):$(ta):$(ss):MaxFlowSend") {
+    field(DTYP, "asynFloat64")
+    field(EGU, "ml/min")
+    field(OUT, "@asyn($(PORT),0) SetMFlow")
+    field(PREC, "3")
+}
+
+record(seq, "$(s):$(ta):$(ss):Scanner") {
+   field(SCAN, "1 second")
+   field(LNK1, "$(s):$(ta):$(ss):Vol.PROC PP")
+   field(DLY2, "0.1")
+   field(LNK2, "$(s):$(ta):$(ss):Pressure.PROC PP")
+   field(DLY3, "0.1")
+   field(LNK3, "$(s):$(ta):$(ss):PressSet_RBV.PROC PP")
+   field(DLY4, "0.1")
+   field(LNK4, "$(s):$(ta):$(ss):Flow.PROC PP")
+   field(DLY5, "0.1")
+   field(LNK5, "$(s):$(ta):$(ss):MaxFlow_RBV.PROC PP")
+   field(DLY6, "0.1")
+   field(LNK6, "$(s):$(ta):$(ss):Status.PROC PP")
+}
+
+record(ai, "$(s):$(ta):$(ss):Vol") {
+   field(DTYP, "asynFloat64")
+   field(INP, "@asyn($(PORT),0) GetVol")
+   field(PREC, "3")
+   info(archive, "Monitor, 00:00:01, VAL")
+}
+record(ai, "$(s):$(ta):$(ss):Pressure") {
+   field(DTYP, "asynFloat64")
+   field(INP,  "@asyn($(PORT),0) GetPress")
+   field(EGU, "bar")
+}
+record(ai,"$(s):$(ta):$(ss):PressSet_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0) GetSetPress")
+    field(EGU, "bar")
+    field(PREC, "3")
+}
+record(ai,"$(s):$(ta):$(ss):Flow") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0) GetFlow")
+    field(EGU, "ml/min")
+    field(PREC, "3")
+}
+record(ai,"$(s):$(ta):$(ss):MaxFlow_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0) GetMFlow")
+    field(EGU, "ml/min")
+    field(PREC, "3")
+}
+record(stringin, "$(s):$(ta):$(ss):Status") {
+    field(DTYP, "asynOctet")
+    field(INP,  "@asyn($(PORT),0) GetStatus")
+}
+
+# Deviation: upstream's "formatCmd" aSub subroutine does not exist
+# anywhere in the shipped module source (confirmed by search) -- its
+# role (prefixing a 2-hex-digit length ahead of the raw command text,
+# per teled_d.proto's sendCmd envelope) is computed directly by
+# `TeledyneDriver::write_octet` instead. Writing this record processes
+# CmdReply via FLNK, which re-reads the cached reply -- reproducing
+# upstream's "written to, sends the string; the reply replaces the
+# string written to it" behavior without the missing subroutine. See
+# this file's header comment and `syringepump::driver`'s module doc.
+record(stringout, "$(s):$(ta):$(ss):Command") {
+   field(DTYP, "asynOctet")
+   field(OUT, "@asyn($(PORT),0) SendCmd")
+   field(FLNK, "$(s):$(ta):$(ss):CmdReply")
+}
+
+record(waveform, "$(s):$(ta):$(ss):CmdReply") {
+   field(DTYP, "asynOctet")
+   field(INP,  "@asyn($(PORT),0) SendCmd")
+   field(FTVL, "CHAR")
+   field(NELM, "80")
+}
+
+record(calc, "$(s):$(ta):$(ss):AlarmI") {
+   field(DESC, "Immediate Alarm")
+   # Removed upstream defect (doc/upstream-c-defects.md #38): INPA
+   # referenced "$(s):$(ta):$(ss):BDetStatus", never defined anywhere in
+   # the module -- dangling link removed, CALC's "(A==3)||" term dropped
+   # with it (see this file's header comment).
+   field(INPB, "$(s):$(ta):$(ss):Vol.SEVR")
+   field(INPC, "$(s):$(ta):$(ss):Pressure.SEVR")
+   field(INPD, "$(s):$(ta):$(ss):Flow.SEVR")
+   field(CALC, "B||C||D")
+   field(HIHI, "0.5")
+   field(HHSV, "MAJOR")
+}

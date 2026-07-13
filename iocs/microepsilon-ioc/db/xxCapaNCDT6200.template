@@ -1,0 +1,804 @@
+# Ported from epics-modules/microEpsilon/capaNCDT6200Sup/Db/xxCapaNCDT6200.vdb
+# against `microepsilon::config_driver::ConfigDriver` (see that module's doc).
+# Record types, PV names, and every display field (ZRVL/ONVL/.../FFVL, DESC,
+# DRVH/DRVL, FTVL/NELM, FLNK chains) are unchanged from upstream -- only
+# DTYP/INP/OUT changed, from StreamDevice's `field(DTYP,"stream") field(INP,
+# "@capaNCDT6200.proto <cmd>($(dev)) $(Link) 0")` to a native asyn command
+# table: `field(DTYP,"asynInt32"/"asynOctet") field(INP/OUT,"@asyn($(Link),0)
+# <ReasonName>")`. mbbi/mbbo bind directly (no ground-truth/display split --
+# see `config_driver`'s "mbbi/mbbo bind directly" module doc section for why
+# that's safe: RVAL round-trips through the ZRVL/ONVL/../FFVL table on both
+# read and write, the same as real hardware-bound mbbi/mbbo).
+#
+# Fan-out flattening (approved option B): upstream's StreamDevice cross-writes
+# straight from one record's own protocol exchange into several OTHER
+# records' VAL/RVAL (e.g. `queryChanStatus`'s reply also sets
+# chan{1-4}StatM, with no `.proto` block of their own) become, in this port,
+# ordinary asyn params `ConfigDriver` populates when the triggering command's
+# reply arrives; the sink record itself binds directly to that param via
+# `SCAN="I/O Intr"`. Every record below whose upstream form had NO `DTYP`
+# field at all (a bare mbbi/longin/stringin, StreamDevice-cross-write-only)
+# is one of these sinks; every record whose upstream form had
+# `DTYP="Soft Channel"` and no `INP` is either a sink (same treatment) or,
+# for `deviceID`/`serialNum` only, a genuinely dead upstream record with no
+# writer anywhere in the module -- see the UNFIXED note below.
+#
+# UNFIXED (preserved upstream dead records, no fix target exists): `deviceID`
+# and `serialNum` are `DTYP="Soft Channel"` waveforms with no `INP` and no
+# fan-out target anywhere in `capaNCDT6200Sup.c` (grepped exhaustively).
+# `capaNCDT6200.proto` itself confirms this was a deliberately abandoned,
+# never-finished feature: `grabDeviceID`/`grabSerialNum` protocol blocks
+# exist in the file but are commented out (`.proto:8-15`), matching the
+# `%[^\r\n]` shape of the still-active `grabWelcomeText` block that feeds
+# `welcome`/`measDataM` -- the intent was clearly to wire these the same way
+# and it was never completed upstream. Ported as-is, still unbound.
+#
+# `queryChanStatus`/`queryStatus` ($CHS/$STS) are two distinct wire commands
+# that both fan out into the exact same four `chan{1-4}StatM` sinks -- not a
+# typo, reproduced verbatim (see `config_driver`'s "genuine duplicate fan-out
+# targets" module doc section).
+
+record(stringin, "$(dev):version1M") {
+  field(DESC, "VersionString1")
+  field(DTYP, "asynOctet")
+  field(INP, "@asyn($(Link),0) QueryVer")
+}
+
+record(stringin, "$(dev):version2M") {
+  field(DESC, "VersionString1")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Version2")
+}
+
+record(waveform, "$(dev):welcome") {
+  field(DESC, "Grab Welcome text")
+  field(DTYP, "asynOctet")
+  field(INP, "@asyn($(Link),0) GrabWelcomeText")
+  field(FTVL, "CHAR")
+  field(NELM, "100")
+  field(PINI, "YES")
+}
+
+# UNFIXED: dead upstream record, see this file's header comment.
+record(waveform, "$(dev):deviceID") {
+  field(DESC, "grab Device ID")
+  field(DTYP, "Soft Channel")
+  field(FTVL, "CHAR")
+  field(NELM, "100")
+}
+
+# UNFIXED: dead upstream record, see this file's header comment.
+record(waveform, "$(dev):serialNum") {
+  field(DESC, "grab serial number")
+  field(DTYP, "Soft Channel")
+  field(FTVL, "CHAR")
+  field(NELM, "100")
+}
+
+record(mbbi, "$(dev):avgTypeModeM") {
+  field(DESC, "Query Avg Type Mode")
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(Link),0) QueryAvgTypeMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(ZRST, "No Averaging")
+  field(ONST, "Moving Average")
+  field(TWST, "Arithmetic Average")
+  field(THST, "Median")
+}
+
+record(mbbo, "$(dev):avgTypeModeC") {
+  field(DESC, "Set Avg Type Mode")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetAvgTypeMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(ZRST, "No Averaging")
+  field(ONST, "Moving Average")
+  field(TWST, "Arithmetic Average")
+  field(THST, "Median")
+}
+
+record(mbbo, "$(dev):trigModeC") {
+  field(DESC, "Set Trigger Mode")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetTrigMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(ZRST, "Continuous")
+  field(ONST, "Rising Edge")
+  field(TWST, "High Level")
+  field(THST, "Gate Rising Edge")
+}
+
+record(mbbi, "$(dev):trigModeM") {
+  field(DESC, "Set Trigger Mode")
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(Link),0) QueryTrigMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(ZRST, "Continuous")
+  field(ONST, "Rising Edge")
+  field(TWST, "High Level")
+  field(THST, "Gate Rising Edge")
+}
+
+record(longout, "$(dev):avgNumModeC") {
+  field(DESC, "Set values to Avg")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetAvgNumMode")
+  field(DRVH, "8")
+  field(DRVL, "2")
+}
+
+record(longin, "$(dev):avgNumModeM") {
+  field(DESC, "Query values to Avg")
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(Link),0) QueryAvgNumMode")
+}
+
+record(mbbi, "$(dev):chan1StatM") {
+  field(DESC, "Channel 1 Status")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1Stat")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(ZRST, "not available")
+  field(ONST, "available")
+  field(TWST, "math function")
+}
+
+record(stringout, "$(dev):chanStatusM") {
+  field(DESC, "Channel Status Monitor")
+  field(DTYP, "asynOctet")
+  field(OUT, "@asyn($(Link),0) QueryChanStatus")
+}
+
+record(mbbi, "$(dev):chan2StatM") {
+  field(DESC, "Channel 2 Status")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2Stat")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(ZRST, "not available")
+  field(ONST, "available")
+  field(TWST, "math function")
+}
+
+record(mbbi, "$(dev):chan3StatM") {
+  field(DESC, "Channel 3 Status")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3Stat")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(ZRST, "not available")
+  field(ONST, "available")
+  field(TWST, "math function")
+}
+
+record(mbbi, "$(dev):chan4StatM") {
+  field(DESC, "Channel 4 Status")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4Stat")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(ZRST, "not available")
+  field(ONST, "available")
+  field(TWST, "math function")
+}
+
+record(stringout, "$(dev):linModeM") {
+  field(DESC, "Channel Linearization Mode")
+  field(DTYP, "asynOctet")
+  field(OUT, "@asyn($(Link),0) QueryLinMode")
+}
+
+record(mbbi, "$(dev):chan1LinModeM") {
+  field(DESC, "Channel 1 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1LinMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(mbbi, "$(dev):chan2LinModeM") {
+  field(DESC, "Channel 2 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2LinMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(mbbi, "$(dev):chan3LinModeM") {
+  field(DESC, "Channel 3 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3LinMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(mbbi, "$(dev):chan4LinModeM") {
+  field(DESC, "Channel 4 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4LinMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(stringout, "$(dev):statusM") {
+  field(DESC, "Channel Linearization Mode")
+  field(DTYP, "asynOctet")
+  field(OUT, "@asyn($(Link),0) QueryStatus")
+}
+
+record(mbbo, "$(dev):sampleTimeC") {
+  field(DESC, "Query sample time")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetSampleTime")
+  field(ZRVL, "384000")
+  field(ONVL, "192000")
+  field(TWVL, "96000")
+  field(THVL, "64000")
+  field(FRVL, "38400")
+  field(FVVL, "32000")
+  field(SXVL, "19200")
+  field(SVVL, "16000")
+  field(EIVL, "9600")
+  field(NIVL, "1920")
+  field(TEVL, "960")
+  field(ELVL, "480")
+  field(TVVL, "256")
+  field(ZRST, "2.6 Sa/s")
+  field(ONST, "5.2 Sa/s")
+  field(TWST, "10.4 Sa/s")
+  field(THST, "15.6 Sa/s")
+  field(FRST, "26 Sa/s")
+  field(FVST, "31.3 Sa/s")
+  field(SXST, "52.1 Sa/s")
+  field(SVST, "62.5 Sa/s")
+  field(EIST, "104.2 Sa/s")
+  field(NIST, "520.8 Sa/s")
+  field(TEST, "1041.7 Sa/s")
+  field(ELST, "2083.3 Sa/s")
+  field(TVST, "3906.3 Sa/s")
+}
+
+record(longout, "$(dev):ch2ClearMathFuncC") {
+  field(DESC, "Clear CH1 Math Function")
+  field(DTYP, "asynInt32")
+  field(VAL, "2")
+  field(OUT, "@asyn($(Link),0) ClearMathFunc")
+}
+
+record(longout, "$(dev):ch3ClearMathFuncC") {
+  field(DESC, "Clear CH1 Math Function")
+  field(DTYP, "asynInt32")
+  field(VAL, "3")
+  field(OUT, "@asyn($(Link),0) ClearMathFunc")
+}
+
+record(longout, "$(dev):ch4ClearMathFuncC") {
+  field(DESC, "Clear CH1 Math Function")
+  field(DTYP, "asynInt32")
+  field(VAL, "4")
+  field(OUT, "@asyn($(Link),0) ClearMathFunc")
+}
+
+record(longout, "$(dev):ch1ClearMathFuncC") {
+  field(DESC, "Clear CH1 Math Function")
+  field(DTYP, "asynInt32")
+  field(VAL, "1")
+  field(OUT, "@asyn($(Link),0) ClearMathFunc")
+}
+
+record(longin, "$(dev):dataPortM") {
+  field(DESC, "Port # of data port")
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(Link),0) QueryDataPort")
+}
+
+record(longout, "$(dev):dataPortC") {
+  field(DESC, "Set port # of data port")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetDataPort")
+}
+
+record(mbbi, "$(dev):sampleTimeM") {
+  field(DESC, "Query sample time")
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(Link),0) QuerySampleTime")
+  field(ZRVL, "384000")
+  field(ONVL, "192000")
+  field(TWVL, "96000")
+  field(THVL, "64000")
+  field(FRVL, "38400")
+  field(FVVL, "32000")
+  field(SXVL, "19200")
+  field(SVVL, "16000")
+  field(EIVL, "9600")
+  field(NIVL, "1920")
+  field(TEVL, "960")
+  field(ELVL, "480")
+  field(TVVL, "256")
+  field(ZRST, "2.6 Sa/s")
+  field(ONST, "5.2 Sa/s")
+  field(TWST, "10.4 Sa/s")
+  field(THST, "15.6 Sa/s")
+  field(FRST, "26 Sa/s")
+  field(FVST, "31.3 Sa/s")
+  field(SXST, "52.1 Sa/s")
+  field(SVST, "62.5 Sa/s")
+  field(EIST, "104.2 Sa/s")
+  field(NIST, "520.8 Sa/s")
+  field(TEST, "1041.7 Sa/s")
+  field(ELST, "2083.3 Sa/s")
+  field(TVST, "3906.3 Sa/s")
+}
+
+record(mbbo, "$(dev):chan1LinModeC") {
+  field(DESC, "Set Ch1 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh1LinearMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(mbbo, "$(dev):chan2LinModeC") {
+  field(DESC, "Set Ch2 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh2LinearMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(mbbo, "$(dev):chan3LinModeC") {
+  field(DESC, "Set Ch3 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh3LinearMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(mbbo, "$(dev):chan4LinModeC") {
+  field(DESC, "Set Ch4 Linearization Mode")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh4LinearMode")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(ZRST, "no linearization")
+  field(ONST, "Start of measuring range")
+  field(TWST, "2-point-linearization")
+  field(THST, "3-point-linearization")
+  field(FRST, "5-point-linearization")
+  field(FVST, "10-point-linearization")
+}
+
+record(mbbo, "$(dev):CH1:setLinPointC") {
+  field(DESC, "Query sample time")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh1LinearPoint")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(SXVL, "6")
+  field(SVVL, "7")
+  field(EIVL, "8")
+  field(NIVL, "9")
+  field(TEVL, "10")
+  field(ONST, "linearization @10% range")
+  field(TWST, "linearization @20% range")
+  field(THST, "linearization @30% range")
+  field(FRST, "linearization @40% range")
+  field(FVST, "linearization @50% range")
+  field(SXST, "linearization @60% range")
+  field(SVST, "linearization @70% range")
+  field(EIST, "linearization @80% range")
+  field(NIST, "linearization @90% range")
+  field(TEST, "linearization @100% range")
+}
+
+record(mbbo, "$(dev):CH2:setLinPointC") {
+  field(DESC, "Query sample time")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh2LinearPoint")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(SXVL, "6")
+  field(SVVL, "7")
+  field(EIVL, "8")
+  field(NIVL, "9")
+  field(TEVL, "10")
+  field(ONST, "linearization @10% range")
+  field(TWST, "linearization @20% range")
+  field(THST, "linearization @30% range")
+  field(FRST, "linearization @40% range")
+  field(FVST, "linearization @50% range")
+  field(SXST, "linearization @60% range")
+  field(SVST, "linearization @70% range")
+  field(EIST, "linearization @80% range")
+  field(NIST, "linearization @90% range")
+  field(TEST, "linearization @100% range")
+}
+
+record(mbbo, "$(dev):CH3:setLinPointC") {
+  field(DESC, "Query sample time")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh3LinearPoint")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(SXVL, "6")
+  field(SVVL, "7")
+  field(EIVL, "8")
+  field(NIVL, "9")
+  field(TEVL, "10")
+  field(ONST, "linearization @10% range")
+  field(TWST, "linearization @20% range")
+  field(THST, "linearization @30% range")
+  field(FRST, "linearization @40% range")
+  field(FVST, "linearization @50% range")
+  field(SXST, "linearization @60% range")
+  field(SVST, "linearization @70% range")
+  field(EIST, "linearization @80% range")
+  field(NIST, "linearization @90% range")
+  field(TEST, "linearization @100% range")
+}
+
+record(mbbo, "$(dev):CH4:setLinPointC") {
+  field(DESC, "Query sample time")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetCh4LinearPoint")
+  field(ONVL, "1")
+  field(TWVL, "2")
+  field(THVL, "3")
+  field(FRVL, "4")
+  field(FVVL, "5")
+  field(SXVL, "6")
+  field(SVVL, "7")
+  field(EIVL, "8")
+  field(NIVL, "9")
+  field(TEVL, "10")
+  field(ONST, "linearization @10% range")
+  field(TWST, "linearization @20% range")
+  field(THST, "linearization @30% range")
+  field(FRST, "linearization @40% range")
+  field(FVST, "linearization @50% range")
+  field(SXST, "linearization @60% range")
+  field(SVST, "linearization @70% range")
+  field(EIST, "linearization @80% range")
+  field(NIST, "linearization @90% range")
+  field(TEST, "linearization @100% range")
+}
+
+record(mbbo, "$(dev):analogFilterC") {
+  field(DESC, "Set Analog Filter")
+  field(DTYP, "asynInt32")
+  field(OUT, "@asyn($(Link),0) SetAnalogFilter")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(ZRST, "filter not active")
+  field(ONST, "low pass filter active")
+}
+
+record(mbbi, "$(dev):analogFilterM") {
+  field(DESC, "Query Analog Filter")
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(Link),0) QueryAnalogFilter")
+  field(ZRVL, "0")
+  field(ONVL, "1")
+  field(ZRST, "filter not active")
+  field(ONST, "low pass filter active")
+}
+
+record(longin, "$(dev):measDataMonitor") {
+  field(DESC, "Port # of data port")
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(Link),0) QueryMeasData")
+}
+
+record(waveform, "$(dev):measDataM") {
+  field(DESC, "Grab Welcome text")
+  field(DTYP, "asynOctet")
+  field(INP, "@asyn($(Link),0) GrabWelcomeText")
+  field(FTVL, "CHAR")
+  field(NELM, "250")
+  field(PINI, "YES")
+  field(FLNK, "$(dev):chan1InfoM")
+}
+
+record(stringout, "$(dev):chan1InfoM") {
+  field(DESC, "Channel #1 Info")
+  field(DTYP, "asynOctet")
+  field(OUT, "@asyn($(Link),0) QueryChan1Info")
+  field(FLNK, "$(dev):chan2InfoM")
+}
+
+record(stringin, "$(dev):chan1NAM") {
+  field(DESC, "Chan #1 Name")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1Nam")
+}
+
+record(longin, "$(dev):chan1ANO") {
+  field(DESC, "Chan #1 Article Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1Ano")
+}
+
+record(longin, "$(dev):chan1OFS") {
+  field(DESC, "Chan #1 Meas Range Offset")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1Ofs")
+}
+
+record(longin, "$(dev):chan1SNO") {
+  field(DESC, "Chan #1 Serial Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1Sno")
+}
+
+record(longin, "$(dev):chan1RNG") {
+  field(DESC, "Chan #1 Meas Range")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1Rng")
+}
+
+record(stringin, "$(dev):chan1UNT") {
+  field(DESC, "Chan #1 Unit of Meas Range")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan1Unt")
+}
+
+record(stringout, "$(dev):chan2InfoM") {
+  field(DESC, "Channel #2 Info")
+  field(DTYP, "asynOctet")
+  field(OUT, "@asyn($(Link),0) QueryChan2Info")
+  field(FLNK, "$(dev):chan3InfoM")
+}
+
+record(stringout, "$(dev):chan3InfoM") {
+  field(DESC, "Channel #3 Info")
+  field(DTYP, "asynOctet")
+  field(OUT, "@asyn($(Link),0) QueryChan3Info")
+  field(FLNK, "$(dev):chan4InfoM")
+}
+
+record(stringout, "$(dev):chan4InfoM") {
+  field(DESC, "Channel #4 Info")
+  field(DTYP, "asynOctet")
+  field(OUT, "@asyn($(Link),0) QueryChan4Info")
+}
+
+record(longin, "$(dev):chan2ANO") {
+  field(DESC, "Chan #2 Article Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2Ano")
+}
+
+record(longin, "$(dev):chan3ANO") {
+  field(DESC, "Chan #3 Article Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3Ano")
+}
+
+record(longin, "$(dev):chan4ANO") {
+  field(DESC, "Chan #4 Article Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4Ano")
+}
+
+record(stringin, "$(dev):chan4NAM") {
+  field(DESC, "Chan #4 Name")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4Nam")
+}
+
+record(stringin, "$(dev):chan3NAM") {
+  field(DESC, "Chan #3 Name")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3Nam")
+}
+
+record(stringin, "$(dev):chan2NAM") {
+  field(DESC, "Chan #2 Name")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2Nam")
+}
+
+record(longin, "$(dev):chan4SNO") {
+  field(DESC, "Chan #4 Serial Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4Sno")
+}
+
+record(longin, "$(dev):chan3SNO") {
+  field(DESC, "Chan #3 Serial Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3Sno")
+}
+
+record(longin, "$(dev):chan2SNO") {
+  field(DESC, "Chan #2 Serial Number")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2Sno")
+}
+
+record(longin, "$(dev):chan4OFS") {
+  field(DESC, "Chan #4 Meas Range Offset")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4Ofs")
+}
+
+record(longin, "$(dev):chan3OFS") {
+  field(DESC, "Chan #3 Meas Range Offset")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3Ofs")
+}
+
+record(longin, "$(dev):chan2OFS") {
+  field(DESC, "Chan #2 Meas Range Offset")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2Ofs")
+}
+
+record(longin, "$(dev):chan4RNG") {
+  field(DESC, "Chan #4 Meas Range")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4Rng")
+}
+
+record(longin, "$(dev):chan3RNG") {
+  field(DESC, "Chan #3 Meas Range")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3Rng")
+}
+
+record(longin, "$(dev):chan2RNG") {
+  field(DESC, "Chan #2 Meas Range")
+  field(DTYP, "asynInt32")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2Rng")
+}
+
+record(stringin, "$(dev):chan4UNT") {
+  field(DESC, "Chan #4 Unit of Meas Range")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan4Unt")
+}
+
+record(stringin, "$(dev):chan3UNT") {
+  field(DESC, "Chan #3 Unit of Meas Range")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan3Unt")
+}
+
+record(stringin, "$(dev):chan2UNT") {
+  field(DESC, "Chan #2 Unit of Meas Range")
+  field(DTYP, "asynOctet")
+  field(SCAN, "I/O Intr")
+  field(INP, "@asyn($(Link),0) Chan2Unt")
+}
