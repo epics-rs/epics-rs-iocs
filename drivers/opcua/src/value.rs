@@ -69,7 +69,7 @@ impl std::fmt::Display for ConvError {
 
 impl std::error::Error for ConvError {}
 
-type Result<T> = std::result::Result<T, ConvError>;
+pub type Result<T> = std::result::Result<T, ConvError>;
 
 /// Every OPC UA numeric widened into the three shapes EPICS can convert from.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use async_opcua::types::custom::{DataTypeTree, DynamicStructure};
+use async_opcua::types::custom::{DataTypeTree, DynamicStructure, EnumTypeInfo, TypeInfoRef};
 use async_opcua::types::{
     DataValue, DateTime, ExpandedMessageInfo, ExtensionObject, NodeId, StatusCode, StructureType,
     Variant,
@@ -149,12 +149,35 @@ impl Item {
                 leaf.incoming = Some(element.clone());
             }
 
-            if leaf.state == ConnectionStatus::InitialRead && leaf.link.bini == Bini::Ignore {
-                leaf.state = ConnectionStatus::Up;
-                continue;
+            let timestamp = self.timestamp_for(&leaf.link, &value, &data);
+            if leaf.state == ConnectionStatus::InitialRead {
+                match leaf.link.bini {
+                    // The initial value is thrown away; the item still needed it
+                    // to learn the node's type (`ItemOpen62541.cpp:150-170`).
+                    Bini::Ignore => {
+                        leaf.state = ConnectionStatus::Up;
+                        continue;
+                    }
+                    // The record's own value goes to the server instead of the
+                    // one just read (`useReadValue` is false here, and
+                    // `manageStateAndBiniProcessing`, `devOpcua.cpp:186-199`,
+                    // asks the record to process for a write). The write request
+                    // is the update the record pops, so the reason it processes
+                    // for still comes from the queue and nowhere else.
+                    Bini::Write => {
+                        leaf.state = ConnectionStatus::InitialWrite;
+                        leaf.push(Update::new(
+                            ProcessReason::WriteRequest,
+                            None,
+                            status,
+                            timestamp,
+                        ));
+                        continue;
+                    }
+                    Bini::Read => {}
+                }
             }
 
-            let timestamp = self.timestamp_for(&leaf.link, &value, &data);
             let update = match element {
                 Some(element) => Update::new(reason, Some(element), status, timestamp),
                 // The element path names something the structure does not have.
@@ -242,6 +265,31 @@ impl Item {
         self.leaves.iter().any(|l| l.lock().dirty)
     }
 
+    /// Give every leaf the enumeration its element's type defines, if it is one
+    /// (`DataElementOpen62541::setEnumChoices`, driven by the node's DataType
+    /// attribute and the server's type dictionary).
+    ///
+    /// The choices are what turns an Int32 on the wire into a state string in an
+    /// mbbi, and what an mbbo's value is checked against on the way out.
+    pub fn resolve_choices(&mut self) {
+        let (Some(tree), Some(data_type)) = (self.type_tree.clone(), self.data_type.clone()) else {
+            return;
+        };
+        for leaf in &self.leaves {
+            let mut leaf = leaf.lock();
+            if leaf.choices.is_some() {
+                continue;
+            }
+            let type_id = element_type_id(&tree, &data_type, &leaf.link.element_path);
+            leaf.choices = type_id
+                .and_then(|id| tree.get_type(&id))
+                .and_then(|info| match info {
+                    TypeInfoRef::Enum(e) => Some(Arc::new(enum_choices(e))),
+                    _ => None,
+                });
+        }
+    }
+
     /// `ItemOpen62541::getStatus` / `uaToEpicsTime` — which of the value's
     /// timestamps the record takes.
     fn timestamp_for(&self, link: &LinkInfo, value: &DataValue, data: &Variant) -> SystemTime {
@@ -265,6 +313,31 @@ impl Item {
         }
         .unwrap_or_else(SystemTime::now)
     }
+}
+
+/// The data type of what an element path addresses: the node's own data type for
+/// an empty path, else the type of the structure field the path walks to.
+fn element_type_id(tree: &DataTypeTree, data_type: &NodeId, path: &[String]) -> Option<NodeId> {
+    let mut current = data_type.clone();
+    for name in path {
+        let structure = tree.get_struct_type(&current)?;
+        let index = *structure.index_by_name.get(name)?;
+        current = structure.fields.get(index)?.type_id.clone();
+    }
+    Some(current)
+}
+
+/// An OPC UA enumeration's `(value, name)` pairs, as the record's state values
+/// and strings. A value outside `epicsUInt32` cannot be a state value, so it is
+/// dropped rather than wrapped.
+fn enum_choices(info: &EnumTypeInfo) -> EnumChoices {
+    info.variants
+        .iter()
+        .filter_map(|(value, field)| {
+            let value = u32::try_from(*value).ok()?;
+            Some((value, field.name.as_ref().to_string()))
+        })
+        .collect()
 }
 
 fn system_time_of(dt: DateTime) -> SystemTime {

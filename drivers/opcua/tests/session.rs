@@ -420,15 +420,13 @@ async fn a_session_that_does_not_autoconnect_waits_for_the_connect_command() {
     assert_eq!(mock.connects.lock().len(), 1);
 }
 
+/// `bini=write` does not use the value just read: the item queues a write request
+/// for the record, which answers it by writing its own value back
+/// (`manageStateAndBiniProcessing`, `devOpcua.cpp:186-199`).
 #[tokio::test]
-async fn bini_write_sends_the_records_value_after_the_initial_read() {
+async fn bini_write_asks_the_record_to_write_after_the_initial_read() {
     let mock = Mock::arc();
     let (item0, leaf0) = item("sess ns=2;s=Sensor bini=write monitor=n", OUTPUT, 0);
-    {
-        let mut leaf = leaf0.lock();
-        leaf.outgoing = Some(Variant::Int32(7));
-        leaf.dirty = true;
-    }
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -436,17 +434,42 @@ async fn bini_write_sends_the_records_value_after_the_initial_read() {
         vec![item0],
     );
     until(|| handle.is_connected()).await;
+    until(|| !leaf0.lock().queue.is_empty()).await;
+
+    let updates = drain(&leaf0);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].reason, ProcessReason::WriteRequest);
+    assert!(updates[0].data.is_none());
+    // The value read is still what the outgoing value's type is taken from.
+    assert_eq!(leaf0.lock().incoming, Some(Variant::Int32(42)));
+}
+
+/// A record that asked for a write while the session was up gets its value out
+/// in the next batch.
+#[tokio::test]
+async fn a_dirty_leaf_is_written_when_the_record_requests_it() {
+    let mock = Mock::arc();
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT, 0);
+
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0],
+    );
+    until(|| handle.is_connected()).await;
+    drain(&leaf0);
+    {
+        let mut leaf = leaf0.lock();
+        leaf.outgoing = Some(Variant::Int32(7));
+        leaf.dirty = true;
+    }
+    handle.request(Priority::Low, Request::Write { handle: 0 });
     until(|| !mock.calls.lock().writes.is_empty()).await;
 
     let writes = mock.calls.lock().writes.clone();
-    assert_eq!(writes.len(), 1);
     assert_eq!(writes[0][0].node_id, NodeId::new(2, "Sensor"));
     assert_eq!(writes[0][0].value.value, Some(Variant::Int32(7)));
-
-    // The read result, then the write result.
-    let updates = drain(&leaf0);
-    assert_eq!(updates[0].reason, ProcessReason::ReadComplete);
-    assert_eq!(updates[1].reason, ProcessReason::WriteComplete);
+    assert_eq!(pop(&leaf0).reason, ProcessReason::WriteComplete);
 }
 
 #[tokio::test]

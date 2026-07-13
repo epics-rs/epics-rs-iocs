@@ -8,9 +8,11 @@
 
 pub mod client;
 pub mod defaults;
+pub mod device_support;
 pub mod item;
 pub mod link;
 pub mod queue;
+pub mod registry;
 pub mod session;
 pub mod subscription;
 pub mod value;

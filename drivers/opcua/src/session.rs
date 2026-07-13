@@ -238,9 +238,15 @@ impl Priority {
 }
 
 /// The handle a record's device support keeps on its session.
+///
+/// The configuration stays mutable: `opcuaOptions` and `opcuaMapNamespace` may
+/// name a session at any time before it connects, and the C applies them to the
+/// live session object (`SessionOpen62541::setOption`). The worker reads it, the
+/// iocsh commands write it, and neither holds the lock across an await.
 #[derive(Debug)]
 pub struct SessionHandle {
-    pub config: SessionConfig,
+    pub name: String,
+    pub config: Mutex<SessionConfig>,
     /// Items on this session, indexed by client handle.
     pub items: Mutex<Vec<Arc<Mutex<Item>>>>,
     pub subscriptions: Mutex<Vec<SubscriptionConfig>>,
@@ -271,6 +277,11 @@ impl SessionHandle {
     pub fn is_connected(&self) -> bool {
         !matches!(*self.status.lock(), ConnectionStatus::Down)
     }
+
+    /// Apply one `key=value` option (`opcuaOptions`).
+    pub fn set_option(&self, name: &str, value: &str) -> Result<(), String> {
+        self.config.lock().set_option(name, value)
+    }
 }
 
 /// Everything the worker owns.
@@ -294,7 +305,8 @@ pub fn create(
     let (commands_tx, commands) = mpsc::unbounded_channel();
     let (control_tx, control) = mpsc::unbounded_channel();
     let handle = Arc::new(SessionHandle {
-        config,
+        name: config.name.clone(),
+        config: Mutex::new(config),
         items: Mutex::new(Vec::new()),
         subscriptions: Mutex::new(Vec::new()),
         status: Mutex::new(ConnectionStatus::Down),
@@ -317,7 +329,7 @@ pub fn create(
 impl SessionWorker {
     /// The worker's whole life: connect, serve, reconnect.
     pub async fn run(mut self) {
-        let mut connect_now = self.handle.config.autoconnect;
+        let mut connect_now = self.autoconnect();
         loop {
             if self.connection.is_none() {
                 if !connect_now {
@@ -329,12 +341,12 @@ impl SessionWorker {
                     continue;
                 }
                 if let Err(e) = self.connect().await {
-                    log::error!("session {}: {e}", self.handle.config.name);
+                    log::error!("session {}: {e}", self.handle.name);
                     // `opcua_ConnectTimeout` is both the connect timeout and the
                     // interval between attempts (`iocshVariables.h:24`).
                     let retry = defaults::CONNECT_TIMEOUT.get().max(0.1);
                     tokio::time::sleep(Duration::from_secs_f64(retry)).await;
-                    connect_now = self.handle.config.autoconnect;
+                    connect_now = self.autoconnect();
                     continue;
                 }
             }
@@ -342,7 +354,7 @@ impl SessionWorker {
             match self.serve().await {
                 ServeOutcome::Shutdown => return,
                 ServeOutcome::Disconnected => {
-                    connect_now = self.handle.config.autoconnect;
+                    connect_now = self.autoconnect();
                 }
                 ServeOutcome::DisconnectRequested => {
                     connect_now = false;
@@ -356,8 +368,13 @@ impl SessionWorker {
     /// limits and namespaces, rebuild the node ids, register the nodes, read
     /// every item once, run the `bini=write` writes, then start the
     /// subscriptions.
+    fn autoconnect(&self) -> bool {
+        self.handle.config.lock().autoconnect
+    }
+
     async fn connect(&mut self) -> Result<(), String> {
-        let connection = self.connector.connect(&self.handle.config).await?;
+        let config = self.handle.config.lock().clone();
+        let connection = self.connector.connect(&config).await?;
         self.server = connection
             .server_info()
             .await
@@ -367,7 +384,7 @@ impl SessionWorker {
             log::warn!(
                 "session {}: the server's type dictionary could not be read; \
                  enumerations and structures will not resolve",
-                self.handle.config.name
+                self.handle.name
             );
         }
 
@@ -384,10 +401,11 @@ impl SessionWorker {
         self.connection = Some(connection.clone());
 
         // The initial read goes ahead of everything a record may already have
-        // queued, and its result is what `bini` acts on.
+        // queued, and its result is what `bini` acts on: a `bini=write` leaf gets
+        // a write request queued for it by the item, which the record then pops
+        // and answers by writing its own value back.
         let handles: Vec<u32> = (0..items.len() as u32).collect();
         self.read_batch(&connection, &handles).await;
-        self.write_bini(&connection, &items).await;
 
         for item in &items {
             item.lock().set_state(ConnectionStatus::Up);
@@ -395,7 +413,7 @@ impl SessionWorker {
         *self.handle.status.lock() = ConnectionStatus::Up;
 
         self.start_subscriptions(&connection).await;
-        log::info!("session {} is up", self.handle.config.name);
+        log::info!("session {} is up", self.handle.name);
         Ok(())
     }
 
@@ -452,8 +470,10 @@ impl SessionWorker {
             .chain(self.writes.iter())
             .map(VecDeque::len)
             .sum::<usize>();
-        let min = self.handle.config.read_timeout_min;
-        let max = self.handle.config.read_timeout_max;
+        let (min, max) = {
+            let config = self.handle.config.lock();
+            (config.read_timeout_min, config.read_timeout_max)
+        };
         let batch = self.read_limit().min(pending.max(1));
         let hold_off = if max > min && batch > 0 {
             min + (max - min) * (pending as f64 / batch as f64).min(1.0)
@@ -473,12 +493,16 @@ impl SessionWorker {
     /// `no_of_properties_read`). A server that states `MaxNodesPerRead = 100`
     /// therefore gets Reads of 200 nodes and answers `BadTooManyOperations`.
     fn read_limit(&self) -> usize {
-        (self.handle.config.read_batch_size(&self.server) / NO_OF_PROPERTIES_READ).max(1)
+        (self.handle.config.lock().read_batch_size(&self.server) / NO_OF_PROPERTIES_READ).max(1)
     }
 
     /// A write puts one node per item into the request.
     fn write_limit(&self) -> usize {
-        self.handle.config.write_batch_size(&self.server).max(1)
+        self.handle
+            .config
+            .lock()
+            .write_batch_size(&self.server)
+            .max(1)
     }
 
     /// Send one batch, highest priority first. Returns false on a connection error.
@@ -556,7 +580,7 @@ impl SessionWorker {
                 true
             }
             Err(status) => {
-                log::error!("session {}: read failed: {status}", self.handle.config.name);
+                log::error!("session {}: read failed: {status}", self.handle.name);
                 for handle in handles {
                     if let Some(item) = items.get(*handle as usize) {
                         item.lock()
@@ -572,6 +596,7 @@ impl SessionWorker {
         let mut item = item.lock();
         if let Some(Variant::NodeId(id)) = &data_type.value {
             item.data_type = Some((**id).clone());
+            item.resolve_choices();
         }
         let status = value.status.unwrap_or(StatusCode::Good);
         if status.is_bad() && value.value.is_none() {
@@ -633,10 +658,7 @@ impl SessionWorker {
                 true
             }
             Err(status) => {
-                log::error!(
-                    "session {}: write failed: {status}",
-                    self.handle.config.name
-                );
+                log::error!("session {}: write failed: {status}", self.handle.name);
                 for item in &written {
                     item.lock()
                         .set_incoming_event(ProcessReason::WriteFailure, status);
@@ -646,32 +668,12 @@ impl SessionWorker {
         }
     }
 
-    /// `bini=write`: after the initial read, write the record's own value back
-    /// (`ItemOpen62541.cpp:150-190`).
-    async fn write_bini(&mut self, connection: &Arc<dyn UaConnection>, items: &[Arc<Mutex<Item>>]) {
-        let handles: Vec<u32> = items
-            .iter()
-            .filter(|item| item.lock().has_dirty_leaf())
-            .map(|item| item.lock().client_handle)
-            .collect();
-        if handles.is_empty() {
-            return;
-        }
-        for item in items {
-            let mut item = item.lock();
-            if item.has_dirty_leaf() {
-                item.set_state(ConnectionStatus::InitialWrite);
-            }
-        }
-        self.write_batch(connection, &handles).await;
-    }
-
     /// Map the configured namespace indices onto the server's, then rebuild every
     /// node id (`SessionOpen62541::updateNamespaceMap` / `rebuildNodeIds`).
     fn rebuild_node_ids(&self) {
-        let map = &self.handle.config.namespace_map;
+        let map = self.handle.config.lock().namespace_map.clone();
         let mut remap: HashMap<u16, u16> = HashMap::new();
-        for (local, uri) in map {
+        for (local, uri) in &map {
             match self
                 .server
                 .namespace_array
@@ -684,7 +686,7 @@ impl SessionWorker {
                 None => log::error!(
                     "session {}: the server has no namespace '{uri}'; \
                      items in namespace {local} keep their configured index",
-                    self.handle.config.name
+                    self.handle.name
                 ),
             }
         }
@@ -725,13 +727,13 @@ impl SessionWorker {
         match connection.register_nodes(&ids).await {
             Ok(registered) => {
                 for ((i, _), id) in to_register.iter().zip(registered) {
-                    log::debug!("session {}: registered node {id}", self.handle.config.name);
+                    log::debug!("session {}: registered node {id}", self.handle.name);
                     items[*i].lock().registered_node_id = Some(id);
                 }
             }
             Err(status) => log::error!(
                 "session {}: registering nodes failed: {status}",
-                self.handle.config.name
+                self.handle.name
             ),
         }
     }
