@@ -174,9 +174,7 @@ impl Pm304Controller {
         self.handle.write_octet(0, &Self::framed(cmd))?;
         let raw = self.handle.read_octet(0, READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
-        Ok(text
-            .trim_end_matches(['\r', '\n', '\0'])
-            .to_string())
+        Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
     }
 
     /// Write a command and return its reply with the PM600 echo removed. Every
