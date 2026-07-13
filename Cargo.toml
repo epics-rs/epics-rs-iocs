@@ -75,6 +75,7 @@ members = [
     "drivers/ip",
     "drivers/yokogawa-gm10",
     "drivers/yokogawa-mw100",
+    "drivers/opcua",
     "iocs/ad/specs-analyser-ioc",
     "iocs/d435i-ioc",
     "iocs/ad/merlin-ioc",

@@ -1,0 +1,17 @@
+[package]
+name = "opcua"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true }
+# `async-opcua` names its lib `opcua`, which collides with this crate's own
+# lib name in the integration-test targets (E0464). Bind it to a distinct
+# extern name.
+async_opcua = { package = "async-opcua", version = "0.18", default-features = false, features = [
+    "client",
+] }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros"] }
+log = "0.4"
