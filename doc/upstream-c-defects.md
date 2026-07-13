@@ -338,3 +338,43 @@ remain open upstream defects the port did not guess at.
 | 166 | `devMW100_bo.c` INFO_TRIG vs `MW100_system.db` — same gap as GM10 | fixed-in-port (`InfoPoll`) |
 | 167 | `devMW100_bi.c` MEASURE_MODE vs `MW100_system.db` — command exists, no record wired (its two sibling status bits have records) | fixed-in-port (`MeasureMode` bi) |
 | 168 | `MW100_MX114_channel.db` + `MW100_MX115_channel.db` — every Alarm1-4 `THSV` reads `"MAJR"` (8 sites) against seven correctly-spelled `"MAJOR"` in the same records | fixed-in-port |
+
+## epics-modules/tpmac (commit `5b71200`)
+
+| # | Defect | Port handling |
+|---|--------|---------------|
+| 169 | `pmacAsynIPPort.c` documents the PMAC error reply `<BELL>ERRxxx<CR>` in its own header, yet `lowLevelWriteRead`/`motorAxisWriteRead` report success for it — every move/home/stop/set-position can fail silently | fixed-in-port (`controller::octet_write_read` errors on a BELL reply) |
+| 170 | `pmacCsGroups.cpp` `switchToGroup` indexes an axis-keyed `std::map` with the loop counter: any group whose axes are not exactly `0..n-1` maps wrong, and `operator[]` grows the map mid-iteration | fixed-in-port (regression test `switch_maps_a_non_contiguous_axis_set_correctly`) |
+| 171 | `pmacAsynCoord.c` `motorAxisMove` ignores its `relative` argument: a REL move on a CS axis drives to the absolute position | fixed-in-port |
+| 172 | `pmacAsynCoord.c` `drvPmacGetAxesStatus` sets `motorAxisProblem` from `CS_STATUS2_AMP_FAULT`, then immediately overwrites it with `CS_STATUS2_RUNTIME_ERR`: an amp fault never reaches the record | fixed-in-port (both bits raise PROBLEM) |
+| 173 | `pmacAsynIPPort.c` `writeIt` sends the 16-bit `wValue` in host order while `htons`-ing `wLength`: wrong packet header on a big-endian IOC | fixed-in-port (written little-endian explicitly) |
+| 174 | `pmacController.cpp` `processDeferredMoves` + `pmacCsGroups` build commands with `sprintf(buf, "%s…", buf, …)` — overlapping src/dst, UB | fixed-in-port (structurally absent) |
+| — | `pmacAxis::getAxisStatus` writes `motorStatusPowerOn_` twice per poll (`!(status1 & OPEN_LOOP)` then `amp_enabled`); which was intended is underivable | observed only (port keeps the observable behaviour: powered = amp_enabled) |
+| — | `PMAC_FEEDRATE_LIM_ = 100` defined and never used | observed only (not reproduced) |
+
+## epics-modules/twincat-ads (commits `ec4464c`, `6c31da6`, `3dee54e`)
+
+| # | Defect | Port handling |
+|---|--------|---------------|
+| 175 | `adsAsynPortDriverUtils.cpp:818,850` — `octetBinary2ascii` INT64/UINT64 formats are `"% PRId64"`/`"% PRIu64"` with the macro *inside* the literal, so it never expands: reading an LINT over the octet interface returns the literal text ` PRId64` | fixed-in-port |
+| 176 | `adsAsynPortDriverUtils.cpp:837,845` — UINT16/UINT32 printed with `%d`: a UDINT above 2³¹ renders negative (`4000000000` → `-294967296`) | fixed-in-port |
+| 177 | `adsAsynPortDriverUtils.cpp:560` — `windowsToEpicsTimeStamp` computes the sub-second remainder as `plcTime - secPastEpoch * WINDOWS_TICK_PER_SEC` in 32-bit arithmetic (`uint32_t` × `int`): wraps for every real timestamp, `nsec` is garbage on every sample | fixed-in-port |
+| 178 | `adsAsynPortDriver.cpp:1557` — `parsePlcInfofromDrvInfo` finds options with `strstr` over the whole drvInfo: a PLC symbol containing an option keyword (`Main.TS_MS_setpoint`, `Main.bADSPORT_OK`) mis-parses and the record fails to bind | fixed-in-port (structural parse) |
+| 179 | `adsAsynPortDriver.cpp:1622-1625` — the `.ADR.` parse-failure path assigns `-1` to unsigned fields, leaving `SIZE_MAX` behind before returning the error | fixed-in-port |
+| 180 | `adsAsynPortDriver.cpp:2229` — the octet symbolic-*write* path `strncpy`s the variable name without NUL termination into a buffer reused across stacked commands (the read path at `:2244` terminates) | fixed-in-port |
+| 181 | `adsAsynPortDriver.cpp:4600` — the `ADST_BIT` arm of `adsUpdateParameter` omits `asynParamInt64`, which every other integer PLC type accepts | fixed-in-port |
+| 182 | `adsAsynPortDriver.cpp:4574` et al — float→integer casts through `(int)`: UB past the integer range | fixed-in-port (Rust `as` saturates) |
+| 183 | `adsAsynPortDriver.cpp:674` vs `:1394` — on a failed sub-request `bulkReadThread` advances the *status* pointer but not the *data* pointer, while `adsAddToBulkRead` sizes the read as if every sub-request occupies its bytes; the two cannot both hold, so one failing variable shifts every later variable's bytes — silent data corruption. The Beckhoff reference (`AdsDef.h:71`) documents the 0xF080 response only as "{list of results} and {list of data}" | fixed-in-port without guessing: the decoder disambiguates the layout off the wire length (the two candidates predict different totals whenever a sub-request fails), and rejects a response matching neither |
+| 184 | `adsAsynPortDriver.cpp:4716-4790` — `fireCallbacks` passes `lastCallbackSize` (**bytes**) as the **element count** to `doCallbacksInt16Array`/`Int32Array`/`Float32Array`/`Float64Array`: a 100-element LREAL array is published as 800 elements read out of a 100-element buffer — OOB read on every array record | fixed-in-port (regression test `an_array_sample_is_served_element_wise_not_byte_wise`) |
+| 185 | `adsAsynPortDriver.cpp:3223` — `writeFloat64Array` copies `nElements * nElements * sizeof(epicsFloat64)` bytes | fixed-in-port |
+| 186 | `adsAsynPortDriver.cpp:496` — destructor `delete`s a `new[]` array | fixed-in-port (structurally absent) |
+| 187 | `adsAsynPortDriver.cpp:306` — constructor `memset(pAdsParamArray_, 0, sizeof(*pAdsParamArray_))` zeroes 8 bytes instead of the parameter table | fixed-in-port (structurally absent) |
+| 188 | `adsAsynPortDriver.cpp:346-358` — the `if (nvals != 6)` check is duplicated | fixed-in-port |
+| 189 | `adsAsynPortDriver.cpp:552`, `:3565` — `exit(-1)`/`exit(1)` on connection loss kills the IOC with the PLC; the constructor's `for(;;) connect()` also blocks `iocInit` forever when the PLC is off | fixed-in-port (reconnect supervisor re-resolves every handle; first connect non-blocking) |
+| 190 | `adsAsynPortDriver.cpp:3800-3806` — the symbol handle is zeroed before the `printf` that logs it: the failure message always reads `0xffffffff` | fixed-in-port |
+| 191 | `adsAsynPortDriver.cpp:1260` — `unlock()` with no matching `lock()` on the alloc-failure path | fixed-in-port (structurally absent) |
+| 192 | `adsAsynPortDriver.cpp:1307` — `poll_info` labels bulk slot 0 `timeLoDW`; it is `timeHiDW` | fixed-in-port |
+| 193 | `adsAsynPortDriverUtils.cpp:409-419` — `adsTypeSize` returns `-1` as a `size_t` (`SIZE_MAX`) for an unknown type | fixed-in-port |
+| 194 | `adsAsynPortDriver.cpp:2651`, `:2802` — `printf` passes `plcDataType` where the message text says "bytes" | fixed-in-port |
+| 195 | iocsh arg label `"(EPCIS=0,PLC=1)"` contradicts `ADS_TIME_BASE_PLC = 0` (`adsAsynPortDriverUtils.h:59-60`), typo included | fixed-in-port |
+| 196 | `adsExApp/Db/adsTestAsyn.db` — `SetFAmplitudeRB` and `SetBEnableUpdateSineRB` each defined twice; `$(ADSCLIENT)`/`$(ADSSERVER_PORT)` referenced but defined by no startup script; `"$(P):Int32Array"` stray colon | fixed-in-port |

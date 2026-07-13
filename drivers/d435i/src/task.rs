@@ -27,6 +27,7 @@ use realsense_rust::processing_blocks::pointcloud::PointCloud;
 use realsense_rust::processing_blocks::spatial_filter::SpatialFilter;
 use realsense_rust::processing_blocks::temporal_filter::TemporalFilter;
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 
 use crate::params::{D435iConfigSnapshot, D435iParams};
@@ -40,11 +41,7 @@ async fn write_string(handle: &PortHandle, reason: usize, addr: i32, value: Stri
     let _ = handle
         .set_params_and_notify(
             addr,
-            vec![ParamSetValue::Octet {
-                reason,
-                addr,
-                value,
-            }],
+            vec![ParamSetValue::new(reason, addr, ParamValue::Octet(value))],
         )
         .await;
 }
@@ -84,26 +81,14 @@ impl AcquisitionContext {
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::Int32 {
-                        reason: self.color_ad.acquire_busy,
-                        addr: 0,
-                        value: 0,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: self.color_ad.status,
-                        addr: 0,
-                        value: ADStatus::Idle as i32,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: self.color_ad.acquire,
-                        addr: 0,
-                        value: 0,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: self.rs_params.rs_connected,
-                        addr: 0,
-                        value: 0,
-                    },
+                    ParamSetValue::new(self.color_ad.acquire_busy, 0, ParamValue::Int32(0)),
+                    ParamSetValue::new(
+                        self.color_ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Idle as i32),
+                    ),
+                    ParamSetValue::new(self.color_ad.acquire, 0, ParamValue::Int32(0)),
+                    ParamSetValue::new(self.rs_params.rs_connected, 0, ParamValue::Int32(0)),
                 ],
             )
             .await;
@@ -258,61 +243,45 @@ async fn publish_array(
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Int32 {
-                    reason: base_params.array_counter,
-                    addr: 0,
-                    value: array.unique_id,
-                },
-                ParamSetValue::Float64 {
-                    reason: base_params.timestamp_rbv,
-                    addr: 0,
-                    value: ts.as_f64(),
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.epics_ts_sec,
-                    addr: 0,
-                    value: ts.sec as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.epics_ts_nsec,
-                    addr: 0,
-                    value: ts.nsec as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.array_size_x,
-                    addr: 0,
-                    value: size_x,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.array_size_y,
-                    addr: 0,
-                    value: size_y,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.array_size_z,
-                    addr: 0,
-                    value: size_z,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.array_size,
-                    addr: 0,
-                    value: array_size,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.n_dimensions,
-                    addr: 0,
-                    value: n_dims as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.color_mode,
-                    addr: 0,
-                    value: color_mode as i32,
-                },
-                ParamSetValue::Int32 {
-                    reason: base_params.data_type,
-                    addr: 0,
-                    value: data_type as u8 as i32,
-                },
+                ParamSetValue::new(
+                    base_params.array_counter,
+                    0,
+                    ParamValue::Int32(array.unique_id),
+                ),
+                ParamSetValue::new(
+                    base_params.timestamp_rbv,
+                    0,
+                    ParamValue::Float64(ts.as_f64()),
+                ),
+                ParamSetValue::new(
+                    base_params.epics_ts_sec,
+                    0,
+                    ParamValue::Int32(ts.sec as i32),
+                ),
+                ParamSetValue::new(
+                    base_params.epics_ts_nsec,
+                    0,
+                    ParamValue::Int32(ts.nsec as i32),
+                ),
+                ParamSetValue::new(base_params.array_size_x, 0, ParamValue::Int32(size_x)),
+                ParamSetValue::new(base_params.array_size_y, 0, ParamValue::Int32(size_y)),
+                ParamSetValue::new(base_params.array_size_z, 0, ParamValue::Int32(size_z)),
+                ParamSetValue::new(base_params.array_size, 0, ParamValue::Int32(array_size)),
+                ParamSetValue::new(
+                    base_params.n_dimensions,
+                    0,
+                    ParamValue::Int32(n_dims as i32),
+                ),
+                ParamSetValue::new(
+                    base_params.color_mode,
+                    0,
+                    ParamValue::Int32(color_mode as i32),
+                ),
+                ParamSetValue::new(
+                    base_params.data_type,
+                    0,
+                    ParamValue::Int32(data_type as u8 as i32),
+                ),
             ],
         )
         .await;
@@ -482,41 +451,41 @@ async fn process_imu(composite: &CompositeFrame, ctx: &AcquisitionContext) {
     let accel_frames: Vec<AccelFrame> = composite.frames_of_type();
     if let Some(accel) = accel_frames.first() {
         let a = accel.acceleration();
-        updates.push(ParamSetValue::Float64 {
-            reason: ctx.rs_params.rs_accel_x,
-            addr: 0,
-            value: a[0] as f64,
-        });
-        updates.push(ParamSetValue::Float64 {
-            reason: ctx.rs_params.rs_accel_y,
-            addr: 0,
-            value: a[1] as f64,
-        });
-        updates.push(ParamSetValue::Float64 {
-            reason: ctx.rs_params.rs_accel_z,
-            addr: 0,
-            value: a[2] as f64,
-        });
+        updates.push(ParamSetValue::new(
+            ctx.rs_params.rs_accel_x,
+            0,
+            ParamValue::Float64(a[0] as f64),
+        ));
+        updates.push(ParamSetValue::new(
+            ctx.rs_params.rs_accel_y,
+            0,
+            ParamValue::Float64(a[1] as f64),
+        ));
+        updates.push(ParamSetValue::new(
+            ctx.rs_params.rs_accel_z,
+            0,
+            ParamValue::Float64(a[2] as f64),
+        ));
     }
 
     let gyro_frames: Vec<GyroFrame> = composite.frames_of_type();
     if let Some(gyro) = gyro_frames.first() {
         let g = gyro.rotational_velocity();
-        updates.push(ParamSetValue::Float64 {
-            reason: ctx.rs_params.rs_gyro_x,
-            addr: 0,
-            value: g[0] as f64,
-        });
-        updates.push(ParamSetValue::Float64 {
-            reason: ctx.rs_params.rs_gyro_y,
-            addr: 0,
-            value: g[1] as f64,
-        });
-        updates.push(ParamSetValue::Float64 {
-            reason: ctx.rs_params.rs_gyro_z,
-            addr: 0,
-            value: g[2] as f64,
-        });
+        updates.push(ParamSetValue::new(
+            ctx.rs_params.rs_gyro_x,
+            0,
+            ParamValue::Float64(g[0] as f64),
+        ));
+        updates.push(ParamSetValue::new(
+            ctx.rs_params.rs_gyro_y,
+            0,
+            ParamValue::Float64(g[1] as f64),
+        ));
+        updates.push(ParamSetValue::new(
+            ctx.rs_params.rs_gyro_z,
+            0,
+            ParamValue::Float64(g[2] as f64),
+        ));
     }
 
     if !updates.is_empty() {
@@ -602,16 +571,12 @@ async fn try_connect_pipeline(
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::Octet {
-                    reason: ctx.color_ad.status_message,
-                    addr: 0,
-                    value: "Connecting to camera...".into(),
-                },
-                ParamSetValue::Int32 {
-                    reason: ctx.rs_params.rs_connected,
-                    addr: 0,
-                    value: 0,
-                },
+                ParamSetValue::new(
+                    ctx.color_ad.status_message,
+                    0,
+                    ParamValue::Octet("Connecting to camera...".into()),
+                ),
+                ParamSetValue::new(ctx.rs_params.rs_connected, 0, ParamValue::Int32(0)),
             ],
         )
         .await;
@@ -676,21 +641,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::Int32 {
-                        reason: ctx.color_ad.num_images_counter,
-                        addr: 0,
-                        value: 0,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: ctx.color_ad.status,
-                        addr: 0,
-                        value: ADStatus::Acquire as i32,
-                    },
-                    ParamSetValue::Int32 {
-                        reason: ctx.color_ad.acquire_busy,
-                        addr: 0,
-                        value: 1,
-                    },
+                    ParamSetValue::new(ctx.color_ad.num_images_counter, 0, ParamValue::Int32(0)),
+                    ParamSetValue::new(
+                        ctx.color_ad.status,
+                        0,
+                        ParamValue::Int32(ADStatus::Acquire as i32),
+                    ),
+                    ParamSetValue::new(ctx.color_ad.acquire_busy, 0, ParamValue::Int32(1)),
                 ],
             )
             .await;
@@ -743,16 +700,12 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::Int32 {
-                        reason: ctx.rs_params.rs_connected,
-                        addr: 0,
-                        value: 1,
-                    },
-                    ParamSetValue::Octet {
-                        reason: ctx.color_ad.status_message,
-                        addr: 0,
-                        value: "Acquiring data".into(),
-                    },
+                    ParamSetValue::new(ctx.rs_params.rs_connected, 0, ParamValue::Int32(1)),
+                    ParamSetValue::new(
+                        ctx.color_ad.status_message,
+                        0,
+                        ParamValue::Octet("Acquiring data".into()),
+                    ),
                 ],
             )
             .await;
@@ -859,16 +812,16 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         .set_params_and_notify(
                             0,
                             vec![
-                                ParamSetValue::Int32 {
-                                    reason: ctx.rs_params.rs_frames_dropped,
-                                    addr: 0,
-                                    value: frames_dropped,
-                                },
-                                ParamSetValue::Int32 {
-                                    reason: ctx.rs_params.rs_error_count,
-                                    addr: 0,
-                                    value: total_errors,
-                                },
+                                ParamSetValue::new(
+                                    ctx.rs_params.rs_frames_dropped,
+                                    0,
+                                    ParamValue::Int32(frames_dropped),
+                                ),
+                                ParamSetValue::new(
+                                    ctx.rs_params.rs_error_count,
+                                    0,
+                                    ParamValue::Int32(total_errors),
+                                ),
                             ],
                         )
                         .await;
@@ -909,11 +862,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                                         .color_handle
                                         .set_params_and_notify(
                                             0,
-                                            vec![ParamSetValue::Int32 {
-                                                reason: ctx.rs_params.rs_connected,
-                                                addr: 0,
-                                                value: 1,
-                                            }],
+                                            vec![ParamSetValue::new(
+                                                ctx.rs_params.rs_connected,
+                                                0,
+                                                ParamValue::Int32(1),
+                                            )],
                                         )
                                         .await;
                                     continue;
@@ -924,11 +877,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                                         .color_handle
                                         .set_params_and_notify(
                                             0,
-                                            vec![ParamSetValue::Int32 {
-                                                reason: ctx.rs_params.rs_error_count,
-                                                addr: 0,
-                                                value: total_errors,
-                                            }],
+                                            vec![ParamSetValue::new(
+                                                ctx.rs_params.rs_error_count,
+                                                0,
+                                                ParamValue::Int32(total_errors),
+                                            )],
                                         )
                                         .await;
                                     write_string(
@@ -990,11 +943,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .color_handle
                 .set_params_and_notify(
                     0,
-                    vec![ParamSetValue::Int32 {
-                        reason: ctx.color_ad.num_images_counter,
-                        addr: 0,
-                        value: num_counter,
-                    }],
+                    vec![ParamSetValue::new(
+                        ctx.color_ad.num_images_counter,
+                        0,
+                        ParamValue::Int32(num_counter),
+                    )],
                 )
                 .await;
 
@@ -1010,11 +963,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                             .color_handle
                             .set_params_and_notify(
                                 0,
-                                vec![ParamSetValue::Float64 {
-                                    reason: ctx.rs_params.rs_depth_units,
-                                    addr: 0,
-                                    value: units as f64,
-                                }],
+                                vec![ParamSetValue::new(
+                                    ctx.rs_params.rs_depth_units,
+                                    0,
+                                    ParamValue::Float64(units as f64),
+                                )],
                             )
                             .await;
                     }
