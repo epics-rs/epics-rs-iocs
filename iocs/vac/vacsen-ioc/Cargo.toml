@@ -1,0 +1,13 @@
+# Vacuum-gauge IOC binary: the `vs` record type + `devVacSen` device support
+# for Granville-Phillips GP307/GP350 and Televac MM200/MX200/CC10 controllers
+# over an asyn serial (or IP) octet port. Exposes CA + PVA. No vendor library.
+
+[package]
+name = "vacsen-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+vac = { path = "../../../drivers/vac" }
+epics-rs = { workspace = true, features = ["asyn", "bridge"] }

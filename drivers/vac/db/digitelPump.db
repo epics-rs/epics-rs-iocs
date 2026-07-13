@@ -1,0 +1,26 @@
+# digitel record — ion pump controller, devDigitelPump (asyn DigitelPump)
+# device support.
+#
+# The asyn octet link lives in INP: "@asyn(PORT ADDR)STN". EOS is owned by the
+# startup script (see the per-device asynOctetSet{Input,Output}Eos calls), not
+# by the device support.
+#
+# Macros:
+#   P     record prefix
+#   PUMP  record name suffix
+#   DEV   device type: D500 | D1500 | MPC | QPC
+#   PORT  asyn octet port name
+#   ADDR  asyn address (0 for the Digitels; device address for MPC/QPC)
+#   STN   station: Digitel = setpoint number 0-3; MPC = first setpoint (pump);
+#         QPC = pump number 1-4
+#
+# HHSV/HSV mirror the C digitelPump.db: a pressure over HIHI is MAJOR, over
+# HIGH is MINOR.
+record(digitel, "$(P)$(PUMP)") {
+    field(SCAN, "2 second")
+    field(DTYP, "asyn DigitelPump")
+    field(TYPE, "$(DEV)")
+    field(INP,  "@asyn($(PORT) $(ADDR))$(STN)")
+    field(HHSV, "MAJOR")
+    field(HSV,  "MINOR")
+}

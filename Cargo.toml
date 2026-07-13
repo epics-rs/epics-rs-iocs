@@ -37,6 +37,7 @@ members = [
     "drivers/motor/pi-gcs2",
     "drivers/motor/pi",
     "drivers/motor/acs",
+    "drivers/vac",
     "drivers/meascomp/meascomp",
     "drivers/meascomp/uldaq-sys",
     "drivers/meascomp/usb-2408",
@@ -88,6 +89,8 @@ members = [
     "iocs/motor/mcb4b-ioc",
     "iocs/usb-2408-ioc",
     "iocs/usb-ctr-ioc",
+    "iocs/vac/vacsen-ioc",
+    "iocs/vac/digitel-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC
