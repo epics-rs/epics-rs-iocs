@@ -37,6 +37,11 @@ struct Inner {
 }
 
 /// What a record's device support gets when it binds its link.
+///
+/// Cloneable because an `opcuaItem` record needs it as well as its device
+/// support does — it is the C's `prec->dpvt`, which the record's `special()`
+/// reaches through (`opcuaItemRecord.cpp:107-125`).
+#[derive(Clone, Debug)]
 pub struct Binding {
     pub session: Arc<SessionHandle>,
     pub item: Arc<Mutex<Item>>,

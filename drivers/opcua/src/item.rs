@@ -66,6 +66,19 @@ impl Leaf {
         }
     }
 
+    /// Ask the record to process for a reason no value came with — the C's
+    /// `RecordConnector::requestRecordProcessing` (`RecordConnector.cpp:88-113`),
+    /// which sets `pcon->reason` and calls `dbProcess`. Here the reason travels
+    /// on the queue, like every other reason a record processes for.
+    pub fn request_processing(&mut self, reason: ProcessReason) {
+        self.push(Update::new(
+            reason,
+            None,
+            StatusCode::Good,
+            SystemTime::now(),
+        ));
+    }
+
     /// Queue an update and wake the record if this is the one it will see first.
     fn push(&mut self, update: Update) {
         if self.queue.push(update) {
@@ -99,6 +112,11 @@ pub struct Item {
     pub leaves: Vec<Arc<Mutex<Leaf>>>,
     /// The item's own last value, from which every leaf's element is taken.
     pub last_value: Option<Variant>,
+    /// The status and the timestamp of the last thing that happened to the node,
+    /// which the `opcuaItem` record shows in STATCODE/STATTEXT and takes its own
+    /// timestamp from (`ItemOpen62541::getStatus`, `ItemOpen62541.cpp:251-275`).
+    pub last_status: StatusCode,
+    pub last_timestamp: Option<SystemTime>,
     /// The server's data type dictionary, needed to rebuild a structure around a
     /// changed element.
     pub type_tree: Option<Arc<DataTypeTree>>,
@@ -116,6 +134,8 @@ impl Item {
             client_handle,
             leaves: Vec::new(),
             last_value: None,
+            last_status: StatusCode::Good,
+            last_timestamp: None,
             type_tree: None,
         }
     }
@@ -138,6 +158,8 @@ impl Item {
         let status = value.status.unwrap_or(StatusCode::Good);
         let data = value.value.clone().unwrap_or(Variant::Empty);
         self.last_value = Some(data.clone());
+        self.last_status = status;
+        self.last_timestamp = Some(self.timestamp_for(&self.link, &value, &data));
 
         for leaf in &self.leaves {
             let mut leaf = leaf.lock();
@@ -193,6 +215,8 @@ impl Item {
     /// An event with no value — a read failure, a write result, a connection
     /// loss (`ItemOpen62541::setIncomingEvent`).
     pub fn set_incoming_event(&mut self, reason: ProcessReason, status: StatusCode) {
+        self.last_status = status;
+        self.last_timestamp = Some(SystemTime::now());
         if reason == ProcessReason::ConnectionLoss {
             self.state = ConnectionStatus::Down;
             self.last_value = None;

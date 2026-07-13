@@ -53,6 +53,7 @@ use epics_rs::ca::server::ioc_app::DeviceSupportContext;
 
 use crate::link::{Bini, InfoDefaults, RecordKind, parse_link};
 use crate::queue::{ConnectionStatus, ProcessReason, Update};
+use crate::record::OpcuaItemRecord;
 use crate::registry::{Binding, Registry};
 use crate::session::{Priority, Request};
 use crate::value::{self, EnumChoices};
@@ -87,7 +88,7 @@ const UNUSED_STATE_VALUE: u32 = u32::MAX;
 /// How a record's fields map onto the node's value — the C's per-record `dset`
 /// (`devOpcua.cpp:1349-1370`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
+pub enum Op {
     /// longin, longout — VAL as an `epicsInt32`.
     Int32,
     /// int64in, int64out — VAL as an `epicsInt64`.
@@ -108,6 +109,9 @@ enum Op {
     LongString,
     /// waveform, aai, aao — VAL as an array, typed by FTVL.
     Array,
+    /// opcuaItem — no value of its own; it reads or writes the whole node
+    /// (`opcua_action_item`).
+    Item,
 }
 
 impl Op {
@@ -132,6 +136,11 @@ impl Op {
             "lso" => (Op::LongString, true),
             "waveform" | "aai" => (Op::Array, false),
             "aao" => (Op::Array, true),
+            // The item record has no value to write; its writes send what its
+            // element records put into the item, so the framework must run its
+            // *read* stage — which is the single `readwrite` entry the C's item
+            // dset has (`SUPI(devItemOpcua, opcuaItem, item, action)`).
+            "opcuaItem" => (Op::Item, false),
             _ => return None,
         })
     }
@@ -230,6 +239,88 @@ impl OpcuaDevice {
         Ok(DeviceReadOutcome::computed())
     }
 
+    /// Send whatever the item's element records have written into it (the C's
+    /// `pcon->requestOpcuaWrite()` on an item record).
+    fn request_write(&mut self) -> CaResult<()> {
+        let bound = self.bound()?;
+        let handle = bound.item.lock().client_handle;
+        bound
+            .session
+            .request(Priority::Low, Request::Write { handle });
+        Ok(())
+    }
+
+    /// The `opcuaItem` record processes (`opcua_action_item`,
+    /// `devOpcua.cpp:1265-1334`).
+    ///
+    /// The record has no value: it reads or writes the whole node, and shows
+    /// what came of it in STATCODE/STATTEXT. Which action it takes is the reason
+    /// it is processing for — a put to READ or WRITE ([`OpcuaItemRecord::special`]),
+    /// an update the item queued for it, or, for a process with no reason at all
+    /// (a put to VAL, a scan, a `.PROC`), DEFACTN.
+    fn item_action(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        let rec = item_record(record, &self.record_name)?;
+        // A put to READ/WRITE processes the record itself, so its reason takes
+        // this pass; an update stays queued for the pass its own pulse brings.
+        let ordered = rec.take_pending();
+        let default_reason = rec.default_reason();
+        let reason = match ordered {
+            Some(reason) => reason,
+            None => match self.bound()?.leaf.lock().queue.pop() {
+                Some((update, _)) => update.reason,
+                None => ProcessReason::None,
+            },
+        };
+
+        let state = self.bound()?.leaf.lock().state;
+        // The C returns 1 — leaving UDF set — for the three failures, and 0 for
+        // everything else, including a request refused because the session is
+        // down (`devOpcua.cpp:1271-1310` against `opcuaItemRecord.cpp:158-166`).
+        let mut ok = true;
+        if reason == ProcessReason::ConnectionLoss {
+            self.alarm = Some((COMM_ALARM, INVALID));
+            ok = false;
+        } else if state == ConnectionStatus::Down {
+            self.alarm = Some((COMM_ALARM, INVALID));
+        } else {
+            match reason {
+                ProcessReason::ReadFailure => {
+                    self.alarm = Some((READ_ALARM, INVALID));
+                    ok = false;
+                }
+                ProcessReason::WriteFailure => {
+                    self.alarm = Some((WRITE_ALARM, INVALID));
+                    ok = false;
+                }
+                ProcessReason::ReadRequest => {
+                    self.request_read()?;
+                }
+                ProcessReason::WriteRequest => self.request_write()?,
+                // No reason of its own: DEFACTN says what to do.
+                ProcessReason::None => match default_reason {
+                    ProcessReason::WriteRequest => self.request_write()?,
+                    _ => {
+                        self.request_read()?;
+                    }
+                },
+                // A value, or a write that completed — the item's status is all
+                // the item record takes from it.
+                _ => {}
+            }
+        }
+
+        let (status, timestamp) = {
+            let item = self.bound()?.item.lock();
+            (item.last_status, item.last_timestamp)
+        };
+        self.timestamp = timestamp;
+        let rec = item_record(record, &self.record_name)?;
+        rec.set_acted(ok);
+        rec.statcode = status.bits();
+        rec.stattext = truncate(&status.to_string(), 40).to_string();
+        Ok(DeviceReadOutcome::computed())
+    }
+
     /// The record's value goes to the server (`opcua_write_*`, the
     /// `reason == none || writeRequest` branch).
     fn send(&mut self, record: &mut dyn Record) -> CaResult<()> {
@@ -324,6 +415,7 @@ impl OpcuaDevice {
                 value::write_string(&long_string(record)?, incoming, choices).map_err(err)
             }
             Op::Array => outgoing_array(record, incoming).map_err(err),
+            Op::Item => Err("the item record has no value of its own".to_string()),
         }
     }
 
@@ -462,6 +554,8 @@ impl OpcuaDevice {
                 store_array(data, record)?;
                 Ok(DeviceReadOutcome::computed())
             }
+            // The item record takes no value from the node — its elements do.
+            Op::Item => Ok(DeviceReadOutcome::computed()),
         }
     }
 
@@ -649,28 +743,50 @@ impl DeviceSupport for OpcuaDevice {
 
         let kind = RecordKind {
             is_output,
-            is_item_record: false,
+            is_item_record: op == Op::Item,
         };
         let defaults = InfoDefaults::from_info(&self.info);
         let link = parse_link(&self.link_text, kind, &defaults, &*self.registry)
             .map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
 
         // `bini=write` is what an output record's own value is for; an input
-        // record has nothing to write.
-        if link.bini == Bini::Write && !is_output {
+        // record has nothing to write. An item record does: its elements' values,
+        // which go out as one structure.
+        if link.bini == Bini::Write && !is_output && op != Op::Item {
             log::warn!(
                 "{}: bini=write on the input record type '{record_type}'",
                 self.record_name
             );
         }
 
+        let names = (
+            link.session().unwrap_or_default().to_string(),
+            link.subscription().unwrap_or_default().to_string(),
+            link.bini,
+        );
+
         let (notify_tx, notify_rx) = mpsc::channel(1);
         let binding = self
             .registry
             .bind(&self.record_name, link, notify_tx)
             .map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
-        self.bound = Some(binding);
+        self.bound = Some(binding.clone());
         self.notify = Some(notify_rx);
+
+        if op == Op::Item {
+            // The C's `init_record`: the item record shows the session and the
+            // subscription its link named, takes the link's `bini` unless the
+            // database set one of its own, and keeps the item in `dpvt`
+            // (`opcuaItemRecord.cpp:56-71`).
+            let (session, subscription, bini) = names;
+            let item_record = item_record(record, &self.record_name)?;
+            item_record.sess = session;
+            item_record.subs = subscription;
+            if item_record.bini == 0 {
+                item_record.bini = bini_index(bini);
+            }
+            item_record.attach(binding);
+        }
 
         init_mask(record).map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
 
@@ -722,6 +838,9 @@ impl DeviceSupport for OpcuaDevice {
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.alarm = None;
+        if self.op == Op::Item {
+            return self.item_action(record);
+        }
         let popped = { self.bound()?.leaf.lock().queue.pop() };
         match popped {
             Some((update, _)) => self.deliver(update, record),
@@ -749,6 +868,26 @@ impl DeviceSupport for OpcuaDevice {
 }
 
 // ------------------------------------------------------------------ record fields
+
+/// The `opcuaItem` record behind a `&mut dyn Record` — the C reads the same
+/// fields straight off `prec`, having been given the concrete record type by its
+/// `dset`.
+fn item_record<'a>(record: &'a mut dyn Record, name: &str) -> CaResult<&'a mut OpcuaItemRecord> {
+    record
+        .as_any_mut()
+        .and_then(|any| any.downcast_mut::<OpcuaItemRecord>())
+        .ok_or_else(|| CaError::LinkError(format!("{name}: not an opcuaItem record")))
+}
+
+/// The `menuBini` index of a link's `bini` option — the two are the same menu
+/// (`opcuaItemRecord.dbd:8-12`, `linkParser.cpp` `LinkOptionBini`).
+fn bini_index(bini: Bini) -> u16 {
+    match bini {
+        Bini::Read => 0,
+        Bini::Ignore => 1,
+        Bini::Write => 2,
+    }
+}
 
 /// Install the MASK the mbb* conversions run over (`opcua_init_mask_read` and
 /// `opcua_init_mask_write`, `devOpcua.cpp:143-157`, which the C wires into the
