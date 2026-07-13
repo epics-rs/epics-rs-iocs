@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::param::{AsynType, ParamOps, ParamRegistry, ParamUpdate};
@@ -287,7 +287,8 @@ impl PortDriver for EigerDriver {
     ///     Y  C config   | S status
     ///     Z  I int32    | D float64    | S octet
     /// ```
-    fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let drv_info = req.drv_info.as_str();
         if let Some(reason) = self.ad.port_base.params.find_param(drv_info) {
             return Ok(DrvUserInfo::from_reason(reason));
         }

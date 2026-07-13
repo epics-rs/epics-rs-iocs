@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::user::AsynUser;
@@ -125,7 +125,8 @@ impl PortDriver for EurothermDriver {
     /// Bind a record link. A link that names an existing parameter resolves to
     /// it; any other link is a payload format (the C's `FMT=`) and gets a
     /// parameter of its own.
-    fn drv_user_create(&mut self, drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let drv_info = req.drv_info.as_str();
         if let Some(reason) = self.base().params.find_param(drv_info) {
             return Ok(DrvUserInfo::from_reason(reason));
         }
@@ -231,10 +232,16 @@ mod tests {
         let (mut driver, rx) = driver(0);
 
         // field(OUT, "@asyn(EURO1,1)SL%4.0lf")
-        let reason = driver.drv_user_create("SL%4.0lf", 1).unwrap().reason;
+        let reason = driver
+            .drv_user_create(&DrvUserRequest::new("SL%4.0lf", 1))
+            .unwrap()
+            .reason;
         // The same link on a second record resolves to the same parameter.
         assert_eq!(
-            driver.drv_user_create("SL%4.0lf", 1).unwrap().reason,
+            driver
+                .drv_user_create(&DrvUserRequest::new("SL%4.0lf", 1))
+                .unwrap()
+                .reason,
             reason
         );
 
@@ -251,14 +258,25 @@ mod tests {
     #[test]
     fn a_link_that_is_neither_a_parameter_nor_a_format_is_rejected() {
         let (mut driver, _rx) = driver(0);
-        assert!(driver.drv_user_create("NOT_A_FORMAT", 0).is_err());
-        assert!(driver.drv_user_create("SL%d", 0).is_err());
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("NOT_A_FORMAT", 0))
+                .is_err()
+        );
+        assert!(
+            driver
+                .drv_user_create(&DrvUserRequest::new("SL%d", 0))
+                .is_err()
+        );
     }
 
     #[test]
     fn a_stringout_on_euro_read_sends_a_read_request() {
         let (mut driver, rx) = driver(2);
-        let reason = driver.drv_user_create(READ_REQUEST, 0).unwrap().reason;
+        let reason = driver
+            .drv_user_create(&DrvUserRequest::new(READ_REQUEST, 0))
+            .unwrap()
+            .reason;
 
         let mut user = AsynUser::new(reason).with_addr(3);
         driver.write_octet(&mut user, b"SP").unwrap();
@@ -270,7 +288,10 @@ mod tests {
     #[test]
     fn an_address_that_is_not_a_single_digit_is_rejected() {
         let (mut driver, _rx) = driver(0);
-        let reason = driver.drv_user_create("SL%.0f", 0).unwrap().reason;
+        let reason = driver
+            .drv_user_create(&DrvUserRequest::new("SL%.0f", 0))
+            .unwrap()
+            .reason;
         let mut user = AsynUser::new(reason).with_addr(10);
         assert!(driver.write_float64(&mut user, 1.0).is_err());
 

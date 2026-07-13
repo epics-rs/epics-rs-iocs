@@ -85,7 +85,7 @@
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -442,7 +442,8 @@ impl PortDriver for LoveDriver {
     }
 
     /// C `create()` (asynDrvUser, `drvLove.c:1106-1138`).
-    fn drv_user_create(&mut self, drv_info: &str, addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let (drv_info, addr) = (req.drv_info.as_str(), req.addr);
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }

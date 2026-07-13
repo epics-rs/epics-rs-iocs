@@ -76,7 +76,7 @@
 //!   registries already reject a duplicate port *name* on their own.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -231,7 +231,7 @@ impl PortDriver for ColbyDriver {
     /// C `create()` (asynDrvUser): never reads `drvInfo`, dispatch is purely
     /// by `pasynManager->getAddr`. The shared reason value is meaningless
     /// here since every read/write override below branches on `user.addr`.
-    fn drv_user_create(&mut self, _drv_info: &str, _addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, _req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         Ok(DrvUserInfo::from_reason(0))
     }
 

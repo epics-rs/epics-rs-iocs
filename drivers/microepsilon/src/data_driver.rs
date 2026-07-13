@@ -123,7 +123,7 @@ use epics_rs::asyn::asyn_record;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -399,7 +399,8 @@ impl PortDriver for DataDriver {
 
     /// No `asynDrvUser` interface in C at all -- every addr resolves to
     /// *some* reason (see [`resolve_reason`]), never rejected at bind time.
-    fn drv_user_create(&mut self, _drv_info: &str, addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let addr = req.addr;
         Ok(DrvUserInfo::from_reason(resolve_reason(
             addr,
             self.disp_reason,
@@ -844,7 +845,9 @@ mod tests {
         let (mut driver, _keep_alive) = make_test_driver();
         let disp_reason = driver.disp_reason;
         for addr in A_DISP_CHAN1..=A_DISP_CHAN4 {
-            let info = driver.drv_user_create("", addr).unwrap();
+            let info = driver
+                .drv_user_create(&DrvUserRequest::new("", addr))
+                .unwrap();
             assert_eq!(info.reason, disp_reason);
         }
     }
@@ -853,7 +856,11 @@ mod tests {
     fn drv_user_create_never_rejects_any_address() {
         let (mut driver, _keep_alive) = make_test_driver();
         for addr in [-5, 0, 41, 999] {
-            assert!(driver.drv_user_create("", addr).is_ok());
+            assert!(
+                driver
+                    .drv_user_create(&DrvUserRequest::new("", addr))
+                    .is_ok()
+            );
         }
     }
 }

@@ -64,7 +64,7 @@
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -324,7 +324,8 @@ impl PortDriver for CoherentSdgDriver {
     /// C `create()` (asynDrvUser): `findCommand(addr)==NULL => asynError`
     /// — unlike Colby, CoherentSDG validates the address eagerly at
     /// record-bind time.
-    fn drv_user_create(&mut self, _drv_info: &str, addr: i32) -> AsynResult<DrvUserInfo> {
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let addr = req.addr;
         if find_spec(addr).is_some() {
             Ok(DrvUserInfo::from_reason(0))
         } else {
