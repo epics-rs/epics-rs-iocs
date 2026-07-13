@@ -64,9 +64,16 @@ fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, Strin
     Ok(Duration::from_secs_f64(seconds))
 }
 
-fn register(ports: &Ports, name: &str, trace: &Arc<TraceManager>, port: IpPortRuntime) {
-    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), trace.clone());
+fn register(
+    ports: &Ports,
+    name: &str,
+    trace: &Arc<TraceManager>,
+    port: IpPortRuntime,
+) -> Result<(), String> {
+    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), trace.clone())
+        .map_err(|e| e.to_string())?;
     ports.lock().expect("port list poisoned").push(port);
+    Ok(())
 }
 
 #[epics_rs::base::epics_main]
@@ -127,7 +134,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 1.0)?;
                 let port = create_mpc(&name, &octet, address, poll)
                     .map_err(|e| format!("MPCConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -163,7 +170,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 2.0)?;
                 let port = create_tpg261(&name, &octet, poll)
                     .map_err(|e| format!("TPG261Config failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -216,7 +223,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 4, 1.0)?;
                 let port = create_televac(&name, &octet, stations, relays, poll)
                     .map_err(|e| format!("TelevacConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -261,7 +268,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 1.0)?;
                 let port = create_mks(&name, &octet, gauges, poll)
                     .map_err(|e| format!("MKSConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -297,7 +304,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 1.0)?;
                 let port = create_nd261(&name, &octet, poll)
                     .map_err(|e| format!("ND261Config failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -336,7 +343,7 @@ async fn main() -> CaResult<()> {
                     .map_err(|_| format!("EurothermConfig: groupAddress {group} is not 0..9"))?;
                 let port = create_eurotherm(&name, &octet, group)
                     .map_err(|e| format!("EurothermConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));

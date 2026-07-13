@@ -87,7 +87,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     &port_name,
                     det.port_handle().clone(),
                     trace.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     det.pool().clone(),

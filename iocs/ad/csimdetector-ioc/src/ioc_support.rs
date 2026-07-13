@@ -115,7 +115,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     &port_name,
                     sim_rt.port_handle().clone(),
                     trace.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
 
                 // Address 0 is the 2-D array and doubles as the driver context.
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

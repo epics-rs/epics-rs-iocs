@@ -84,7 +84,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     .map_err(|e| format!("failed to create pvAccess detector: {e}"))?;
 
                 let port_handle = det_runtime.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle, trace.clone());
+                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle, trace.clone())
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     det_runtime.pool().clone(),

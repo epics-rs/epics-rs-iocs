@@ -74,7 +74,8 @@ fn tetramm_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-            );
+            )
+            .map_err(|e| e.to_string())?;
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)

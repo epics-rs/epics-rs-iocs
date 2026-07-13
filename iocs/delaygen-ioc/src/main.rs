@@ -154,7 +154,8 @@ async fn main() -> CaResult<()> {
                     &port,
                     runtime_handle.port_handle().clone(),
                     trace_c.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
                 ctx.println(&format!(
                     "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
                 ));
@@ -211,7 +212,8 @@ async fn main() -> CaResult<()> {
                     &my_port,
                     runtime_handle.port_handle().clone(),
                     trace_c.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },
@@ -285,7 +287,8 @@ async fn main() -> CaResult<()> {
                     &my_port,
                     runtime_handle.port_handle().clone(),
                     trace_c.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },
@@ -342,7 +345,8 @@ async fn main() -> CaResult<()> {
                     &my_port,
                     runtime_handle.port_handle().clone(),
                     trace_c.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },

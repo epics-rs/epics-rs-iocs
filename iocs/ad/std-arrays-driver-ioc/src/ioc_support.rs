@@ -84,7 +84,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     &port_name,
                     nd_rt.port_handle().clone(),
                     trace.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
 
                 // The single address-0 NDArray output doubles as the driver
                 // context for downstream plugin wiring.

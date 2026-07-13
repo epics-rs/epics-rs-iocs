@@ -121,7 +121,8 @@ async fn main() -> CaResult<()> {
                     &cfg_port,
                     runtime_handle.port_handle().clone(),
                     trace_c.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
                 // See drivers/microepsilon::data_driver's module doc
                 // (`PortRuntimeHandle` gap note): dropping the last handle
                 // to a port runtime closes its shutdown channel and the

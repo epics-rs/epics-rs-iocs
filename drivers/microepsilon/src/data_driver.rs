@@ -639,7 +639,7 @@ pub fn configure(
     let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
     *self_handle.lock().unwrap() = Some(runtime_handle.port_handle().clone());
 
-    asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), trace);
+    asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), trace)?;
 
     // See the module doc's `PortRuntimeHandle` gap note: both runtimes must
     // outlive this function.

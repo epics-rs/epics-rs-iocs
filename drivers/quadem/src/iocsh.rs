@@ -130,8 +130,8 @@ pub fn register_quadem_port(
     handle: PortHandle,
     pool: Arc<NDArrayPool>,
     outputs: &[Arc<parking_lot::Mutex<NDArrayOutput>>],
-) {
-    epics_rs::asyn::asyn_record::register_port(port_name, handle, trace.clone());
+) -> epics_rs::asyn::error::AsynResult<()> {
+    epics_rs::asyn::asyn_record::register_port(port_name, handle, trace.clone())?;
 
     mgr.set_driver(Arc::new(GenericDriverContext::new(
         pool,
@@ -143,6 +143,7 @@ pub fn register_quadem_port(
         mgr.wiring()
             .register_output(&format!("{port_name}:{addr}"), output.clone());
     }
+    Ok(())
 }
 
 /// C++ `drvAHxxxConfigure(portName, QEPortName, ringBufferSize, modelName)`.
@@ -225,7 +226,8 @@ pub fn ahxxx_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-            );
+            )
+            .map_err(|e| e.to_string())?;
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)
@@ -312,7 +314,8 @@ pub fn nsls_em_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-            );
+            )
+            .map_err(|e| e.to_string())?;
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)
@@ -383,7 +386,8 @@ pub fn fx4_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-            );
+            )
+            .map_err(|e| e.to_string())?;
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)
@@ -453,7 +457,8 @@ pub fn pcr4_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-            );
+            )
+            .map_err(|e| e.to_string())?;
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)
@@ -537,7 +542,8 @@ pub fn t4u_em_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-            );
+            )
+            .map_err(|e| e.to_string())?;
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)
@@ -628,7 +634,8 @@ pub fn t4u_direct_em_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-            );
+            )
+            .map_err(|e| e.to_string())?;
 
             *runtime.lock().unwrap() = Some(rt);
             Ok(CommandOutcome::Continue)

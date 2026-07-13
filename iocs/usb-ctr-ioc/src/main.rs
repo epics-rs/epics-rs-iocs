@@ -89,7 +89,8 @@ async fn main() -> CaResult<()> {
                     &port_name,
                     port_handle,
                     trace_c.clone(),
-                );
+                )
+                .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(ctr_rt);
                 Ok(CommandOutcome::Continue)

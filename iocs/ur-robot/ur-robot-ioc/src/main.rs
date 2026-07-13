@@ -50,9 +50,16 @@ fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, Strin
     Ok(Duration::from_secs_f64(seconds))
 }
 
-fn register(ports: &Ports, name: &str, trace: &Arc<TraceManager>, port: UrPortRuntime) {
-    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), trace.clone());
+fn register(
+    ports: &Ports,
+    name: &str,
+    trace: &Arc<TraceManager>,
+    port: UrPortRuntime,
+) -> Result<(), String> {
+    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), trace.clone())
+        .map_err(|e| e.to_string())?;
     ports.lock().expect("port list poisoned").push(port);
+    Ok(())
 }
 
 #[epics_rs::base::epics_main]
@@ -105,7 +112,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 0.1)?;
                 let port = create_dashboard(&name, &ip, poll)
                     .map_err(|e| format!("URDashboardConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -141,7 +148,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 0.02)?;
                 let port = create_receive(&name, &ip, poll)
                     .map_err(|e| format!("RTDEReceiveConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -178,7 +185,7 @@ async fn main() -> CaResult<()> {
                 let ip = string_arg(args, 1)?;
                 let port =
                     create_io(&name, &ip).map_err(|e| format!("RTDEInOutConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -220,7 +227,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 0.02)?;
                 let port = create_control(&name, &dash, &recv, poll)
                     .map_err(|e| format!("RTDEControlConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -256,7 +263,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 0.02)?;
                 let port = create_gripper(&name, &dash, poll)
                     .map_err(|e| format!("URGripperConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port);
+                register(&ports, &name, &trace, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
