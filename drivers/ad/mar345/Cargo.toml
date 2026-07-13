@@ -1,0 +1,11 @@
+[package]
+name = "ad-mar345"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "ad"] }
+# NDArrayOutput lives behind a parking_lot::Mutex (the ArrayPublisher input).
+parking_lot = "0.12"
+log = "0.4"

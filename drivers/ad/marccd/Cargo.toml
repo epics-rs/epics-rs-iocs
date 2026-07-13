@@ -1,0 +1,19 @@
+[package]
+name = "ad-marccd"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "ad"] }
+parking_lot = "0.12"
+# The marccd server is a second asyn port; a PortDriver method cannot block on
+# it, so all server I/O runs on worker threads that serialise access through an
+# async mutex (the C driver-lock analog). tokio::sync::Mutex is runtime-agnostic
+# and, unlike parking_lot, may be held across await points.
+tokio = { version = "1", features = ["sync"] }
+tiff = "0.11"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
