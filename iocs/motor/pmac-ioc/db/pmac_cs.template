@@ -1,0 +1,22 @@
+# Delta Tau PMAC coordinate-system (kinematic) axis. DTYP is
+# PMACCS_$(CS)_$(AXIS), the key registered by pmacAsynCoordCreate (CS name +
+# 1-based CS axis number: 1=A 2=B 3=C 4=U 5=V 6=W 7=X 8=Y 9=Z).
+#
+# A CS axis is driven in the EGU the coordinate system's position-reporting PLC
+# publishes on Q8n, so MRES = 1 (the C driver's stepsPerUnit was the same factor
+# applied twice, once in the driver and once as its reciprocal in MRES).
+#
+# Homing and jogging are not defined for a kinematic axis: HOMF/HOMR/JOGF/JOGR
+# return an error, as they do in the C driver.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PMACCS_$(CS)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=100)")
+    field(DLLM, "$(LLM=-100)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=4)")
+}

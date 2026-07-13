@@ -1,0 +1,24 @@
+# Delta Tau PMAC real (motor) axis: one motor record per axis. DTYP is
+# PMAC_$(CTRL)_$(AXIS), the key registered by pmacCreateAxis/pmacCreateAxes
+# (controller name + 1-based axis number).
+#
+# The driver speaks the controller's own counts: demands go out as `#n J=` in
+# counts and readbacks come back in counts, with no driver-side scaling. The
+# counts-per-EGU conversion is the record's MRES, exactly as for any other
+# controller (the C driver's pmacSetAxisScale was the same factor applied twice,
+# once in the driver and once as 1/scale in MRES).
+#
+# VELO is EGU/s and ACCL the time to velocity; the driver converts them into the
+# controller's I{n}22 (counts/msec) and I{n}20 (acceleration time, msec).
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "PMAC_$(CTRL)_$(AXIS)")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000)")
+    field(ACCL, "$(ACCL=0.5)")
+    field(DHLM, "$(HLM=100000)")
+    field(DLLM, "$(LLM=-100000)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=counts)")
+    field(PREC, "$(PREC=3)")
+}
