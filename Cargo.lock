@@ -2361,6 +2361,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "motor-pmac"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "motor-common",
+]
+
+[[package]]
 name = "motor-rs"
 version = "0.23.0"
 source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#e955db8965ac2993f5d16f8f2e9ea5b291aacecb"
@@ -2812,6 +2820,15 @@ version = "0.1.0"
 dependencies = [
  "epics-rs",
  "motor-newport",
+]
+
+[[package]]
+name = "pmac-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "motor-common",
+ "motor-pmac",
 ]
 
 [[package]]

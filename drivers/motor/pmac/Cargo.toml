@@ -1,0 +1,18 @@
+# Delta Tau Turbo PMAC / Geobrick motion controller driver, ported from
+# epics-modules/tpmac (pmacApp/pmacAsynMotorPortSrc — the model-3 asyn motor
+# driver — plus pmacApp/pmacAsynIPPortSrc, the PMAC ethernet packet framing,
+# and pmacApp/pmacAsynCoordSrc, the coordinate-system axis driver). Pure ASCII
+# protocol over an asyn octet port (serial, plain TCP, or the PMAC ethernet
+# framing installed by `pmacAsynIPConfigure`), so this crate builds and tests
+# on any host. The VME DPRAM paths (pmacApp/src, pmacApp/src_eth) are not
+# ported — see the crate docs for the classification.
+
+[package]
+name = "motor-pmac"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }

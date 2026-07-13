@@ -1,0 +1,15 @@
+# Delta Tau Turbo PMAC / Geobrick motor IOC binary. Wires the motor-pmac driver
+# to a serial, plain-TCP, or PMAC-ethernet octet port and one motor record per
+# axis (real axes and coordinate-system axes), exposing CA + PVA. No vendor
+# library — builds on any host.
+
+[package]
+name = "pmac-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+motor-pmac = { path = "../../../drivers/motor/pmac" }
+motor-common = { path = "../../../drivers/motor/common" }
+epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }
