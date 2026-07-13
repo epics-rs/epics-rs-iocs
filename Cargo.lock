@@ -2888,6 +2888,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opcua-ioc"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "opcua",
+]
+
+[[package]]
 name = "oriel-ioc"
 version = "0.1.0"
 dependencies = [
