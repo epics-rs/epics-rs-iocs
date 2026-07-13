@@ -197,15 +197,14 @@ impl Registry {
     /// a data element of an `opcuaItem` record (`opcua_add_record`,
     /// `devOpcua.cpp:88-110`).
     ///
-    /// Framework gap, and the reason an element record's item is created on
-    /// demand rather than looked up: `epics_rs` wires device support in
-    /// `HashMap` order (`ioc_app.rs:1087`, over `PvDatabase::all_record_names`,
-    /// whose `records` is a `HashMap`), so the order records bind in is neither
-    /// the database's load order nor stable from one run to the next. The C
-    /// binds as each record is *loaded* — `opcua_add_record` is a device support
-    /// extension — and can therefore require the `opcuaItem` record to be
-    /// already initialized (`linkParser.cpp:226-234`); requiring that here would
-    /// make an example database from the C module fail at random.
+    /// Why an element record's item is created on demand rather than looked
+    /// up: the C binds as each record is *loaded* — `opcua_add_record` is a
+    /// device support extension — and can therefore require the `opcuaItem`
+    /// record to be already initialized (`linkParser.cpp:226-234`). epics-rs
+    /// wires device support in database load order too since PR #29 (it was
+    /// `HashMap` order before, which made the C module's example database fail
+    /// at random), but this port keeps binding order-independent rather than
+    /// reintroducing the C's declaration-order requirement.
     ///
     /// So both an element record and the item record itself reach the item
     /// through [`Self::item_of_record`], and whichever of the two binds first

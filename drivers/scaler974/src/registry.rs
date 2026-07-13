@@ -20,14 +20,13 @@
 //! (`"Asyn Scaler"`) for every scaler974 instance: nothing in the current
 //! `DeviceSupportContext` can tell two `scalerRecord`s apart at bind time.
 //!
-//! A call-order (FIFO) fallback was considered and rejected: `PvDatabase`
-//! stores records in a plain `HashMap`
-//! (`server/database/mod.rs::PvDatabaseInner::records`), and
-//! `wire_device_support` walks it via `all_record_names()` -- iteration
-//! order is not insertion order and isn't stable across runs, so a FIFO
-//! match would silently bind the wrong driver to the wrong record on some
-//! fraction of IOC boots. That failure mode is worse than refusing
-//! multi-instance outright.
+//! A call-order (FIFO) fallback was considered and rejected: it would tie
+//! correctness to `wire_device_support`'s iteration order. That order is
+//! database load order since epics-rs PR #29 (`all_record_names()`), but a
+//! FIFO match would still silently bind the wrong driver to the wrong
+//! record whenever `st.cmd` interleaves configure calls and `dbLoadRecords`
+//! differently than the records are declared. That failure mode is worse
+//! than refusing multi-instance outright.
 //!
 //! Given that, this registry supports **exactly one** pending Scaler974
 //! instance at a time: [`register`] fails loudly if a previously

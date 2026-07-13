@@ -23,7 +23,7 @@ dependencies = [
 [[package]]
 name = "ad-core-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -90,7 +90,7 @@ dependencies = [
 [[package]]
 name = "ad-plugins-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
@@ -411,7 +411,7 @@ dependencies = [
 [[package]]
 name = "asyn-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "bitflags",
  "epics-base-rs",
@@ -1224,7 +1224,7 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 [[package]]
 name = "epics-base-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1246,7 +1246,7 @@ dependencies = [
 [[package]]
 name = "epics-bridge-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1269,7 +1269,7 @@ dependencies = [
 [[package]]
 name = "epics-ca-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1291,7 +1291,7 @@ dependencies = [
 [[package]]
 name = "epics-macros-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1302,7 +1302,7 @@ dependencies = [
 [[package]]
 name = "epics-modbus-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -1315,7 +1315,7 @@ dependencies = [
 [[package]]
 name = "epics-pva-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "bytes",
  "chrono",
@@ -1353,7 +1353,7 @@ dependencies = [
 [[package]]
 name = "epics-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -2599,7 +2599,7 @@ dependencies = [
 [[package]]
 name = "motor-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "asyn-rs",
  "bitflags",
@@ -3681,7 +3681,7 @@ dependencies = [
 [[package]]
 name = "scaler-rs"
 version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#5ec24db94daff0d20825518900f50c72de73d500"
+source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",

@@ -142,12 +142,12 @@ impl Item {
     /// An item whose node and session are not known yet.
     ///
     /// An element record's link names its `opcuaItem` record, and that record's
-    /// device support is what tells the item which node and session it is on —
-    /// but the framework wires device support in `HashMap` order
-    /// (`ioc_app.rs:1087`, over `PvDatabase::all_record_names`), not in database
-    /// load order, so an element record can bind before the item record it is an
-    /// element of. The item exists from whichever of the two binds first, and the
-    /// item record's binding adopts it.
+    /// device support is what tells the item which node and session it is on.
+    /// The framework wires device support in database load order (epics-rs
+    /// PR #29; it was `HashMap` order before), but this port does not depend on
+    /// it: an element record declared above its item record still binds first.
+    /// The item exists from whichever of the two binds first, and the item
+    /// record's binding adopts it.
     pub fn pending() -> Self {
         Self {
             link: LinkInfo::default(),
