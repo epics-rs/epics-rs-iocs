@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 
 use crate::link::{Bini, LinkInfo, TimestampSource};
 use crate::queue::{ConnectionStatus, ProcessReason, Update, UpdateQueue};
+use crate::session::{Priority, Request, SessionHandle};
 use crate::value::EnumChoices;
 
 /// One record's binding to an item (`DataElementOpen62541Leaf` +
@@ -120,24 +121,94 @@ pub struct Item {
     /// The server's data type dictionary, needed to rebuild a structure around a
     /// changed element.
     pub type_tree: Option<Arc<DataTypeTree>>,
+    /// The session the item's node lives on — `None` until
+    /// [`Item::adopt`] puts it there.
+    ///
+    /// A record only ever reaches its session *through* its item, so this is the
+    /// one place the two are tied together, and it is set exactly when the item
+    /// enters `SessionHandle::items` (which is what [`Self::client_handle`]
+    /// indexes).
+    session: Option<Arc<SessionHandle>>,
+}
+
+/// What a record asks its item's session to do with the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Read,
+    Write,
 }
 
 impl Item {
-    pub fn new(link: LinkInfo, node_id: NodeId, client_handle: u32) -> Self {
+    /// An item whose node and session are not known yet.
+    ///
+    /// An element record's link names its `opcuaItem` record, and that record's
+    /// device support is what tells the item which node and session it is on —
+    /// but the framework wires device support in `HashMap` order
+    /// (`ioc_app.rs:1087`, over `PvDatabase::all_record_names`), not in database
+    /// load order, so an element record can bind before the item record it is an
+    /// element of. The item exists from whichever of the two binds first, and the
+    /// item record's binding adopts it.
+    pub fn pending() -> Self {
         Self {
-            link,
-            configured_node_id: node_id.clone(),
-            node_id,
+            link: LinkInfo::default(),
+            configured_node_id: NodeId::null(),
+            node_id: NodeId::null(),
             registered_node_id: None,
             data_type: None,
             state: ConnectionStatus::Down,
-            client_handle,
+            client_handle: 0,
             leaves: Vec::new(),
             last_value: None,
             last_status: StatusCode::Good,
             last_timestamp: None,
             type_tree: None,
+            session: None,
         }
+    }
+
+    /// The record that *addresses the node* has bound: the item is on this
+    /// session, at this node, under this client handle.
+    pub fn adopt(
+        &mut self,
+        link: LinkInfo,
+        node_id: NodeId,
+        client_handle: u32,
+        session: Arc<SessionHandle>,
+    ) {
+        self.link = link;
+        self.configured_node_id = node_id.clone();
+        self.node_id = node_id;
+        self.client_handle = client_handle;
+        self.session = Some(session);
+    }
+
+    /// Whether the item ever found the record that addresses its node
+    /// ([`Item::adopt`]).
+    pub fn is_adopted(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Ask the session to read or write the node
+    /// (`RecordConnector::requestOpcuaRead`/`requestOpcuaWrite`).
+    ///
+    /// Framework gap: a record's PRIO lives in `RecordInstance.common`, which
+    /// device support cannot reach (`set_record_info` passes the name and the
+    /// scan, nothing else), so the C's three priority queues
+    /// (`RequestQueueBatcher`, one per `menuPriority`) collapse to one here.
+    pub fn request(&self, priority: Priority, action: Action) {
+        let Some(session) = &self.session else {
+            // The item was never adopted: the `opcuaItem` record its records link
+            // to is not in the database. `Registry::start` reports that.
+            return;
+        };
+        let handle = self.client_handle;
+        session.request(
+            priority,
+            match action {
+                Action::Read => Request::Read { handle },
+                Action::Write => Request::Write { handle },
+            },
+        );
     }
 
     /// The node id to use on the wire: the registered one when the server gave

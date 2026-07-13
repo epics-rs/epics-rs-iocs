@@ -51,11 +51,12 @@ use epics_rs::base::server::record::{ProcessContext, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
 
+use crate::item::Action;
 use crate::link::{Bini, InfoDefaults, RecordKind, parse_link};
 use crate::queue::{ConnectionStatus, ProcessReason, Update};
 use crate::record::OpcuaItemRecord;
 use crate::registry::{Binding, Registry};
-use crate::session::{Priority, Request};
+use crate::session::Priority;
 use crate::value::{self, EnumChoices};
 
 /// The DTYP every OPC UA record uses (`opcua.dbd`: `device(ai, INST_IO,
@@ -217,22 +218,19 @@ impl OpcuaDevice {
             .ok_or_else(|| CaError::LinkError(format!("{}: link not bound", self.record_name)))
     }
 
+    /// The item and the leaf this record's link bound to — the C's `prec->dpvt`.
+    pub fn binding(&self) -> Option<&Binding> {
+        self.bound.as_ref()
+    }
+
     /// The record wants a value it does not have: ask the session to read the
     /// node (the C's `pcon->requestOpcuaRead()`).
-    ///
-    /// Framework gap: a record's PRIO lives in `RecordInstance.common`, which
-    /// device support cannot reach (`set_record_info` passes the name and the
-    /// scan, nothing else), so the C's three priority queues
-    /// (`RequestQueueBatcher`, one per `menuPriority`) collapse to one here.
     fn request_read(&mut self) -> CaResult<DeviceReadOutcome> {
         let bound = self.bound()?;
         if bound.leaf.lock().state == ConnectionStatus::Down {
             self.alarm = Some((COMM_ALARM, INVALID));
         } else {
-            let handle = bound.item.lock().client_handle;
-            bound
-                .session
-                .request(Priority::Low, Request::Read { handle });
+            bound.item.lock().request(Priority::Low, Action::Read);
         }
         // Nothing about the record's value changed on this pass, so its
         // conversion must not run again over an unchanged RVAL.
@@ -242,11 +240,10 @@ impl OpcuaDevice {
     /// Send whatever the item's element records have written into it (the C's
     /// `pcon->requestOpcuaWrite()` on an item record).
     fn request_write(&mut self) -> CaResult<()> {
-        let bound = self.bound()?;
-        let handle = bound.item.lock().client_handle;
-        bound
-            .session
-            .request(Priority::Low, Request::Write { handle });
+        self.bound()?
+            .item
+            .lock()
+            .request(Priority::Low, Action::Write);
         Ok(())
     }
 
@@ -366,10 +363,7 @@ impl OpcuaDevice {
         // decides when the structure goes out (WOC).
         if !linked_to_item && matches!(state, ConnectionStatus::Up | ConnectionStatus::InitialWrite)
         {
-            let handle = bound.item.lock().client_handle;
-            bound
-                .session
-                .request(Priority::Low, Request::Write { handle });
+            bound.item.lock().request(Priority::Low, Action::Write);
         }
         Ok(())
     }

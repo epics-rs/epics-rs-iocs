@@ -197,10 +197,12 @@ fn node_id_of(link: &LinkInfo) -> NodeId {
     }
 }
 
-/// One item with one record bound to the whole node.
-fn item(text: &str, kind: RecordKind, handle: u32) -> (Arc<Mutex<Item>>, Arc<Mutex<Leaf>>) {
+/// One item with one record bound to the whole node. The item is adopted — given
+/// its node, its client handle and its session — when [`spawn`] puts it on a
+/// session, which is where a `Registry` adopts one too.
+fn item(text: &str, kind: RecordKind) -> (Arc<Mutex<Item>>, Arc<Mutex<Leaf>>) {
     let info = link(text, kind);
-    let mut item = Item::new(info.clone(), node_id_of(&info), handle);
+    let mut item = Item::pending();
     // A capacity of one is all a test needs; the record end of the channel is
     // dropped, so a pulse that finds no room is simply dropped.
     let (notify, _rx) = mpsc::channel(1);
@@ -215,6 +217,12 @@ fn spawn(
     items: Vec<Arc<Mutex<Item>>>,
 ) -> Arc<SessionHandle> {
     let (handle, worker) = session::create(config, Arc::new(MockConnector(mock.clone())));
+    for (client_handle, item) in items.iter().enumerate() {
+        let mut item = item.lock();
+        let info = item.leaves[0].lock().link.clone();
+        let node_id = node_id_of(&info);
+        item.adopt(info, node_id, client_handle as u32, handle.clone());
+    }
     *handle.items.lock() = items;
     tokio::spawn(worker.run());
     handle
@@ -364,8 +372,8 @@ async fn connecting_reads_every_item_once() {
     mock.values
         .lock()
         .insert(NodeId::new(2, "Sensor"), Variant::Int32(11));
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
-    let (item1, leaf1) = item("sess ns=2;s=Other monitor=n", INPUT, 1);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let (item1, leaf1) = item("sess ns=2;s=Other monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -391,7 +399,7 @@ async fn connecting_reads_every_item_once() {
 #[tokio::test]
 async fn the_data_type_read_alongside_the_value_lands_on_the_item() {
     let mock = Mock::arc();
-    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -406,7 +414,7 @@ async fn the_data_type_read_alongside_the_value_lands_on_the_item() {
 #[tokio::test]
 async fn a_session_that_does_not_autoconnect_waits_for_the_connect_command() {
     let mock = Mock::arc();
-    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     config.autoconnect = false;
 
@@ -426,7 +434,7 @@ async fn a_session_that_does_not_autoconnect_waits_for_the_connect_command() {
 #[tokio::test]
 async fn bini_write_asks_the_record_to_write_after_the_initial_read() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("sess ns=2;s=Sensor bini=write monitor=n", OUTPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor bini=write monitor=n", OUTPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -449,7 +457,7 @@ async fn bini_write_asks_the_record_to_write_after_the_initial_read() {
 #[tokio::test]
 async fn a_dirty_leaf_is_written_when_the_record_requests_it() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -475,7 +483,7 @@ async fn a_dirty_leaf_is_written_when_the_record_requests_it() {
 #[tokio::test]
 async fn bini_ignore_drops_the_initial_read_but_still_learns_the_type() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("sess ns=2;s=Sensor bini=ignore monitor=n", OUTPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor bini=ignore monitor=n", OUTPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -492,7 +500,7 @@ async fn bini_ignore_drops_the_initial_read_but_still_learns_the_type() {
 #[tokio::test]
 async fn a_registered_node_is_the_one_the_service_calls_use() {
     let mock = Mock::arc();
-    let (item0, _leaf0) = item("sess ns=2;s=Sensor register=y monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor register=y monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -517,7 +525,7 @@ async fn the_namespace_map_moves_an_item_onto_the_servers_index() {
     ];
     let mock = Arc::new(mock);
 
-    let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     config.namespace_map.insert(4, "urn:sensors".to_string());
 
@@ -531,7 +539,7 @@ async fn the_namespace_map_moves_an_item_onto_the_servers_index() {
 #[tokio::test]
 async fn an_item_whose_namespace_the_server_does_not_have_keeps_its_index() {
     let mock = Mock::arc();
-    let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("sess ns=4;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     config.namespace_map.insert(4, "urn:absent".to_string());
 
@@ -545,7 +553,7 @@ async fn an_item_whose_namespace_the_server_does_not_have_keeps_its_index() {
 #[tokio::test]
 async fn a_records_read_request_reaches_the_server() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -569,7 +577,7 @@ async fn a_records_read_request_reaches_the_server() {
 #[tokio::test]
 async fn a_records_write_request_carries_its_value() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -597,7 +605,7 @@ async fn a_records_write_request_carries_its_value() {
 async fn a_failed_write_reaches_the_record_as_a_write_failure() {
     let mock = Mock::arc();
     mock.behave(|b| b.write_status = Some(StatusCode::BadTypeMismatch));
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", OUTPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -625,7 +633,7 @@ async fn a_failed_write_reaches_the_record_as_a_write_failure() {
 #[tokio::test]
 async fn a_failed_read_reaches_the_record_as_a_read_failure() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -652,7 +660,7 @@ async fn a_failed_read_reaches_the_record_as_a_read_failure() {
 async fn a_server_that_returns_too_few_results_does_not_read_past_the_end() {
     let mock = Mock::arc();
     mock.behave(|b| b.truncate_read = true);
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -674,9 +682,9 @@ async fn a_batch_is_split_at_the_servers_limit() {
     mock.server.max_nodes_per_read = 2;
     let mock = Arc::new(mock);
 
-    let (item0, _l0) = item("sess ns=2;s=A monitor=n", INPUT, 0);
-    let (item1, _l1) = item("sess ns=2;s=B monitor=n", INPUT, 1);
-    let (item2, _l2) = item("sess ns=2;s=C monitor=n", INPUT, 2);
+    let (item0, _l0) = item("sess ns=2;s=A monitor=n", INPUT);
+    let (item1, _l1) = item("sess ns=2;s=B monitor=n", INPUT);
+    let (item2, _l2) = item("sess ns=2;s=C monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -703,8 +711,8 @@ async fn a_high_priority_request_goes_out_before_a_low_priority_one() {
     mock.server.max_nodes_per_read = 2;
     let mock = Arc::new(mock);
 
-    let (item0, _l0) = item("sess ns=2;s=Low monitor=n", INPUT, 0);
-    let (item1, _l1) = item("sess ns=2;s=High monitor=n", INPUT, 1);
+    let (item0, _l0) = item("sess ns=2;s=Low monitor=n", INPUT);
+    let (item1, _l1) = item("sess ns=2;s=High monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     // Hold the batch back long enough for both requests to be queued.
     config.read_timeout_min = 30.0;
@@ -727,7 +735,7 @@ async fn a_high_priority_request_goes_out_before_a_low_priority_one() {
 #[tokio::test]
 async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     config.autoconnect = false;
 
@@ -751,7 +759,7 @@ async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
 #[tokio::test]
 async fn requests_queued_for_a_lost_connection_are_dropped() {
     let mock = Mock::arc();
-    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     config.autoconnect = false;
     // A hold-off long enough that the queued read is still waiting when the
@@ -778,7 +786,7 @@ async fn requests_queued_for_a_lost_connection_are_dropped() {
 #[tokio::test]
 async fn a_disconnected_session_reconnects_when_it_autoconnects() {
     let mock = Mock::arc();
-    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
 
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -804,7 +812,6 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
     let (item0, _leaf0) = item(
         "subs ns=2;s=Sensor sampling=250 qsize=8 discard=new deadband=0.5",
         INPUT,
-        0,
     );
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
@@ -843,7 +850,7 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
 #[tokio::test]
 async fn an_unmonitored_item_gets_no_monitored_item() {
     let mock = Mock::arc();
-    let (item0, _leaf0) = item("subs ns=2;s=Sensor monitor=n", INPUT, 0);
+    let (item0, _leaf0) = item("subs ns=2;s=Sensor monitor=n", INPUT);
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
         &mock,
@@ -861,8 +868,8 @@ async fn an_unmonitored_item_gets_no_monitored_item() {
 #[tokio::test]
 async fn a_value_the_server_pushes_reaches_the_item_its_handle_names() {
     let mock = Mock::arc();
-    let (item0, leaf0) = item("subs ns=2;s=A", INPUT, 0);
-    let (item1, leaf1) = item("subs ns=2;s=B", INPUT, 1);
+    let (item0, leaf0) = item("subs ns=2;s=A", INPUT);
+    let (item1, leaf1) = item("subs ns=2;s=B", INPUT);
     let handle = spawn(
         SessionConfig::new("sess", "opc.tcp://host"),
         &mock,

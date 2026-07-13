@@ -41,9 +41,12 @@ struct Inner {
 /// Cloneable because an `opcuaItem` record needs it as well as its device
 /// support does — it is the C's `prec->dpvt`, which the record's `special()`
 /// reaches through (`opcuaItemRecord.cpp:107-125`).
+///
+/// There is no session here: a record reaches its session through its item
+/// ([`Item::request`]), which is the only thing that knows which session the
+/// node is on.
 #[derive(Clone, Debug)]
 pub struct Binding {
-    pub session: Arc<SessionHandle>,
     pub item: Arc<Mutex<Item>>,
     pub leaf: Arc<Mutex<Leaf>>,
 }
@@ -152,9 +155,38 @@ impl Registry {
 
     /// Start every session's worker. Called once, after `iocInit`, so that the
     /// items of every record are in place before the first connection.
+    ///
+    /// Deviation, forced by the framework gap in [`Self::bind`]: an element
+    /// record whose link names an `opcuaItem` record that is not in the database
+    /// is reported here rather than refused at init. The C can refuse it, because
+    /// it parses the link as each record is *loaded* (`opcua_add_record` is a
+    /// device support extension, `devOpcua.cpp:88`), by which point every record
+    /// loaded before it is initialized; this port parses at `iocInit`, in an
+    /// order that says nothing about which record was loaded first, so "the item
+    /// record has not bound yet" and "there is no such item record" are only
+    /// distinguishable once every record has bound.
     pub fn start(&self) -> usize {
-        let workers = std::mem::take(&mut self.inner.lock().workers);
+        let mut inner = self.inner.lock();
+        for (name, item) in &inner.item_records {
+            let item = item.lock();
+            if item.is_adopted() {
+                continue;
+            }
+            let records: Vec<String> = item
+                .leaves
+                .iter()
+                .map(|leaf| leaf.lock().record.clone())
+                .collect();
+            log::error!(
+                "no opcuaItem record '{name}' with OPCUA device support is loaded; \
+                 the records linked to it will never update: {}",
+                records.join(", ")
+            );
+        }
+
+        let workers = std::mem::take(&mut inner.workers);
         let started = workers.len();
+        drop(inner);
         for worker in workers {
             tokio::spawn(worker.run());
         }
@@ -162,8 +194,23 @@ impl Registry {
     }
 
     /// Bind one record to its item: a new item on a session or subscription, or
-    /// a data element of an already-loaded `opcuaItem` record
-    /// (`opcua_add_record`, `devOpcua.cpp:88-110`).
+    /// a data element of an `opcuaItem` record (`opcua_add_record`,
+    /// `devOpcua.cpp:88-110`).
+    ///
+    /// Framework gap, and the reason an element record's item is created on
+    /// demand rather than looked up: `epics_rs` wires device support in
+    /// `HashMap` order (`ioc_app.rs:1087`, over `PvDatabase::all_record_names`,
+    /// whose `records` is a `HashMap`), so the order records bind in is neither
+    /// the database's load order nor stable from one run to the next. The C
+    /// binds as each record is *loaded* — `opcua_add_record` is a device support
+    /// extension — and can therefore require the `opcuaItem` record to be
+    /// already initialized (`linkParser.cpp:226-234`); requiring that here would
+    /// make an example database from the C module fail at random.
+    ///
+    /// So both an element record and the item record itself reach the item
+    /// through [`Self::item_of_record`], and whichever of the two binds first
+    /// creates it. The item record's binding is the one that [`Item::adopt`]s it:
+    /// gives it its node, its session and its client handle.
     pub fn bind(
         &self,
         record: &str,
@@ -177,29 +224,9 @@ impl Registry {
         )));
 
         if let LinkTarget::ItemRecord(item_record) = &link.target {
-            // The item record must already be loaded — the C looks its
-            // `RecordConnector` up in the database and refuses the link if it
-            // has not been initialized (`linkParser.cpp:226-234`).
-            let inner = self.inner.lock();
-            let item = inner
-                .item_records
-                .get(item_record)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "opcuaItem record '{item_record}' is not loaded yet; \
-                     it must be loaded before the records that are its elements"
-                    )
-                })?;
-            let session_name = item.lock().link.session().unwrap_or_default().to_string();
-            let session = inner.sessions[&session_name].clone();
-            drop(inner);
+            let item = self.item_of_record(item_record);
             item.lock().leaves.push(leaf.clone());
-            return Ok(Binding {
-                session,
-                item,
-                leaf,
-            });
+            return Ok(Binding { item, leaf });
         }
 
         let session_name = link
@@ -209,28 +236,33 @@ impl Registry {
         let session = self.session(&session_name)?;
         let node_id = node_id_of(&link)?;
 
-        let item = {
+        let item = if link.is_item_record {
+            self.item_of_record(record)
+        } else {
+            Arc::new(Mutex::new(Item::pending()))
+        };
+        {
             let mut items = session.items.lock();
             let client_handle = items.len() as u32;
-            let mut item = Item::new(link.clone(), node_id, client_handle);
-            item.leaves.push(leaf.clone());
-            let item = Arc::new(Mutex::new(item));
+            let mut locked = item.lock();
+            locked.adopt(link, node_id, client_handle, session.clone());
+            locked.leaves.push(leaf.clone());
+            drop(locked);
             items.push(item.clone());
-            item
-        };
-
-        if link.is_item_record {
-            self.inner
-                .lock()
-                .item_records
-                .insert(record.to_string(), item.clone());
         }
 
-        Ok(Binding {
-            session,
-            item,
-            leaf,
-        })
+        Ok(Binding { item, leaf })
+    }
+
+    /// The item of an `opcuaItem` record, by that record's name — created empty
+    /// if neither that record nor one of its element records has bound yet.
+    fn item_of_record(&self, record: &str) -> Arc<Mutex<Item>> {
+        self.inner
+            .lock()
+            .item_records
+            .entry(record.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(Item::pending())))
+            .clone()
     }
 }
 

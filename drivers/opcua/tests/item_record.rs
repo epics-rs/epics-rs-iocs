@@ -341,6 +341,58 @@ fn the_nodes_status_lands_in_statcode_and_stattext() {
     assert_eq!(record.ostatcode, record.statcode);
 }
 
+// ------------------------------------------------------------- the binding order
+
+#[tokio::test]
+async fn an_element_record_may_bind_before_the_item_record_it_belongs_to() {
+    // The framework wires device support in `HashMap` order, so this is the order
+    // half the runs will take. The item exists from whichever record binds first;
+    // the item record's binding is the one that gives it its node and its session.
+    let mock = Arc::new(Mock::default());
+    let registry = live(&mock);
+
+    let mut element = LongoutRecord::new(0);
+    let mut element_device = bind(&registry, "EL", &mut element, "ITEM");
+
+    let mut item = OpcuaItemRecord::default();
+    let mut item_device = bind(&registry, "ITEM", &mut item, "S ns=2;s=Struct monitor=n");
+    let leaf = leaf_of(&mut item);
+    registry.start();
+    settled(&mock, &leaf).await;
+
+    // The element is on the item the item record adopted: its value goes out in
+    // the item's write, and the write reaches the server.
+    element.put_field("VAL", EpicsValue::Long(5)).unwrap();
+    element.process().unwrap();
+    element_device
+        .write(&mut element)
+        .expect("the value is set");
+    put(&mut item, "WRITE", EpicsValue::Char(1));
+    process(&mut item_device, &mut item);
+
+    until(|| !mock.calls.lock().writes.is_empty()).await;
+    let writes = mock.calls.lock().writes.clone();
+    assert_eq!(writes[0][0].value.value, Some(Variant::Int32(5)));
+}
+
+#[tokio::test]
+async fn an_element_record_whose_item_record_is_not_in_the_database_is_reported() {
+    // The C refuses the link at load; this port cannot tell "not bound yet" from
+    // "not in the database" until every record has bound, so `start` is where it
+    // is found. The element must not take the IOC down, and must not be adopted.
+    let registry = offline();
+    let mut element = LongoutRecord::new(0);
+    let device = bind(&registry, "EL", &mut element, "MISSING");
+
+    registry.start();
+
+    let binding = device.binding().expect("the element bound to an item");
+    assert!(
+        !binding.item.lock().is_adopted(),
+        "no item record ever gave the item a node or a session"
+    );
+}
+
 // -------------------------------------------------------------------- the actions
 
 #[tokio::test]

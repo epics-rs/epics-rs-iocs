@@ -88,6 +88,14 @@ pub enum LinkTarget {
     ItemRecord(String),
 }
 
+impl Default for LinkTarget {
+    /// No session — an item that has not been adopted yet
+    /// ([`crate::item::Item::pending`]).
+    fn default() -> Self {
+        Self::Session(String::new())
+    }
+}
+
 /// Tells the parser what an existing name refers to. The session and
 /// subscription registries are populated by iocsh before `dbLoadRecords`, so a
 /// name that is in neither can only be an `opcuaItem` record — whose existence
@@ -100,7 +108,11 @@ pub trait NameResolver {
 }
 
 /// Parsed configuration of one record's link (`struct linkInfo`, `devOpcua.h:81`).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Default` is what an item that has not been adopted by the record addressing
+/// its node holds ([`crate::item::Item::pending`]) — not a link any record has;
+/// [`parse_link`] builds every real one from the module defaults.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LinkInfo {
     /// The link names a session or subscription, so this record addresses an OPC
     /// UA node directly. `false` when it names an `opcuaItem` record instead
