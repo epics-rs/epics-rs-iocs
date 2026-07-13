@@ -12,6 +12,7 @@ members = [
     "drivers/ad/eiger",
     "drivers/ad/mythen",
     "drivers/ad/timepix3",
+    "drivers/ad/specs-analyser",
     "drivers/d435i",
     "drivers/ad/merlin",
     "drivers/ad/photonii",
@@ -70,6 +71,9 @@ members = [
     "drivers/ether-ip",
     "drivers/ur-robot",
     "drivers/ip",
+    "drivers/yokogawa-gm10",
+    "drivers/yokogawa-mw100",
+    "iocs/ad/specs-analyser-ioc",
     "iocs/d435i-ioc",
     "iocs/ad/merlin-ioc",
     "iocs/ad/photonii-ioc",
@@ -132,6 +136,8 @@ members = [
     "iocs/scaler974-ioc",
     "iocs/syringepump-ioc",
     "iocs/microepsilon-ioc",
+    "iocs/yokogawa-gm10-ioc",
+    "iocs/yokogawa-mw100-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC

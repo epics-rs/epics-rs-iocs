@@ -1,0 +1,13 @@
+# Yokogawa GM10 data-acquisition-unit IOC binary. Wires the yokogawa-gm10
+# driver's dynamic DeviceSupport factory (no asyn — GM10's wire protocol is
+# proprietary TCP ASCII/binary, not Modbus) and exposes CA + PVA.
+
+[package]
+name = "yokogawa-gm10-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+yokogawa-gm10 = { path = "../../drivers/yokogawa-gm10" }
+epics-rs = { workspace = true, features = ["bridge"] }

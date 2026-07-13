@@ -1,0 +1,14 @@
+# SPECS Phoibos electron analyser IOC binary. Wires the specs-analyser driver
+# to an IP octet port (drvAsynIPPortConfigure) via AdIoc, exposing CA + PVA.
+
+[package]
+name = "specs-analyser-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ad-specs-analyser = { path = "../../../drivers/ad/specs-analyser" }
+epics-rs = { workspace = true, features = ["asyn", "ad", "ioc", "pva", "bridge"] }
+ad-plugins-rs = { workspace = true, features = ["ioc", "pva"] }
+tokio = { version = "1", features = ["full"] }

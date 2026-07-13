@@ -1,0 +1,16 @@
+# SPECS Phoibos electron analyser driver, ported from epics-modules
+# specsAnalyser (specsAnalyserApp/src/specsAnalyser.cpp). ADDriver-derived:
+# ASCII/TCP command-response protocol over an underlying asyn octet port,
+# producing spectrum/image Float64Array data. Pure protocol logic — no
+# vendor library, builds/tests on any host.
+
+[package]
+name = "ad-specs-analyser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "ad"] }
+parking_lot = "0.12"
+log = "0.4"

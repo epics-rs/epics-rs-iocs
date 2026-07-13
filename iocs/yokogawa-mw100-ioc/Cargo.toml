@@ -1,0 +1,13 @@
+# Yokogawa MW100 data-acquisition-unit IOC binary. Wires the yokogawa-mw100
+# driver's dynamic DeviceSupport factory (no asyn — MW100's wire protocol is
+# proprietary TCP ASCII/binary, not Modbus) and exposes CA + PVA.
+
+[package]
+name = "yokogawa-mw100-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+yokogawa-mw100 = { path = "../../drivers/yokogawa-mw100" }
+epics-rs = { workspace = true, features = ["bridge"] }
