@@ -1,0 +1,16 @@
+[package]
+name = "ad-pva-driver"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "ad", "pva"] }
+parking_lot = "0.12"
+log = "0.4"
+# Only needed for `tokio::select!`, to race the driver command channel
+# against the PVA client's own connect/monitor callback bridge — the
+# `ad_core_rs::runtime` facade's `CommandReceiver` covers a single channel,
+# not a multi-channel select (same rationale as drivers/motor/common's and
+# drivers/motor/newport's direct `tokio` dependency).
+tokio = { version = "1", features = ["macros"] }
