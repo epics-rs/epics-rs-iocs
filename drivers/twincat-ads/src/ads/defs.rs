@@ -51,6 +51,26 @@ pub const ADSTRANS_SERVERONCHA: u32 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct AmsNetId(pub [u8; 6]);
 
+impl AmsNetId {
+    /// The Net Id an ADS client answers to when none was configured: its own
+    /// IPv4 address followed by `.1.1`.
+    ///
+    /// This is what Beckhoff's router does when the application never called
+    /// `AdsSetLocalAddress` — `AmsRouter::AddRoute` derives `localAddr` from the
+    /// connection's own IP (AmsRouter.cpp:73-76) through
+    /// `AmsNetId(uint32_t ipv4Addr)`, which appends `1, 1` (AmsNetId.cpp:10-18).
+    pub fn from_ipv4(ip: std::net::Ipv4Addr) -> Self {
+        let o = ip.octets();
+        Self([o[0], o[1], o[2], o[3], 1, 1])
+    }
+
+    /// `true` for the all-zero id — C's `AmsNetId::operator bool`, used to mean
+    /// "no local address configured yet".
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0; 6]
+    }
+}
+
 impl fmt::Display for AmsNetId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let b = self.0;

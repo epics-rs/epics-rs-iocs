@@ -75,6 +75,9 @@ impl AdsClient {
     /// `local` is this IOC's AMS address; `target_net_id` is the PLC's. The
     /// AMS port of each request is passed per call, because one driver serves
     /// several PLC runtimes (851, 852, …) over the same socket.
+    /// A zero `local.net_id` means "derive it", exactly as Beckhoff's router
+    /// does when the application never called `AdsSetLocalAddress`: the local
+    /// end of the socket, plus `.1.1` (see [`AmsNetId::from_ipv4`]).
     pub fn connect(
         host: &str,
         local: AmsAddr,
@@ -94,6 +97,24 @@ impl AdsClient {
             })?;
         let stream = TcpStream::connect_timeout(&addr, timeout)?;
         stream.set_nodelay(true)?;
+
+        let mut local = local;
+        if local.net_id.is_zero() {
+            match stream.local_addr()? {
+                std::net::SocketAddr::V4(v4) => {
+                    local.net_id = AmsNetId::from_ipv4(*v4.ip());
+                }
+                std::net::SocketAddr::V6(_) => {
+                    return Err(AdsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        "no local AMS Net Id configured and the socket is IPv6, \
+                         which carries no address to derive one from — \
+                         call adsSetLocalAddress",
+                    )));
+                }
+            }
+        }
+
         Self::from_stream(
             stream,
             local,
@@ -102,6 +123,11 @@ impl AdsClient {
             on_notification,
             on_disconnect,
         )
+    }
+
+    /// This client's AMS address (with the derived Net Id, once connected).
+    pub fn local_addr(&self) -> AmsAddr {
+        self.shared.local
     }
 
     /// Build a client over an already-connected socket (used by the tests'
@@ -283,6 +309,25 @@ impl AdsClient {
         let ads = AdsState::from_u16(r.u16()?);
         let device = r.u16()?;
         Ok((ads, device))
+    }
+
+    /// ADS WriteControl — command the PLC runtime into an ADS state
+    /// (C `adsWriteState`, `AdsSyncWriteControlReqEx`).
+    pub fn write_control(
+        &self,
+        ams_port: u16,
+        ads_state: u16,
+        device_state: u16,
+        data: &[u8],
+    ) -> Result<(), AdsError> {
+        let mut payload = Vec::with_capacity(8 + data.len());
+        payload.extend_from_slice(&ads_state.to_le_bytes());
+        payload.extend_from_slice(&device_state.to_le_bytes());
+        payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        payload.extend_from_slice(data);
+        let resp = self.request(ams_port, CMD_WRITE_CONTROL, &payload)?;
+        let mut r = Reader::new(&resp);
+        check(r.u32()?)
     }
 
     /// ADS ReadDeviceInfo → (name, version).

@@ -15,9 +15,13 @@
 
 pub mod ads;
 pub mod convert;
+pub mod driver;
 pub mod drvinfo;
 pub mod octet;
 pub mod time;
 
 pub use ads::{AdsClient, AdsError, AdsState, AdsType, AmsAddr, AmsNetId};
+pub use driver::{
+    AdsConfig, AdsPortDriver, AdsRuntime, create_ads_port, poll_info, set_local_address,
+};
 pub use drvinfo::{DrvInfo, DrvInfoDefaults, TimeBase};

@@ -71,6 +71,7 @@ members = [
     "iocs/motor/pigcs2-ioc",
     "iocs/motor/pi-ioc",
     "iocs/motor/mcb4b-ioc",
+    "iocs/twincat-ads-ioc",
     "iocs/usb-2408-ioc",
     "iocs/usb-ctr-ioc",
 ]

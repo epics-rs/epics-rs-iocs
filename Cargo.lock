@@ -2875,6 +2875,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "twincat-ads-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "tokio",
+ "twincat-ads",
+]
+
+[[package]]
 name = "twox-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
