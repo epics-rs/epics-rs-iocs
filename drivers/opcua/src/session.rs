@@ -50,7 +50,8 @@ pub struct SessionConfig {
     pub security_mode: SecurityMode,
     pub security_policy: Option<String>,
     pub identity: Identity,
-    pub pki_dir: String,
+    /// `None` — the client's PKI store (`opcuaSetupPKI`), or the default.
+    pub pki_dir: Option<String>,
     pub certificate_path: Option<String>,
     pub private_key_path: Option<String>,
     pub trust_server_certs: bool,
@@ -75,7 +76,7 @@ impl SessionConfig {
             security_mode: SecurityMode::Best,
             security_policy: None,
             identity: Identity::Anonymous,
-            pki_dir: "pki".to_string(),
+            pki_dir: None,
             certificate_path: None,
             private_key_path: None,
             trust_server_certs: false,
@@ -119,7 +120,7 @@ impl SessionConfig {
             }
             "sec-policy" => self.security_policy = Some(value.to_string()),
             "sec-id" => self.identity = parse_identity(value)?,
-            "pki-dir" => self.pki_dir = value.to_string(),
+            "pki-dir" => self.pki_dir = Some(value.to_string()),
             "cert" => self.certificate_path = Some(value.to_string()),
             "key" => self.private_key_path = Some(value.to_string()),
             _ => return Err(format!("unknown session option '{name}'")),

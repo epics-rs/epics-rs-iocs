@@ -19,10 +19,14 @@ use async_opcua::types::{
     TimestampsToReturn, Variant, WriteValue, custom::DataTypeTree,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::session::SessionConfig;
 use crate::subscription::SubscriptionConfig;
+
+/// Where the PKI file store lives when neither the client nor the session says.
+pub const DEFAULT_PKI_DIR: &str = "pki";
 
 /// `Server_NamespaceArray` (OPC UA Part 5, well-known node).
 const NAMESPACE_ARRAY: u32 = 2255;
@@ -94,6 +98,20 @@ pub trait UaConnector: Send + Sync {
 pub struct AsyncOpcuaConnector {
     application_name: String,
     application_uri: String,
+    security: Mutex<ClientSecurity>,
+}
+
+/// The security the *client* is configured with, which every session shares —
+/// the C's `Session::setClientCertificate` (`opcuaClientCertificate`) and
+/// `Session::setupPKI` (`opcuaSetupPKI`) are static, one client per IOC. A
+/// session's own `cert`, `key` and `pki-dir` options override it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientSecurity {
+    pub certificate_path: Option<String>,
+    pub private_key_path: Option<String>,
+    /// The root of the PKI file store. `async-opcua` lays it out itself —
+    /// `trusted/`, `rejected/`, `issuers/` beneath the root.
+    pub pki_root: Option<String>,
 }
 
 impl AsyncOpcuaConnector {
@@ -101,7 +119,30 @@ impl AsyncOpcuaConnector {
         Self {
             application_name: "EPICS IOC".to_string(),
             application_uri: "urn:EPICS:IOC".to_string(),
+            security: Mutex::new(ClientSecurity::default()),
         }
+    }
+
+    /// `opcuaClientCertificate(cert, key)`.
+    pub fn set_client_certificate(&self, certificate: &str, private_key: &str) {
+        let mut security = self.security.lock();
+        security.certificate_path = Some(certificate.to_string());
+        security.private_key_path = Some(private_key.to_string());
+    }
+
+    /// `opcuaSetupPKI(root)`.
+    ///
+    /// Accepted-and-documented: the C's four-argument form names the four
+    /// locations (trusted server certs, server CRLs, issuer certs, issuer CRLs)
+    /// separately. `async-opcua` derives all four from the root with a layout of
+    /// its own, so only the C's one-argument form — "a standard directory
+    /// structure under the specified location" — has an equivalent here.
+    pub fn set_pki_root(&self, root: &str) {
+        self.security.lock().pki_root = Some(root.to_string());
+    }
+
+    pub fn security(&self) -> ClientSecurity {
+        self.security.lock().clone()
     }
 }
 
@@ -114,19 +155,30 @@ impl Default for AsyncOpcuaConnector {
 #[async_trait]
 impl UaConnector for AsyncOpcuaConnector {
     async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+        // The session's own options win over the client-wide ones; what neither
+        // sets falls back to the `async-opcua` default PKI location.
+        let client = self.security();
+        let pki_dir = config
+            .pki_dir
+            .clone()
+            .or(client.pki_root)
+            .unwrap_or_else(|| DEFAULT_PKI_DIR.to_string());
+        let certificate = config.certificate_path.clone().or(client.certificate_path);
+        let private_key = config.private_key_path.clone().or(client.private_key_path);
+
         let mut builder = ClientBuilder::new()
             .application_name(&self.application_name)
             .application_uri(&self.application_uri)
             .product_uri("urn:epics-rs:opcua")
             .session_retry_limit(0)
             .session_name(&config.name)
-            .pki_dir(&config.pki_dir)
+            .pki_dir(&pki_dir)
             .trust_server_certs(config.trust_server_certs)
             .create_sample_keypair(true);
-        if let Some(cert) = &config.certificate_path {
+        if let Some(cert) = &certificate {
             builder = builder.certificate_path(cert);
         }
-        if let Some(key) = &config.private_key_path {
+        if let Some(key) = &private_key {
             builder = builder.private_key_path(key);
         }
 
@@ -278,6 +330,15 @@ pub enum Identity {
 }
 
 impl Identity {
+    /// What `opcuaShowSecurity` prints. A password is never shown.
+    pub fn describe(&self) -> String {
+        match self {
+            Identity::Anonymous => "anonymous".to_string(),
+            Identity::UserName { user, .. } => format!("username '{user}'"),
+            Identity::Certificate { certificate, .. } => format!("certificate '{certificate}'"),
+        }
+    }
+
     fn token(&self) -> Result<IdentityToken, String> {
         Ok(match self {
             Identity::Anonymous => IdentityToken::Anonymous,

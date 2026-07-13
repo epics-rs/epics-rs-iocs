@@ -137,6 +137,19 @@ impl Registry {
         self.inner.lock().sessions.values().cloned().collect()
     }
 
+    /// Every name `opcuaOptions` and `opcuaShow` can match: the sessions and the
+    /// subscriptions (`RegistryKeyNamespace::global`, which the C keeps them
+    /// both in).
+    pub fn names(&self) -> Vec<String> {
+        let inner = self.inner.lock();
+        inner
+            .sessions
+            .keys()
+            .chain(inner.subscriptions.keys())
+            .cloned()
+            .collect()
+    }
+
     /// Start every session's worker. Called once, after `iocInit`, so that the
     /// items of every record are in place before the first connection.
     pub fn start(&self) -> usize {

@@ -9,6 +9,7 @@
 pub mod client;
 pub mod defaults;
 pub mod device_support;
+pub mod ioc;
 pub mod item;
 pub mod link;
 pub mod queue;

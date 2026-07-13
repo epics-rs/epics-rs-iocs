@@ -320,7 +320,7 @@ fn session_options_are_parsed() {
             password: "secret".into()
         }
     );
-    assert_eq!(config.pki_dir, "/etc/pki");
+    assert_eq!(config.pki_dir.as_deref(), Some("/etc/pki"));
 }
 
 #[test]
