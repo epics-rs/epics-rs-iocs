@@ -1,0 +1,442 @@
+# TwinCAT ADS test records — port of adsExApp/Db/adsTestAsyn.db.
+#
+# Every link is `@asyn(PORT,addr,timeout)<options>/<plc address><? or =>`:
+#   `?` the record reads the variable, `=` it only writes it.
+# Options, all optional:
+#   ADSPORT=851   AMS port (PLC runtime) this variable lives on
+#   TS_MS=10      how often the PLC samples the variable for changes
+#   T_DLY_MS=500  how long the PLC may buffer changes before sending them
+#   TIMEBASE=PLC  stamp samples with the PLC clock (needs TSE=-2) or EPICS
+#   POLL_RATE=1.0 read it in the bulk poll instead of subscribing to it
+#
+# Three upstream defects are fixed here (see the commit message):
+#   * SetFAmplitudeRB and SetBEnableUpdateSineRB were each defined twice, once
+#     plain and once with POLL_RATE — the second definition of a record name is
+#     an error, so the file could not load. The polled variants are renamed.
+#   * The Int32Array record referenced $(ADSCLIENT)/$(ADSSERVER_PORT), macros no
+#     st.cmd in the module defines.
+#   * ...and was named "$(P):Int32Array", the only record with a colon after the
+#     prefix.
+
+###############################################################################
+# fAmplitude (LREAL): analog in/out, I/O Intr and polled readback.
+
+# Readback on I/O Intr: the PLC pushes each change. If the PLC can silently
+# ignore a write (clamping, interlocks), the record keeps the value it wrote
+# and no callback corrects it — use the polled variant below instead.
+record(ao,"$(P)SetFAmplitudeRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.fAmplitude?")
+    field(PREC, "3")
+    field(SCAN, "Passive")
+
+    info(asyn:READBACK,"1")
+}
+
+# The same readback, polled at 1 Hz through the sum-up bulk read.
+record(ao,"$(P)SetFAmplitudeRBPoll"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/POLL_RATE=1.0/Main.fAmplitude?")
+    field(PREC, "3")
+    field(SCAN, "Passive")
+
+    info(asyn:READBACK,"1")
+}
+
+record(ao,"$(P)SetFAmplitude"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.fAmplitude=")
+    field(PREC, "3")
+    field(SCAN, "Passive")
+}
+
+record(ai,"$(P)GetFAmplitude"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.fAmplitude?")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+###############################################################################
+# fTest (LREAL): fast updates, once with the PLC clock and once with the IOC's.
+# TS_MS=10 samples in the PLC every 10 ms, T_DLY_MS=500 lets it buffer up to
+# 500 ms of them — so one push can carry 50 samples.
+
+record(ai,"$(P)GetFTestPLCTime"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1)TIMEBASE=PLC/T_DLY_MS=500/TS_MS=10/ADSPORT=$(ADSPORT=851)/Main.fTest?")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai,"$(P)GetFTestEpicsTime"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1)TIMEBASE=EPICS/T_DLY_MS=500/TS_MS=10/ADSPORT=$(ADSPORT=851)/Main.fTest?")
+    field(PREC, "3")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)GetFTestEpicsTime:T") {
+    field(DTYP, "Soft Timestamp")
+    field(TSEL, "$(P)GetFTestEpicsTime.TIME CP")
+    field(INP,  "@%b %d, %Y %H:%M:%S.%09f")
+}
+
+record(stringin, "$(P)GetFTestPLCTime:T") {
+    field(DTYP, "Soft Timestamp")
+    field(TSEL, "$(P)GetFTestPLCTime.TIME CP")
+    field(INP,  "@%b %d, %Y %H:%M:%S.%09f")
+}
+
+###############################################################################
+# bEnableUpdateSine (BOOL): binary in/out.
+
+record(bo,"$(P)SetBEnableUpdateSineRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.bEnableUpdateSine?")
+    field(SCAN, "Passive")
+    field(ZNAM, "Zero")
+    field(ONAM, "One")
+
+    info(asyn:READBACK,"1")
+}
+
+record(bo,"$(P)SetBEnableUpdateSineRBPoll"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/POLL_RATE=1.0/Main.bEnableUpdateSine?")
+    field(SCAN, "Passive")
+    field(ZNAM, "Zero")
+    field(ONAM, "One")
+
+    info(asyn:READBACK,"1")
+}
+
+record(bo,"$(P)SetBEnableUpdateSine"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.bEnableUpdateSine=")
+    field(SCAN, "Passive")
+    field(ZNAM, "Zero")
+    field(ONAM, "One")
+}
+
+record(bi,"$(P)GetBEnableUpdateSine"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.bEnableUpdateSine?")
+    field(SCAN, "I/O Intr")
+    field(ZNAM, "Zero")
+    field(ONAM, "One")
+}
+
+###############################################################################
+# iCycleCounter (DINT).
+
+record(ao,"$(P)SetICycleCounter"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.iCycleCounter=")
+    field(SCAN, "Passive")
+}
+
+record(ao,"$(P)SetICycleCounterRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.iCycleCounter?")
+    field(SCAN, "Passive")
+
+    info(asyn:READBACK,"1")
+}
+
+record(ai,"$(P)GetICycleCounter"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.iCycleCounter?")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai,"$(P)GetICycleCounterSCAN"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.iCycleCounter?")
+    field(SCAN, "1 second")
+}
+
+###############################################################################
+# fTestArray (ARRAY OF LREAL): waveform in.
+
+record(waveform,"$(P)GetFTestArray"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.fTestArray?")
+    field(NELM, "100")
+    field(SCAN, "I/O Intr")
+    field(FTVL, "DOUBLE")
+}
+
+###############################################################################
+# fTestArray2 (ARRAY OF LREAL): waveform in and out.
+
+record(waveform,"$(P)SetFTestArray2RB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.fTestArray2?")
+    field(NELM, "10")
+    field(SCAN, "Passive")
+    field(FTVL, "DOUBLE")
+
+    info(asyn:READBACK,"1")
+}
+
+record(waveform,"$(P)SetFTestArray2"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.fTestArray2=")
+    field(NELM, "10")
+    field(SCAN, "Passive")
+    field(FTVL, "DOUBLE")
+}
+
+record(waveform,"$(P)GetFTestArray2"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynFloat64ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.fTestArray2?")
+    field(NELM, "10")
+    field(SCAN, "I/O Intr")
+    field(FTVL, "DOUBLE")
+}
+
+###############################################################################
+# bArray (ARRAY OF BOOL): waveform in and out, as CHAR.
+
+record(waveform,"$(P)SetBArrayRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.bArray?")
+    field(NELM, "10")
+    field(SCAN, "Passive")
+    field(FTVL, "CHAR")
+
+    info(asyn:READBACK,"1")
+}
+
+record(waveform,"$(P)SetBArray"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.bArray=")
+    field(NELM, "10")
+    field(SCAN, "Passive")
+    field(FTVL, "CHAR")
+}
+
+record(waveform,"$(P)GetBArray"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.bArray?")
+    field(NELM, "10")
+    field(SCAN, "I/O Intr")
+    field(FTVL, "CHAR")
+}
+
+###############################################################################
+# sTest (STRING): as a CHAR waveform.
+
+record(waveform,"$(P)SetSTestRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest?")
+    field(NELM, "100")
+    field(SCAN, "Passive")
+    field(FTVL, "CHAR")
+
+    info(asyn:READBACK,"1")
+}
+
+record(waveform,"$(P)SetSTest"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest=")
+    field(NELM, "100")
+    field(SCAN, "Passive")
+    field(FTVL, "CHAR")
+}
+
+record(waveform,"$(P)GetSTest"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest?")
+    field(NELM, "100")
+    field(SCAN, "I/O Intr")
+    field(FTVL, "CHAR")
+}
+
+###############################################################################
+# sTest (STRING) again, this time as a native string through asynOctet.
+# lso/lsi carry more than the 40 characters stringout/stringin hold; SIZV must
+# be at least the PLC variable's size.
+
+record(stringout,"$(P)SetSTestStringRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest?")
+    field(SCAN, "Passive")
+
+    info(asyn:READBACK,"1")
+}
+
+record(stringout,"$(P)SetSTestString"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest=")
+    field(SCAN, "Passive")
+}
+
+record(stringin,"$(P)GetSTestString"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest?")
+    field(SCAN, "I/O Intr")
+}
+
+record(lso,"$(P)SetSTestLsoRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest?")
+    field(SIZV, "100")
+    field(SCAN, "Passive")
+
+    info(asyn:READBACK,"1")
+}
+
+record(lso,"$(P)SetSTestLso"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynOctetWrite")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest=")
+    field(SIZV, "100")
+    field(SCAN, "Passive")
+}
+
+record(lsi,"$(P)GetSTestLsi"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.sTest?")
+    field(SIZV, "100")
+    field(SCAN, "I/O Intr")
+}
+
+###############################################################################
+# Int8Array (ARRAY OF SINT).
+
+record(waveform,"$(P)SetInt8ArrayRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.Int8Array?")
+    field(NELM, "100")
+    field(SCAN, "Passive")
+    field(FTVL, "CHAR")
+
+    info(asyn:READBACK,"1")
+}
+
+record(waveform,"$(P)SetInt8Array"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.Int8Array=")
+    field(NELM, "100")
+    field(SCAN, "Passive")
+    field(FTVL, "CHAR")
+}
+
+record(waveform,"$(P)GetInt8Array"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt8ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.Int8Array?")
+    field(NELM, "100")
+    field(SCAN, "I/O Intr")
+    field(FTVL, "CHAR")
+}
+
+###############################################################################
+# Int32Array (ARRAY OF DINT).
+
+record(waveform,"$(P)SetInt32ArrayRB"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32ArrayOut")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.Int32Array?")
+    field(NELM, "100")
+    field(SCAN, "Passive")
+    field(FTVL, "LONG")
+
+    info(asyn:READBACK,"1")
+}
+
+record(waveform,"$(P)GetInt32Array"){
+    field(PINI, "1")
+    field(TSE,  "-2")
+    field(DTYP, "asynInt32ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/Main.Int32Array?")
+    field(NELM, "100")
+    field(SCAN, "I/O Intr")
+    field(FTVL, "LONG")
+}
+
+###############################################################################
+# The AMS port's own ADS state: 5 = RUN, 6 = STOP. Writing it commands the
+# runtime; this is the driver's own datum, never read from the PLC's symbols.
+
+record(ai,"$(P)GetAmsPort851State"){
+    field(PINI, "1")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/.AMSPORTSTATE.?")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao,"$(P)SetAmsPort851State"){
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1)ADSPORT=$(ADSPORT=851)/.AMSPORTSTATE.?")
+    field(SCAN, "Passive")
+
+    info(asyn:READBACK,"1")
+}
