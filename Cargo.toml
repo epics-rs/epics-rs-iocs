@@ -29,6 +29,7 @@ members = [
     "drivers/motor/pi-gcs2",
     "drivers/motor/pi",
     "drivers/motor/acs",
+    "drivers/twincat-ads",
     "drivers/meascomp/meascomp",
     "drivers/meascomp/uldaq-sys",
     "drivers/meascomp/usb-2408",
