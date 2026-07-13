@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::user::AsynUser;
@@ -47,11 +48,11 @@ impl ModbusRegs {
         })?;
         let handle = entry.handle;
         let data_reason = handle
-            .drv_user_create_blocking(MODBUS_DATA, 0)
+            .drv_user_create_blocking(&DrvUserRequest::new(MODBUS_DATA, 0))
             .map_err(|e| e.to_string())?
             .reason;
         let read_reason = handle
-            .drv_user_create_blocking(MODBUS_READ, 0)
+            .drv_user_create_blocking(&DrvUserRequest::new(MODBUS_READ, 0))
             .map_err(|e| e.to_string())?
             .reason;
         Ok(Self {
