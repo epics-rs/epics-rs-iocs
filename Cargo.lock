@@ -36,6 +36,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ad-csimdetector"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "ad-csimdetector-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-csimdetector",
+ "ad-plugins-rs",
+ "epics-rs",
+ "tokio",
+]
+
+[[package]]
 name = "ad-plugins-rs"
 version = "0.23.0"
 source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#e955db8965ac2993f5d16f8f2e9ea5b291aacecb"
@@ -61,6 +81,45 @@ dependencies = [
  "tiff 0.9.1",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "ad-simdetector"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "ad-simdetector-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "ad-simdetector",
+ "epics-rs",
+ "tokio",
+]
+
+[[package]]
+name = "ad-std-arrays-driver"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "ad-std-arrays-driver-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "ad-std-arrays-driver",
+ "epics-rs",
+ "tokio",
 ]
 
 [[package]]

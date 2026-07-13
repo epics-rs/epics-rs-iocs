@@ -1,0 +1,68 @@
+#=================================================================#
+# Template file: ADCSimDetectorN.template
+# Per-signal records for the ADC simulated detector driver (one instance per
+# signal, ADDR = 0..7).
+# Ported from ADCSimDetector ADCSimDetectorApp/Db/ADCSimDetectorN.template
+# Macros: P, R, PORT, ADDR, TIMEOUT, NAME
+
+record(stringout, "$(P)$(R)Name")
+{
+   field(VAL,  "$(NAME)")
+   info(autosaveFields, "VAL")
+}
+
+record(ao, "$(P)$(R)Amplitude")
+{
+   field(PINI, "YES")
+   field(DTYP, "asynFloat64")
+   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))SIM_AMPLITUDE")
+   field(PREC, "3")
+   field(VAL,  "1")
+   info(autosaveFields, "VAL")
+}
+
+record(ao, "$(P)$(R)Offset")
+{
+   field(PINI, "YES")
+   field(DTYP, "asynFloat64")
+   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))SIM_OFFSET")
+   field(PREC, "3")
+   info(autosaveFields, "VAL")
+}
+
+record(ao, "$(P)$(R)Period")
+{
+   field(PINI, "YES")
+   field(DTYP, "asynFloat64")
+   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))SIM_PERIOD")
+   field(PREC, "3")
+   field(VAL,  "1")
+   info(autosaveFields, "VAL")
+}
+
+record(ai, "$(P)$(R)Frequency")
+{
+   field(DTYP, "asynFloat64")
+   field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))SIM_FREQUENCY")
+   field(PREC, "3")
+   field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)$(R)Phase")
+{
+   field(PINI, "YES")
+   field(DTYP, "asynFloat64")
+   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))SIM_PHASE")
+   field(PREC, "3")
+   info(autosaveFields, "VAL")
+}
+
+record(ao, "$(P)$(R)Noise")
+{
+   field(PINI, "YES")
+   field(DTYP, "asynFloat64")
+   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))SIM_NOISE")
+   field(PREC, "3")
+   info(autosaveFields, "VAL")
+}
+
