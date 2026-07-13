@@ -6,7 +6,11 @@
 //! client, which takes the place of both C client backends (Unified Automation
 //! SDK and open62541). The open62541 backend is the behavioural reference.
 
+pub mod client;
 pub mod defaults;
+pub mod item;
 pub mod link;
 pub mod queue;
+pub mod session;
+pub mod subscription;
 pub mod value;
