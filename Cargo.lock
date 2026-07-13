@@ -401,6 +401,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bruker"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "bruker-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "bruker",
+ "epics-rs",
+ "tokio",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1510,6 +1529,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "merlin"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "merlin-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "merlin",
+ "tokio",
+]
+
+[[package]]
 name = "metrics"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2074,6 +2112,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "photonii"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "photonii-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "photonii",
+ "tokio",
+]
+
+[[package]]
 name = "phytron-ioc"
 version = "0.1.0"
 dependencies = [
@@ -2114,6 +2171,26 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pixirad"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+ "socket2 0.6.3",
+]
+
+[[package]]
+name = "pixirad-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "pixirad",
+ "tokio",
+]
 
 [[package]]
 name = "pkcs5"
@@ -2194,6 +2271,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "psl"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "log",
+ "parking_lot",
+]
+
+[[package]]
+name = "psl-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-plugins-rs",
+ "epics-rs",
+ "psl",
+ "tokio",
 ]
 
 [[package]]

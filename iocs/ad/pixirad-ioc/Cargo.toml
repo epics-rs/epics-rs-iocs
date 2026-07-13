@@ -1,0 +1,14 @@
+[package]
+name = "pixirad-ioc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+pixirad = { path = "../../../drivers/ad/pixirad" }
+epics-rs = { workspace = true, features = ["asyn", "ad", "ioc", "pva", "bridge"] }
+# Direct dep with the `pva` feature: the umbrella crate's `ioc` feature only
+# pulls `ad-plugins-rs/ioc`, so we add this here to also enable
+# `ad-plugins-rs/pva` (which is what gates `AdIoc::run_from_args_with_pva`).
+ad-plugins-rs = { workspace = true, features = ["ioc", "pva"] }
+tokio = { version = "1", features = ["full"] }

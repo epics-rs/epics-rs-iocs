@@ -1,0 +1,60 @@
+# PSL.template
+# Records specific to the Photonic Sciences Ltd. CCD driver.
+#
+# Ported from ADPSL/pslApp/Db/PSL.template.
+#
+# Macros:
+#   P, R             EPICS name prefix / suffix
+#   PORT             asyn port of the detector driver
+#   ADDR             asyn address
+#   TIMEOUT          asyn timeout
+#   PSL_SERVER_PORT  asyn port of the PSLViewer socket (for the asyn record)
+
+include "ADBase.template"
+include "NDFile.template"
+
+# The choices of CameraName, TriggerMode and FileFormat are not known until the
+# driver has asked the server for them, so the driver answers the enum read
+# these records issue at initialisation. Their ZRST/ONST/... fields are left
+# empty on purpose.
+
+record(mbbo, "$(P)$(R)CameraName")
+{
+    field(PINI, "YES")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))PSL_CAMERA_NAME")
+}
+
+record(mbbi, "$(P)$(R)CameraName_RBV")
+{
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))PSL_CAMERA_NAME")
+    field(SCAN, "I/O Intr")
+}
+
+record(waveform, "$(P)$(R)TIFFComment")
+{
+    field(PINI, "YES")
+    field(DTYP, "asynOctetWrite")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))PSL_TIFF_COMMENT")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+}
+
+record(waveform, "$(P)$(R)TIFFComment_RBV")
+{
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))PSL_TIFF_COMMENT")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+
+# The raw command channel to PSLViewer, for debugging from the command line.
+record(asyn, "$(P)$(R)PSLServer")
+{
+    field(PORT, "$(PSL_SERVER_PORT)")
+    field(ADDR, "0")
+    field(IMAX, "4096")
+    field(OMAX, "4096")
+}
