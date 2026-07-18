@@ -252,6 +252,30 @@ pub struct FastSweepDriver {
     shared: Arc<Shared>,
 }
 
+/// The upstream interrupt subscriptions [`FastSweepDriver::connect`] sets up,
+/// handed to [`start`] once the driver has its own [`PortHandle`].
+///
+/// [`connect`](FastSweepDriver::connect) cannot spawn the data/interval
+/// publisher threads itself: they publish through *this* port's own params
+/// (current channel, elapsed time, dwell time, acquiring), but this port's
+/// [`PortHandle`] does not exist yet at construction time -- asyn-rs only
+/// creates one once [`epics_rs::asyn::runtime::port::create_port_runtime`]
+/// wraps the driver (see `drivers/ur-robot/src/drivers/dashboard.rs`'s
+/// `start_poller`/`create_dashboard` split for the established precedent).
+/// Publishing through the *upstream* port's handle instead (what an earlier
+/// version of this driver did by reusing `input_port_name`'s handle) looks
+/// plausible -- the calls compile and mostly run -- but every update
+/// resolves FastSweep's own reason indices against the upstream port's own,
+/// unrelated param list, failing with a "param index out of range" error the
+/// moment the two lists' lengths diverge, and silently doing nothing (or
+/// worse, hitting an unrelated param) whenever they happen to overlap.
+pub struct FastSweepSubscriptions {
+    data_sub: InterruptSubscription,
+    data_rx: InterruptReceiver,
+    interval: Option<(InterruptSubscription, InterruptReceiver)>,
+    shared: Arc<Shared>,
+}
+
 impl FastSweepDriver {
     /// C `initFastSweep(portName, inputName, maxSignals, maxPoints,
     /// dataString, intervalString)` (`drvFastSweep.cpp:57-211`).
@@ -262,6 +286,10 @@ impl FastSweepDriver {
     /// `asynFloat64` interval connection is best-effort (matches C: a
     /// failed `drvUserCreate` here leaves `numAverage_` at its default `1`
     /// rather than failing the whole driver).
+    ///
+    /// Returns the driver plus a [`FastSweepSubscriptions`] the caller must
+    /// pass to [`start`] once it has wrapped the driver in a port runtime
+    /// (see [`FastSweepSubscriptions`]'s doc for why).
     pub fn connect(
         port_name: &str,
         input_port_name: &str,
@@ -269,7 +297,7 @@ impl FastSweepDriver {
         max_points: usize,
         data_drv_info: &str,
         interval_drv_info: &str,
-    ) -> AsynResult<Self> {
+    ) -> AsynResult<(Self, FastSweepSubscriptions)> {
         // C `if (dataString[0]==0) dataString_ = "DATA";` /
         // `if (intervalString[0]==0) intervalString_ = "SCAN_PERIOD";`
         // (`drvFastSweep.cpp:116-125`).
@@ -322,36 +350,62 @@ impl FastSweepDriver {
                     reason: Some(data_info.reason),
                     ..Default::default()
                 });
-        spawn_data_thread(data_sub, data_rx, input.handle.clone(), Arc::clone(&shared));
 
         // Best-effort: C falls back to `numAverage_ = 1` rather than
         // failing the driver when no interval source is configured
         // (`drvFastSweep.cpp:200-208`).
         let interval_req =
             DrvUserRequest::new(interval_drv_info, 0).with_iface(InterfaceType::Float64);
-        if let Ok(interval_info) = input.handle.drv_user_create_blocking(&interval_req) {
-            // C's one-time `pasynFloat64SyncIO->read` seed before any
-            // callback arrives (`drvFastSweep.cpp:207`).
-            if let Ok(seed) = input.handle.read_float64_blocking(interval_info.reason, 0) {
-                shared.state.lock().unwrap().callback_interval = seed;
-            }
-            let (interval_sub, interval_rx) =
-                input
-                    .handle
-                    .interrupts()
-                    .register_interrupt_user(InterruptFilter {
-                        reason: Some(interval_info.reason),
-                        ..Default::default()
-                    });
-            spawn_interval_thread(
-                interval_sub,
-                interval_rx,
-                input.handle.clone(),
-                Arc::clone(&shared),
-            );
-        }
+        let interval =
+            if let Ok(interval_info) = input.handle.drv_user_create_blocking(&interval_req) {
+                // C's one-time `pasynFloat64SyncIO->read` seed before any
+                // callback arrives (`drvFastSweep.cpp:207`).
+                if let Ok(seed) = input.handle.read_float64_blocking(interval_info.reason, 0) {
+                    shared.state.lock().unwrap().callback_interval = seed;
+                }
+                Some(
+                    input
+                        .handle
+                        .interrupts()
+                        .register_interrupt_user(InterruptFilter {
+                            reason: Some(interval_info.reason),
+                            ..Default::default()
+                        }),
+                )
+            } else {
+                None
+            };
 
-        Ok(FastSweepDriver { base, shared })
+        let driver = FastSweepDriver {
+            base,
+            shared: Arc::clone(&shared),
+        };
+        let subscriptions = FastSweepSubscriptions {
+            data_sub,
+            data_rx,
+            interval,
+            shared,
+        };
+        Ok((driver, subscriptions))
+    }
+}
+
+/// Starts the data/interval publisher threads against `handle` -- the
+/// FastSweep port's own [`PortHandle`], obtained from
+/// `create_port_runtime`'s return value after wrapping the
+/// [`FastSweepDriver`] [`FastSweepDriver::connect`] returned. See
+/// [`FastSweepSubscriptions`]'s doc for why this must happen as a separate
+/// step instead of inside `connect` itself.
+pub fn start(handle: PortHandle, subscriptions: FastSweepSubscriptions) {
+    let FastSweepSubscriptions {
+        data_sub,
+        data_rx,
+        interval,
+        shared,
+    } = subscriptions;
+    spawn_data_thread(data_sub, data_rx, handle.clone(), Arc::clone(&shared));
+    if let Some((interval_sub, interval_rx)) = interval {
+        spawn_interval_thread(interval_sub, interval_rx, handle, shared);
     }
 }
 
