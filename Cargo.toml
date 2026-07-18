@@ -77,6 +77,7 @@ members = [
     "drivers/yokogawa-mw100",
     "drivers/opcua",
     "drivers/mca",
+    "drivers/mca-amptek",
     "iocs/ad/specs-analyser-ioc",
     "iocs/d435i-ioc",
     "iocs/ad/merlin-ioc",
@@ -146,6 +147,7 @@ members = [
     "iocs/yokogawa-mw100-ioc",
     "iocs/opcua-ioc",
     "iocs/mca-ioc",
+    "iocs/mca-amptek-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC

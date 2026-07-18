@@ -2258,6 +2258,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "mca-amptek"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "mca",
+ "tempfile",
+]
+
+[[package]]
+name = "mca-amptek-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "mca",
+ "mca-amptek",
+ "mca-rs",
+ "tokio",
+]
+
+[[package]]
 name = "mca-ioc"
 version = "0.1.0"
 dependencies = [
