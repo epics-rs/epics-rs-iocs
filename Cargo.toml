@@ -77,6 +77,7 @@ members = [
     "drivers/yokogawa-mw100",
     "drivers/opcua",
     "drivers/mca",
+    "drivers/mca-rontec",
     "iocs/ad/specs-analyser-ioc",
     "iocs/d435i-ioc",
     "iocs/ad/merlin-ioc",
