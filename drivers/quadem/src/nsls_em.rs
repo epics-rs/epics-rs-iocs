@@ -159,7 +159,9 @@ fn find_module(port_name: &str, broadcast_address: &str, module_id: i32) -> Asyn
         true,
     )?;
     command.set_input_eos(b"\r\n")?;
-    command.handle().set_output_eos_blocking(b"\r")?;
+    command
+        .handle()
+        .set_output_eos_blocking(AsynUser::default(), b"\r")?;
 
     let (data, data_runtime) = ip_port(
         &format!("TCP_Data_{port_name}"),

@@ -359,11 +359,7 @@ fn indexed(name: &str) -> Option<(&'static str, usize)> {
 /// `field_list` is stable.
 static INDEXED_FIELDS: &[FieldDesc] = &{
     const fn f(name: &'static str, dbf_type: DbFieldType, ro: bool) -> FieldDesc {
-        FieldDesc {
-            name,
-            dbf_type,
-            read_only: ro,
-        }
+        FieldDesc::new(name, dbf_type, ro)
     }
     use DbFieldType::{Double, Enum};
     [
@@ -429,11 +425,7 @@ static INDEXED_FIELDS: &[FieldDesc] = &{
 /// DBF_STRING readbacks and the simulation link fields.
 static STRING_FIELDS: &[FieldDesc] = &{
     const fn f(name: &'static str, ro: bool) -> FieldDesc {
-        FieldDesc {
-            name,
-            dbf_type: DbFieldType::String,
-            read_only: ro,
-        }
+        FieldDesc::new(name, DbFieldType::String, ro)
     }
     [
         f("MODL", true),
@@ -653,7 +645,7 @@ impl Record for DigitelRecord {
         put_scalar(self, name, value)
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         let fields: &Vec<FieldDesc> = &ALL_FIELDS;
         // `ALL_FIELDS` is a `LazyLock` that lives for the whole program.
         unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
@@ -798,7 +790,7 @@ impl Record for DigitelRecord {
         if self.read_alarm {
             set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
         }
-        if common.udf {
+        if common.udf != 0 {
             return;
         }
         self.limit_alarms(common);
@@ -867,7 +859,7 @@ mod tests {
 
     fn common() -> CommonFields {
         CommonFields {
-            udf: false,
+            udf: 0,
             ..CommonFields::default()
         }
     }
@@ -875,7 +867,7 @@ mod tests {
     #[test]
     fn every_declared_field_is_readable() {
         let r = DigitelRecord::default();
-        for f in r.field_list() {
+        for f in r.declared_fields() {
             assert!(r.get_field(f.name).is_some(), "{} unreadable", f.name);
         }
     }
@@ -1044,7 +1036,7 @@ mod tests {
             ..Default::default()
         };
         let mut c = common();
-        c.udf = true;
+        c.udf = 1;
         r.check_alarms(&mut c);
         assert_eq!(c.nsev, AlarmSeverity::NoAlarm);
     }

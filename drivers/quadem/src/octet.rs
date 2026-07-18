@@ -145,7 +145,7 @@ impl OctetIo {
     /// `pasynOctetSyncIO->setInputEos`. Called once at driver construction;
     /// nothing writes this cell afterwards.
     pub fn set_input_eos(&self, eos: &[u8]) -> AsynResult<()> {
-        self.handle.set_input_eos_blocking(eos)
+        self.handle.set_input_eos_blocking(AsynUser::default(), eos)
     }
 
     /// `asynOctetSyncIO->flush`.
@@ -176,7 +176,7 @@ pub fn create_ip_port(
         driver.base_mut().auto_connect = false;
     }
     if process_eos {
-        driver.push_interpose(Box::new(
+        driver.install_interpose(Box::new(
             epics_rs::asyn::interpose::eos::EosInterpose::default(),
         ));
     }

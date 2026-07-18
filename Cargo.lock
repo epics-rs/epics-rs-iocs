@@ -22,8 +22,9 @@ dependencies = [
 
 [[package]]
 name = "ad-core-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a46076696118aa7213226eb6dafd9b39149b33aa818505abfc123ab74894a905"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -72,7 +73,7 @@ dependencies = [
  "log",
  "parking_lot",
  "tempfile",
- "tiff 0.11.3",
+ "tiff",
  "tokio",
 ]
 
@@ -84,13 +85,14 @@ dependencies = [
  "log",
  "parking_lot",
  "tempfile",
- "tiff 0.11.3",
+ "tiff",
 ]
 
 [[package]]
 name = "ad-plugins-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2addcae6672b34dc65336a502ca2a97a889a67937106f264aebbe2fab13498db"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
@@ -110,7 +112,6 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
- "tiff 0.9.1",
  "tokio",
  "tracing",
 ]
@@ -410,10 +411,12 @@ dependencies = [
 
 [[package]]
 name = "asyn-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0c6960d8f14675da177c1805707af1aa0473a72f500a88236259a31a06e3dca"
 dependencies = [
  "bitflags",
+ "chrono",
  "epics-base-rs",
  "libc",
  "parking_lot",
@@ -1223,8 +1226,9 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "epics-base-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c16a89ec4df7d0bcb7e15e66503d00b54875b3cee2dc19db2c364860eec44478"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1245,8 +1249,9 @@ dependencies = [
 
 [[package]]
 name = "epics-bridge-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76a25889c850848cf562ac4fc330022576926306c010317ba77cf734c1e0fbf4"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1268,8 +1273,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2c544d3e386f1e314d144734eb96b43ffa8b5d234023e22f506e4a7a2987ad"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1286,12 +1292,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a47ae6cc1d86b7d56ec9e330b1391ba296fba9757f3cc470ad04638ee623a716"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1301,8 +1309,9 @@ dependencies = [
 
 [[package]]
 name = "epics-modbus-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7f3cd8b59d26ea3cfbd4a16579a5b8199944859ed822b7cb4f2ae05b1bb4ec2"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -1314,8 +1323,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f2e0c9eda8d9f1df01bdae4f5079a7e15adce94459d1e31ae85c2e24a15593e"
 dependencies = [
  "bytes",
  "chrono",
@@ -1352,8 +1362,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2f5315278012a9446df1daf46264f7f1db49cbabdd8b1169fa0a5771fec40a4"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -1967,7 +1978,7 @@ dependencies = [
  "moxcms",
  "num-traits",
  "png",
- "tiff 0.11.3",
+ "tiff",
  "zune-core",
  "zune-jpeg",
 ]
@@ -2598,8 +2609,9 @@ dependencies = [
 
 [[package]]
 name = "motor-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "937cba8477dddd996515a6672edcb498730d6bec66b8a39b1a6809a57256a88a"
 dependencies = [
  "asyn-rs",
  "bitflags",
@@ -3680,8 +3692,9 @@ dependencies = [
 
 [[package]]
 name = "scaler-rs"
-version = "0.23.0"
-source = "git+https://github.com/epics-rs/epics-rs.git?branch=main#b475ee0e47cbb85e35af87efa3d5073aaa96389d"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f75f4f93691e4d70b0fec639d42a630de9d70de4abdbf7e2069c0c0ade117d9"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -4158,17 +4171,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "tiff"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba1310fcea54c6a9a4fd1aad794ecc02c31682f6bfbecdf460bf19533eed1e3e"
-dependencies = [
- "flate2",
- "jpeg-decoder",
- "weezl",
 ]
 
 [[package]]

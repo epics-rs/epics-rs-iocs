@@ -3,7 +3,7 @@
 //! Both are registered from the IOC crate with
 //! `IocApplication::register_record_type`; no `.dbd` file is involved, because
 //! the framework's database loader resolves field types from
-//! [`Record::field_list`](epics_rs::base::server::record::Record::field_list)
+//! [`Record::declared_fields`](epics_rs::base::server::record::Record::declared_fields)
 //! and menu choices from `menu_field_choices`. A field the record does not
 //! declare falls through to `dbCommon` — which is how `INP`, `SCAN` and the
 //! alarm-severity fields reach the record instance.
@@ -27,11 +27,11 @@ macro_rules! record_fields {
         $( $name:literal : $variant:ident = $field:ident , $ro:literal );+ $(;)?
     ) => {
         static $list: &[::epics_rs::base::server::record::FieldDesc] = &[
-            $(::epics_rs::base::server::record::FieldDesc {
-                name: $name,
-                dbf_type: $crate::records::dbf_type_of!($variant),
-                read_only: $ro,
-            }),+
+            $(::epics_rs::base::server::record::FieldDesc::new(
+                $name,
+                $crate::records::dbf_type_of!($variant),
+                $ro,
+            )),+
         ];
 
         fn $get(r: &$rec, name: &str) -> Option<::epics_rs::base::types::EpicsValue> {

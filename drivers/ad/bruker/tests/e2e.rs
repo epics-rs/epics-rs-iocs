@@ -87,13 +87,15 @@ fn ip_port(name: &str, addr: &str, input_eos: &[u8], output_eos: &[u8]) -> PortH
     let mut driver = DrvAsynIPPort::new(name, addr).expect("ip port");
     // What `drvAsynIPPortConfigure` does before it starts the port: the EOS
     // bytes are only cached, never applied, unless this layer is there.
-    driver.push_interpose(Box::new(EosInterpose::default()));
+    driver.install_interpose(Box::new(EosInterpose::default()));
     let (runtime, _) = create_port_runtime(driver, RuntimeConfig::default());
     let handle = runtime.port_handle().clone();
-    handle.set_input_eos_blocking(input_eos).expect("input eos");
+    handle
+        .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), input_eos)
+        .expect("input eos");
     if !output_eos.is_empty() {
         handle
-            .set_output_eos_blocking(output_eos)
+            .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), output_eos)
             .expect("output eos");
     }
     // The runtime must outlive the test.

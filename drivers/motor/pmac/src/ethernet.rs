@@ -416,8 +416,8 @@ pub fn pmac_asyn_ip_configure_command(trace: Arc<TraceManager>) -> CommandDef {
             // on first and the framing layer sits between it and the socket —
             // the same order as C (interposeInterface, then
             // asynInterposeEosConfig above it).
-            driver.push_interpose(Box::new(EosInterpose::default()));
-            driver.push_interpose(Box::new(PmacIpInterpose::new()));
+            driver.install_interpose(Box::new(EosInterpose::default()));
+            driver.install_interpose(Box::new(PmacIpInterpose::new()));
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
             epics_rs::asyn::asyn_record::register_port(

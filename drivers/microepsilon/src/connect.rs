@@ -33,10 +33,10 @@ pub fn connect_octet(
         )
     })?;
     port.handle
-        .set_input_eos_blocking(INPUT_EOS)
+        .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), INPUT_EOS)
         .map_err(|e| format!("failed to set input EOS on '{port_name}': {e}"))?;
     port.handle
-        .set_output_eos_blocking(OUTPUT_EOS)
+        .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), OUTPUT_EOS)
         .map_err(|e| format!("failed to set output EOS on '{port_name}': {e}"))?;
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),

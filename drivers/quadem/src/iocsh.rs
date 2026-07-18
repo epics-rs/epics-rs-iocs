@@ -93,9 +93,13 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let res = if input {
-                entry.handle.set_input_eos_blocking(&eos)
+                entry
+                    .handle
+                    .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), &eos)
             } else {
-                entry.handle.set_output_eos_blocking(&eos)
+                entry
+                    .handle
+                    .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), &eos)
             };
             if let Err(e) = res {
                 ctx.println(&format!("{name}: {e}"));
@@ -109,8 +113,12 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
 /// call: create the octet port, then frame it.
 pub fn octet_port_commands(trace: Arc<TraceManager>) -> Vec<CommandDef> {
     vec![
-        epics_rs::asyn::iocsh::drv_asyn_ip_port_configure_command(trace.clone()),
-        epics_rs::asyn::iocsh::drv_asyn_serial_port_configure_command(trace),
+        epics_rs::asyn::iocsh::drv_asyn_ip_port_configure_command(
+            epics_rs::asyn::services::PortServices::new(trace.clone()),
+        ),
+        epics_rs::asyn::iocsh::drv_asyn_serial_port_configure_command(
+            epics_rs::asyn::services::PortServices::new(trace),
+        ),
         eos_command("asynOctetSetInputEos", true),
         eos_command("asynOctetSetOutputEos", false),
     ]

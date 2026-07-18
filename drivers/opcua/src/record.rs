@@ -15,7 +15,7 @@
 //! [`Op::Item`]: crate::device_support::Op
 //!
 //! No `.dbd` file is involved: the framework's database loader takes the field
-//! types from [`Record::field_list`] and the menu choices from
+//! types from [`Record::declared_fields`] and the menu choices from
 //! `menu_field_choices`, and serves every field this record does not declare
 //! (INP, SCAN, PINI, the alarm fields) from `dbCommon`.
 
@@ -45,61 +45,17 @@ const WOC_IMMEDIATE: u16 = 1;
 const MAX_STRING_SIZE: usize = 40;
 
 static FIELDS: &[FieldDesc] = &[
-    FieldDesc {
-        name: "VAL",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SESS",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "SUBS",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "DEFACTN",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "BINI",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "READ",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WRITE",
-        dbf_type: DbFieldType::Char,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STATCODE",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "OSTATCODE",
-        dbf_type: DbFieldType::ULong,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "STATTEXT",
-        dbf_type: DbFieldType::String,
-        read_only: false,
-    },
-    FieldDesc {
-        name: "WOC",
-        dbf_type: DbFieldType::Enum,
-        read_only: false,
-    },
+    FieldDesc::new("VAL", DbFieldType::ULong, false),
+    FieldDesc::new("SESS", DbFieldType::String, false),
+    FieldDesc::new("SUBS", DbFieldType::String, false),
+    FieldDesc::new("DEFACTN", DbFieldType::Enum, false),
+    FieldDesc::new("BINI", DbFieldType::Enum, false),
+    FieldDesc::new("READ", DbFieldType::Char, false),
+    FieldDesc::new("WRITE", DbFieldType::Char, false),
+    FieldDesc::new("STATCODE", DbFieldType::ULong, false),
+    FieldDesc::new("OSTATCODE", DbFieldType::ULong, false),
+    FieldDesc::new("STATTEXT", DbFieldType::String, false),
+    FieldDesc::new("WOC", DbFieldType::Enum, false),
 ];
 
 #[derive(Debug, Default)]
@@ -172,7 +128,7 @@ impl Record for OpcuaItemRecord {
         "opcuaItem"
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         FIELDS
     }
 

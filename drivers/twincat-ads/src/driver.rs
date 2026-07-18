@@ -1342,9 +1342,10 @@ impl PortDriver for AdsPortDriver {
         self.write_array(user, &[AdsType::Real64], &bytes)
     }
 
-    fn report(&self, _level: i32) {
+    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
         let cfg = &self.shared.cfg;
-        eprintln!(
+        let _ = writeln!(
+            out,
             "twincat-ads port {}: PLC {} ({}), default AMS port {}, {}",
             cfg.port_name,
             cfg.ip_addr,
@@ -1357,7 +1358,8 @@ impl PortDriver for AdsPortDriver {
             }
         );
         for port in self.shared.ports.lock().iter() {
-            eprintln!(
+            let _ = writeln!(
+                out,
                 "  AMS port {}: {} ({})",
                 port.ams_port,
                 port.state.as_str(),
@@ -1370,7 +1372,8 @@ impl PortDriver for AdsPortDriver {
         }
         for (reason, slot) in self.shared.params.lock().iter().enumerate() {
             let Some(p) = slot else { continue };
-            eprintln!(
+            let _ = writeln!(
+                out,
                 "  [{reason}] {} — PLC {} ({} bytes){}",
                 p.info.raw,
                 p.plc_type.as_str(),

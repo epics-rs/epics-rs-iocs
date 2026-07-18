@@ -150,13 +150,13 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs upstream main (user directive 2026-07-13): PRs #18-#24 are merged
-# but the v0.24.0 release is held, so ports baseline on the published repo's
-# main branch. Cargo.lock pins the exact rev — reproducible until a
-# deliberate `cargo update`; switch back to a version once 0.24.0 ships.
-epics-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
-asyn-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
-ad-core-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
-ad-plugins-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main" }
+# epics-rs 0.24.0 (released; user directive 2026-07-18): the git-main baseline
+# that carried PRs #18-#29 is now published as v0.24.0 on crates.io, so ports
+# consume the released version instead of the main branch. Cargo.lock pins the
+# exact patch release.
+epics-rs = "0.24.0"
+asyn-rs = "0.24.0"
+ad-core-rs = "0.24.0"
+ad-plugins-rs = "0.24.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { git = "https://github.com/epics-rs/epics-rs.git", branch = "main", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.24.0", package = "epics-modbus-rs" }

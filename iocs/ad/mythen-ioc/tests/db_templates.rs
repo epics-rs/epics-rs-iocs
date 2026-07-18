@@ -93,6 +93,7 @@ fn every_sd_drv_info_is_one_the_driver_creates() {
             if field != "INP" && field != "OUT" {
                 continue;
             }
+            let value = value.as_str_lossy();
             let Some(rest) = value.strip_prefix("@asyn(") else {
                 continue;
             };

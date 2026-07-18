@@ -246,11 +246,7 @@ static INDEXED_FIELDS: &[FieldDesc] = &{
         dbf_type: epics_rs::base::types::DbFieldType,
         ro: bool,
     ) -> FieldDesc {
-        FieldDesc {
-            name,
-            dbf_type,
-            read_only: ro,
-        }
+        FieldDesc::new(name, dbf_type, ro)
     }
     [
         f("SP1", Enum, true),
@@ -411,7 +407,7 @@ impl Record for VsRecord {
         }
     }
 
-    fn field_list(&self) -> &'static [FieldDesc] {
+    fn declared_fields(&self) -> &'static [FieldDesc] {
         let fields: &Vec<FieldDesc> = &ALL_FIELDS;
         // `ALL_FIELDS` is a `LazyLock` that lives for the whole program.
         unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
@@ -506,7 +502,7 @@ impl Record for VsRecord {
         }
         // C returns immediately on UDF; the framework's `rec_gbl_check_udf`
         // raises `UDF_ALARM` at `UDFS`.
-        if common.udf {
+        if common.udf != 0 {
             return;
         }
         self.limit_alarms(common);
@@ -578,7 +574,7 @@ mod tests {
     /// dbCommon `UDF = 1`.
     fn common() -> CommonFields {
         CommonFields {
-            udf: false,
+            udf: 0,
             ..CommonFields::default()
         }
     }
@@ -598,7 +594,7 @@ mod tests {
     #[test]
     fn every_declared_field_is_readable() {
         let r = VsRecord::default();
-        for f in r.field_list() {
+        for f in r.declared_fields() {
             assert!(r.get_field(f.name).is_some(), "{} unreadable", f.name);
         }
     }
@@ -762,7 +758,7 @@ mod tests {
             ..Default::default()
         };
         let mut c = common();
-        c.udf = true;
+        c.udf = 1;
         r.check_alarms(&mut c);
         assert_eq!(c.nsev, AlarmSeverity::NoAlarm);
         assert_eq!(r.lalm, 0.0);

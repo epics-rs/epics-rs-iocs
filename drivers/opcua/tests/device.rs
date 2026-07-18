@@ -129,6 +129,7 @@ fn defined() -> ProcessContext {
     ProcessContext {
         udf: false,
         udfs: AlarmSeverity::Invalid,
+        nsev: AlarmSeverity::NoAlarm,
         phas: 0,
         tse: 0,
         time: SystemTime::UNIX_EPOCH,
@@ -371,9 +372,9 @@ fn mbbo_direct_reads_back_val_and_its_bits_from_the_shifted_raw() {
     // recomputes it; the record's own readback keeps the two fields apart.
     assert_eq!(field(&record, "RVAL"), EpicsValue::ULong(0x50));
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(5));
-    assert_eq!(field(&record, "B0"), EpicsValue::Char(1));
-    assert_eq!(field(&record, "B1"), EpicsValue::Char(0));
-    assert_eq!(field(&record, "B2"), EpicsValue::Char(1));
+    assert_eq!(field(&record, "B0"), EpicsValue::UChar(1));
+    assert_eq!(field(&record, "B1"), EpicsValue::UChar(0));
+    assert_eq!(field(&record, "B2"), EpicsValue::UChar(1));
 }
 
 // ------------------------------------------------------------------ enumerations
@@ -590,7 +591,7 @@ fn a_waveform_takes_the_array_in_its_own_element_type() {
         field(&record, "VAL"),
         EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])
     );
-    assert_eq!(field(&record, "NORD"), EpicsValue::Long(3));
+    assert_eq!(field(&record, "NORD"), EpicsValue::ULong(3));
 }
 
 #[test]
