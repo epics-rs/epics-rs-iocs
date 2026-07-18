@@ -1,0 +1,13 @@
+[package]
+name = "mca-amptek"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+mca = { path = "../mca" }
+epics-rs = { workspace = true, features = ["asyn"] }
+asyn-rs = { workspace = true, features = ["epics"] }
+
+[dev-dependencies]
+tempfile = "3"

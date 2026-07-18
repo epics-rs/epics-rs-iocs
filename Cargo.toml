@@ -78,6 +78,7 @@ members = [
     "drivers/opcua",
     "drivers/mca",
     "drivers/mca-rontec",
+    "drivers/mca-amptek",
     "iocs/ad/specs-analyser-ioc",
     "iocs/d435i-ioc",
     "iocs/ad/merlin-ioc",
@@ -148,6 +149,7 @@ members = [
     "iocs/opcua-ioc",
     "iocs/mca-ioc",
     "iocs/mca-rontec-ioc",
+    "iocs/mca-amptek-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC
