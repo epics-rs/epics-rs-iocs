@@ -284,6 +284,45 @@ pub enum ReceivedPacket {
     },
 }
 
+/// `CConsoleHelper::ProcessSpectrumEx` (`ConsoleHelper.cpp:736-754`):
+/// derive the channel count from a [`ReceivedPacket::Spectrum`]'s `pid2`
+/// and decode each channel as a 3-byte little-endian value. Returns
+/// `(channels, values)`; the caller slices out any trailing 64-byte DP4
+/// status block (present when `pid2` is even, `data[channels*3..]`) and
+/// decodes it separately via [`crate::status::process_status`] -- this
+/// function only does the spectrum half, matching `ProcessSpectrumEx`
+/// itself (its own trailing-status branch calls out to
+/// `DP5Stat.Process_Status` rather than inlining it).
+///
+/// `(pid2 - 1) & 14` is always in `0..=14` for any `u8` (C computes the
+/// same mask after promoting `PID2` to `int`, so the identical
+/// arithmetic-vs-bitwise identity holds there too), so `channels` is
+/// always in `256..=32768` regardless of `pid2` -- no overflow risk from
+/// an out-of-range value.
+///
+/// # Restructuring vs. C
+/// `Packet_In::DATA` is a fixed 32768-byte array, so a short response
+/// still leaves `CHANNELS` fully computed from `pid2` and
+/// `ProcessSpectrumEx` reads whatever stale/zeroed bytes happen to sit
+/// past what the socket actually wrote -- garbage data, not a
+/// memory-safety bug, but not reproducible against a right-sized
+/// `Vec<u8>` here. This returns however many complete 3-byte groups
+/// `data` actually contains (`channels.min(data.len() / 3)`) instead.
+pub fn decode_spectrum(pid2: u8, data: &[u8]) -> (usize, Vec<i32>) {
+    let shift = ((i32::from(pid2) - 1) & 14) / 2;
+    let channels = (256i32 << shift) as usize;
+    let n = channels.min(data.len() / 3);
+    let values = (0..n)
+        .map(|i| {
+            let base = i * 3;
+            i32::from(data[base])
+                + i32::from(data[base + 1]) * 256
+                + i32::from(data[base + 2]) * 65536
+        })
+        .collect();
+    (channels, values)
+}
+
 /// `CParsePacket::ParsePacketStatus` (`ParsePacket.cpp:11-49`): validate
 /// `SYNC1`/`SYNC2`/checksum and extract `(pid1, pid2, data)`. Returns
 /// `Err(status)` for anything but `PID2_ACK_OK` -- C instead threads the
@@ -472,6 +511,60 @@ mod tests {
                 other => panic!("pid2={pid2:#x}: expected Spectrum, got {other:?}"),
             }
         }
+    }
+
+    /// `ProcessSpectrumEx`'s channel-count formula
+    /// (`256 * 2^(((pid2-1)&14)/2)`), spot-checked at the boundaries of
+    /// each doubling step across the full `SPECTRUM_256_LO..=
+    /// SPECTRUM_8192_HI` range.
+    #[test]
+    fn decode_spectrum_channel_count_matches_pid2() {
+        let expected = [
+            (0x01u8, 256usize),
+            (0x02, 256),
+            (0x03, 512),
+            (0x04, 512),
+            (0x05, 1024),
+            (0x06, 1024),
+            (0x07, 2048),
+            (0x08, 2048),
+            (0x09, 4096),
+            (0x0A, 4096),
+            (0x0B, 8192),
+            (0x0C, 8192),
+        ];
+        for (pid2, channels) in expected {
+            let (got, _) = decode_spectrum(pid2, &[]);
+            assert_eq!(got, channels, "pid2={pid2:#x}");
+        }
+    }
+
+    /// Each channel is a 3-byte little-endian value
+    /// (`DATA[i*3] + DATA[i*3+1]*256 + DATA[i*3+2]*65536`).
+    #[test]
+    fn decode_spectrum_decodes_3_byte_little_endian_channels() {
+        // pid2=0x01 -> 256 channels; only supply 3 real channels' worth
+        // of data, the rest is implicitly absent (short-response case).
+        let data = [
+            0x01, 0x00, 0x00, // channel 0 = 1
+            0xFF, 0x00, 0x00, // channel 1 = 255
+            0x00, 0x01, 0x00, // channel 2 = 256
+        ];
+        let (channels, values) = decode_spectrum(0x01, &data);
+        assert_eq!(channels, 256);
+        assert_eq!(values, vec![1, 255, 256]);
+    }
+
+    /// A response shorter than `channels * 3` bytes yields only the
+    /// complete 3-byte groups actually present, not a panic or
+    /// out-of-bounds read -- see the function doc's "Restructuring vs.
+    /// C" note.
+    #[test]
+    fn decode_spectrum_truncates_to_available_data() {
+        let data = [0x2A, 0x00, 0x00, 0x01]; // 1 full channel + 1 stray byte
+        let (channels, values) = decode_spectrum(0x01, &data);
+        assert_eq!(channels, 256);
+        assert_eq!(values, vec![42]);
     }
 
     /// `ParsePacket`'s config-readback route (`RCVPT_CONFIG_READBACK`,
