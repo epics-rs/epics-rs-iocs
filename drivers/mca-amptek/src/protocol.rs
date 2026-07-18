@@ -266,22 +266,26 @@ pub enum ReceivedPacket {
     /// (`ConsoleHelper::ProcessCfgReadEx`'s `CfgReadBack` branch,
     /// `ConsoleHelper.cpp:769-823`).
     ConfigReadback { data: Vec<u8> },
-    /// `preqProcessAck`: `PID1_ACK` with no further routing
-    /// (`ParsePacket.cpp:154-155`). `status` is `AckStatus::Ok` for a bare
-    /// ACK or the specific error the device reported.
-    Ack { status: AckStatus },
-    /// Any other well-framed, checksum-valid packet C's `ParsePacket`
-    /// falls through to `PID2_ACK_PID_ERROR`/`preqProcessError` for
-    /// (`ParsePacket.cpp:156-159`), or a packet whose framing/checksum
-    /// itself failed (`ParsePacketStatus`, `ParsePacket.cpp:17-46`).
-    /// `offending_command` is `ParseCmd`'s extracted text
-    /// (`ParsePacket.cpp:179-199`), populated only for
-    /// `BadParam`/`Pc5NotPresent`/`Unrecognized` with a nonzero-length
-    /// payload.
-    Error {
-        status: AckStatus,
-        offending_command: Option<String>,
-    },
+    /// `preqProcessAck`: **any** well-framed `PID1_ACK` packet
+    /// (`ParsePacket.cpp:154-155`). C's routing `if`/`else if` chain only
+    /// gates on the packet's frame-level `STATUS` (sync/length/checksum,
+    /// checked once up front); once that passes, `PID1 == PID1_ACK` alone
+    /// selects this route regardless of the ack code in `PID2` -- a
+    /// `PID2_ACK_BAD_PARAM` response is routed here exactly like a bare
+    /// `PID2_ACK_OK`. `ReceiveData()` therefore reports success
+    /// (`bDataReceived = true`) for an error ack too; distinguishing a real
+    /// failure from a bare success is `ParseCmd`'s job
+    /// (`ParsePacket.cpp:179-199`), which only `sendCommandString` bothers
+    /// to call -- see [`offending_command_text`]. `data` is `PIN->DATA`,
+    /// needed by that same check.
+    Ack { status: AckStatus, data: Vec<u8> },
+    /// A packet whose framing/checksum itself failed (`ParsePacketStatus`,
+    /// `ParsePacket.cpp:17-46`), or any other well-framed, checksum-valid
+    /// packet C's `ParsePacket` falls through to
+    /// `PID2_ACK_PID_ERROR`/`preqProcessError` for
+    /// (`ParsePacket.cpp:156-159`). Never produced for an ack packet --
+    /// see [`ReceivedPacket::Ack`].
+    Error { status: AckStatus },
 }
 
 /// `CConsoleHelper::ProcessSpectrumEx` (`ConsoleHelper.cpp:736-754`):
@@ -367,8 +371,12 @@ fn parse_packet_status(raw: &[u8]) -> Result<(u8, u8, Vec<u8>), AckStatus> {
 
 /// `CParsePacket::ParseCmd` (`ParsePacket.cpp:179-199`): extract the
 /// offending command text C's firmware echoes back in `DATA` for
-/// `BadParam`/`Pc5NotPresent`/`Unrecognized` responses.
-fn offending_command_text(status: AckStatus, data: &[u8]) -> Option<String> {
+/// `BadParam`/`Pc5NotPresent`/`Unrecognized` responses. Callable on any
+/// [`ReceivedPacket::Ack`], matching `sendCommandString`
+/// (`drvAmptek.cpp:437-477`), the only caller that checks this -- it is
+/// the sole way to tell a real error ack from a bare success, since
+/// [`ReceivedPacket::Ack`] itself makes no such distinction.
+pub fn offending_command_text(status: AckStatus, data: &[u8]) -> Option<String> {
     if !data.is_empty()
         && matches!(
             status,
@@ -394,10 +402,7 @@ pub fn parse_packet(raw: &[u8]) -> ReceivedPacket {
     let (pid1, pid2, data) = match parse_packet_status(raw) {
         Ok(parsed) => parsed,
         Err(status) => {
-            return ReceivedPacket::Error {
-                status,
-                offending_command: None,
-            };
+            return ReceivedPacket::Error { status };
         }
     };
 
@@ -410,19 +415,13 @@ pub fn parse_packet(raw: &[u8]) -> ReceivedPacket {
     } else if pid1 == pid1::RCV_SCOPE_MISC && pid2 == pid2_rcv::CONFIG_READBACK {
         ReceivedPacket::ConfigReadback { data }
     } else if pid1 == pid1::ACK {
-        let status = AckStatus::from_byte(pid2);
-        if status == AckStatus::Ok {
-            ReceivedPacket::Ack { status }
-        } else {
-            ReceivedPacket::Error {
-                offending_command: offending_command_text(status, &data),
-                status,
-            }
+        ReceivedPacket::Ack {
+            status: AckStatus::from_byte(pid2),
+            data,
         }
     } else {
         ReceivedPacket::Error {
             status: AckStatus::PidError,
-            offending_command: None,
         }
     }
 }
@@ -585,22 +584,31 @@ mod tests {
         assert_eq!(
             parse_packet(&buf),
             ReceivedPacket::Ack {
-                status: AckStatus::Ok
+                status: AckStatus::Ok,
+                data: vec![],
             }
         );
     }
 
-    /// An ACK carrying an error status and offending-command text
+    /// An ACK carrying an error status still routes to `Ack`, not `Error`
+    /// -- `ParsePacket` doesn't look at the ack code, only `PID1_ACK`
+    /// (`ParsePacket.cpp:154-155`); `offending_command_text` is the
+    /// separate, caller-invoked check that actually distinguishes it
     /// (`CParsePacket::ParseCmd`, `ParsePacket.cpp:179-199`).
     #[test]
-    fn parse_packet_extracts_offending_command_on_bad_param() {
+    fn parse_packet_routes_error_ack_to_ack_not_error() {
         let buf = pack_out(0xFF, 0x05, b"BADCMD=1;");
         match parse_packet(&buf) {
-            ReceivedPacket::Error {
+            ReceivedPacket::Ack {
                 status: AckStatus::BadParam,
-                offending_command: Some(text),
-            } => assert_eq!(text, "BADCMD=1;"),
-            other => panic!("expected BadParam error with text, got {other:?}"),
+                data,
+            } => {
+                assert_eq!(
+                    offending_command_text(AckStatus::BadParam, &data),
+                    Some("BADCMD=1;".to_string())
+                );
+            }
+            other => panic!("expected BadParam Ack, got {other:?}"),
         }
     }
 
@@ -613,7 +621,6 @@ mod tests {
             parse_packet(&buf),
             ReceivedPacket::Error {
                 status: AckStatus::PidError,
-                offending_command: None
             }
         );
     }
