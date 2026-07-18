@@ -76,6 +76,7 @@ members = [
     "drivers/yokogawa-gm10",
     "drivers/yokogawa-mw100",
     "drivers/opcua",
+    "drivers/mca",
     "iocs/ad/specs-analyser-ioc",
     "iocs/d435i-ioc",
     "iocs/ad/merlin-ioc",
@@ -160,3 +161,7 @@ ad-core-rs = "0.24.0"
 ad-plugins-rs = "0.24.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
 modbus-rs = { version = "0.24.0", package = "epics-modbus-rs" }
+# mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
+# epics-rs "mca" feature exists yet, so drivers/mca depends on this
+# standalone published crate directly.
+mca-rs = "0.24.0"
