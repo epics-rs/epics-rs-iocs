@@ -398,3 +398,10 @@ remain open upstream defects the port did not guess at.
 | 209 | `devOpcua.cpp:783`, `:891` — a readRequest on an *output* record falls through to the read branch, which pops an update that a read request never queued | fixed-in-port (requests the read it names) |
 | — | `RecordConnector.cpp:56-77` vs `Update.h:45` — the reason a record processes for is kept in two places (`pconnector->reason` and inside the queued update), free to fall out of step | observed only (port keeps the queue as the single source) |
 | — | `mbbiDirectRecord.c:157-162` (epics-base) only shifts where epics-rs masks with MASK then shifts (asyn convention): with NOBT set, out-of-window bits the server sends are dropped in the port and kept in C | observed only (framework-carried deviation, not an opcua defect) |
+
+## epics-modules/mca (commit `bcb5ad5`)
+
+| # | Defect | Port handling |
+|---|--------|---------------|
+| 210 | `drvFastSweep.cpp:345-356` — `readInt32Array` ignores the caller's `maxChans` buffer capacity and always `memcpy`s `numPoints_*sizeof(int)` bytes from `pData_`: when `numPoints_ > maxChans` (a shorter waveform NELM than the configured channel count) it overruns the caller's `data` buffer | fixed-in-port (copies `min(numPoints_, maxChans)`) |
+| 211 | `drvFastSweep.cpp:278` — `computeNumAverage` computes `dwellTime_/callbackInterval_` with no guard on `callbackInterval_ == 0`; C float division by zero yields inf/nan and the subsequent `(int)` cast is UB, while under Rust's defined saturating cast it would silently freeze acquisition | fixed-in-port (zero `callbackInterval_` guarded before the divide) |
