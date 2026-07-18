@@ -95,14 +95,37 @@ impl DevMcaAsyn {
             .write_float64_blocking(self.reasons[reason as usize], self.addr, value)
     }
 
+    /// C `paramList::getInteger` (`asynPortDriver.cpp:301-321`) writes the
+    /// type default (`0`) *unconditionally* before attempting the real
+    /// read, then separately returns `asynParamUndefined` if the value was
+    /// never set -- a status [`Self::read_status`]'s C counterpart
+    /// (`devMcaAsyn.c:364-380`, the `mcaReadStatus` branch) never inspects:
+    /// every `pasynInt32->read`/`pasynFloat64->read` call there is bare,
+    /// its return value discarded. A never-yet-acquired status field (e.g.
+    /// `Acquiring` before the first status sample) is therefore a normal
+    /// "0" read in C, not an error. The strict blocking helper collapses
+    /// that (value, ignorable status) pair into one `Result`, so this
+    /// tolerates [`AsynError::ParamUndefined`] specifically -- any other
+    /// error (bad index, wrong type, disconnected) still propagates.
     fn read_i32(&self, reason: McaReason) -> AsynResult<i32> {
-        self.handle
+        match self
+            .handle
             .read_int32_blocking(self.reasons[reason as usize], self.addr)
+        {
+            Err(AsynError::ParamUndefined(_)) => Ok(0),
+            other => other,
+        }
     }
 
+    /// See [`Self::read_i32`].
     fn read_f64(&self, reason: McaReason) -> AsynResult<f64> {
-        self.handle
+        match self
+            .handle
             .read_float64_blocking(self.reasons[reason as usize], self.addr)
+        {
+            Err(AsynError::ParamUndefined(_)) => Ok(0.0),
+            other => other,
+        }
     }
 
     /// C `send_msg`'s switch (`devMcaAsyn.c:262-330`), restructured: every
