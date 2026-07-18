@@ -147,6 +147,7 @@ members = [
     "iocs/yokogawa-mw100-ioc",
     "iocs/opcua-ioc",
     "iocs/mca-ioc",
+    "iocs/mca-rontec-ioc",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC

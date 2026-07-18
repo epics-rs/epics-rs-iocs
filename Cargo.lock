@@ -2277,6 +2277,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mca-rontec-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "mca",
+ "mca-rontec",
+ "mca-rs",
+ "tokio",
+]
+
+[[package]]
 name = "mca-rs"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
