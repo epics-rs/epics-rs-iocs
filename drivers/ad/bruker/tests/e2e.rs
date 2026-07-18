@@ -188,6 +188,21 @@ impl Fixture {
     fn next_array(&self, timeout: Duration) -> Option<Arc<NDArray>> {
         self.arrays.recv_timeout(timeout).ok()
     }
+
+    /// Poll an integer parameter until it equals `want`, returning the last
+    /// value read once it matches or `timeout` elapses. The acquisition task
+    /// flips `acquire`/`status` *after* it publishes the array, so a bare read
+    /// of them the instant the array arrives races that task under load.
+    fn wait_int32(&self, reason: usize, want: i32, timeout: Duration) -> i32 {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let got = self.sync.read_int32(reason).expect("int32 parameter");
+            if got == want || std::time::Instant::now() >= deadline {
+                return got;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 impl Drop for Fixture {
@@ -257,10 +272,12 @@ fn one_scan_reaches_the_plugins() {
         8
     );
 
-    // The acquisition ended by itself: ImageMode was Single.
-    assert_eq!(fixture.sync.read_int32(ad.acquire).expect("acquire"), 0);
+    // The acquisition ended by itself: ImageMode was Single. The acquisition
+    // task flips these after publishing the array, so wait for the transition
+    // rather than racing it.
+    assert_eq!(fixture.wait_int32(ad.acquire, 0, Duration::from_secs(5)), 0);
     assert_eq!(
-        fixture.sync.read_int32(ad.status).expect("status"),
+        fixture.wait_int32(ad.status, ADStatus::Idle as i32, Duration::from_secs(5)),
         ADStatus::Idle as i32
     );
 
@@ -299,24 +316,31 @@ fn a_stop_during_the_exposure_publishes_no_frame() {
         .expect("acquire time");
     fixture.sync.write_int32(ad.acquire, 1).expect("acquire");
 
-    // Let the scan go out and the countdown start.
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        fixture.dir.join("frame_007.sfrm").exists(),
-        "BIS has written the frame"
-    );
+    // Let the scan go out and the countdown start. The actor enters Acquire
+    // when it processes the acquire write and BIS writes the frame when the
+    // acquisition task sends the scan; both lag the write under load and on
+    // independent timelines, so wait for each rather than assuming a fixed
+    // delay. The 30 s exposure keeps us mid-scan throughout.
     assert_eq!(
-        fixture.sync.read_int32(ad.status).expect("status"),
+        fixture.wait_int32(ad.status, ADStatus::Acquire as i32, Duration::from_secs(5)),
         ADStatus::Acquire as i32
     );
+    let frame = fixture.dir.join("frame_007.sfrm");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !frame.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(frame.exists(), "BIS has written the frame");
 
     fixture.sync.write_int32(ad.acquire, 0).expect("stop");
 
     let array = fixture.next_array(Duration::from_secs(2));
     assert!(array.is_none(), "a stopped exposure is not a frame");
-    assert_eq!(fixture.sync.read_int32(ad.acquire).expect("acquire"), 0);
+    // The stop is handled asynchronously; wait for the transition it drives
+    // rather than racing the task that applies it.
+    assert_eq!(fixture.wait_int32(ad.acquire, 0, Duration::from_secs(5)), 0);
     assert_eq!(
-        fixture.sync.read_int32(ad.status).expect("status"),
+        fixture.wait_int32(ad.status, ADStatus::Idle as i32, Duration::from_secs(5)),
         ADStatus::Idle as i32
     );
     // Nothing was published, so the array counter was never touched: it is
