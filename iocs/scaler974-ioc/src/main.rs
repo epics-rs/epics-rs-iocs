@@ -44,6 +44,15 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(asyn_name, move || asyn_factory());
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
+    // Contribute the scaler record type's DTYP menu. The device support is
+    // bound dynamically by DTYP string at iocInit (register_dynamic_device_support
+    // below), which is name-blind and runs AFTER st.cmd's
+    // `dbpf(...DTYP,"Asyn Scaler")`, so the name is not in any device menu when
+    // that put validates. Register it here at app setup, before the startup
+    // script runs, so the put resolves against the record type's live device
+    // menu instead of failing S_db_noRSET. (asyn contributes its own menus via
+    // register_asyn_device_support; the dynamic scaler support has no such hook.)
+    epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
