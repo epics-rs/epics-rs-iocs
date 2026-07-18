@@ -154,17 +154,16 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.24.0 (released; user directive 2026-07-18): the git-main baseline
-# that carried PRs #18-#29 is now published as v0.24.0 on crates.io, so ports
-# consume the released version instead of the main branch. Cargo.lock pins the
-# exact patch release.
-epics-rs = "0.24.0"
-asyn-rs = "0.24.0"
-ad-core-rs = "0.24.0"
-ad-plugins-rs = "0.24.0"
+# epics-rs 0.24.1 (released; user directive 2026-07-18): ports consume the
+# released version instead of the main branch; bumped 0.24.0 -> 0.24.1.
+# Cargo.lock pins the exact patch release.
+epics-rs = "0.24.1"
+asyn-rs = "0.24.1"
+ad-core-rs = "0.24.1"
+ad-plugins-rs = "0.24.1"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.24.0", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.24.1", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.24.0"
+mca-rs = "0.24.1"
