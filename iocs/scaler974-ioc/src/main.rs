@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -39,8 +38,6 @@ async fn main() -> CaResult<()> {
     // scaler16.db, ...) -- no template is authored in this crate.
     epics_rs::base::runtime::env::set_default("SCALER", epics_rs::scaler::SCALER_DB_DIR);
 
-    let trace = Arc::new(TraceManager::new());
-
     let mut app = IocApplication::new();
 
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
@@ -65,7 +62,6 @@ async fn main() -> CaResult<()> {
     }
 
     {
-        let trace_c = trace.clone();
         let mgr_c = port_manager.clone();
         app = app.register_startup_command(CommandDef::new(
             "drvAsynSerialPortConfigure",
@@ -123,20 +119,21 @@ async fn main() -> CaResult<()> {
                     }
                 };
 
-                let runtime_handle =
-                    match mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                            return Ok(CommandOutcome::Continue);
-                        }
-                    };
-                epics_rs::asyn::asyn_record::register_port(
-                    &port,
-                    runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                // `register_port_with_config` is the sole registration owner:
+                // it publishes the port into both the PortManager's own map
+                // (so PortManager-resolved commands like asynSetOption find
+                // it directly) and the process-wide asyn_record registry
+                // (asyn-rs 0.24.0 manager.rs) in one atomic call. A second
+                // manual `asyn_record::register_port` on the same name used
+                // to be required (asyn-rs 0.22.1: register_port_with_config
+                // did not touch asyn_record and PortManager::find_port_handle
+                // had no registry fallback) but is now a duplicate that the
+                // registry rejects with "port already registered", failing
+                // this command's very first invocation.
+                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
+                    ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
                 ctx.println(&format!(
                     "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
                 ));

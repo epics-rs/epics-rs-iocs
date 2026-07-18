@@ -59,7 +59,6 @@ async fn main() -> CaResult<()> {
     }
 
     {
-        let trace_c = trace.clone();
         let mgr_c = port_manager.clone();
         app = app.register_startup_command(CommandDef::new(
             "drvAsynSerialPortConfigure",
@@ -117,20 +116,21 @@ async fn main() -> CaResult<()> {
                     }
                 };
 
-                let runtime_handle =
-                    match mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                            return Ok(CommandOutcome::Continue);
-                        }
-                    };
-                epics_rs::asyn::asyn_record::register_port(
-                    &port,
-                    runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                // `register_port_with_config` is the sole registration owner:
+                // it publishes the port into both the PortManager's own map
+                // (so PortManager-resolved commands like asynSetOption find
+                // it directly) and the process-wide asyn_record registry
+                // (asyn-rs 0.24.0 manager.rs) in one atomic call. A second
+                // manual `asyn_record::register_port` on the same name used
+                // to be required (asyn-rs 0.22.1: register_port_with_config
+                // did not touch asyn_record and PortManager::find_port_handle
+                // had no registry fallback) but is now a duplicate that the
+                // registry rejects with "port already registered", failing
+                // this command's very first invocation.
+                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
+                    ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
                 ctx.println(&format!(
                     "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
                 ));

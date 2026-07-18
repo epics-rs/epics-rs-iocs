@@ -69,22 +69,25 @@ async fn main() -> CaResult<()> {
     }
 
     // Second half of the same framework gap: asyn-rs 0.22.1's
-    // `drvAsynSerialPortConfigure` (from `register_asyn_commands`) registers
+    // `drvAsynSerialPortConfigure` (from `register_asyn_commands`) registered
     // the port it creates only in the global `asyn_record` registry, never
     // in the `PortManager` instance passed to `register_asyn_commands` — so
     // `asynSetOption`/`asynOctetSetInputEos`/`asynOctetSetOutputEos`/
     // `asynReport`, which all resolve their port via
-    // `PortManager::find_port_handle`, can never find a port created this
+    // `PortManager::find_port_handle`, could never find a port created this
     // way ("port not found: serial1"), even after the fix above. Shadow
     // `drvAsynSerialPortConfigure` (last registration for a given command
     // name wins — see `IocApplication::run`/`CommandRegistry::register`)
-    // with an equivalent that registers into *both* registries:
-    // `PortManager::register_port_with_config` for the `PortManager` half,
-    // plus the same `asyn_record::register_port` call the original command
-    // makes. No delaygen or serial-port logic is reimplemented — this only
-    // bridges two registries the vendored crate itself left disjoint.
+    // with an equivalent that registers into the `PortManager` instance via
+    // `register_port_with_config`. As of asyn-rs 0.24.0,
+    // `register_port_with_config` is itself the single owner of both halves
+    // — it publishes into the `PortManager`'s own map *and* the process-wide
+    // `asyn_record` registry in one atomic call (`asyn-rs::manager.rs`), so
+    // this shim must not also call `asyn_record::register_port` itself: that
+    // used to be required (0.22.1) but is now a duplicate the registry
+    // rejects with "port already registered", failing this command's very
+    // first invocation.
     {
-        let trace_c = trace.clone();
         let mgr_c = port_manager.clone();
         app = app.register_startup_command(CommandDef::new(
             "drvAsynSerialPortConfigure",
@@ -142,20 +145,10 @@ async fn main() -> CaResult<()> {
                     }
                 };
 
-                let runtime_handle =
-                    match mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                            return Ok(CommandOutcome::Continue);
-                        }
-                    };
-                epics_rs::asyn::asyn_record::register_port(
-                    &port,
-                    runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
+                    ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
+                    return Ok(CommandOutcome::Continue);
+                }
                 ctx.println(&format!(
                     "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
                 ));
