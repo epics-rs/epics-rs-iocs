@@ -34,13 +34,17 @@ epicsEnvSet("P", "SP:")
 # Teledyne D-series (demo instance -- no upstream st.cmd/iocBoot exists
 # for either Teledyne family; see header comment).
 # ------------------------------------------------------------------
+# The driver port records bind to ($(TELD_PORT)) must differ from the serial
+# transport it rides on ($(TELD_TTY)): TeledyneDInit registers its own port,
+# so reusing the serial port's name collides ("port already registered").
 epicsEnvSet("TELD_PORT", "TelD1")
-drvAsynSerialPortConfigure("$(TELD_PORT)", "/dev/ttyS0", 0, 0, 0)
-asynSetTraceIOMask("$(TELD_PORT)", 0, HEX)
+epicsEnvSet("TELD_TTY", "TelD1_tty")
+drvAsynSerialPortConfigure("$(TELD_TTY)", "/dev/ttyS0", 0, 0, 0)
+asynSetTraceIOMask("$(TELD_TTY)", 0, HEX)
 # TeledyneDInit(port, serPort, serAddr, unit) -- unit 6 matches
 # teled_d.proto/teled_h.proto's shipped default ($(u=6), never overridden
 # anywhere upstream).
-TeledyneDInit("$(TELD_PORT)", "$(TELD_PORT)", 0, 6)
+TeledyneDInit("$(TELD_PORT)", "$(TELD_TTY)", 0, 6)
 
 dbLoadRecords("db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=D1,PORT=$(TELD_PORT),ADDR=0")
 
@@ -48,9 +52,10 @@ dbLoadRecords("db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=
 # Teledyne H-series (demo instance -- see header comment).
 # ------------------------------------------------------------------
 epicsEnvSet("TELH_PORT", "TelH1")
-drvAsynSerialPortConfigure("$(TELH_PORT)", "/dev/ttyS1", 0, 0, 0)
-asynSetTraceIOMask("$(TELH_PORT)", 0, HEX)
-TeledyneHInit("$(TELH_PORT)", "$(TELH_PORT)", 0, 6)
+epicsEnvSet("TELH_TTY", "TelH1_tty")
+drvAsynSerialPortConfigure("$(TELH_TTY)", "/dev/ttyS1", 0, 0, 0)
+asynSetTraceIOMask("$(TELH_TTY)", 0, HEX)
+TeledyneHInit("$(TELH_PORT)", "$(TELH_TTY)", 0, 6)
 
 dbLoadRecords("db/teledynePumpH.template", "s=SP,ta=Teledyne,ss=H1,PORT=$(TELH_PORT)")
 
