@@ -209,7 +209,16 @@ impl DeviceSupport for DevMcaAsyn {
     /// `self.addr` before this device support was ever registered -- unlike
     /// C, a bad link or unknown port cannot reach `init` at all (see
     /// `connect`'s doc).
-    fn init(&mut self, _record: &mut dyn Record) -> CaResult<()> {
+    ///
+    /// Also reproduces the record-level `init_record`'s OWN second half
+    /// (`mcaRecord.c:463-487`, "Initialize hardware to agree with the
+    /// record"): every setup field's db-loaded value is sent to the driver
+    /// once, here, unconditionally -- independent of the runtime
+    /// NEWV/`special()` write path ([`McaRecord::take_device_requests`]),
+    /// which only yields a field the first time a *later* `caput` changes
+    /// it. Without this, a driver never learns a setup field's db-loaded
+    /// value (e.g. `NUSE`) until a client explicitly rewrites it after boot.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
         for reason in McaReason::ALL {
             let req = DrvUserRequest::new(reason.drv_info(), self.addr);
             let info: DrvUserInfo = self
@@ -217,6 +226,24 @@ impl DeviceSupport for DevMcaAsyn {
                 .drv_user_create_blocking(&req)
                 .map_err(asyn_to_ca)?;
             self.reasons[reason as usize] = info.reason;
+        }
+
+        let mca = Self::mca(record)?;
+        for command in [
+            McaCommand::ChannelAdvanceSource(mca.chas as i32),
+            McaCommand::NumChannels(mca.nuse),
+            McaCommand::Sequence(mca.seq),
+            McaCommand::DwellTime(mca.dwel),
+            McaCommand::Prescale(mca.pscl),
+            McaCommand::PresetRealTime(mca.prtm),
+            McaCommand::PresetLiveTime(mca.pltm),
+            McaCommand::PresetCounts(mca.pct),
+            McaCommand::PresetLowChannel(mca.pctl),
+            McaCommand::PresetHighChannel(mca.pcth),
+            McaCommand::PresetSweeps(mca.pswp),
+            McaCommand::AcquireMode(mca.mode as i32),
+        ] {
+            self.send_command(command).map_err(asyn_to_ca)?;
         }
         Ok(())
     }
