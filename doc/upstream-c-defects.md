@@ -399,9 +399,13 @@ remain open upstream defects the port did not guess at.
 | — | `RecordConnector.cpp:56-77` vs `Update.h:45` — the reason a record processes for is kept in two places (`pconnector->reason` and inside the queued update), free to fall out of step | observed only (port keeps the queue as the single source) |
 | — | `mbbiDirectRecord.c:157-162` (epics-base) only shifts where epics-rs masks with MASK then shifts (asyn convention): with NOBT set, out-of-window bits the server sends are dropped in the port and kept in C | observed only (framework-carried deviation, not an opcua defect) |
 
-## epics-modules/mca (commit `bcb5ad5`)
+## epics-modules/mca (commits `bcb5ad5` FastSweep, `f1f1ece` Rontec)
 
 | # | Defect | Port handling |
 |---|--------|---------------|
 | 210 | `drvFastSweep.cpp:345-356` — `readInt32Array` ignores the caller's `maxChans` buffer capacity and always `memcpy`s `numPoints_*sizeof(int)` bytes from `pData_`: when `numPoints_ > maxChans` (a shorter waveform NELM than the configured channel count) it overruns the caller's `data` buffer | fixed-in-port (copies `min(numPoints_, maxChans)`) |
 | 211 | `drvFastSweep.cpp:278` — `computeNumAverage` computes `dwellTime_/callbackInterval_` with no guard on `callbackInterval_ == 0`; C float division by zero yields inf/nan and the subsequent `(int)` cast is UB, while under Rust's defined saturating cast it would silently freeze acquisition | fixed-in-port (zero `callbackInterval_` guarded before the divide) |
+| 212 | `drvMcaRontec.c:307-317` — `mcaReadStatus` has no `break` before `case mcaChannelAdvanceSource`: control falls through from the status read into the channel-advance case (harmless today only because that case's body is itself `break;`) | fixed-in-port (Rust `match` cannot fall through) |
+| 213 | `drvMcaRontec.c:330` — `mcaNumChannels`: `binning = maxChans / nchans` is unguarded and only the upper bound of `nchans` is clamped (`:325`); a client `caput` of `NumChannels(0)` (or negative) divides by zero → SIGFPE | fixed-in-port (zero/negative channel count rejected before the divide) |
+| 214 | `drvMcaRontec.c:307-317` — `mcaReadStatus` discards each `sendMessage` return status and then reads `response[4]` / `atoi(&response[4])` unconditionally from a stack buffer never written on an I/O failure: `acquiring`/`elive`/`ereal` are set from uninitialized garbage on any comms error | fixed-in-port (status checked; on failure the fields are left unchanged) |
+| 215 | `drvMcaRontec.c:459-475` — `int32ArrayRead`: (a) `nread = 4 + 4*maxChans` is written into the fixed `mcaBuffer[RONTEC_MAXCHANS*4+4]` with no check that `maxChans <= RONTEC_MAXCHANS` → buffer overflow; (b) a short read (`nbytesIn != nread`) is only logged, then the loop parses `maxChans` channels from stale/garbage buffer bytes anyway | fixed-in-port (capacity checked; a short read is an error that does not parse) |
