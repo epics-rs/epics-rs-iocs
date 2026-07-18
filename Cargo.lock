@@ -2249,6 +2249,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "mca"
+version = "0.1.0"
+dependencies = [
+ "epics-rs",
+ "mca-rs",
+ "tokio",
+]
+
+[[package]]
+name = "mca-ioc"
+version = "0.1.0"
+dependencies = [
+ "asyn-rs",
+ "epics-rs",
+ "mca",
+ "mca-rs",
+ "tokio",
+]
+
+[[package]]
+name = "mca-rs"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa292a0f63ba157325ba7d37288fffe016f1f86e3f4f25fcc27ec51cfdca7e0a"
+dependencies = [
+ "chrono",
+ "epics-base-rs",
+]
+
+[[package]]
 name = "mcb4b-ioc"
 version = "0.1.0"
 dependencies = [

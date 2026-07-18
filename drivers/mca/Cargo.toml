@@ -1,0 +1,23 @@
+# Shared core of epics-modules/mca's mcaApp/mcaSrc: the asyn MCA interface
+# contract (`mca.h`/`drvMca.h`), the `devMcaAsyn` device support binding
+# `mca-rs`'s mcaRecord to any conforming asyn MCA driver, and the first
+# proving driver, `drvFastSweep.cpp` (a software MCA that sweeps an
+# upstream asyn int32Array/float64 source into channels).
+#
+# `mcaSum.c` (ROI summing) is NOT ported here -- it is already implemented
+# in `mca-rs::record::roi` (`sum_rois`), called by `McaRecord::process()`
+# itself. Round-2 vendor driver crates (mca-rontec, mca-amptek, ...) depend
+# on this crate for the `interface` module's public drvInfo strings/reasons
+# and register their own `PortDriver` against them, the same way
+# `drvFastSweep` does here.
+
+[package]
+name = "mca"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn"] }
+mca-rs = { workspace = true }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
