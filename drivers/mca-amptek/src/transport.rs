@@ -177,6 +177,34 @@ impl AmptekUdpTransport {
         Ok(found)
     }
 
+    /// `CConsoleHelper::DppSocket_Connect_Default_DPP`
+    /// (`ConsoleHelper.cpp:300-342`): broadcast-discover all responding
+    /// devices (retrying up to 3 times, 1 s apart, while *none* respond at
+    /// all -- the same retry shape as [`Self::connect_direct`]), then check
+    /// whether `target` is among the addresses found. Unlike
+    /// `connect_direct`, a round that finds *other* devices but not
+    /// `target` is not retried -- `DppSocket_Connect_Default_DPP`'s retry
+    /// condition is `NumDevices == 0`, not "no match yet"; the match check
+    /// against `target` runs once, against whichever round's results first
+    /// came back nonempty.
+    pub fn discover_default(
+        &self,
+        broadcast_addr: SocketAddrV4,
+        target: Ipv4Addr,
+    ) -> io::Result<bool> {
+        let mut found = Vec::new();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            found = self.discover_broadcast(broadcast_addr)?;
+            if !found.is_empty() {
+                break;
+            }
+        }
+        Ok(found.contains(&target))
+    }
+
     /// `CDppSocket::SendPacketInet` (`DppSocket.cpp:452-506`): send
     /// `packet` to `target:10001`, sleep 50 ms, then accumulate up to
     /// [`MAX_RESPONSE_SIZE`] bytes across up to [`MAX_RECV_ITERATIONS`]
@@ -355,6 +383,49 @@ mod tests {
         let found = transport.discover_broadcast(broadcast_addr).unwrap();
         handle.join().unwrap();
         assert_eq!(found, vec![LOOPBACK]);
+    }
+
+    #[test]
+    fn discover_default_confirms_when_target_is_among_responses() {
+        let responder = UdpSocket::bind((LOOPBACK, 0)).unwrap();
+        let responder_port = responder.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let (n, from) = responder.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 6);
+            let mut reply = vec![0x01, 0x00, buf[2], buf[3]];
+            reply.extend(std::iter::repeat_n(0u8, 28));
+            responder.send_to(&reply, from).unwrap();
+        });
+
+        let transport = AmptekUdpTransport::bind().unwrap();
+        let broadcast_addr = SocketAddrV4::new(LOOPBACK, responder_port);
+        assert!(
+            transport
+                .discover_default(broadcast_addr, LOOPBACK)
+                .unwrap()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn discover_default_rejects_when_target_is_not_among_responses() {
+        let responder = UdpSocket::bind((LOOPBACK, 0)).unwrap();
+        let responder_port = responder.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            let (n, from) = responder.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 6);
+            let mut reply = vec![0x01, 0x00, buf[2], buf[3]];
+            reply.extend(std::iter::repeat_n(0u8, 28));
+            responder.send_to(&reply, from).unwrap();
+        });
+
+        let transport = AmptekUdpTransport::bind().unwrap();
+        let broadcast_addr = SocketAddrV4::new(LOOPBACK, responder_port);
+        let other = Ipv4Addr::new(10, 0, 0, 99);
+        assert!(!transport.discover_default(broadcast_addr, other).unwrap());
+        handle.join().unwrap();
     }
 
     #[test]
