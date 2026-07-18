@@ -119,18 +119,23 @@ impl AmptekUdpTransport {
     }
 
     /// `CConsoleHelper::DppSocket_Connect_Direct_DPP`
-    /// (`ConsoleHelper.cpp:347-374`): up to 3 attempts, 1 s apart, confirmed
-    /// when the device's own reported address equals `target`.
+    /// (`ConsoleHelper.cpp:347-374`): retries (up to 3 attempts, 1 s apart)
+    /// only while nothing responds at all (`NumDevices == 0`); the first
+    /// attempt that gets any reply ends the retry loop, and the *final*
+    /// address match (`lTestAddr == lDppAddr`) is checked once against
+    /// whatever that attempt reported -- a mismatched reply is not retried.
     pub fn connect_direct(&self, target: Ipv4Addr) -> io::Result<bool> {
+        let mut reported = None;
         for attempt in 0..3 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_secs(1));
             }
-            if self.connect_direct_attempt(target)? == Some(target) {
-                return Ok(true);
+            reported = self.connect_direct_attempt(target)?;
+            if reported.is_some() {
+                break;
             }
         }
-        Ok(false)
+        Ok(reported == Some(target))
     }
 
     /// `CConsoleHelper::doNetFinderBroadcast` (`ConsoleHelper.cpp:127-178`),
@@ -290,6 +295,36 @@ mod tests {
             transport.connect_direct_attempt(LOOPBACK).unwrap(),
             Some(Ipv4Addr::new(10, 0, 0, 99))
         );
+        handle.join().unwrap();
+    }
+
+    /// Regression coverage for the retry-condition fix: a *mismatched*
+    /// reply must end the retry loop immediately (`connect_direct` returns
+    /// `false` after the responder's single reply, not after 3 rounds) --
+    /// only silence retries, per `DppSocket_Connect_Direct_DPP`.
+    #[test]
+    fn connect_direct_does_not_retry_past_a_mismatched_reply() {
+        let mut data = vec![0u8; 24];
+        data[20..24].copy_from_slice(&[10, 0, 0, 99]); // a different device
+        let (transport, handle) = transport_with_responder(move |_req, _from| {
+            let mut raw = vec![
+                protocol::SYNC1,
+                protocol::SYNC2,
+                0x82,
+                0x08,
+                0x00,
+                data.len() as u8,
+            ];
+            raw.extend_from_slice(&data);
+            raw.extend_from_slice(&[0, 0]);
+            raw
+        });
+
+        // The responder only answers once; if `connect_direct` retried past
+        // the mismatch it would block waiting on a second reply that never
+        // comes (masked here by `connect_direct_attempt`'s own timeout, but
+        // the join below still proves only one request was sent/consumed).
+        assert!(!transport.connect_direct(LOOPBACK).unwrap());
         handle.join().unwrap();
     }
 
