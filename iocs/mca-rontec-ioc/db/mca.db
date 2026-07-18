@@ -1,0 +1,15 @@
+# mca.db -- one mcaRecord instance bound to an asynMCA driver (devMcaAsyn).
+#
+# Macros:
+#   P, R      - record name prefix/suffix -> "$(P)$(R)"
+#   PORT      - the asyn MCA port name (e.g. a RontecConfig portName)
+#   ADDR      - asyn address selecting which signal's spectrum this record
+#               reads (default 0)
+#   NCHAN     - NMAX/NUSE, the record's channel-array capacity
+
+grecord(mca,"$(P)$(R)") {
+	field(DTYP,"asynMCA")
+	field(INP,"@asyn($(PORT),$(ADDR=0))")
+	field(NMAX,"$(NCHAN)")
+	field(NUSE,"$(NCHAN)")
+}

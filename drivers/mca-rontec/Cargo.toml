@@ -1,0 +1,14 @@
+# Rontec MCA asyn port driver, ported from epics-modules/mca's
+# mcaApp/RontecSrc/drvMcaRontec.c. Pure serial ASCII/binary protocol over
+# asynOctetSyncIO -- no vendor library, so this crate builds/tests on any
+# host.
+
+[package]
+name = "mca-rontec"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+mca = { path = "../mca" }
+epics-rs = { workspace = true, features = ["asyn"] }
