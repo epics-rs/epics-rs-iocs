@@ -294,6 +294,27 @@ locally). Same rules: each anchor searched workspace-wide for the family.
 
 ---
 
+## Wave-2 fix status — FIXED on unmerged worktree branches (user merges)
+
+All verified against upstream C first; one commit per finding; docs untouched by
+the fixers. Per-crate `fmt`/`clippy -D warnings`/`nextest` green; full-workspace
+pass still owed before push.
+
+- **branch `caucus/MXSR5DMPDZ/motor-fix-a-250d2112-1`:** PP-12 (`8a37c55` velocity, `a145992` accel), PP-13 `702a85e`, PP-14 `3fd0d3e`, PP-19 `9c6a91a`, PP-20 `cf72a37`.
+- **branch `caucus/MXSR5DMPDZ/motor-fix-b-240d1f7f-1`:** PP-15 `0f479d8`, PP-16 `95bf86b`, PP-17 `a135c08`, PP-18 `b24f896`, PP-21 `5be3a47` (ims/mclennan/micronix fixed; kohzu/oriel verified not-a-defect), PP-22 `6d87be0`.
+- **branch `caucus/MXSR5DMPDZ/ad-fix-cc1be77a-1`:** PP-24 `1f0f748`, PP-25 `fd946c0`, PP-26 `615fe51`, PP-27 `03705dc` (sibling sweep: simdetector was the only omission), PP-28 `f541208`, PP-29 `a14bb78`, PP-36 `0070e62`.
+- **branch `caucus/MXSR5DMPDZ/proto-fix-c74a3f6f-1`:** PP-30 `d526968`, PP-31 `e885106`, PP-32 `80d6e18`, PP-33 `50331d8`, PP-34 `650dd8f`, PP-35 `31b3a14`.
+
+Not fixed: PP-23 (deferred — needs device manual); PP-37/38/39 (observations).
+PP-40/41/42 (measComp live) are being fixed inside the completion port (below).
+
+Partial gap noted: PP-20's *input flush before re-read* is not reproduced —
+`SyncIOHandle` exposes no flush primitive; the tolerate-one-failure debounce (the
+record-observable behavior) is implemented and the flush gap is documented in
+`motor_common::comm`.
+
+---
+
 # Third wave — measComp (usb-ctr / usb-2408 / meascomp), 2026-07-19
 
 Audited after the user supplied the measComp C upstream. **Key scope finding:**
