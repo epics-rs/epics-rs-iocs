@@ -411,7 +411,7 @@ fixed as part of the completion, grounded in `drvUSBCTR.cpp`.
 
 ---
 
-## PP-43 [LOW] usb-ctr MCS time-waveform not recomputed on `MCA_DWELL_TIME` write — OPEN
+## PP-43 [LOW] usb-ctr MCS time-waveform not recomputed on `MCA_DWELL_TIME` write — FIXED
 
 - **Rust:** `drivers/meascomp/usb-ctr` computes the MCS time waveform only at `start_mcs`.
 - **C:** `drvUSBCTR.cpp:1302-1304` — `writeFloat64` recomputes the time waveform and does
@@ -422,8 +422,14 @@ fixed as part of the completion, grounded in `drvUSBCTR.cpp`.
   These waveform records are now wired (usbctr-completion `f603139`), so this is a live,
   record-observable divergence — it was out of the completion's *listed* item scope and left
   as-is by the porter. Surfaced here as a follow-up candidate, not silently dropped.
-- **Family:** single site (`writeFloat64` dwell branch). Fix: recompute + callback the time
-  waveforms in the `MCA_DWELL_TIME` write handler, not only at scan start.
+- **Family:** single site (`writeFloat64` dwell branch). `writeInt32`'s `mcaNumChannels_`
+  branch (`:1229-1236`) only clamps and does NOT call `computeMCSTimes` — so the num-channels
+  write must NOT recompute either (adding it would diverge from C). Verified single-site.
+- **Fixed:** commit `42d27b3` on branch `caucus/MXSR5DMPDZ/usbctr-completion-22f0c1fd-1`.
+  Factored `mcs::compute_mcs_times(state, num_points, dwell)` (`time_buffer[i] = i*dwell` over
+  `MCA_NUM_CHANNELS`, buffer-bounded; absolute-time buffer untouched); the `write_float64`
+  dwell branch calls it then publishes `MCS_TIME_WF` via `set_float32_array` +
+  `call_param_callbacks`. nextest `-p usb-ctr` 30/30 (2 new). Full-workspace pass still owed.
 
 ## Documented, not fixed (unreachable / port-is-stricter / degenerate)
 
