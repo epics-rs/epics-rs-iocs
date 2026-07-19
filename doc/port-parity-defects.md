@@ -368,6 +368,45 @@ Each sub-finding has an existing record and is a real divergence:
 
 ---
 
+# measComp coverage map — DRIVER-level complete (2/2), BOARD-level partial (2/18), 2026-07-20
+
+Exhaustive check of whether any measComp subsystem remains unported.
+
+**measComp has exactly TWO device drivers** (`measCompApp/src`): `drvMultiFunction.cpp`
+(generic; runtime-detects ~17 board families by ProductID via a `boardEnums[]`
+range/input-type table) and `drvUSBCTR.cpp` (USB-CTR counter/scaler/MCS). Everything
+else in `src/` is `test_*` / `measCompAppMain` / `measCompDiscover`.
+
+**Driver level — 2/2 ported and complete:**
+- `drvUSBCTR.cpp` → `usb-ctr` — complete (scaler/MCS/MCA/pulse/counter all done; PP-42/43 fixed).
+- `drvMultiFunction.cpp` → `usb-2408` — complete **for the USB-2408-2AO board config**.
+  Verified its param set covers every subsystem `USB2408.substitutions` loads (AnalogInMode,
+  AnalogIn, AnalogOut, BinaryDir/In/Out, Counter, Device, LongIn/Out, TemperatureIn,
+  WaveformDig(N), WaveformGen(N)); also carries VoltageIn + TriggerMode.
+
+**Board level — only 2 of 18 board configs exist as Rust IOCs.** `usb-2408` hardcodes the
+USB-2408-2AO board (`params.rs`: `MAX_ANALOG_IN=8`, `MAX_ANALOG_OUT=2`, `NUM_IO_BITS=8`,
+AO range `BIP10VOLTS`); it has NO board-family table, NO ProductID switch. The generic C
+driver serves 16 more boards that have **zero Rust port** (no crate config, no
+`.substitutions`, no iocBoot):
+- Analog multifunction: USB-231, USB-1208, USB-1608G, USB-1608G-2AO, USB-1608HS-2AO,
+  USB-1808, USB-3104, USB-3105, E1608.
+- Temperature: TC32, ETC, USBTEMP, USBTEMP-AI.
+- Digital/relay: EDIO24, USBERB24, USBSSR08.
+
+**Subsystems the `usb-2408` port does NOT yet implement** (needed only by some other boards):
+`measCompEncoder` (USB-1808 only) and `measCompPulseGen` (USB-1608G/1808/1608HS-2AO/1608G-2AO;
+note `usb-ctr` DOES have `PULSE_*`, so the logic exists to borrow). VoltageIn/Trigger are
+already present in `usb-2408`.
+
+**Open scope question (NOT a defect):** whether these 16 board variants are in scope. If the
+campaign's intent is one representative IOC per C driver, measComp is DONE at driver level.
+If board variants are wanted, each needs board-specific constants + range/input-type tables +
+`.substitutions`/iocBoot, plus Encoder/PulseGen subsystems for the boards that use them.
+Awaiting user decision — no work started.
+
+---
+
 # measComp unported subsystems — COMPLETED (user decision 2026-07-19)
 
 **Status: DONE.** Both completion ports finished and verified on their branches
