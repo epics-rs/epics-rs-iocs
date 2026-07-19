@@ -344,14 +344,26 @@ Each sub-finding has an existing record and is a real divergence:
 
 ---
 
-# Documented, not fixed — measComp unported subsystems (scope reductions, not defects)
+# measComp unported subsystems — BEING COMPLETED (user decision 2026-07-19)
 
-- **usb-ctr: entire scaler subsystem UNPORTED** — no `SCALER_*` records/reasons in the db; `scaler.rs` exists in the crate but nothing wires arm/done/preset/channels/read to records. All raw-audit "scaler" findings (DONE-not-cleared, preset-gate registers, `scalerChannels_`, `resetScaler` side effects) are unreachable — no scaler record exists to exhibit them.
-- **usb-ctr: MCA-spectrum + scaler-count + time-waveform ARRAY data path UNPORTED** — no waveform/mca records and no `read_int32_array`/`read_float32_array`/`read_float64_array` driver overrides. The MCS spectrum, per-channel counts, and time waveforms are computed in the poller but intentionally not exposed. (This is the raw audit's "H1"; not a live defect — there is no record to read them.)
-- **usb-ctr: MCS trigger-mode / point0-action / prescale controls UNPORTED** — no trigger/point0/prescale record. Defaults (no ext-trigger, point0=Clear, prescale=1) are what the hardware runs; the raw audit's "H2/H3/M3/M5" target these unwired controls. The `mcs.rs:83-85` comment ("C ignores prescale") is factually wrong about C and should be corrected if the control is ever wired.
-- **usb-2408: AO sync-write UNPORTED** — no `ANALOG_OUT_SYNC_WRITE` record, so the `AOUTARRAY_FF_SIMULTANEOUS` drop (`driver.rs:147-153`) is unreachable.
-- **usb-2408: user-defined waveform array input UNPORTED** — `WAVEGEN_WAVE_TYPE` can select `User`, but there is no `WAVEGEN_USER_WF` array record, so User yields a 0V scan. Wiring the array input (with a `write_float32_array` handler) is the fix if User mode is wanted.
-- **usb-2408: per-counter value poller read is a Rust ADDITION** (`poller.rs`), not a C divergence — C never reads single counters. Keep or drop by preference; may error on counters not configured for plain counting.
+**Correction to the initial framing:** these subsystems are NOT beyond-C scope —
+they ARE part of the standard C USB-CTR / USB-2408 IOC. The authoritative C boot
+`measComp/iocBoot/iocUSBCTR/st.cmd` wires the scaler via the **standard EPICS
+`scalerRecord`** (`scaler.db`, `DTYP="Asyn Scaler"`), the MCS control scalars via
+`measCompMCS.template`, and the MCA spectrum via the **standard `mca` record**
+(`simple_mca.db`, commented out by default → optional). The Rust ports omitted
+them. Per the user's "complete it" decision they are being ported (worktree
+panels `usbctr-completion`, `usb2408-completion`), reusing the sibling
+`scaler974` (ScalerDriver trait) and `mca` module. Live defects that live INSIDE
+these subsystems (scaler DONE-on-arm, ext-trigger, point0 Skip, prescale) are
+fixed as part of the completion, grounded in `drvUSBCTR.cpp`.
+
+- **usb-ctr scaler** → standard `scalerRecord` via ScalerDriver trait (like `scaler974`); wire `scaler.db` into st.cmd.
+- **usb-ctr MCA spectrum + time-waveforms** → `read_int32_array`/`read_float32_array`/`read_float64_array` for `mcaData_`/`scalerRead_`/`MCSTimeWF_`/`MCSAbsTimeWF_`; MCA spectrum to the standard `mca` record (commented example matching C's `simple_mca.db`).
+- **usb-ctr MCS trigger-mode / point0-action / prescale** → `ulDaqInSetTrigger` + unconditional `SO_EXTTRIGGER`; Clear/NoClear/Skip (not a bool); prescale counter config. Fix the wrong `mcs.rs:83-85` comment.
+- **usb-2408 waveform-gen user/internal arrays** → `UserTimeWF`/`IntTimeWF` waveform records + `write_float32_array` user buffer plumbing (fixes User-type → 0V).
+- **usb-2408 AO sync-write** → `ANALOG_OUT_SYNC_MASTER` + `AOUTARRAY_FF_SIMULTANEOUS`.
+- **usb-2408 per-counter value poller read** is a Rust ADDITION (not a C divergence); kept — revisit only if it errors on non-counting-configured counters.
 
 ---
 
