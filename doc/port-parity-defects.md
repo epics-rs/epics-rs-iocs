@@ -86,8 +86,233 @@ unreachable-in-practice / cosmetic churn.
 
 ---
 
+# Second wave — full 61-driver exhaustive re-audit (2026-07-19/20)
+
+Found by the second parity sweep across **all 61 ported drivers** (34 AD/misc +
+3 deferred + 27 motor; N/A: d435i has no C upstream, measComp trio absent
+locally). Same rules: each anchor searched workspace-wide for the family.
+
+## PP-12 [HIGH] smartmotor: VCONFAC velocity + ACONFAC accel unit conversions dropped
+
+- **Rust:** `drivers/motor-smartmotor/src/smartmotor.rs:160,209` (velocity written raw, no `VCONFAC` scale) and `:64-66,163` (accel written raw, no `ACONFAC` scale + min-clamp applied to the wrong magnitude).
+- **C:** `devSmartMotor.cc:58,190,250,290` multiply commanded velocity by `VCONFAC = 16.1063`; `:66,191,253-265` scale accel by `ACONFAC = 3.958322e-3` before the `AT=` command and clamp the *scaled* value.
+- **Failure:** on real hardware every commanded velocity is ~16× too slow and every commanded acceleration is ~250× too large; the accel min-clamp guards the unscaled number so it never engages. Device-breaking on the primary target.
+- **Family:** smartmotor-only (these constants are SmartMotor-specific); split into two commits (velocity, accel) — distinct constants/sites.
+- **Fix:** apply `VCONFAC`/`ACONFAC` at the same sites C does; clamp the scaled accel.
+
+## PP-13 [MED] acstech80 position/encoder readback rounds where C truncates
+
+- **Rust:** `drivers/motor-acstech80/src/spiiplus.rs:444,449` — `nint()` (round-to-nearest) on the `FPOS`/`APOS` feedback strings.
+- **C:** `devSPiiPlus.cc` uses `(long)atof(...)` (truncation toward zero).
+- **Failure:** fractional feedback (e.g. 100.6 cts) reports 101 vs C's 100 — off-by-one readback near integer boundaries.
+- **Family:** acstech80-only (nint-vs-cast on a readback string; other ports cast).
+- **Fix:** truncate (`as i32`/`trunc`) to match `(long)atof`.
+
+## PP-14 [MED] kohzu speed clamp applied only to jog, not positional/home moves
+
+- **Rust:** `drivers/motor-kohzu/src/kohzu.rs:223,238,275` — positional and home move builders omit the `[1, 4095500]` speed clamp that the jog path applies.
+- **C:** `drvKohzuHDR.cc` clamps the speed for every move command.
+- **Failure:** a record with `VBAS=0` / very high `VELO` emits an out-of-range speed on absolute/home moves; the controller rejects the command (jog works, positioning does not).
+- **Family:** kohzu-only (this clamp band is device-specific).
+- **Fix:** hoist the clamp to a shared helper used by jog, positional, and home builders.
+
+## PP-15 [MED] parker/oem motorStatusHome_ (encoder_home) never set
+
+- **Rust:** `drivers/motor-parker/src/oem.rs:294-309` — the home-limit / `motorStatusHome_` MSTA bit is never assigned.
+- **C:** `drvOms58.cc`/OEM status decode sets the home bit from the controller's home-switch state.
+- **Failure:** under `UEIP=Yes` the record's `ATHM` field never asserts; homing-complete logic and displays keyed on `ATHM` never fire.
+- **Family:** see PP-22 (MSTA status-bit divergences) — but this one is a straight omission, fix at source.
+- **Fix:** decode and set `motorStatusHome_` from the OEM status word.
+
+## PP-16 [MED] pi-gcs2: stale direction on velocity move + SPA precision loss
+
+- **Rust:** `drivers/motor-pi-gcs2/src/gcs2.rs:628-646` — `last_direction` not updated on a velocity (jog) move; `:369` builds the `SPA` accel/decel value with `{:.6}`.
+- **C:** `PIGCSController.cpp` updates the cached direction on every commanded move and formats `SPA` with `%.12g`.
+- **Failure:** MSTA `RA_DIRECTION` reports the previous move's direction after a jog; `SPA` loses precision for accel/decel values needing >6 significant digits.
+- **Family:** direction → PP-22; float-format → PP-18.
+- **Fix:** set `last_direction` from the velocity sign; format `SPA` with a `%.12g`-equivalent.
+
+## PP-17 [MED] smaract MCS2 drops FOLLOWING_LIMIT_REACHED (slip/stall)
+
+- **Rust:** `drivers/motor-smaract/src/mcs2.rs:322-338` — the `0x0400` FOLLOWING_LIMIT_REACHED status bit is not mapped to `motorStatusSlipStall_`.
+- **C:** `smarActMCS2.cpp` maps it to the slip/stall MSTA bit.
+- **Failure:** a following-error stall is never reported to the record; operators lose the `SLIP_STALL` indication.
+- **Family:** smaract-only (MCS2 status word); MCS-classic path uses a different word.
+- **Fix:** map `0x0400` to `motorStatusSlipStall_`.
+
+## PP-18 [MED] npoint/c300: POS wire format `{}` vs C `%f` (FAMILY: float wire format)
+
+- **Rust:** `drivers/motor-npoint-c300/src/c300.rs:186,200` — position setpoint formatted with `{}` (Rust `f64::Display`, shortest round-trip).
+- **C:** `C300Driver.cpp` uses `%f` (fixed 6 decimals).
+- **Failure:** high-precision setpoints serialize to a different digit string than C; on a controller that parses fixed-width or rounds the field this changes the commanded position.
+- **Family:** float-Display-vs-C-printf — **c300 `{}`/`%f`** and **pi-gcs2 `{:.6}`/`%.12g`** (PP-16). Both are wire-format divergences; fix each to match its C format specifier.
+- **Fix:** format with `{:.6}` (c300) / `%.12g`-equivalent (pi-gcs2).
+
+## PP-19 [MED] motorsim move-accept doesn't set done=0 immediately
+
+- **Rust:** `drivers/motor-motorsim/src/motorsim.rs:232-303` — on accepting a move the driver does not clear `motorStatusDone_` before the first status poll.
+- **C:** `motorSimDriver.cpp` sets `done=0` at move-accept time.
+- **Failure:** a zero/near-zero-distance move can be observed with `DMOV=1` for one cycle (record may latch move-complete on a move that never appeared to start). Contingent on framework poll ordering.
+- **Family:** motorsim-only.
+- **Fix:** set `motorStatusDone_ = 0` synchronously when a move is accepted.
+
+## PP-20 [MED] model-1 poll RETRY-once comms debounce dropped (FAMILY)
+
+- **Rust:** `faulhaber.rs:342-359`, `kohzu.rs:322-331`, `pijeds.rs:310-319`, `smartmotor.rs` poll path, `thorlabs` poll path — a single failed/short poll reply immediately raises a comms error / PROBLEM.
+- **C:** the model-1 `devXxx.cc` drivers run a `NORMAL → RETRY → COMM_ERR` state machine (one tolerated failure, often with a flush + re-read) before declaring the axis in error; thorlabs additionally recovers from a flipped command echo.
+- **Failure:** one dropped byte / transient short reply spuriously alarms the axis (and, for thorlabs, a persistent `comms_error` if the echo state flips) where C rides through it.
+- **Family:** the five model-1 poll ports above. One structural pattern (missing debounce state); fix as a shared retry-once helper per driver's poll.
+- **Fix:** implement the NORMAL→RETRY→COMM_ERR debounce (flush + single re-read) before signalling error.
+
+## PP-21 [MED] init-probe failure fatal to axis creation (FAMILY)
+
+- **Rust:** `ims/mdriveplus.rs:142-146` (version reply <2 chars aborts axis creation), plus the same abort-on-probe shape in `kohzu` (IDN), `mclennan`, `micronix`, `oriel`.
+- **C:** these controllers log/retry a failed identity probe but still create the axis (MForce-1 IMS drives legitimately error on `PR VR`).
+- **Failure:** a drive that doesn't answer the identity/version query is dropped entirely — the axis never exists in the IOC (vs C creating a usable axis).
+- **Family:** the init-probe-fatal ports above; verify each controller's C tolerates the probe failure before relaxing (do not relax a probe C treats as fatal).
+- **Fix:** demote the probe failure from fatal to logged-and-continue where C does.
+
+## PP-22 [MED] MSTA encoder/gain/home status bits diverge from C (FAMILY)
+
+- **Rust:** two opposite divergences on `motorStatus*_` bits —
+  - **wrongly ASSERTED** where C leaves clear: `mclennan/pm304.rs:438-439` (`EA_PRESENT`+`GAIN_SUPPORT`), `micos` taurus/hydra (has_encoder/direction hardcoded true).
+  - **wrongly OMITTED** where C sets it: `pijeds.rs:343-359` (has_encoder never set → `EA_PRESENT=0` forces `UEIP=No`), parker/oem home bit (PP-15).
+- **C:** each sets these bits from the controller's actual capability/status word.
+- **Failure:** `MSTA` reports wrong encoder-present / gain-support / direction / home state; `UEIP` and homing/closed-loop logic key off these.
+- **Family:** the sites above (plus the LOW-severity hardcodes listed in "Documented, not fixed"). Structural cause: MSTA bits set from a constant instead of the status word — fix per driver from the real status.
+- **Fix:** derive each bit from the controller status, not a literal.
+
+## PP-23 [LOW/AMBIGUOUS] jog velocity sign dropped via `.abs()` (FAMILY — needs manual verify)
+
+- **Rust:** `faulhaber.rs:279` (SP), `mclennan/pm304.rs:325-327` (SV), `oriel/emc18011.rs`, `pijeds.rs` jog builders — jog speed emitted as magnitude; direction carried only by a separate sign/command field or dropped.
+- **C:** the corresponding `devXxx.cc` sends a signed velocity on the same command.
+- **Status:** **OPEN pending manual verification** — for some of these controllers the direction is legitimately a separate field and `.abs()` is correct; for others the sign is lost. Requires the device command reference to classify each; not fixed without it (do not guess protocol semantics).
+
+## PP-24 [MED] marccd exposure countdown anchored before shutter opens
+
+- **Rust:** `drivers/ad-marccd/src/...` — the exposure-time countdown/deadline is started before the shutter-open handshake completes.
+- **C:** `marccdApp` starts timing at shutter-open.
+- **Failure:** the frame is read out early by the shutter-open latency → systematic under-exposure.
+- **Family:** marccd-only.
+- **Fix:** anchor the exposure deadline at shutter-open.
+
+## PP-25 [MED] marccd read-mode enum choices not narrowed (series-mode hang)
+
+- **Rust:** the port drops the `read_enum`/menu-narrowing that restricts valid read modes per server capability.
+- **C:** `marccdApp` narrows the menu so series/burst modes unavailable on the server can't be selected.
+- **Failure:** selecting a server-unsupported read mode issues a command the server never answers → acquisition hangs.
+- **Family:** marccd-only.
+- **Fix:** restore the capability-narrowed enum.
+
+## PP-26 [MED] eiger setShutter dropped from the internal-trigger loop
+
+- **Rust:** `drivers/ad-eiger/src/...` internal-trigger acquire loop never calls the shutter open/close that C issues per frame.
+- **C:** `eigerDetector.cpp` toggles the shutter inside the internal-trigger loop.
+- **Failure:** with an external shutter wired, frames are exposed with the shutter in the wrong state.
+- **Family:** eiger-only (marccd has a shutter but on a different path — PP-24).
+- **Fix:** issue the shutter open/close inside the internal-trigger loop.
+
+## PP-27 [MED] simdetector image `time_stamp` (double) never set
+
+- **Rust:** `drivers/ad-simdetector/src/...` sets the NDArray epics/`epicsTS` fields but leaves the `double time_stamp` at 0.
+- **C:** `ADDriver`/`simDetector` sets both `timeStamp` (double) and `epicsTS`.
+- **Failure:** downstream NTNDArray `dataTimeStamp` is 0; pipeline stages / clients keyed on the double timestamp see an invalid time.
+- **Family:** update-timestamps invariant — every AD port that builds an NDArray must set both fields. simdetector confirmed; the other AD ports should be swept against this invariant.
+- **Fix:** set `time_stamp` alongside `epicsTS` (single update-timestamps helper).
+
+## PP-28 [MED] specs-analyser readback params not mirrored from internal state
+
+- **Rust:** `drivers/ad-specs-analyser/src/...` — Connected / ServerName / ProtocolVersion / message-counter readback params are not written back from the driver's internal connection state.
+- **C:** `specsAnalyser.cpp` publishes each on state change.
+- **Failure:** operator screens show stale/blank connection status and a frozen message counter even while the driver is live.
+- **Family:** specs-analyser-only.
+- **Fix:** mirror the internal state into the readback params on change.
+
+## PP-29 [MED] quadem/pcr4 reset() aborts the reboot-wait loop on non-ACK
+
+- **Rust:** `drivers/quadem-*/src/...` `reset()` returns `?` (propagates the error) on a non-ACK reply during the post-reset reboot.
+- **C:** the C driver polls/waits through the reboot window, tolerating non-ACK until the device answers.
+- **Failure:** a `Reset` bails out mid-reboot and leaves the driver in error instead of waiting for the device to come back.
+- **Family:** quadem family (verify pcr4 + other quadem models share the reset path).
+- **Fix:** retry/wait through the reboot window instead of propagating the first non-ACK.
+
+## PP-30 [MED] opcua mbbo values-undefined branch skips mask/shift
+
+- **Rust:** `drivers/opcua/src/...` — the mask/shift applied on the output path (upstream-c-defects #208) is missing from the "values undefined" mbbo branch.
+- **C:** applies the mask/shift on both branches.
+- **Failure:** an mbbo with no explicit state values writes an unmasked/unshifted raw value to the OPC UA node.
+- **Family:** opcua-only.
+- **Fix:** apply the same mask/shift in the values-undefined branch.
+
+## PP-31 [MED] StreamDevice `ExtraInput=Ignore` not honored (FAMILY)
+
+- **Rust:** `drivers/microepsilon-*/src/...` and `drivers/syringepump/src/...` (Teledyne H) — the reply parser rejects trailing/padding bytes that StreamDevice's `ExtraInput=Ignore` mode is configured to discard.
+- **C/StreamDevice:** with `ExtraInput=Ignore` a match consumes the fields and ignores the remainder of the line.
+- **Failure:** devices that pad replies (fixed-width, trailing status) fail every read with a parse error.
+- **Family:** microepsilon + syringepump; any port re-implementing a StreamDevice protocol with `ExtraInput=Ignore` set.
+- **Fix:** stop treating trailing bytes as a parse error when the protocol declares `ExtraInput=Ignore`.
+
+## PP-32 [MED] ip shared worker log-and-skip drops record INVALID alarm (FAMILY)
+
+- **Rust:** the shared IP-vacuum worker (`mks`, `televac`, `tpg261`, `mpc`) logs and skips a comms/parse failure without setting the record's alarm status.
+- **C:** the corresponding device support returns an error so the record goes `READ/INVALID`.
+- **Failure:** a failed read silently keeps the last value with `NO_ALARM`; operators can't distinguish live data from a dead link. Framework `set_param_status` (param.rs:1089) exists to signal this.
+- **Family:** the four IP-vacuum ports above (shared worker).
+- **Fix:** route comms/parse failure through `set_param_status` so the record alarms INVALID.
+
+## PP-33 [MED] ip/tpg261 gauge-status byte never alarms the pressure record
+
+- **Rust:** `drivers/ip-tpg261/src/...` — the per-gauge status (off / underrange / overrange / sensor error) is parsed but never mapped to the pressure record's alarm.
+- **C:** `devTPG261` sets the record INVALID/alarm when the gauge status is not "measurement OK".
+- **Failure:** a switched-off or errored gauge reports its stale/garbage pressure with `NO_ALARM`.
+- **Family:** tpg261-specific status decode (distinct from PP-32's transport failure).
+- **Fix:** map non-OK gauge status to the record alarm.
+
+## PP-34 [MED] twincat-ads PLC BOOL/BIT write: truncate-then-!=0 vs C value>0
+
+- **Rust:** `drivers/twincat-ads/src/...` — a BOOL/BIT write truncates the value to an integer then tests `!= 0`.
+- **C:** the ADS device support tests `value > 0`.
+- **Failure:** a fractional value in `(0,1)` writes FALSE where C writes... (0.5 → Rust truncates to 0 → FALSE; C `0.5 > 0` → TRUE); a negative value writes TRUE in Rust (`-2 != 0`) but FALSE in C (`-2 > 0` false). Opposite PLC state on both edges.
+- **Family:** twincat-ads-only.
+- **Fix:** test `value > 0` before writing the BOOL.
+
+## PP-35 [MED] twincat-ads-ioc: time-source out-of-range → EPICS; adsTimeoutMS=0 not clamped
+
+- **Rust:** `iocs/twincat-ads-ioc/src/main.rs` — an out-of-range time-source config selects EPICS time instead of PLC; `adsTimeoutMS=0` is accepted and yields an instant-timeout client.
+- **C:** the iocsh config validates/clamps both.
+- **Failure:** a misconfigured time source silently timestamps from the IOC not the PLC; a `0` timeout makes every ADS request time out immediately.
+- **Family:** twincat-ads-ioc crate (config surface) — distinct from the driver PP-34.
+- **Fix:** validate the time-source enum and clamp/reject `timeout == 0`.
+
+## PP-36 [LOW→corruption] mythen partial/timed-out readout yields a silent corrupt NDArray
+
+- **Rust:** `drivers/ad-mythen/src/...` — a short/timed-out frame readout still publishes an NDArray built from the partial buffer and leaves the detector running on a hard error.
+- **C:** `mythen` treats a short readout as an acquisition error (no frame published, detector stopped/reset).
+- **Failure:** on a comms hiccup the client receives a corrupt image indistinguishable from a good one, and the detector is left in an inconsistent running state.
+- **Family:** mythen-only (this readout-length check is mythen-specific).
+- **Fix:** treat a short readout as an error — do not publish, stop the detector.
+
+---
+
 ## Documented, not fixed (unreachable / port-is-stricter / degenerate)
 
 - **PP-9 [LOW] GM10 FData module-presence gate `(address-1)/100` vs C `address/100`** (`instrument.rs:752` ↔ `drvGM10.c:995`). Differs only at addresses that are exact multiples of 100, which are never real channels (channels are `module*100 + 1..=n`). C is itself internally inconsistent (`:712` uses the 0-based form). Unreachable — not fixed.
 - **PP-10 [LOW] GM10 strict whole-string link parse vs C lenient prefix parse** (`link.rs:82` ↔ `devGM10_*.c` `atoi`/`strtol`). Rust rejects trailing garbage in db link text that C would accept; only reachable via malformed db. The port being stricter is defensible — not fixed.
 - **PP-11 [LOW] Rontec zero-length spectrum read early-return** (`drivers/mca-rontec/src/driver.rs:284`). Rust returns empty for `max_chans == 0`; C still sends `$SS …,0` and drains a 4-byte reply. Degenerate — a real mca record never requests 0 channels. Not fixed.
+- **PP-37 [LOW] Motor MSTA direction/encoder bits hardcoded to a constant** — `micos` taurus/hydra/corvus (direction=true, has_encoder=true), `pi` c662/c630 (`EA_POSITION`/powered hardcoded), `attocube` (direction hardcoded), `mvp2001` (encoder_position set where C leaves 0), various C-series. These set an MSTA bit from a literal instead of the status word. Low impact where the constant happens to match the common configuration; the *reachable* wrong-state cases (pijeds omit, mclennan/micos assert) are promoted to **PP-22** and fixed. The remaining constant-hardcodes are recorded here — fix opportunistically when touching each driver, not a separate round.
+- **PP-38 [LOW] Motor init/version probe made fatal on controllers where C also treats it as fatal** — a subset of the PP-21 candidates turned out to match C (the probe *is* required). Recorded so a later reviewer doesn't re-flag them: only the ports listed under **PP-21** are confirmed-divergent; the rest abort exactly as C does.
+- **PP-39 [LOW] oriel/emc18011 missing second-message drain after `L`** (`drivers/motor-oriel/src/emc18011.rs:167-184`). C drains a second reply line after the `L` (limits) query; Rust reads one. Only matters if the controller emits the trailing line on this firmware — unverified against hardware. Recorded, not fixed without a device to confirm.
+
+### No new defects (audited clean)
+
+acs (MCB4B), acsmotion, amci, aerotech (both variants), oms-asyn, parker/acr, phytron — motor. These were audited value-for-value against their C upstream with no divergence found.
+
+### Audit deferred — upstream absent locally
+
+measComp / usb-2408 / usb-ctr — the measComp C module is **not present** on this machine, so these three ports could not be audited. Provide the measComp source path to complete them.
+
+### Scope-limited audits (siblings not yet covered)
+
+- **newport** — only `smc100` audited; `agap`/`agilis`/`conex`/`esp300`/`hxp`/`mm3000`/`mm4000`/`pm500`/`pmnc`/`xps` not yet swept.
+- **pi** — C-series (c862/c848/c844/c663/c662/c630) + E-series (prior round) audited; any other PI model not covered.
+- **npoint** — only `c300` audited, not `lc400`.
