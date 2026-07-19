@@ -294,6 +294,67 @@ locally). Same rules: each anchor searched workspace-wide for the family.
 
 ---
 
+# Third wave — measComp (usb-ctr / usb-2408 / meascomp), 2026-07-19
+
+Audited after the user supplied the measComp C upstream. **Key scope finding:**
+`usb-ctr` and `usb-2408` are **partial ports** — only a scalar control/waveform
+surface is wired. The IOC db (`db/meascomp_*.template`, loaded by
+`iocs/usb-{ctr,2408}-ioc/st.cmd`) defines only ai/ao/bi/bo/longin/longout/mbbo
+records; there are **zero** waveform/mca/aai/aao records anywhere. So the
+MCA-spectrum / scaler-count-array / time-waveform **array data path**, the whole
+**scaler subsystem**, and the MCS **trigger-mode / point0-action / prescale**
+controls are UNPORTED (no records *and* no driver methods) — recorded below as
+scope reductions, not defects. Findings from the raw audit that target those
+subsystems (originally rated HIGH against full C) are therefore **not live
+defects** in this IOC configuration.
+
+`meascomp` (the `uldaq-sys` safe wrapper) audited **clean**: FFI argument
+order/type verified against every C `ul*` call site; only USB-only addressing
+scope, the TC `-9999` caller-policy boundary, and `MAX_DEVICES=64` vs C's `100`
+noted (all benign). The systemic "raw uldaq const vs CBW_* menu" risk the
+usb-2408 auditor flagged is **resolved**: the db mbbo menus carry uldaq ordinals
+(`Range +/-10V → 5 = BIP10VOLTS`), matching the driver's pass-through — correct.
+
+## PP-40 [HIGH] usb-2408 internal-waveform amplitude is 2× too large
+
+- **Rust:** `drivers/meascomp/usb-2408/src/wave_gen.rs:66,72-74,80,99` — uses full `amplitude` as peak (`offset + amplitude*sin`, square `offset±amplitude`, saw/random full-span).
+- **C:** `drvMultiFunction.cpp:1542,1546,1549-1550,1554,1568-1570` — `AMPLITUDE` is peak-to-peak: `amplitude/2` about the offset.
+- **Failure:** `WAVEGEN_AMPLITUDE=1V` produces ±1V (2Vpp) where C produces ±0.5V (1Vpp) — every internal waveform on the DAC is double the intended voltage (over-drive risk). `WAVEGEN_AMPLITUDE` record exists → live.
+- **Family:** usb-2408 wave_gen (all four internal wave types).
+- **Fix:** halve the amplitude about the offset, matching C's peak-to-peak semantics.
+
+## PP-41 [MED] usb-2408 cluster (live, within ported wave/AO/AI scope)
+
+Each sub-finding has an existing record and is a real divergence:
+- **WAVEGEN_ENABLE ignored** — `driver.rs:329-330` hardcodes first/last chan = 0..MAX; C iterates enabled channels and errors if none (`drvMultiFunction.cpp:1603-1636`).
+- **Immediate AO write has no generator-running guard** — `driver.rs:115-131`; C refuses `ANALOG_OUT_VALUE` with `asynError` while `waveGenRunning_` (`:2131-2135`).
+- **Analog-in read not gated on channel type** — `poller.rs:119-138` reads voltage on every channel incl. thermocouple; C `continue`s on `type != AI_CHAN_TYPE_VOLTAGE` (`:2764`), overwriting TC records with garbage.
+- **Volts→TC switch doesn't reprogram TC type + open-detect** — `driver.rs:157-166`; C re-applies `AI_CFG_CHAN_TC_TYPE` + `setOpenThermocoupleDetect()` (`:1969-1982`).
+- **Wavegen pulse width treated as 0..1 fraction, delay dropped** — `wave_gen.rs:83-92`; C uses time-based `pulseWidth/dwell` sample counts with a delay region (`:1556-1566`). (`WAVEGEN_PULSE_DELAY` itself is unported — no record.)
+- LOW sub: digital_output direction gate (`driver.rs:393-404`↔`:2404`); TC-type/open-detect `isThermocouple` guard (`:167-183`↔`:2004,2019`); wave-dig `-9999` bad-rate sentinel (`wave_dig.rs:152-154`↔`:1842-1846`); sin/saw period `numPoints-1` off-by-one (`wave_gen.rs:66,80`↔`:1545,1553`).
+
+## PP-42 [MED] usb-ctr cluster (live, within ported MCS/pulse/counter scope)
+
+- **MCS `SINGLEIO` threshold dropped** — `mcs.rs:164` always `SO_SINGLEIO`; C uses `SO_DEFAULTIO` and adds `SO_SINGLEIO` only when `dwell >= 0.01` (`drvUSBCTR.cpp:674,678-679`) — short-dwell high-rate scans lose data.
+- **Pulse-generator input clamps dropped** — `pulse_gen.rs:17-26` passes frequency/duty/delay raw; C clamps to `[0.023,48e6]`/`[.0001,.9999]`/`[0,67.11]` (`:466-472`). `PULSE_*` records exist.
+- **Model/`numCounters_` hardcoded to 8** — `scaler.rs:37` etc.; C derives 8 (CTR08) vs 4 (CTR04) and bounds loops (`:364-372,544,687`) — on a CTR04 the port drives nonexistent counters 4-7.
+- **MCS start missing re-entry / already-complete guards** — `driver.rs:180-221`; C skips if `MCSRunning_` and short-circuits `currentPoint >= numTimePoints` (`:1189-1198`). (The `scalerRunning_` guard is moot — scaler unported.)
+- **Elapsed real/live time never published** — `mcs.rs:241` computes `elapsed` only for the done check; C writes `mcaElapsedRealTime_`/`LiveTime_` each read (`:797-800`) — the `MCS:ElapsedReal` record (exists, I/O Intr) stays 0.
+- LOW sub: `mca_num_channels` clamp to `maxTimePoints_` + actual-dwell writeback (`:1235-1240,711`); digital_output direction gate (`driver.rs:304-315`↔`:1348`); `counterReset_` `ulCClear` vs C `ulCLoad(CRT_LOAD,0)` (`:1124`, equivalence unconfirmed); MCS channel `range=0` vs `BIP10VOLTS` (benign for CTR).
+
+---
+
+# Documented, not fixed — measComp unported subsystems (scope reductions, not defects)
+
+- **usb-ctr: entire scaler subsystem UNPORTED** — no `SCALER_*` records/reasons in the db; `scaler.rs` exists in the crate but nothing wires arm/done/preset/channels/read to records. All raw-audit "scaler" findings (DONE-not-cleared, preset-gate registers, `scalerChannels_`, `resetScaler` side effects) are unreachable — no scaler record exists to exhibit them.
+- **usb-ctr: MCA-spectrum + scaler-count + time-waveform ARRAY data path UNPORTED** — no waveform/mca records and no `read_int32_array`/`read_float32_array`/`read_float64_array` driver overrides. The MCS spectrum, per-channel counts, and time waveforms are computed in the poller but intentionally not exposed. (This is the raw audit's "H1"; not a live defect — there is no record to read them.)
+- **usb-ctr: MCS trigger-mode / point0-action / prescale controls UNPORTED** — no trigger/point0/prescale record. Defaults (no ext-trigger, point0=Clear, prescale=1) are what the hardware runs; the raw audit's "H2/H3/M3/M5" target these unwired controls. The `mcs.rs:83-85` comment ("C ignores prescale") is factually wrong about C and should be corrected if the control is ever wired.
+- **usb-2408: AO sync-write UNPORTED** — no `ANALOG_OUT_SYNC_WRITE` record, so the `AOUTARRAY_FF_SIMULTANEOUS` drop (`driver.rs:147-153`) is unreachable.
+- **usb-2408: user-defined waveform array input UNPORTED** — `WAVEGEN_WAVE_TYPE` can select `User`, but there is no `WAVEGEN_USER_WF` array record, so User yields a 0V scan. Wiring the array input (with a `write_float32_array` handler) is the fix if User mode is wanted.
+- **usb-2408: per-counter value poller read is a Rust ADDITION** (`poller.rs`), not a C divergence — C never reads single counters. Keep or drop by preference; may error on counters not configured for plain counting.
+
+---
+
 ## Documented, not fixed (unreachable / port-is-stricter / degenerate)
 
 - **PP-9 [LOW] GM10 FData module-presence gate `(address-1)/100` vs C `address/100`** (`instrument.rs:752` ↔ `drvGM10.c:995`). Differs only at addresses that are exact multiples of 100, which are never real channels (channels are `module*100 + 1..=n`). C is itself internally inconsistent (`:712` uses the 0-based form). Unreachable — not fixed.
