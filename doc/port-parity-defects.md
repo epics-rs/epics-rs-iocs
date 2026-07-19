@@ -306,7 +306,8 @@ pass still owed before push.
 - **branch `caucus/MXSR5DMPDZ/proto-fix-c74a3f6f-1`:** PP-30 `d526968`, PP-31 `e885106`, PP-32 `80d6e18`, PP-33 `50331d8`, PP-34 `650dd8f`, PP-35 `31b3a14`.
 
 Not fixed: PP-23 (deferred — needs device manual); PP-37/38/39 (observations).
-PP-40/41/42 (measComp live) are being fixed inside the completion port (below).
+PP-40/41/42 (measComp live) are **FIXED** inside the completion port — see the
+measComp completion status block below for commits/branches.
 
 Partial gap noted: PP-20's *input flush before re-read* is not reproduced —
 `SyncIOHandle` exposes no flush primitive; the tolerate-one-failure debounce (the
@@ -336,7 +337,7 @@ noted (all benign). The systemic "raw uldaq const vs CBW_* menu" risk the
 usb-2408 auditor flagged is **resolved**: the db mbbo menus carry uldaq ordinals
 (`Range +/-10V → 5 = BIP10VOLTS`), matching the driver's pass-through — correct.
 
-## PP-40 [HIGH] usb-2408 internal-waveform amplitude is 2× too large
+## PP-40 [HIGH] usb-2408 internal-waveform amplitude is 2× too large — FIXED
 
 - **Rust:** `drivers/meascomp/usb-2408/src/wave_gen.rs:66,72-74,80,99` — uses full `amplitude` as peak (`offset + amplitude*sin`, square `offset±amplitude`, saw/random full-span).
 - **C:** `drvMultiFunction.cpp:1542,1546,1549-1550,1554,1568-1570` — `AMPLITUDE` is peak-to-peak: `amplitude/2` about the offset.
@@ -344,7 +345,7 @@ usb-2408 auditor flagged is **resolved**: the db mbbo menus carry uldaq ordinals
 - **Family:** usb-2408 wave_gen (all four internal wave types).
 - **Fix:** halve the amplitude about the offset, matching C's peak-to-peak semantics.
 
-## PP-41 [MED] usb-2408 cluster (live, within ported wave/AO/AI scope)
+## PP-41 [MED] usb-2408 cluster (live, within ported wave/AO/AI scope) — FIXED (1 LOW sub DEFERRED)
 
 Each sub-finding has an existing record and is a real divergence:
 - **WAVEGEN_ENABLE ignored** — `driver.rs:329-330` hardcodes first/last chan = 0..MAX; C iterates enabled channels and errors if none (`drvMultiFunction.cpp:1603-1636`).
@@ -352,9 +353,11 @@ Each sub-finding has an existing record and is a real divergence:
 - **Analog-in read not gated on channel type** — `poller.rs:119-138` reads voltage on every channel incl. thermocouple; C `continue`s on `type != AI_CHAN_TYPE_VOLTAGE` (`:2764`), overwriting TC records with garbage.
 - **Volts→TC switch doesn't reprogram TC type + open-detect** — `driver.rs:157-166`; C re-applies `AI_CFG_CHAN_TC_TYPE` + `setOpenThermocoupleDetect()` (`:1969-1982`).
 - **Wavegen pulse width treated as 0..1 fraction, delay dropped** — `wave_gen.rs:83-92`; C uses time-based `pulseWidth/dwell` sample counts with a delay region (`:1556-1566`). (`WAVEGEN_PULSE_DELAY` itself is unported — no record.)
-- LOW sub: digital_output direction gate (`driver.rs:393-404`↔`:2404`); TC-type/open-detect `isThermocouple` guard (`:167-183`↔`:2004,2019`); wave-dig `-9999` bad-rate sentinel (`wave_dig.rs:152-154`↔`:1842-1846`); sin/saw period `numPoints-1` off-by-one (`wave_gen.rs:66,80`↔`:1545,1553`).
+- LOW sub: digital_output direction gate (`driver.rs:393-404`↔`:2404`) FIXED `346be12`; TC-type/open-detect `isThermocouple` guard (`:167-183`↔`:2004,2019`) FIXED `13b3600`; wave-dig `-9999` bad-rate sentinel (`wave_dig.rs:152-154`↔`:1842-1846`) **DEFERRED — see below**; sin/saw period `numPoints-1` off-by-one (`wave_gen.rs:66,80`↔`:1545,1553`) FIXED `a48e827`.
 
-## PP-42 [MED] usb-ctr cluster (live, within ported MCS/pulse/counter scope)
+**DEFERRED (wave-dig `ERR_BAD_RATE` → `-9999` dwell-actual sentinel):** C returns `-9999` for the actual-dwell when `ulDaqOutScan` reports `ERR_BAD_RATE`. Implementing the guard needs the uldaq `UlError::ERR_BAD_RATE` numeric value. `uldaq.h` is **not installed** anywhere on this machine (searched machine-wide 2026-07-19); the constant is absent from `drivers/meascomp/uldaq-sys/src/lib.rs` (a curated subset). Per the no-guessing rule the value was not hardcoded. **Blocked on:** the path to `uldaq.h`/libuldaq SDK header, or that header being installed — then add `ERR_BAD_RATE` to `uldaq-sys` and implement. Authorization alone is insufficient; the value's source is required.
+
+## PP-42 [MED] usb-ctr cluster (live, within ported MCS/pulse/counter scope) — FIXED
 
 - **MCS `SINGLEIO` threshold dropped** — `mcs.rs:164` always `SO_SINGLEIO`; C uses `SO_DEFAULTIO` and adds `SO_SINGLEIO` only when `dwell >= 0.01` (`drvUSBCTR.cpp:674,678-679`) — short-dwell high-rate scans lose data.
 - **Pulse-generator input clamps dropped** — `pulse_gen.rs:17-26` passes frequency/duty/delay raw; C clamps to `[0.023,48e6]`/`[.0001,.9999]`/`[0,67.11]` (`:466-472`). `PULSE_*` records exist.
@@ -365,7 +368,27 @@ Each sub-finding has an existing record and is a real divergence:
 
 ---
 
-# measComp unported subsystems — BEING COMPLETED (user decision 2026-07-19)
+# measComp unported subsystems — COMPLETED (user decision 2026-07-19)
+
+**Status: DONE.** Both completion ports finished and verified on their branches
+(per-crate `fmt`/`clippy -D warnings`/`nextest` green; full-workspace pass still
+owed before push).
+
+- **branch `caucus/MXSR5DMPDZ/usb2408-completion-367adb0c-1`** (7 commits, nextest 12/12):
+  waveform-gen user/internal arrays `fe0091b`; AO simultaneous sync-write + sync-master
+  `782434d`; PP-40 amplitude peak-to-peak `8e2794a`; PP-41 cluster `2d7bbae`; LOW subs
+  `13b3600`/`a48e827`/`346be12`. One LOW sub (wave-dig `ERR_BAD_RATE` sentinel) DEFERRED —
+  see PP-41 block above.
+- **branch `caucus/MXSR5DMPDZ/usbctr-completion-22f0c1fd-1`** (nextest 28/28):
+  scaler via standard `scalerRecord`/`ScalerDriver` trait `5e11e4b`; MCS control scalars +
+  ext-trigger + point0-action `0057eab`/`cde36a1`/`be5845c`; MCS prescale/channel-advance
+  counter `50dce47`; MCA_DATA `read_int32_array` + 9 missing mca params + mca record/`asynMCA`
+  device support + vendored `simple_mca.db` `a934a56`; MCSTimeWF/MCSAbsTimeWF array reads
+  `5967d4b`; `measCompMCSWaveform.template` + 9 per-counter waveforms wired `f603139`. All
+  PP-42 live fixes included.
+
+The original scope list follows (all items now delivered):
+
 
 **Correction to the initial framing:** these subsystems are NOT beyond-C scope —
 they ARE part of the standard C USB-CTR / USB-2408 IOC. The authoritative C boot
@@ -387,6 +410,20 @@ fixed as part of the completion, grounded in `drvUSBCTR.cpp`.
 - **usb-2408 per-counter value poller read** is a Rust ADDITION (not a C divergence); kept — revisit only if it errors on non-counting-configured counters.
 
 ---
+
+## PP-43 [LOW] usb-ctr MCS time-waveform not recomputed on `MCA_DWELL_TIME` write — OPEN
+
+- **Rust:** `drivers/meascomp/usb-ctr` computes the MCS time waveform only at `start_mcs`.
+- **C:** `drvUSBCTR.cpp:1302-1304` — `writeFloat64` recomputes the time waveform and does
+  array callbacks whenever `MCA_DWELL_TIME` is written, so `MCSTimeWF`/`MCSAbsTimeWF` update
+  immediately on a dwell change even before the scan starts.
+- **Failure:** a client that writes `MCA_DWELL_TIME` then reads the time-waveform records
+  *before* starting the MCS sees stale/last-scan values under Rust; C shows the new dwell.
+  These waveform records are now wired (usbctr-completion `f603139`), so this is a live,
+  record-observable divergence — it was out of the completion's *listed* item scope and left
+  as-is by the porter. Surfaced here as a follow-up candidate, not silently dropped.
+- **Family:** single site (`writeFloat64` dwell branch). Fix: recompute + callback the time
+  waveforms in the `MCA_DWELL_TIME` write handler, not only at scan start.
 
 ## Documented, not fixed (unreachable / port-is-stricter / degenerate)
 
