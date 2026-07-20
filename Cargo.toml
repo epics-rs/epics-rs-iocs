@@ -156,17 +156,17 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.24.2 (released; user directive 2026-07-19): ports consume the
-# released version instead of the main branch; bumped 0.24.1 -> 0.24.2
-# (0.24.2 carries the dbpf DTYP merged-device-menu fix, PR #43).
+# epics-rs 0.24.3 (released): ports consume the released version instead of
+# the main branch; bumped 0.24.2 -> 0.24.3 (0.24.3 adds the dbLoadTemplate
+# iocsh command, PR #47, plus histogram/CA-clamp/asyn-escape parity fixes).
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.24.2"
-asyn-rs = "0.24.2"
-ad-core-rs = "0.24.2"
-ad-plugins-rs = "0.24.2"
+epics-rs = "0.24.3"
+asyn-rs = "0.24.3"
+ad-core-rs = "0.24.3"
+ad-plugins-rs = "0.24.3"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.24.2", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.24.3", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.24.2"
+mca-rs = "0.24.3"
