@@ -84,5 +84,10 @@ jobs:
       - name: Build (workspace + tests)
         run: cargo build --workspace --tests ${{ env.LINK_EXCLUDES }} --verbose
 
+      # `--no-fail-fast` runs every test even after one fails, so a single
+      # platform-specific failure surfaces the WHOLE list for that cell in
+      # one run instead of masking the rest behind the first (nextest
+      # cancels the run on first failure by default). This matters most for
+      # the Windows cells, whose failures are only observable here.
       - name: Test (nextest)
-        run: cargo nextest run --workspace ${{ env.LINK_EXCLUDES }}
+        run: cargo nextest run --workspace ${{ env.LINK_EXCLUDES }} --no-fail-fast
