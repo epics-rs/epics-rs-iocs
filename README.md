@@ -1,10 +1,20 @@
 # epics-rs-iocs
 
+[![Rust](https://github.com/epics-rs/epics-rs-iocs/actions/workflows/rust.yml/badge.svg)](https://github.com/epics-rs/epics-rs-iocs/actions/workflows/rust.yml)
+[![Cross-platform build](https://github.com/epics-rs/epics-rs-iocs/actions/workflows/cross-platform.yml/badge.svg)](https://github.com/epics-rs/epics-rs-iocs/actions/workflows/cross-platform.yml)
+
 Cargo workspace containing epics-rs based IOC applications.
 Each device driver is an independent library crate under `drivers/`, and
 each IOC binary lives under `iocs/`.
 
-> **Platform**: Linux only. Windows is not currently supported.
+> **Platform**: Linux is the primary, fully-supported target — every
+> crate builds and is tested there. CI additionally builds and tests the
+> workspace on macOS and Windows (arm64 + x86_64), **excluding** the
+> vendor-SDK crates whose C libraries are Linux-oriented: the measComp
+> family (`uldaq-sys`, `meascomp`, `usb-2408`, `usb-ctr`, and their IOCs)
+> and the RealSense `d435i` driver/IOC. POSIX-only behaviour degrades
+> gracefully off Linux — e.g. the Eiger file-writer's file-permission
+> bits are a no-op on Windows.
 
 ## Workspace Structure
 
