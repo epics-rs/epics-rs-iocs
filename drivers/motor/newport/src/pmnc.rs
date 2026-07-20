@@ -581,7 +581,7 @@ impl AsynMotor for PmncAxis {
         // 1. Which motor is selected on this driver? (8751 has only motor 0.)
         let select_motor = if self.is_8753() {
             let reply = checked!(ctrl.command(&format!("CHL {d}")));
-            atoi(&reply) as i32
+            atoi(&reply)
         } else {
             0
         };
