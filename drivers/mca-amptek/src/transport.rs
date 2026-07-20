@@ -63,6 +63,26 @@ const MAX_ENTRIES: usize = 10;
 /// `DppSocket.cpp:493`).
 const MAX_RECV_ITERATIONS: usize = 50;
 
+/// Whether a UDP discovery/probe `recv` error means "nothing valid
+/// replied", i.e. the same outcome as a timeout.
+///
+/// On Unix an unanswered `recv_from` simply times out (`WouldBlock` /
+/// `TimedOut`). On Windows a datagram sent to a port with no listener
+/// comes back as an ICMP port-unreachable that the OS surfaces on the
+/// *next* `recv` as `WSAECONNRESET` (`ConnectionReset`; `ConnectionRefused`
+/// on a connected socket) rather than a timeout. For NetFinder discovery
+/// and the direct-connect probe these all mean the same thing — no device
+/// answered — so they are treated identically.
+fn is_no_response(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+    )
+}
+
 pub struct AmptekUdpTransport {
     socket: UdpSocket,
     /// The DP5 command port every send targets. Always
@@ -109,11 +129,7 @@ impl AmptekUdpTransport {
         let mut buf = [0u8; RECV_CHUNK_SIZE];
         match self.socket.recv_from(&mut buf) {
             Ok((n, _from)) => Ok(net_finder::parse_direct_response(&buf[..n])),
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                Ok(None)
-            }
+            Err(e) if is_no_response(e.kind()) => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -165,12 +181,7 @@ impl AmptekUdpTransport {
                     found.push(*from.ip());
                 }
                 Ok(_) => continue,
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break;
-                }
+                Err(e) if is_no_response(e.kind()) => break,
                 Err(e) => return Err(e),
             }
         }
@@ -237,12 +248,7 @@ impl AmptekUdpTransport {
                     }
                 }
                 Ok(_) => break,
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    break;
-                }
+                Err(e) if is_no_response(e.kind()) => break,
                 Err(e) => return Err(e),
             }
         }
