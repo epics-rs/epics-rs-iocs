@@ -1,0 +1,16 @@
+# Line-ending policy.
+#
+# This workspace is developed and deployed on Linux, and its text is parsed
+# assuming LF end-of-line throughout:
+#   - vendored script embedded at compile time via include_str!
+#     (drivers/ur-robot/src/rtde_control.script — its injection anchors match
+#     on "\n"),
+#   - EPICS iocsh startup scripts (st.cmd, *.cmd — iocsh, not Windows batch),
+#   - db / template / proto / substitutions record files.
+#
+# Force LF on checkout on every platform so a Windows checkout with
+# core.autocrlf=true cannot inject CRLF and break LF-sensitive parsing (this is
+# what failed the ur-robot script test on the Windows CI cells). text=auto lets
+# git leave genuine binaries untouched; eol=lf pins the working-tree EOL for
+# everything it classifies as text.
+* text=auto eol=lf
