@@ -1,0 +1,49 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Crates that build/link against a vendor C library not present on a
+  # stock GitHub runner. They are excluded here — not silenced — and still
+  # build/test locally where the library is installed.
+  #   * libuldaq (measComp Linux SDK): uldaq-sys and everything that links
+  #     it — meascomp, usb-2408, usb-ctr, and the two IOC binaries.
+  #   * librealsense2 (Intel RealSense SDK): d435i and its IOC binary.
+  # `--exclude` takes package names (not paths).
+  LINK_EXCLUDES: >-
+    --exclude uldaq-sys --exclude meascomp
+    --exclude usb-2408 --exclude usb-ctr
+    --exclude usb-2408-ioc --exclude usb-ctr-ioc
+    --exclude d435i --exclude d435i-ioc
+  # clippy/check never invokes the linker, so the uldaq crates lint fine:
+  # their build script degrades gracefully (emits `-luldaq` for a link that
+  # never happens). Only realsense-sys's build script hard-fails without
+  # librealsense2 (pkg-config probe panics), so just the d435i pair is
+  # dropped from the lint gate.
+  CLIPPY_EXCLUDES: >-
+    --exclude d435i --exclude d435i-ioc
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.94.0
+        components: rustfmt, clippy
+    - uses: taiki-e/install-action@nextest
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets $CLIPPY_EXCLUDES -- -D warnings
+    - name: Build
+      run: cargo build --workspace $LINK_EXCLUDES --verbose
+    - name: Run tests (nextest)
+      run: cargo nextest run --workspace $LINK_EXCLUDES
+    - name: Run doctests
+      run: cargo test --doc --workspace $LINK_EXCLUDES
