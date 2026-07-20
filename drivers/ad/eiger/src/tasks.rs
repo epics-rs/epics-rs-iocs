@@ -908,18 +908,28 @@ async fn save_task(
 /// of the written file.
 fn write_file(path: &str, data: &[u8], perms: u32) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(perms)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(perms);
+    }
+    let mut f = opts.open(path)?;
     f.write_all(data)?;
     // An existing file keeps its old mode through `open`, so set it explicitly
-    // (C calls fchmod for the same reason).
-    f.set_permissions(std::fs::Permissions::from_mode(perms))?;
+    // (C calls fchmod for the same reason). POSIX mode bits have no portable
+    // Windows equivalent, so on non-unix the file is left at the OS default.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(perms))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = perms;
+    }
     Ok(())
 }
 
