@@ -93,13 +93,23 @@ impl EigerDriver {
         self.apply(updates)?;
 
         // Read the sensor size with the ROI disabled — that is the maximum.
-        // Writing roi_mode invalidates x/y_pixels_in_detector, and `put_str`
+        // Writing roi_mode invalidates x/y_pixels_in_detector, and `put_int`
         // re-fetches every DetConfig parameter the reply names, so the sizes
         // below are the ones that belong to the mode in force.
-        let roi_mode = self.string_param(self.p.roi_mode)?;
-        if roi_mode != "disabled" {
-            self.put_str(self.p.roi_mode, "disabled")?;
-        }
+        //
+        // `roi_mode` is an enum: the parameter library holds its index, only
+        // the detector speaks the names, so the comparison and the restore both
+        // stay in the index domain. Asking the library for a string here — as
+        // this did — is a type error against an `asynParamInt32`, which failed
+        // `init_params` for every detector, reachable or not.
+        let roi_mode = self.ad.port_base.get_int32_param(self.p.roi_mode, 0)?;
+        let restore = match self.ops.enum_index_of(self.p.roi_mode, "disabled") {
+            Some(disabled) if disabled != roi_mode => {
+                self.put_int(self.p.roi_mode, disabled)?;
+                true
+            }
+            _ => false,
+        };
         let max_size_x = self
             .ad
             .port_base
@@ -108,8 +118,8 @@ impl EigerDriver {
             .ad
             .port_base
             .get_int32_param(self.p.nd_array_size_y, 0)?;
-        if roi_mode != "disabled" {
-            self.put_str(self.p.roi_mode, &roi_mode)?;
+        if restore {
+            self.put_int(self.p.roi_mode, roi_mode)?;
         }
 
         let base = &mut self.ad.port_base;

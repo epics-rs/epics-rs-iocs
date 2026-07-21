@@ -476,6 +476,17 @@ impl ParamOps {
         }
     }
 
+    /// Where `name` sits in an enum parameter's value table.
+    ///
+    /// The parameter library holds an enum's *index*; the detector speaks the
+    /// name. This is the read direction of [`encode_int`], which is what makes
+    /// a comparison against a named enum member possible without asking the
+    /// library for a string it does not hold.
+    pub fn enum_index_of(&self, index: usize, name: &str) -> Option<i32> {
+        let def = self.def(index).ok()?;
+        enum_index(&def.meta.enum_values, name).and_then(|i| i32::try_from(i).ok())
+    }
+
     fn def(&self, index: usize) -> RestResult<ParamDef> {
         self.reg
             .lock()
@@ -811,6 +822,26 @@ mod tests {
     fn meta_of(body: &str, sys: Sys) -> Meta {
         let v: Value = serde_json::from_str(body).unwrap();
         parse_meta(&v, sys, false, &Meta::default()).unwrap()
+    }
+
+    /// An enum parameter lives in the library as an index and on the wire as a
+    /// name. `enum_index_of` is the read direction of `encode_int`; reading the
+    /// same parameter as a string instead is a type error against the
+    /// `asynParamInt32` it really is.
+    #[test]
+    fn an_enum_parameter_is_compared_by_index_not_by_string() {
+        let mut reg = ParamRegistry::new();
+        reg.add(7, "ROI_MODE", AsynType::Int32, Sys::DetConfig, "roi_mode");
+        reg.set_enum_values(7, &["disabled", "4M"]);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let ops = ParamOps::new(RestApi::new("127.0.0.1", port), reg);
+
+        assert_eq!(ops.enum_index_of(7, "disabled"), Some(0));
+        assert_eq!(ops.enum_index_of(7, "4M"), Some(1));
+        assert_eq!(ops.enum_index_of(7, "nonesuch"), None);
     }
 
     /// `fetch_all` used to hold the registry lock across the loop body, and
