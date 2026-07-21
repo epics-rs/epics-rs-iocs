@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# A new push to the same PR branch cancels the in-flight lint gate; on main,
+# never cancel head-of-main coverage. Mirrors cross-platform.yml.
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Crates that build/link against a vendor C library not present on a
@@ -31,6 +37,7 @@ env:
 jobs:
   checks:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
     - uses: actions/checkout@v4
@@ -39,6 +46,9 @@ jobs:
         toolchain: 1.94.0
         components: rustfmt, clippy
     - uses: taiki-e/install-action@nextest
+    # Restore the dependency-graph build cache. This gate runs on every push
+    # (not just PRs); without a cache all four steps recompile from zero.
+    - uses: Swatinem/rust-cache@v2
     - name: Clippy
       run: cargo clippy --workspace --all-targets $CLIPPY_EXCLUDES -- -D warnings
     - name: Build

@@ -7,18 +7,19 @@
 #   cargo run -p pilatus-ioc -- iocs/ad/pilatus-ioc/st.cmd
 #
 #------------------------------------------------------------
-# BOOT LIMITATION (published epics-rs 0.22.1 baseline)
+# Boots clean on the pinned ad-plugins-rs / ad-core-rs 0.24.3.
 #
-# The published ad-plugins-rs 0.22.1 `AdIoc` does NOT register the asyn
+# History: the published 0.22.1 baseline did NOT register the asyn
 # port/EOS/trace iocsh commands (`drvAsynIPPortConfigure`,
 # `asynOctetSetInputEos`, `asynOctetSetOutputEos`, `asynSetTraceMask`,
-# `asynSetTraceIOMask`), and it sets `$(ADCORE)` to a crates.io registry
-# path that does not exist on disk. As a result this script does NOT boot
-# unchanged on the published baseline: the camserver port cannot be
-# created, its EOS cannot be set, and the `$(ADCORE)/db` /
-# `$(ADCORE)/iocBoot` includes below cannot be resolved. The lines are
-# kept (some as comments) so they run verbatim once the framework
-# provides those commands. See the crate UNFIXED notes.
+# `asynSetTraceIOMask`) and set `$(ADCORE)` to a crates.io registry path
+# that did not exist, so this script could not boot unchanged. As of
+# 0.24.3 `AdIoc` registers those commands and `$(ADCORE)` resolves to
+# ad-core-rs's real crate dir: the camserver port is created, the EOS
+# commands exist, and `$(ADCORE)/db` + `$(ADCORE)/ioc/commonPlugins.cmd`
+# all resolve (verified live to iocInit). The EOS-setting lines below are
+# still commented pending a decision on whether to set them (the commands
+# are now registered, so uncommenting should work; not separately tested).
 #============================================================
 
 # Prefix for all records
@@ -45,7 +46,7 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADPILATUS)/db:$(ADCORE)/db")
 
 ###
 # Create the asyn port to talk to the Pilatus camserver on TCP port 41234.
-# (Requires drvAsynIPPortConfigure — see BOOT LIMITATION above.)
+# (drvAsynIPPortConfigure is registered by AdIoc as of ad-plugins-rs 0.24.3.)
 drvAsynIPPortConfigure("camserver", "gse-pilatus1:41234")
 
 # camserver framing (reproduced from the C st.cmd): camserver terminates
@@ -53,10 +54,11 @@ drvAsynIPPortConfigure("camserver", "gse-pilatus1:41234")
 # with 0x0A (LF). The C boot sets these with:
 #   asynOctetSetInputEos("camserver", 0, "\x18")
 #   asynOctetSetOutputEos("camserver", 0, "\n")
-# Omitted here because the published AdIoc does not register the
-# asynOctetSetInputEos / asynOctetSetOutputEos iocsh commands (BOOT
-# LIMITATION). The driver's read loop consumes camserver replies framed on
-# the 0x18 input terminator, so this EOS must be set for correct operation.
+# Left commented pending verification: as of ad-plugins-rs 0.24.3 AdIoc
+# registers the asynOctetSetInputEos / asynOctetSetOutputEos iocsh commands,
+# so these lines can be enabled. The driver's read loop consumes camserver
+# replies framed on the 0x18 input terminator, so this EOS must be set for
+# correct operation.
 
 pilatusDetectorConfig("$(PORT)", "camserver", $(XSIZE), $(YSIZE), 0, 0)
 dbLoadRecords("pilatus.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,CAMSERVER_PORT=camserver")
@@ -65,9 +67,8 @@ dbLoadRecords("pilatus.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEO
 NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
 dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
 
-# Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE),
-# see BOOT LIMITATION).
-< $(ADCORE)/iocBoot/commonPlugins.cmd
+# Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
+< $(ADCORE)/ioc/commonPlugins.cmd
 
 # iocInit is called automatically by IocApplication after this script completes.
 #

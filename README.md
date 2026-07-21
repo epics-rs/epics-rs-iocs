@@ -284,7 +284,7 @@ Records (`iocs/ad/mar345-ioc/db/mar345.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p mar345-ioc --release -- iocs/ad/mar345-ioc/st.cmd`
 
-Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot limitation: on the published `ad-plugins-rs` 0.22.1 baseline, `drvAsynIPPortConfigure`/`asynOctetSetInputEos`/`asynOctetSetOutputEos` iocsh commands aren't registered, so this st.cmd cannot actually create the marServer port unmodified (see st.cmd header comment).
+Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on the pinned `ad-plugins-rs`/`ad-core-rs` 0.24.3 — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
 
 ---
 
@@ -391,7 +391,7 @@ Records (`iocs/ad/pilatus-ioc/db/pilatus.template`, includes `ADBase.template` +
 
 Build/run: `cargo run -p pilatus-ioc --release -- iocs/ad/pilatus-ioc/st.cmd`
 
-Deviations (per crate doc comments): CBF file format is not supported (C links CBFlib; this port logs an error and fails the read on `.cbf`). Camserver I/O is queued to a `PilatusCmdTask` worker thread rather than run inline in the write callback (same actor-blocking constraint as mar345/marccd). `createFileName`/`checkPath` are reimplemented locally because `ad-core-rs` 0.22.1 doesn't expose them. Multi-strip TIFFs decode correctly here (the `tiff` crate reads every strip), whereas C's `readTiff` always passes strip index 0 — the two agree because camserver only ever writes single-strip files. Bad-pixel indices are bounds-checked (C does not).
+Deviations (per crate doc comments): CBF file format is not supported (C links CBFlib; this port logs an error and fails the read on `.cbf`). Camserver I/O is queued to a `PilatusCmdTask` worker thread rather than run inline in the write callback (same actor-blocking constraint as mar345/marccd). `createFileName`/`checkPath` are reimplemented locally in `file_name.rs` — `ADDriverBase` (the base these detectors use) still doesn't expose them as of `ad-core-rs` 0.24.3; only the separate `NDArrayDriverBase` gained public `create_file_name`/`check_path`, and these drivers don't use that base. Multi-strip TIFFs decode correctly here (the `tiff` crate reads every strip), whereas C's `readTiff` always passes strip index 0 — the two agree because camserver only ever writes single-strip files. Bad-pixel indices are bounds-checked (C does not).
 
 ---
 
@@ -704,7 +704,7 @@ Ports from [`epics-modules/mca`](https://github.com/epics-modules/mca):
 - `drivers/mca-rontec` — Rontec detector driver, ported from `mcaApp/RontecSrc/drvMcaRontec.c`.
 - `drivers/mca-amptek` — Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X driver, ported from `mcaApp/AmptekSrc/drvAmptek.cpp`. USB (`DppLibUsb.cpp`) is feasibility-gated out (no USB crate in the workspace); serial is unported because it's an empty no-op in the upstream C driver too.
 
-The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.24.2"` — pinned because "no `epics-rs` \"mca\" feature exists yet"). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
+The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.24.3"` — pinned because "no `epics-rs` \"mca\" feature exists yet"). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
 
 #### Shared MCA record set
 
@@ -741,7 +741,7 @@ Ports from [`epics-modules/scaler`](https://github.com/epics-modules/scaler) —
 
 #### scaler974 records
 
-Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at `scaler_rs::SCALER_DB_DIR` (the `scaler-rs` crate's own bundled `db/`, pinned to `scaler-rs 0.24.0` per `Cargo.lock`) and loads `$(SCALER)/scaler.db`. That file instantiates one real `scalerRecord`:
+Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at `epics_rs::scaler::SCALER_DB_DIR` (the `scaler-rs` crate's own bundled `db/`, re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.24.0` per `Cargo.lock`) and loads `$(SCALER)/scaler.db`. That file instantiates one real `scalerRecord`:
 
 ```
 grecord(scaler,"$(P)$(S)") {
@@ -753,7 +753,7 @@ grecord(scaler,"$(P)$(S)") {
     field(PREC,"3")
 }
 ```
-plus 8 chained `calc`/`transform` helper records (`_calcEnable`, `_calc_ctrl`, `_calc1`-`_calc8`, `_cts1`-`_cts4`) that derive count-rates from the record's own `.S1`-`.S16` (16-channel counts) and `.T` (elapsed-time preset) fields — confirming a 16-channel `scalerRecord`, consistent with `scaler-rs`'s sibling `scaler16.db`/`scaler32.db`/`scaler16m.db` files also present in that crate's `db/` (not loaded by this IOC).
+plus 14 chained `bo`/`calc`/`transform` helper records (`_calcEnable`, `_calc_ctrl` (2 `bo`), `_calc1`-`_calc8` (8 `calc`), `_cts1`-`_cts4` (4 `transform`)) that derive count-rates from the record's own `.S1`-`.S16` (16-channel counts) and `.T` (elapsed-time preset) fields — confirming a 16-channel `scalerRecord`, consistent with `scaler-rs`'s sibling `scaler16.db`/`scaler32.db`/`scaler16m.db` files also present in that crate's `db/` (not loaded by this IOC).
 
 `iocs/scaler974-ioc/st.cmd` configures a serial port (`drvAsynSerialPortConfigure`, 9600/8/N/1, EOS `\r\n`/`\r` — not set by `drvScaler974` itself, per `connect.rs`'s doc, so this is the IOC's own choice pending the Ortec 974 manual), then `initScaler974("SCL1","S0",0,100)` (100 ms poll), then `dbLoadRecords("$(SCALER)/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")` followed by a `dbpf(...DTYP,"Asyn Scaler")` — DTYP is set via `dbpf` rather than a `dbLoadRecords` macro because macro-based `DTYP=` would force-overwrite every record's DTYP field in `scaler.db`, corrupting the `_calcEnable`/`_calc_ctrl` helper records' `"Soft Channel"` DTYP.
 

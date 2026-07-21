@@ -67,12 +67,20 @@ const MAX_RECV_ITERATIONS: usize = 50;
 /// replied", i.e. the same outcome as a timeout.
 ///
 /// On Unix an unanswered `recv_from` simply times out (`WouldBlock` /
-/// `TimedOut`). On Windows a datagram sent to a port with no listener
-/// comes back as an ICMP port-unreachable that the OS surfaces on the
-/// *next* `recv` as `WSAECONNRESET` (`ConnectionReset`; `ConnectionRefused`
-/// on a connected socket) rather than a timeout. For NetFinder discovery
-/// and the direct-connect probe these all mean the same thing — no device
-/// answered — so they are treated identically.
+/// `TimedOut`). On Windows the OS defers the ICMP error from an
+/// unanswered datagram to the *next* `recv` rather than timing out, and
+/// which ICMP shape it is depends on why nothing replied:
+/// - a live host with no listener on the port → port-unreachable →
+///   `WSAECONNRESET` (`ConnectionReset`; `ConnectionRefused` on a
+///   connected socket);
+/// - no host / no route at the target address at all (the common case
+///   when probing an IP where no DP5 is currently plugged in) →
+///   host/network-unreachable or network-down → `HostUnreachable` /
+///   `NetworkUnreachable` / `NetworkDown`.
+///
+/// For NetFinder discovery and the direct-connect probe every one of
+/// these means the same thing — no device answered — so they are treated
+/// identically to a timeout.
 fn is_no_response(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -80,6 +88,9 @@ fn is_no_response(kind: io::ErrorKind) -> bool {
             | io::ErrorKind::TimedOut
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NetworkDown
     )
 }
 
