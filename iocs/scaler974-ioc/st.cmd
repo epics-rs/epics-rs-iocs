@@ -7,7 +7,7 @@
 # Mirrors upstream epics-modules/scaler's iocBoot/iocScalerTest/st.cmd
 # (serial port setup) plus iocsh/softScaler.iocsh's dbLoadRecords
 # convention (this driver reuses scaler-rs's own bundled db/scaler.db —
-# see main.rs's `SCALER` env var, set to `scaler_rs::SCALER_DB_DIR`).
+# see main.rs's `SCALER` env var, set to `epics_rs::scaler::SCALER_DB_DIR`).
 #
 # Like delaygen/love, EOS is not set by drvScaler974 itself (see
 # connect.rs's module doc) -- consult the Ortec 974 manual for the actual
