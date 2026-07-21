@@ -753,7 +753,7 @@ grecord(scaler,"$(P)$(S)") {
     field(PREC,"3")
 }
 ```
-plus 8 chained `calc`/`transform` helper records (`_calcEnable`, `_calc_ctrl`, `_calc1`-`_calc8`, `_cts1`-`_cts4`) that derive count-rates from the record's own `.S1`-`.S16` (16-channel counts) and `.T` (elapsed-time preset) fields — confirming a 16-channel `scalerRecord`, consistent with `scaler-rs`'s sibling `scaler16.db`/`scaler32.db`/`scaler16m.db` files also present in that crate's `db/` (not loaded by this IOC).
+plus 14 chained `bo`/`calc`/`transform` helper records (`_calcEnable`, `_calc_ctrl` (2 `bo`), `_calc1`-`_calc8` (8 `calc`), `_cts1`-`_cts4` (4 `transform`)) that derive count-rates from the record's own `.S1`-`.S16` (16-channel counts) and `.T` (elapsed-time preset) fields — confirming a 16-channel `scalerRecord`, consistent with `scaler-rs`'s sibling `scaler16.db`/`scaler32.db`/`scaler16m.db` files also present in that crate's `db/` (not loaded by this IOC).
 
 `iocs/scaler974-ioc/st.cmd` configures a serial port (`drvAsynSerialPortConfigure`, 9600/8/N/1, EOS `\r\n`/`\r` — not set by `drvScaler974` itself, per `connect.rs`'s doc, so this is the IOC's own choice pending the Ortec 974 manual), then `initScaler974("SCL1","S0",0,100)` (100 ms poll), then `dbLoadRecords("$(SCALER)/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")` followed by a `dbpf(...DTYP,"Asyn Scaler")` — DTYP is set via `dbpf` rather than a `dbLoadRecords` macro because macro-based `DTYP=` would force-overwrite every record's DTYP field in `scaler.db`, corrupting the `_calcEnable`/`_calc_ctrl` helper records' `"Soft Channel"` DTYP.
 
