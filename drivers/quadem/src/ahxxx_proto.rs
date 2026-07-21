@@ -440,6 +440,23 @@ pub fn ah501_ascii_expected_len(resolution: i32, num_channels: usize) -> usize {
     (resolution as usize / 4) * num_channels + (num_channels - 1)
 }
 
+/// C++ `readThread`'s AH501BE Ext. Gate literal: `strncmp((const char *)
+/// input, "ACK\r\n", 5)`.
+pub const ACK_PREAMBLE: &[u8] = b"ACK\r\n";
+
+/// C++ `readThread` (drvAHxxx.cpp:252-259): a binary read that timed out
+/// after transferring exactly the 5-byte ACK preamble and nothing else.
+pub fn is_ack_preamble_only(partial: &[u8]) -> bool {
+    partial == ACK_PREAMBLE
+}
+
+/// C++ `readThread` (drvAHxxx.cpp:265-267): a completed read whose first 5
+/// bytes are the ACK preamble — the gate fired between the ACK and the rest
+/// of the frame arriving.
+pub fn starts_with_ack_preamble(data: &[u8]) -> bool {
+    data.starts_with(ACK_PREAMBLE)
+}
+
 /// C++ `readThread`, AH501 ASCII branch: `strtol(inPtr, &inPtr, 16)` per
 /// channel, then the resolution's sign transform.
 pub fn parse_ascii_ah501(line: &str, resolution: i32, num_channels: usize) -> [f64; QE_MAX_INPUTS] {
@@ -765,5 +782,25 @@ mod tests {
     fn read_len_matches_three_bytes_four_channels() {
         assert_eq!(ah401_read_len(1), 12);
         assert_eq!(ah401_read_len(5), 60);
+    }
+
+    #[test]
+    fn ack_preamble_only_matches_exactly_five_bytes() {
+        assert!(is_ack_preamble_only(b"ACK\r\n"));
+        // A timeout that landed mid-preamble, or with trailing frame bytes,
+        // is not the ACK case — C++'s `nRead == 5` guard requires the exact
+        // count.
+        assert!(!is_ack_preamble_only(b"ACK\r"));
+        assert!(!is_ack_preamble_only(b"ACK\r\nA"));
+        assert!(!is_ack_preamble_only(b""));
+    }
+
+    #[test]
+    fn starts_with_ack_preamble_ignores_trailing_frame_bytes() {
+        let mut frame = b"ACK\r\n".to_vec();
+        frame.extend([0u8; 12]);
+        assert!(starts_with_ack_preamble(&frame));
+        assert!(!starts_with_ack_preamble(b"AK\r\n"));
+        assert!(!starts_with_ack_preamble(b""));
     }
 }
