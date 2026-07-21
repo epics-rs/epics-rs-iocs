@@ -56,6 +56,11 @@ pub struct Settings {
 
 pub struct Detector {
     transport: Mutex<Transport>,
+    /// Whether the detector is answering.
+    ///
+    /// Owned here and written in exactly one place, [`Detector::exchange`]: the
+    /// outcome of a real command is the only thing that may change it.
+    connected: AtomicBool,
     pub state: DetState,
 }
 
@@ -63,8 +68,81 @@ impl Detector {
     pub fn new(transport: Transport) -> Self {
         Self {
             transport: Mutex::new(transport),
+            // Optimistic: the first command is what finds out.
+            connected: AtomicBool::new(true),
             state: DetState::default(),
         }
+    }
+
+    /// Whether the detector is currently believed to be answering.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// The gate every detector command passes through.
+    ///
+    /// INVARIANT: while the detector is marked disconnected no command reaches
+    /// the socket. Each one would otherwise sit out the full 5 s
+    /// [`M1K_TIMEOUT`](crate::transport::M1K_TIMEOUT), and they are serialized
+    /// through the port's single request queue — the 37 records that process at
+    /// `iocInit` cost minutes between them instead of nothing at all.
+    ///
+    /// The caller gets [`AsynStatus::Disconnected`] instead, which is the
+    /// record layer's own word for it.
+    fn io<T>(
+        &self,
+        what: &str,
+        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
+    ) -> AsynResult<T> {
+        if !self.is_connected() {
+            return Err(disconnected(what));
+        }
+        self.exchange(what, exchange)
+    }
+
+    /// Run one command and let its outcome own the connection state.
+    ///
+    /// The only writer of `connected`, and the only path to the socket. Every
+    /// error inside here is the detector failing to answer in full — a timeout
+    /// with nothing in hand, or a reply too short to decode — so every one of
+    /// them means disconnected. Replies the detector *did* send and the driver
+    /// rejects (`-get tau` out of range, a negative module count) are checked by
+    /// the callers, above this line, and leave the state alone.
+    fn exchange<T>(
+        &self,
+        what: &str,
+        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
+    ) -> AsynResult<T> {
+        let result = exchange(&self.transport.lock());
+        match &result {
+            Ok(_) => {
+                if !self.connected.swap(true, Ordering::AcqRel) {
+                    log::warn!("mythen: [{what}] answered; the detector is connected again");
+                }
+            }
+            Err(e) => {
+                if self.connected.swap(false, Ordering::AcqRel) {
+                    log::error!(
+                        "mythen: [{what}] got no answer ({e}); the detector is marked \
+                         disconnected and no further command will be sent until an acquisition \
+                         probes it"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// The one command allowed past the gate: the probe that can bring the
+    /// detector back.
+    ///
+    /// C has no such path — a detector that was off when the IOC booted stays
+    /// unusable until the IOC is restarted, because C's constructor is the only
+    /// place that reads the module count (mythen.cpp:1363).
+    pub fn probe(&self) -> AsynResult<String> {
+        let version = self.exchange("-get version", Transport::get_version)?;
+        self.store_firmware(&version);
+        Ok(version)
     }
 
     /// How many modules the detector reported, or `None` while that is not
@@ -87,25 +165,29 @@ impl Detector {
 
     /// Send a command and check the status integer it replies with.
     pub fn send(&self, command: &str) -> AsynResult<()> {
-        self.transport.lock().send_command(command)?;
+        self.io(command, |t| t.send_command(command))?;
         Ok(())
     }
 
     fn get_int(&self, command: &str) -> AsynResult<i32> {
-        self.transport.lock().get_int(command)
+        self.io(command, |t| t.get_int(command))
     }
 
     fn get_float(&self, command: &str) -> AsynResult<f32> {
-        self.transport.lock().get_float(command)
+        self.io(command, |t| t.get_float(command))
     }
 
     /// C `getFirmware`, mythen.cpp:497.
     pub fn get_firmware(&self) -> AsynResult<String> {
-        let version = self.transport.lock().get_version()?;
+        let version = self.io("-get version", Transport::get_version)?;
+        self.store_firmware(&version);
+        Ok(version)
+    }
+
+    fn store_firmware(&self, version: &str) {
         self.state
             .firmware_major
-            .store(protocol::firmware_major(&version), Ordering::Release);
-        Ok(version)
+            .store(protocol::firmware_major(version), Ordering::Release);
     }
 
     /// C `-get nmodules` in the constructor, mythen.cpp:1363.
@@ -161,7 +243,7 @@ impl Detector {
     /// the command carries its own length.
     pub fn stop(&self) -> AsynResult<()> {
         self.state.acquiring.store(false, Ordering::Release);
-        self.transport.lock().send_command("-stop")?;
+        self.io("-stop", |t| t.send_command("-stop"))?;
         Ok(())
     }
 
@@ -390,7 +472,19 @@ impl Detector {
         } else {
             "-readout"
         };
-        self.transport.lock().readout(command, expect, timeout)
+        self.io(command, |t| t.readout(command, expect, timeout))
+    }
+}
+
+/// The error a caller gets while the detector is marked disconnected: the
+/// command was never sent.
+fn disconnected(what: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Disconnected,
+        message: format!(
+            "mythen: [{what}] not sent: the detector is disconnected — write ADAcquire to probe \
+             it again"
+        ),
     }
 }
 

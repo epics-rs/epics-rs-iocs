@@ -14,6 +14,11 @@ use epics_rs::asyn::user::AsynUser;
 use crate::detector::{Detector, Settings};
 use crate::protocol::CHANNELS_PER_MODULE;
 
+/// The detector is one row of channels, however many modules it has
+/// (C `MAX_DIMS` / `dims[1]`, mythen.cpp:1345).
+const SENSOR_SIZE_X: i32 = CHANNELS_PER_MODULE as i32;
+const SENSOR_SIZE_Y: i32 = 1;
+
 /// The parameters this driver adds to `ADDriver` (C `SD*String`).
 #[derive(Debug, Clone, Copy)]
 pub struct MythenParams {
@@ -113,9 +118,7 @@ impl MythenDriver {
         max_memory: usize,
         start_tx: rt::CommandSender<()>,
     ) -> AsynResult<Self> {
-        let sensor_size_x = CHANNELS_PER_MODULE as i32;
-        let sensor_size_y = 1;
-        let mut ad = ADDriverBase::new(port_name, sensor_size_x, sensor_size_y, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, SENSOR_SIZE_X, SENSOR_SIZE_Y, max_memory)?;
         let p = MythenParams::create(&mut ad.port_base)?;
 
         let mut driver = Self {
@@ -124,8 +127,22 @@ impl MythenDriver {
             det,
             start_tx,
         };
-        driver.init_params(sensor_size_x, sensor_size_y)?;
+        driver.init_params()?;
         Ok(driver)
+    }
+
+    /// Probe a detector that is marked disconnected and, if it answers, re-read
+    /// everything the constructor reads.
+    ///
+    /// The only way back to connected. C has none: its constructor is the only
+    /// place that reads the module count (mythen.cpp:1363), so a detector that
+    /// was off when the IOC booted stays unusable until the IOC restarts —
+    /// every readout after that would be sized from a count that was never
+    /// read. Re-running the constructor's queries here is what closes that.
+    pub fn reconnect(&mut self) -> AsynResult<()> {
+        let version = self.det.probe()?;
+        log::warn!("mythen: the detector answered again (firmware {version}); re-reading it");
+        self.init_params()
     }
 
     /// C's constructor body, mythen.cpp:1326-1377.
@@ -135,7 +152,7 @@ impl MythenDriver {
     /// a detector that is powered off when the IOC boots leaves the parameters
     /// at their defaults but still gets a port — and the IOC still reaches
     /// `iocInit`. Nothing here may use `?` on the detector directly.
-    fn init_params(&mut self, sensor_size_x: i32, sensor_size_y: i32) -> AsynResult<()> {
+    fn init_params(&mut self) -> AsynResult<()> {
         let mut q = BootQueries::default();
 
         let firmware = q.run("the firmware version", self.det.get_firmware());
@@ -148,12 +165,12 @@ impl MythenDriver {
         base.set_string_param(self.ad.params.base.model, 0, "Mythen".into())?;
         base.set_string_param(self.p.firmware_version, 0, firmware.unwrap_or_default())?;
 
-        base.set_int32_param(self.ad.params.max_size_x, 0, sensor_size_x)?;
-        base.set_int32_param(self.ad.params.max_size_y, 0, sensor_size_y)?;
+        base.set_int32_param(self.ad.params.max_size_x, 0, SENSOR_SIZE_X)?;
+        base.set_int32_param(self.ad.params.max_size_y, 0, SENSOR_SIZE_Y)?;
         base.set_int32_param(self.ad.params.min_x, 0, 1)?;
         base.set_int32_param(self.ad.params.min_y, 0, 1)?;
-        base.set_int32_param(self.ad.params.size_x, 0, sensor_size_x)?;
-        base.set_int32_param(self.ad.params.size_y, 0, sensor_size_y)?;
+        base.set_int32_param(self.ad.params.size_x, 0, SENSOR_SIZE_X)?;
+        base.set_int32_param(self.ad.params.size_y, 0, SENSOR_SIZE_Y)?;
         base.set_int32_param(self.ad.params.base.array_size, 0, 0)?;
         base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::UInt32 as i32)?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Single as i32)?;
@@ -192,19 +209,27 @@ impl MythenDriver {
             )?;
         }
 
-        if let Some(failed) = q.failure_summary() {
-            log::error!(
-                "mythen: the detector did not answer at startup ({failed}); the port is created \
-                 with default parameters and ADStatus=Disconnected"
-            );
-            let base = &mut self.ad.port_base;
-            base.set_int32_param(self.ad.params.status, 0, ADStatus::Disconnected as i32)?;
-            base.set_string_param(
-                self.ad.params.status_message,
-                0,
-                "Mythen FAILED TO CONNECT".into(),
-            )?;
-        }
+        // The message is set and cleared here because this runs again on every
+        // reconnect: a detector that came back must not leave the operator
+        // reading "FAILED TO CONNECT" off a working port.
+        let message = match q.failure_summary() {
+            Some(failed) => {
+                log::error!(
+                    "mythen: the detector did not answer ({failed}); the port keeps its default \
+                     parameters and reports ADStatus=Disconnected"
+                );
+                self.ad.port_base.set_int32_param(
+                    self.ad.params.status,
+                    0,
+                    ADStatus::Disconnected as i32,
+                )?;
+                "Mythen FAILED TO CONNECT"
+            }
+            None => "",
+        };
+        self.ad
+            .port_base
+            .set_string_param(self.ad.params.status_message, 0, message.into())?;
 
         self.ad.port_base.call_param_callbacks(0)
     }
@@ -261,6 +286,13 @@ impl MythenDriver {
                 .port_base
                 .set_int32_param(self.ad.params.status, 0, status as i32)?;
             return Ok(());
+        }
+        // Starting an acquisition is the one moment worth spending a real
+        // command on a detector that is not answering: the operator asked for
+        // data, and the module count the readout is sized from is only ever
+        // read by the constructor's queries, which `reconnect` re-runs.
+        if !self.det.is_connected() {
+            self.reconnect()?;
         }
         if self.det.start()? && self.start_tx.try_send(()).is_err() {
             log::error!("mythen: the acquisition task is not running");
