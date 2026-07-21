@@ -43,14 +43,13 @@ const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// C++ `setIntegerParam(P_ValuesPerRead, 5)` in the constructor.
 const DEFAULT_VALUES_PER_READ: i32 = 5;
 
+/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
+/// the bytes transferred before it. A bare `AsynError::Status` variant match
+/// would miss that wrapper and misclassify every partial-transfer timeout —
+/// routine on this port, since it installs the EOS interpose — as an
+/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
+    e.status() == AsynStatus::Timeout
 }
 
 fn error(message: impl Into<String>) -> AsynError {
@@ -656,4 +655,36 @@ pub fn create_nsls_em(
         _read_thread: read_thread_handle,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::interpose::PartialOctetRead;
+
+    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
+    /// read's transferred bytes (see the fix note on `is_timeout`); a bare
+    /// `AsynError::Status` match would miss it entirely. Routine on this
+    /// port's TCP command/data sub-ports, which install the EOS interpose.
+    #[test]
+    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
+        let e = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(PartialOctetRead {
+            data: b"12.3".to_vec(),
+            eom_reason: EomReason::empty(),
+        });
+        assert!(is_timeout(&e));
+        assert_eq!(
+            e.partial_read().map(|p| p.data.as_slice()),
+            Some(&b"12.3"[..])
+        );
+    }
+
+    #[test]
+    fn is_timeout_rejects_a_real_error() {
+        assert!(!is_timeout(&error("boom")));
+    }
 }

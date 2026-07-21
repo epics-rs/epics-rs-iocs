@@ -32,14 +32,13 @@ const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// C++ `reset`: `epicsThreadSleep(1.0)` between probes.
 const RESET_POLL: Duration = Duration::from_secs(1);
 
+/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
+/// the bytes transferred before it. A bare `AsynError::Status` variant match
+/// would miss that wrapper and misclassify every partial-transfer timeout —
+/// routine on this port, since it installs the EOS interpose — as an
+/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
+    e.status() == AsynStatus::Timeout
 }
 
 fn error(message: impl Into<String>) -> AsynError {
