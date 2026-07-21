@@ -5,11 +5,12 @@
 //! atomic against the acquisition task's readout, which C gets for free from
 //! asyn's per-port request queue.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use parking_lot::Mutex;
 
 use crate::protocol::{self, READ_MODE_RAW};
@@ -66,8 +67,18 @@ impl Detector {
         }
     }
 
-    pub fn nmodules(&self) -> usize {
-        self.state.nmodules.load(Ordering::Acquire).max(0) as usize
+    /// How many modules the detector reported, or `None` while that is not
+    /// known — `-get nmodules` has not answered yet, or answered nonsense.
+    ///
+    /// Deliberately not a count of zero. Every readout length is derived from
+    /// this, and a zero-length readout is a command sent whose reply nobody
+    /// reads: the bytes stay in the socket and desynchronise every command
+    /// after it. `None` is what stops that being expressible.
+    pub fn nmodules(&self) -> Option<usize> {
+        match self.state.nmodules.load(Ordering::Acquire) {
+            n if n > 0 => Some(n as usize),
+            _ => None,
+        }
     }
 
     pub fn firmware_major(&self) -> u32 {
@@ -212,8 +223,14 @@ impl Detector {
 
     /// `-module N` followed by `command`, for every module (C repeats this
     /// pattern in setKthresh / setEnergy / loadSettings / setReset).
+    ///
+    /// Refuses when the module count is unknown rather than looping zero times:
+    /// a silent no-op here is a threshold the operator believes was applied.
     fn for_each_module(&self, command: &str) -> AsynResult<()> {
-        for module in 0..self.nmodules() {
+        let nmodules = self
+            .nmodules()
+            .ok_or_else(|| unknown_nmodules(&format!("send [{command}] to every module")))?;
+        for module in 0..nmodules {
             self.send(&format!("-module {module}"))?;
             self.send(command)?;
         }
@@ -351,23 +368,41 @@ impl Detector {
         Ok(value)
     }
 
-    /// The size, in bytes, of the next readout reply (C `nread_expect`).
-    pub fn readout_len(&self) -> usize {
-        protocol::readout_len(
+    /// The size, in bytes, of the next readout reply (C `nread_expect`), or
+    /// `None` while the module count is unknown.
+    pub fn readout_len(&self) -> Option<NonZeroUsize> {
+        NonZeroUsize::new(protocol::readout_len(
             self.state.read_mode.load(Ordering::Acquire),
-            self.nmodules(),
+            self.nmodules()?,
             self.state.nbits.load(Ordering::Acquire),
-        )
+        ))
     }
 
     /// C `-readoutraw` / `-readout`, mythen.cpp:889.
-    pub fn readout(&self, expect: usize, timeout: Duration) -> AsynResult<Vec<u8>> {
+    ///
+    /// `expect` is a [`NonZeroUsize`] because it is the length the reply will
+    /// be read back at: a zero would send the command and read nothing, and the
+    /// reply the detector then sends would be picked up as the answer to
+    /// whatever command came next.
+    pub fn readout(&self, expect: NonZeroUsize, timeout: Duration) -> AsynResult<Vec<u8>> {
         let command = if self.state.read_mode.load(Ordering::Acquire) == READ_MODE_RAW {
             "-readoutraw"
         } else {
             "-readout"
         };
         self.transport.lock().readout(command, expect, timeout)
+    }
+}
+
+/// The error a caller gets when it asks for detector work whose size depends on
+/// a module count the detector has never reported.
+pub fn unknown_nmodules(what: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!(
+            "mythen: cannot {what}: the module count is unknown — `-get nmodules` has not \
+             answered since the IOC started"
+        ),
     }
 }
 
