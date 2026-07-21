@@ -46,6 +46,18 @@ fn is_timeout(e: &AsynError) -> bool {
     e.status() == AsynStatus::Timeout
 }
 
+/// `read_thread`'s binary-read error arm (C++ `drvAHxxx.cpp:252-259`): trigger
+/// callbacks only when the failure was a genuine timeout. `status` must be
+/// checked first — `AsynError::PartialRead` also wraps non-timeout failures
+/// (an ECONNRESET, say) that could happen to carry the same 5 bytes, and C++
+/// reaches this trigger only inside `status != asynTimeout`'s `else`.
+fn is_ext_gate_ack_timeout(e: &AsynError, ext_gate: bool) -> bool {
+    ext_gate
+        && is_timeout(e)
+        && e.partial_read()
+            .is_some_and(|partial| proto::is_ack_preamble_only(&partial.data))
+}
+
 fn error(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -683,10 +695,7 @@ fn read_thread(ctx: ReadContext) {
                         // external gate pulse, so the binary read times out
                         // after exactly those 5 bytes. Only
                         // `AsynError::partial_read` still carries them.
-                        if ext_gate
-                            && let Some(partial) = e.partial_read()
-                            && proto::is_ack_preamble_only(&partial.data)
-                        {
+                        if is_ext_gate_ack_timeout(&e, ext_gate) {
                             ctx.shared.trigger_callbacks();
                         }
                         if !is_timeout(&e) {
@@ -911,5 +920,30 @@ mod tests {
     #[test]
     fn is_timeout_rejects_a_real_error() {
         assert!(!is_timeout(&error("boom")));
+    }
+
+    /// `AsynError::PartialRead` wraps non-timeout failures too (`error.rs`
+    /// cites a mid-transfer ECONNRESET). One that happens to carry exactly
+    /// the 5-byte ACK preamble must NOT trigger callbacks — only a genuine
+    /// timeout carrying it should.
+    #[test]
+    fn ext_gate_ack_trigger_requires_a_genuine_timeout() {
+        let ack_payload = PartialOctetRead {
+            data: proto::ACK_PREAMBLE.to_vec(),
+            eom_reason: EomReason::empty(),
+        };
+        let non_timeout = AsynError::Status {
+            status: AsynStatus::Error,
+            message: "read error: ECONNRESET".into(),
+        }
+        .with_partial_read(ack_payload.clone());
+        assert!(!is_ext_gate_ack_timeout(&non_timeout, true));
+
+        let timeout = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(ack_payload);
+        assert!(is_ext_gate_ack_timeout(&timeout, true));
     }
 }
