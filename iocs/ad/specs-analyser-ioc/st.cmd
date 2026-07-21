@@ -49,7 +49,7 @@ NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
 dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=$(NELEMENTS)")
 
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
-< $(ADCORE)/iocBoot/commonPlugins.cmd
+< $(ADCORE)/ioc/commonPlugins.cmd
 
 # iocInit is called automatically by IocApplication after this script completes.
 #

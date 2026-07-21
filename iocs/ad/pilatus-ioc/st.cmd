@@ -67,7 +67,7 @@ dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,
 
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE),
 # see BOOT LIMITATION).
-< $(ADCORE)/iocBoot/commonPlugins.cmd
+< $(ADCORE)/ioc/commonPlugins.cmd
 
 # iocInit is called automatically by IocApplication after this script completes.
 #
