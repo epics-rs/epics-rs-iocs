@@ -391,7 +391,7 @@ Records (`iocs/ad/pilatus-ioc/db/pilatus.template`, includes `ADBase.template` +
 
 Build/run: `cargo run -p pilatus-ioc --release -- iocs/ad/pilatus-ioc/st.cmd`
 
-Deviations (per crate doc comments): CBF file format is not supported (C links CBFlib; this port logs an error and fails the read on `.cbf`). Camserver I/O is queued to a `PilatusCmdTask` worker thread rather than run inline in the write callback (same actor-blocking constraint as mar345/marccd). `createFileName`/`checkPath` are reimplemented locally because `ad-core-rs` 0.22.1 doesn't expose them. Multi-strip TIFFs decode correctly here (the `tiff` crate reads every strip), whereas C's `readTiff` always passes strip index 0 — the two agree because camserver only ever writes single-strip files. Bad-pixel indices are bounds-checked (C does not).
+Deviations (per crate doc comments): CBF file format is not supported (C links CBFlib; this port logs an error and fails the read on `.cbf`). Camserver I/O is queued to a `PilatusCmdTask` worker thread rather than run inline in the write callback (same actor-blocking constraint as mar345/marccd). `createFileName`/`checkPath` are reimplemented locally in `file_name.rs` — `ADDriverBase` (the base these detectors use) still doesn't expose them as of `ad-core-rs` 0.24.3; only the separate `NDArrayDriverBase` gained public `create_file_name`/`check_path`, and these drivers don't use that base. Multi-strip TIFFs decode correctly here (the `tiff` crate reads every strip), whereas C's `readTiff` always passes strip index 0 — the two agree because camserver only ever writes single-strip files. Bad-pixel indices are bounds-checked (C does not).
 
 ---
 
