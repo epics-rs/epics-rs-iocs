@@ -1,0 +1,56 @@
+# Ported from epics-modules/SyringePump/SPApp/Db/VindumWriteHoldingRegisters.substitutions.
+# Every `file "$(MODBUS)/db/*.template"` below rewritten to a bare filename
+# resolved relative to this file's own directory (db/) -- dbLoadTemplate does
+# not macro-expand `file` paths. Upstream's "mbbo.template" is
+# "vindumMbbo.template" here: epics-modbus-rs only bundles bit-packed
+# mbbiDirect/mbboDirect, not a plain enumerated mbbo (see
+# vindumMbbo.template's own header).
+#
+# These are the output holding registers starting at address 0, function code 16
+file "longoutInt32.template" {
+pattern
+{     R,              OFFSET,  DATA_TYPE,  PINI}
+{A:PumpModeRaw,            2,     UINT16,    NO}
+{B:PumpModeRaw,            3,     UINT16,    NO}
+{ServerID,                31,     UINT16,    NO}
+{AutoRateReturnTime,      37,     UINT16,    NO}
+{A:OpenDiffGain,          38,     UINT16,    NO}
+{A:CloseDiffGain,         39,     UINT16,    NO}
+{A:OpenPropGain,          40,     UINT16,    NO}
+{A:ClosePropGain,         41,     UINT16,    NO}
+{B:OpenDiffGain,          42,     UINT16,    NO}
+{B:CloseDiffGain,         43,     UINT16,    NO}
+{B:OpenPropGain,          44,     UINT16,    NO}
+{B:ClosePropGain,         45,     UINT16,    NO}
+}
+
+file "vindumMbbo.template" {
+pattern
+{     R,              OFFSET,       ZRST,    ZRVL,   ONST,     ONVL, TWST, TWVL,  THST,  THVL,  PINI}
+#
+{A:Direction,              0,    "Extending",  1, "Retracting",  2,    "",   0,    "",     0,    NO}
+{B:Direction,              1,    "Extending",  1, "Retracting",  2,    "",   0,    "",     0,    NO}
+{PressureUnits,           29,    "PSI",        0, "bar",         1, "kPa",   2,  "MPa",    3,    NO}
+{RateUnits,               30,    "ml/min",     0, "ml/hour",     1,    "",   0,    "",     0,    NO}
+}
+
+# These are the float values for the output holding registers starting at address 0, function code 16
+file "aoFloat64.template" {
+pattern
+{     R,              OFFSET,  DATA_TYPE,  PREC,  PINI}
+#
+{A:SetFlowRate,            5, FLOAT32_BE,   3,     YES}
+{B:SetFlowRate,            7, FLOAT32_BE,   3,     YES}
+{SetMaxRate,               9, FLOAT32_BE,   3,     YES}
+{A:SetPressure,           11, FLOAT32_BE,   2,     YES}
+{B:SetPressure,           13, FLOAT32_BE,   2,     YES}
+{SetMaxPressure,          15, FLOAT32_BE,   2,     YES}
+{A:PressureGain,          17, FLOAT32_BE,   2,     NO}
+{B:PressureGain,          19, FLOAT32_BE,   2,     NO}
+{A:SafetyPressure,        21, FLOAT32_BE,   2,     YES}
+{B:SafetyPressure,        23, FLOAT32_BE,   2,     YES}
+{A:SetVolume,             25, FLOAT32_BE,   2,     YES}
+{B:SetVolume,             27, FLOAT32_BE,   2,     YES}
+{FillOpenPressure,        33, FLOAT32_BE,   2,     NO}
+{ReturnRateMult,          35, FLOAT32_BE,   2,     NO}
+}

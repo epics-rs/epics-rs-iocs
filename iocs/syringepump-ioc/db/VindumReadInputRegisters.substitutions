@@ -1,0 +1,45 @@
+# Ported from epics-modules/SyringePump/SPApp/Db/VindumReadInputRegisters.substitutions.
+# Every `file "$(MODBUS)/db/*.template"` below rewritten to a bare filename
+# resolved relative to this file's own directory (db/) -- dbLoadTemplate does
+# not macro-expand `file` paths.
+#
+# These are the values for the input registers starting at 0 with function code 4
+file "longinInt32.template" {
+pattern
+{     R,                      OFFSET,  DATA_TYPE,        SCAN}
+{ComResponse,                      0,     UINT16,  "I/O Intr"}
+{PumpType,                        19,     UINT16,  "I/O Intr"}
+{A:ErrorState,                    23,  UINT32_BE,  "I/O Intr"}
+{B:ErrorState,                    25,  UINT32_BE,  "I/O Intr"}
+{CommonErrorState,                27,  UINT32_BE,  "I/O Intr"}
+{A:LatchedErrorState,             29,  UINT32_BE,  "I/O Intr"}
+{B:LatchedErrorState,             31,  UINT32_BE,  "I/O Intr"}
+{LatchedCommonErrorState,         33,  UINT32_BE,  "I/O Intr"}
+{CommonErrorState2,               39,  UINT32_BE,  "I/O Intr"}
+{LatchedCommonErrorState2,        41,  UINT32_BE,  "I/O Intr"}
+}
+
+# Position range is 0 to 640 for VP pumps.  Convert to percent.
+# Say the ADC is unipolar 10 bits, so full scale is 1024, EGUF=1024/640 = 1.60 %
+file "ai.template" {
+pattern
+{     R,                      OFFSET,  BITS,   EGUL,   EGUF,   PREC,       SCAN}
+{A:Position,                      20,    10,     0.,   160.,      1,    "I/O Intr"}
+{B:Position,                      21,    10,     0.,   160.,      1,    "I/O Intr"}
+}
+
+file "aiFloat64.template" {
+pattern
+{     R,                      OFFSET,   DATA_TYPE,  PREC,   SCAN}
+{A:Pressure,                       1,  FLOAT32_BE,   2,  "I/O Intr"}
+{B:Pressure,                       3,  FLOAT32_BE,   2,  "I/O Intr"}
+{PairedPressure,                   5,  FLOAT32_BE,   2,  "I/O Intr"}
+{A:FlowRate,                       7,  FLOAT32_BE,   3,  "I/O Intr"}
+{B:FlowRate,                       9,  FLOAT32_BE,   3,  "I/O Intr"}
+{PairedRate,                      11,  FLOAT32_BE,   3,  "I/O Intr"}
+{A:Volume,                        13,  FLOAT32_BE,   2,  "I/O Intr"}
+{B:Volume,                        15,  FLOAT32_BE,   2,  "I/O Intr"}
+{TotalVolume,                     17,  FLOAT32_BE,   2,  "I/O Intr"}
+{A:TotalVolume,                   35,  FLOAT32_BE,   2,  "I/O Intr"}
+{B:TotalVolume,                   37,  FLOAT32_BE,   2,  "I/O Intr"}
+}

@@ -1,0 +1,113 @@
+# Ported from epics-modules/SyringePump/SPApp/Db/ISCOBinaryOut.substitutions.
+# Only change from upstream: `file "$(MODBUS)/db/bo_bit.template"` rewritten
+# to a bare filename resolved relative to this file's own directory (db/) --
+# dbLoadTemplate does not macro-expand `file` paths.
+file "bo_bit.template" {
+pattern
+{  R,                 PORT,      OFFSET,  ZNAM,    ONAM}
+{A:Run,             SP1_Bit_Out,     0,    Stop,    Run}
+{B:Run,             SP1_Bit_Out,     1,    Stop,    Run}
+{C:Run,             SP1_Bit_Out,     2,    Stop,    Run}
+{D:Run,             SP1_Bit_Out,     3,    Stop,    Run}
+{Link-AB-CD,        SP1_Bit_Out,     4, Disable, Enable}
+{A:Refill,          SP1_Bit_Out,     5,    Stop,    Run}
+{B:Refill,          SP1_Bit_Out,     6,    Stop,    Run}
+{C:Refill,          SP1_Bit_Out,     7,    Stop,    Run}
+{D:Refill,          SP1_Bit_Out,     8,    Stop,    Run}
+{A:ConstPress,      SP1_Bit_Out,     9,     Off,     On}
+{B:ConstPress,      SP1_Bit_Out,    10,     Off,     On}
+{C:ConstPress,      SP1_Bit_Out,    11,     Off,     On}
+{D:ConstPress,      SP1_Bit_Out,    12,     Off,     On}
+{A:ConstFlow,       SP1_Bit_Out,    13,     Off,     On}
+{B:ConstFlow,       SP1_Bit_Out,    14,     Off,     On}
+{C:ConstFlow,       SP1_Bit_Out,    15,     Off,     On}
+{D:ConstFlow,       SP1_Bit_Out,    16,     Off,     On}
+{AB:Independent,    SP1_Bit_Out,    17,   False,   True}
+{AB:ConstFlow,      SP1_Bit_Out,    18,     Off,     On}
+{AB:ConstPress,     SP1_Bit_Out,    19,     Off,     On}
+{AB:ModAdd,         SP1_Bit_Out,    20,     Off,     On}
+{AB:ContModAdd,     SP1_Bit_Out,    21,     Off,     On}
+{CD:Independent,    SP1_Bit_Out,    22,   False,   True}
+{CD:ConstFlow,      SP1_Bit_Out,    23,     Off,     On}
+{CD:ConstPress,     SP1_Bit_Out,    24,     Off,     On}
+{AB:DeliverMode,    SP1_Bit_Out,    25, Deliver, Receive}
+{AB:PressureMode,   SP1_Bit_Out,    26,     Low,  Normal}
+{AB:PressureMatch,  SP1_Bit_Out,    27,    Fast,  Normal}
+{CD:DeliverMode,    SP1_Bit_Out,    28, Deliver, Receive}
+{CD:PressureMode,   SP1_Bit_Out,    29,     Low,  Normal}
+{CD:PressureMatch,  SP1_Bit_Out,    30,    Fast,  Normal}
+{A:RapidPress,      SP1_Bit_Out,    31, Disable,  Enable}
+{B:RapidPress,      SP1_Bit_Out,    32, Disable,  Enable}
+{C:RapidPress,      SP1_Bit_Out,    33, Disable,  Enable}
+{D:RapidPress,      SP1_Bit_Out,    34, Disable,  Enable}
+
+## Coils 35-45 are readonly
+
+{LocalOperation,    SP1_Bit_Out,     46, Disable,  Enable}
+{RemoteOperation,   SP1_Bit_Out,     47, Disable,  Enable}
+{ExternalOperation, SP1_Bit_Out,     48, Disable,  Enable}
+{ExternalRefill,    SP1_Bit_Out,     49, Disable,  Enable}
+{A:ZeroPressure,    SP1_Bit_Out,     50, Disable,  Enable}
+{B:ZeroPressure,    SP1_Bit_Out,     51, Disable,  Enable}
+{C:ZeroPressure,    SP1_Bit_Out,     52, Disable,  Enable}
+{D:ZeroPressure,    SP1_Bit_Out,     53, Disable,  Enable}
+{A:PressIntegrator, SP1_Bit_Out,     54,     Off,      On}
+{B:PressIntegrator, SP1_Bit_Out,     55,     Off,      On}
+{C:PressIntegrator, SP1_Bit_Out,     56,     Off,      On}
+{D:PressIntegrator, SP1_Bit_Out,     57,     Off,      On}
+{A:PressDeadband8,  SP1_Bit_Out,     58,     Off,      On}
+{B:PressDeadband,   SP1_Bit_Out,     59,     Off,      On}
+{C:PressDeadband,   SP1_Bit_Out,     60,     Off,      On}
+{D:PressDeadband,   SP1_Bit_Out,     61,     Off,      On}
+{A:AutoRefill,      SP1_Bit_Out,     62,     Off,      On}
+{B:AutoRefill,      SP1_Bit_Out,     63,     Off,      On}
+{C:AutoRefill,      SP1_Bit_Out,     64,     Off,      On}
+{D:AutoRefill,      SP1_Bit_Out,     65,     Off,      On}
+{A:AutoFill,        SP1_Bit_Out,     66,     Off,      On}
+{B:AutoFill,        SP1_Bit_Out,     67,     Off,      On}
+{C:AutoFill,        SP1_Bit_Out,     68,     Off,      On}
+{D:AutoFill,        SP1_Bit_Out,     69,     Off,      On}
+{OutputBit1,        SP1_Bit_Out,     70,     Low,    High}
+{OutputBit2,        SP1_Bit_Out,     71,     Low,    High}
+{OutputBit3,        SP1_Bit_Out,     72,     Low,    High}
+{OutputBit4,        SP1_Bit_Out,     73,     Low,    High}
+{OutputBit5,        SP1_Bit_Out,     74,     Low,    High}
+{OutputBit6,        SP1_Bit_Out,     75,     Low,    High}
+{OutputBit7,        SP1_Bit_Out,     76,     Low,    High}
+{OutputBit8,        SP1_Bit_Out,     77,     Low,    High}
+{A:DispenseModeCF,  SP1_Bit_Out,     78, Disable,  Enable}
+{B:DispenseModeCF,  SP1_Bit_Out,     79, Disable,  Enable}
+{C:DispenseModeCF,  SP1_Bit_Out,     80, Disable,  Enable}
+{D:DispenseModeCF,  SP1_Bit_Out,     81, Disable,  Enable}
+{AB:ResetVolDel,    SP1_Bit_Out,     82, Disable,  Enable}
+{CD:ResetVolDel,    SP1_Bit_Out,     83, Disable,  Enable}
+{Unit:ATM,          SP1_Bit_Out,     84,     Off,      On}
+{Unit:BAR,          SP1_Bit_Out,     85,     Off,      On}
+{Unit:kPa,          SP1_Bit_Out,     86,     Off,      On}
+{Unit:PSI,          SP1_Bit_Out,     87,     Off,      On}
+{Unit:mlPerMin,     SP1_Bit_Out,     88,     Off,      On}
+{Unit:mlPerHr,      SP1_Bit_Out,     89,     Off,      On}
+{Unit:ulPerMin,     SP1_Bit_Out,     90,     Off,      On}
+{Unit:ulPerHr,      SP1_Bit_Out,     91,     Off,      On}
+{OverpressAlarm,    SP1_Bit_Out,     92, Disable,  Enable}
+{OverpressDisplay,  SP1_Bit_Out,     93, Disable,  Enable}
+{OverpressShutdown, SP1_Bit_Out,     94, Disable,  Enable}
+{UnderpressAlarm,   SP1_Bit_Out,     95, Disable,  Enable}
+{UnderpressDisplay, SP1_Bit_Out,     96, Disable,  Enable}
+{UnderpressShutdown,SP1_Bit_Out,     97, Disable,  Enable}
+{OverflowAlarm,     SP1_Bit_Out,     98, Disable,  Enable}
+{OverflowDisplay,   SP1_Bit_Out,     99, Disable,  Enable}
+{OverflowShutdown,  SP1_Bit_Out,    100, Disable,  Enable}
+{UnderflowAlarm,    SP1_Bit_Out,    101, Disable,  Enable}
+{UnderflowDisplay,  SP1_Bit_Out,    102, Disable,  Enable}
+{UnderflowShutdown, SP1_Bit_Out,    103, Disable,  Enable}
+{A:PoorFillAlarm,   SP1_Bit_Out,    104, Disable,  Enable}
+{B:PoorFillAlarm,   SP1_Bit_Out,    105, Disable,  Enable}
+{C:PoorFillAlarm,   SP1_Bit_Out,    106, Disable,  Enable}
+{D:PoorFillAlarm,   SP1_Bit_Out,    107, Disable,  Enable}
+{ResetAll,          SP1_Bit_Out,    108,    Done,   Reset}
+
+## Coils 109-141 are readonly
+}
+
+

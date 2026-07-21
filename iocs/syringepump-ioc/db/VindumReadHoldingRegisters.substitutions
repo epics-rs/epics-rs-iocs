@@ -1,0 +1,56 @@
+# Ported from epics-modules/SyringePump/SPApp/Db/VindumReadHoldingRegisters.substitutions.
+# Every `file "$(MODBUS)/db/*.template"` below rewritten to a bare filename
+# resolved relative to this file's own directory (db/) -- dbLoadTemplate does
+# not macro-expand `file` paths. Upstream's "mbbi.template" is
+# "vindumMbbi.template" here: epics-modbus-rs only bundles bit-packed
+# mbbiDirect/mbboDirect, not a plain enumerated mbbi (see
+# vindumMbbi.template's own header).
+#
+# These are the values for the holding registers starting at address 0, function code 3.
+file "longinInt32.template" {
+pattern
+{     R,                  OFFSET,  DATA_TYPE,      SCAN}
+#
+{A:PumpModeRaw_RBV,            2,     UINT16,   "I/O Intr"}
+{B:PumpModeRaw_RBV,            3,     UINT16,   "I/O Intr"}
+{ServerID_RBV,                31,     UINT16,   "I/O Intr"}
+{AutoRateReturnTime_RBV,      37,     UINT16,   "I/O Intr"}
+{A:OpenDiffGain_RBV,          38,     UINT16,   "I/O Intr"}
+{A:CloseDiffGain_RBV,         39,     UINT16,   "I/O Intr"}
+{A:OpenPropGain_RBV,          40,     UINT16,   "I/O Intr"}
+{A:ClosePropGain_RBV,         41,     UINT16,   "I/O Intr"}
+{B:OpenDiffGain_RBV,          42,     UINT16,   "I/O Intr"}
+{B:CloseDiffGain_RBV,         43,     UINT16,   "I/O Intr"}
+{B:OpenPropGain_RBV,          44,     UINT16,   "I/O Intr"}
+{B:ClosePropGain_RBV,         45,     UINT16,   "I/O Intr"}
+}
+
+file "vindumMbbi.template" {
+pattern
+{     R,                  OFFSET,       ZRST,    ZRVL,   ONST,     ONVL, TWST, TWVL,  THST,  THVL, SCAN}
+#
+{A:Direction_RBV,              0,    "Extending",  1, "Retracting",  2,    "",   0,    "",     0,  "I/O Intr"}
+{B:Direction_RBV,              1,    "Extending",  1, "Retracting",  2,    "",   0,    "",     0,  "I/O Intr"}
+{PressureUnits_RBV,           29,    "PSI",        0, "bar",         1, "kPa",   2,  "MPa",    3,  "I/O Intr"}
+{RateUnits_RBV,               30,    "ml/min",     0, "ml/hour",     1,    "",   0,    "",     0,  "I/O Intr"}
+}
+
+file "aiFloat64.template" {
+pattern
+{     R,                  OFFSET,  DATA_TYPE,   PREC,    SCAN}
+#
+{A:SetFlowRate_RBV,            5, FLOAT32_BE,     3,  "I/O Intr"}
+{B:SetFlowRate_RBV,            7, FLOAT32_BE,     3,  "I/O Intr"}
+{SetMaxRate_RBV,               9, FLOAT32_BE,     3,  "I/O Intr"}
+{A:SetPressure_RBV,           11, FLOAT32_BE,     2,  "I/O Intr"}
+{B:SetPressure_RBV,           13, FLOAT32_BE,     2,  "I/O Intr"}
+{SetMaxPressure_RBV,          15, FLOAT32_BE,     2,  "I/O Intr"}
+{A:PressureGain_RBV,          17, FLOAT32_BE,     2,  "I/O Intr"}
+{B:PressureGain_RBV,          19, FLOAT32_BE,     2,  "I/O Intr"}
+{A:SafetyPressure_RBV,        21, FLOAT32_BE,     2,  "I/O Intr"}
+{B:SafetyPressure_RBV,        23, FLOAT32_BE,     2,  "I/O Intr"}
+{A:SetVolume_RBV,             25, FLOAT32_BE,     2,  "I/O Intr"}
+{B:SetVolume_RBV,             27, FLOAT32_BE,     2,  "I/O Intr"}
+{B:FillOpenPressure_RBV,      33, FLOAT32_BE,     2,  "I/O Intr"}
+{B:ReturnRateMult_RBV,        35, FLOAT32_BE,     2,  "I/O Intr"}
+}
