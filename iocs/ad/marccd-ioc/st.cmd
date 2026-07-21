@@ -7,18 +7,19 @@
 #   cargo run -p marccd-ioc -- iocs/ad/marccd-ioc/st.cmd
 #
 #------------------------------------------------------------
-# BOOT LIMITATION (published epics-rs 0.22.1 baseline)
+# Boots clean on the pinned ad-plugins-rs / ad-core-rs 0.24.3.
 #
-# The published ad-plugins-rs 0.22.1 `AdIoc` does NOT register the asyn
+# History: the published 0.22.1 baseline did NOT register the asyn
 # port/EOS/trace iocsh commands (`drvAsynIPPortConfigure`,
 # `asynOctetSetInputEos`, `asynOctetSetOutputEos`, `asynSetTraceMask`,
-# `asynSetTraceIOMask`), and it sets `$(ADCORE)` to a crates.io registry
-# path that does not exist on disk. As a result this script does NOT boot
-# unchanged on the published baseline: the marServer port cannot be
-# created, its EOS cannot be set, and the `$(ADCORE)/db` /
-# `$(ADCORE)/iocBoot` includes below cannot be resolved. The lines are
-# kept (some as comments) so they run verbatim once the framework
-# provides those commands. See the crate UNFIXED notes.
+# `asynSetTraceIOMask`) and set `$(ADCORE)` to a crates.io registry path
+# that did not exist, so this script could not boot unchanged. As of
+# 0.24.3 `AdIoc` registers those commands and `$(ADCORE)` resolves to
+# ad-core-rs's real crate dir: the marServer port is created, the EOS
+# commands exist, and `$(ADCORE)/db` + `$(ADCORE)/ioc/commonPlugins.cmd`
+# all resolve (verified live to iocInit). The EOS-setting lines below are
+# still commented pending a decision on whether to set them (the commands
+# are now registered, so uncommenting should work; not separately tested).
 #============================================================
 
 # Prefix for all records

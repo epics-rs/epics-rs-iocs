@@ -284,7 +284,7 @@ Records (`iocs/ad/mar345-ioc/db/mar345.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p mar345-ioc --release -- iocs/ad/mar345-ioc/st.cmd`
 
-Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot limitation: on the published `ad-plugins-rs` 0.22.1 baseline, `drvAsynIPPortConfigure`/`asynOctetSetInputEos`/`asynOctetSetOutputEos` iocsh commands aren't registered, so this st.cmd cannot actually create the marServer port unmodified (see st.cmd header comment).
+Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on the pinned `ad-plugins-rs`/`ad-core-rs` 0.24.3 — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
 
 ---
 
