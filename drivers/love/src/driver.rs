@@ -239,14 +239,13 @@ fn protocol_error(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
+/// the bytes transferred before it. A bare `AsynError::Status` variant match
+/// would miss that wrapper and misclassify every partial-transfer timeout —
+/// routine on this port, since it installs the EOS interpose — as an
+/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
+    e.status() == AsynStatus::Timeout
 }
 
 /// C `sendCommand`'s `retry==0` framing: `STX 'L' ADDR(2 hex) BODY
@@ -574,5 +573,32 @@ mod tests {
     fn process_write_response_fails_on_nonzero_code() {
         assert!(process_write_response(b"00").is_ok());
         assert!(process_write_response(b"01xyz").is_err());
+    }
+
+    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
+    /// read's transferred bytes (see the fix note on `is_timeout`); a bare
+    /// `AsynError::Status` match would miss it entirely.
+    #[test]
+    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
+        use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+
+        let e = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(PartialOctetRead {
+            data: b"\x02L01".to_vec(),
+            eom_reason: EomReason::empty(),
+        });
+        assert!(is_timeout(&e));
+        assert_eq!(
+            e.partial_read().map(|p| p.data.as_slice()),
+            Some(&b"\x02L01"[..])
+        );
+    }
+
+    #[test]
+    fn is_timeout_rejects_a_real_error() {
+        assert!(!is_timeout(&protocol_error("boom")));
     }
 }
