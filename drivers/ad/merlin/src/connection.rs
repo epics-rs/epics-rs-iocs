@@ -46,12 +46,12 @@ impl From<MpxError> for ChannelError {
 
 impl From<AsynError> for ChannelError {
     fn from(e: AsynError) -> Self {
-        match &e {
-            AsynError::Status {
-                status: AsynStatus::Timeout,
-                ..
-            } => Self::Timeout,
-            _ => Self::Transport(e),
+        // `status()` reads *through* a `PartialRead` carrier, so a timeout that
+        // returned partial bytes (EOS interpose installed) is still recognized.
+        if e.status() == AsynStatus::Timeout {
+            Self::Timeout
+        } else {
+            Self::Transport(e)
         }
     }
 }
@@ -211,4 +211,36 @@ impl MpxConnection {
 /// `Labview_DEFAULT_TIMEOUT`).
 pub fn default_timeout() -> Duration {
     Duration::from_secs_f64(LABVIEW_DEFAULT_TIMEOUT_SEC)
+}
+
+#[cfg(test)]
+mod is_timeout_tests {
+    use super::*;
+    use epics_rs::asyn::interpose::{EomReason, PartialOctetRead};
+
+    /// A read that times out *after* transferring bytes arrives as
+    /// `AsynError::PartialRead` when the EOS interpose is installed (this
+    /// port's st.cmd uses `noProcessEos=0`). A bare `AsynError::Status`
+    /// match missed it and misclassified the timeout as a transport fault.
+    #[test]
+    fn a_partial_read_wrapped_timeout_maps_to_timeout() {
+        let e = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(PartialOctetRead {
+            data: b"partial".to_vec(),
+            eom_reason: EomReason::empty(),
+        });
+        assert!(matches!(ChannelError::from(e), ChannelError::Timeout));
+    }
+
+    #[test]
+    fn a_real_error_maps_to_transport() {
+        let e = AsynError::Status {
+            status: AsynStatus::Error,
+            message: "boom".into(),
+        };
+        assert!(matches!(ChannelError::from(e), ChannelError::Transport(_)));
+    }
 }
