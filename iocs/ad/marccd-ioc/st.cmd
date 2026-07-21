@@ -46,17 +46,17 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADMARCCD)/db:$(ADCORE)/db")
 
 ###
 # Create the asyn port to talk to the MAR on TCP port 2222.
-# (Requires drvAsynIPPortConfigure — see BOOT LIMITATION above.)
+# (drvAsynIPPortConfigure is registered by AdIoc as of ad-plugins-rs 0.24.3.)
 drvAsynIPPortConfigure("marServer", "gse-marccd1.cars.aps.anl.gov:2222")
 
 # marServer framing (reproduced from the C st.cmd): commands and replies are
 # both terminated with 0x0A (LF). The C boot sets these with:
 #   asynOctetSetInputEos("marServer", 0, "\n")
 #   asynOctetSetOutputEos("marServer", 0, "\n")
-# Omitted here because the published AdIoc does not register the
-# asynOctetSetInputEos / asynOctetSetOutputEos iocsh commands (BOOT
-# LIMITATION). The driver sends commands and parses replies with no embedded
-# terminator, so this EOS must be set for correct operation.
+# Left commented pending verification: as of ad-plugins-rs 0.24.3 AdIoc
+# registers the asynOctetSetInputEos / asynOctetSetOutputEos iocsh commands,
+# so these lines can be enabled. The driver sends commands and parses replies
+# with no embedded terminator, so this EOS must be set for correct operation.
 
 marCCDConfig("$(PORT)", "marServer", 0, 0)
 dbLoadRecords("marCCD.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,MARSERVER_PORT=marServer")
@@ -66,8 +66,7 @@ dbLoadRecords("marCCD.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOU
 NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
 dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
 
-# Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE),
-# see BOOT LIMITATION).
+# Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd
 
 # iocInit is called automatically by IocApplication after this script completes.
