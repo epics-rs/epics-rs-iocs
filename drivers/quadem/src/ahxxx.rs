@@ -4,11 +4,13 @@
 //!
 //! Ported models: AH401B, AH401D, AH501, AH501BE, AH501C, AH501D.
 //!
-//! One combination is refused rather than approximated: an AH501BE in
-//! external-gate trigger mode. Upstream recognises the meter's `ACK\r\n`
-//! preamble partly through a *timed-out* binary read that returned five bytes,
-//! and `asyn-rs` 0.22.1 discards a timed-out read's partial bytes. Accepting
-//! the mode would silently drop the trigger callbacks that path fires.
+//! The AH501BE in external-gate trigger mode needs the partial bytes of a
+//! *timed-out* binary read: upstream recognises the meter's `ACK\r\n`
+//! preamble either there or at the front of a completed frame
+//! (`drvAHxxx.cpp:252-283`). `asyn-rs` 0.22.1 discarded a timed-out read's
+//! partial bytes, so the port used to refuse the mode outright;
+//! `AsynError::partial_read` (asyn-rs 0.24.0+) carries them, so `read_thread`'s
+//! binary branch now detects the preamble the same way upstream does.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,14 +37,13 @@ const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// C++ `epicsThreadSleep(1.0)` after an unexpected read error.
 const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
+/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
+/// the bytes transferred before it. A bare `AsynError::Status` variant match
+/// would miss that wrapper and misclassify every partial-transfer timeout —
+/// routine on this port, since it installs the EOS interpose — as an
+/// unexpected error.
 fn is_timeout(e: &AsynError) -> bool {
-    matches!(
-        e,
-        AsynError::Status {
-            status: AsynStatus::Timeout,
-            ..
-        }
-    )
+    e.status() == AsynStatus::Timeout
 }
 
 fn error(message: impl Into<String>) -> AsynError {
@@ -322,14 +323,6 @@ impl QuadEmDevice for AhxxxDriver {
             }
             self.base_set_acquire(0)?;
             return Ok(());
-        }
-
-        // See the module docs: this combination needs the partial bytes of a
-        // timed-out read, which the framework does not surface.
-        if self.model == QeModel::Ah501be && trigger_mode == QeTriggerMode::ExtGate {
-            return Err(error(
-                "AHxxx: AH501BE in external-gate trigger mode is not supported",
-            ));
         }
 
         self.base_set_acquire(1)?;
@@ -623,6 +616,11 @@ struct ReadContext {
     params: QuadEmParams,
     shared: Arc<QuadEmShared>,
     ah401_series: Arc<AtomicBool>,
+    /// C++ `model_ == QE_ModelAH501BE`. Fixed for the port's whole life:
+    /// unlike `ah401_series`, `ahxxx_proto::model_from_firmware` has no
+    /// AH501BE branch, so a meter configured as anything else can never
+    /// become one through firmware rediscovery in `reset()`.
+    is_ah501be: bool,
 }
 
 /// C++ `drvAHxxx::readThread`.
@@ -672,9 +670,25 @@ fn read_thread(ctx: ReadContext) {
                 } else {
                     proto::ah501_read_len(resolution, num_channels, values_per_read as usize)
                 };
-                let outcome = match ctx.io.read_binary(n_requested) {
+                let ext_gate = ctx.is_ah501be
+                    && QeTriggerMode::from_i32(ctx.shared.acq.lock().trigger_mode)
+                        == QeTriggerMode::ExtGate;
+
+                let mut outcome = match ctx.io.read_binary(n_requested) {
                     Ok(o) => o,
                     Err(e) => {
+                        // C++ `readThread` (drvAHxxx.cpp:252-259): in Ext.
+                        // Gate mode the AH501BE answers its `ACK\r\n`
+                        // preamble and then goes quiet waiting for the
+                        // external gate pulse, so the binary read times out
+                        // after exactly those 5 bytes. Only
+                        // `AsynError::partial_read` still carries them.
+                        if ext_gate
+                            && let Some(partial) = e.partial_read()
+                            && proto::is_ack_preamble_only(&partial.data)
+                        {
+                            ctx.shared.trigger_callbacks();
+                        }
                         if !is_timeout(&e) {
                             log::error!("drvAHxxx: unexpected error reading meter: {e}");
                             thread::sleep(READ_ERROR_BACKOFF);
@@ -682,6 +696,7 @@ fn read_thread(ctx: ReadContext) {
                         continue;
                     }
                 };
+
                 if outcome.data.len() != n_requested || !outcome.eom.contains(EomReason::CNT) {
                     log::error!(
                         "drvAHxxx: unexpected error reading meter, nRead={} expected {n_requested}, eom={:?}",
@@ -691,6 +706,26 @@ fn read_thread(ctx: ReadContext) {
                     thread::sleep(READ_ERROR_BACKOFF);
                     continue;
                 }
+
+                // C++ `readThread` (drvAHxxx.cpp:265-283): a full, correctly
+                // terminated read can still start with the ACK preamble if
+                // the gate fired between the ACK and the rest of the frame
+                // arriving. Trigger, then shift the preamble out and top the
+                // buffer back up to `n_requested`. `accumulate_binary_*`
+                // below already rejects a too-short buffer, so a failed or
+                // short refill is caught there rather than re-checked here.
+                if ext_gate && proto::starts_with_ack_preamble(&outcome.data) {
+                    ctx.shared.trigger_callbacks();
+                    let preamble_len = proto::ACK_PREAMBLE.len();
+                    outcome.data.drain(0..preamble_len);
+                    match ctx.io.read_binary(preamble_len) {
+                        Ok(extra) => outcome.data.extend_from_slice(&extra.data),
+                        Err(e) => log::error!(
+                            "drvAHxxx: unexpected error reading additional {preamble_len} bytes from meter: {e}"
+                        ),
+                    }
+                }
+
                 let decoded = if ah401_series {
                     proto::accumulate_binary_ah401(&outcome.data, values_per_read as usize)
                 } else {
@@ -820,6 +855,7 @@ pub fn create_ahxxx(
         params,
         shared: shared.clone(),
         ah401_series,
+        is_ah501be: model == QeModel::Ah501be,
     };
     let read_thread_handle = thread::Builder::new()
         .name("drvAHxxxTask".into())
@@ -845,4 +881,35 @@ pub fn create_ahxxx(
         _read_thread: read_thread_handle,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::interpose::PartialOctetRead;
+
+    /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
+    /// read's transferred bytes (see the module docs); a bare
+    /// `AsynError::Status` match would miss it entirely.
+    #[test]
+    fn is_timeout_recognizes_a_partial_read_wrapped_timeout() {
+        let e = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "read timeout".into(),
+        }
+        .with_partial_read(PartialOctetRead {
+            data: proto::ACK_PREAMBLE.to_vec(),
+            eom_reason: EomReason::empty(),
+        });
+        assert!(is_timeout(&e));
+        assert_eq!(
+            e.partial_read().map(|p| p.data.as_slice()),
+            Some(proto::ACK_PREAMBLE)
+        );
+    }
+
+    #[test]
+    fn is_timeout_rejects_a_real_error() {
+        assert!(!is_timeout(&error("boom")));
+    }
 }

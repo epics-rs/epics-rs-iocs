@@ -13,7 +13,6 @@ epicsEnvSet("RECORD",    "AH501:")
 epicsEnvSet("PORT",      "AH501")
 epicsEnvSet("TEMPLATE",  "AH501")
 #epicsEnvSet("MODEL",     "AH501D")
-# AH501BE rejects TriggerMode=ExtGate at Acquire=1; every other mode works.
 epicsEnvSet("MODEL",     "AH501BE")
 epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "1000")
