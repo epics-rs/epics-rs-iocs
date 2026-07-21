@@ -787,7 +787,11 @@ impl ParamOps {
     pub fn fetch_all(&self) -> (Vec<ParamUpdate>, usize) {
         let mut updates = Vec::new();
         let mut failures = 0;
-        for idx in self.reg.lock().indices() {
+        // The guard has to be dropped before the loop body runs: a `for` holds
+        // the temporaries of its iterator expression for the whole loop, and
+        // `fetch` locks the same (non-reentrant) mutex on its first call.
+        let indices = self.reg.lock().indices();
+        for idx in indices {
             match self.fetch(idx) {
                 Ok(mut u) => updates.append(&mut u),
                 Err(e) => {
@@ -807,6 +811,26 @@ mod tests {
     fn meta_of(body: &str, sys: Sys) -> Meta {
         let v: Value = serde_json::from_str(body).unwrap();
         parse_meta(&v, sys, false, &Meta::default()).unwrap()
+    }
+
+    /// `fetch_all` used to hold the registry lock across the loop body, and
+    /// `fetch` locks the same non-reentrant mutex — the first iteration hung.
+    /// The port it belongs to never came up, whatever the detector answered.
+    #[test]
+    fn fetch_all_does_not_deadlock_on_the_registry() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut reg = ParamRegistry::new();
+        reg.add(0, "STATE", AsynType::Octet, Sys::DetStatus, "state");
+        let ops = ParamOps::new(RestApi::new("127.0.0.1", port), reg);
+
+        // Every request fails against a closed port, which is the point: the
+        // call has to *return*.
+        let (updates, failures) = ops.fetch_all();
+        assert!(updates.is_empty());
+        assert_eq!(failures, 1);
     }
 
     #[test]
