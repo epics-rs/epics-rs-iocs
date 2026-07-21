@@ -225,9 +225,14 @@ pub struct RestApi {
 }
 
 impl RestApi {
-    /// Connect and negotiate the API version, as the C constructor does before
-    /// any other request (restApi.cpp:256-289).
-    pub fn new(hostname: &str, port: u16) -> RestResult<Self> {
+    /// Build the client. Does no I/O — the API version starts at the 1.6.0
+    /// bootstrap value, which is the only one whose paths are version-free, and
+    /// [`RestApi::negotiate_api_version`] replaces it with the detector's own.
+    ///
+    /// Construction and the first request are separate because the caller has
+    /// to be able to keep going when the detector does not answer; C fuses them
+    /// in the `RestAPI` constructor (restApi.cpp:256-289), which throws.
+    pub fn new(hostname: &str, port: u16) -> Self {
         let agent = ureq::Agent::config_builder()
             // We inspect status codes ourselves: `wait_file` treats 404 as
             // "not there yet", not as a transport failure.
@@ -235,17 +240,21 @@ impl RestApi {
             .timeout_global(Some(DEFAULT_TIMEOUT))
             .build()
             .new_agent();
-        let origin = format!("http://{hostname}:{port}");
-
-        // Bootstrap with 1.6.0 paths: only /detector/api/version is version-free.
-        let probe = Self {
+        Self {
             agent,
-            origin,
+            origin: format!("http://{hostname}:{port}"),
             api: ApiVersion::V1_6_0,
-        };
-        let body = probe.get(Sys::ApiVersion, "", Duration::from_secs(10))?;
-        let api = parse_api_version(&body)?;
-        Ok(Self { api, ..probe })
+        }
+    }
+
+    /// Ask the detector which SIMPLON API it speaks, which decides every other
+    /// path (C's `RestAPI` constructor, restApi.cpp:258-274).
+    ///
+    /// On failure the version is left at the 1.6.0 bootstrap value.
+    pub fn negotiate_api_version(&mut self) -> RestResult<()> {
+        let body = self.get(Sys::ApiVersion, "", Duration::from_secs(10))?;
+        self.api = parse_api_version(&body)?;
+        Ok(())
     }
 
     pub fn api_version(&self) -> ApiVersion {

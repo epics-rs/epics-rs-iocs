@@ -67,6 +67,25 @@ impl EigerDriver {
     /// Fetch every parameter and apply the driver's fixed defaults
     /// (C `eigerDetector::initParams`, eigerDetector.cpp:1621).
     fn init_params(&mut self) -> AsynResult<()> {
+        self.set_driver_version()?;
+
+        // C tests the detector with a single fetch of `state` before it touches
+        // anything else, and abandons the rest of the constructor when that
+        // fails (eigerDetector.cpp:229-235) — the port still exists, so the IOC
+        // boots with the detector reported disconnected. This is the one gate
+        // that keeps that true here: everything below it is allowed to use `?`
+        // precisely because the detector has already answered once.
+        if let Err(e) = self.fetch(self.p.state) {
+            log::error!("eiger: cannot fetch the detector state, it may be disconnected: {e}");
+            self.status_message("Eiger FAILED TO CONNECT")?;
+            self.ad.port_base.set_int32_param(
+                self.ad.params.status,
+                0,
+                ADStatus::Disconnected as i32,
+            )?;
+            return self.ad.port_base.call_param_callbacks(0);
+        }
+
         let (updates, failures) = self.ops.fetch_all();
         if failures > 0 {
             log::warn!("eiger: {failures} parameter(s) failed to fetch at startup");
@@ -105,11 +124,6 @@ impl EigerDriver {
         };
         base.set_string_param(self.ad.params.base.manufacturer, 0, manufacturer)?;
         base.set_string_param(self.ad.params.base.model, 0, model)?;
-        base.set_string_param(
-            self.ad.params.base.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
 
         base.set_int32_param(self.ad.params.base.array_size, 0, 0)?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Multiple as i32)?;
@@ -191,6 +205,17 @@ impl EigerDriver {
     fn fetch(&mut self, index: usize) -> AsynResult<()> {
         let updates = self.ops.fetch(index).map_err(rest_err)?;
         self.apply(updates)
+    }
+
+    /// C sets `NDDriverVersion` before it first talks to the detector
+    /// (eigerDetector.cpp:214), so it is filled in even on a port that never
+    /// reaches the rest of the constructor.
+    fn set_driver_version(&mut self) -> AsynResult<()> {
+        self.ad.port_base.set_string_param(
+            self.ad.params.base.driver_version,
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+        )
     }
 
     fn status_message(&mut self, msg: &str) -> AsynResult<()> {
