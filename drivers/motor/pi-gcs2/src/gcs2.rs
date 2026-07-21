@@ -411,10 +411,10 @@ impl PIGCS2Controller {
         }
         match self.query(&format!("HAR? {axis}")) {
             Ok(reply) => get_value_bool(&reply),
-            Err(AsynError::Status {
-                status: AsynStatus::Timeout,
-                ..
-            }) => {
+            // `status()` reads *through* a `PartialRead` carrier, so a timeout
+            // that returned partial bytes (EOS interpose installed) is still
+            // recognized as "no limit switches" rather than a hard fault.
+            Err(e) if e.status() == AsynStatus::Timeout => {
                 let err = self.get_gcs_error()?;
                 if err == PI_CNTR_UNKNOWN_COMMAND {
                     Ok(false)
