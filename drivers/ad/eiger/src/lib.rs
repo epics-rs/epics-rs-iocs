@@ -90,34 +90,28 @@ pub fn create_eiger_detector_on_port(
     // catch, and the IOC dies on an uncaught exception — where the very next
     // thing C's own constructor does (the `state` fetch below) is careful to
     // log and carry on.
-    let reachable = match rest.negotiate_api_version() {
-        Ok(()) => true,
-        Err(e) => {
-            log::error!(
-                "eiger: cannot read the SIMPLON API version from {hostname}: {e}; the port is \
-                 created with the detector disconnected"
-            );
-            false
-        }
-    };
+    if let Err(e) = rest.negotiate_api_version() {
+        log::error!(
+            "eiger: cannot read the SIMPLON API version from {hostname}: {e}; the port is created \
+             with the detector disconnected"
+        );
+    }
     let api = rest.api_version();
 
     // The model decides which parameters exist, so it has to be known before any
     // of them are created. C interleaves the two by fetching `description`
     // through a parameter it has just created; here the fetch is a plain GET.
     //
-    // These three GETs are skipped once the detector is known to be unreachable:
-    // each would otherwise sit out the full 20 s request timeout for a value
-    // that is already known to be unobtainable.
-    let description = if reachable {
-        rest.get_value(rest::Sys::DetConfig, "description")
-            .unwrap_or_else(|e| {
-                log::warn!("eiger: cannot read the detector description: {e}");
-                String::new()
-            })
-    } else {
-        String::new()
-    };
+    // The version negotiation above is the probe: a detector that did not answer
+    // it is marked disconnected, so this GET — and every other request the
+    // constructor makes — fails at the client's gate instead of sitting out the
+    // full 20 s timeout. Nothing here needs to know that; the gate is uniform.
+    let description = rest
+        .get_value(rest::Sys::DetConfig, "description")
+        .unwrap_or_else(|e| {
+            log::warn!("eiger: cannot read the detector description: {e}");
+            String::new()
+        });
     let model = Model::from_description(&description);
     log::info!("eiger: {hostname} is a {model:?} on SIMPLON API {api:?}");
 
@@ -126,9 +120,6 @@ pub fn create_eiger_detector_on_port(
     // The sensor size is only known once the parameters have been fetched, so
     // the pool starts from the detector's own x/y_pixels_in_detector.
     let sensor_size = |param: &str| {
-        if !reachable {
-            return 0;
-        }
         rest.get_value(rest::Sys::DetConfig, param)
             .ok()
             .and_then(|v| v.parse::<i32>().ok())

@@ -96,6 +96,27 @@ impl EigerDriver {
         Ok(driver)
     }
 
+    /// Probe a detector that is marked disconnected and, if it answers, re-read
+    /// everything the constructor reads.
+    ///
+    /// The only way back to connected. C has none: a detector that was off when
+    /// the IOC booted keeps its parameters at whatever `initParams` left them
+    /// (eigerDetector.cpp:229-235) until the IOC restarts.
+    pub fn reconnect(&mut self) -> AsynResult<()> {
+        let api = self.ops.rest.probe().map_err(rest_err)?;
+        if api != self.api {
+            // The parameter set was built for the API this port was created
+            // with, so it cannot follow the detector to another one.
+            log::warn!(
+                "eiger: the detector speaks SIMPLON {api:?} but this port was created for {:?}; \
+                 restart the IOC to pick up the right parameter set",
+                self.api
+            );
+        }
+        log::warn!("eiger: the detector answered again; re-reading it");
+        self.init_params()
+    }
+
     /// Fetch every parameter and apply the driver's fixed defaults
     /// (C `eigerDetector::initParams`, eigerDetector.cpp:1621).
     fn init_params(&mut self) -> AsynResult<()> {
@@ -114,7 +135,13 @@ impl EigerDriver {
 
         match q.failure_summary() {
             Some(failed) => self.boot_disconnected(&failed),
-            None => self.ad.port_base.call_param_callbacks(0),
+            None => {
+                // Cleared here because this runs again on every reconnect: a
+                // detector that came back must not leave the operator reading
+                // "FAILED TO CONNECT" off a working port.
+                self.status_message("")?;
+                self.ad.port_base.call_param_callbacks(0)
+            }
         }
     }
 
@@ -442,6 +469,14 @@ impl PortDriver for EigerDriver {
 
         if reason == acquire {
             if value != 0 && ad_status != ADStatus::Acquire as i32 {
+                // Starting an acquisition is the one moment worth spending a
+                // real request on a detector that is not answering: the
+                // operator asked for data, and every parameter the acquisition
+                // needs was left at its default by the constructor that could
+                // not read them.
+                if !self.ops.rest.is_connected() {
+                    self.reconnect()?;
+                }
                 self.ad.port_base.set_int32_param(
                     self.ad.params.status,
                     0,
