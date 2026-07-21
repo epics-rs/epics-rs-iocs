@@ -5,6 +5,7 @@
 //! as in C, and the output EOS the detector needs is set there with
 //! `asynOctetSetOutputEos` — the driver sends the bare command text.
 
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -108,8 +109,19 @@ impl Transport {
     }
 
     /// A readout command, whose reply is `expect` bytes of binary data.
-    pub fn readout(&self, command: &str, expect: usize, timeout: Duration) -> AsynResult<Vec<u8>> {
-        self.write_read(command.as_bytes(), expect, timeout)
+    ///
+    /// The only length on this port that is computed rather than a protocol
+    /// constant, so it is the only one that can come out zero — and
+    /// [`Transport::write_read`] writes before it reads, so a zero would leave
+    /// the detector's reply in the socket for the next command to misread.
+    /// [`NonZeroUsize`] is what makes that unrepresentable.
+    pub fn readout(
+        &self,
+        command: &str,
+        expect: NonZeroUsize,
+        timeout: Duration,
+    ) -> AsynResult<Vec<u8>> {
+        self.write_read(command.as_bytes(), expect.get(), timeout)
     }
 }
 

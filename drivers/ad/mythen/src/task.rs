@@ -71,8 +71,20 @@ async fn acquire(s: &Arc<Shared>) {
     let det = &s.det;
     let read_mode = det.state.read_mode.load(Ordering::Acquire);
     let nbits = det.state.nbits.load(Ordering::Acquire);
-    let nmodules = det.nmodules();
-    let expect = det.readout_len();
+    // Without a module count there is no readout length, and a readout with no
+    // length would send the command and read none of the reply — the frame
+    // would sit in the socket and be picked up as the answer to the next
+    // command, for the life of the process. Refuse instead.
+    let (Some(nmodules), Some(expect)) = (det.nmodules(), det.readout_len()) else {
+        log::error!(
+            "mythen: cannot read out: the module count is unknown — `-get nmodules` has not \
+             answered since the IOC started"
+        );
+        det.state.acquiring.store(false, Ordering::Release);
+        s.set_int(s.ad.status, ADStatus::Disconnected as i32).await;
+        s.set_int(s.ad.acquire, 0).await;
+        return;
+    };
     let acquire_time = s.get_f64(s.ad.acquire_time).await;
     let timeout = M1K_TIMEOUT + Duration::from_secs_f64(acquire_time.max(0.0));
     let command = if read_mode == READ_MODE_RAW {
@@ -96,7 +108,7 @@ async fn acquire(s: &Arc<Shared>) {
     // status go back to Idle and ends the loop (C, mythen.cpp:883-921).
     while status != ADStatus::Error {
         match det.readout(expect, timeout) {
-            Ok(reply) if reply.len() == expect => {
+            Ok(reply) if reply.len() == expect.get() => {
                 if !publish(s, &reply, nmodules, decode_nbits).await {
                     status = read_status(s).await;
                 }

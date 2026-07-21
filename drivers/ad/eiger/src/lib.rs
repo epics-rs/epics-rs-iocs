@@ -64,13 +64,48 @@ pub fn create_eiger_detector(
     hostname: &str,
     max_memory: usize,
 ) -> AsynResult<EigerRuntime> {
-    let rest = RestApi::new(hostname, REST_PORT)
-        .map_err(|e| driver::asyn_err(format!("eiger: cannot reach {hostname}: {e}")))?;
+    create_eiger_detector_on_port(port_name, hostname, REST_PORT, max_memory)
+}
+
+/// [`create_eiger_detector`] against a REST port other than 80.
+///
+/// C hard-codes the port in the constructor's initialiser list
+/// (`mApi(serverHostname, 80)`); this seam exists so a test can aim the driver
+/// at a socket it controls.
+pub fn create_eiger_detector_on_port(
+    port_name: &str,
+    hostname: &str,
+    rest_port: u16,
+    max_memory: usize,
+) -> AsynResult<EigerRuntime> {
+    let mut rest = RestApi::new(hostname, rest_port);
+
+    // A detector that does not answer must not stop the IOC from booting, so
+    // the version negotiation only logs and leaves the 1.6.0 bootstrap paths in
+    // place — every later request against a dead detector fails anyway, and the
+    // port comes up reporting itself disconnected.
+    //
+    // UPSTREAM DEFECT (restApi.cpp:262-274 + eigerDetector.cpp:2137): C throws
+    // out of the `RestAPI` constructor here, `eigerDetectorConfig` does not
+    // catch, and the IOC dies on an uncaught exception — where the very next
+    // thing C's own constructor does (the `state` fetch below) is careful to
+    // log and carry on.
+    if let Err(e) = rest.negotiate_api_version() {
+        log::error!(
+            "eiger: cannot read the SIMPLON API version from {hostname}: {e}; the port is created \
+             with the detector disconnected"
+        );
+    }
     let api = rest.api_version();
 
     // The model decides which parameters exist, so it has to be known before any
     // of them are created. C interleaves the two by fetching `description`
     // through a parameter it has just created; here the fetch is a plain GET.
+    //
+    // The version negotiation above is the probe: a detector that did not answer
+    // it is marked disconnected, so this GET — and every other request the
+    // constructor makes — fails at the client's gate instead of sitting out the
+    // full 20 s timeout. Nothing here needs to know that; the gate is uniform.
     let description = rest
         .get_value(rest::Sys::DetConfig, "description")
         .unwrap_or_else(|e| {
@@ -84,16 +119,14 @@ pub fn create_eiger_detector(
 
     // The sensor size is only known once the parameters have been fetched, so
     // the pool starts from the detector's own x/y_pixels_in_detector.
-    let max_size_x = rest
-        .get_value(rest::Sys::DetConfig, "x_pixels_in_detector")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(0);
-    let max_size_y = rest
-        .get_value(rest::Sys::DetConfig, "y_pixels_in_detector")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(0);
+    let sensor_size = |param: &str| {
+        rest.get_value(rest::Sys::DetConfig, param)
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0)
+    };
+    let max_size_x = sensor_size("x_pixels_in_detector");
+    let max_size_y = sensor_size("y_pixels_in_detector");
 
     let cfg = driver::EigerConfig {
         port_name: port_name.to_string(),

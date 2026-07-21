@@ -7,6 +7,8 @@
 //! name patterns, sequence-id extraction) is factored into pure functions so it
 //! can be tested without a detector.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -17,6 +19,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const TIMEOUT_INIT: Duration = Duration::from_secs(240);
 /// Timeout for `arm` (C `DEFAULT_TIMEOUT_ARM`).
 pub const TIMEOUT_ARM: Duration = Duration::from_secs(120);
+/// Timeout for the one request that decides whether the detector is there.
+pub const TIMEOUT_PROBE: Duration = Duration::from_secs(10);
 
 const DATA_NATIVE: &str = "application/json; charset=utf-8";
 const DATA_TIFF: &str = "application/tiff";
@@ -196,6 +200,8 @@ pub enum RestError {
         code: u16,
     },
     Parse(String),
+    /// The request was never made: the detector is marked disconnected.
+    Disconnected(String),
 }
 
 impl std::fmt::Display for RestError {
@@ -204,6 +210,11 @@ impl std::fmt::Display for RestError {
             Self::Transport(m) => write!(f, "transport: {m}"),
             Self::Status { path, code } => write!(f, "[{path}] server returned error code {code}"),
             Self::Parse(m) => write!(f, "parse: {m}"),
+            Self::Disconnected(path) => write!(
+                f,
+                "[{path}] not sent: the detector is disconnected — write ADAcquire to probe it \
+                 again"
+            ),
         }
     }
 }
@@ -222,12 +233,24 @@ pub struct RestApi {
     agent: ureq::Agent,
     origin: String,
     api: ApiVersion,
+    /// Whether the detector is answering.
+    ///
+    /// Shared by every clone, so the driver, the control task, the monitor and
+    /// the file tasks all see the same state. Written in exactly one place,
+    /// [`RestApi::exchange`]: the outcome of a real request is the only thing
+    /// that may change it.
+    connected: Arc<AtomicBool>,
 }
 
 impl RestApi {
-    /// Connect and negotiate the API version, as the C constructor does before
-    /// any other request (restApi.cpp:256-289).
-    pub fn new(hostname: &str, port: u16) -> RestResult<Self> {
+    /// Build the client. Does no I/O — the API version starts at the 1.6.0
+    /// bootstrap value, which is the only one whose paths are version-free, and
+    /// [`RestApi::negotiate_api_version`] replaces it with the detector's own.
+    ///
+    /// Construction and the first request are separate because the caller has
+    /// to be able to keep going when the detector does not answer; C fuses them
+    /// in the `RestAPI` constructor (restApi.cpp:256-289), which throws.
+    pub fn new(hostname: &str, port: u16) -> Self {
         let agent = ureq::Agent::config_builder()
             // We inspect status codes ourselves: `wait_file` treats 404 as
             // "not there yet", not as a transport failure.
@@ -235,17 +258,79 @@ impl RestApi {
             .timeout_global(Some(DEFAULT_TIMEOUT))
             .build()
             .new_agent();
-        let origin = format!("http://{hostname}:{port}");
-
-        // Bootstrap with 1.6.0 paths: only /detector/api/version is version-free.
-        let probe = Self {
+        Self {
             agent,
-            origin,
+            origin: format!("http://{hostname}:{port}"),
             api: ApiVersion::V1_6_0,
-        };
-        let body = probe.get(Sys::ApiVersion, "", Duration::from_secs(10))?;
-        let api = parse_api_version(&body)?;
-        Ok(Self { api, ..probe })
+            // Optimistic: the first request is what finds out.
+            connected: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Whether the detector is currently believed to be answering.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// The gate every request passes through.
+    ///
+    /// INVARIANT: while the detector is marked disconnected nothing goes to the
+    /// network. Each request would otherwise sit out its full timeout — 20 s for
+    /// most of them — and the driver issues one per parameter: the ~80 records
+    /// that process at `iocInit`, plus a fetch for every `EIG_*` parameter
+    /// `drv_user_create` builds, cost minutes between them.
+    fn guarded<T>(&self, what: &str, call: impl FnOnce() -> RestResult<T>) -> RestResult<T> {
+        if !self.is_connected() {
+            return Err(RestError::Disconnected(what.to_string()));
+        }
+        self.exchange(what, call)
+    }
+
+    /// Run one request and let its outcome own the connection state.
+    ///
+    /// The only writer of `connected`. Only a transport failure means the
+    /// detector is not there: an error status code or a body the driver cannot
+    /// parse both came *from* the detector, which is therefore answering.
+    fn exchange<T>(&self, what: &str, call: impl FnOnce() -> RestResult<T>) -> RestResult<T> {
+        let result = call();
+        match &result {
+            Ok(_) | Err(RestError::Status { .. }) | Err(RestError::Parse(_)) => {
+                if !self.connected.swap(true, Ordering::AcqRel) {
+                    log::warn!("eiger: [{what}] answered; the detector is connected again");
+                }
+            }
+            Err(e @ RestError::Transport(_)) => {
+                if self.connected.swap(false, Ordering::AcqRel) {
+                    log::error!(
+                        "eiger: [{what}] did not answer ({e}); the detector is marked \
+                         disconnected and no further request will be made until an acquisition \
+                         probes it"
+                    );
+                }
+            }
+            // Never produced by a real request: `guarded` returns it instead of
+            // calling one.
+            Err(RestError::Disconnected(_)) => {}
+        }
+        result
+    }
+
+    /// The one request allowed past the gate: it asks which SIMPLON API the
+    /// detector speaks, and by answering at all it proves the detector is there
+    /// (C's `RestAPI` constructor, restApi.cpp:258-274).
+    pub fn probe(&self) -> RestResult<ApiVersion> {
+        let url = self.url(Sys::ApiVersion, "");
+        let body = self.exchange(&url, || self.raw_get(&url, DATA_NATIVE, TIMEOUT_PROBE))?;
+        parse_api_version(&body)
+    }
+
+    /// Ask the detector which API it speaks and adopt it, which decides every
+    /// other path.
+    ///
+    /// On failure the version is left at the 1.6.0 bootstrap value.
+    pub fn negotiate_api_version(&mut self) -> RestResult<()> {
+        self.api = self.probe()?;
+        Ok(())
     }
 
     pub fn api_version(&self) -> ApiVersion {
@@ -274,10 +359,16 @@ impl RestApi {
     /// GET a parameter, returning the raw JSON body (C `RestAPI::get`).
     pub fn get(&self, sys: Sys, param: &str, timeout: Duration) -> RestResult<String> {
         let url = self.url(sys, param);
+        self.guarded(&url, || self.raw_get(&url, DATA_NATIVE, timeout))
+    }
+
+    /// The GET itself, with no gate around it — [`RestApi::probe`] is the only
+    /// caller that is allowed to reach the network unconditionally.
+    fn raw_get(&self, url: &str, accept: &str, timeout: Duration) -> RestResult<String> {
         let mut resp = self
             .agent
-            .get(&url)
-            .header("Accept", DATA_NATIVE)
+            .get(url)
+            .header("Accept", accept)
             .config()
             .timeout_global(Some(timeout))
             .build()
@@ -285,7 +376,10 @@ impl RestApi {
             .map_err(|e| RestError::Transport(format!("GET {url}: {e}")))?;
         let code = resp.status().as_u16();
         if code != 200 {
-            return Err(RestError::Status { path: url, code });
+            return Err(RestError::Status {
+                path: url.to_string(),
+                code,
+            });
         }
         resp.body_mut()
             .read_to_string()
@@ -310,23 +404,28 @@ impl RestApi {
         } else {
             put_body(raw_value)
         };
-        let mut resp = self
-            .agent
-            .put(&url)
-            .header("Content-Type", DATA_NATIVE)
-            .header("Accept-Encoding", "identity")
-            .config()
-            .timeout_global(Some(timeout))
-            .build()
-            .send(&body)
-            .map_err(|e| RestError::Transport(format!("PUT {url}: {e}")))?;
-        let code = resp.status().as_u16();
-        if code != 200 {
-            return Err(RestError::Status { path: url, code });
-        }
-        resp.body_mut()
-            .read_to_string()
-            .map_err(|e| RestError::Transport(format!("PUT {url}: reading body: {e}")))
+        self.guarded(&url, || {
+            let mut resp = self
+                .agent
+                .put(&url)
+                .header("Content-Type", DATA_NATIVE)
+                .header("Accept-Encoding", "identity")
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
+                .send(&body)
+                .map_err(|e| RestError::Transport(format!("PUT {url}: {e}")))?;
+            let code = resp.status().as_u16();
+            if code != 200 {
+                return Err(RestError::Status {
+                    path: url.clone(),
+                    code,
+                });
+            }
+            resp.body_mut()
+                .read_to_string()
+                .map_err(|e| RestError::Transport(format!("PUT {url}: reading body: {e}")))
+        })
     }
 
     // ---- Commands (C RestAPI::restart .. statusUpdate) ----
@@ -402,21 +501,28 @@ impl RestApi {
     pub fn wait_file(&self, filename: &str, timeout: Duration) -> RestResult<bool> {
         let url = self.url(Sys::Data, filename);
         let start = std::time::Instant::now();
-        loop {
-            let resp = self
-                .agent
-                .head(&url)
-                .call()
-                .map_err(|e| RestError::Transport(format!("HEAD {url}: {e}")))?;
-            match resp.status().as_u16() {
-                200 => return Ok(true),
-                404 => {}
-                code => return Err(RestError::Status { path: url, code }),
+        self.guarded(&url, || {
+            loop {
+                let resp = self
+                    .agent
+                    .head(&url)
+                    .call()
+                    .map_err(|e| RestError::Transport(format!("HEAD {url}: {e}")))?;
+                match resp.status().as_u16() {
+                    200 => return Ok(true),
+                    404 => {}
+                    code => {
+                        return Err(RestError::Status {
+                            path: url.clone(),
+                            code,
+                        });
+                    }
+                }
+                if start.elapsed() >= timeout {
+                    return Ok(false);
+                }
             }
-            if start.elapsed() >= timeout {
-                return Ok(false);
-            }
-        }
+        })
     }
 
     /// Download a data file (C `RestAPI::getFile`).
@@ -427,16 +533,21 @@ impl RestApi {
     /// Delete a data file (C `RestAPI::deleteFile`). The detector answers 204.
     pub fn delete_file(&self, filename: &str) -> RestResult<()> {
         let url = self.url(Sys::Data, filename);
-        let resp = self
-            .agent
-            .delete(&url)
-            .call()
-            .map_err(|e| RestError::Transport(format!("DELETE {url}: {e}")))?;
-        let code = resp.status().as_u16();
-        if code != 204 {
-            return Err(RestError::Status { path: url, code });
-        }
-        Ok(())
+        self.guarded(&url, || {
+            let resp = self
+                .agent
+                .delete(&url)
+                .call()
+                .map_err(|e| RestError::Transport(format!("DELETE {url}: {e}")))?;
+            let code = resp.status().as_u16();
+            if code != 204 {
+                return Err(RestError::Status {
+                    path: url.clone(),
+                    code,
+                });
+            }
+            Ok(())
+        })
     }
 
     /// Fetch the newest monitor image as a TIFF blob
@@ -455,23 +566,29 @@ impl RestApi {
     /// GET a binary body (C `RestAPI::getBlob`).
     fn get_blob(&self, sys: Sys, name: &str, accept: &str) -> RestResult<Vec<u8>> {
         let url = self.url(sys, name);
-        let mut resp = self
-            .agent
-            .get(&url)
-            .header("Accept", accept)
-            .call()
-            .map_err(|e| RestError::Transport(format!("GET {url}: {e}")))?;
-        let code = resp.status().as_u16();
-        if code != 200 {
-            return Err(RestError::Status { path: url, code });
-        }
-        resp.body_mut()
-            // The detector sends Content-Length; ureq's default read limit is
-            // smaller than a data file, so raise it to the pool's ceiling.
-            .with_config()
-            .limit(u64::MAX)
-            .read_to_vec()
-            .map_err(|e| RestError::Transport(format!("GET {url}: reading body: {e}")))
+        self.guarded(&url, || {
+            let mut resp = self
+                .agent
+                .get(&url)
+                .header("Accept", accept)
+                .call()
+                .map_err(|e| RestError::Transport(format!("GET {url}: {e}")))?;
+            let code = resp.status().as_u16();
+            if code != 200 {
+                return Err(RestError::Status {
+                    path: url.clone(),
+                    code,
+                });
+            }
+            resp.body_mut()
+                // The detector sends Content-Length; ureq's default read limit
+                // is smaller than a data file, so raise it to the pool's
+                // ceiling.
+                .with_config()
+                .limit(u64::MAX)
+                .read_to_vec()
+                .map_err(|e| RestError::Transport(format!("GET {url}: reading body: {e}")))
+        })
     }
 }
 

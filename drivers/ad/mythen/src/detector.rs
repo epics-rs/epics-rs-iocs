@@ -5,11 +5,12 @@
 //! atomic against the acquisition task's readout, which C gets for free from
 //! asyn's per-port request queue.
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use parking_lot::Mutex;
 
 use crate::protocol::{self, READ_MODE_RAW};
@@ -55,6 +56,11 @@ pub struct Settings {
 
 pub struct Detector {
     transport: Mutex<Transport>,
+    /// Whether the detector is answering.
+    ///
+    /// Owned here and written in exactly one place, [`Detector::exchange`]: the
+    /// outcome of a real command is the only thing that may change it.
+    connected: AtomicBool,
     pub state: DetState,
 }
 
@@ -62,12 +68,95 @@ impl Detector {
     pub fn new(transport: Transport) -> Self {
         Self {
             transport: Mutex::new(transport),
+            // Optimistic: the first command is what finds out.
+            connected: AtomicBool::new(true),
             state: DetState::default(),
         }
     }
 
-    pub fn nmodules(&self) -> usize {
-        self.state.nmodules.load(Ordering::Acquire).max(0) as usize
+    /// Whether the detector is currently believed to be answering.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Acquire)
+    }
+
+    /// The gate every detector command passes through.
+    ///
+    /// INVARIANT: while the detector is marked disconnected no command reaches
+    /// the socket. Each one would otherwise sit out the full 5 s
+    /// [`M1K_TIMEOUT`](crate::transport::M1K_TIMEOUT), and they are serialized
+    /// through the port's single request queue — the 37 records that process at
+    /// `iocInit` cost minutes between them instead of nothing at all.
+    ///
+    /// The caller gets [`AsynStatus::Disconnected`] instead, which is the
+    /// record layer's own word for it.
+    fn io<T>(
+        &self,
+        what: &str,
+        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
+    ) -> AsynResult<T> {
+        if !self.is_connected() {
+            return Err(disconnected(what));
+        }
+        self.exchange(what, exchange)
+    }
+
+    /// Run one command and let its outcome own the connection state.
+    ///
+    /// The only writer of `connected`, and the only path to the socket. Every
+    /// error inside here is the detector failing to answer in full — a timeout
+    /// with nothing in hand, or a reply too short to decode — so every one of
+    /// them means disconnected. Replies the detector *did* send and the driver
+    /// rejects (`-get tau` out of range, a negative module count) are checked by
+    /// the callers, above this line, and leave the state alone.
+    fn exchange<T>(
+        &self,
+        what: &str,
+        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
+    ) -> AsynResult<T> {
+        let result = exchange(&self.transport.lock());
+        match &result {
+            Ok(_) => {
+                if !self.connected.swap(true, Ordering::AcqRel) {
+                    log::warn!("mythen: [{what}] answered; the detector is connected again");
+                }
+            }
+            Err(e) => {
+                if self.connected.swap(false, Ordering::AcqRel) {
+                    log::error!(
+                        "mythen: [{what}] got no answer ({e}); the detector is marked \
+                         disconnected and no further command will be sent until an acquisition \
+                         probes it"
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// The one command allowed past the gate: the probe that can bring the
+    /// detector back.
+    ///
+    /// C has no such path — a detector that was off when the IOC booted stays
+    /// unusable until the IOC is restarted, because C's constructor is the only
+    /// place that reads the module count (mythen.cpp:1363).
+    pub fn probe(&self) -> AsynResult<String> {
+        let version = self.exchange("-get version", Transport::get_version)?;
+        self.store_firmware(&version);
+        Ok(version)
+    }
+
+    /// How many modules the detector reported, or `None` while that is not
+    /// known — `-get nmodules` has not answered yet, or answered nonsense.
+    ///
+    /// Deliberately not a count of zero. Every readout length is derived from
+    /// this, and a zero-length readout is a command sent whose reply nobody
+    /// reads: the bytes stay in the socket and desynchronise every command
+    /// after it. `None` is what stops that being expressible.
+    pub fn nmodules(&self) -> Option<usize> {
+        match self.state.nmodules.load(Ordering::Acquire) {
+            n if n > 0 => Some(n as usize),
+            _ => None,
+        }
     }
 
     pub fn firmware_major(&self) -> u32 {
@@ -76,25 +165,29 @@ impl Detector {
 
     /// Send a command and check the status integer it replies with.
     pub fn send(&self, command: &str) -> AsynResult<()> {
-        self.transport.lock().send_command(command)?;
+        self.io(command, |t| t.send_command(command))?;
         Ok(())
     }
 
     fn get_int(&self, command: &str) -> AsynResult<i32> {
-        self.transport.lock().get_int(command)
+        self.io(command, |t| t.get_int(command))
     }
 
     fn get_float(&self, command: &str) -> AsynResult<f32> {
-        self.transport.lock().get_float(command)
+        self.io(command, |t| t.get_float(command))
     }
 
     /// C `getFirmware`, mythen.cpp:497.
     pub fn get_firmware(&self) -> AsynResult<String> {
-        let version = self.transport.lock().get_version()?;
+        let version = self.io("-get version", Transport::get_version)?;
+        self.store_firmware(&version);
+        Ok(version)
+    }
+
+    fn store_firmware(&self, version: &str) {
         self.state
             .firmware_major
-            .store(protocol::firmware_major(&version), Ordering::Release);
-        Ok(version)
+            .store(protocol::firmware_major(version), Ordering::Release);
     }
 
     /// C `-get nmodules` in the constructor, mythen.cpp:1363.
@@ -150,7 +243,7 @@ impl Detector {
     /// the command carries its own length.
     pub fn stop(&self) -> AsynResult<()> {
         self.state.acquiring.store(false, Ordering::Release);
-        self.transport.lock().send_command("-stop")?;
+        self.io("-stop", |t| t.send_command("-stop"))?;
         Ok(())
     }
 
@@ -212,8 +305,14 @@ impl Detector {
 
     /// `-module N` followed by `command`, for every module (C repeats this
     /// pattern in setKthresh / setEnergy / loadSettings / setReset).
+    ///
+    /// Refuses when the module count is unknown rather than looping zero times:
+    /// a silent no-op here is a threshold the operator believes was applied.
     fn for_each_module(&self, command: &str) -> AsynResult<()> {
-        for module in 0..self.nmodules() {
+        let nmodules = self
+            .nmodules()
+            .ok_or_else(|| unknown_nmodules(&format!("send [{command}] to every module")))?;
+        for module in 0..nmodules {
             self.send(&format!("-module {module}"))?;
             self.send(command)?;
         }
@@ -351,23 +450,53 @@ impl Detector {
         Ok(value)
     }
 
-    /// The size, in bytes, of the next readout reply (C `nread_expect`).
-    pub fn readout_len(&self) -> usize {
-        protocol::readout_len(
+    /// The size, in bytes, of the next readout reply (C `nread_expect`), or
+    /// `None` while the module count is unknown.
+    pub fn readout_len(&self) -> Option<NonZeroUsize> {
+        NonZeroUsize::new(protocol::readout_len(
             self.state.read_mode.load(Ordering::Acquire),
-            self.nmodules(),
+            self.nmodules()?,
             self.state.nbits.load(Ordering::Acquire),
-        )
+        ))
     }
 
     /// C `-readoutraw` / `-readout`, mythen.cpp:889.
-    pub fn readout(&self, expect: usize, timeout: Duration) -> AsynResult<Vec<u8>> {
+    ///
+    /// `expect` is a [`NonZeroUsize`] because it is the length the reply will
+    /// be read back at: a zero would send the command and read nothing, and the
+    /// reply the detector then sends would be picked up as the answer to
+    /// whatever command came next.
+    pub fn readout(&self, expect: NonZeroUsize, timeout: Duration) -> AsynResult<Vec<u8>> {
         let command = if self.state.read_mode.load(Ordering::Acquire) == READ_MODE_RAW {
             "-readoutraw"
         } else {
             "-readout"
         };
-        self.transport.lock().readout(command, expect, timeout)
+        self.io(command, |t| t.readout(command, expect, timeout))
+    }
+}
+
+/// The error a caller gets while the detector is marked disconnected: the
+/// command was never sent.
+fn disconnected(what: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Disconnected,
+        message: format!(
+            "mythen: [{what}] not sent: the detector is disconnected — write ADAcquire to probe \
+             it again"
+        ),
+    }
+}
+
+/// The error a caller gets when it asks for detector work whose size depends on
+/// a module count the detector has never reported.
+pub fn unknown_nmodules(what: &str) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: format!(
+            "mythen: cannot {what}: the module count is unknown — `-get nmodules` has not \
+             answered since the IOC started"
+        ),
     }
 }
 
