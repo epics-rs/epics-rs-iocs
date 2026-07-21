@@ -15,18 +15,15 @@
 //! own and are wired here directly against `epics-modbus-rs`'s existing
 //! `drvModbusAsynConfigure`/`modbusInterposeConfig` iocsh commands.
 //!
-//! # dbLoadTemplate gap (Deviation, not a feasibility blocker)
-//! epics-base-rs 0.22.1 has a working `.substitutions` parser
-//! (`db_loader::substitution::{parse_substitutions, load_substitution_file}`)
-//! but no `dbLoadTemplate` iocsh command wraps it. `dbLoadTemplate` itself is,
-//! in both real EPICS and here, nothing more than "macro-expand each pattern
-//! row, then `dbLoadRecords` the target template once per row" -- a pure
-//! textual expansion, not a distinct capability. `st.cmd` reproduces that
-//! expansion directly: every `ISCO*.substitutions`/`Vindum*.substitutions`
-//! row (mechanically transcribed from the upstream file, byte-for-byte) is
-//! one explicit `dbLoadRecords` call. This is textually equivalent to what
-//! `dbLoadTemplate` would have produced; see `st.cmd`'s own header comment
-//! for the per-block upstream-file citations.
+//! # dbLoadTemplate (epics-base-rs 0.24.3)
+//! `ISCO*.substitutions`/`Vindum*.substitutions` load via the `dbLoadTemplate`
+//! iocsh command, registered as a framework builtin as of epics-base-rs
+//! 0.24.3 (`server::iocsh::commands::register_builtins`). Earlier ports of
+//! this IOC worked around the then-missing command by mechanically
+//! transcribing each substitutions row into an explicit `dbLoadRecords` call
+//! in `st.cmd`; that expansion has been replaced by the direct
+//! `dbLoadTemplate` calls now that the command exists. See `st.cmd`'s own
+//! header comment for the per-block upstream-file citations.
 //!
 //! # Vendored modbus-rs db/ templates
 //! A crates.io dependency has no installed, runtime-resolvable path to its
