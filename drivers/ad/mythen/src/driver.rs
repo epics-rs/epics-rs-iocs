@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use epics_rs::ad_core::driver::{ADDriverBase, ImageMode};
+use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -61,6 +61,42 @@ impl MythenParams {
     }
 }
 
+/// The outcome of the constructor's detector queries.
+///
+/// The single gate that keeps a constructor-time detector query from failing
+/// port creation: it logs the failure, records which query it was, and hands
+/// the caller a `None` to fall back from. C gets the same property from
+/// `status |= ...` over a C++ constructor, which cannot fail — an unreachable
+/// detector must never stop the IOC from reaching `iocInit`.
+#[derive(Default)]
+struct BootQueries {
+    failed: Vec<String>,
+}
+
+impl BootQueries {
+    /// Run one constructor-time query, logging and recording a failure.
+    fn run<T>(&mut self, what: &str, result: AsynResult<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(e) => {
+                self.fail(what, &e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Record a query that answered, but answered something unusable.
+    fn fail(&mut self, what: &str, why: &str) {
+        log::error!("mythen: cannot read {what} at startup: {why}");
+        self.failed.push(what.to_string());
+    }
+
+    /// The queries that failed, or `None` when every one of them worked.
+    fn failure_summary(&self) -> Option<String> {
+        (!self.failed.is_empty()).then(|| self.failed.join(", "))
+    }
+}
+
 pub struct MythenDriver {
     pub ad: ADDriverBase,
     pub p: MythenParams,
@@ -93,14 +129,24 @@ impl MythenDriver {
     }
 
     /// C's constructor body, mythen.cpp:1326-1377.
+    ///
+    /// Every detector query on this path goes through [`BootQueries`]. C runs
+    /// the same queries with `status |= ...` and carries on when one fails, so
+    /// a detector that is powered off when the IOC boots leaves the parameters
+    /// at their defaults but still gets a port — and the IOC still reaches
+    /// `iocInit`. Nothing here may use `?` on the detector directly.
     fn init_params(&mut self, sensor_size_x: i32, sensor_size_y: i32) -> AsynResult<()> {
-        let firmware = self.det.get_firmware()?;
-        log::info!("mythen: firmware {firmware}");
+        let mut q = BootQueries::default();
+
+        let firmware = q.run("the firmware version", self.det.get_firmware());
+        if let Some(firmware) = &firmware {
+            log::info!("mythen: firmware {firmware}");
+        }
 
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.base.manufacturer, 0, "Dectris".into())?;
         base.set_string_param(self.ad.params.base.model, 0, "Mythen".into())?;
-        base.set_string_param(self.p.firmware_version, 0, firmware)?;
+        base.set_string_param(self.p.firmware_version, 0, firmware.unwrap_or_default())?;
 
         base.set_int32_param(self.ad.params.max_size_x, 0, sensor_size_x)?;
         base.set_int32_param(self.ad.params.max_size_y, 0, sensor_size_y)?;
@@ -112,31 +158,53 @@ impl MythenDriver {
         base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::UInt32 as i32)?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Single as i32)?;
 
-        let status = self.det.get_status()?;
-        self.ad
-            .port_base
-            .set_int32_param(self.ad.params.status, 0, status as i32)?;
-
-        let settings = self.det.get_settings()?;
-        self.apply_settings(&settings)?;
-
-        let nmodules = self.det.read_nmodules()?;
-        if nmodules < 0 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("mythen: [-get nmodules] unexpected reply: {nmodules}"),
-            });
-        }
-        self.ad
-            .port_base
-            .set_int32_param(self.p.nmodules, 0, nmodules)?;
-        // One module is 1280 channels; the array the driver publishes is as
-        // wide as all the modules together.
+        let status = q.run("the detector status", self.det.get_status());
         self.ad.port_base.set_int32_param(
-            self.ad.params.base.array_size_x,
+            self.ad.params.status,
             0,
-            nmodules * CHANNELS_PER_MODULE as i32,
+            status.unwrap_or(ADStatus::Disconnected) as i32,
         )?;
+
+        if let Some(settings) = q.run("the detector settings", self.det.get_settings()) {
+            self.apply_settings(&settings)?;
+        }
+
+        let nmodules = match q.run("the module count", self.det.read_nmodules()) {
+            Some(n) if n >= 0 => Some(n),
+            // C prints the same message and abandons the rest of the
+            // constructor (mythen.cpp:1367-1372); the port survives either way.
+            Some(n) => {
+                q.fail("the module count", &format!("unexpected reply: {n}"));
+                None
+            }
+            None => None,
+        };
+        if let Some(nmodules) = nmodules {
+            self.ad
+                .port_base
+                .set_int32_param(self.p.nmodules, 0, nmodules)?;
+            // One module is 1280 channels; the array the driver publishes is as
+            // wide as all the modules together.
+            self.ad.port_base.set_int32_param(
+                self.ad.params.base.array_size_x,
+                0,
+                nmodules * CHANNELS_PER_MODULE as i32,
+            )?;
+        }
+
+        if let Some(failed) = q.failure_summary() {
+            log::error!(
+                "mythen: the detector did not answer at startup ({failed}); the port is created \
+                 with default parameters and ADStatus=Disconnected"
+            );
+            let base = &mut self.ad.port_base;
+            base.set_int32_param(self.ad.params.status, 0, ADStatus::Disconnected as i32)?;
+            base.set_string_param(
+                self.ad.params.status_message,
+                0,
+                "Mythen FAILED TO CONNECT".into(),
+            )?;
+        }
 
         self.ad.port_base.call_param_callbacks(0)
     }
