@@ -109,7 +109,8 @@ async fn main() -> CaResult<()> {
                 let driver = AmptekDriver::new(&port_name, interface, &address_info, direct_mode)
                     .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 let (runtime_handle, _actor) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default())
+                        .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime_handle.port_handle().clone(),

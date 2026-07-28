@@ -632,12 +632,12 @@ pub fn configure(
     // (`capaNCDT6200Sup.c:476`): noAutoConnect=1.
     rbk_driver.base_mut().set_auto_connect(false);
     // noProcessEos=1: no `push_interpose` call -- no EOS interpose installed.
-    let (rbk_runtime, _rbk_actor_jh) = create_port_runtime(rbk_driver, RuntimeConfig::default());
+    let (rbk_runtime, _rbk_actor_jh) = create_port_runtime(rbk_driver, RuntimeConfig::default())?;
     let rbk_port_handle = rbk_runtime.port_handle().clone();
 
     let self_handle: Arc<Mutex<Option<PortHandle>>> = Arc::new(Mutex::new(None));
     let driver = DataDriver::new(port_name, rbk_port_handle, self_handle.clone())?;
-    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())?;
     *self_handle.lock().unwrap() = Some(runtime_handle.port_handle().clone());
 
     asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), trace)?;
@@ -745,7 +745,8 @@ mod tests {
         let dummy = DummyPort {
             base: PortDriverBase::new("dummy_rbk_for_test", 1, PortFlags::default()),
         };
-        let (rbk_runtime, _jh) = create_port_runtime(dummy, RuntimeConfig::default());
+        let (rbk_runtime, _jh) =
+            create_port_runtime(dummy, RuntimeConfig::default()).expect("rbk port runtime");
         let rbk_handle = rbk_runtime.port_handle().clone();
         let driver =
             DataDriver::new("test_data_port", rbk_handle, Arc::new(Mutex::new(None))).unwrap();

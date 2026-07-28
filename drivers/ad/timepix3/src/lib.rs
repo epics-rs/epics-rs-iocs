@@ -70,7 +70,7 @@ pub fn create_timepix3_detector(
     let ad_params = driver.ad.params;
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())?;
 
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let ctx = Arc::new(tasks::Ctx {

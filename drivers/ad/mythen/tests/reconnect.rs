@@ -65,7 +65,8 @@ fn switchable_detector(answering: Arc<AtomicBool>) -> (PortHandle, mpsc::Receive
     });
 
     let driver = DrvAsynIPPort::new("MYTHEN_RECONNECT_IP", &addr).expect("ip port");
-    let (runtime, _) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime, _) =
+        create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
     let handle = runtime.port_handle().clone();
     // The port actor must outlive the test.
     std::mem::forget(runtime);

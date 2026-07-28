@@ -82,9 +82,24 @@ async fn try_connect(
 
     let frame_tx = event_tx;
     let subscription = match client
-        .pvmonitor_handle(pv_name, move |_desc, value| {
-            let _ = frame_tx.try_send(PvaEvent::Frame(value.clone()));
-        })
+        .pvmonitor_handle(
+            pv_name,
+            move |_desc, value| {
+                let _ = frame_tx.try_send(PvaEvent::Frame(value.clone()));
+            },
+            // `PVAPvConnectionStatus` is driven by the [`ConnectHandle`] above,
+            // which is this driver's `channelStateChange` — pvxs `pvaDriver`
+            // takes the channel's state from its `ChannelRequester`, not from
+            // the monitor (`pvaDriver.cpp`, `connectPv`). Posting the monitor's
+            // own transitions here as well would write the parameter twice per
+            // transition and, worse, drop the status to 0 during an internal
+            // resubscribe the channel never left Active for.
+            //
+            // The `MonitorConnEvent` invariant is not bypassed by this: it
+            // forbids inferring connection state from the subscription handle
+            // or its future *terminating*, which this task never does.
+            |_conn| {},
+        )
         .await
     {
         Ok(sub) => sub,

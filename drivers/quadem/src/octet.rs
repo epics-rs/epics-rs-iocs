@@ -180,7 +180,7 @@ pub fn create_ip_port(
             epics_rs::asyn::interpose::eos::EosInterpose::default(),
         ));
     }
-    let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let io = OctetIo::new(runtime.port_handle().clone(), timeout);
     Ok((io, runtime))
 }

@@ -218,7 +218,7 @@ pub fn create_pva_detector(
     let ad_params = det.ad.params;
     let pva_params = det.pva_params;
     let pool = det.ad.pool.clone();
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 

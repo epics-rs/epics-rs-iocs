@@ -7,7 +7,8 @@
 #   cargo run -p pilatus-ioc -- iocs/ad/pilatus-ioc/st.cmd
 #
 #------------------------------------------------------------
-# Boots clean on the pinned ad-plugins-rs / ad-core-rs 0.24.3.
+# Boots clean on ad-plugins-rs / ad-core-rs 0.24.3 — the pin when that was
+# verified; not re-verified since the workspace moved to 0.25.2.
 #
 # History: the published 0.22.1 baseline did NOT register the asyn
 # port/EOS/trace iocsh commands (`drvAsynIPPortConfigure`,

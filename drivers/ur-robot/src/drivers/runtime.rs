@@ -36,7 +36,7 @@ pub fn create_dashboard(
     let client = driver.client();
     let shared = driver.shared();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = dashboard::start_poller(
         runtime_handle.port_handle().clone(),
         params,
@@ -61,7 +61,7 @@ pub fn create_receive(
     let iface = driver.iface();
     let shared = driver.shared();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = receive::start_poller(
         runtime_handle.port_handle().clone(),
         params,
@@ -80,7 +80,7 @@ pub fn create_receive(
 /// argument is accepted and ignored, as upstream does).
 pub fn create_io(port_name: &str, robot_ip: &str) -> AsynResult<UrPortRuntime> {
     let driver = io::IoDriver::new(port_name, robot_ip)?;
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     Ok(UrPortRuntime {
         runtime_handle,
         _poller: None,
@@ -99,7 +99,7 @@ pub fn create_control(
     let inner = driver.inner();
     let receive = driver.receive();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = control::start_poller(
         runtime_handle.port_handle().clone(),
         params,
@@ -124,7 +124,7 @@ pub fn create_gripper(
     let g = driver.gripper();
     let dash = driver.dashboard();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = gripper::start_poller(
         runtime_handle.port_handle().clone(),
         params,

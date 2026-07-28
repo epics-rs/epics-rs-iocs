@@ -296,7 +296,7 @@ pub fn create_sim_detector(
     // ownership of it and the IOC still needs to attach plugin senders.
     let queued_counter = det.ad.queued_counter.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
     let task_handle = start_sim_task(SimTaskContext {

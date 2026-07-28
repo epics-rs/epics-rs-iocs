@@ -156,17 +156,21 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.24.3 (released): ports consume the released version instead of
-# the main branch; bumped 0.24.2 -> 0.24.3 (0.24.3 adds the dbLoadTemplate
-# iocsh command, PR #47, plus histogram/CA-clamp/asyn-escape parity fixes).
+# epics-rs 0.25.2 (released): ports consume the released version instead of
+# the main branch; bumped 0.24.3 -> 0.25.2. Breaking across that range:
+# `create_port_runtime` became fallible (a port whose actor thread the OS
+# refuses is now an error rather than a handle to a port that can never run
+# a request), `CommandContext::runtime_handle` was replaced by `bridge()`
+# so iocsh commands spawn on either async backend, and
+# `PvaClient::pvmonitor_handle` gained an `on_conn` callback.
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.24.3"
-asyn-rs = "0.24.3"
-ad-core-rs = "0.24.3"
-ad-plugins-rs = "0.24.3"
+epics-rs = "0.25.2"
+asyn-rs = "0.25.2"
+ad-core-rs = "0.25.2"
+ad-plugins-rs = "0.25.2"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.24.3", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.25.2", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.24.3"
+mca-rs = "0.25.2"
