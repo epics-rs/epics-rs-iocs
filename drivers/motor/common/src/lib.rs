@@ -80,7 +80,7 @@ impl MotorHolder {
 
         let device_support = device_support.with_dtyp_name(dtyp_key.clone());
 
-        ctx.runtime_handle().spawn(poll_loop.run());
+        ctx.bridge().spawn(poll_loop.run());
 
         self.poll_senders
             .lock()
