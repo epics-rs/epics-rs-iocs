@@ -88,7 +88,8 @@ fn ip_port(name: &str, addr: &str, input_eos: &[u8], output_eos: &[u8]) -> PortH
     // What `drvAsynIPPortConfigure` does before it starts the port: the EOS
     // bytes are only cached, never applied, unless this layer is there.
     driver.install_interpose(Box::new(EosInterpose::default()));
-    let (runtime, _) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime, _) =
+        create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
     let handle = runtime.port_handle().clone();
     handle
         .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), input_eos)

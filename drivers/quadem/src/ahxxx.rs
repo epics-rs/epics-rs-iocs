@@ -855,7 +855,7 @@ pub fn create_ahxxx(
     let io = driver.io.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let read_ctx = ReadContext {

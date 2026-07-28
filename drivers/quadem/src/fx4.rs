@@ -569,7 +569,7 @@ pub fn create_fx4(
     let outputs = driver.base.outputs.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let socket_ctx = SocketContext {

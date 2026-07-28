@@ -143,7 +143,7 @@ pub fn create_eiger_detector_on_port(
     let ops = det.ops.clone();
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
 
     let outputs = Outputs::new();
     let shared = tasks::shared(

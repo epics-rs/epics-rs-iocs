@@ -316,7 +316,7 @@ pub fn create_c_sim_detector(
     let pool = det.pool.clone();
     let queued_counter = det.queued_counter.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
 
     let outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>> = (0..MAX_ADDR)
         .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))

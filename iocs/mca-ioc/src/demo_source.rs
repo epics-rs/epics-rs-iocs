@@ -100,7 +100,7 @@ pub fn connect(
         .set_float64(period_reason, 0, period.as_secs_f64())?;
 
     let driver = DemoSourceDriver { base };
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     spawn_producer(
         runtime_handle.port_handle().clone(),
         data_reason,

@@ -116,7 +116,8 @@ async fn main() -> CaResult<()> {
                 })?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default())
+                        .map_err(|e| format!("CapaNCDT6200ConfigInit: {e}"))?;
                 asyn_record::register_port(
                     &cfg_port,
                     runtime_handle.port_handle().clone(),

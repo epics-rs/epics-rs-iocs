@@ -568,7 +568,7 @@ pub fn create_nd_std_arrays(
     let params = driver.params;
     let ndsa = driver.ndsa;
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())?;
 
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let publisher = ArrayPublisher::new(output.clone());

@@ -24,7 +24,7 @@ pub fn create_tpg261(
     let (driver, commands) = TpgDriver::new(port_name)?;
     let params = driver.params();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let worker = TpgWorker::new(
         Transport::new(io),
         runtime_handle.port_handle().clone(),

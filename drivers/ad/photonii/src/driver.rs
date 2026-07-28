@@ -273,7 +273,7 @@ pub fn create_photonii_detector(
     let params = det.params;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 

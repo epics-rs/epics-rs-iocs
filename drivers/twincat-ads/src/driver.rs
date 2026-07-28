@@ -1474,7 +1474,7 @@ pub fn create_ads_port(cfg: AdsConfig) -> AsynResult<AdsRuntime> {
     let driver = AdsPortDriver::new(cfg)?;
     let shared = driver.shared();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
 
     if let Err(e) = connect(&shared) {
         log::warn!(
