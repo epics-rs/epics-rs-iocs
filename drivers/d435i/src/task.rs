@@ -12,8 +12,6 @@ use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
 
-use std::collections::HashSet;
-
 use realsense_rust::config::Config;
 use realsense_rust::context::Context;
 use realsense_rust::frame::{AccelFrame, ColorFrame, CompositeFrame, DepthFrame, GyroFrame};
@@ -33,6 +31,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 
 use crate::params::{D435iConfigSnapshot, D435iParams};
+use crate::types::CameraCapabilities;
 use crate::types::{AcqCommand, DirtyFlags};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 50;
@@ -70,6 +69,8 @@ pub(crate) struct AcquisitionContext {
     pub rs_params: D435iParams,
     /// Device serial number (set at create time, not read from params).
     pub serial: String,
+    /// What the camera supports, queried once at create time.
+    pub caps: crate::types::CameraCapabilities,
 }
 
 impl AcquisitionContext {
@@ -102,48 +103,18 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
     rt::run_thread_named("D435iTask", move || acquisition_loop_async(ctx))
 }
 
-/// Whether the camera this config targets carries an IMU.
-///
-/// The D435i does; the D405 has no motion sensors at all. `enable_stream` for
-/// a kind the device cannot provide is accepted silently and then makes the
-/// WHOLE config unresolvable -- `pipeline.start` fails with "Config cannot be
-/// resolved by any active devices / stream combinations" and not one frame
-/// arrives, colour or depth included. So ask the device rather than assume the
-/// model.
-///
-/// An empty `serial` means "first device found", which is what the pipeline
-/// itself will pick.
-fn device_has_imu(rs_ctx: &Context, serial: &str) -> bool {
-    let devices = rs_ctx.query_devices(HashSet::new());
-    let device = devices.iter().find(|d| {
-        serial.is_empty()
-            || d.info(Rs2CameraInfo::SerialNumber)
-                .is_some_and(|s| s.to_string_lossy() == serial)
-    });
-    let Some(device) = device else {
-        // Not enumerable right now; let the pipeline report the real error
-        // instead of silently dropping the IMU streams.
-        return true;
-    };
-    device.sensors().iter().any(|sensor| {
-        sensor
-            .stream_profiles()
-            .iter()
-            .any(|profile| matches!(profile.kind(), Rs2StreamKind::Accel | Rs2StreamKind::Gyro))
-    })
-}
-
 /// Open a fresh context and start a pipeline for `config`.
 fn start_pipeline(
     config: &D435iConfigSnapshot,
+    caps: &CameraCapabilities,
 ) -> anyhow::Result<realsense_rust::pipeline::ActivePipeline> {
     let rs_ctx = Context::new()?;
     let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
-    let rs_config = build_config(&rs_ctx, config)?;
+    let rs_config = build_config(config, caps)?;
     rs_pipeline.start(Some(rs_config))
 }
 
-fn build_config(rs_ctx: &Context, config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
+fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyhow::Result<Config> {
     let mut cfg = Config::new();
     let w = config.res_x as usize;
     let h = config.res_y as usize;
@@ -151,7 +122,10 @@ fn build_config(rs_ctx: &Context, config: &D435iConfigSnapshot) -> anyhow::Resul
 
     cfg.enable_stream(Rs2StreamKind::Color, None, w, h, Rs2Format::Rgb8, fps)?;
     cfg.enable_stream(Rs2StreamKind::Depth, None, w, h, Rs2Format::Z16, fps)?;
-    if device_has_imu(rs_ctx, &config.serial) {
+    // enable_stream for a kind the camera does not have is accepted here and
+    // then makes the WHOLE config unresolvable: pipeline.start fails and not
+    // one frame arrives, colour and depth included.
+    if caps.has_imu {
         cfg.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
         cfg.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
     } else {
@@ -182,7 +156,11 @@ fn set_sensor_option(sensor: &mut realsense_rust::sensor::Sensor, option: Rs2Opt
     }
 }
 
-fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot) {
+fn apply_sensor_options(
+    composite: &CompositeFrame,
+    config: &D435iConfigSnapshot,
+    caps: &CameraCapabilities,
+) {
     use realsense_rust::frame::FrameEx;
 
     // Color sensor options (exposure, gain, auto-exposure)
@@ -200,6 +178,9 @@ fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot
     }
 
     // Depth sensor options (emitter, laser power)
+    if !caps.has_emitter {
+        return;
+    }
     let depth_frames: Vec<DepthFrame> = composite.frames_of_type();
     if let Some(depth_frame) = depth_frames.first()
         && let Ok(mut sensor) = FrameEx::sensor(depth_frame)
@@ -658,7 +639,7 @@ async fn try_connect_pipeline(
             return None;
         }
 
-        let result = start_pipeline(config);
+        let result = start_pipeline(config, &ctx.caps);
 
         match result {
             Ok(p) => return Some(p),
@@ -829,7 +810,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 };
 
                 drop(pipeline.stop());
-                pipeline = match start_pipeline(&config) {
+                pipeline = match start_pipeline(&config, &ctx.caps) {
                     Ok(p) => p,
                     Err(e) => {
                         // RSStreamMode offers every mode the D435i supports,
@@ -857,7 +838,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                                 )],
                             )
                             .await;
-                        match start_pipeline(&config) {
+                        match start_pipeline(&config, &ctx.caps) {
                             Ok(p) => p,
                             Err(e) => {
                                 log::error!("D435i: could not fall back to the previous mode: {e}");
@@ -1026,7 +1007,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Apply sensor options on first frame after config change
             if !sensor_options_applied {
-                apply_sensor_options(&composite, &config);
+                apply_sensor_options(&composite, &config, &ctx.caps);
                 sensor_options_applied = true;
             }
 

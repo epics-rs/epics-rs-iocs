@@ -22,6 +22,8 @@ pub struct D435iParams {
 
     // Depth info (read-only)
     pub rs_depth_units: usize,
+    pub rs_has_imu: usize,
+    pub rs_has_emitter: usize,
 
     // IMU
     pub rs_accel_x: usize,
@@ -73,6 +75,8 @@ impl D435iParams {
             rs_laser_power: base.create_param("RS_LASER_POWER", ParamType::Float64)?,
             rs_emitter_enabled: base.create_param("RS_EMITTER_ENABLED", ParamType::Int32)?,
             rs_depth_units: base.create_param("RS_DEPTH_UNITS", ParamType::Float64)?,
+            rs_has_imu: base.create_param("RS_HAS_IMU", ParamType::Int32)?,
+            rs_has_emitter: base.create_param("RS_HAS_EMITTER", ParamType::Int32)?,
             rs_accel_x: base.create_param("RS_ACCEL_X", ParamType::Float64)?,
             rs_accel_y: base.create_param("RS_ACCEL_Y", ParamType::Float64)?,
             rs_accel_z: base.create_param("RS_ACCEL_Z", ParamType::Float64)?,

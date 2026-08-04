@@ -386,3 +386,24 @@ record(bi, "$(P)$(R)RSPointcloudEnable_RBV") {
     field(ONAM, "On")
     field(SCAN, "I/O Intr")
 }
+
+# ===== Camera capabilities =====
+# Queried once at connect. The D400 family is not uniform: a D405 has no IMU
+# and no controllable projector, so RSAccel*/RSGyro* stay at zero and
+# RSEmitterEnabled/RSLaserPower have nothing to act on. Without these an
+# operator cannot tell that apart from a camera sitting still in the dark.
+record(bi, "$(P)$(R)RSHasIMU_RBV") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_HAS_IMU")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(PINI, "YES")
+}
+
+record(bi, "$(P)$(R)RSHasEmitter_RBV") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_HAS_EMITTER")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(PINI, "YES")
+}

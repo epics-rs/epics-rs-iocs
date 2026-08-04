@@ -111,6 +111,64 @@ pub const PREFERRED_MODE: StreamMode = StreamMode {
 /// offer. Cameras list far more combinations than that.
 pub const MAX_STREAM_MODES: usize = 16;
 
+/// What the attached camera can actually do.
+///
+/// Queried once, at driver construction, and used everywhere a model would
+/// otherwise be assumed: the D400 family differs in stream modes, in whether
+/// there is an IMU, and in whether the depth projector is controllable.
+#[derive(Clone)]
+pub struct CameraCapabilities {
+    pub modes: Vec<StreamMode>,
+    /// Accel and Gyro streams exist. Absent on the D405.
+    pub has_imu: bool,
+    /// The depth sensor takes EmitterEnabled / LaserPower. Absent on the D405.
+    pub has_emitter: bool,
+}
+
+impl CameraCapabilities {
+    /// Ask the camera at `serial` what it supports; an empty `serial` means
+    /// "first device found", matching what the pipeline itself will open.
+    pub fn discover(serial: &str) -> Self {
+        let (has_imu, has_emitter) = query_sensor_capabilities(serial).unwrap_or_else(|| {
+            // Not enumerable: assume the D435i's feature set so nothing is
+            // silently dropped, and let the pipeline report the real problem.
+            log::warn!("D435i: camera not enumerable; assuming a D435i feature set");
+            (true, true)
+        });
+        Self {
+            modes: discover_stream_modes(serial),
+            has_imu,
+            has_emitter,
+        }
+    }
+}
+
+fn query_sensor_capabilities(serial: &str) -> Option<(bool, bool)> {
+    use realsense_rust::context::Context;
+    use realsense_rust::kind::{Rs2CameraInfo, Rs2Option, Rs2StreamKind};
+    use std::collections::HashSet;
+
+    let ctx = Context::new().ok()?;
+    let devices = ctx.query_devices(HashSet::new());
+    let device = devices.iter().find(|d| {
+        serial.is_empty()
+            || d.info(Rs2CameraInfo::SerialNumber)
+                .is_some_and(|s| s.to_string_lossy() == serial)
+    })?;
+
+    let sensors = device.sensors();
+    let has_imu = sensors.iter().any(|sensor| {
+        sensor
+            .stream_profiles()
+            .iter()
+            .any(|p| matches!(p.kind(), Rs2StreamKind::Accel | Rs2StreamKind::Gyro))
+    });
+    let has_emitter = sensors
+        .iter()
+        .any(|sensor| sensor.supports_option(Rs2Option::EmitterEnabled));
+    Some((has_imu, has_emitter))
+}
+
 /// Modes the camera at `serial` supports for Color(RGB8) and Depth(Z16) both.
 ///
 /// RSStreamMode used to be a fixed table of what a D435i can do, which meant

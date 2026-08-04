@@ -15,7 +15,7 @@ use epics_rs::ad_core::runtime as rt;
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
-use crate::types::{AcqCommand, DirtyFlags, StreamMode, default_mode_index};
+use crate::types::{AcqCommand, CameraCapabilities, DirtyFlags, StreamMode, default_mode_index};
 
 // ============================================================================
 // Color Driver (main)
@@ -38,7 +38,7 @@ impl D435iColorDriver {
         max_memory: usize,
         acq_tx: rt::CommandSender<AcqCommand>,
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
-        stream_modes: Vec<StreamMode>,
+        caps: CameraCapabilities,
     ) -> AsynResult<Self> {
         let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
         let rs_params = D435iParams::create(&mut ad.port_base)?;
@@ -56,6 +56,7 @@ impl D435iColorDriver {
 
         // Default stream config. The enum choices are the camera's own modes,
         // so RSStreamMode never offers one it will reject.
+        let stream_modes: Vec<StreamMode> = caps.modes.clone();
         let default_index = default_mode_index(&stream_modes);
         let default_mode = &stream_modes[default_index as usize];
         base.set_enum_choices_param(
@@ -72,6 +73,11 @@ impl D435iColorDriver {
                 .collect(),
         )?;
         base.set_enum_index_param(rs_params.rs_stream_mode, 0, default_index as usize)?;
+
+        // What this camera has, so the records that depend on it are not
+        // silently inert: a D405 has neither an IMU nor a controllable emitter.
+        base.set_int32_param(rs_params.rs_has_imu, 0, caps.has_imu as i32)?;
+        base.set_int32_param(rs_params.rs_has_emitter, 0, caps.has_emitter as i32)?;
         base.set_int32_param(rs_params.rs_res_x, 0, default_mode.width)?;
         base.set_int32_param(rs_params.rs_res_y, 0, default_mode.height)?;
         base.set_int32_param(rs_params.rs_frame_rate, 0, default_mode.fps)?;
@@ -450,10 +456,12 @@ pub fn create_d435i_detector(
 
     // Ask the camera which modes it has before the records are built: the
     // RSStreamMode enum is served from this list.
-    let stream_modes = crate::types::discover_stream_modes(serial);
+    let caps = CameraCapabilities::discover(serial);
     log::info!(
-        "D435i: camera offers {} colour+depth stream modes",
-        stream_modes.len()
+        "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}",
+        caps.modes.len(),
+        caps.has_imu,
+        caps.has_emitter
     );
 
     // --- Color port ---
@@ -464,7 +472,7 @@ pub fn create_d435i_detector(
         max_memory,
         acq_tx,
         dirty.clone(),
-        stream_modes,
+        caps.clone(),
     )?;
     let color_ad_params = color_det.ad.params;
     let color_rs_params = color_det.rs_params;
@@ -499,6 +507,7 @@ pub fn create_d435i_detector(
         depth_ad: depth_ad_params,
         rs_params: color_rs_params,
         serial: serial.to_string(),
+        caps,
     });
 
     let color_runtime = D435iColorRuntime {
