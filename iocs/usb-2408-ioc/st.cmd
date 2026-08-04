@@ -3,9 +3,11 @@
 epicsEnvSet("PREFIX", "USB2408:")
 epicsEnvSet("PORT",   "USB2408_1")
 epicsEnvSet("UNIQUE_ID", "01DA523D")
+epicsEnvSet("WDIG_POINTS", "2048")
+epicsEnvSet("WGEN_POINTS", "2048")
 
 # Create the USB-2408-2AO driver
-MultiFunctionConfig("$(PORT)", "$(UNIQUE_ID)", 2048, 2048)
+MultiFunctionConfig("$(PORT)", "$(UNIQUE_ID)", $(WDIG_POINTS), $(WGEN_POINTS))
 
 # Device info
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_device.template", "P=$(PREFIX),PORT=$(PORT)")
@@ -58,10 +60,10 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo8,PORT=$(PORT),ADDR=0,MASK=0x80")
 
 # Waveform digitizer
-dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig.template", "P=$(PREFIX),PORT=$(PORT)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig.template", "P=$(PREFIX),PORT=$(PORT),WDIG_POINTS=$(WDIG_POINTS)")
 
 # Waveform generator
-dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen.template", "P=$(PREFIX),PORT=$(PORT)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen.template", "P=$(PREFIX),PORT=$(PORT),WGEN_POINTS=$(WGEN_POINTS)")
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen1,PORT=$(PORT),ADDR=0")
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen2,PORT=$(PORT),ADDR=1")
 

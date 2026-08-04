@@ -11,7 +11,9 @@ record(bo, "$(P)WaveDigRun") {
 record(longout, "$(P)WaveDigNumPoints") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_NUM_POINTS")
-    field(VAL,  "2048")
+    field(VAL,  "$(WDIG_POINTS=2048)")
+    field(DRVL, "1")
+    field(DRVH, "$(WDIG_POINTS=2048)")
     field(PINI, "YES")
 }
 
@@ -19,6 +21,8 @@ record(longout, "$(P)WaveDigFirstChan") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_FIRST_CHAN")
     field(VAL,  "0")
+    field(DRVL, "0")
+    field(DRVH, "7")
     field(PINI, "YES")
 }
 
@@ -26,6 +30,8 @@ record(longout, "$(P)WaveDigNumChans") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_NUM_CHANS")
     field(VAL,  "8")
+    field(DRVL, "1")
+    field(DRVH, "8")
     field(PINI, "YES")
 }
 

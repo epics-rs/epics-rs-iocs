@@ -105,6 +105,19 @@ impl PortDriver for MultiFunctionDriver {
         let reason = user.reason;
         let addr = user.addr;
 
+        // The scan buffers are sized once from maxInputPoints/maxOutputPoints,
+        // so a point count above that capacity must never reach the store --
+        // wave_dig indexes its fixed per-channel buffers by it. The records
+        // carry the same bound in DRVL/DRVH; this gate is what makes the
+        // invariant hold no matter what the database says.
+        let value = if reason == self.params.wave_dig_num_points {
+            value.clamp(1, self.max_input_points as i32)
+        } else if reason == self.params.wave_gen_num_points {
+            value.clamp(1, self.max_output_points as i32)
+        } else {
+            value
+        };
+
         self.base.params.set_int32(reason, addr, value)?;
 
         if reason == self.params.counter_reset && value != 0 {

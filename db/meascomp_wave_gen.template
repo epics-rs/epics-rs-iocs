@@ -33,7 +33,9 @@ record(ai, "$(P)WaveGenTotalTime") {
 record(longout, "$(P)WaveGenNumPoints") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_NUM_POINTS")
-    field(VAL,  "2048")
+    field(VAL,  "$(WGEN_POINTS=2048)")
+    field(DRVL, "1")
+    field(DRVH, "$(WGEN_POINTS=2048)")
     field(PINI, "YES")
 }
 
