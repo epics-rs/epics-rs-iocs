@@ -65,14 +65,6 @@ pub struct CtrParams {
     pub mca_elapsed_real: usize,
     pub mca_elapsed_live: usize,
     pub mca_prescale: usize,
-
-    // Scaler
-    pub scaler_reset: usize,
-    pub scaler_channels: usize,
-    pub scaler_read: usize,
-    pub scaler_presets: usize,
-    pub scaler_arm: usize,
-    pub scaler_done: usize,
 }
 
 impl CtrParams {
@@ -125,13 +117,6 @@ impl CtrParams {
             mca_elapsed_real: base.create_param("MCA_ELAPSED_REAL_TIME", ParamType::Float64)?,
             mca_elapsed_live: base.create_param("MCA_ELAPSED_LIVE_TIME", ParamType::Float64)?,
             mca_prescale: base.create_param("MCA_PRESCALE", ParamType::Int32)?,
-
-            scaler_reset: base.create_param("SCALER_RESET_COMMAND", ParamType::Int32)?,
-            scaler_channels: base.create_param("SCALER_CHANNELS_COMMAND", ParamType::Int32)?,
-            scaler_read: base.create_param("SCALER_READ_COMMAND", ParamType::Int32Array)?,
-            scaler_presets: base.create_param("SCALER_PRESET_COMMAND", ParamType::Int32)?,
-            scaler_arm: base.create_param("SCALER_ARM_COMMAND", ParamType::Int32)?,
-            scaler_done: base.create_param("SCALER_DONE_COMMAND", ParamType::Int32)?,
         })
     }
 }

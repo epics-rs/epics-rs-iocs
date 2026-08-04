@@ -60,6 +60,9 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo7,PORT=$(PORT),ADDR=0,MASK=0x40")
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo8,PORT=$(PORT),ADDR=0,MASK=0x80")
 
+# scalerRecord over the 8 counters (scaler.db ships with scaler-rs)
+dbLoadRecords("$(SCALER)/scaler.db", "P=$(PREFIX),S=scaler1,DTYP=Asyn Scaler,OUT=@asyn($(PORT)),FREQ=10000000")
+
 # MCS (Multi-Channel Scaler)
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs.template", "P=$(PREFIX),PORT=$(PORT),MAX_POINTS=$(MAX_POINTS)")
 

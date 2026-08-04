@@ -12,7 +12,7 @@ use crate::mcs::{self, McsScan, McsState};
 use crate::params::*;
 use crate::poller::{self, PollerState};
 use crate::pulse_gen;
-use crate::scaler::{self, ScalerState};
+use crate::scaler::ScalerState;
 
 /// USB-CTR08 port driver.
 pub struct CtrDriver {
@@ -170,33 +170,6 @@ impl PortDriver for CtrDriver {
             let dev = self.device.lock().unwrap();
             if let Err(e) = dev.digital_out(uldaq_sys::AUXPORT, value as u64) {
                 log::error!("digital_out error: {e}");
-            }
-        } else if reason == self.params.scaler_arm {
-            let dev = self.device.lock().unwrap();
-            let mut st = self.state.lock().unwrap();
-            if value != 0 {
-                if let Err(e) = scaler::start_scaler(&dev, &mut st.scaler) {
-                    log::error!("start_scaler error: {e}");
-                }
-            } else {
-                scaler::stop_scaler(&dev, &mut st.scaler);
-            }
-        } else if reason == self.params.scaler_reset {
-            let dev = self.device.lock().unwrap();
-            let mut st = self.state.lock().unwrap();
-            scaler::reset_scaler(&dev, &mut st.scaler);
-            // Clear all presets (matches C++ resetScaler behavior)
-            for i in 0..MAX_COUNTERS {
-                st.scaler.presets[i] = 0;
-                let _ = self
-                    .base
-                    .params
-                    .set_int32(self.params.scaler_presets, i as i32, 0);
-            }
-        } else if reason == self.params.scaler_presets {
-            let mut st = self.state.lock().unwrap();
-            if (addr as usize) < MAX_COUNTERS {
-                st.scaler.presets[addr as usize] = value as u64;
             }
         } else if reason == self.params.mca_start_acquire {
             if value != 0 {
@@ -388,6 +361,7 @@ pub struct CtrRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: CtrParams,
     pub device: Arc<Mutex<DaqDevice>>,
+    pub state: Arc<Mutex<PollerState>>,
     _poller_handle: std::thread::JoinHandle<()>,
 }
 
@@ -420,13 +394,14 @@ pub fn create_usb_ctr(
         runtime_handle.port_handle().clone(),
         params,
         device.clone(),
-        state,
+        state.clone(),
     );
 
     Ok(CtrRuntime {
         runtime_handle,
         params,
         device,
+        state,
         _poller_handle: poller_handle,
     })
 }

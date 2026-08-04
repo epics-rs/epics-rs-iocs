@@ -121,7 +121,6 @@ fn poller_loop(
             for (i, c) in counts.iter().enumerate() {
                 let _ = handle.write_int32_blocking(params.counter_value, i as i32, *c as i32);
             }
-            let _ = handle.write_int32_blocking(params.scaler_done, 0, 1);
         } else if snapshot.mcs_running {
             let _ = handle.write_int32_blocking(
                 params.mcs_current_point,
