@@ -133,6 +133,16 @@ fn device_has_imu(rs_ctx: &Context, serial: &str) -> bool {
     })
 }
 
+/// Open a fresh context and start a pipeline for `config`.
+fn start_pipeline(
+    config: &D435iConfigSnapshot,
+) -> anyhow::Result<realsense_rust::pipeline::ActivePipeline> {
+    let rs_ctx = Context::new()?;
+    let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
+    let rs_config = build_config(&rs_ctx, config)?;
+    rs_pipeline.start(Some(rs_config))
+}
+
 fn build_config(rs_ctx: &Context, config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
     let mut cfg = Config::new();
     let w = config.res_x as usize;
@@ -628,12 +638,7 @@ async fn try_connect_pipeline(
             return None;
         }
 
-        let result = (|| -> anyhow::Result<_> {
-            let rs_ctx = Context::new()?;
-            let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
-            let rs_config = build_config(&rs_ctx, config)?;
-            rs_pipeline.start(Some(rs_config))
-        })();
+        let result = start_pipeline(config);
 
         match result {
             Ok(p) => return Some(p),
@@ -790,6 +795,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             if dirty_flags.reconfigure_pipeline {
                 // Need to restart pipeline with new config
+                let previous = config.clone();
                 config = match D435iConfigSnapshot::read_via_handle(
                     &ctx.color_handle,
                     &ctx.color_ad,
@@ -802,22 +808,49 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     Err(_) => break,
                 };
 
-                let inactive = pipeline.stop();
-                let new_config = match Context::new()
-                    .map_err(anyhow::Error::from)
-                    .and_then(|rs_ctx| build_config(&rs_ctx, &config))
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::error!("D435i: failed to rebuild config: {e}");
-                        break;
-                    }
-                };
-                pipeline = match inactive.start(Some(new_config)) {
+                drop(pipeline.stop());
+                pipeline = match start_pipeline(&config) {
                     Ok(p) => p,
                     Err(e) => {
-                        log::error!("D435i: failed to restart pipeline: {e}");
-                        break;
+                        // RSStreamMode offers every mode the D435i supports,
+                        // and a D405 rejects the 1280x720 ones. Losing the
+                        // stream over a refused mode is the wrong answer:
+                        // report it, go back to the mode that was running, and
+                        // only give up if that fails too.
+                        log::error!("D435i: stream mode refused by the camera: {e}");
+                        write_string(
+                            &ctx.color_handle,
+                            ctx.color_ad.status_message,
+                            0,
+                            format!("Stream mode refused, kept the previous one: {e}"),
+                        )
+                        .await;
+                        config = previous;
+                        let _ = ctx
+                            .color_handle
+                            .set_params_and_notify(
+                                0,
+                                vec![ParamSetValue::new(
+                                    ctx.rs_params.rs_stream_mode,
+                                    0,
+                                    ParamValue::Int32(config.stream_mode),
+                                )],
+                            )
+                            .await;
+                        match start_pipeline(&config) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::error!("D435i: could not fall back to the previous mode: {e}");
+                                write_string(
+                                    &ctx.color_handle,
+                                    ctx.color_ad.status_message,
+                                    0,
+                                    format!("Acquisition stopped: {e}"),
+                                )
+                                .await;
+                                break;
+                            }
+                        }
                     }
                 };
                 sensor_options_applied = false;

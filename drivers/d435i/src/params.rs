@@ -106,7 +106,10 @@ impl D435iParams {
 }
 
 /// Configuration snapshot read from the Color port for the acquisition thread.
+#[derive(Clone)]
 pub struct D435iConfigSnapshot {
+    /// Index into `STREAM_MODES`, kept so a refused mode can be put back.
+    pub stream_mode: i32,
     pub res_x: i32,
     pub res_y: i32,
     pub frame_rate: i32,
@@ -156,6 +159,7 @@ impl D435iConfigSnapshot {
         serial: &str,
     ) -> AsynResult<Self> {
         Ok(Self {
+            stream_mode: handle.read_int32(rs.rs_stream_mode, 0).await?,
             res_x: handle.read_int32(rs.rs_res_x, 0).await?,
             res_y: handle.read_int32(rs.rs_res_y, 0).await?,
             frame_rate: handle.read_int32(rs.rs_frame_rate, 0).await?,
