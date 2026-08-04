@@ -69,6 +69,15 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),
 # Waveform digitizer
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig.template", "P=$(PREFIX),PORT=$(PORT),WDIG_POINTS=$(WDIG_POINTS)")
 
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig1,PORT=$(PORT),ADDR=0,WDIG_POINTS=$(WDIG_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig2,PORT=$(PORT),ADDR=1,WDIG_POINTS=$(WDIG_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig3,PORT=$(PORT),ADDR=2,WDIG_POINTS=$(WDIG_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig4,PORT=$(PORT),ADDR=3,WDIG_POINTS=$(WDIG_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig5,PORT=$(PORT),ADDR=4,WDIG_POINTS=$(WDIG_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig6,PORT=$(PORT),ADDR=5,WDIG_POINTS=$(WDIG_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig7,PORT=$(PORT),ADDR=6,WDIG_POINTS=$(WDIG_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),R=WaveDig8,PORT=$(PORT),ADDR=7,WDIG_POINTS=$(WDIG_POINTS)")
+
 # Waveform generator
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen.template", "P=$(PREFIX),PORT=$(PORT),WGEN_POINTS=$(WGEN_POINTS)")
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen1,PORT=$(PORT),ADDR=0")

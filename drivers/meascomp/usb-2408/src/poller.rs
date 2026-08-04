@@ -44,6 +44,9 @@ struct PollSnapshot {
     wave_dig_running: bool,
     wave_dig_current_point: usize,
     wave_dig_just_stopped: bool,
+    /// Array callbacks for the digitized data, built while the state lock is
+    /// held and pushed after it is released.
+    wave_dig_arrays: Vec<ParamSetValue>,
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
     ai_volts: [Option<f64>; MAX_ANALOG_IN],
@@ -115,6 +118,9 @@ fn poller_loop(
                     }
                     snap.wave_dig_running = st.wave_dig.running;
                     snap.wave_dig_just_stopped = wd_was_running && !st.wave_dig.running;
+                    if snap.wave_dig_just_stopped {
+                        snap.wave_dig_arrays = wave_dig::waveform_updates(&params, &st.wave_dig);
+                    }
 
                     if !st.wave_dig.running {
                         for ch in 0..MAX_ANALOG_IN {
@@ -206,6 +212,9 @@ fn poller_loop(
             );
             if snapshot.wave_dig_just_stopped {
                 let _ = handle.write_int32_blocking(params.wave_dig_run, 0, 0);
+                // The scan is complete: hand the acquired points to the
+                // waveform records, as C stopWaveDig does through readWaveDig.
+                let _ = handle.set_params_and_notify_blocking(0, snapshot.wave_dig_arrays.clone());
             }
         } else {
             for ch in 0..MAX_ANALOG_IN {

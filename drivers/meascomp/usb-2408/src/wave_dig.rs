@@ -1,5 +1,7 @@
 use std::time::SystemTime;
 
+use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::request::ParamSetValue;
 use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
@@ -16,8 +18,8 @@ pub struct WaveDigState {
     pub auto_restart: bool,
     /// Scan buffer (f64, allocated by ulAInScan).
     pub scan_buffer: Vec<f64>,
-    /// Per-channel waveform data [channel][point].
-    pub channel_buffers: Vec<Vec<f32>>,
+    /// Per-channel waveform data [channel][point], in volts.
+    pub channel_buffers: Vec<Vec<f64>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
     /// Time waveform per point.
@@ -33,7 +35,7 @@ impl WaveDigState {
     pub fn new(max_points: usize) -> Self {
         let mut channel_buffers = Vec::with_capacity(MAX_ANALOG_IN);
         for _ in 0..MAX_ANALOG_IN {
-            channel_buffers.push(vec![0.0f32; max_points]);
+            channel_buffers.push(vec![0.0f64; max_points]);
         }
         Self {
             running: false,
@@ -194,8 +196,7 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
         for j in 0..n_chans {
             let ch = state.first_chan + j;
             if ch < MAX_ANALOG_IN {
-                state.channel_buffers[ch][state.current_point] =
-                    state.scan_buffer[buf_offset + j] as f32;
+                state.channel_buffers[ch][state.current_point] = state.scan_buffer[buf_offset + j];
             }
         }
         state.abs_time_buffer[state.current_point] = now;
@@ -263,4 +264,42 @@ fn current_time_secs() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Array callbacks carrying the digitized data: WAVEDIG_VOLT_WF for each
+/// scanned channel plus the absolute time base, both truncated to the points
+/// actually acquired. C `MultiFunction::readWaveDig`.
+///
+/// Returned rather than applied so the actor thread (a WAVEDIG_READ_WF write)
+/// and the poller thread can each push them through their own owner.
+pub fn waveform_updates(params: &MultiFunctionParams, state: &WaveDigState) -> Vec<ParamSetValue> {
+    let n = state.current_point.min(state.num_points);
+    let mut updates = Vec::with_capacity(state.num_chans + 1);
+    for j in 0..state.num_chans {
+        let ch = state.first_chan + j;
+        if ch < MAX_ANALOG_IN {
+            updates.push(ParamSetValue::new(
+                params.wave_dig_volt_wf,
+                ch as i32,
+                ParamValue::Float64Array(state.channel_buffers[ch][..n].into()),
+            ));
+        }
+    }
+    updates.push(ParamSetValue::new(
+        params.wave_dig_abs_time_wf,
+        0,
+        ParamValue::Float64Array(state.abs_time_buffer[..n].into()),
+    ));
+    updates
+}
+
+/// Array callback for the dwell-derived time base. C
+/// `MultiFunction::computeWaveDigTimes`.
+pub fn time_wf_update(params: &MultiFunctionParams, state: &WaveDigState) -> ParamSetValue {
+    let n = state.num_points.min(state.time_buffer.len());
+    ParamSetValue::new(
+        params.wave_dig_time_wf,
+        0,
+        ParamValue::Float32Array(state.time_buffer[..n].into()),
+    )
 }

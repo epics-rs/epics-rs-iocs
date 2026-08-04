@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -114,6 +115,27 @@ impl MultiFunctionDriver {
 }
 
 impl MultiFunctionDriver {
+    /// Apply array (or scalar) updates built by the wave_dig/wave_gen helpers.
+    ///
+    /// The poller pushes the same list through
+    /// `set_params_and_notify_blocking`; on the actor thread that call would
+    /// be a self-deadlock, so the store is written directly instead.
+    fn apply_updates(&mut self, updates: Vec<ParamSetValue>) {
+        for update in updates {
+            let ParamSetValue::Value {
+                reason,
+                addr,
+                value,
+            } = update
+            else {
+                continue;
+            };
+            if let Err(e) = self.base.params.set_value(reason, addr, value) {
+                log::error!("waveform callback error: {e}");
+            }
+        }
+    }
+
     /// Push THERMOCOUPLE_TYPE and THERMOCOUPLE_OPEN_DETECT for `chan` to the
     /// device.
     ///
@@ -181,6 +203,11 @@ impl PortDriver for MultiFunctionDriver {
         };
 
         self.base.params.set_int32(reason, addr, value)?;
+
+        // Collected under the state lock, applied after it is dropped: both
+        // helpers borrow the driver, and apply_updates needs it mutably.
+        let mut wave_arrays: Vec<ParamSetValue> = Vec::new();
+        let mut time_wf: Option<ParamSetValue> = None;
 
         if reason == self.params.counter_reset && value != 0 {
             let dev = self.device.lock().unwrap();
@@ -324,9 +351,15 @@ impl PortDriver for MultiFunctionDriver {
                         0,
                         st.wave_dig.dwell_actual * num_points as f64,
                     )?;
+                    time_wf = Some(wave_dig::time_wf_update(&self.params, &st.wave_dig));
                 }
             } else {
                 wave_dig::stop_wave_dig(&dev, &mut st.wave_dig);
+            }
+        } else if reason == self.params.wave_dig_read_wf {
+            if value != 0 {
+                let st = self.state.lock().unwrap();
+                wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig);
             }
         } else if reason == self.params.wave_gen_run {
             let dev = self.device.lock().unwrap();
@@ -424,6 +457,11 @@ impl PortDriver for MultiFunctionDriver {
                 wave_gen::stop_wave_gen(&dev, &mut st.wave_gen);
             }
         }
+
+        if let Some(update) = time_wf {
+            wave_arrays.push(update);
+        }
+        self.apply_updates(wave_arrays);
 
         self.base.call_param_callbacks(addr)?;
         Ok(())

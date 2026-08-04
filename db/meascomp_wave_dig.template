@@ -97,3 +97,48 @@ record(bo, "$(P)WaveDigBurstMode") {
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
+
+record(bo, "$(P)WaveDigRetrigger") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_RETRIGGER")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)WaveDigTriggerCount") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_TRIGGER_COUNT")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+# Time base, recomputed by the driver whenever a scan starts.
+record(waveform, "$(P)WaveDigTimeWF") {
+    field(DTYP, "asynFloat32ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEDIG_TIME_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(WDIG_POINTS=2048)")
+    field(SCAN, "I/O Intr")
+}
+
+record(waveform, "$(P)WaveDigAbsTimeWF") {
+    field(DTYP, "asynFloat64ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEDIG_ABS_TIME_WF")
+    field(FTVL, "DOUBLE")
+    field(NELM, "$(WDIG_POINTS=2048)")
+    field(SCAN, "I/O Intr")
+}
+
+# Hand the points acquired so far to the VoltWF records. The driver does this
+# by itself when a scan completes, so this is only needed to watch a scan in
+# progress; SDIS keeps it from polling while stopped.
+record(bo, "$(P)WaveDigReadWF") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_READ_WF")
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(SCAN, "1 second")
+    field(SDIS, "$(P)WaveDigRun")
+    field(DISV, "0")
+}

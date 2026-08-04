@@ -1,0 +1,10 @@
+# Digitized data for one waveform-digitizer channel.
+# Macros: P (prefix), R (record name), PORT (asyn port), ADDR (channel),
+#         WDIG_POINTS (buffer capacity)
+record(waveform, "$(P)$(R)VoltWF") {
+    field(DTYP, "asynFloat64ArrayIn")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)WAVEDIG_VOLT_WF")
+    field(FTVL, "DOUBLE")
+    field(NELM, "$(WDIG_POINTS=2048)")
+    field(SCAN, "I/O Intr")
+}
