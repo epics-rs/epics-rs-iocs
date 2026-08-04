@@ -99,6 +99,47 @@ impl MultiFunctionDriver {
     }
 }
 
+impl MultiFunctionDriver {
+    /// Push THERMOCOUPLE_TYPE and THERMOCOUPLE_OPEN_DETECT for `chan` to the
+    /// device.
+    ///
+    /// ulAISetConfig rejects both with ERR_BAD_AI_CHAN_TYPE unless the channel
+    /// is already configured as a thermocouple input, so this is a no-op while
+    /// the channel reads volts and every caller must come back through here
+    /// once ANALOG_IN_TYPE switches it to TC.
+    fn apply_tc_config(&self, dev: &DaqDevice, chan: i32) {
+        if self
+            .base
+            .get_int32_param(self.params.analog_in_type, chan)
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        if let Ok(tc) = self
+            .base
+            .get_int32_param(self.params.thermocouple_type, chan)
+            && let Err(e) =
+                dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TC_TYPE, chan as u32, tc as i64)
+        {
+            log::error!("ai_set_config tc_type error: {e}");
+        }
+        if let Ok(detect) = self
+            .base
+            .get_int32_param(self.params.thermocouple_open_detect, chan)
+        {
+            let otd = if detect != 0 {
+                uldaq_sys::OTD_ENABLED
+            } else {
+                uldaq_sys::OTD_DISABLED
+            };
+            if let Err(e) = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_OTD_MODE, chan as u32, otd) {
+                log::error!("ai_set_config otd error: {e}");
+            }
+        }
+    }
+}
+
 impl PortDriver for MultiFunctionDriver {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -183,24 +224,17 @@ impl PortDriver for MultiFunctionDriver {
             };
             if let Err(e) = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, chan_type) {
                 log::error!("ai_set_config chan_type error: {e}");
+            } else if value != 0 {
+                // The channel has just become a thermocouple input; the TC type
+                // and open-detect settings the records already hold could not be
+                // pushed while it was a voltage channel, so push them now.
+                self.apply_tc_config(&dev, addr);
             }
-        } else if reason == self.params.thermocouple_type {
+        } else if reason == self.params.thermocouple_type
+            || reason == self.params.thermocouple_open_detect
+        {
             let dev = self.device.lock().unwrap();
-            if let Err(e) =
-                dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TC_TYPE, addr as u32, value as i64)
-            {
-                log::error!("ai_set_config tc_type error: {e}");
-            }
-        } else if reason == self.params.thermocouple_open_detect {
-            let dev = self.device.lock().unwrap();
-            let otd = if value != 0 {
-                uldaq_sys::OTD_ENABLED
-            } else {
-                uldaq_sys::OTD_DISABLED
-            };
-            if let Err(e) = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_OTD_MODE, addr as u32, otd) {
-                log::error!("ai_set_config otd error: {e}");
-            }
+            self.apply_tc_config(&dev, addr);
         } else if reason == self.params.wave_dig_run {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
