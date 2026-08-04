@@ -1,11 +1,14 @@
 # Waveform digitizer control records
 # Macros: P (prefix), PORT (asyn port)
 
-record(bo, "$(P)WaveDigRun") {
+# busy + asyn:READBACK so the record follows the driver: a one-shot scan
+# stops by itself and a client waiting on Run must see it clear.
+record(busy, "$(P)WaveDigRun") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_RUN")
     field(ZNAM, "Stop")
     field(ONAM, "Run")
+    info(asyn:READBACK, "1")
 }
 
 record(longout, "$(P)WaveDigNumPoints") {
