@@ -9,7 +9,7 @@ use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
 
 use realsense_rust::config::Config;
@@ -125,29 +125,29 @@ fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot
 
     // Color sensor options (exposure, gain, auto-exposure)
     let color_frames: Vec<ColorFrame> = composite.frames_of_type();
-    if let Some(color_frame) = color_frames.first() {
-        if let Ok(mut sensor) = FrameEx::sensor(color_frame) {
-            if config.auto_exposure {
-                let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 1.0);
-            } else {
-                let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 0.0);
-                let _ = sensor.set_option(Rs2Option::Exposure, config.exposure as f32);
-                let _ = sensor.set_option(Rs2Option::Gain, config.gain as f32);
-            }
+    if let Some(color_frame) = color_frames.first()
+        && let Ok(mut sensor) = FrameEx::sensor(color_frame)
+    {
+        if config.auto_exposure {
+            let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 1.0);
+        } else {
+            let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 0.0);
+            let _ = sensor.set_option(Rs2Option::Exposure, config.exposure as f32);
+            let _ = sensor.set_option(Rs2Option::Gain, config.gain as f32);
         }
     }
 
     // Depth sensor options (emitter, laser power)
     let depth_frames: Vec<DepthFrame> = composite.frames_of_type();
-    if let Some(depth_frame) = depth_frames.first() {
-        if let Ok(mut sensor) = FrameEx::sensor(depth_frame) {
-            let _ = sensor.set_option(
-                Rs2Option::EmitterEnabled,
-                if config.emitter_enabled { 1.0 } else { 0.0 },
-            );
-            if config.emitter_enabled {
-                let _ = sensor.set_option(Rs2Option::LaserPower, config.laser_power as f32);
-            }
+    if let Some(depth_frame) = depth_frames.first()
+        && let Ok(mut sensor) = FrameEx::sensor(depth_frame)
+    {
+        let _ = sensor.set_option(
+            Rs2Option::EmitterEnabled,
+            if config.emitter_enabled { 1.0 } else { 0.0 },
+        );
+        if config.emitter_enabled {
+            let _ = sensor.set_option(Rs2Option::LaserPower, config.laser_power as f32);
         }
     }
 }
@@ -156,39 +156,38 @@ async fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame
     use realsense_rust::frame::FrameEx;
 
     let color_frames: Vec<ColorFrame> = composite.frames_of_type();
-    if let Some(color_frame) = color_frames.first() {
-        if let Ok(sensor) = FrameEx::sensor(color_frame) {
-            if let Ok(device) = sensor.device() {
-                if let Some(serial) = device.info(Rs2CameraInfo::SerialNumber) {
-                    let s = serial.to_string_lossy().into_owned();
-                    write_string(
-                        &ctx.color_handle,
-                        ctx.color_ad.base.serial_number,
-                        0,
-                        s.clone(),
-                    )
-                    .await;
-                    write_string(&ctx.color_handle, ctx.rs_params.rs_serial, 0, s).await;
-                }
-                if let Some(fw) = device.info(Rs2CameraInfo::FirmwareVersion) {
-                    write_string(
-                        &ctx.color_handle,
-                        ctx.color_ad.base.firmware_version,
-                        0,
-                        fw.to_string_lossy().into_owned(),
-                    )
-                    .await;
-                }
-                if let Some(name) = device.info(Rs2CameraInfo::Name) {
-                    write_string(
-                        &ctx.color_handle,
-                        ctx.color_ad.base.model,
-                        0,
-                        name.to_string_lossy().into_owned(),
-                    )
-                    .await;
-                }
-            }
+    if let Some(color_frame) = color_frames.first()
+        && let Ok(sensor) = FrameEx::sensor(color_frame)
+        && let Ok(device) = sensor.device()
+    {
+        if let Some(serial) = device.info(Rs2CameraInfo::SerialNumber) {
+            let s = serial.to_string_lossy().into_owned();
+            write_string(
+                &ctx.color_handle,
+                ctx.color_ad.base.serial_number,
+                0,
+                s.clone(),
+            )
+            .await;
+            write_string(&ctx.color_handle, ctx.rs_params.rs_serial, 0, s).await;
+        }
+        if let Some(fw) = device.info(Rs2CameraInfo::FirmwareVersion) {
+            write_string(
+                &ctx.color_handle,
+                ctx.color_ad.base.firmware_version,
+                0,
+                fw.to_string_lossy().into_owned(),
+            )
+            .await;
+        }
+        if let Some(name) = device.info(Rs2CameraInfo::Name) {
+            write_string(
+                &ctx.color_handle,
+                ctx.color_ad.base.model,
+                0,
+                name.to_string_lossy().into_owned(),
+            )
+            .await;
         }
     }
 }
@@ -215,7 +214,7 @@ fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usi
 /// Publish an NDArray through a port handle, updating counters and metadata.
 async fn publish_array(
     handle: &PortHandle,
-    output: &parking_lot::Mutex<NDArrayOutput>,
+    output: &Arc<parking_lot::Mutex<NDArrayOutput>>,
     base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     array: NDArray,
     color_mode: NDColorMode,
@@ -286,9 +285,13 @@ async fn publish_array(
         )
         .await;
 
-    // Hold the parking_lot guard across .await: safe on a current-thread runtime
-    // with no concurrent tasks — no other task will try to re-acquire the lock.
-    output.lock().publish(Arc::new(array)).await;
+    // ArrayPublisher is the API for exactly this: it snapshots the sender
+    // list under the lock, releases it, then fans out. Holding a parking_lot
+    // guard across the await would block the whole executor thread the moment
+    // a downstream queue applies back-pressure.
+    ArrayPublisher::new(output.clone())
+        .publish(Arc::new(array))
+        .await;
 }
 
 async fn process_color_frame(
