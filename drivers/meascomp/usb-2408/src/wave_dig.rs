@@ -185,7 +185,7 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
         return;
     }
 
-    let last_point = ((xfer.current_index as usize + 1) / n_chans).min(state.num_points);
+    let last_point = (xfer.current_index as usize / n_chans + 1).min(state.num_points);
     let now = current_time_secs();
 
     // Copy new data
