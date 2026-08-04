@@ -13,9 +13,14 @@ epicsEnvSet("PORT",       "RS1")
 epicsEnvSet("DEPTH_PORT", "$(PORT)_DEPTH")
 epicsEnvSet("PC_PORT",    "$(PORT)_PC")
 epicsEnvSet("QSIZE",      "20")
-epicsEnvSet("XSIZE",      "640")
-epicsEnvSet("YSIZE",      "480")
+# Largest frame the camera can deliver. This is the driver's MaxSizeX/MaxSizeY
+# and the size the plugins' profile arrays are allocated for -- not the stream
+# mode in use, which RSStreamMode selects at runtime (default 640x480).
+epicsEnvSet("XSIZE",      "1280")
+epicsEnvSet("YSIZE",      "720")
 epicsEnvSet("NCHANS",     "2048")
+# Bins in the NDStats histogram array.
+epicsEnvSet("HIST_SIZE",  "256")
 epicsEnvSet("CBUFFS",     "500")
 
 # NELEMENTS sizing for the three NDStdArrays output waveforms.
