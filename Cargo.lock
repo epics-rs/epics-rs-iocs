@@ -1031,6 +1031,7 @@ version = "0.1.0"
 dependencies = [
  "ad-plugins-rs",
  "d435i",
+ "env_logger",
  "epics-rs",
  "tokio",
 ]
