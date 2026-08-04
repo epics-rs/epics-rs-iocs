@@ -4,45 +4,17 @@
 include "ADBase.template"
 
 # ===== D435i Stream config =====
-# Valid modes: intersection of Color(RGB8) and Depth(Z16) capabilities.
+# No state fields on RSStreamMode: the driver serves the enum through asynEnum,
+# built from the modes the attached camera reports for Color(RGB8) and
+# Depth(Z16) both. A fixed table offered a D405 modes it rejects.
 record(mbbo, "$(P)$(R)RSStreamMode") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_STREAM_MODE")
-    field(ZRST, "424x240 @ 15fps")  field(ZRVL, "0")
-    field(ONST, "424x240 @ 30fps")  field(ONVL, "1")
-    field(TWST, "424x240 @ 60fps")  field(TWVL, "2")
-    field(THST, "640x360 @ 15fps")  field(THVL, "3")
-    field(FRST, "640x360 @ 30fps")  field(FRVL, "4")
-    field(FVST, "640x360 @ 60fps")  field(FVVL, "5")
-    field(SXST, "640x480 @ 15fps")  field(SXVL, "6")
-    field(SVST, "640x480 @ 30fps")  field(SVVL, "7")
-    field(EIST, "640x480 @ 60fps")  field(EIVL, "8")
-    field(NIST, "848x480 @ 15fps")  field(NIVL, "9")
-    field(TEST, "848x480 @ 30fps")  field(TEVL, "10")
-    field(ELST, "848x480 @ 60fps")  field(ELVL, "11")
-    field(TVST, "1280x720 @ 6fps")  field(TVVL, "12")
-    field(TTST, "1280x720 @ 15fps")  field(TTVL, "13")
-    field(FTST, "1280x720 @ 30fps")  field(FTVL, "14")
 }
 
 record(mbbi, "$(P)$(R)RSStreamMode_RBV") {
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_STREAM_MODE")
-    field(ZRST, "424x240 @ 15fps")  field(ZRVL, "0")
-    field(ONST, "424x240 @ 30fps")  field(ONVL, "1")
-    field(TWST, "424x240 @ 60fps")  field(TWVL, "2")
-    field(THST, "640x360 @ 15fps")  field(THVL, "3")
-    field(FRST, "640x360 @ 30fps")  field(FRVL, "4")
-    field(FVST, "640x360 @ 60fps")  field(FVVL, "5")
-    field(SXST, "640x480 @ 15fps")  field(SXVL, "6")
-    field(SVST, "640x480 @ 30fps")  field(SVVL, "7")
-    field(EIST, "640x480 @ 60fps")  field(EIVL, "8")
-    field(NIST, "848x480 @ 15fps")  field(NIVL, "9")
-    field(TEST, "848x480 @ 30fps")  field(TEVL, "10")
-    field(ELST, "848x480 @ 60fps")  field(ELVL, "11")
-    field(TVST, "1280x720 @ 6fps")  field(TVVL, "12")
-    field(TTST, "1280x720 @ 15fps")  field(TTVL, "13")
-    field(FTST, "1280x720 @ 30fps")  field(FTVL, "14")
     field(SCAN, "I/O Intr")
 }
 

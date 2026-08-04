@@ -63,7 +63,7 @@ pub struct D435iParams {
 impl D435iParams {
     pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
-            rs_stream_mode: base.create_param("RS_STREAM_MODE", ParamType::Int32)?,
+            rs_stream_mode: base.create_param("RS_STREAM_MODE", ParamType::Enum)?,
             rs_res_x: base.create_param("RS_RES_X", ParamType::Int32)?,
             rs_res_y: base.create_param("RS_RES_Y", ParamType::Int32)?,
             rs_frame_rate: base.create_param("RS_FRAME_RATE", ParamType::Int32)?,
