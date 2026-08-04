@@ -126,25 +126,32 @@ fn poller_loop(
                     if !st.wave_dig.running {
                         for ch in 0..MAX_ANALOG_IN {
                             let ch_i = ch as i32;
-                            match dev.analog_in(
-                                ch_i,
-                                input_mode,
-                                in_ranges[ch],
-                                uldaq_sys::AIN_FF_NOSCALEDATA,
-                            ) {
-                                Ok(raw) => snap.ai_raw[ch] = Some(raw as i32),
-                                Err(e) => snap.errors.push(format!("AIn({ch}): {e}")),
-                            }
-                            match dev.analog_in(
-                                ch_i,
-                                input_mode,
-                                in_ranges[ch],
-                                uldaq_sys::AIN_FF_DEFAULT,
-                            ) {
-                                Ok(volts) => snap.ai_volts[ch] = Some(volts),
-                                Err(e) => snap.errors.push(format!("AIn scaled({ch}): {e}")),
-                            }
-                            if in_types[ch] != 0 {
+                            // One call per channel, chosen by its configured
+                            // type: ulAIn rejects a thermocouple channel with
+                            // ERR_BAD_RANGE and ulTIn rejects a voltage one.
+                            // C drvMultiFunction skips each the same way.
+                            if in_types[ch] == 0 {
+                                match dev.analog_in(
+                                    ch_i,
+                                    input_mode,
+                                    in_ranges[ch],
+                                    uldaq_sys::AIN_FF_NOSCALEDATA,
+                                ) {
+                                    Ok(raw) => snap.ai_raw[ch] = Some(raw as i32),
+                                    Err(e) => snap.errors.push(format!("AIn({ch}): {e}")),
+                                }
+                                match dev.analog_in(
+                                    ch_i,
+                                    input_mode,
+                                    in_ranges[ch],
+                                    uldaq_sys::AIN_FF_DEFAULT,
+                                ) {
+                                    Ok(volts) => snap.ai_volts[ch] = Some(volts),
+                                    Err(e) => snap.errors.push(format!("AIn scaled({ch}): {e}")),
+                                }
+                            } else {
+                                // An open or broken thermocouple is expected,
+                                // not an error: ulTIn reports it as -9999.
                                 match dev.temperature_in(
                                     ch_i,
                                     tc_scales[ch],
@@ -152,7 +159,7 @@ fn poller_loop(
                                 ) {
                                     Ok(temp) => snap.ai_temp[ch] = Some(temp),
                                     Err(e) => {
-                                        if e.code == uldaq_sys::ERR_TEMP_OUT_OF_RANGE {
+                                        if e.code == uldaq_sys::ERR_OPEN_CONNECTION {
                                             snap.ai_temp[ch] = Some(-9999.0);
                                         } else {
                                             snap.errors.push(format!("TIn({ch}): {e}"));
