@@ -1,37 +1,37 @@
 record(stringin, "$(P)ModelName") {
     field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0,1.0)MODEL_NAME")
-    field(SCAN, "I/O Intr")
+    field(PINI, "YES")
 }
 
 record(longin, "$(P)ModelNumber") {
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),0,1.0)MODEL_NUMBER")
-    field(SCAN, "I/O Intr")
+    field(PINI, "YES")
 }
 
 record(stringin, "$(P)FirmwareVersion") {
     field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0,1.0)FIRMWARE_VERSION")
-    field(SCAN, "I/O Intr")
+    field(PINI, "YES")
 }
 
 record(stringin, "$(P)UniqueID") {
     field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0,1.0)UNIQUE_ID")
-    field(SCAN, "I/O Intr")
+    field(PINI, "YES")
 }
 
 record(stringin, "$(P)ULVersion") {
     field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0,1.0)UL_VERSION")
-    field(SCAN, "I/O Intr")
+    field(PINI, "YES")
 }
 
 record(stringin, "$(P)DriverVersion") {
     field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0,1.0)DRIVER_VERSION")
-    field(SCAN, "I/O Intr")
+    field(PINI, "YES")
 }
 
 record(ai, "$(P)PollTimeMS") {
