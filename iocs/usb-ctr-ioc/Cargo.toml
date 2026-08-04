@@ -9,3 +9,4 @@ usb-ctr = { path = "../../drivers/meascomp/usb-ctr" }
 epics-rs = { workspace = true, features = ["asyn", "scaler", "bridge"] }
 asyn-rs = { workspace = true, features = ["epics"] }
 tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
