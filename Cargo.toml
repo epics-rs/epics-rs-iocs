@@ -156,21 +156,23 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.25.2 (released): ports consume the released version instead of
-# the main branch; bumped 0.24.3 -> 0.25.2. Breaking across that range:
-# `create_port_runtime` became fallible (a port whose actor thread the OS
-# refuses is now an error rather than a handle to a port that can never run
-# a request), `CommandContext::runtime_handle` was replaced by `bridge()`
-# so iocsh commands spawn on either async backend, and
-# `PvaClient::pvmonitor_handle` gained an `on_conn` callback.
-# Cargo.lock pins the exact patch release.
-epics-rs = "0.25.2"
-asyn-rs = "0.25.2"
-ad-core-rs = "0.25.2"
-ad-plugins-rs = "0.25.2"
+# epics-rs 0.25.4 (released): ports consume the released version instead of
+# the main branch. 0.24.3 -> 0.25.2 was the breaking step and the code here
+# already carries it: `create_port_runtime` became fallible (a port whose
+# actor thread the OS refuses is now an error rather than a handle to a port
+# that can never run a request), `CommandContext::runtime_handle` was
+# replaced by `bridge()` so iocsh commands spawn on either async backend,
+# and `PvaClient::pvmonitor_handle` gained an `on_conn` callback. 0.25.3 and
+# 0.25.4 are patch releases with no API change: UDP/IPv6 SEARCH sockets on
+# the embedded targets, and on the CA server an ENOBUFS retry plus a bounded
+# monitor outbox. Cargo.lock pins the exact patch release.
+epics-rs = "0.25.4"
+asyn-rs = "0.25.4"
+ad-core-rs = "0.25.4"
+ad-plugins-rs = "0.25.4"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.25.2", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.25.4", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.25.2"
+mca-rs = "0.25.4"
