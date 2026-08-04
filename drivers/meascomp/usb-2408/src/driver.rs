@@ -455,7 +455,8 @@ pub fn create_usb_2408(
     let device = driver.device.clone();
     let state = driver.state.clone();
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+        .map_err(|e| format!("failed to create the USB-2408 port runtime: {e}"))?;
 
     let poller_handle = poller::start_poller(
         runtime_handle.port_handle().clone(),

@@ -200,7 +200,9 @@ async fn main() -> CaResult<()> {
                     .map_err(|e| format!("DG645Config: failed to initialize {my_port}: {e}"))?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                        format!("DG645Config: failed to create the {my_port} port runtime: {e}")
+                    })?;
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
@@ -275,7 +277,9 @@ async fn main() -> CaResult<()> {
                     .map_err(|e| format!("ColbyConfig: failed to initialize {my_port}: {e}"))?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                        format!("ColbyConfig: failed to create the {my_port} port runtime: {e}")
+                    })?;
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
@@ -333,7 +337,11 @@ async fn main() -> CaResult<()> {
                 })?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                        format!(
+                            "CoherentSdgConfig: failed to create the {my_port} port runtime: {e}"
+                        )
+                    })?;
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),

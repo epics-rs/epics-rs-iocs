@@ -82,9 +82,17 @@ async fn try_connect(
 
     let frame_tx = event_tx;
     let subscription = match client
-        .pvmonitor_handle(pv_name, move |_desc, value| {
-            let _ = frame_tx.try_send(PvaEvent::Frame(value.clone()));
-        })
+        .pvmonitor_handle(
+            pv_name,
+            move |_desc, value| {
+                let _ = frame_tx.try_send(PvaEvent::Frame(value.clone()));
+            },
+            // The subscription's own connect/disconnect transitions are not a
+            // second source here: `PVAPvConnectionStatus` is driven by the
+            // channel watcher above, as C++ `pvaDriver` drives it from the
+            // channel and not from `m_monitor`.
+            |_| {},
+        )
         .await
     {
         Ok(sub) => sub,

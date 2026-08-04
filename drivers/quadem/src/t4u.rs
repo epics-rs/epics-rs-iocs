@@ -1285,7 +1285,7 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
     let t4u = driver.t4u;
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let regs = RegSink {

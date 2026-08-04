@@ -115,8 +115,15 @@ async fn main() -> CaResult<()> {
                     format!("CapaNCDT6200ConfigInit: failed to initialize {cfg_port}: {e}")
                 })?;
 
-                let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                let (runtime_handle, _actor_jh) = create_port_runtime(
+                    driver,
+                    RuntimeConfig::default(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "CapaNCDT6200ConfigInit: failed to create the {cfg_port} port runtime: {e}"
+                    )
+                })?;
                 asyn_record::register_port(
                     &cfg_port,
                     runtime_handle.port_handle().clone(),

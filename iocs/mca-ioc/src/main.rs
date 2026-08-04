@@ -189,7 +189,9 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("initFastSweep: {e}"))?;
                 let (runtime_handle, _actor) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                        format!("initFastSweep: failed to create the {port_name} port runtime: {e}")
+                    })?;
                 mca::fastsweep::start(runtime_handle.port_handle().clone(), subscriptions);
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,

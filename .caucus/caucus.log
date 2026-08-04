@@ -1,0 +1,5 @@
+2026-07-10T10:05:46.877194Z  WARN caucus::input: the outer tmux uses Ctrl-A as its own prefix; caucus commands moved to Ctrl-B (pin one with --prefix / CAUCUS_PREFIX / `[settings] prefix`)
+2026-07-12T10:52:45.429983Z  WARN caucus::input: the outer tmux uses Ctrl-A as its own prefix; caucus commands moved to Ctrl-B (pin one with --prefix / CAUCUS_PREFIX / `[settings] prefix`)
+2026-07-14T21:14:39.727637Z  WARN caucus::input: the outer tmux uses Ctrl-A as its own prefix; caucus commands moved to Ctrl-B (pin one with --prefix / CAUCUS_PREFIX / `[settings] prefix`)
+2026-07-18T13:07:41.594742Z  WARN caucus::session::runtime::spawn: refusing to close the main worker panel panel=01KXH7PQ7VFT5CYQNHZBKJKH1N
+2026-07-20T04:14:16.869041Z  WARN caucus::input: the outer tmux uses Ctrl-A as its own prefix; caucus commands moved to Ctrl-B (pin one with --prefix / CAUCUS_PREFIX / `[settings] prefix`)

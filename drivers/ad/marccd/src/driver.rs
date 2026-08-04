@@ -271,7 +271,8 @@ pub fn create_marccd_detector(
     let marccd_params = driver.p;
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())
+        .map_err(|e| format!("failed to create the marCCD port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());

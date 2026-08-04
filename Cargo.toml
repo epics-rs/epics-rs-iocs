@@ -156,17 +156,18 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.24.3 (released): ports consume the released version instead of
-# the main branch; bumped 0.24.2 -> 0.24.3 (0.24.3 adds the dbLoadTemplate
-# iocsh command, PR #47, plus histogram/CA-clamp/asyn-escape parity fixes).
-# Cargo.lock pins the exact patch release.
-epics-rs = "0.24.3"
-asyn-rs = "0.24.3"
-ad-core-rs = "0.24.3"
-ad-plugins-rs = "0.24.3"
+# epics-rs 0.25.4 (released): ports consume the released version instead of
+# the main branch; bumped 0.24.3 -> 0.25.4, which crosses the 0.25.0 minor.
+# 0.25.x adds the RTEMS/VxWorks embedded targets, the UDP SEARCH and IPv6
+# SEARCH sockets on every backend, and on the CA server an ENOBUFS retry plus
+# a bounded monitor outbox. Cargo.lock pins the exact patch release.
+epics-rs = "0.25.4"
+asyn-rs = "0.25.4"
+ad-core-rs = "0.25.4"
+ad-plugins-rs = "0.25.4"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.24.3", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.25.4", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.24.3"
+mca-rs = "0.25.4"

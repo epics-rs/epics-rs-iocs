@@ -419,7 +419,10 @@ pub fn pmac_asyn_ip_configure_command(trace: Arc<TraceManager>) -> CommandDef {
             driver.install_interpose(Box::new(EosInterpose::default()));
             driver.install_interpose(Box::new(PmacIpInterpose::new()));
 
-            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default());
+            let (handle, _jh) =
+                create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                    format!("pmacAsynIPConfigure: failed to create the {port} port runtime: {e}")
+                })?;
             epics_rs::asyn::asyn_record::register_port(
                 &port,
                 handle.port_handle().clone(),

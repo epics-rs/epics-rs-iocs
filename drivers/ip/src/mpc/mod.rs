@@ -27,7 +27,7 @@ pub fn create_mpc(
     let (driver, commands) = MpcDriver::new(port_name, address)?;
     let params = driver.params();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let worker = MpcWorker::new(
         Transport::new(io),
         runtime_handle.port_handle().clone(),

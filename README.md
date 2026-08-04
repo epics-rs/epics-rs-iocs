@@ -8,7 +8,7 @@ IOC applications — Rust ports of the EPICS device-driver modules. Each
 device driver is an independent library crate under `drivers/`, and each
 IOC binary lives under `iocs/`. The workspace currently holds **67 driver
 crates** and **82 IOC crates**, all consuming a single pinned epics-rs
-version (**0.24.3**) declared once in the root `Cargo.toml`.
+version (**0.25.4**) declared once in the root `Cargo.toml`.
 
 > **Platform**: Linux is the primary, fully-supported target — every
 > crate builds and is tested there. CI additionally builds and tests the
@@ -44,7 +44,7 @@ same layout under `iocs/`.
 
 ```
 epics-rs-iocs/
-├── Cargo.toml                  # Workspace root — pins epics-rs 0.24.3 for all crates
+├── Cargo.toml                  # Workspace root — pins epics-rs 0.25.4 for all crates
 ├── drivers/
 │   ├── motor/                  # 27 motor-controller drivers + shared `common` crate
 │   │                           #   acs, acsmotion, acstech80, aerotech, amci, attocube,
@@ -1269,7 +1269,7 @@ caput USB2408:WaveDigRun 1
 
 # D435i RealSense areaDetector IOC
 
-An epics-rs 0.24.3 based areaDetector IOC for the Intel RealSense D435i
+An epics-rs 0.25.4 based areaDetector IOC for the Intel RealSense D435i
 camera. A single pipeline produces three NDArray outputs simultaneously
 (Color RGB8, Depth Z16, optional XYZ Pointcloud) and publishes IMU data
 as PVs.

@@ -560,7 +560,8 @@ mod tests {
         let (serial_runtime, _serial_thread) = create_port_runtime(
             NullTestDriver { base: serial_base },
             RuntimeConfig::default(),
-        );
+        )
+        .expect("serial port runtime");
         RontecDriver {
             base,
             serial: serial_runtime.port_handle().clone(),

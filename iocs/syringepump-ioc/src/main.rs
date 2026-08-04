@@ -246,7 +246,9 @@ async fn main() -> CaResult<()> {
                 let driver = TeledyneDriver::new(&port, handle, Family::D, unit);
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                        format!("TeledyneDInit: failed to create the {port} port runtime: {e}")
+                    })?;
                 epics_rs::asyn::asyn_record::register_port(
                     &port,
                     runtime_handle.port_handle().clone(),
@@ -311,7 +313,9 @@ async fn main() -> CaResult<()> {
                 let driver = TeledyneDriver::new(&port, handle, Family::H, unit);
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                        format!("TeledyneHInit: failed to create the {port} port runtime: {e}")
+                    })?;
                 epics_rs::asyn::asyn_record::register_port(
                     &port,
                     runtime_handle.port_handle().clone(),

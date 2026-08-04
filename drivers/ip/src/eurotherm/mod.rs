@@ -207,7 +207,7 @@ pub fn create_eurotherm(
     let (commands, rx) = channel::<EurothermCommand>();
     let driver = EurothermDriver::new(port_name, group_address, commands)?;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default());
+    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let worker = EurothermWorker {
         transport: Transport::new(io),
     };

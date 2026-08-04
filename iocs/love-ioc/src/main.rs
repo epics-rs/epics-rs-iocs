@@ -186,7 +186,9 @@ async fn main() -> CaResult<()> {
                 love::registry::register(&lov_port, models);
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default());
+                    create_port_runtime(driver, RuntimeConfig::default()).map_err(|e| {
+                        format!("LoveInit: failed to create the {lov_port} port runtime: {e}")
+                    })?;
                 epics_rs::asyn::asyn_record::register_port(
                     &lov_port,
                     runtime_handle.port_handle().clone(),
