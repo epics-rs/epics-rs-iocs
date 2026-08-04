@@ -12,6 +12,8 @@ use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
 
+use std::collections::HashSet;
+
 use realsense_rust::config::Config;
 use realsense_rust::context::Context;
 use realsense_rust::frame::{AccelFrame, ColorFrame, CompositeFrame, DepthFrame, GyroFrame};
@@ -100,7 +102,38 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
     rt::run_thread_named("D435iTask", move || acquisition_loop_async(ctx))
 }
 
-fn build_config(config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
+/// Whether the camera this config targets carries an IMU.
+///
+/// The D435i does; the D405 has no motion sensors at all. `enable_stream` for
+/// a kind the device cannot provide is accepted silently and then makes the
+/// WHOLE config unresolvable -- `pipeline.start` fails with "Config cannot be
+/// resolved by any active devices / stream combinations" and not one frame
+/// arrives, colour or depth included. So ask the device rather than assume the
+/// model.
+///
+/// An empty `serial` means "first device found", which is what the pipeline
+/// itself will pick.
+fn device_has_imu(rs_ctx: &Context, serial: &str) -> bool {
+    let devices = rs_ctx.query_devices(HashSet::new());
+    let device = devices.iter().find(|d| {
+        serial.is_empty()
+            || d.info(Rs2CameraInfo::SerialNumber)
+                .is_some_and(|s| s.to_string_lossy() == serial)
+    });
+    let Some(device) = device else {
+        // Not enumerable right now; let the pipeline report the real error
+        // instead of silently dropping the IMU streams.
+        return true;
+    };
+    device.sensors().iter().any(|sensor| {
+        sensor
+            .stream_profiles()
+            .iter()
+            .any(|profile| matches!(profile.kind(), Rs2StreamKind::Accel | Rs2StreamKind::Gyro))
+    })
+}
+
+fn build_config(rs_ctx: &Context, config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
     let mut cfg = Config::new();
     let w = config.res_x as usize;
     let h = config.res_y as usize;
@@ -108,8 +141,12 @@ fn build_config(config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
 
     cfg.enable_stream(Rs2StreamKind::Color, None, w, h, Rs2Format::Rgb8, fps)?;
     cfg.enable_stream(Rs2StreamKind::Depth, None, w, h, Rs2Format::Z16, fps)?;
-    cfg.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
-    cfg.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
+    if device_has_imu(rs_ctx, &config.serial) {
+        cfg.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
+        cfg.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
+    } else {
+        log::info!("D435i: no IMU on this camera; streaming colour and depth only");
+    }
 
     if !config.serial.is_empty() {
         let serial_cstr = CString::new(config.serial.as_str())
@@ -594,7 +631,7 @@ async fn try_connect_pipeline(
         let result = (|| -> anyhow::Result<_> {
             let rs_ctx = Context::new()?;
             let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
-            let rs_config = build_config(config)?;
+            let rs_config = build_config(&rs_ctx, config)?;
             rs_pipeline.start(Some(rs_config))
         })();
 
@@ -766,7 +803,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 };
 
                 let inactive = pipeline.stop();
-                let new_config = match build_config(&config) {
+                let new_config = match Context::new()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|rs_ctx| build_config(&rs_ctx, &config))
+                {
                     Ok(c) => c,
                     Err(e) => {
                         log::error!("D435i: failed to rebuild config: {e}");
