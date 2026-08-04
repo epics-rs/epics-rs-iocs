@@ -58,6 +58,13 @@ impl CtrDriver {
         // Configure AUXPORT as bit-configurable input by default
         let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
 
+        // Seed DIGITAL_INPUT so the bi records have a value to read at init.
+        // The poller only pushes on a changed bit, and its one forced first
+        // callback happens here -- before dbLoadRecords has run.
+        if let Ok(data) = device.digital_in(uldaq_sys::AUXPORT) {
+            base.set_uint32_param(params.digital_input, 0, data as u32, 0xFFFF_FFFF, 0)?;
+        }
+
         let state = Arc::new(Mutex::new(PollerState {
             scaler: ScalerState::new(),
             mcs: McsState::new(max_time_points),
@@ -191,8 +198,7 @@ impl PortDriver for CtrDriver {
                 let trigger = self.base.get_int32_param(self.params.trigger_mode, 0)? != 0;
                 let enable = self
                     .base
-                    .get_int32_param(self.params.mcs_counter_enable, 0)?
-                    as u32;
+                    .get_uint32_param(self.params.mcs_counter_enable, 0)?;
                 st.mcs.preset_real_time = self
                     .base
                     .get_float64_param(self.params.mca_preset_real, 0)?;

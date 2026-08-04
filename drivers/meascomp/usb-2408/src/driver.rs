@@ -72,6 +72,13 @@ impl MultiFunctionDriver {
         // Configure AUXPORT as input by default
         let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
 
+        // Seed DIGITAL_INPUT so the bi records have a value to read at init.
+        // The poller only pushes on a changed bit, and its one forced first
+        // callback happens here -- before dbLoadRecords has run.
+        if let Ok(data) = device.digital_in(uldaq_sys::AUXPORT) {
+            base.set_uint32_param(params.digital_input, 0, data as u32, 0xFFFF_FFFF, 0)?;
+        }
+
         let state = Arc::new(Mutex::new(PollerState {
             wave_dig: WaveDigState::new(max_input_points),
             wave_gen: WaveGenState::new(max_output_points),

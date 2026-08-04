@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
 
 use meascomp::device::DaqDevice;
 
@@ -169,7 +170,16 @@ fn poller_loop(
             if force_callback || changed != 0 {
                 prev_digital_input = data;
                 force_callback = false;
-                let _ = handle.write_int32_blocking(params.digital_input, 0, data as i32);
+                let _ = handle.set_params_and_notify_blocking(
+                    0,
+                    vec![ParamSetValue::uint32_digital(
+                        params.digital_input,
+                        0,
+                        data as u32,
+                        0xFFFF_FFFF,
+                        0,
+                    )],
+                );
             }
         }
         for (counter, value) in snapshot.counters.iter().enumerate() {
