@@ -262,6 +262,41 @@ impl PortDriver for CtrDriver {
         Ok(n)
     }
 
+    /// MCS time base (seconds from the start of the scan).
+    fn read_float32_array(&mut self, user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
+        if user.reason != self.params.mcs_time_wf {
+            return Ok(0);
+        }
+        // Only the points the scan is configured for, as C
+        // computeMCSTimes' doCallbacksFloat32Array(.., numTimePoints, ..)
+        // does -- a full-length time base against a short spectrum is
+        // unplottable.
+        let num_channels = self
+            .base
+            .get_int32_param(self.params.mca_num_channels, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let st = self.state.lock().unwrap();
+        let n = buf.len().min(st.mcs.time_buffer.len()).min(num_channels);
+        buf[..n].copy_from_slice(&st.mcs.time_buffer[..n]);
+        Ok(n)
+    }
+
+    /// MCS absolute time base (seconds since the epoch, per acquired point).
+    fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
+        if user.reason != self.params.mcs_abs_time_wf {
+            return Ok(0);
+        }
+        let st = self.state.lock().unwrap();
+        // Points actually acquired, as C readMCS reports them.
+        let n = buf
+            .len()
+            .min(st.mcs.abs_time_buffer.len())
+            .min(st.mcs.current_point);
+        buf[..n].copy_from_slice(&st.mcs.abs_time_buffer[..n]);
+        Ok(n)
+    }
+
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let mut last_error: Option<String> = None;
         let reason = user.reason;

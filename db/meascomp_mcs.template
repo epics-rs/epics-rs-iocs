@@ -6,6 +6,7 @@ record(bo, "$(P)MCS:StartAll") {
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_START_ACQUIRE")
     field(ZNAM, "Done")
     field(ONAM, "Start")
+    field(FLNK, "$(P)MCS:SetAcquiring")
 }
 
 record(bo, "$(P)MCS:StopAll") {
@@ -22,12 +23,121 @@ record(bo, "$(P)MCS:EraseAll") {
     field(ONAM, "Erase")
 }
 
-record(bi, "$(P)MCS:Acquiring") {
+# What the driver is doing right now.
+record(bi, "$(P)MCS:HardwareAcquiring") {
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),0,1.0)MCA_ACQUIRING")
     field(SCAN, "I/O Intr")
     field(ZNAM, "Done")
     field(ONAM, "Acquiring")
+    field(FLNK, "$(P)MCS:AcquireDone")
+}
+
+# What a client waits on. Set when acquisition starts and cleared only after
+# the spectra have been re-read, so `caput -c $(P)MCS:EraseStart 1` returns
+# with the data already in the waveform records. Upstream gets this ordering
+# from USBCTR_SNL.st; the same fan-out done in the database needs no
+# sequencer.
+record(busy, "$(P)MCS:Acquiring") {
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+}
+
+# Fires once on the hardware's 1 -> 0 transition.
+record(calcout, "$(P)MCS:AcquireDone") {
+    field(INPA, "$(P)MCS:HardwareAcquiring  NPP NMS")
+    field(CALC, "A")
+    field(OOPT, "Transition To Zero")
+    field(OUT,  "$(P)MCS:DoReadAll  PP")
+}
+
+record(bo, "$(P)MCS:SetAcquiring") {
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+    field(OUT,  "$(P)MCS:Acquiring  PP")
+}
+
+# Erase, mark acquiring, start -- in that order.
+record(seq, "$(P)MCS:EraseStart") {
+    field(SELM, "All")
+    field(DOL1, "1")  field(LNK1, "$(P)MCS:EraseAll  PP")
+    field(DOL2, "1")  field(LNK2, "$(P)MCS:SetAcquiring  PP")
+    field(DOL3, "1")  field(LNK3, "$(P)MCS:StartAll  PP")
+}
+
+# Re-read every spectrum plus the time bases, then release Acquiring.
+record(bo, "$(P)MCS:DoReadAll") {
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(FLNK, "$(P)MCS:ReadFanout")
+}
+
+record(bo, "$(P)MCS:ReadAll") {
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(FLNK, "$(P)MCS:ReadFanout")
+}
+
+record(bo, "$(P)MCS:ReadAllOnce") {
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(FLNK, "$(P)MCS:ReadFanout")
+}
+
+record(fanout, "$(P)MCS:ReadFanout") {
+    field(SELM, "All")
+    field(LNK0, "$(P)MCS:mca1  PP")
+    field(LNK1, "$(P)MCS:mca2  PP")
+    field(LNK2, "$(P)MCS:mca3  PP")
+    field(LNK3, "$(P)MCS:mca4  PP")
+    field(LNK4, "$(P)MCS:mca5  PP")
+    field(LNK5, "$(P)MCS:mca6  PP")
+    field(LNK6, "$(P)MCS:mca7  PP")
+    field(LNK7, "$(P)MCS:mca8  PP")
+    field(LNK8, "$(P)MCS:mca9  PP")
+    field(LNK9, "$(P)MCS:TimeWF  PP")
+    field(LNKA, "$(P)MCS:AbsTimeWF  PP")
+    field(FLNK, "$(P)MCS:ClearAcquiring")
+}
+
+record(bo, "$(P)MCS:ClearAcquiring") {
+    field(VAL,  "0")
+    field(OUT,  "$(P)MCS:Acquiring  PP")
+}
+
+# Time bases, read on demand through the fan-out above.
+record(waveform, "$(P)MCS:TimeWF") {
+    field(DTYP, "asynFloat32ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)MCS_TIME_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(MAX_POINTS=2048)")
+}
+
+record(waveform, "$(P)MCS:AbsTimeWF") {
+    field(DTYP, "asynFloat64ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)MCS_ABS_TIME_WF")
+    field(FTVL, "DOUBLE")
+    field(NELM, "$(MAX_POINTS=2048)")
+}
+
+# A client that needs to be released only after it has consumed the data sets
+# EnableClientWait; ClientWait is then raised with Acquiring and the client
+# clears it when done.
+record(bo, "$(P)MCS:EnableClientWait") {
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+}
+
+record(bo, "$(P)MCS:SetClientWait") {
+    field(VAL,  "1")
+    field(SDIS, "$(P)MCS:EnableClientWait  NPP NMS")
+    field(DISV, "0")
+    field(OUT,  "$(P)MCS:ClientWait  PP")
+}
+
+record(busy, "$(P)MCS:ClientWait") {
+    field(ZNAM, "Done")
+    field(ONAM, "Waiting")
 }
 
 record(ao, "$(P)MCS:Dwell") {
