@@ -83,7 +83,7 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_dig_n.template", "P=$(PREFIX),
 
 # Waveform generator
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen.template", "P=$(PREFIX),PORT=$(PORT),WGEN_POINTS=$(WGEN_POINTS)")
-dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen1,PORT=$(PORT),ADDR=0")
-dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen2,PORT=$(PORT),ADDR=1")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen1,PORT=$(PORT),ADDR=0,WGEN_POINTS=$(WGEN_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen2,PORT=$(PORT),ADDR=1,WGEN_POINTS=$(WGEN_POINTS)")
 
 iocInit()

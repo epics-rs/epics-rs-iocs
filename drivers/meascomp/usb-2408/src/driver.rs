@@ -415,9 +415,20 @@ impl PortDriver for MultiFunctionDriver {
                     let pw = self
                         .base
                         .get_float64_param(self.params.wave_gen_pulse_width, ch)?;
-                    per_chan.push(wave_gen::generate_waveform(
-                        wave_type, num_points, amp, offset, pw,
-                    ));
+                    if wave_type == wave_gen::WAVE_TYPE_USER {
+                        // A user waveform shorter than the scan is repeated;
+                        // an absent one leaves the channel at zero volts.
+                        let user = &st.wave_gen.user_waveforms[ch as usize];
+                        per_chan.push(if user.is_empty() {
+                            vec![0.0; num_points]
+                        } else {
+                            (0..num_points).map(|i| user[i % user.len()]).collect()
+                        });
+                    } else {
+                        per_chan.push(wave_gen::generate_waveform(
+                            wave_type, num_points, amp, offset, pw,
+                        ));
+                    }
                 }
                 // Interleave: [ch0_pt0, ch1_pt0, ch0_pt1, ch1_pt1, ...]
                 let mut waveform = Vec::with_capacity(MAX_ANALOG_OUT * num_points);
@@ -488,6 +499,21 @@ impl PortDriver for MultiFunctionDriver {
         }
 
         self.base.call_param_callbacks(addr)?;
+        Ok(())
+    }
+
+    /// Load a user-defined generator waveform (volts) for one channel.
+    fn write_float32_array(&mut self, user: &AsynUser, data: &[f32]) -> AsynResult<()> {
+        if user.reason != self.params.wave_gen_user_wf {
+            return Ok(());
+        }
+        let ch = user.addr as usize;
+        if ch >= MAX_ANALOG_OUT {
+            return Ok(());
+        }
+        let mut st = self.state.lock().unwrap();
+        let n = data.len().min(st.wave_gen.max_points);
+        st.wave_gen.user_waveforms[ch] = data[..n].iter().map(|v| *v as f64).collect();
         Ok(())
     }
 

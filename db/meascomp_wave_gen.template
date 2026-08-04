@@ -68,3 +68,25 @@ record(bo, "$(P)WaveGenContinuous") {
     field(ZNAM, "One-shot")
     field(ONAM, "Continuous")
 }
+
+record(bo, "$(P)WaveGenRetrigger") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_RETRIGGER")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)WaveGenTriggerCount") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_TRIGGER_COUNT")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)WaveGenDwell") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_DWELL")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}

@@ -46,3 +46,19 @@ record(ao, "$(P)$(R)PulseWidth") {
     field(VAL,  "0.001")
     field(PINI, "YES")
 }
+
+# User-defined waveform in volts, used when WaveType is "User". A waveform
+# shorter than WaveGenNumPoints is repeated to fill the scan.
+record(waveform, "$(P)$(R)UserWF") {
+    field(DTYP, "asynFloat32ArrayOut")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_USER_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(WGEN_POINTS=2048)")
+}
+
+record(ao, "$(P)$(R)PulseDelay") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_PULSE_DELAY")
+    field(PREC, "4")
+    field(PINI, "YES")
+}
