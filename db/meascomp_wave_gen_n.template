@@ -17,6 +17,8 @@ record(mbbo, "$(P)$(R)WaveType") {
 record(bo, "$(P)$(R)Enable") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_ENABLE")
+    field(VAL,  "1")
+    field(PINI, "YES")
     field(ZNAM, "Off")
     field(ONAM, "On")
     field(VAL,  "1")
