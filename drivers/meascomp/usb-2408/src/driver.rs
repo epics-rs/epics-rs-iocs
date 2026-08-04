@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -120,7 +121,7 @@ impl MultiFunctionDriver {
     /// The poller pushes the same list through
     /// `set_params_and_notify_blocking`; on the actor thread that call would
     /// be a self-deadlock, so the store is written directly instead.
-    fn apply_updates(&mut self, updates: Vec<ParamSetValue>) {
+    fn apply_updates(&mut self, updates: Vec<ParamSetValue>) -> Option<String> {
         for update in updates {
             let ParamSetValue::Value {
                 reason,
@@ -131,9 +132,10 @@ impl MultiFunctionDriver {
                 continue;
             };
             if let Err(e) = self.base.params.set_value(reason, addr, value) {
-                log::error!("waveform callback error: {e}");
+                return Some(format!("waveform callback error: {e}"));
             }
         }
+        None
     }
 
     /// Push THERMOCOUPLE_TYPE and THERMOCOUPLE_OPEN_DETECT for `chan` to the
@@ -143,14 +145,14 @@ impl MultiFunctionDriver {
     /// is already configured as a thermocouple input, so this is a no-op while
     /// the channel reads volts and every caller must come back through here
     /// once ANALOG_IN_TYPE switches it to TC.
-    fn apply_tc_config(&self, dev: &DaqDevice, chan: i32) {
+    fn apply_tc_config(&self, dev: &DaqDevice, chan: i32) -> Option<String> {
         if self
             .base
             .get_int32_param(self.params.analog_in_type, chan)
             .unwrap_or(0)
             == 0
         {
-            return;
+            return None;
         }
         if let Ok(tc) = self
             .base
@@ -158,7 +160,7 @@ impl MultiFunctionDriver {
             && let Err(e) =
                 dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TC_TYPE, chan as u32, tc as i64)
         {
-            log::error!("ai_set_config tc_type error: {e}");
+            return Some(format!("ai_set_config tc_type error: {e}"));
         }
         if let Ok(detect) = self
             .base
@@ -170,9 +172,10 @@ impl MultiFunctionDriver {
                 uldaq_sys::OTD_DISABLED
             };
             if let Err(e) = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_OTD_MODE, chan as u32, otd) {
-                log::error!("ai_set_config otd error: {e}");
+                return Some(format!("ai_set_config otd error: {e}"));
             }
         }
+        None
     }
 }
 
@@ -186,6 +189,7 @@ impl PortDriver for MultiFunctionDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
 
@@ -212,7 +216,7 @@ impl PortDriver for MultiFunctionDriver {
         if reason == self.params.counter_reset && value != 0 {
             let dev = self.device.lock().unwrap();
             if let Err(e) = dev.counter_clear(addr) {
-                log::error!("counter_clear error: {e}");
+                last_error = Some(format!("counter_clear error: {e}"));
             }
         } else if reason == self.params.analog_out_value {
             // Only write immediately if sync mode is disabled
@@ -228,7 +232,7 @@ impl PortDriver for MultiFunctionDriver {
                 if let Err(e) =
                     dev.analog_out(addr, range, uldaq_sys::AOUT_FF_NOSCALEDATA, value as f64)
                 {
-                    log::error!("analog_out error: {e}");
+                    last_error = Some(format!("analog_out error: {e}"));
                 }
             }
         } else if reason == self.params.analog_out_sync_write {
@@ -253,7 +257,7 @@ impl PortDriver for MultiFunctionDriver {
                     uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
                     &mut values,
                 ) {
-                    log::error!("analog_out_array error: {e}");
+                    last_error = Some(format!("analog_out_array error: {e}"));
                 }
             }
         } else if reason == self.params.analog_in_type {
@@ -264,18 +268,18 @@ impl PortDriver for MultiFunctionDriver {
                 uldaq_sys::AI_VOLTAGE
             };
             if let Err(e) = dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TYPE, addr as u32, chan_type) {
-                log::error!("ai_set_config chan_type error: {e}");
+                last_error = Some(format!("ai_set_config chan_type error: {e}"));
             } else if value != 0 {
                 // The channel has just become a thermocouple input; the TC type
                 // and open-detect settings the records already hold could not be
                 // pushed while it was a voltage channel, so push them now.
-                self.apply_tc_config(&dev, addr);
+                last_error = self.apply_tc_config(&dev, addr);
             }
         } else if reason == self.params.thermocouple_type
             || reason == self.params.thermocouple_open_detect
         {
             let dev = self.device.lock().unwrap();
-            self.apply_tc_config(&dev, addr);
+            last_error = self.apply_tc_config(&dev, addr);
         } else if reason == self.params.wave_dig_run {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
@@ -342,7 +346,7 @@ impl PortDriver for MultiFunctionDriver {
                         burst_mode: burst,
                     },
                 ) {
-                    log::error!("start_wave_dig error: {e}");
+                    last_error = Some(format!("start_wave_dig error: {e}"));
                 } else {
                     self.base.params.set_float64(
                         self.params.wave_dig_dwell_actual,
@@ -455,7 +459,7 @@ impl PortDriver for MultiFunctionDriver {
                     &waveform,
                     &saved,
                 ) {
-                    log::error!("start_wave_gen error: {e}");
+                    last_error = Some(format!("start_wave_gen error: {e}"));
                 } else {
                     self.base.params.set_float64(
                         self.params.wave_gen_dwell_actual,
@@ -476,8 +480,16 @@ impl PortDriver for MultiFunctionDriver {
         if let Some(update) = time_wf {
             wave_arrays.push(update);
         }
-        self.apply_updates(wave_arrays);
+        last_error = self.apply_updates(wave_arrays).or(last_error);
 
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }
@@ -523,6 +535,7 @@ impl PortDriver for MultiFunctionDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
 
@@ -534,33 +547,42 @@ impl PortDriver for MultiFunctionDriver {
                     if let Err(e) =
                         dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0)
                     {
-                        log::error!("digital_bit_out error: {e}");
+                        last_error = Some(format!("digital_bit_out error: {e}"));
                     }
                 }
             }
         } else if reason == self.params.digital_direction {
             if !self.dio_configurable {
-                log::error!("digital direction is fixed on this model; ignoring write");
-                self.base.params.set_uint32(reason, addr, value, mask, 0)?;
-                self.base.call_param_callbacks(addr)?;
-                return Ok(());
-            }
-            let dev = self.device.lock().unwrap();
-            for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
-                    let dir = if (value >> bit) & 1 != 0 {
-                        uldaq_sys::DD_OUTPUT
-                    } else {
-                        uldaq_sys::DD_INPUT
-                    };
-                    if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir) {
-                        log::error!("digital_config_bit error: {e}");
+                last_error =
+                    Some("digital direction is fixed on this model; ignoring write".to_string());
+            } else {
+                let dev = self.device.lock().unwrap();
+                for bit in 0..NUM_IO_BITS {
+                    if mask & (1 << bit) != 0 {
+                        let dir = if (value >> bit) & 1 != 0 {
+                            uldaq_sys::DD_OUTPUT
+                        } else {
+                            uldaq_sys::DD_INPUT
+                        };
+                        if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir)
+                        {
+                            last_error = Some(format!("digital_config_bit error: {e}"));
+                        }
                     }
                 }
             }
         }
 
         self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }

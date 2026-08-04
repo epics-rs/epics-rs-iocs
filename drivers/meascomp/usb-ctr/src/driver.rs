@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -106,6 +107,7 @@ impl PortDriver for CtrDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
 
@@ -152,24 +154,24 @@ impl PortDriver for CtrDriver {
                             actual_delay,
                         );
                     }
-                    Err(e) => log::error!("pulse_gen start error: {e}"),
+                    Err(e) => last_error = Some(format!("pulse_gen start error: {e}")),
                 }
             } else if reason == self.params.pulse_run
                 && let Err(e) = pulse_gen::stop(&dev, addr)
             {
-                log::error!("pulse_gen stop error: {e}");
+                last_error = Some(format!("pulse_gen stop error: {e}"));
             }
         } else if reason == self.params.counter_reset {
             if value != 0 {
                 let dev = self.device.lock().unwrap();
                 if let Err(e) = dev.counter_clear(addr) {
-                    log::error!("counter_clear error: {e}");
+                    last_error = Some(format!("counter_clear error: {e}"));
                 }
             }
         } else if reason == self.params.digital_output {
             let dev = self.device.lock().unwrap();
             if let Err(e) = dev.digital_out(uldaq_sys::AUXPORT, value as u64) {
-                log::error!("digital_out error: {e}");
+                last_error = Some(format!("digital_out error: {e}"));
             }
         } else if reason == self.params.mca_start_acquire {
             let already_running = self.state.lock().unwrap().mcs.running;
@@ -207,7 +209,7 @@ impl PortDriver for CtrDriver {
                         point0_no_clear,
                     },
                 ) {
-                    log::error!("start_mcs error: {e}");
+                    last_error = Some(format!("start_mcs error: {e}"));
                 }
                 self.base
                     .params
@@ -226,6 +228,14 @@ impl PortDriver for CtrDriver {
             mcs::erase_mcs(&mut st.mcs);
         }
 
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }
@@ -253,6 +263,7 @@ impl PortDriver for CtrDriver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
         self.base.params.set_float64(reason, addr, value)?;
@@ -299,11 +310,19 @@ impl PortDriver for CtrDriver {
                             actual_delay,
                         );
                     }
-                    Err(e) => log::error!("pulse_gen restart error: {e}"),
+                    Err(e) => last_error = Some(format!("pulse_gen restart error: {e}")),
                 }
             }
         }
 
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }
@@ -314,6 +333,7 @@ impl PortDriver for CtrDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
 
@@ -325,33 +345,42 @@ impl PortDriver for CtrDriver {
                     if let Err(e) =
                         dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0)
                     {
-                        log::error!("digital_bit_out error: {e}");
+                        last_error = Some(format!("digital_bit_out error: {e}"));
                     }
                 }
             }
         } else if reason == self.params.digital_direction {
             if !self.dio_configurable {
-                log::error!("digital direction is fixed on this model; ignoring write");
-                self.base.params.set_uint32(reason, addr, value, mask, 0)?;
-                self.base.call_param_callbacks(addr)?;
-                return Ok(());
-            }
-            let dev = self.device.lock().unwrap();
-            for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
-                    let dir = if (value >> bit) & 1 != 0 {
-                        uldaq_sys::DD_OUTPUT
-                    } else {
-                        uldaq_sys::DD_INPUT
-                    };
-                    if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir) {
-                        log::error!("digital_config_bit error: {e}");
+                last_error =
+                    Some("digital direction is fixed on this model; ignoring write".to_string());
+            } else {
+                let dev = self.device.lock().unwrap();
+                for bit in 0..NUM_IO_BITS {
+                    if mask & (1 << bit) != 0 {
+                        let dir = if (value >> bit) & 1 != 0 {
+                            uldaq_sys::DD_OUTPUT
+                        } else {
+                            uldaq_sys::DD_INPUT
+                        };
+                        if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir)
+                        {
+                            last_error = Some(format!("digital_config_bit error: {e}"));
+                        }
                     }
                 }
             }
         }
 
         self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }

@@ -48,3 +48,12 @@ record(ao, "$(P)PollSleepMS") {
     field(VAL,  "50")
     field(PINI, "YES")
 }
+
+# Newest driver-reported failure, as C reportError() publishes it.
+record(waveform, "$(P)LastErrorMessage") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),0,1.0)LAST_ERROR_MESSAGE")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
