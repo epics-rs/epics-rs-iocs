@@ -1,0 +1,8 @@
+# Whole digital input port as one integer.
+# Macros: P (prefix), R (record name), PORT (asyn port), ADDR, MASK
+record(longin, "$(P)$(R)") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_INPUT")
+    field(SCAN, "I/O Intr")
+    field(PINI, "YES")
+}

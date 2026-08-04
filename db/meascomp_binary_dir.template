@@ -1,0 +1,10 @@
+# Direction of one digital I/O bit.
+# Macros: P (prefix), R (record name), PORT (asyn port), ADDR, MASK, VAL
+record(bo, "$(P)$(R)") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_DIRECTION")
+    field(ZNAM, "In")
+    field(ONAM, "Out")
+    field(VAL,  "$(VAL=0)")
+    field(PINI, "YES")
+}
