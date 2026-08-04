@@ -73,3 +73,67 @@ record(mbbo, "$(P)MCS:ChannelAdvance") {
     field(ONST, "External")  field(ONVL, "1")
     field(PINI, "YES")
 }
+
+# Per-counter MCS enable. The driver reads MCS_COUNTER_ENABLE as one
+# bitmask (bit i = counter i, bit 8 = the digital I/O channel); the bo
+# records below drive the individual bits of it.
+record(mbboDirect, "$(P)MCS:MCSCounterEnable") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT,  "@asynMask($(PORT),0,0xFFFFFFFF)MCS_COUNTER_ENABLE")
+    field(VAL,  "0x1FF")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter1Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B0 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter2Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B1 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter3Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B2 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter4Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B3 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter5Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B4 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter6Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B5 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter7Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B6 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter8Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B7 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSDIOEnable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B8 PP")
+    field(PINI, "YES")
+}
