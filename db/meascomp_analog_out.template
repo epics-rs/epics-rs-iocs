@@ -11,3 +11,49 @@ record(mbbo, "$(P)$(R)Range") {
     field(ZRVL, "5")
     field(PINI, "YES")
 }
+
+###################################################################
+# Simultaneous update: with SyncEnable set, a write to $(P)$(R)    #
+# only stages the value and SyncWrite pushes every channel at once #
+###################################################################
+# No SyncMaster record: ulAOSetConfig(AO_CFG_SYNC_MODE) returns
+# ERR_CONFIG_NOT_SUPPORTED on the USB-2408-2AO, whose two DACs always update
+# together anyway.
+
+record(bo, "$(P)$(R)SyncEnable") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_SYNC_ENABLE")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)$(R)SyncWrite") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_SYNC_WRITE")
+    field(ZNAM, "Done")
+    field(ONAM, "Write")
+}
+
+###################################################################
+#  Tweak the output up or down by a fixed step                    #
+###################################################################
+record(ao, "$(P)$(R)TweakVal") {
+    field(PREC, "$(PREC=0)")
+}
+
+record(calcout, "$(P)$(R)TweakUp") {
+    field(CALC, "A+B")
+    field(INPA, "$(P)$(R).VAL  NPP MS")
+    field(INPB, "$(P)$(R)TweakVal.VAL  NPP MS")
+    field(OUT,  "$(P)$(R).VAL  PP MS")
+    field(PREC, "$(PREC=0)")
+}
+
+record(calcout, "$(P)$(R)TweakDown") {
+    field(CALC, "A-B")
+    field(INPA, "$(P)$(R).VAL  NPP MS")
+    field(INPB, "$(P)$(R)TweakVal.VAL  NPP MS")
+    field(OUT,  "$(P)$(R).VAL  PP MS")
+    field(PREC, "$(PREC=0)")
+}

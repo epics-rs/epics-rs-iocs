@@ -36,6 +36,9 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_temperature.template", "P=$(PREFIX)
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_temperature.template", "P=$(PREFIX),R=Ti7,PORT=$(PORT),ADDR=6")
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_temperature.template", "P=$(PREFIX),R=Ti8,PORT=$(PORT),ADDR=7")
 
+# Analog input mode (shared by all channels)
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_analog_in_mode.template", "P=$(PREFIX),R=AiMode,PORT=$(PORT),MODE=0")
+
 # Analog outputs (2 channels)
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_analog_out.template", "P=$(PREFIX),R=Ao1,PORT=$(PORT),ADDR=0")
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_analog_out.template", "P=$(PREFIX),R=Ao2,PORT=$(PORT),ADDR=1")
