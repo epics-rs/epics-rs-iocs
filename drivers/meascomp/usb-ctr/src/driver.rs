@@ -172,7 +172,8 @@ impl PortDriver for CtrDriver {
                 log::error!("digital_out error: {e}");
             }
         } else if reason == self.params.mca_start_acquire {
-            if value != 0 {
+            let already_running = self.state.lock().unwrap().mcs.running;
+            if value != 0 && !already_running {
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
                 let num_channels =

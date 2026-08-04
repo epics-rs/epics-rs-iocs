@@ -279,7 +279,10 @@ impl PortDriver for MultiFunctionDriver {
         } else if reason == self.params.wave_dig_run {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
-            if value != 0 {
+            // C parity (drvMultiFunction.cpp:2086-2091): start only when idle,
+            // stop only when running. The busy record echoes the driver's own
+            // value back, so an unguarded start would hit ERR_ALREADY_ACTIVE.
+            if value != 0 && !st.wave_dig.running {
                 let first_chan = self
                     .base
                     .get_int32_param(self.params.wave_dig_first_chan, 0)?
@@ -353,7 +356,7 @@ impl PortDriver for MultiFunctionDriver {
                     )?;
                     time_wf = Some(wave_dig::time_wf_update(&self.params, &st.wave_dig));
                 }
-            } else {
+            } else if value == 0 {
                 wave_dig::stop_wave_dig(&dev, &mut st.wave_dig);
             }
         } else if reason == self.params.wave_dig_read_wf {
@@ -364,7 +367,8 @@ impl PortDriver for MultiFunctionDriver {
         } else if reason == self.params.wave_gen_run {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
-            if value != 0 {
+            // Same start/stop guard as the digitizer above.
+            if value != 0 && !st.wave_gen.running {
                 let num_points = self
                     .base
                     .get_int32_param(self.params.wave_gen_num_points, 0)?
@@ -453,7 +457,7 @@ impl PortDriver for MultiFunctionDriver {
                         st.wave_gen.dwell_actual * num_points as f64,
                     )?;
                 }
-            } else {
+            } else if value == 0 {
                 wave_gen::stop_wave_gen(&dev, &mut st.wave_gen);
             }
         }
