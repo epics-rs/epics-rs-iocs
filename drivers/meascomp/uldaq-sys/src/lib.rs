@@ -373,7 +373,18 @@ pub const AO_INFO_RESOLUTION: i32 = 1;
 
 // DioInfoItem
 pub const DIO_INFO_NUM_PORTS: i32 = 1;
+pub const DIO_INFO_PORT_IO_TYPE: i32 = 3;
 pub const DIO_INFO_NUM_BITS: i32 = 4;
+
+// DigitalPortIoType, returned by ulDIOGetInfo(DIO_INFO_PORT_IO_TYPE)
+pub const DPIOT_IN: i64 = 1;
+pub const DPIOT_OUT: i64 = 2;
+/// Direction is programmable for the whole port (ulDConfigPort).
+pub const DPIOT_IO: i64 = 3;
+/// Direction is programmable per bit (ulDConfigBit).
+pub const DPIOT_BITIO: i64 = 4;
+/// Fixed direction; ulDConfigPort/ulDConfigBit are rejected.
+pub const DPIOT_NONCONFIG: i64 = 5;
 
 // OTD mode
 pub const OTD_DISABLED: i64 = 1;

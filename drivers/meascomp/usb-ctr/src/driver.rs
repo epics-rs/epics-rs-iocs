@@ -21,6 +21,9 @@ pub struct CtrDriver {
     pub device: Arc<Mutex<DaqDevice>>,
     pub state: Arc<Mutex<PollerState>>,
     pub max_time_points: usize,
+    /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
+    /// `DPIOT_BITIO`). The USB-CTR08 reports `DPIOT_BITIO`.
+    dio_configurable: bool,
 }
 
 impl CtrDriver {
@@ -55,8 +58,18 @@ impl CtrDriver {
         base.set_string_param(params.ul_version, 0, ul_ver)?;
         base.set_string_param(params.driver_version, 0, "0.1.0".into())?;
 
-        // Configure AUXPORT as bit-configurable input by default
-        let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
+        // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
+        // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
+        // the device instead of assuming.
+        let dio_configurable = matches!(
+            device.digital_port_io_type(0),
+            Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
+        );
+        if dio_configurable
+            && let Err(e) = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT)
+        {
+            log::error!("digital_config_port error: {e}");
+        }
 
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
         // The poller only pushes on a changed bit, and its one forced first
@@ -78,6 +91,7 @@ impl CtrDriver {
             device: Arc::new(Mutex::new(device)),
             state,
             max_time_points,
+            dio_configurable,
         })
     }
 }
@@ -320,6 +334,12 @@ impl PortDriver for CtrDriver {
                 }
             }
         } else if reason == self.params.digital_direction {
+            if !self.dio_configurable {
+                log::error!("digital direction is fixed on this model; ignoring write");
+                self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+                self.base.call_param_callbacks(addr)?;
+                return Ok(());
+            }
             let dev = self.device.lock().unwrap();
             for bit in 0..NUM_IO_BITS {
                 if mask & (1 << bit) != 0 {
