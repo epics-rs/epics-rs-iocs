@@ -86,4 +86,12 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen.template", "P=$(PREFIX),PO
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen1,PORT=$(PORT),ADDR=0,WGEN_POINTS=$(WGEN_POINTS)")
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=WaveGen2,PORT=$(PORT),ADDR=1,WGEN_POINTS=$(WGEN_POINTS)")
 
+# Autosave: request files live next to this script, saved state under
+# ./autosave. set_pass1_restoreFile is a no-op until the first save has run.
+set_requestfile_path("$(MEASCOMP)")
+set_savefile_path("$(MEASCOMP)/autosave")
+set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
+
 iocInit()
+
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")

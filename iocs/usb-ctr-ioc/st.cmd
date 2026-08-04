@@ -78,4 +78,12 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca9,PORT=$(PORT),ADDR=8,MAX_POINTS=$(MAX_POINTS)")
 
 
+# Autosave: request files live next to this script, saved state under
+# ./autosave. set_pass1_restoreFile is a no-op until the first save has run.
+set_requestfile_path("$(MEASCOMP)")
+set_savefile_path("$(MEASCOMP)/autosave")
+set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
+
 iocInit()
+
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
