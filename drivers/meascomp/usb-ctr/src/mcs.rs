@@ -211,6 +211,16 @@ pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Re
     Ok(())
 }
 
+/// Number of complete scan points behind `current_index`; see
+/// `usb_2408::wave_dig::points_transferred` for the C original. Kept here
+/// rather than shared so the two drivers stay independent crates.
+pub fn points_transferred(current_index: i64, n_chans: usize, max_points: usize) -> usize {
+    if current_index < 0 || n_chans == 0 {
+        return 0;
+    }
+    (current_index as usize / n_chans + 1).min(max_points)
+}
+
 /// Read MCS data from the scan buffer. Called from poller when running.
 pub fn read_mcs(device: &DaqDevice, state: &mut McsState) {
     let (status, xfer) = match device.daq_in_scan_status() {
@@ -230,7 +240,7 @@ pub fn read_mcs(device: &DaqDevice, state: &mut McsState) {
         return;
     }
 
-    let last_point = (xfer.current_index as usize / n_chans + 1).min(state.max_points);
+    let last_point = points_transferred(xfer.current_index, n_chans, state.max_points);
     let now = current_time_secs();
 
     // Copy new data points
@@ -271,4 +281,28 @@ fn current_time_secs() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_completed_scan_counts_every_point() {
+        // 9 MCS channels x 100 points: the last sample written is index 899.
+        assert_eq!(points_transferred(899, 9, 2048), 100);
+    }
+
+    #[test]
+    fn the_first_sample_of_a_point_already_counts_it() {
+        assert_eq!(points_transferred(0, 9, 2048), 1);
+        assert_eq!(points_transferred(8, 9, 2048), 1);
+        assert_eq!(points_transferred(9, 9, 2048), 2);
+    }
+
+    #[test]
+    fn no_transfer_yet_is_zero_points() {
+        assert_eq!(points_transferred(-1, 9, 2048), 0);
+        assert_eq!(points_transferred(10, 0, 2048), 0);
+    }
 }

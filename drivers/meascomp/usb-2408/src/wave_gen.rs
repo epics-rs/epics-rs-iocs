@@ -271,4 +271,54 @@ mod tests {
         assert_eq!(data[0], 0.0);
         assert_eq!(data[1], 65535.0);
     }
+
+    #[test]
+    fn an_unset_wave_type_is_all_zeros() {
+        // WAVE_TYPE_USER has no internal shape: the driver fills it from
+        // WAVEGEN_USER_WF, and an unwritten one must stay at 0 V.
+        let data = generate_waveform(WAVE_TYPE_USER, 8, 5.0, 1.0, 0.5);
+        assert_eq!(data, vec![0.0; 8]);
+    }
+
+    #[test]
+    fn a_square_wave_is_half_high_half_low_around_the_offset() {
+        let data = generate_waveform(WAVE_TYPE_SQUARE, 4, 2.0, 1.0, 0.5);
+        assert_eq!(data, vec![3.0, 3.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn a_sawtooth_spans_offset_plus_or_minus_amplitude() {
+        let data = generate_waveform(WAVE_TYPE_SAWTOOTH, 4, 2.0, 0.0, 0.5);
+        assert_eq!(data, vec![-2.0, -1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_pulse_is_at_least_one_sample_wide() {
+        // A pulse width that rounds to zero samples must still produce a
+        // pulse, not a flat line at the offset.
+        let data = generate_waveform(WAVE_TYPE_PULSE, 10, 1.0, 0.0, 0.0);
+        assert_eq!(data[0], 1.0);
+        assert_eq!(&data[1..], &[0.0; 9]);
+    }
+
+    #[test]
+    fn a_pulse_wider_than_the_waveform_stays_high() {
+        let data = generate_waveform(WAVE_TYPE_PULSE, 4, 1.0, 0.0, 2.0);
+        assert_eq!(data, vec![1.0; 4]);
+    }
+
+    #[test]
+    fn a_single_point_waveform_is_well_defined() {
+        for wave_type in [
+            WAVE_TYPE_SIN,
+            WAVE_TYPE_SQUARE,
+            WAVE_TYPE_SAWTOOTH,
+            WAVE_TYPE_PULSE,
+            WAVE_TYPE_RANDOM,
+        ] {
+            let data = generate_waveform(wave_type, 1, 1.0, 0.0, 0.5);
+            assert_eq!(data.len(), 1);
+            assert!(data[0].is_finite());
+        }
+    }
 }

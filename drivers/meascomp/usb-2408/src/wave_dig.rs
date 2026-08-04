@@ -168,6 +168,19 @@ pub fn start_wave_dig(
     Ok(())
 }
 
+/// Number of complete scan points behind `current_index`.
+///
+/// ulAInScanStatus reports `currentIndex` as the position of the LAST sample
+/// written, so the count is `index / chans + 1` -- C drvMultiFunction.cpp's
+/// `lastPoint = aiIndex / numWaveDigChans_ + 1`. Clamped to `num_points`
+/// because the per-channel buffers are sized once at construction.
+pub fn points_transferred(current_index: i64, n_chans: usize, num_points: usize) -> usize {
+    if current_index < 0 || n_chans == 0 {
+        return 0;
+    }
+    (current_index as usize / n_chans + 1).min(num_points)
+}
+
 /// Read waveform digitizer data from scan buffer. Called from poller.
 pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
     let (status, xfer) = match device.analog_in_scan_status() {
@@ -187,7 +200,7 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
         return;
     }
 
-    let last_point = (xfer.current_index as usize / n_chans + 1).min(state.num_points);
+    let last_point = points_transferred(xfer.current_index, n_chans, state.num_points);
     let now = current_time_secs();
 
     // Copy new data
@@ -302,4 +315,37 @@ pub fn time_wf_update(params: &MultiFunctionParams, state: &WaveDigState) -> Par
         0,
         ParamValue::Float32Array(state.time_buffer[..n].into()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_completed_scan_counts_every_point() {
+        // 2 channels x 50 points: the last sample written is index 98.
+        assert_eq!(points_transferred(98, 2, 50), 50);
+        // 1 channel x 20 points: index 19.
+        assert_eq!(points_transferred(19, 1, 20), 20);
+    }
+
+    #[test]
+    fn the_first_sample_of_a_point_already_counts_it() {
+        // C counts a point as soon as its first channel lands, so index 0 and
+        // index 1 of a 2-channel scan are both "point 1".
+        assert_eq!(points_transferred(0, 2, 50), 1);
+        assert_eq!(points_transferred(1, 2, 50), 1);
+        assert_eq!(points_transferred(2, 2, 50), 2);
+    }
+
+    #[test]
+    fn an_index_past_the_buffer_is_clamped() {
+        assert_eq!(points_transferred(4096, 2, 50), 50);
+    }
+
+    #[test]
+    fn no_transfer_yet_is_zero_points() {
+        assert_eq!(points_transferred(-1, 2, 50), 0);
+        assert_eq!(points_transferred(10, 0, 50), 0);
+    }
 }
