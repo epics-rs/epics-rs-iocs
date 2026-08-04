@@ -167,6 +167,21 @@ fn build_config(rs_ctx: &Context, config: &D435iConfigSnapshot) -> anyhow::Resul
     Ok(cfg)
 }
 
+/// Apply one sensor option, saying so when the camera will not take it.
+///
+/// Options are not uniform across the D400 family, and a discarded error here
+/// is indistinguishable from a setting that took effect -- the readback record
+/// echoes the requested value either way.
+fn set_sensor_option(sensor: &mut realsense_rust::sensor::Sensor, option: Rs2Option, value: f32) {
+    if !sensor.supports_option(option) {
+        log::warn!("D435i: this camera has no {option:?} option; ignoring");
+        return;
+    }
+    if let Err(e) = sensor.set_option(option, value) {
+        log::warn!("D435i: camera refused {option:?}={value}: {e}");
+    }
+}
+
 fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot) {
     use realsense_rust::frame::FrameEx;
 
@@ -176,11 +191,11 @@ fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot
         && let Ok(mut sensor) = FrameEx::sensor(color_frame)
     {
         if config.auto_exposure {
-            let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 1.0);
+            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 1.0);
         } else {
-            let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 0.0);
-            let _ = sensor.set_option(Rs2Option::Exposure, config.exposure as f32);
-            let _ = sensor.set_option(Rs2Option::Gain, config.gain as f32);
+            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 0.0);
+            set_sensor_option(&mut sensor, Rs2Option::Exposure, config.exposure as f32);
+            set_sensor_option(&mut sensor, Rs2Option::Gain, config.gain as f32);
         }
     }
 
@@ -189,12 +204,17 @@ fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot
     if let Some(depth_frame) = depth_frames.first()
         && let Ok(mut sensor) = FrameEx::sensor(depth_frame)
     {
-        let _ = sensor.set_option(
+        set_sensor_option(
+            &mut sensor,
             Rs2Option::EmitterEnabled,
             if config.emitter_enabled { 1.0 } else { 0.0 },
         );
         if config.emitter_enabled {
-            let _ = sensor.set_option(Rs2Option::LaserPower, config.laser_power as f32);
+            set_sensor_option(
+                &mut sensor,
+                Rs2Option::LaserPower,
+                config.laser_power as f32,
+            );
         }
     }
 }
