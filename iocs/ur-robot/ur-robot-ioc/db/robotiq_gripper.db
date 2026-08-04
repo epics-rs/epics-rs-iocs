@@ -123,10 +123,10 @@ record(bo, "$(P)RobotiqGripper:SetPositionRange")
 
 record(mbbo, "$(P)RobotiqGripper:PositionUnit")
 {
-    field(ZRST, "Device")
-    field(ONST, "Normalized")
-    field(TWST, "Percent")
-    field(THST, "mm")
+    field(ZRST, "Device")  field(ZRVL, "0")
+    field(ONST, "Normalized")  field(ONVL, "1")
+    field(TWST, "Percent")  field(TWVL, "2")
+    field(THST, "mm")  field(THVL, "3")
     field(VAL, "1")
     field(OUT, "$(P)RobotiqGripper:PositionUnitRaw PP")
 }
@@ -141,10 +141,10 @@ record(longout, "$(P)RobotiqGripper:PositionUnitRaw")
 record(mbbi, "$(P)RobotiqGripper:MoveStatus")
 {
     field(INP, "$(P)RobotiqGripper:MoveStatusRaw CP")
-    field(ZRST, "Moving")
-    field(ONST, "Stopped outer object")
-    field(TWST, "Stopped inner object")
-    field(THST, "At target destination")
+    field(ZRST, "Moving")  field(ZRVL, "0")
+    field(ONST, "Stopped outer object")  field(ONVL, "1")
+    field(TWST, "Stopped inner object")  field(TWVL, "2")
+    field(THST, "At target destination")  field(THVL, "3")
 }
 
 record(longin, "$(P)RobotiqGripper:MoveStatusRaw")
