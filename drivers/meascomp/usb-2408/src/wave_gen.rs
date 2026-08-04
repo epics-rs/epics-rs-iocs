@@ -45,7 +45,12 @@ pub fn volts_to_dac(data: &mut [f64]) {
     const DAC_OFFSET: f64 = 10.0; // mid-scale for ±10V
     const DAC_SCALE: f64 = 65535.0 / 20.0; // 16-bit DAC units per volt
     for v in data.iter_mut() {
-        *v = ((*v + DAC_OFFSET) * DAC_SCALE + 0.5).clamp(0.0, 65535.0);
+        // C casts to epicsUInt16 after the +0.5, i.e. rounds to the nearest
+        // DAC count. Without the truncation every sample kept a half-count
+        // bias and the clamp was applied to the un-rounded value.
+        *v = ((*v + DAC_OFFSET) * DAC_SCALE + 0.5)
+            .floor()
+            .clamp(0.0, 65535.0);
     }
 }
 
@@ -243,5 +248,27 @@ pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
             );
         }
         state.running = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dac_conversion_spans_the_bipolar_range() {
+        let mut data = [-10.0, 0.0, 10.0];
+        volts_to_dac(&mut data);
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], 32768.0);
+        assert_eq!(data[2], 65535.0);
+    }
+
+    #[test]
+    fn dac_conversion_clamps_beyond_the_range() {
+        let mut data = [-25.0, 25.0];
+        volts_to_dac(&mut data);
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], 65535.0);
     }
 }
