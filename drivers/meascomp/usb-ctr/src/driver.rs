@@ -256,6 +256,28 @@ impl PortDriver for CtrDriver {
         Ok(())
     }
 
+    /// MCS spectrum readout. C `USBCTR::readInt32Array` / the `mcaReadData`
+    /// the mca record and SIS38XX_waveform.template both go through: the data
+    /// lives in McsState::mcs_buffers and only leaves the driver here.
+    fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+        if user.reason != self.params.mca_data {
+            return Ok(0);
+        }
+        let counter = user.addr as usize;
+        let num_channels = self
+            .base
+            .get_int32_param(self.params.mca_num_channels, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let st = self.state.lock().unwrap();
+        let Some(src) = st.mcs.mcs_buffers.get(counter) else {
+            return Ok(0);
+        };
+        let n = buf.len().min(src.len()).min(num_channels);
+        buf[..n].copy_from_slice(&src[..n]);
+        Ok(n)
+    }
+
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;

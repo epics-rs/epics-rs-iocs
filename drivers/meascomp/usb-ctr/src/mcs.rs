@@ -56,6 +56,13 @@ impl McsState {
     }
 }
 
+impl McsState {
+    /// Seconds since `start_mcs` armed the scan.
+    pub fn elapsed_secs(&self) -> f64 {
+        (current_time_secs() - self.start_time).max(0.0)
+    }
+}
+
 /// Erase all MCS buffers.
 pub fn erase_mcs(state: &mut McsState) {
     for buf in &mut state.mcs_buffers {

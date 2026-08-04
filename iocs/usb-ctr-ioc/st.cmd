@@ -3,9 +3,10 @@
 epicsEnvSet("PREFIX", "USBCTR:")
 epicsEnvSet("PORT",   "USBCTR_1")
 epicsEnvSet("UNIQUE_ID", "01DAB0FB")
+epicsEnvSet("MAX_POINTS", "2048")
 
 # Create the USB-CTR08 driver
-USBCTRConfig("$(PORT)", "$(UNIQUE_ID)", 2048)
+USBCTRConfig("$(PORT)", "$(UNIQUE_ID)", $(MAX_POINTS))
 
 # Device info
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_device.template", "P=$(PREFIX),PORT=$(PORT)")
@@ -60,6 +61,18 @@ dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),
 dbLoadRecords("$(MEASCOMP)/../../db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo8,PORT=$(PORT),ADDR=0,MASK=0x80")
 
 # MCS (Multi-Channel Scaler)
-dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs.template", "P=$(PREFIX),PORT=$(PORT)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs.template", "P=$(PREFIX),PORT=$(PORT),MAX_POINTS=$(MAX_POINTS)")
+
+# Per-counter MCS spectra (counters 1-8 plus the digital I/O channel)
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca1,PORT=$(PORT),ADDR=0,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca2,PORT=$(PORT),ADDR=1,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca3,PORT=$(PORT),ADDR=2,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca4,PORT=$(PORT),ADDR=3,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca5,PORT=$(PORT),ADDR=4,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca6,PORT=$(PORT),ADDR=5,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca7,PORT=$(PORT),ADDR=6,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca8,PORT=$(PORT),ADDR=7,MAX_POINTS=$(MAX_POINTS)")
+dbLoadRecords("$(MEASCOMP)/../../db/meascomp_mcs_n.template", "P=$(PREFIX),R=MCS:mca9,PORT=$(PORT),ADDR=8,MAX_POINTS=$(MAX_POINTS)")
+
 
 iocInit()

@@ -1,0 +1,19 @@
+# MCS spectrum for one counter, as a waveform.
+# Macros: P (prefix), R (record name), PORT (asyn port), ADDR (counter),
+#         MAX_POINTS (time points allocated by USBCTRConfig)
+#
+# The equivalent of mca's SIS38XX_waveform.template: the driver holds the
+# spectrum and only hands it over on a read, so Read must be processed to
+# refresh the waveform.
+record(waveform, "$(P)$(R)") {
+    field(DTYP, "asynInt32ArrayIn")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)MCA_DATA")
+    field(FTVL, "LONG")
+    field(NELM, "$(MAX_POINTS=2048)")
+}
+
+record(bo, "$(P)$(R)Read") {
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(OUT,  "$(P)$(R).PROC PP")
+}

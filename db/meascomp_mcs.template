@@ -41,7 +41,30 @@ record(ao, "$(P)MCS:Dwell") {
 record(longout, "$(P)MCS:NuseAll") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_NUM_CHANNELS")
-    field(VAL,  "2048")
+    field(VAL,  "$(MAX_POINTS=2048)")
+    field(DRVL, "1")
+    field(DRVH, "$(MAX_POINTS=2048)")
+    field(PINI, "YES")
+}
+
+record(longin, "$(P)MCS:MaxChannels") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MCS_MAX_POINTS")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)MCS:Prescale") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_PRESCALE")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:TrigMode") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)TRIGGER_MODE")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
     field(PINI, "YES")
 }
 
