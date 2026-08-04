@@ -10,6 +10,10 @@
 epicsEnvSet("PREFIX",     "RS1:")
 epicsEnvSet("CAM",        "cam1:")
 epicsEnvSet("PORT",       "RS1")
+# Which camera to open. An empty serial takes the first one librealsense
+# enumerates, which is not a stable choice once more than one is plugged in --
+# set it explicitly then. `rs-enumerate-devices -s` lists the serials.
+epicsEnvSet("SERIAL",     "")
 epicsEnvSet("DEPTH_PORT", "$(PORT)_DEPTH")
 epicsEnvSet("PC_PORT",    "$(PORT)_PC")
 epicsEnvSet("QSIZE",      "20")
@@ -36,7 +40,7 @@ epicsEnvSet("NELEMENTS_PC",    "2764800")
 # IOC startup. The shared workspace db/ lives two levels up from there.
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADD435I)/../../db:$(ADCORE)/db")
 
-d435iConfig("$(PORT)", "", $(XSIZE), $(YSIZE), 100000000)
+d435iConfig("$(PORT)", "$(SERIAL)", $(XSIZE), $(YSIZE), 100000000)
 
 # Load per-port record databases
 dbLoadRecords("d435i_color.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
