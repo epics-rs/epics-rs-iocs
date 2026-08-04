@@ -69,7 +69,7 @@ record(longin, "$(P)MCS:CurrentChannel") {
 record(mbbo, "$(P)MCS:ChannelAdvance") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADVANCE_SOURCE")
-    field(ZRST, "Internal")
-    field(ONST, "External")
+    field(ZRST, "Internal")  field(ZRVL, "0")
+    field(ONST, "External")  field(ONVL, "1")
     field(PINI, "YES")
 }
