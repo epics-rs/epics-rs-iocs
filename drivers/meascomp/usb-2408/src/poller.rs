@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
 
 use meascomp::device::DaqDevice;
 
@@ -43,6 +45,9 @@ struct PollSnapshot {
     wave_dig_running: bool,
     wave_dig_current_point: usize,
     wave_dig_just_stopped: bool,
+    /// Array callbacks for the digitized data, built while the state lock is
+    /// held and pushed after it is released.
+    wave_dig_arrays: Vec<ParamSetValue>,
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
     ai_volts: [Option<f64>; MAX_ANALOG_IN],
@@ -114,29 +119,39 @@ fn poller_loop(
                     }
                     snap.wave_dig_running = st.wave_dig.running;
                     snap.wave_dig_just_stopped = wd_was_running && !st.wave_dig.running;
+                    if snap.wave_dig_just_stopped {
+                        snap.wave_dig_arrays = wave_dig::waveform_updates(&params, &st.wave_dig);
+                    }
 
                     if !st.wave_dig.running {
                         for ch in 0..MAX_ANALOG_IN {
                             let ch_i = ch as i32;
-                            match dev.analog_in(
-                                ch_i,
-                                input_mode,
-                                in_ranges[ch],
-                                uldaq_sys::AIN_FF_NOSCALEDATA,
-                            ) {
-                                Ok(raw) => snap.ai_raw[ch] = Some(raw as i32),
-                                Err(e) => snap.errors.push(format!("AIn({ch}): {e}")),
-                            }
-                            match dev.analog_in(
-                                ch_i,
-                                input_mode,
-                                in_ranges[ch],
-                                uldaq_sys::AIN_FF_DEFAULT,
-                            ) {
-                                Ok(volts) => snap.ai_volts[ch] = Some(volts),
-                                Err(e) => snap.errors.push(format!("AIn scaled({ch}): {e}")),
-                            }
-                            if in_types[ch] != 0 {
+                            // One call per channel, chosen by its configured
+                            // type: ulAIn rejects a thermocouple channel with
+                            // ERR_BAD_RANGE and ulTIn rejects a voltage one.
+                            // C drvMultiFunction skips each the same way.
+                            if in_types[ch] == 0 {
+                                match dev.analog_in(
+                                    ch_i,
+                                    input_mode,
+                                    in_ranges[ch],
+                                    uldaq_sys::AIN_FF_NOSCALEDATA,
+                                ) {
+                                    Ok(raw) => snap.ai_raw[ch] = Some(raw as i32),
+                                    Err(e) => snap.errors.push(format!("AIn({ch}): {e}")),
+                                }
+                                match dev.analog_in(
+                                    ch_i,
+                                    input_mode,
+                                    in_ranges[ch],
+                                    uldaq_sys::AIN_FF_DEFAULT,
+                                ) {
+                                    Ok(volts) => snap.ai_volts[ch] = Some(volts),
+                                    Err(e) => snap.errors.push(format!("AIn scaled({ch}): {e}")),
+                                }
+                            } else {
+                                // An open or broken thermocouple is expected,
+                                // not an error: ulTIn reports it as -9999.
                                 match dev.temperature_in(
                                     ch_i,
                                     tc_scales[ch],
@@ -144,7 +159,7 @@ fn poller_loop(
                                 ) {
                                     Ok(temp) => snap.ai_temp[ch] = Some(temp),
                                     Err(e) => {
-                                        if e.code == uldaq_sys::ERR_TEMP_OUT_OF_RANGE {
+                                        if e.code == uldaq_sys::ERR_OPEN_CONNECTION {
                                             snap.ai_temp[ch] = Some(-9999.0);
                                         } else {
                                             snap.errors.push(format!("TIn({ch}): {e}"));
@@ -163,13 +178,32 @@ fn poller_loop(
         for msg in &snapshot.errors {
             log::warn!("USB-2408 poller {msg}");
         }
+        if let Some(msg) = snapshot.errors.last() {
+            let _ = handle.set_params_and_notify_blocking(
+                0,
+                vec![ParamSetValue::new(
+                    params.last_error_message,
+                    0,
+                    ParamValue::Octet(msg.clone()),
+                )],
+            );
+        }
 
         if let Some(data) = snapshot.digital_input {
             let changed = data ^ prev_digital_input;
             if force_callback || changed != 0 {
                 prev_digital_input = data;
                 force_callback = false;
-                let _ = handle.write_int32_blocking(params.digital_input, 0, data as i32);
+                let _ = handle.set_params_and_notify_blocking(
+                    0,
+                    vec![ParamSetValue::uint32_digital(
+                        params.digital_input,
+                        0,
+                        data as u32,
+                        0xFFFF_FFFF,
+                        0,
+                    )],
+                );
             }
         }
         for (counter, value) in snapshot.counters.iter().enumerate() {
@@ -196,6 +230,9 @@ fn poller_loop(
             );
             if snapshot.wave_dig_just_stopped {
                 let _ = handle.write_int32_blocking(params.wave_dig_run, 0, 0);
+                // The scan is complete: hand the acquired points to the
+                // waveform records, as C stopWaveDig does through readWaveDig.
+                let _ = handle.set_params_and_notify_blocking(0, snapshot.wave_dig_arrays.clone());
             }
         } else {
             for ch in 0..MAX_ANALOG_IN {

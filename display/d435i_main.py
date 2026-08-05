@@ -325,7 +325,7 @@ class D435iMainDisplay(Display):
         form = QFormLayout()
         grp.setLayout(form)
         form.addRow("Align D->C:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSAlignEnable")))
-        form.addRow("Pointcloud:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSPointcloudEnable")))
+        form.addRow("Pointcloud:", PyDMEnumComboBox(init_channel=self._pv("cam1:RSPointCloudEnable")))
         return grp
 
     def _plugins_group(self):

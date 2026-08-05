@@ -26,6 +26,18 @@ impl DaqDevice {
         error::check(unsafe { ulDConfigPort(self.handle(), port, direction) })
     }
 
+    /// `DPIOT_*` I/O type of port `index`.
+    ///
+    /// Only `DPIOT_IO` and `DPIOT_BITIO` ports accept `digital_config_port` /
+    /// `digital_config_bit`; the rest reject them with `ERR_BAD_DEV_TYPE`.
+    pub fn digital_port_io_type(&self, index: u32) -> Result<i64> {
+        let mut value: i64 = 0;
+        error::check(unsafe {
+            ulDIOGetInfo(self.handle(), DIO_INFO_PORT_IO_TYPE, index, &mut value)
+        })?;
+        Ok(value)
+    }
+
     /// Configure a single bit direction.
     pub fn digital_config_bit(&self, port: i32, bit: i32, direction: i32) -> Result<()> {
         error::check(unsafe { ulDConfigBit(self.handle(), port, bit, direction) })

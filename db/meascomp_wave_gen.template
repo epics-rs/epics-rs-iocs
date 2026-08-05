@@ -1,19 +1,23 @@
 # Waveform generator control records
 # Macros: P (prefix), PORT (asyn port)
 
-record(bo, "$(P)WaveGenRun") {
+# busy + asyn:READBACK so the record follows the driver: a one-shot scan
+# stops by itself and a client waiting on Run must see it clear.
+record(busy, "$(P)WaveGenRun") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_RUN")
     field(ZNAM, "Stop")
     field(ONAM, "Run")
+    info(asyn:READBACK, "1")
 }
 
-record(ao, "$(P)WaveGenFreq") {
+# Readback of the frequency in use; set it through UserFrequency or
+# IntFrequency below, whichever matches the selected wave type.
+record(ai, "$(P)WaveGenFreq") {
     field(DTYP, "asynFloat64")
-    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_FREQ")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_FREQ")
     field(PREC, "3")
-    field(VAL,  "1.0")
-    field(PINI, "YES")
+    field(SCAN, "I/O Intr")
 }
 
 record(ai, "$(P)WaveGenDwellActual") {
@@ -30,11 +34,104 @@ record(ai, "$(P)WaveGenTotalTime") {
     field(SCAN, "I/O Intr")
 }
 
-record(longout, "$(P)WaveGenNumPoints") {
+record(longin, "$(P)WaveGenNumPoints") {
     field(DTYP, "asynInt32")
-    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_NUM_POINTS")
-    field(VAL,  "2048")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_NUM_POINTS")
+    field(SCAN, "I/O Intr")
+}
+
+###################################################################
+# A user-defined waveform is played back at its own point count    #
+# and dwell; an internally generated one at its own. The driver    #
+# rejects a mixture across enabled channels, because the two take  #
+# their timing from different parameters.                          #
+###################################################################
+record(longout, "$(P)WaveGenUserNumPoints") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_USER_NUM_POINTS")
+    field(VAL,  "$(WGEN_POINTS=2048)")
+    field(DRVL, "1")
+    field(DRVH, "$(WGEN_POINTS=2048)")
     field(PINI, "YES")
+}
+
+record(longout, "$(P)WaveGenIntNumPoints") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_INT_NUM_POINTS")
+    field(VAL,  "$(WGEN_POINTS=2048)")
+    field(DRVL, "1")
+    field(DRVH, "$(WGEN_POINTS=2048)")
+    field(PINI, "YES")
+}
+
+record(ao, "$(P)WaveGenUserDwell") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_USER_DWELL")
+    field(PREC, "6")
+    field(VAL,  "0.001")
+    field(PINI, "YES")
+    field(FLNK, "$(P)WaveGenCalcUserFrequency")
+}
+
+record(calcout, "$(P)WaveGenCalcUserFrequency") {
+    field(INPA, "$(P)WaveGenUserDwell  NPP MS")
+    field(INPB, "$(P)WaveGenUserNumPoints  NPP MS")
+    field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OUT,  "$(P)WaveGenUserFrequency.VAL  NPP MS")
+}
+
+record(ao, "$(P)WaveGenUserFrequency") {
+    field(PREC, "3")
+    field(FLNK, "$(P)WaveGenCalcUserDwell")
+}
+
+record(calcout, "$(P)WaveGenCalcUserDwell") {
+    field(INPA, "$(P)WaveGenUserFrequency  NPP MS")
+    field(INPB, "$(P)WaveGenUserNumPoints  NPP MS")
+    field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OUT,  "$(P)WaveGenUserDwell.VAL  PP MS")
+}
+
+record(ao, "$(P)WaveGenIntDwell") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_INT_DWELL")
+    field(PREC, "6")
+    field(VAL,  "0.001")
+    field(PINI, "YES")
+    field(FLNK, "$(P)WaveGenCalcIntFrequency")
+}
+
+record(calcout, "$(P)WaveGenCalcIntFrequency") {
+    field(INPA, "$(P)WaveGenIntDwell  NPP MS")
+    field(INPB, "$(P)WaveGenIntNumPoints  NPP MS")
+    field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OUT,  "$(P)WaveGenIntFrequency.VAL  NPP MS")
+}
+
+record(ao, "$(P)WaveGenIntFrequency") {
+    field(PREC, "3")
+    field(FLNK, "$(P)WaveGenCalcIntDwell")
+}
+
+record(calcout, "$(P)WaveGenCalcIntDwell") {
+    field(INPA, "$(P)WaveGenIntFrequency  NPP MS")
+    field(INPB, "$(P)WaveGenIntNumPoints  NPP MS")
+    field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OUT,  "$(P)WaveGenIntDwell.VAL  PP MS")
+}
+
+record(waveform, "$(P)WaveGenUserTimeWF") {
+    field(DTYP, "asynFloat32ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_USER_TIME_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(WGEN_POINTS=2048)")
+}
+
+record(waveform, "$(P)WaveGenIntTimeWF") {
+    field(DTYP, "asynFloat32ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_INT_TIME_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(WGEN_POINTS=2048)")
 }
 
 record(longin, "$(P)WaveGenCurrentPoint") {
@@ -62,4 +159,26 @@ record(bo, "$(P)WaveGenContinuous") {
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_CONTINUOUS")
     field(ZNAM, "One-shot")
     field(ONAM, "Continuous")
+}
+
+record(bo, "$(P)WaveGenRetrigger") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_RETRIGGER")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)WaveGenTriggerCount") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_TRIGGER_COUNT")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(ai, "$(P)WaveGenDwell") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_DWELL")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
 }

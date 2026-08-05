@@ -9,7 +9,7 @@ use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
 
 use realsense_rust::config::Config;
@@ -31,6 +31,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 
 use crate::params::{D435iConfigSnapshot, D435iParams};
+use crate::types::CameraCapabilities;
 use crate::types::{AcqCommand, DirtyFlags};
 
 const MAX_CONSECUTIVE_ERRORS: u32 = 50;
@@ -68,6 +69,8 @@ pub(crate) struct AcquisitionContext {
     pub rs_params: D435iParams,
     /// Device serial number (set at create time, not read from params).
     pub serial: String,
+    /// What the camera supports, queried once at create time.
+    pub caps: crate::types::CameraCapabilities,
 }
 
 impl AcquisitionContext {
@@ -100,7 +103,18 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
     rt::run_thread_named("D435iTask", move || acquisition_loop_async(ctx))
 }
 
-fn build_config(config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
+/// Open a fresh context and start a pipeline for `config`.
+fn start_pipeline(
+    config: &D435iConfigSnapshot,
+    caps: &CameraCapabilities,
+) -> anyhow::Result<realsense_rust::pipeline::ActivePipeline> {
+    let rs_ctx = Context::new()?;
+    let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
+    let rs_config = build_config(config, caps)?;
+    rs_pipeline.start(Some(rs_config))
+}
+
+fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyhow::Result<Config> {
     let mut cfg = Config::new();
     let w = config.res_x as usize;
     let h = config.res_y as usize;
@@ -108,8 +122,15 @@ fn build_config(config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
 
     cfg.enable_stream(Rs2StreamKind::Color, None, w, h, Rs2Format::Rgb8, fps)?;
     cfg.enable_stream(Rs2StreamKind::Depth, None, w, h, Rs2Format::Z16, fps)?;
-    cfg.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
-    cfg.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
+    // enable_stream for a kind the camera does not have is accepted here and
+    // then makes the WHOLE config unresolvable: pipeline.start fails and not
+    // one frame arrives, colour and depth included.
+    if caps.has_imu {
+        cfg.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
+        cfg.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
+    } else {
+        log::info!("D435i: no IMU on this camera; streaming colour and depth only");
+    }
 
     if !config.serial.is_empty() {
         let serial_cstr = CString::new(config.serial.as_str())
@@ -120,34 +141,61 @@ fn build_config(config: &D435iConfigSnapshot) -> anyhow::Result<Config> {
     Ok(cfg)
 }
 
-fn apply_sensor_options(composite: &CompositeFrame, config: &D435iConfigSnapshot) {
+/// Apply one sensor option, saying so when the camera will not take it.
+///
+/// Options are not uniform across the D400 family, and a discarded error here
+/// is indistinguishable from a setting that took effect -- the readback record
+/// echoes the requested value either way.
+fn set_sensor_option(sensor: &mut realsense_rust::sensor::Sensor, option: Rs2Option, value: f32) {
+    if !sensor.supports_option(option) {
+        log::warn!("D435i: this camera has no {option:?} option; ignoring");
+        return;
+    }
+    if let Err(e) = sensor.set_option(option, value) {
+        log::warn!("D435i: camera refused {option:?}={value}: {e}");
+    }
+}
+
+fn apply_sensor_options(
+    composite: &CompositeFrame,
+    config: &D435iConfigSnapshot,
+    caps: &CameraCapabilities,
+) {
     use realsense_rust::frame::FrameEx;
 
     // Color sensor options (exposure, gain, auto-exposure)
     let color_frames: Vec<ColorFrame> = composite.frames_of_type();
-    if let Some(color_frame) = color_frames.first() {
-        if let Ok(mut sensor) = FrameEx::sensor(color_frame) {
-            if config.auto_exposure {
-                let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 1.0);
-            } else {
-                let _ = sensor.set_option(Rs2Option::EnableAutoExposure, 0.0);
-                let _ = sensor.set_option(Rs2Option::Exposure, config.exposure as f32);
-                let _ = sensor.set_option(Rs2Option::Gain, config.gain as f32);
-            }
+    if let Some(color_frame) = color_frames.first()
+        && let Ok(mut sensor) = FrameEx::sensor(color_frame)
+    {
+        if config.auto_exposure {
+            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 1.0);
+        } else {
+            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 0.0);
+            set_sensor_option(&mut sensor, Rs2Option::Exposure, config.exposure as f32);
+            set_sensor_option(&mut sensor, Rs2Option::Gain, config.gain as f32);
         }
     }
 
     // Depth sensor options (emitter, laser power)
+    if !caps.has_emitter {
+        return;
+    }
     let depth_frames: Vec<DepthFrame> = composite.frames_of_type();
-    if let Some(depth_frame) = depth_frames.first() {
-        if let Ok(mut sensor) = FrameEx::sensor(depth_frame) {
-            let _ = sensor.set_option(
-                Rs2Option::EmitterEnabled,
-                if config.emitter_enabled { 1.0 } else { 0.0 },
+    if let Some(depth_frame) = depth_frames.first()
+        && let Ok(mut sensor) = FrameEx::sensor(depth_frame)
+    {
+        set_sensor_option(
+            &mut sensor,
+            Rs2Option::EmitterEnabled,
+            if config.emitter_enabled { 1.0 } else { 0.0 },
+        );
+        if config.emitter_enabled {
+            set_sensor_option(
+                &mut sensor,
+                Rs2Option::LaserPower,
+                config.laser_power as f32,
             );
-            if config.emitter_enabled {
-                let _ = sensor.set_option(Rs2Option::LaserPower, config.laser_power as f32);
-            }
         }
     }
 }
@@ -156,39 +204,38 @@ async fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame
     use realsense_rust::frame::FrameEx;
 
     let color_frames: Vec<ColorFrame> = composite.frames_of_type();
-    if let Some(color_frame) = color_frames.first() {
-        if let Ok(sensor) = FrameEx::sensor(color_frame) {
-            if let Ok(device) = sensor.device() {
-                if let Some(serial) = device.info(Rs2CameraInfo::SerialNumber) {
-                    let s = serial.to_string_lossy().into_owned();
-                    write_string(
-                        &ctx.color_handle,
-                        ctx.color_ad.base.serial_number,
-                        0,
-                        s.clone(),
-                    )
-                    .await;
-                    write_string(&ctx.color_handle, ctx.rs_params.rs_serial, 0, s).await;
-                }
-                if let Some(fw) = device.info(Rs2CameraInfo::FirmwareVersion) {
-                    write_string(
-                        &ctx.color_handle,
-                        ctx.color_ad.base.firmware_version,
-                        0,
-                        fw.to_string_lossy().into_owned(),
-                    )
-                    .await;
-                }
-                if let Some(name) = device.info(Rs2CameraInfo::Name) {
-                    write_string(
-                        &ctx.color_handle,
-                        ctx.color_ad.base.model,
-                        0,
-                        name.to_string_lossy().into_owned(),
-                    )
-                    .await;
-                }
-            }
+    if let Some(color_frame) = color_frames.first()
+        && let Ok(sensor) = FrameEx::sensor(color_frame)
+        && let Ok(device) = sensor.device()
+    {
+        if let Some(serial) = device.info(Rs2CameraInfo::SerialNumber) {
+            let s = serial.to_string_lossy().into_owned();
+            write_string(
+                &ctx.color_handle,
+                ctx.color_ad.base.serial_number,
+                0,
+                s.clone(),
+            )
+            .await;
+            write_string(&ctx.color_handle, ctx.rs_params.rs_serial, 0, s).await;
+        }
+        if let Some(fw) = device.info(Rs2CameraInfo::FirmwareVersion) {
+            write_string(
+                &ctx.color_handle,
+                ctx.color_ad.base.firmware_version,
+                0,
+                fw.to_string_lossy().into_owned(),
+            )
+            .await;
+        }
+        if let Some(name) = device.info(Rs2CameraInfo::Name) {
+            write_string(
+                &ctx.color_handle,
+                ctx.color_ad.base.model,
+                0,
+                name.to_string_lossy().into_owned(),
+            )
+            .await;
         }
     }
 }
@@ -215,7 +262,7 @@ fn copy_frame_data(frame_ptr: *const u8, stride: usize, row_bytes: usize, h: usi
 /// Publish an NDArray through a port handle, updating counters and metadata.
 async fn publish_array(
     handle: &PortHandle,
-    output: &parking_lot::Mutex<NDArrayOutput>,
+    output: &Arc<parking_lot::Mutex<NDArrayOutput>>,
     base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     array: NDArray,
     color_mode: NDColorMode,
@@ -286,9 +333,13 @@ async fn publish_array(
         )
         .await;
 
-    // Hold the parking_lot guard across .await: safe on a current-thread runtime
-    // with no concurrent tasks — no other task will try to re-acquire the lock.
-    output.lock().publish(Arc::new(array)).await;
+    // ArrayPublisher is the API for exactly this: it snapshots the sender
+    // list under the lock, releases it, then fans out. Holding a parking_lot
+    // guard across the await would block the whole executor thread the moment
+    // a downstream queue applies back-pressure.
+    ArrayPublisher::new(output.clone())
+        .publish(Arc::new(array))
+        .await;
 }
 
 async fn process_color_frame(
@@ -588,12 +639,7 @@ async fn try_connect_pipeline(
             return None;
         }
 
-        let result = (|| -> anyhow::Result<_> {
-            let rs_ctx = Context::new()?;
-            let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
-            let rs_config = build_config(config)?;
-            rs_pipeline.start(Some(rs_config))
-        })();
+        let result = start_pipeline(config, &ctx.caps);
 
         match result {
             Ok(p) => return Some(p),
@@ -750,6 +796,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             if dirty_flags.reconfigure_pipeline {
                 // Need to restart pipeline with new config
+                let previous = config.clone();
                 config = match D435iConfigSnapshot::read_via_handle(
                     &ctx.color_handle,
                     &ctx.color_ad,
@@ -762,19 +809,49 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     Err(_) => break,
                 };
 
-                let inactive = pipeline.stop();
-                let new_config = match build_config(&config) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        log::error!("D435i: failed to rebuild config: {e}");
-                        break;
-                    }
-                };
-                pipeline = match inactive.start(Some(new_config)) {
+                drop(pipeline.stop());
+                pipeline = match start_pipeline(&config, &ctx.caps) {
                     Ok(p) => p,
                     Err(e) => {
-                        log::error!("D435i: failed to restart pipeline: {e}");
-                        break;
+                        // RSStreamMode offers every mode the D435i supports,
+                        // and a D405 rejects the 1280x720 ones. Losing the
+                        // stream over a refused mode is the wrong answer:
+                        // report it, go back to the mode that was running, and
+                        // only give up if that fails too.
+                        log::error!("D435i: stream mode refused by the camera: {e}");
+                        write_string(
+                            &ctx.color_handle,
+                            ctx.color_ad.status_message,
+                            0,
+                            format!("Stream mode refused, kept the previous one: {e}"),
+                        )
+                        .await;
+                        config = previous;
+                        let _ = ctx
+                            .color_handle
+                            .set_params_and_notify(
+                                0,
+                                vec![ParamSetValue::new(
+                                    ctx.rs_params.rs_stream_mode,
+                                    0,
+                                    ParamValue::Int32(config.stream_mode),
+                                )],
+                            )
+                            .await;
+                        match start_pipeline(&config, &ctx.caps) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::error!("D435i: could not fall back to the previous mode: {e}");
+                                write_string(
+                                    &ctx.color_handle,
+                                    ctx.color_ad.status_message,
+                                    0,
+                                    format!("Acquisition stopped: {e}"),
+                                )
+                                .await;
+                                break;
+                            }
+                        }
                     }
                 };
                 sensor_options_applied = false;
@@ -930,7 +1007,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Apply sensor options on first frame after config change
             if !sensor_options_applied {
-                apply_sensor_options(&composite, &config);
+                apply_sensor_options(&composite, &config, &ctx.caps);
                 sensor_options_applied = true;
             }
 

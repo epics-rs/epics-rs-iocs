@@ -12,3 +12,4 @@ epics-rs = { workspace = true, features = ["asyn", "ad", "ioc", "pva", "bridge"]
 # `ad-plugins-rs/pva` (which is what gates `AdIoc::run_from_args_with_pva`).
 ad-plugins-rs = { workspace = true, features = ["ioc", "pva"] }
 tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"

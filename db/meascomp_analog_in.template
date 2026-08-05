@@ -22,7 +22,7 @@ record(mbbo, "$(P)$(R)Range") {
 record(mbbo, "$(P)$(R)Type") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_TYPE")
-    field(ZRST, "Volts")
-    field(ONST, "TC deg.")
+    field(ZRST, "Volts")     field(ZRVL, "0")
+    field(ONST, "TC deg.")   field(ONVL, "1")
     field(PINI, "YES")
 }

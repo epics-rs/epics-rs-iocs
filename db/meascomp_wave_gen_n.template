@@ -4,12 +4,12 @@
 record(mbbo, "$(P)$(R)WaveType") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_WAVE_TYPE")
-    field(ZRST, "User")
-    field(ONST, "Sin")
-    field(TWST, "Square")
-    field(THST, "Sawtooth")
-    field(FRST, "Pulse")
-    field(FVST, "Random")
+    field(ZRST, "User")      field(ZRVL, "0")
+    field(ONST, "Sin")       field(ONVL, "1")
+    field(TWST, "Square")    field(TWVL, "2")
+    field(THST, "Sawtooth")  field(THVL, "3")
+    field(FRST, "Pulse")     field(FRVL, "4")
+    field(FVST, "Random")    field(FVVL, "5")
     field(VAL,  "1")
     field(PINI, "YES")
 }
@@ -17,6 +17,8 @@ record(mbbo, "$(P)$(R)WaveType") {
 record(bo, "$(P)$(R)Enable") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_ENABLE")
+    field(VAL,  "1")
+    field(PINI, "YES")
     field(ZNAM, "Off")
     field(ONAM, "On")
     field(VAL,  "1")
@@ -44,5 +46,21 @@ record(ao, "$(P)$(R)PulseWidth") {
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_PULSE_WIDTH")
     field(PREC, "6")
     field(VAL,  "0.001")
+    field(PINI, "YES")
+}
+
+# User-defined waveform in volts, used when WaveType is "User". A waveform
+# shorter than WaveGenNumPoints is repeated to fill the scan.
+record(waveform, "$(P)$(R)UserWF") {
+    field(DTYP, "asynFloat32ArrayOut")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_USER_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(WGEN_POINTS=2048)")
+}
+
+record(ao, "$(P)$(R)PulseDelay") {
+    field(DTYP, "asynFloat64")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_PULSE_DELAY")
+    field(PREC, "4")
     field(PINI, "YES")
 }

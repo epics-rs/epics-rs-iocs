@@ -1,0 +1,13 @@
+# Whole digital output port as one integer, with readback.
+# Macros: P (prefix), R (record name), PORT (asyn port), ADDR, MASK
+record(longout, "$(P)$(R)") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_OUTPUT")
+    field(PINI, "$(PINI=NO)")
+}
+
+record(longin, "$(P)$(R)_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_OUTPUT")
+    field(SCAN, "I/O Intr")
+}

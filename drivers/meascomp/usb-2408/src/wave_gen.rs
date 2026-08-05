@@ -15,6 +15,12 @@ pub struct WaveGenState {
     /// Saved output values to restore after stop.
     pub saved_outputs: [f64; MAX_ANALOG_OUT],
     pub dwell_actual: f64,
+    /// Per-channel user-defined waveform, in volts, as written to
+    /// WAVEGEN_USER_WF. Used when a channel's WAVEGEN_WAVE_TYPE is `User`.
+    pub user_waveforms: Vec<Vec<f64>>,
+    /// Capacity the port was configured with; a user waveform is truncated to
+    /// it so it can never outrun the scan buffer.
+    pub max_points: usize,
 }
 
 impl WaveGenState {
@@ -27,6 +33,8 @@ impl WaveGenState {
             scan_buffer: Vec::new(),
             saved_outputs: [0.0; MAX_ANALOG_OUT],
             dwell_actual: 0.001,
+            user_waveforms: vec![Vec::new(); MAX_ANALOG_OUT],
+            max_points,
         }
     }
 }
@@ -37,7 +45,12 @@ pub fn volts_to_dac(data: &mut [f64]) {
     const DAC_OFFSET: f64 = 10.0; // mid-scale for ±10V
     const DAC_SCALE: f64 = 65535.0 / 20.0; // 16-bit DAC units per volt
     for v in data.iter_mut() {
-        *v = ((*v + DAC_OFFSET) * DAC_SCALE + 0.5).clamp(0.0, 65535.0);
+        // C casts to epicsUInt16 after the +0.5, i.e. rounds to the nearest
+        // DAC count. Without the truncation every sample kept a half-count
+        // bias and the clamp was applied to the un-rounded value.
+        *v = ((*v + DAC_OFFSET) * DAC_SCALE + 0.5)
+            .floor()
+            .clamp(0.0, 65535.0);
     }
 }
 
@@ -100,7 +113,8 @@ pub fn generate_waveform(
             }
         }
         _ => {
-            // WAVE_TYPE_USER: return zeros, caller should provide user data
+            // WAVE_TYPE_USER: the caller fills this in from the channel's
+            // WAVEGEN_USER_WF; zeros only if nothing was ever written.
         }
     }
     data
@@ -234,5 +248,77 @@ pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
             );
         }
         state.running = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dac_conversion_spans_the_bipolar_range() {
+        let mut data = [-10.0, 0.0, 10.0];
+        volts_to_dac(&mut data);
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], 32768.0);
+        assert_eq!(data[2], 65535.0);
+    }
+
+    #[test]
+    fn dac_conversion_clamps_beyond_the_range() {
+        let mut data = [-25.0, 25.0];
+        volts_to_dac(&mut data);
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], 65535.0);
+    }
+
+    #[test]
+    fn an_unset_wave_type_is_all_zeros() {
+        // WAVE_TYPE_USER has no internal shape: the driver fills it from
+        // WAVEGEN_USER_WF, and an unwritten one must stay at 0 V.
+        let data = generate_waveform(WAVE_TYPE_USER, 8, 5.0, 1.0, 0.5);
+        assert_eq!(data, vec![0.0; 8]);
+    }
+
+    #[test]
+    fn a_square_wave_is_half_high_half_low_around_the_offset() {
+        let data = generate_waveform(WAVE_TYPE_SQUARE, 4, 2.0, 1.0, 0.5);
+        assert_eq!(data, vec![3.0, 3.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn a_sawtooth_spans_offset_plus_or_minus_amplitude() {
+        let data = generate_waveform(WAVE_TYPE_SAWTOOTH, 4, 2.0, 0.0, 0.5);
+        assert_eq!(data, vec![-2.0, -1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn a_pulse_is_at_least_one_sample_wide() {
+        // A pulse width that rounds to zero samples must still produce a
+        // pulse, not a flat line at the offset.
+        let data = generate_waveform(WAVE_TYPE_PULSE, 10, 1.0, 0.0, 0.0);
+        assert_eq!(data[0], 1.0);
+        assert_eq!(&data[1..], &[0.0; 9]);
+    }
+
+    #[test]
+    fn a_pulse_wider_than_the_waveform_stays_high() {
+        let data = generate_waveform(WAVE_TYPE_PULSE, 4, 1.0, 0.0, 2.0);
+        assert_eq!(data, vec![1.0; 4]);
+    }
+
+    #[test]
+    fn a_single_point_waveform_is_well_defined() {
+        for wave_type in [
+            WAVE_TYPE_SIN,
+            WAVE_TYPE_SQUARE,
+            WAVE_TYPE_SAWTOOTH,
+            WAVE_TYPE_PULSE,
+            WAVE_TYPE_RANDOM,
+        ] {
+            let data = generate_waveform(wave_type, 1, 1.0, 0.0, 0.5);
+            assert_eq!(data.len(), 1);
+            assert!(data[0].is_finite());
+        }
     }
 }

@@ -6,6 +6,7 @@ record(bo, "$(P)MCS:StartAll") {
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_START_ACQUIRE")
     field(ZNAM, "Done")
     field(ONAM, "Start")
+    field(FLNK, "$(P)MCS:SetAcquiring")
 }
 
 record(bo, "$(P)MCS:StopAll") {
@@ -22,12 +23,121 @@ record(bo, "$(P)MCS:EraseAll") {
     field(ONAM, "Erase")
 }
 
-record(bi, "$(P)MCS:Acquiring") {
+# What the driver is doing right now.
+record(bi, "$(P)MCS:HardwareAcquiring") {
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),0,1.0)MCA_ACQUIRING")
     field(SCAN, "I/O Intr")
     field(ZNAM, "Done")
     field(ONAM, "Acquiring")
+    field(FLNK, "$(P)MCS:AcquireDone")
+}
+
+# What a client waits on. Set when acquisition starts and cleared only after
+# the spectra have been re-read, so `caput -c $(P)MCS:EraseStart 1` returns
+# with the data already in the waveform records. Upstream gets this ordering
+# from USBCTR_SNL.st; the same fan-out done in the database needs no
+# sequencer.
+record(busy, "$(P)MCS:Acquiring") {
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+}
+
+# Fires once on the hardware's 1 -> 0 transition.
+record(calcout, "$(P)MCS:AcquireDone") {
+    field(INPA, "$(P)MCS:HardwareAcquiring  NPP NMS")
+    field(CALC, "A")
+    field(OOPT, "Transition To Zero")
+    field(OUT,  "$(P)MCS:DoReadAll  PP")
+}
+
+record(bo, "$(P)MCS:SetAcquiring") {
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+    field(OUT,  "$(P)MCS:Acquiring  PP")
+}
+
+# Erase, mark acquiring, start -- in that order.
+record(seq, "$(P)MCS:EraseStart") {
+    field(SELM, "All")
+    field(DOL1, "1")  field(LNK1, "$(P)MCS:EraseAll  PP")
+    field(DOL2, "1")  field(LNK2, "$(P)MCS:SetAcquiring  PP")
+    field(DOL3, "1")  field(LNK3, "$(P)MCS:StartAll  PP")
+}
+
+# Re-read every spectrum plus the time bases, then release Acquiring.
+record(bo, "$(P)MCS:DoReadAll") {
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(FLNK, "$(P)MCS:ReadFanout")
+}
+
+record(bo, "$(P)MCS:ReadAll") {
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(FLNK, "$(P)MCS:ReadFanout")
+}
+
+record(bo, "$(P)MCS:ReadAllOnce") {
+    field(ZNAM, "Done")
+    field(ONAM, "Read")
+    field(FLNK, "$(P)MCS:ReadFanout")
+}
+
+record(fanout, "$(P)MCS:ReadFanout") {
+    field(SELM, "All")
+    field(LNK0, "$(P)MCS:mca1  PP")
+    field(LNK1, "$(P)MCS:mca2  PP")
+    field(LNK2, "$(P)MCS:mca3  PP")
+    field(LNK3, "$(P)MCS:mca4  PP")
+    field(LNK4, "$(P)MCS:mca5  PP")
+    field(LNK5, "$(P)MCS:mca6  PP")
+    field(LNK6, "$(P)MCS:mca7  PP")
+    field(LNK7, "$(P)MCS:mca8  PP")
+    field(LNK8, "$(P)MCS:mca9  PP")
+    field(LNK9, "$(P)MCS:TimeWF  PP")
+    field(LNKA, "$(P)MCS:AbsTimeWF  PP")
+    field(FLNK, "$(P)MCS:ClearAcquiring")
+}
+
+record(bo, "$(P)MCS:ClearAcquiring") {
+    field(VAL,  "0")
+    field(OUT,  "$(P)MCS:Acquiring  PP")
+}
+
+# Time bases, read on demand through the fan-out above.
+record(waveform, "$(P)MCS:TimeWF") {
+    field(DTYP, "asynFloat32ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)MCS_TIME_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(MAX_POINTS=2048)")
+}
+
+record(waveform, "$(P)MCS:AbsTimeWF") {
+    field(DTYP, "asynFloat64ArrayIn")
+    field(INP,  "@asyn($(PORT),0,1.0)MCS_ABS_TIME_WF")
+    field(FTVL, "DOUBLE")
+    field(NELM, "$(MAX_POINTS=2048)")
+}
+
+# A client that needs to be released only after it has consumed the data sets
+# EnableClientWait; ClientWait is then raised with Acquiring and the client
+# clears it when done.
+record(bo, "$(P)MCS:EnableClientWait") {
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
+}
+
+record(bo, "$(P)MCS:SetClientWait") {
+    field(VAL,  "1")
+    field(SDIS, "$(P)MCS:EnableClientWait  NPP NMS")
+    field(DISV, "0")
+    field(OUT,  "$(P)MCS:ClientWait  PP")
+}
+
+record(busy, "$(P)MCS:ClientWait") {
+    field(ZNAM, "Done")
+    field(ONAM, "Waiting")
 }
 
 record(ao, "$(P)MCS:Dwell") {
@@ -41,7 +151,30 @@ record(ao, "$(P)MCS:Dwell") {
 record(longout, "$(P)MCS:NuseAll") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_NUM_CHANNELS")
-    field(VAL,  "2048")
+    field(VAL,  "$(MAX_POINTS=2048)")
+    field(DRVL, "1")
+    field(DRVH, "$(MAX_POINTS=2048)")
+    field(PINI, "YES")
+}
+
+record(longin, "$(P)MCS:MaxChannels") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MCS_MAX_POINTS")
+    field(PINI, "YES")
+}
+
+record(longout, "$(P)MCS:Prescale") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_PRESCALE")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:TrigMode") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)TRIGGER_MODE")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
     field(PINI, "YES")
 }
 
@@ -69,7 +202,71 @@ record(longin, "$(P)MCS:CurrentChannel") {
 record(mbbo, "$(P)MCS:ChannelAdvance") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADVANCE_SOURCE")
-    field(ZRST, "Internal")
-    field(ONST, "External")
+    field(ZRST, "Internal")  field(ZRVL, "0")
+    field(ONST, "External")  field(ONVL, "1")
+    field(PINI, "YES")
+}
+
+# Per-counter MCS enable. The driver reads MCS_COUNTER_ENABLE as one
+# bitmask (bit i = counter i, bit 8 = the digital I/O channel); the bo
+# records below drive the individual bits of it.
+record(mbboDirect, "$(P)MCS:MCSCounterEnable") {
+    field(DTYP, "asynUInt32Digital")
+    field(OUT,  "@asynMask($(PORT),0,0xFFFFFFFF)MCS_COUNTER_ENABLE")
+    field(VAL,  "0x1FF")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter1Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B0 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter2Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B1 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter3Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B2 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter4Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B3 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter5Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B4 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter6Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B5 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter7Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B6 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSCounter8Enable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B7 PP")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:MCSDIOEnable") {
+    field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
+    field(OUT,  "$(P)MCS:MCSCounterEnable.B8 PP")
     field(PINI, "YES")
 }

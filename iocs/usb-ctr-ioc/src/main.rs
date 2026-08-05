@@ -7,13 +7,19 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
+use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::ca::server::ioc_app::IocApplication;
+use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
-use usb_ctr::{CtrRuntime, create_usb_ctr};
+use usb_ctr::{CtrRuntime, CtrScalerDriver, create_usb_ctr};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
+    // The drivers report every uldaq failure through `log`; without a
+    // backend installed those calls are no-ops and a failed ulAOut or
+    // ulAInScan leaves no trace anywhere. Defaults to warn-and-above.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     let args: Vec<String> = std::env::args().collect();
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
@@ -23,17 +29,30 @@ async fn main() -> CaResult<()> {
     };
 
     epics_rs::base::runtime::env::set_default("MEASCOMP", env!("CARGO_MANIFEST_DIR"));
+    // scaler-rs ships scaler.db; st.cmd loads it from $(SCALER) the way
+    // upstream's USBCTR st.cmd loads it from the scaler module.
+    epics_rs::base::runtime::env::set_default("SCALER", epics_rs::scaler::SCALER_DB_DIR);
 
     let trace = Arc::new(TraceManager::new());
 
     // Runtime kept alive by being captured in the startup command closure
     let runtime: Arc<Mutex<Option<CtrRuntime>>> = Arc::new(Mutex::new(None));
+    // Hand-off slot from USBCTRConfig to the scalerRecord bind at iocInit.
+    // One USB-CTR08 per IOC, so a single slot is enough.
+    let pending_scaler: Arc<Mutex<Option<CtrScalerDriver>>> = Arc::new(Mutex::new(None));
 
     let mut app = IocApplication::new();
 
     // Register record types
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
+
+    let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
+    app = app.register_record_type(scaler_name, move || scaler_factory());
+    // The scaler device support binds dynamically by DTYP at iocInit, so the
+    // name is in no device menu when scaler.db's DTYP field is applied.
+    // Contributing the menu here makes that assignment resolve.
+    epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
 
     // Universal asyn device support
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
@@ -48,6 +67,7 @@ async fn main() -> CaResult<()> {
     {
         let trace_c = trace.clone();
         let rt = runtime.clone();
+        let scaler_slot = pending_scaler.clone();
         app = app.register_startup_command(CommandDef::new(
             "USBCTRConfig",
             vec![
@@ -84,6 +104,11 @@ async fn main() -> CaResult<()> {
 
                 let ctr_rt = create_usb_ctr(&port_name, &unique_id, max_points)?;
 
+                *scaler_slot.lock().unwrap() = Some(CtrScalerDriver::new(
+                    ctr_rt.device.clone(),
+                    ctr_rt.state.clone(),
+                ));
+
                 let port_handle = ctr_rt.port_handle().clone();
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
@@ -96,6 +121,22 @@ async fn main() -> CaResult<()> {
                 Ok(CommandOutcome::Continue)
             },
         ));
+    }
+
+    // Binds the USB-CTR08's counters to the scalerRecord scaler.db declares.
+    {
+        let scaler_slot = pending_scaler.clone();
+        app = app.register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
+            if ctx.dtyp != "Asyn Scaler" {
+                return None;
+            }
+            let driver = scaler_slot.lock().unwrap().take()?;
+            Some(Box::new(
+                epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(
+                    Box::new(driver),
+                ),
+            ) as Box<dyn DeviceSupport>)
+        });
     }
 
     app.startup_script(&script)

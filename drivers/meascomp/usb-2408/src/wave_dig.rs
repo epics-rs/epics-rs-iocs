@@ -1,5 +1,7 @@
 use std::time::SystemTime;
 
+use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::request::ParamSetValue;
 use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
@@ -16,8 +18,8 @@ pub struct WaveDigState {
     pub auto_restart: bool,
     /// Scan buffer (f64, allocated by ulAInScan).
     pub scan_buffer: Vec<f64>,
-    /// Per-channel waveform data [channel][point].
-    pub channel_buffers: Vec<Vec<f32>>,
+    /// Per-channel waveform data [channel][point], in volts.
+    pub channel_buffers: Vec<Vec<f64>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
     /// Time waveform per point.
@@ -33,7 +35,7 @@ impl WaveDigState {
     pub fn new(max_points: usize) -> Self {
         let mut channel_buffers = Vec::with_capacity(MAX_ANALOG_IN);
         for _ in 0..MAX_ANALOG_IN {
-            channel_buffers.push(vec![0.0f32; max_points]);
+            channel_buffers.push(vec![0.0f64; max_points]);
         }
         Self {
             running: false,
@@ -166,6 +168,19 @@ pub fn start_wave_dig(
     Ok(())
 }
 
+/// Number of complete scan points behind `current_index`.
+///
+/// ulAInScanStatus reports `currentIndex` as the position of the LAST sample
+/// written, so the count is `index / chans + 1` -- C drvMultiFunction.cpp's
+/// `lastPoint = aiIndex / numWaveDigChans_ + 1`. Clamped to `num_points`
+/// because the per-channel buffers are sized once at construction.
+pub fn points_transferred(current_index: i64, n_chans: usize, num_points: usize) -> usize {
+    if current_index < 0 || n_chans == 0 {
+        return 0;
+    }
+    (current_index as usize / n_chans + 1).min(num_points)
+}
+
 /// Read waveform digitizer data from scan buffer. Called from poller.
 pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
     let (status, xfer) = match device.analog_in_scan_status() {
@@ -185,7 +200,7 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
         return;
     }
 
-    let last_point = ((xfer.current_index as usize + 1) / n_chans).min(state.num_points);
+    let last_point = points_transferred(xfer.current_index, n_chans, state.num_points);
     let now = current_time_secs();
 
     // Copy new data
@@ -194,8 +209,7 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
         for j in 0..n_chans {
             let ch = state.first_chan + j;
             if ch < MAX_ANALOG_IN {
-                state.channel_buffers[ch][state.current_point] =
-                    state.scan_buffer[buf_offset + j] as f32;
+                state.channel_buffers[ch][state.current_point] = state.scan_buffer[buf_offset + j];
             }
         }
         state.abs_time_buffer[state.current_point] = now;
@@ -263,4 +277,75 @@ fn current_time_secs() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+/// Array callbacks carrying the digitized data: WAVEDIG_VOLT_WF for each
+/// scanned channel plus the absolute time base, both truncated to the points
+/// actually acquired. C `MultiFunction::readWaveDig`.
+///
+/// Returned rather than applied so the actor thread (a WAVEDIG_READ_WF write)
+/// and the poller thread can each push them through their own owner.
+pub fn waveform_updates(params: &MultiFunctionParams, state: &WaveDigState) -> Vec<ParamSetValue> {
+    let n = state.current_point.min(state.num_points);
+    let mut updates = Vec::with_capacity(state.num_chans + 1);
+    for j in 0..state.num_chans {
+        let ch = state.first_chan + j;
+        if ch < MAX_ANALOG_IN {
+            updates.push(ParamSetValue::new(
+                params.wave_dig_volt_wf,
+                ch as i32,
+                ParamValue::Float64Array(state.channel_buffers[ch][..n].into()),
+            ));
+        }
+    }
+    updates.push(ParamSetValue::new(
+        params.wave_dig_abs_time_wf,
+        0,
+        ParamValue::Float64Array(state.abs_time_buffer[..n].into()),
+    ));
+    updates
+}
+
+/// Array callback for the dwell-derived time base. C
+/// `MultiFunction::computeWaveDigTimes`.
+pub fn time_wf_update(params: &MultiFunctionParams, state: &WaveDigState) -> ParamSetValue {
+    let n = state.num_points.min(state.time_buffer.len());
+    ParamSetValue::new(
+        params.wave_dig_time_wf,
+        0,
+        ParamValue::Float32Array(state.time_buffer[..n].into()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_completed_scan_counts_every_point() {
+        // 2 channels x 50 points: the last sample written is index 98.
+        assert_eq!(points_transferred(98, 2, 50), 50);
+        // 1 channel x 20 points: index 19.
+        assert_eq!(points_transferred(19, 1, 20), 20);
+    }
+
+    #[test]
+    fn the_first_sample_of_a_point_already_counts_it() {
+        // C counts a point as soon as its first channel lands, so index 0 and
+        // index 1 of a 2-channel scan are both "point 1".
+        assert_eq!(points_transferred(0, 2, 50), 1);
+        assert_eq!(points_transferred(1, 2, 50), 1);
+        assert_eq!(points_transferred(2, 2, 50), 2);
+    }
+
+    #[test]
+    fn an_index_past_the_buffer_is_clamped() {
+        assert_eq!(points_transferred(4096, 2, 50), 50);
+    }
+
+    #[test]
+    fn no_transfer_yet_is_zero_points() {
+        assert_eq!(points_transferred(-1, 2, 50), 0);
+        assert_eq!(points_transferred(10, 0, 50), 0);
+    }
 }

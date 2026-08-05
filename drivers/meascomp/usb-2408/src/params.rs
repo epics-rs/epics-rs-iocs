@@ -168,7 +168,7 @@ impl MultiFunctionParams {
             wave_dig_abs_time_wf: base
                 .create_param("WAVEDIG_ABS_TIME_WF", ParamType::Float64Array)?,
             wave_dig_read_wf: base.create_param("WAVEDIG_READ_WF", ParamType::Int32)?,
-            wave_dig_volt_wf: base.create_param("WAVEDIG_VOLT_WF", ParamType::Float32Array)?,
+            wave_dig_volt_wf: base.create_param("WAVEDIG_VOLT_WF", ParamType::Float64Array)?,
 
             wave_gen_freq: base.create_param("WAVEGEN_FREQ", ParamType::Float64)?,
             wave_gen_dwell: base.create_param("WAVEGEN_DWELL", ParamType::Float64)?,

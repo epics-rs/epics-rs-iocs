@@ -9,3 +9,4 @@ usb-2408 = { path = "../../drivers/meascomp/usb-2408" }
 epics-rs = { workspace = true, features = ["asyn", "bridge"] }
 asyn-rs = { workspace = true, features = ["epics"] }
 tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"

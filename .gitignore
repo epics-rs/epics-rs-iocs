@@ -3,3 +3,6 @@
 
 # caucus local session state (worktrees, panel logs, round reports)
 .caucus/sessions/
+
+# autosave state written at runtime by create_monitor_set
+/iocs/*/autosave/

@@ -22,6 +22,8 @@ pub struct D435iParams {
 
     // Depth info (read-only)
     pub rs_depth_units: usize,
+    pub rs_has_imu: usize,
+    pub rs_has_emitter: usize,
 
     // IMU
     pub rs_accel_x: usize,
@@ -63,7 +65,7 @@ pub struct D435iParams {
 impl D435iParams {
     pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
-            rs_stream_mode: base.create_param("RS_STREAM_MODE", ParamType::Int32)?,
+            rs_stream_mode: base.create_param("RS_STREAM_MODE", ParamType::Enum)?,
             rs_res_x: base.create_param("RS_RES_X", ParamType::Int32)?,
             rs_res_y: base.create_param("RS_RES_Y", ParamType::Int32)?,
             rs_frame_rate: base.create_param("RS_FRAME_RATE", ParamType::Int32)?,
@@ -73,6 +75,8 @@ impl D435iParams {
             rs_laser_power: base.create_param("RS_LASER_POWER", ParamType::Float64)?,
             rs_emitter_enabled: base.create_param("RS_EMITTER_ENABLED", ParamType::Int32)?,
             rs_depth_units: base.create_param("RS_DEPTH_UNITS", ParamType::Float64)?,
+            rs_has_imu: base.create_param("RS_HAS_IMU", ParamType::Int32)?,
+            rs_has_emitter: base.create_param("RS_HAS_EMITTER", ParamType::Int32)?,
             rs_accel_x: base.create_param("RS_ACCEL_X", ParamType::Float64)?,
             rs_accel_y: base.create_param("RS_ACCEL_Y", ParamType::Float64)?,
             rs_accel_z: base.create_param("RS_ACCEL_Z", ParamType::Float64)?,
@@ -106,7 +110,10 @@ impl D435iParams {
 }
 
 /// Configuration snapshot read from the Color port for the acquisition thread.
+#[derive(Clone)]
 pub struct D435iConfigSnapshot {
+    /// Index into `STREAM_MODES`, kept so a refused mode can be put back.
+    pub stream_mode: i32,
     pub res_x: i32,
     pub res_y: i32,
     pub frame_rate: i32,
@@ -156,6 +163,7 @@ impl D435iConfigSnapshot {
         serial: &str,
     ) -> AsynResult<Self> {
         Ok(Self {
+            stream_mode: handle.read_int32(rs.rs_stream_mode, 0).await?,
             res_x: handle.read_int32(rs.rs_res_x, 0).await?,
             res_y: handle.read_int32(rs.rs_res_y, 0).await?,
             frame_rate: handle.read_int32(rs.rs_frame_rate, 0).await?,

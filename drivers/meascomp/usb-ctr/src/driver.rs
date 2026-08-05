@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -12,7 +13,7 @@ use crate::mcs::{self, McsScan, McsState};
 use crate::params::*;
 use crate::poller::{self, PollerState};
 use crate::pulse_gen;
-use crate::scaler::{self, ScalerState};
+use crate::scaler::ScalerState;
 
 /// USB-CTR08 port driver.
 pub struct CtrDriver {
@@ -21,6 +22,9 @@ pub struct CtrDriver {
     pub device: Arc<Mutex<DaqDevice>>,
     pub state: Arc<Mutex<PollerState>>,
     pub max_time_points: usize,
+    /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
+    /// `DPIOT_BITIO`). The USB-CTR08 reports `DPIOT_BITIO`.
+    dio_configurable: bool,
 }
 
 impl CtrDriver {
@@ -55,8 +59,25 @@ impl CtrDriver {
         base.set_string_param(params.ul_version, 0, ul_ver)?;
         base.set_string_param(params.driver_version, 0, "0.1.0".into())?;
 
-        // Configure AUXPORT as bit-configurable input by default
-        let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
+        // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
+        // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
+        // the device instead of assuming.
+        let dio_configurable = matches!(
+            device.digital_port_io_type(0),
+            Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
+        );
+        if dio_configurable
+            && let Err(e) = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT)
+        {
+            log::error!("digital_config_port error: {e}");
+        }
+
+        // Seed DIGITAL_INPUT so the bi records have a value to read at init.
+        // The poller only pushes on a changed bit, and its one forced first
+        // callback happens here -- before dbLoadRecords has run.
+        if let Ok(data) = device.digital_in(uldaq_sys::AUXPORT) {
+            base.set_uint32_param(params.digital_input, 0, data as u32, 0xFFFF_FFFF, 0)?;
+        }
 
         let state = Arc::new(Mutex::new(PollerState {
             scaler: ScalerState::new(),
@@ -71,6 +92,7 @@ impl CtrDriver {
             device: Arc::new(Mutex::new(device)),
             state,
             max_time_points,
+            dio_configurable,
         })
     }
 }
@@ -85,6 +107,7 @@ impl PortDriver for CtrDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
 
@@ -131,54 +154,28 @@ impl PortDriver for CtrDriver {
                             actual_delay,
                         );
                     }
-                    Err(e) => log::error!("pulse_gen start error: {e}"),
+                    Err(e) => last_error = Some(format!("pulse_gen start error: {e}")),
                 }
             } else if reason == self.params.pulse_run
                 && let Err(e) = pulse_gen::stop(&dev, addr)
             {
-                log::error!("pulse_gen stop error: {e}");
+                last_error = Some(format!("pulse_gen stop error: {e}"));
             }
         } else if reason == self.params.counter_reset {
             if value != 0 {
                 let dev = self.device.lock().unwrap();
                 if let Err(e) = dev.counter_clear(addr) {
-                    log::error!("counter_clear error: {e}");
+                    last_error = Some(format!("counter_clear error: {e}"));
                 }
             }
         } else if reason == self.params.digital_output {
             let dev = self.device.lock().unwrap();
             if let Err(e) = dev.digital_out(uldaq_sys::AUXPORT, value as u64) {
-                log::error!("digital_out error: {e}");
-            }
-        } else if reason == self.params.scaler_arm {
-            let dev = self.device.lock().unwrap();
-            let mut st = self.state.lock().unwrap();
-            if value != 0 {
-                if let Err(e) = scaler::start_scaler(&dev, &mut st.scaler) {
-                    log::error!("start_scaler error: {e}");
-                }
-            } else {
-                scaler::stop_scaler(&dev, &mut st.scaler);
-            }
-        } else if reason == self.params.scaler_reset {
-            let dev = self.device.lock().unwrap();
-            let mut st = self.state.lock().unwrap();
-            scaler::reset_scaler(&dev, &mut st.scaler);
-            // Clear all presets (matches C++ resetScaler behavior)
-            for i in 0..MAX_COUNTERS {
-                st.scaler.presets[i] = 0;
-                let _ = self
-                    .base
-                    .params
-                    .set_int32(self.params.scaler_presets, i as i32, 0);
-            }
-        } else if reason == self.params.scaler_presets {
-            let mut st = self.state.lock().unwrap();
-            if (addr as usize) < MAX_COUNTERS {
-                st.scaler.presets[addr as usize] = value as u64;
+                last_error = Some(format!("digital_out error: {e}"));
             }
         } else if reason == self.params.mca_start_acquire {
-            if value != 0 {
+            let already_running = self.state.lock().unwrap().mcs.running;
+            if value != 0 && !already_running {
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
                 let num_channels =
@@ -191,8 +188,7 @@ impl PortDriver for CtrDriver {
                 let trigger = self.base.get_int32_param(self.params.trigger_mode, 0)? != 0;
                 let enable = self
                     .base
-                    .get_int32_param(self.params.mcs_counter_enable, 0)?
-                    as u32;
+                    .get_uint32_param(self.params.mcs_counter_enable, 0)?;
                 st.mcs.preset_real_time = self
                     .base
                     .get_float64_param(self.params.mca_preset_real, 0)?;
@@ -213,7 +209,7 @@ impl PortDriver for CtrDriver {
                         point0_no_clear,
                     },
                 ) {
-                    log::error!("start_mcs error: {e}");
+                    last_error = Some(format!("start_mcs error: {e}"));
                 }
                 self.base
                     .params
@@ -232,11 +228,77 @@ impl PortDriver for CtrDriver {
             mcs::erase_mcs(&mut st.mcs);
         }
 
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }
 
+    /// MCS spectrum readout. C `USBCTR::readInt32Array` / the `mcaReadData`
+    /// the mca record and SIS38XX_waveform.template both go through: the data
+    /// lives in McsState::mcs_buffers and only leaves the driver here.
+    fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+        if user.reason != self.params.mca_data {
+            return Ok(0);
+        }
+        let counter = user.addr as usize;
+        let num_channels = self
+            .base
+            .get_int32_param(self.params.mca_num_channels, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let st = self.state.lock().unwrap();
+        let Some(src) = st.mcs.mcs_buffers.get(counter) else {
+            return Ok(0);
+        };
+        let n = buf.len().min(src.len()).min(num_channels);
+        buf[..n].copy_from_slice(&src[..n]);
+        Ok(n)
+    }
+
+    /// MCS time base (seconds from the start of the scan).
+    fn read_float32_array(&mut self, user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
+        if user.reason != self.params.mcs_time_wf {
+            return Ok(0);
+        }
+        // Only the points the scan is configured for, as C
+        // computeMCSTimes' doCallbacksFloat32Array(.., numTimePoints, ..)
+        // does -- a full-length time base against a short spectrum is
+        // unplottable.
+        let num_channels = self
+            .base
+            .get_int32_param(self.params.mca_num_channels, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let st = self.state.lock().unwrap();
+        let n = buf.len().min(st.mcs.time_buffer.len()).min(num_channels);
+        buf[..n].copy_from_slice(&st.mcs.time_buffer[..n]);
+        Ok(n)
+    }
+
+    /// MCS absolute time base (seconds since the epoch, per acquired point).
+    fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
+        if user.reason != self.params.mcs_abs_time_wf {
+            return Ok(0);
+        }
+        let st = self.state.lock().unwrap();
+        // Points actually acquired, as C readMCS reports them.
+        let n = buf
+            .len()
+            .min(st.mcs.abs_time_buffer.len())
+            .min(st.mcs.current_point);
+        buf[..n].copy_from_slice(&st.mcs.abs_time_buffer[..n]);
+        Ok(n)
+    }
+
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
         self.base.params.set_float64(reason, addr, value)?;
@@ -283,11 +345,19 @@ impl PortDriver for CtrDriver {
                             actual_delay,
                         );
                     }
-                    Err(e) => log::error!("pulse_gen restart error: {e}"),
+                    Err(e) => last_error = Some(format!("pulse_gen restart error: {e}")),
                 }
             }
         }
 
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }
@@ -298,6 +368,7 @@ impl PortDriver for CtrDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
+        let mut last_error: Option<String> = None;
         let reason = user.reason;
         let addr = user.addr;
 
@@ -309,27 +380,42 @@ impl PortDriver for CtrDriver {
                     if let Err(e) =
                         dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0)
                     {
-                        log::error!("digital_bit_out error: {e}");
+                        last_error = Some(format!("digital_bit_out error: {e}"));
                     }
                 }
             }
         } else if reason == self.params.digital_direction {
-            let dev = self.device.lock().unwrap();
-            for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
-                    let dir = if (value >> bit) & 1 != 0 {
-                        uldaq_sys::DD_OUTPUT
-                    } else {
-                        uldaq_sys::DD_INPUT
-                    };
-                    if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir) {
-                        log::error!("digital_config_bit error: {e}");
+            if !self.dio_configurable {
+                last_error =
+                    Some("digital direction is fixed on this model; ignoring write".to_string());
+            } else {
+                let dev = self.device.lock().unwrap();
+                for bit in 0..NUM_IO_BITS {
+                    if mask & (1 << bit) != 0 {
+                        let dir = if (value >> bit) & 1 != 0 {
+                            uldaq_sys::DD_OUTPUT
+                        } else {
+                            uldaq_sys::DD_INPUT
+                        };
+                        if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir)
+                        {
+                            last_error = Some(format!("digital_config_bit error: {e}"));
+                        }
                     }
                 }
             }
         }
 
         self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+
+        if let Some(msg) = last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg),
+            );
+        }
         self.base.call_param_callbacks(addr)?;
         Ok(())
     }
@@ -340,6 +426,7 @@ pub struct CtrRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: CtrParams,
     pub device: Arc<Mutex<DaqDevice>>,
+    pub state: Arc<Mutex<PollerState>>,
     _poller_handle: std::thread::JoinHandle<()>,
 }
 
@@ -372,13 +459,14 @@ pub fn create_usb_ctr(
         runtime_handle.port_handle().clone(),
         params,
         device.clone(),
-        state,
+        state.clone(),
     );
 
     Ok(CtrRuntime {
         runtime_handle,
         params,
         device,
+        state,
         _poller_handle: poller_handle,
     })
 }

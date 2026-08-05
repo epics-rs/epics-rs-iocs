@@ -14,6 +14,11 @@ use usb_2408::{MultiFunctionRuntime, create_usb_2408};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
+    // The drivers report every uldaq failure through `log`; without a
+    // backend installed those calls are no-ops and a failed ulAOut or
+    // ulAInScan leaves no trace anywhere. Defaults to warn-and-above.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     let args: Vec<String> = std::env::args().collect();
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()

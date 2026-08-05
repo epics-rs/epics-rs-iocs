@@ -15,7 +15,7 @@ use epics_rs::ad_core::runtime as rt;
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
-use crate::types::{AcqCommand, DEFAULT_STREAM_MODE, DirtyFlags, STREAM_MODES};
+use crate::types::{AcqCommand, CameraCapabilities, DirtyFlags, StreamMode, default_mode_index};
 
 // ============================================================================
 // Color Driver (main)
@@ -26,6 +26,8 @@ pub struct D435iColorDriver {
     pub rs_params: D435iParams,
     pub dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     acq_tx: rt::CommandSender<AcqCommand>,
+    /// The modes this camera actually offers, in RSStreamMode index order.
+    stream_modes: Vec<StreamMode>,
 }
 
 impl D435iColorDriver {
@@ -36,6 +38,7 @@ impl D435iColorDriver {
         max_memory: usize,
         acq_tx: rt::CommandSender<AcqCommand>,
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
+        caps: CameraCapabilities,
     ) -> AsynResult<Self> {
         let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
         let rs_params = D435iParams::create(&mut ad.port_base)?;
@@ -51,9 +54,30 @@ impl D435iColorDriver {
             env!("CARGO_PKG_VERSION").into(),
         )?;
 
-        // Default stream config
-        let default_mode = &STREAM_MODES[DEFAULT_STREAM_MODE as usize];
-        base.set_int32_param(rs_params.rs_stream_mode, 0, DEFAULT_STREAM_MODE)?;
+        // Default stream config. The enum choices are the camera's own modes,
+        // so RSStreamMode never offers one it will reject.
+        let stream_modes: Vec<StreamMode> = caps.modes.clone();
+        let default_index = default_mode_index(&stream_modes);
+        let default_mode = &stream_modes[default_index as usize];
+        base.set_enum_choices_param(
+            rs_params.rs_stream_mode,
+            0,
+            stream_modes
+                .iter()
+                .enumerate()
+                .map(|(i, m)| epics_rs::asyn::param::EnumEntry {
+                    string: m.label(),
+                    value: i as i32,
+                    severity: 0,
+                })
+                .collect(),
+        )?;
+        base.set_enum_index_param(rs_params.rs_stream_mode, 0, default_index as usize)?;
+
+        // What this camera has, so the records that depend on it are not
+        // silently inert: a D405 has neither an IMU nor a controllable emitter.
+        base.set_int32_param(rs_params.rs_has_imu, 0, caps.has_imu as i32)?;
+        base.set_int32_param(rs_params.rs_has_emitter, 0, caps.has_emitter as i32)?;
         base.set_int32_param(rs_params.rs_res_x, 0, default_mode.width)?;
         base.set_int32_param(rs_params.rs_res_y, 0, default_mode.height)?;
         base.set_int32_param(rs_params.rs_frame_rate, 0, default_mode.fps)?;
@@ -116,6 +140,7 @@ impl D435iColorDriver {
             rs_params,
             dirty,
             acq_tx,
+            stream_modes,
         })
     }
 }
@@ -170,7 +195,7 @@ impl PortDriver for D435iColorDriver {
             }
         } else if reason == self.rs_params.rs_stream_mode {
             // Validate mode index and apply
-            if let Some(mode) = STREAM_MODES.get(value as usize) {
+            if let Some(mode) = self.stream_modes.get(value as usize).copied() {
                 self.ad
                     .port_base
                     .params
@@ -204,8 +229,8 @@ impl PortDriver for D435iColorDriver {
                 self.dirty.lock().reconfigure_pipeline = true;
             } else {
                 log::warn!(
-                    "D435i: invalid stream mode index {value}, max is {}",
-                    STREAM_MODES.len() - 1
+                    "D435i: invalid stream mode index {value}, this camera offers {}",
+                    self.stream_modes.len()
                 );
             }
         } else {
@@ -298,10 +323,10 @@ impl D435iDepthDriver {
             env!("CARGO_PKG_VERSION").into(),
         )?;
 
-        // Image size and ROI (use default stream mode)
-        let default_mode = &STREAM_MODES[DEFAULT_STREAM_MODE as usize];
-        base.set_int32_param(ad.params.size_x, 0, default_mode.width)?;
-        base.set_int32_param(ad.params.size_y, 0, default_mode.height)?;
+        // Image size and ROI. The depth port has no mode of its own; it
+        // follows the colour port's stream, so start it at the preferred mode.
+        base.set_int32_param(ad.params.size_x, 0, crate::types::PREFERRED_MODE.width)?;
+        base.set_int32_param(ad.params.size_y, 0, crate::types::PREFERRED_MODE.height)?;
         base.set_int32_param(ad.params.min_x, 0, 0)?;
         base.set_int32_param(ad.params.min_y, 0, 0)?;
         base.set_int32_param(ad.params.bin_x, 0, 1)?;
@@ -310,8 +335,9 @@ impl D435iDepthDriver {
         base.set_int32_param(ad.params.reverse_y, 0, 0)?;
 
         // Acquire timing and control
-        base.set_float64_param(ad.params.acquire_time, 0, 1.0 / default_mode.fps as f64)?;
-        base.set_float64_param(ad.params.acquire_period, 0, 1.0 / default_mode.fps as f64)?;
+        let fps = crate::types::PREFERRED_MODE.fps as f64;
+        base.set_float64_param(ad.params.acquire_time, 0, 1.0 / fps)?;
+        base.set_float64_param(ad.params.acquire_period, 0, 1.0 / fps)?;
         base.set_int32_param(ad.params.image_mode, 0, ImageMode::Continuous as i32)?;
         base.set_int32_param(ad.params.num_images, 0, 100)?;
         base.set_int32_param(ad.params.num_exposures, 0, 1)?;
@@ -428,6 +454,16 @@ pub fn create_d435i_detector(
     let dirty = Arc::new(parking_lot::Mutex::new(DirtyFlags::default()));
     dirty.lock().set_all();
 
+    // Ask the camera which modes it has before the records are built: the
+    // RSStreamMode enum is served from this list.
+    let caps = CameraCapabilities::discover(serial);
+    log::info!(
+        "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}",
+        caps.modes.len(),
+        caps.has_imu,
+        caps.has_emitter
+    );
+
     // --- Color port ---
     let color_det = D435iColorDriver::new(
         port_name,
@@ -436,6 +472,7 @@ pub fn create_d435i_detector(
         max_memory,
         acq_tx,
         dirty.clone(),
+        caps.clone(),
     )?;
     let color_ad_params = color_det.ad.params;
     let color_rs_params = color_det.rs_params;
@@ -470,6 +507,7 @@ pub fn create_d435i_detector(
         depth_ad: depth_ad_params,
         rs_params: color_rs_params,
         serial: serial.to_string(),
+        caps,
     });
 
     let color_runtime = D435iColorRuntime {

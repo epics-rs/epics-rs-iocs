@@ -1,7 +1,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
 
 use meascomp::device::DaqDevice;
 
@@ -41,6 +43,9 @@ struct PollSnapshot {
     mcs_running: bool,
     mcs_current_point: usize,
     mcs_just_stopped: bool,
+    /// Seconds since the MCS scan started; C readMCS keeps
+    /// mcaElapsedRealTime/LiveTime on every counter address.
+    mcs_elapsed: f64,
     errors: Vec<String>,
 }
 
@@ -77,6 +82,7 @@ fn poller_loop(
                         snap.mcs_running = true;
                         snap.mcs_current_point = st.mcs.current_point;
                         snap.mcs_just_stopped = mcs_was_acquiring && !st.mcs.acquiring;
+                        snap.mcs_elapsed = st.mcs.elapsed_secs();
                     } else {
                         for counter in 0..MAX_COUNTERS {
                             match dev.counter_in(counter as i32) {
@@ -94,26 +100,58 @@ fn poller_loop(
         for msg in &snapshot.errors {
             log::warn!("CTR poller {msg}");
         }
+        if let Some(msg) = snapshot.errors.last() {
+            let _ = handle.set_params_and_notify_blocking(
+                0,
+                vec![ParamSetValue::new(
+                    params.last_error_message,
+                    0,
+                    ParamValue::Octet(msg.clone()),
+                )],
+            );
+        }
 
         if let Some(data) = snapshot.digital_input {
             let changed = data ^ prev_digital_input;
             if force_callback || changed != 0 {
                 prev_digital_input = data;
                 force_callback = false;
-                let _ = handle.write_int32_blocking(params.digital_input, 0, data as i32);
+                let _ = handle.set_params_and_notify_blocking(
+                    0,
+                    vec![ParamSetValue::uint32_digital(
+                        params.digital_input,
+                        0,
+                        data as u32,
+                        0xFFFF_FFFF,
+                        0,
+                    )],
+                );
             }
         }
         if let Some(counts) = snapshot.scaler_done_snapshot {
             for (i, c) in counts.iter().enumerate() {
                 let _ = handle.write_int32_blocking(params.counter_value, i as i32, *c as i32);
             }
-            let _ = handle.write_int32_blocking(params.scaler_done, 0, 1);
         } else if snapshot.mcs_running {
             let _ = handle.write_int32_blocking(
                 params.mcs_current_point,
                 0,
                 snapshot.mcs_current_point as i32,
             );
+            // C readMCS sets the elapsed times on every counter address, so a
+            // per-counter mca record sees them too.
+            for addr in 0..MAX_MCS_COUNTERS as i32 {
+                let _ = handle.write_float64_blocking(
+                    params.mca_elapsed_real,
+                    addr,
+                    snapshot.mcs_elapsed,
+                );
+                let _ = handle.write_float64_blocking(
+                    params.mca_elapsed_live,
+                    addr,
+                    snapshot.mcs_elapsed,
+                );
+            }
             if snapshot.mcs_just_stopped {
                 let _ = handle.write_int32_blocking(params.mca_acquiring, 0, 0);
             }

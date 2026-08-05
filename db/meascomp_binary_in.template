@@ -1,7 +1,11 @@
+# PINI reads DIGITAL_INPUT once at init; "I/O Intr" alone would leave the
+# record UDF until a bit changes, because the driver's forced first callback
+# fires while the port is being created -- before this record exists.
 record(bi, "$(P)$(R)") {
     field(DTYP, "asynUInt32Digital")
     field(INP,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_INPUT")
     field(SCAN, "I/O Intr")
+    field(PINI, "YES")
     field(ZNAM, "Low")
     field(ONAM, "High")
 }
