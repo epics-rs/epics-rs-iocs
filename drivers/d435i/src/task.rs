@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use epics_rs::asyn::port_handle::PortHandle;
 
-use epics_rs::ad_core::attributes::NDAttributeList;
+use epics_rs::ad_core::attributes::{
+    NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList,
+};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
@@ -264,9 +266,24 @@ async fn publish_array(
     handle: &PortHandle,
     output: &Arc<parking_lot::Mutex<NDArrayOutput>>,
     base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    array: NDArray,
+    mut array: NDArray,
     color_mode: NDColorMode,
 ) {
+    // Tag the array itself, not just the parameter. `NDArray::info()` resolves
+    // the layout from the `ColorMode` attribute and defaults to Mono when it is
+    // absent -- matching C ADCore, where `int colorMode = NDColorModeMono` is
+    // overwritten only from the attribute and never inferred from the dims.
+    // Publishing RGB1 frames without it made every downstream plugin read them
+    // as Mono: NDColorConvert saw source == target and passed the frame through
+    // unconverted, so `image1:ArraySize0_RBV` stayed 3 (the RGB component count)
+    // where a viewer expects the image width.
+    array.attributes.add(NDAttribute::new_static(
+        "ColorMode",
+        "Color mode",
+        NDAttrSource::Driver,
+        NDAttrValue::Int32(color_mode as i32),
+    ));
+
     let ts = array.timestamp;
     let n_dims = array.dims.len();
     let (size_x, size_y, size_z) = match n_dims {
