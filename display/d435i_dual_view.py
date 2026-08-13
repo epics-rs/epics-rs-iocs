@@ -1,7 +1,12 @@
 """
 D435i Dual Image Viewer — Color + Depth side by side
 
-Launch with: pydm d435i_dual_view.py -m '{"P":"RS1:"}'
+Launch with: pydm -m '{"P":"RS1:"}' d435i_dual_view.py
+
+`-m` must come BEFORE the display file. PyDM's parser treats everything after
+the displayfile as `display_args` and passes it through to the display, so
+`pydm d435i_dual_view.py -m '{...}'` silently drops the macro and every
+channel binds to the default prefix instead.
 """
 
 from pydm import Display
@@ -57,12 +62,17 @@ class D435iDualViewDisplay(Display):
         plugins.addWidget(QLabel("Viewer plugins:"))
         for prefix, label in [("CC1:", "CC1 (RGB→Mono)"), ("image1:", "image1 (color)"), ("image2:", "image2 (depth)")]:
             cb = QCheckBox(label)
-            cb.setChecked(True)
             cb.stateChanged.connect(
                 lambda state, p=prefix: self._caput(
                     f"{p}EnableCallbacks", 1 if state else 0
                 )
             )
+            # Connect BEFORE setChecked, so ticking these on at startup actually
+            # writes EnableCallbacks. The other way round the boxes come up
+            # looking enabled while nothing was ever sent -- which left the
+            # depth pane permanently blank, since `_setup_color_pipeline` only
+            # covers CC1 and image1. Do not "tidy" this back.
+            cb.setChecked(True)
             plugins.addWidget(cb)
         plugins.addStretch()
         layout.addLayout(plugins)

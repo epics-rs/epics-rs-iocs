@@ -1,7 +1,12 @@
 """
 D435i RealSense Main Detector Control Display
 
-Launch with: pydm d435i_main.py -m '{"P":"RS1:"}'
+Launch with: pydm -m '{"P":"RS1:"}' d435i_main.py
+
+`-m` must come BEFORE the display file. PyDM's parser treats everything after
+the displayfile as `display_args` and passes it through to the display, so
+`pydm d435i_main.py -m '{...}'` silently drops the macro and every channel
+binds to the default prefix instead.
 """
 
 from os import path
