@@ -67,7 +67,8 @@ epics-rs-iocs/
 │   ├── mca/                    # MCA foundation (mcaRecord device support)
 │   ├── mca-amptek/             # Amptek DP5 (UDP/NetFinder)
 │   ├── mca-rontec/             # Rontec MCA
-│   ├── d435i/                  # Intel RealSense D435i areaDetector driver
+│   ├── d435i/                  # Intel RealSense areaDetector driver (D435i, D405 —
+│   │                           #   capabilities are read from the camera, not assumed)
 │   ├── vac/                    # Vacuum gauges + ion pumps (custom vs/digitel records)
 │   ├── ip/                     # epics-modules `ip` serial instruments (crate `ip-devices`)
 │   ├── ether-ip/               # Allen-Bradley EtherNet/IP + CIP
@@ -1299,7 +1300,23 @@ can attach via `NDARRAY_PORT=RS1_PC`. It does not carry control records.
 
 - Rust toolchain (stable)
 - [librealsense2](https://github.com/IntelRealSense/librealsense) (for d435i driver)
-  - Ubuntu: `sudo apt install librealsense2-dev`
+  - Not in the Ubuntu archive. Upstream's
+    [install guide](https://github.com/IntelRealSense/librealsense/blob/master/doc/distribution_linux.md)
+    adds the vendor apt repo (`librealsense.realsenseai.com`, formerly
+    `librealsense.intel.com`).
+  - As of 2026-08 that repo's `InRelease` fails signature verification —
+    `gpgv`, which apt uses, reports BAD, so `apt update` rejects the repo.
+    The detached `Release.gpg` over the same `Release` verifies GOOD, so
+    the contents are authentic and only the Artifactory-generated
+    `InRelease` is broken. Until it is fixed, fetch the `.deb`s directly
+    and verify them against the signed `Release` → `Packages` chain.
+  - `librealsense2-dev` ships the `realsense2.pc` that `realsense-sys`'s
+    build script looks for; `-udev-rules` is what makes the cameras
+    openable as a non-root user (without it `/dev/video*` carries only a
+    display-manager ACL). `-utils` is optional — it pulls a GTK/GL stack
+    for `realsense-viewer`.
+  - Match the SDK version to the `realsense-sys` version in `Cargo.lock`
+    (currently 2.56.5) — its bindings are generated against those headers.
 
 ## Build
 
@@ -1331,6 +1348,41 @@ Or run the compiled binary directly:
 
 > The bin target is `d435i-ioc` (hyphen, not underscore), and the startup
 > script path is `iocs/d435i-ioc/st.cmd` relative to the workspace root.
+
+### Per-camera instances
+
+`st.cmd` leaves `SERIAL` empty, which takes whichever camera librealsense
+enumerates first — fine for one camera, arbitrary for two. The two variant
+scripts pin a serial each, so an instance stays bound to its camera
+regardless of plug order:
+
+| script | camera | prefix | asyn port | PVA port |
+|---|---|---|---|---|
+| `st.d435i.cmd` | D435i | `RS435:` | `RS435` | 5075 |
+| `st.d405.cmd` | D405 | `RS405:` | `RS405` | 5085 |
+
+```bash
+cargo run -p d435i-ioc --release -- iocs/d435i-ioc/st.d435i.cmd
+cargo run -p d435i-ioc --release -- iocs/d435i-ioc/st.d405.cmd
+```
+
+Both run the same binary and the same driver: the D405 is not a special
+case in code, because the driver asks the camera what it supports instead
+of assuming a model. `RSStreamMode` is built from the modes that camera
+reports for Color(RGB8) and Depth(Z16) both, and `RSHasIMU_RBV` /
+`RSHasEmitter_RBV` report 0 on the D405, so the records backed by hardware
+it lacks are visibly inert rather than silently so.
+
+The serials belong to the cameras, not to the repo — read yours with
+`rs-enumerate-devices -s` and edit the `epicsEnvSet("SERIAL", ...)` line
+before running these elsewhere. Take the serial from librealsense, *not*
+from `lsusb`: the USB `iSerial` descriptor is a different number, and
+`d435iConfig` will fail to resolve a config against it
+("Config cannot be resolved by any active devices / stream combinations").
+
+The PVA ports differ because two IOCs on one host cannot both bind the
+default 5075. CA needs no such split: its TCP port is ephemeral and the
+5064 name-search socket is shared.
 
 ## Startup Script (st.cmd)
 
