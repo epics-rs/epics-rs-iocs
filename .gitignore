@@ -6,3 +6,9 @@
 
 # autosave state written at runtime by create_monitor_set
 /iocs/*/autosave/
+
+# procServ console log written at runtime by the systemd units
+/iocs/*/procServ-*.log
+
+# Python bytecode from the PyDM screens
+__pycache__/

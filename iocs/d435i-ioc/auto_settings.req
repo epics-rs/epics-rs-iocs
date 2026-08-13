@@ -1,0 +1,55 @@
+# Settings restored at the next start of a d435i-ioc instance.
+#
+# Macros: P (record prefix, e.g. RS405: or RS435:)
+#
+# Two groups, both of which otherwise reset on every IOC restart:
+#
+#  1. Camera configuration. RSStreamMode is the one that bites -- the driver
+#     defaults to 640x480 @ 30fps, so a site that runs at 15fps silently goes
+#     back to 30 (and to twice the USB isochronous load) after any restart.
+#
+#  2. Viewer plugin wiring. These come up disabled, and a viewer that was
+#     already running does not re-send its startup writes to the new IOC --
+#     the panes then show the single value fetched at connect and never
+#     update again, which reads as a broken camera rather than a disabled
+#     plugin.
+
+# ---- Acquisition ----
+$(P)cam1:ImageMode
+$(P)cam1:NumImages
+
+# ---- Stream configuration ----
+$(P)cam1:RSStreamMode
+
+# ---- Sensor options ----
+$(P)cam1:RSExposure
+$(P)cam1:RSGain
+$(P)cam1:RSAutoExposure
+$(P)cam1:RSLaserPower
+$(P)cam1:RSEmitterEnabled
+
+# ---- Post-processing filters ----
+$(P)cam1:RSDecimationEnable
+$(P)cam1:RSDecimationMag
+$(P)cam1:RSSpatialEnable
+$(P)cam1:RSSpatialAlpha
+$(P)cam1:RSSpatialDelta
+$(P)cam1:RSSpatialMag
+$(P)cam1:RSTemporalEnable
+$(P)cam1:RSTemporalAlpha
+$(P)cam1:RSTemporalDelta
+$(P)cam1:RSHoleFillEnable
+$(P)cam1:RSHoleFillMode
+
+# ---- Alignment / pointcloud ----
+$(P)cam1:RSAlignEnable
+$(P)cam1:RSPointCloudEnable
+
+# ---- Viewer plugin chain ----
+# Colour is RGB8 interleaved, which PyDMImageView cannot draw directly, so the
+# dual-view screen routes image1 through the colour-convert plugin as Mono.
+$(P)CC1:ColorModeOut
+$(P)CC1:EnableCallbacks
+$(P)image1:NDArrayPort
+$(P)image1:EnableCallbacks
+$(P)image2:EnableCallbacks
