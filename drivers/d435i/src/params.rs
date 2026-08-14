@@ -60,6 +60,41 @@ pub struct D435iParams {
 
     // Pointcloud
     pub rs_pointcloud_enable: usize,
+
+    // Intrinsics, read from the stream profiles once the pipeline is up.
+    //
+    // Both sets live on the Color port because that is where every other RS_*
+    // parameter lives -- `D435iDepthDriver` carries only an `ADDriverBase` and
+    // has no parameter set of its own. Depth values are therefore prefixed
+    // rather than sitting on the depth port.
+    //
+    // A pinhole model in pixels: fx/fy focal length, ppx/ppy principal point.
+    // These belong to the *stream profile in use*, so they follow RSStreamMode
+    // -- a 1280x720 profile does not share a 640x480 profile's numbers.
+    pub rs_fx: usize,
+    pub rs_fy: usize,
+    pub rs_ppx: usize,
+    pub rs_ppy: usize,
+    /// Distortion model name, e.g. "Inverse Brown Conrady" (librealsense's own
+    /// spelling), published as a string so a client need not track the enum.
+    pub rs_dist_model: usize,
+    /// The five distortion coefficients, in librealsense's `coeffs[]` order.
+    pub rs_dist_coeff1: usize,
+    pub rs_dist_coeff2: usize,
+    pub rs_dist_coeff3: usize,
+    pub rs_dist_coeff4: usize,
+    pub rs_dist_coeff5: usize,
+
+    pub rs_depth_fx: usize,
+    pub rs_depth_fy: usize,
+    pub rs_depth_ppx: usize,
+    pub rs_depth_ppy: usize,
+    pub rs_depth_dist_model: usize,
+    pub rs_depth_dist_coeff1: usize,
+    pub rs_depth_dist_coeff2: usize,
+    pub rs_depth_dist_coeff3: usize,
+    pub rs_depth_dist_coeff4: usize,
+    pub rs_depth_dist_coeff5: usize,
 }
 
 impl D435iParams {
@@ -105,6 +140,28 @@ impl D435iParams {
 
             rs_align_enable: base.create_param("RS_ALIGN_ENABLE", ParamType::Int32)?,
             rs_pointcloud_enable: base.create_param("RS_POINTCLOUD_ENABLE", ParamType::Int32)?,
+
+            rs_fx: base.create_param("RS_FX", ParamType::Float64)?,
+            rs_fy: base.create_param("RS_FY", ParamType::Float64)?,
+            rs_ppx: base.create_param("RS_PPX", ParamType::Float64)?,
+            rs_ppy: base.create_param("RS_PPY", ParamType::Float64)?,
+            rs_dist_model: base.create_param("RS_DIST_MODEL", ParamType::Octet)?,
+            rs_dist_coeff1: base.create_param("RS_DIST_COEFF1", ParamType::Float64)?,
+            rs_dist_coeff2: base.create_param("RS_DIST_COEFF2", ParamType::Float64)?,
+            rs_dist_coeff3: base.create_param("RS_DIST_COEFF3", ParamType::Float64)?,
+            rs_dist_coeff4: base.create_param("RS_DIST_COEFF4", ParamType::Float64)?,
+            rs_dist_coeff5: base.create_param("RS_DIST_COEFF5", ParamType::Float64)?,
+
+            rs_depth_fx: base.create_param("RS_DEPTH_FX", ParamType::Float64)?,
+            rs_depth_fy: base.create_param("RS_DEPTH_FY", ParamType::Float64)?,
+            rs_depth_ppx: base.create_param("RS_DEPTH_PPX", ParamType::Float64)?,
+            rs_depth_ppy: base.create_param("RS_DEPTH_PPY", ParamType::Float64)?,
+            rs_depth_dist_model: base.create_param("RS_DEPTH_DIST_MODEL", ParamType::Octet)?,
+            rs_depth_dist_coeff1: base.create_param("RS_DEPTH_DIST_COEFF1", ParamType::Float64)?,
+            rs_depth_dist_coeff2: base.create_param("RS_DEPTH_DIST_COEFF2", ParamType::Float64)?,
+            rs_depth_dist_coeff3: base.create_param("RS_DEPTH_DIST_COEFF3", ParamType::Float64)?,
+            rs_depth_dist_coeff4: base.create_param("RS_DEPTH_DIST_COEFF4", ParamType::Float64)?,
+            rs_depth_dist_coeff5: base.create_param("RS_DEPTH_DIST_COEFF5", ParamType::Float64)?,
         })
     }
 }
