@@ -9,12 +9,14 @@ record(bi, "$(P)Control:Jogging") {
 record(bo, "$(P)Control:JogStart") {
     field(DTYP, "asynInt32")
     field(OUT, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))JOG_START")
+    field(VAL, 1)
     field(FLNK, "$(P)Control:jog_watchdog:set_start.PROC")
 }
 
 record(bo, "$(P)Control:JogStop") {
     field(DTYP, "asynInt32")
     field(OUT, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))JOG_STOP")
+    field(VAL, 1)
     field(FLNK, "$(P)Control:jog_watchdog:set_stop.PROC")
 }
 

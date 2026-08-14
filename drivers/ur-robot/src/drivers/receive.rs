@@ -129,6 +129,12 @@ impl ReceiveParams {
             output_integer_reg12: base.create_param("OUTPUT_INTEGER_REG12", ParamType::Int32)?,
         })
     }
+
+    /// The momentary commands of this port — see the
+    /// [module docs](crate::drivers#momentary-commands).
+    fn is_command(&self, reason: usize) -> bool {
+        reason == self.disconnect || reason == self.reconnect
+    }
 }
 
 /// The RTDE receive driver.
@@ -229,6 +235,10 @@ impl PortDriver for ReceiveDriver {
         let reason = user.reason;
         let p = self.params;
         self.base.params.set_int32(reason, user.addr, value)?;
+
+        if p.is_command(reason) && value == 0 {
+            return Ok(());
+        }
 
         if reason == p.reconnect {
             return if self.try_connect() {
@@ -684,5 +694,50 @@ mod tests {
         let batches = by_addr(publish(p, &Snapshot::new(values)));
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].0, 0);
+    }
+
+    /// The gate's own boundary, on the one command whose action is reachable
+    /// without a robot: with no interface, `DISCONNECT` fails loudly, so the
+    /// zero write returning `Ok` is proof it never got that far. Drop the
+    /// `is_command` guard from `write_int32` and the first assertion fails.
+    #[test]
+    fn a_zero_write_to_a_command_is_a_no_op_and_a_one_still_acts() {
+        let mut base = PortDriverBase::new("recv_gate", NUM_JOINTS, PortFlags::default());
+        let params = ReceiveParams::create(&mut base).expect("params create");
+        let mut driver = ReceiveDriver {
+            base,
+            params,
+            iface: Arc::new(Mutex::new(None)),
+            robot_ip: String::new(),
+            shared: ReceiveHandle::new(),
+        };
+
+        let mut user = AsynUser::new(params.disconnect);
+        assert!(driver.write_int32(&mut user, 0).is_ok());
+        assert!(driver.write_int32(&mut user, 1).is_err());
+
+        // The store happens either way: the readback follows the record.
+        assert_eq!(
+            driver.base.params.get_int32(params.disconnect, 0).ok(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_two_link_commands_are_commands_and_the_readbacks_are_not() {
+        let mut base = PortDriverBase::new("recv_is_command", NUM_JOINTS, PortFlags::default());
+        let p = ReceiveParams::create(&mut base).expect("params create");
+
+        assert!(p.is_command(p.disconnect));
+        assert!(p.is_command(p.reconnect));
+        for reason in [
+            p.is_connected,
+            p.runtime_state,
+            p.controller_timestamp,
+            p.actual_joint_pos,
+            p.output_integer_reg12,
+        ] {
+            assert!(!p.is_command(reason));
+        }
     }
 }
