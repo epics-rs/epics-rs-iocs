@@ -302,11 +302,35 @@ pub fn start_poller(
                     }
                 };
 
-                let _ = handle.set_params_and_notify_blocking(0, updates);
+                for (addr, batch) in by_addr(updates) {
+                    let _ = handle.set_params_and_notify_blocking(addr, batch);
+                }
                 std::thread::sleep(poll_period);
             }
         })
         .expect("failed to spawn the RTDE receive poll thread")
+}
+
+/// Split a poll batch into one flush per address list.
+///
+/// `callParamCallbacks` flushes a single address list (C
+/// asynPortDriver.cpp:820), and [`publish`] writes the joint and TCP-pose
+/// elements at addresses `0..NUM_JOINTS`. Flushing address 0 alone stores the
+/// other five but consumes no changed flag for them, so `Joint2`-`Joint6` and
+/// `PoseY`-`PoseYaw` never see an `I/O Intr` and stay UDF for the life of the
+/// IOC.
+fn by_addr(updates: Vec<ParamSetValue>) -> Vec<(i32, Vec<ParamSetValue>)> {
+    let mut batches: Vec<(i32, Vec<ParamSetValue>)> = Vec::new();
+    for u in updates {
+        let addr = match u {
+            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => addr,
+        };
+        match batches.iter_mut().find(|(a, _)| *a == addr) {
+            Some((_, batch)) => batch.push(u),
+            None => batches.push((addr, vec![u])),
+        }
+    }
+    batches
 }
 
 fn deg(rad: f64) -> f64 {
@@ -613,5 +637,49 @@ mod tests {
             u,
             ParamSetValue::Value { reason, value: ParamValue::Int32(_), .. } if *reason == p.output_integer_reg12
         )));
+    }
+
+    fn addr_of(u: &ParamSetValue) -> i32 {
+        match u {
+            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => *addr,
+        }
+    }
+
+    #[test]
+    fn every_update_is_flushed_under_its_own_address() {
+        let p = params();
+        let mut values = HashMap::new();
+        values.insert("timestamp".to_string(), Value::Double(3.5));
+        values.insert(
+            "actual_q".to_string(),
+            Value::Doubles(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5]),
+        );
+        values.insert(
+            "actual_TCP_pose".to_string(),
+            Value::Doubles(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+        );
+        let updates = publish(p, &Snapshot::new(values));
+        let total = updates.len();
+
+        let batches = by_addr(updates);
+        assert_eq!(
+            batches.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            (0..NUM_JOINTS as i32).collect::<Vec<_>>(),
+            "one flush per address, address 0 first"
+        );
+        assert_eq!(batches.iter().map(|(_, b)| b.len()).sum::<usize>(), total);
+        for (addr, batch) in &batches {
+            assert!(batch.iter().all(|u| addr_of(u) == *addr));
+        }
+    }
+
+    #[test]
+    fn a_batch_that_touches_only_address_0_is_one_flush() {
+        let p = params();
+        let mut values = HashMap::new();
+        values.insert("timestamp".to_string(), Value::Double(3.5));
+        let batches = by_addr(publish(p, &Snapshot::new(values)));
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, 0);
     }
 }
