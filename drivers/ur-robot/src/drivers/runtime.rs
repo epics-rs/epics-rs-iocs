@@ -3,6 +3,10 @@
 //! Each factory builds the driver, hands it to the asyn-rs port runtime and
 //! starts the driver's poll thread against the resulting port handle. The IOC
 //! keeps the returned [`UrPortRuntime`] alive for the life of the process.
+//!
+//! Each factory also arms the [`ioc_ready`] gate before it starts the thread,
+//! and the thread holds its first parameter flush until `iocInit` opens it —
+//! see that module for what a pre-`iocInit` flush costs.
 
 use std::time::Duration;
 
@@ -11,6 +15,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 
+use crate::drivers::ioc_ready;
 use crate::drivers::{control, dashboard, gripper, io, receive};
 
 /// A live port: the runtime actor plus the poll thread feeding it.
@@ -36,6 +41,7 @@ pub fn create_dashboard(
     let client = driver.client();
     let shared = driver.shared();
 
+    let ready = ioc_ready::arm();
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = dashboard::start_poller(
         runtime_handle.port_handle().clone(),
@@ -43,6 +49,7 @@ pub fn create_dashboard(
         client,
         shared,
         poll_period,
+        ready,
     );
     Ok(UrPortRuntime {
         runtime_handle,
@@ -61,6 +68,7 @@ pub fn create_receive(
     let iface = driver.iface();
     let shared = driver.shared();
 
+    let ready = ioc_ready::arm();
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = receive::start_poller(
         runtime_handle.port_handle().clone(),
@@ -68,6 +76,7 @@ pub fn create_receive(
         iface,
         shared,
         poll_period,
+        ready,
     );
     Ok(UrPortRuntime {
         runtime_handle,
@@ -99,6 +108,7 @@ pub fn create_control(
     let inner = driver.inner();
     let receive = driver.receive();
 
+    let ready = ioc_ready::arm();
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = control::start_poller(
         runtime_handle.port_handle().clone(),
@@ -106,6 +116,7 @@ pub fn create_control(
         inner,
         receive,
         poll_period,
+        ready,
     );
     Ok(UrPortRuntime {
         runtime_handle,
@@ -124,6 +135,7 @@ pub fn create_gripper(
     let g = driver.gripper();
     let dash = driver.dashboard();
 
+    let ready = ioc_ready::arm();
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let poller = gripper::start_poller(
         runtime_handle.port_handle().clone(),
@@ -131,6 +143,7 @@ pub fn create_gripper(
         g,
         dash,
         poll_period,
+        ready,
     );
     Ok(UrPortRuntime {
         runtime_handle,

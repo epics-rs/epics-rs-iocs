@@ -17,6 +17,7 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::error::{UrError, UrResult};
 use crate::gripper::{MoveMode, MoveParameter, ObjectStatus, RobotiqGripper, Unit};
 use crate::registry::{self, DashboardHandle};
@@ -284,10 +285,12 @@ pub fn start_poller(
     gripper: Arc<Mutex<RobotiqGripper>>,
     dashboard: DashboardHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-gripper-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let updates = {
                     let mut g = gripper.lock();

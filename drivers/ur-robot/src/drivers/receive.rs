@@ -16,6 +16,7 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::receive::ReceiveInterface;
 use crate::registry::{self, ReceiveHandle, ReceiveState};
 use crate::stream::Snapshot;
@@ -263,10 +264,12 @@ pub fn start_poller(
     iface: Arc<Mutex<Option<ReceiveInterface>>>,
     shared: ReceiveHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-receive-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let snapshot = {
                     let slot = iface.lock();

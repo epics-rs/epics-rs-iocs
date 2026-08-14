@@ -12,6 +12,7 @@ pub mod control;
 pub mod dashboard;
 pub mod gripper;
 pub mod io;
+pub mod ioc_ready;
 pub mod receive;
 pub mod runtime;
 

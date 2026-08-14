@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 
 use crate::dashboard::DashboardClient;
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::registry::{self, DashboardHandle, DashboardState};
 use crate::session::DEFAULT_TIMEOUT;
 
@@ -289,10 +290,12 @@ pub fn start_poller(
     client: Arc<Mutex<DashboardClient>>,
     shared: DashboardHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-dashboard-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let mut updates = Vec::new();
                 let mut state = shared.get();

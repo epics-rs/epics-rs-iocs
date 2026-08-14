@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 
 use crate::control::ControlInterface;
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::error::{UrError, UrResult};
 use crate::registry::{self, DashboardHandle, ReceiveHandle};
 
@@ -663,10 +664,12 @@ pub fn start_poller(
     inner: Arc<Mutex<ControlInner>>,
     receive: ReceiveHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-control-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let updates = {
                     let mut guard = inner.lock();
