@@ -53,3 +53,8 @@ $(P)CC1:EnableCallbacks
 $(P)image1:NDArrayPort
 $(P)image1:EnableCallbacks
 $(P)image2:EnableCallbacks
+# PVA image serving (rsdm viewer default): colour Pva1 loads Disabled from
+# commonPlugins.cmd, so its enable lives here; depthPva1 loads ENABLED=1 and
+# is listed for symmetry.
+$(P)Pva1:EnableCallbacks
+$(P)depthPva1:EnableCallbacks

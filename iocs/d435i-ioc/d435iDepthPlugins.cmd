@@ -9,6 +9,13 @@
 NDStdArraysConfigure("IMAGE2", $(QSIZE), 0, "$(DEPTH_PORT)", 0)
 dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=IMAGE2,NDARRAY_PORT=$(DEPTH_PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS_DEPTH)")
 
+# ===== PVA: depth NTNDArray (Z16 -> ushortValue), for pva:// viewers =====
+# The colour stream's NDPva lives in commonPlugins.cmd (RS405:Pva1:Image);
+# depth gets its own here. ENABLED=1 because a PVA channel that exists but
+# never posts is indistinguishable from a broken one to a viewer.
+NDPvaConfigure("PVA2", $(QSIZE), 0, "$(DEPTH_PORT)", 0, "$(PREFIX)depthPva1:Image")
+dbLoadRecords("NDPva.template", "P=$(PREFIX),R=depthPva1:,PORT=PVA2,NDARRAY_PORT=$(DEPTH_PORT),ENABLED=1")
+
 # ===== ROI + ROIStat for region analysis =====
 NDROIConfigure("ROI1_D", $(QSIZE), 0, "$(DEPTH_PORT)", 0)
 dbLoadRecords("NDROI.template", "P=$(PREFIX),R=depthROI1:,PORT=ROI1_D,NDARRAY_PORT=$(DEPTH_PORT)")
