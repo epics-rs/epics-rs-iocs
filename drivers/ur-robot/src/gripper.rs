@@ -230,6 +230,10 @@ pub struct RobotiqGripper {
     port: u16,
     timeout: Duration,
     socket: Option<TcpStream>,
+    /// Bytes received past the last '\n' — the head of the next reply.
+    /// Cleared on connect and disconnect so a reconnect never starts with
+    /// a stale fragment.
+    recv: Vec<u8>,
     cfg: GripperConfig,
     /// Last speed/force set through [`RobotiqGripper::set_speed`] /
     /// [`RobotiqGripper::set_force`], in device units (`speed_`, `force_`).
@@ -244,6 +248,7 @@ impl RobotiqGripper {
             port: GRIPPER_PORT,
             timeout,
             socket: None,
+            recv: Vec::new(),
             cfg: GripperConfig::default(),
             speed: 255,
             force: 0,
@@ -276,13 +281,20 @@ impl RobotiqGripper {
         sock.set_read_timeout(Some(self.timeout)).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();
         self.socket = Some(sock);
+        self.recv.clear();
         Ok(())
     }
 
     pub fn disconnect(&mut self) {
         self.socket = None;
+        self.recv.clear();
     }
 
+    /// One request, one '\n'-terminated reply line. A single `read()` is
+    /// not a line: TCP may split one reply across segments ("ac" + "k\n")
+    /// or coalesce two replies into one segment ("ack\nack\n") — ur_rtde's
+    /// own `robotiq_gripper.cpp` single-recv has the same defect. Bytes
+    /// past the '\n' stay in `recv` as the head of the next reply.
     fn transact(&mut self, request: &str) -> UrResult<String> {
         let sock = self
             .socket
@@ -293,15 +305,21 @@ impl RobotiqGripper {
         sock.flush()
             .map_err(|e| UrError::Io(format!("gripper flush: {e}")))?;
 
-        let mut buf = [0u8; 1024];
-        let n = sock
-            .read(&mut buf)
-            .map_err(|e| UrError::Io(format!("gripper read: {e}")))?;
-        if n == 0 {
-            return Err(UrError::Io("gripper connection closed by peer".into()));
+        loop {
+            if let Some(pos) = self.recv.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.recv.drain(..=pos).collect();
+                return String::from_utf8(line[..pos].to_vec())
+                    .map_err(|e| UrError::Protocol(format!("gripper sent non-UTF-8: {e}")));
+            }
+            let mut buf = [0u8; 1024];
+            let n = sock
+                .read(&mut buf)
+                .map_err(|e| UrError::Io(format!("gripper read: {e}")))?;
+            if n == 0 {
+                return Err(UrError::Io("gripper connection closed by peer".into()));
+            }
+            self.recv.extend_from_slice(&buf[..n]);
         }
-        String::from_utf8(buf[..n].to_vec())
-            .map_err(|e| UrError::Protocol(format!("gripper sent non-UTF-8: {e}")))
     }
 
     /// `GET <var>` — the reply is `"<var> <value>"`. A `?` in place of the value
@@ -741,6 +759,49 @@ mod tests {
         g.port = port;
         g.connect().unwrap();
         g
+    }
+
+    /// A reply split across TCP segments ("ac" + "k\n") must be
+    /// reassembled into one line, not parsed from the first segment.
+    #[test]
+    fn a_reply_split_across_segments_is_reassembled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let jh = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let _ = sock.read(&mut buf).unwrap(); // the SET line
+            sock.write_all(b"ac").unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            sock.write_all(b"k\n").unwrap();
+        });
+
+        let mut g = gripper_on(port);
+        g.set_var("ACT", 1).unwrap();
+        jh.join().unwrap();
+    }
+
+    /// Two replies coalesced into one segment must serve two requests: the
+    /// first transact consumes its own line only, and the leftover is the
+    /// next reply, not garbage prepended to it.
+    #[test]
+    fn two_replies_in_one_segment_serve_two_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let jh = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 64];
+            let _ = sock.read(&mut buf).unwrap(); // first GET
+            sock.write_all(b"STA 3\nACT 1\n").unwrap(); // both replies at once
+            let _ = sock.read(&mut buf); // second GET; its reply already went
+        });
+
+        let mut g = gripper_on(port);
+        assert_eq!(g.get_var("STA").unwrap(), 3);
+        assert_eq!(g.get_var("ACT").unwrap(), 1);
+        drop(g);
+        jh.join().unwrap();
     }
 
     #[test]
