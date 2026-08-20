@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 
 use crate::control::ControlInterface;
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::error::{UrError, UrResult};
 use crate::registry::{self, DashboardHandle, ReceiveHandle};
 
@@ -153,6 +154,27 @@ impl ControlParams {
             jog_acceleration: base.create_param("JOG_ACCELERATION", ParamType::Float64)?,
             jogging: base.create_param("JOGGING", ParamType::Int32)?,
         })
+    }
+
+    /// The momentary commands of this port — see the
+    /// [module docs](crate::drivers#momentary-commands).
+    ///
+    /// `TEACH_MODE`, `WAYPOINT_MOVE` and `WAYPOINT_ACTION_DONE` are absent:
+    /// each reads its own value, so zero means "leave teach mode" / "no
+    /// action" rather than "no request".
+    fn is_command(&self, reason: usize) -> bool {
+        reason == self.reconnect
+            || reason == self.disconnect
+            || reason == self.run_custom_script_file
+            || reason == self.move_j
+            || reason == self.move_l
+            || reason == self.stop_j
+            || reason == self.stop_l
+            || reason == self.reupload_control_script
+            || reason == self.stop_control_script
+            || reason == self.trigger_prot_stop
+            || reason == self.jog_start
+            || reason == self.jog_stop
     }
 }
 
@@ -488,6 +510,10 @@ impl PortDriver for ControlDriver {
         let p = self.params;
         self.base.params.set_int32(reason, user.addr, value)?;
 
+        if p.is_command(reason) && value == 0 {
+            return Ok(());
+        }
+
         if reason == p.reconnect {
             return if self.try_connect() {
                 Ok(())
@@ -663,10 +689,12 @@ pub fn start_poller(
     inner: Arc<Mutex<ControlInner>>,
     receive: ReceiveHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-control-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let updates = {
                     let mut guard = inner.lock();
@@ -1036,5 +1064,44 @@ mod tests {
     fn degrees_convert_to_radians() {
         assert!((deg_to_rad(180.0) - std::f64::consts::PI).abs() < 1e-12);
         assert!((deg_to_rad(-90.0) + std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    }
+
+    /// `TEACH_MODE` is the one that would be tempting to lump in with the
+    /// commands: it is a bo like the rest. It reads its value — zero ends
+    /// teach mode — so classifying it as a command would silently drop
+    /// `caput Control:TeachMode 0` and strand the robot in teach mode.
+    #[test]
+    fn the_twelve_commands_are_commands_and_the_valued_writes_are_not() {
+        let mut base = PortDriverBase::new("ctrl_is_command", NUM_JOINTS, PortFlags::default());
+        let p = ControlParams::create(&mut base).expect("params create");
+
+        for reason in [
+            p.reconnect,
+            p.disconnect,
+            p.run_custom_script_file,
+            p.move_j,
+            p.move_l,
+            p.stop_j,
+            p.stop_l,
+            p.reupload_control_script,
+            p.stop_control_script,
+            p.trigger_prot_stop,
+            p.jog_start,
+            p.jog_stop,
+        ] {
+            assert!(p.is_command(reason));
+        }
+        for reason in [
+            p.teach_mode,
+            p.waypoint_move,
+            p.waypoint_action_done,
+            p.joint_cmd,
+            p.pose_cmd,
+            p.jog_speed,
+            p.jog_acceleration,
+            p.tcp_offset,
+        ] {
+            assert!(!p.is_command(reason));
+        }
     }
 }

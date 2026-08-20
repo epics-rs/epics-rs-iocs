@@ -22,9 +22,9 @@ dependencies = [
 
 [[package]]
 name = "ad-core-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b893143420282ddbe963529729697b796c212e8a7fc793969a66643d259a12d"
+checksum = "3475ad75f76d9d7d3511f3b0cbc3453920b187d08a6a1b0f12a378a8c618be5b"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -91,9 +91,9 @@ dependencies = [
 
 [[package]]
 name = "ad-plugins-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eeb291490c86868067798589a5fcefcb292d898ebe7eb39a8fcd81586813010"
+checksum = "51b136e70748e16a751973392e7790d852eb942a235c257dfc8845bc762a73a0"
 dependencies = [
  "ad-core-rs",
  "asyn-rs",
@@ -412,9 +412,9 @@ dependencies = [
 
 [[package]]
 name = "asyn-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9566dd95d4133a48aa7acfdc574d821b39c19630ce59a149782699aedd7165d"
+checksum = "e218ad36d134006ffc7c7a03bf119d0006b0fa11ea94cef45787044fe02c3033"
 dependencies = [
  "bitflags 2.11.1",
  "chrono",
@@ -1288,9 +1288,9 @@ dependencies = [
 
 [[package]]
 name = "epics-base-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76045f2b0da95da6f1198cb39908b14ded9ebb7b6c4793f11baea49cff97a34a"
+checksum = "ae22509dc89e54cbd6906b08d62b1e0e180f9bcd0a54bdf2e467a9b45bf74249"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1314,9 +1314,9 @@ dependencies = [
 
 [[package]]
 name = "epics-bridge-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e28560a8170fe5753fc7433e47894bb3245227a2889421ee000f823c79c5aa6d"
+checksum = "154223c81bbe1b64fbb025039c8db4d45cf9d3fd89d216392ad6a65c707a792d"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1339,9 +1339,9 @@ dependencies = [
 
 [[package]]
 name = "epics-ca-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09c517094891c497733157af229523bbe9324973d088878c2a337f91ab4f6149"
+checksum = "c059438a307791e5522ac91e5c5992e9a94357fc10542a824f1ae5b87c06d2dd"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1364,9 +1364,9 @@ dependencies = [
 
 [[package]]
 name = "epics-libcom-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9eacb7fc80b548079f252c053712a789f7bce218510f8fffcb176539606bbbc3"
+checksum = "71b56131d4f291641ce0fac15631d9b3818f7c43fed613868921546402f1828f"
 dependencies = [
  "chrono",
  "epics-rtems-boot",
@@ -1381,9 +1381,9 @@ dependencies = [
 
 [[package]]
 name = "epics-macros-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f3eb7d24b02faf3d833e3392f7a81865ffb72fe3a92aeafd35ef0b155b1f5e8"
+checksum = "4adad853c367f4f427ebcc7a0953306d1e6de27a548d456ce98a73f8d2e0aecc"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1393,9 +1393,9 @@ dependencies = [
 
 [[package]]
 name = "epics-modbus-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef6ce5ccb9e9390af6f9e500015690ac50a689569c4ad1180794df70ea723753"
+checksum = "3b290a72a2aad93b7bd11254262c23a886025a5371303a690b0d8fad90602dff"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -1407,9 +1407,9 @@ dependencies = [
 
 [[package]]
 name = "epics-pva-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a08bebc5f2ae2c31c640ac6d48945c6769600e2ed7c2ceb8a0471c1d47f71e7d"
+checksum = "b7a11ab4037afb36eb91ec68c4aeabb767d821b62dbdccc6cbc68636600f0e5f"
 dependencies = [
  "bytes",
  "chrono",
@@ -1446,9 +1446,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20edb8fc65aba5e6f582cd1282845a2a4d4621b415476c0f78144b2a92adf5ca"
+checksum = "484e1279e7b50f8a9379ee77042b2e5ea8f165982c762fb95094a134fbc51717"
 dependencies = [
  "ad-core-rs",
  "ad-plugins-rs",
@@ -1463,9 +1463,9 @@ dependencies = [
 
 [[package]]
 name = "epics-rtems-boot"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d77d49dcdf0712699bee58384328f07b8011416f60daaf5475fc837fd57e46bf"
+checksum = "71f5c06770ac414f9a5c81d1d69146396f3c7341e3178993da74950ecb58d238"
 dependencies = [
  "cc",
  "libc",
@@ -2442,9 +2442,9 @@ dependencies = [
 
 [[package]]
 name = "mca-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d83bd4fc9ebf9b58c511e1ebe4e57fd90374c04c7aab713bb426a99fd9b5513"
+checksum = "e116bd31aa0d7456b98687df7b65448e75bed5ca188041c61db26c945e59a07e"
 dependencies = [
  "chrono",
  "epics-base-rs",
@@ -2811,9 +2811,9 @@ dependencies = [
 
 [[package]]
 name = "motor-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb7b475234fd17780509a916ff270f0fa883df5069a91f3e0706805b8bd7bb66"
+checksum = "94646d60126420686f9f1dde367ee14630413a665c053fa8090058c2632f85e6"
 dependencies = [
  "asyn-rs",
  "bitflags 2.11.1",
@@ -3732,9 +3732,9 @@ dependencies = [
 
 [[package]]
 name = "rust-hdf5"
-version = "0.3.2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76d9a3a248d812fc26bb6342fa6c978bf08ff3c801418608854678d462b7c52c"
+checksum = "d6944dd9a338f0cc79d1b291f2216765669cc129ab5713451a7e6295d5c240a1"
 dependencies = [
  "bzip2",
  "flate2",
@@ -3742,6 +3742,7 @@ dependencies = [
  "rayon",
  "rust-zstd",
  "snap",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -3894,9 +3895,9 @@ dependencies = [
 
 [[package]]
 name = "scaler-rs"
-version = "0.25.4"
+version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22efd6e7e989bde78a4a7730b8ac810f4942e2c58be5fddff56d3272cbe8502d"
+checksum = "7e5159c6a3d43e243a99e83c39c1ef16c3fcec6bfdd698fd8097435509cf1071"
 dependencies = [
  "asyn-rs",
  "epics-base-rs",
@@ -5384,6 +5385,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b31d188d9d685a4f9c7b46d6e36631b07058d2cfe190267adce54dc230bf12"
 
 [[package]]
 name = "zmij"

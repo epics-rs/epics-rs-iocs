@@ -16,6 +16,7 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::receive::ReceiveInterface;
 use crate::registry::{self, ReceiveHandle, ReceiveState};
 use crate::stream::Snapshot;
@@ -128,6 +129,12 @@ impl ReceiveParams {
             output_integer_reg12: base.create_param("OUTPUT_INTEGER_REG12", ParamType::Int32)?,
         })
     }
+
+    /// The momentary commands of this port — see the
+    /// [module docs](crate::drivers#momentary-commands).
+    fn is_command(&self, reason: usize) -> bool {
+        reason == self.disconnect || reason == self.reconnect
+    }
 }
 
 /// The RTDE receive driver.
@@ -229,6 +236,10 @@ impl PortDriver for ReceiveDriver {
         let p = self.params;
         self.base.params.set_int32(reason, user.addr, value)?;
 
+        if p.is_command(reason) && value == 0 {
+            return Ok(());
+        }
+
         if reason == p.reconnect {
             return if self.try_connect() {
                 Ok(())
@@ -263,10 +274,12 @@ pub fn start_poller(
     iface: Arc<Mutex<Option<ReceiveInterface>>>,
     shared: ReceiveHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-receive-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let snapshot = {
                     let slot = iface.lock();
@@ -302,11 +315,35 @@ pub fn start_poller(
                     }
                 };
 
-                let _ = handle.set_params_and_notify_blocking(0, updates);
+                for (addr, batch) in by_addr(updates) {
+                    let _ = handle.set_params_and_notify_blocking(addr, batch);
+                }
                 std::thread::sleep(poll_period);
             }
         })
         .expect("failed to spawn the RTDE receive poll thread")
+}
+
+/// Split a poll batch into one flush per address list.
+///
+/// `callParamCallbacks` flushes a single address list (C
+/// asynPortDriver.cpp:820), and [`publish`] writes the joint and TCP-pose
+/// elements at addresses `0..NUM_JOINTS`. Flushing address 0 alone stores the
+/// other five but consumes no changed flag for them, so `Joint2`-`Joint6` and
+/// `PoseY`-`PoseYaw` never see an `I/O Intr` and stay UDF for the life of the
+/// IOC.
+fn by_addr(updates: Vec<ParamSetValue>) -> Vec<(i32, Vec<ParamSetValue>)> {
+    let mut batches: Vec<(i32, Vec<ParamSetValue>)> = Vec::new();
+    for u in updates {
+        let addr = match u {
+            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => addr,
+        };
+        match batches.iter_mut().find(|(a, _)| *a == addr) {
+            Some((_, batch)) => batch.push(u),
+            None => batches.push((addr, vec![u])),
+        }
+    }
+    batches
 }
 
 fn deg(rad: f64) -> f64 {
@@ -613,5 +650,94 @@ mod tests {
             u,
             ParamSetValue::Value { reason, value: ParamValue::Int32(_), .. } if *reason == p.output_integer_reg12
         )));
+    }
+
+    fn addr_of(u: &ParamSetValue) -> i32 {
+        match u {
+            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => *addr,
+        }
+    }
+
+    #[test]
+    fn every_update_is_flushed_under_its_own_address() {
+        let p = params();
+        let mut values = HashMap::new();
+        values.insert("timestamp".to_string(), Value::Double(3.5));
+        values.insert(
+            "actual_q".to_string(),
+            Value::Doubles(vec![0.0, 0.1, 0.2, 0.3, 0.4, 0.5]),
+        );
+        values.insert(
+            "actual_TCP_pose".to_string(),
+            Value::Doubles(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+        );
+        let updates = publish(p, &Snapshot::new(values));
+        let total = updates.len();
+
+        let batches = by_addr(updates);
+        assert_eq!(
+            batches.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+            (0..NUM_JOINTS as i32).collect::<Vec<_>>(),
+            "one flush per address, address 0 first"
+        );
+        assert_eq!(batches.iter().map(|(_, b)| b.len()).sum::<usize>(), total);
+        for (addr, batch) in &batches {
+            assert!(batch.iter().all(|u| addr_of(u) == *addr));
+        }
+    }
+
+    #[test]
+    fn a_batch_that_touches_only_address_0_is_one_flush() {
+        let p = params();
+        let mut values = HashMap::new();
+        values.insert("timestamp".to_string(), Value::Double(3.5));
+        let batches = by_addr(publish(p, &Snapshot::new(values)));
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].0, 0);
+    }
+
+    /// The gate's own boundary, on the one command whose action is reachable
+    /// without a robot: with no interface, `DISCONNECT` fails loudly, so the
+    /// zero write returning `Ok` is proof it never got that far. Drop the
+    /// `is_command` guard from `write_int32` and the first assertion fails.
+    #[test]
+    fn a_zero_write_to_a_command_is_a_no_op_and_a_one_still_acts() {
+        let mut base = PortDriverBase::new("recv_gate", NUM_JOINTS, PortFlags::default());
+        let params = ReceiveParams::create(&mut base).expect("params create");
+        let mut driver = ReceiveDriver {
+            base,
+            params,
+            iface: Arc::new(Mutex::new(None)),
+            robot_ip: String::new(),
+            shared: ReceiveHandle::new(),
+        };
+
+        let mut user = AsynUser::new(params.disconnect);
+        assert!(driver.write_int32(&mut user, 0).is_ok());
+        assert!(driver.write_int32(&mut user, 1).is_err());
+
+        // The store happens either way: the readback follows the record.
+        assert_eq!(
+            driver.base.params.get_int32(params.disconnect, 0).ok(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn the_two_link_commands_are_commands_and_the_readbacks_are_not() {
+        let mut base = PortDriverBase::new("recv_is_command", NUM_JOINTS, PortFlags::default());
+        let p = ReceiveParams::create(&mut base).expect("params create");
+
+        assert!(p.is_command(p.disconnect));
+        assert!(p.is_command(p.reconnect));
+        for reason in [
+            p.is_connected,
+            p.runtime_state,
+            p.controller_timestamp,
+            p.actual_joint_pos,
+            p.output_integer_reg12,
+        ] {
+            assert!(!p.is_command(reason));
+        }
     }
 }

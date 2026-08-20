@@ -11,6 +11,7 @@ record(bo, "$(P)Receive:Disconnect")
     field(DESC, "Disconnects from the RTDE interface")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))DISCONNECT")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Receive:Reconnect")
@@ -18,6 +19,7 @@ record(bo, "$(P)Receive:Reconnect")
     field(DESC, "Tries reconnecting to the RTDE interface")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))RECONNECT")
+    field(VAL, 1)
 }
 
 record(ai, "$(P)Receive:ControllerTimestamp")

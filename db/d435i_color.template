@@ -126,6 +126,163 @@ record(ai, "$(P)$(R)RSDepthUnits_RBV") {
     field(SCAN, "I/O Intr")
 }
 
+# ===== Intrinsics (read-only, both sets on the color port) =====
+# A pinhole model in pixels: fx/fy focal length, PPx/PPy principal point, plus
+# the distortion model and its five coefficients in librealsense's coeffs[]
+# order. Read from the stream profile in use, so they follow RSStreamMode --
+# a 1280x720 profile does not share a 640x480 profile's principal point.
+#
+# The depth set is prefixed rather than living on the depth port: the depth
+# driver carries only an ADDriverBase and has no parameter set of its own.
+#
+# Published on the first frame after acquisition starts. Before that they read
+# 0 -- intrinsics come from the running pipeline, not from the device.
+record(ai, "$(P)$(R)RSFx_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_FX")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSFy_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_FY")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSPPx_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_PPX")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSPPy_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_PPY")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)RSDistModel_RBV") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DIST_MODEL")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDistCoeff1_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DIST_COEFF1")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDistCoeff2_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DIST_COEFF2")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDistCoeff3_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DIST_COEFF3")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDistCoeff4_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DIST_COEFF4")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDistCoeff5_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DIST_COEFF5")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthFx_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_FX")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthFy_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_FY")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthPPx_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_PPX")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthPPy_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_PPY")
+    field(EGU,  "px")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)RSDepthDistModel_RBV") {
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_DIST_MODEL")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthDistCoeff1_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_DIST_COEFF1")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthDistCoeff2_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_DIST_COEFF2")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthDistCoeff3_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_DIST_COEFF3")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthDistCoeff4_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_DIST_COEFF4")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)RSDepthDistCoeff5_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))RS_DEPTH_DIST_COEFF5")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
 # ===== IMU =====
 record(ai, "$(P)$(R)RSAccelX_RBV") {
     field(DTYP, "asynFloat64")

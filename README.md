@@ -8,7 +8,7 @@ IOC applications — Rust ports of the EPICS device-driver modules. Each
 device driver is an independent library crate under `drivers/`, and each
 IOC binary lives under `iocs/`. The workspace currently holds **67 driver
 crates** and **82 IOC crates**, all consuming a single pinned epics-rs
-version (**0.25.4**) declared once in the root `Cargo.toml`.
+version (**0.26.1**) declared once in the root `Cargo.toml`.
 
 > **Platform**: Linux is the primary, fully-supported target — every
 > crate builds and is tested there. CI additionally builds and tests the
@@ -44,7 +44,7 @@ same layout under `iocs/`.
 
 ```
 epics-rs-iocs/
-├── Cargo.toml                  # Workspace root — pins epics-rs 0.25.4 for all crates
+├── Cargo.toml                  # Workspace root — pins epics-rs 0.26.1 for all crates
 ├── drivers/
 │   ├── motor/                  # 27 motor-controller drivers + shared `common` crate
 │   │                           #   acs, acsmotion, acstech80, aerotech, amci, attocube,
@@ -67,7 +67,8 @@ epics-rs-iocs/
 │   ├── mca/                    # MCA foundation (mcaRecord device support)
 │   ├── mca-amptek/             # Amptek DP5 (UDP/NetFinder)
 │   ├── mca-rontec/             # Rontec MCA
-│   ├── d435i/                  # Intel RealSense D435i areaDetector driver
+│   ├── d435i/                  # Intel RealSense areaDetector driver (D435i, D405 —
+│   │                           #   capabilities are read from the camera, not assumed)
 │   ├── vac/                    # Vacuum gauges + ion pumps (custom vs/digitel records)
 │   ├── ip/                     # epics-modules `ip` serial instruments (crate `ip-devices`)
 │   ├── ether-ip/               # Allen-Bradley EtherNet/IP + CIP
@@ -133,7 +134,7 @@ at `$(P)$(M)` (or an axis-letter macro variant such as `$(P)$(MX)`, `$(P)$(MU)`,
 multi-axis controllers) — confirmed by grepping `record(` across all 54 `db/*.template` files in
 `iocs/motor/*/db/`: every single one is `record(motor, ...)`, with no other record type anywhere
 in the MOTOR family. Field definitions below are taken directly from the vendored
-`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.25.4/dbd/motorRecord.dbd`, mirrored at
+`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.26.1/dbd/motorRecord.dbd`, mirrored at
 `crates/motor-rs/dbd/motorRecord.dbd` in `epics-rs`):
 
 | Field | Type | Purpose |
@@ -284,7 +285,7 @@ Records (`iocs/ad/mar345-ioc/db/mar345.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p mar345-ioc --release -- iocs/ad/mar345-ioc/st.cmd`
 
-Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.25.4) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
+Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.26.1) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
 
 ---
 
@@ -704,7 +705,7 @@ Ports from [`epics-modules/mca`](https://github.com/epics-modules/mca):
 - `drivers/mca-rontec` — Rontec detector driver, ported from `mcaApp/RontecSrc/drvMcaRontec.c`.
 - `drivers/mca-amptek` — Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X driver, ported from `mcaApp/AmptekSrc/drvAmptek.cpp`. USB (`DppLibUsb.cpp`) is feasibility-gated out (no USB crate in the workspace); serial is unported because it's an empty no-op in the upstream C driver too.
 
-The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.25.4"` — pinned because "no `epics-rs` \"mca\" feature exists yet"). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
+The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.26.1"` — pinned because "no `epics-rs` \"mca\" feature exists yet"). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
 
 #### Shared MCA record set
 
@@ -741,7 +742,7 @@ Ports from [`epics-modules/scaler`](https://github.com/epics-modules/scaler) —
 
 #### scaler974 records
 
-Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at `epics_rs::scaler::SCALER_DB_DIR` (the `scaler-rs` crate's own bundled `db/`, re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.25.4` per `Cargo.lock`) and loads `$(SCALER)/scaler.db`. That file instantiates one real `scalerRecord`:
+Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at `epics_rs::scaler::SCALER_DB_DIR` (the `scaler-rs` crate's own bundled `db/`, re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.26.1` per `Cargo.lock`) and loads `$(SCALER)/scaler.db`. That file instantiates one real `scalerRecord`:
 
 ```
 grecord(scaler,"$(P)$(S)") {
@@ -1269,7 +1270,7 @@ caput USB2408:WaveDigRun 1
 
 # D435i RealSense areaDetector IOC
 
-An epics-rs 0.25.4 based areaDetector IOC for the Intel RealSense D435i
+An epics-rs 0.26.1 based areaDetector IOC for the Intel RealSense D435i
 camera. A single pipeline produces three NDArray outputs simultaneously
 (Color RGB8, Depth Z16, optional XYZ Pointcloud) and publishes IMU data
 as PVs.
@@ -1299,7 +1300,23 @@ can attach via `NDARRAY_PORT=RS1_PC`. It does not carry control records.
 
 - Rust toolchain (stable)
 - [librealsense2](https://github.com/IntelRealSense/librealsense) (for d435i driver)
-  - Ubuntu: `sudo apt install librealsense2-dev`
+  - Not in the Ubuntu archive. Upstream's
+    [install guide](https://github.com/IntelRealSense/librealsense/blob/master/doc/distribution_linux.md)
+    adds the vendor apt repo (`librealsense.realsenseai.com`, formerly
+    `librealsense.intel.com`).
+  - As of 2026-08 that repo's `InRelease` fails signature verification —
+    `gpgv`, which apt uses, reports BAD, so `apt update` rejects the repo.
+    The detached `Release.gpg` over the same `Release` verifies GOOD, so
+    the contents are authentic and only the Artifactory-generated
+    `InRelease` is broken. Until it is fixed, fetch the `.deb`s directly
+    and verify them against the signed `Release` → `Packages` chain.
+  - `librealsense2-dev` ships the `realsense2.pc` that `realsense-sys`'s
+    build script looks for; `-udev-rules` is what makes the cameras
+    openable as a non-root user (without it `/dev/video*` carries only a
+    display-manager ACL). `-utils` is optional — it pulls a GTK/GL stack
+    for `realsense-viewer`.
+  - Match the SDK version to the `realsense-sys` version in `Cargo.lock`
+    (currently 2.56.5) — its bindings are generated against those headers.
 
 ## Build
 
@@ -1331,6 +1348,41 @@ Or run the compiled binary directly:
 
 > The bin target is `d435i-ioc` (hyphen, not underscore), and the startup
 > script path is `iocs/d435i-ioc/st.cmd` relative to the workspace root.
+
+### Per-camera instances
+
+`st.cmd` leaves `SERIAL` empty, which takes whichever camera librealsense
+enumerates first — fine for one camera, arbitrary for two. The two variant
+scripts pin a serial each, so an instance stays bound to its camera
+regardless of plug order:
+
+| script | camera | prefix | asyn port | PVA port |
+|---|---|---|---|---|
+| `st.d435i.cmd` | D435i | `RS435:` | `RS435` | 5075 |
+| `st.d405.cmd` | D405 | `RS405:` | `RS405` | 5085 |
+
+```bash
+cargo run -p d435i-ioc --release -- iocs/d435i-ioc/st.d435i.cmd
+cargo run -p d435i-ioc --release -- iocs/d435i-ioc/st.d405.cmd
+```
+
+Both run the same binary and the same driver: the D405 is not a special
+case in code, because the driver asks the camera what it supports instead
+of assuming a model. `RSStreamMode` is built from the modes that camera
+reports for Color(RGB8) and Depth(Z16) both, and `RSHasIMU_RBV` /
+`RSHasEmitter_RBV` report 0 on the D405, so the records backed by hardware
+it lacks are visibly inert rather than silently so.
+
+The serials belong to the cameras, not to the repo — read yours with
+`rs-enumerate-devices -s` and edit the `epicsEnvSet("SERIAL", ...)` line
+before running these elsewhere. Take the serial from librealsense, *not*
+from `lsusb`: the USB `iSerial` descriptor is a different number, and
+`d435iConfig` will fail to resolve a config against it
+("Config cannot be resolved by any active devices / stream combinations").
+
+The PVA ports differ because two IOCs on one host cannot both bind the
+default 5075. CA needs no such split: its TCP port is ephemeral and the
+5064 name-search socket is shared.
 
 ## Startup Script (st.cmd)
 

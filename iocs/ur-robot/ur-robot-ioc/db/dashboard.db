@@ -37,6 +37,7 @@ record(bo, "$(P)Dashboard:Play")
     field(DESC, "Play program")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))PLAY")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:Stop")
@@ -44,6 +45,7 @@ record(bo, "$(P)Dashboard:Stop")
     field(DESC, "Stop program")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))STOP")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:Pause")
@@ -51,6 +53,7 @@ record(bo, "$(P)Dashboard:Pause")
     field(DESC, "Pause program")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))PAUSE")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:Connect")
@@ -58,6 +61,7 @@ record(bo, "$(P)Dashboard:Connect")
     field(DESC, "Connects to dashboard server")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CONNECT")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:Disconnect")
@@ -65,6 +69,7 @@ record(bo, "$(P)Dashboard:Disconnect")
     field(DESC, "Closes connection")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))DISCONNECT")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:Shutdown")
@@ -72,6 +77,7 @@ record(bo, "$(P)Dashboard:Shutdown")
     field(DESC, "Shuts down robot and controller")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))SHUTDOWN")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:ClosePopup")
@@ -79,6 +85,7 @@ record(bo, "$(P)Dashboard:ClosePopup")
     field(DESC, "Close popup")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CLOSE_POPUP")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:CloseSafetyPopup")
@@ -86,6 +93,7 @@ record(bo, "$(P)Dashboard:CloseSafetyPopup")
     field(DESC, "Close safety popup")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CLOSE_SAFETY_POPUP")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:PowerOn")
@@ -93,6 +101,7 @@ record(bo, "$(P)Dashboard:PowerOn")
     field(DESC, "Powers on the robot")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))POWER_ON")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:PowerOff")
@@ -100,6 +109,7 @@ record(bo, "$(P)Dashboard:PowerOff")
     field(DESC, "Powers off the robot")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))POWER_OFF")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:BrakeRelease")
@@ -107,6 +117,7 @@ record(bo, "$(P)Dashboard:BrakeRelease")
     field(DESC, "Release breaks")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))BRAKE_RELEASE")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:UnlockProtectiveStop")
@@ -114,6 +125,7 @@ record(bo, "$(P)Dashboard:UnlockProtectiveStop")
     field(DESC, "Unlocks protective stop")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))UNLOCK_PROTECTIVE_STOP")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Dashboard:RestartSafety")
@@ -121,6 +133,7 @@ record(bo, "$(P)Dashboard:RestartSafety")
     field(DESC, "Restarts safety, power off robot")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))RESTART_SAFETY")
+    field(VAL, 1)
 }
 
 record(stringin, "$(P)Dashboard:PolyscopeVersion")

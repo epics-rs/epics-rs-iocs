@@ -66,6 +66,7 @@ record(bo, "$(P)RobotiqGripper:Connect")
     field(DESC, "Connects to Robotiq gripper")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CONNECT")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)RobotiqGripper:Activate")
@@ -74,6 +75,7 @@ record(bo, "$(P)RobotiqGripper:Activate")
     field(DTYP, "asynInt32")
     field(PINI, "$(AUTO_ACTIVATE=YES)")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))ACTIVATE")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)RobotiqGripper:AutoCalibrate")
@@ -81,6 +83,7 @@ record(bo, "$(P)RobotiqGripper:AutoCalibrate")
     field(DESC, "Calibrates open/close positions")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))AUTO_CALIBRATE")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)RobotiqGripper:Open")
@@ -88,6 +91,7 @@ record(bo, "$(P)RobotiqGripper:Open")
     field(DESC, "Opens Robotiq gripper")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))OPEN")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)RobotiqGripper:Close")
@@ -95,6 +99,7 @@ record(bo, "$(P)RobotiqGripper:Close")
     field(DESC, "Close Robotiq gripper")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))CLOSE")
+    field(VAL, 1)
 }
 
 record(longout, "$(P)RobotiqGripper:MinPosition")
@@ -119,6 +124,7 @@ record(bo, "$(P)RobotiqGripper:SetPositionRange")
 {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))SET_POSITION_RANGE")
+    field(VAL, 1)
 }
 
 record(mbbo, "$(P)RobotiqGripper:PositionUnit")

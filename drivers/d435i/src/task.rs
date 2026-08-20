@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use epics_rs::asyn::port_handle::PortHandle;
 
-use epics_rs::ad_core::attributes::NDAttributeList;
+use epics_rs::ad_core::attributes::{
+    NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList,
+};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
@@ -200,6 +202,119 @@ fn apply_sensor_options(
     }
 }
 
+/// Publish one stream's pinhole intrinsics and distortion.
+///
+/// `reasons` is (fx, fy, ppx, ppy, model, coeff1..coeff5) so the colour and
+/// depth sets go through the same code with different parameter indices.
+#[allow(clippy::too_many_arguments)]
+async fn publish_intrinsics(
+    handle: &PortHandle,
+    intr: &realsense_rust::base::Rs2Intrinsics,
+    fx: usize,
+    fy: usize,
+    ppx: usize,
+    ppy: usize,
+    model: usize,
+    coeffs: [usize; 5],
+) {
+    let _ = handle
+        .set_params_and_notify(
+            0,
+            vec![
+                ParamSetValue::new(fx, 0, ParamValue::Float64(intr.fx() as f64)),
+                ParamSetValue::new(fy, 0, ParamValue::Float64(intr.fy() as f64)),
+                ParamSetValue::new(ppx, 0, ParamValue::Float64(intr.ppx() as f64)),
+                ParamSetValue::new(ppy, 0, ParamValue::Float64(intr.ppy() as f64)),
+            ],
+        )
+        .await;
+
+    let distortion = intr.distortion();
+
+    // Just the model, not the whole `Rs2Distortion`: its Debug spells out the
+    // coefficient array too, which overruns a stringin's 40 characters and
+    // truncates mid-name ("Rs2Distortion { model: BrownConradyInve"). The
+    // variant name alone -- "BrownConradyInverse" -- fits and is what the SDK
+    // docs use. The enum index would have made a client carry librealsense's
+    // table.
+    write_string(handle, model, 0, format!("{:?}", distortion.model)).await;
+
+    // coeffs[] is a fixed five-element array in the C struct, kept in that
+    // order: a client reading them back into rs2_intrinsics must not have to
+    // reorder them.
+    let _ = handle
+        .set_params_and_notify(
+            0,
+            coeffs
+                .iter()
+                .zip(distortion.coeffs.iter())
+                .map(|(&reason, &c)| ParamSetValue::new(reason, 0, ParamValue::Float64(c as f64)))
+                .collect(),
+        )
+        .await;
+}
+
+/// Read the intrinsics of the profiles actually in use and publish both sets.
+///
+/// Taken from the frames rather than from the device, so these describe the
+/// running configuration: intrinsics belong to a stream profile, and a
+/// 1280x720 profile does not share a 640x480 profile's principal point. The
+/// acquisition loop calls this on the first frame after every (re)start, and
+/// an RSStreamMode change restarts the pipeline, so the values track the mode.
+async fn update_intrinsics(ctx: &AcquisitionContext, composite: &CompositeFrame) {
+    use realsense_rust::frame::FrameEx;
+
+    let p = &ctx.rs_params;
+
+    let color_frames: Vec<ColorFrame> = composite.frames_of_type();
+    if let Some(frame) = color_frames.first()
+        && let Ok(intr) = FrameEx::stream_profile(frame).intrinsics()
+    {
+        publish_intrinsics(
+            &ctx.color_handle,
+            &intr,
+            p.rs_fx,
+            p.rs_fy,
+            p.rs_ppx,
+            p.rs_ppy,
+            p.rs_dist_model,
+            [
+                p.rs_dist_coeff1,
+                p.rs_dist_coeff2,
+                p.rs_dist_coeff3,
+                p.rs_dist_coeff4,
+                p.rs_dist_coeff5,
+            ],
+        )
+        .await;
+    }
+
+    // Depth intrinsics also land on the Color port: `D435iDepthDriver` carries
+    // only an `ADDriverBase` and has no parameter set to hang them on.
+    let depth_frames: Vec<DepthFrame> = composite.frames_of_type();
+    if let Some(frame) = depth_frames.first()
+        && let Ok(intr) = FrameEx::stream_profile(frame).intrinsics()
+    {
+        publish_intrinsics(
+            &ctx.color_handle,
+            &intr,
+            p.rs_depth_fx,
+            p.rs_depth_fy,
+            p.rs_depth_ppx,
+            p.rs_depth_ppy,
+            p.rs_depth_dist_model,
+            [
+                p.rs_depth_dist_coeff1,
+                p.rs_depth_dist_coeff2,
+                p.rs_depth_dist_coeff3,
+                p.rs_depth_dist_coeff4,
+                p.rs_depth_dist_coeff5,
+            ],
+        )
+        .await;
+    }
+}
+
 async fn update_device_info(ctx: &AcquisitionContext, composite: &CompositeFrame) {
     use realsense_rust::frame::FrameEx;
 
@@ -264,9 +379,24 @@ async fn publish_array(
     handle: &PortHandle,
     output: &Arc<parking_lot::Mutex<NDArrayOutput>>,
     base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    array: NDArray,
+    mut array: NDArray,
     color_mode: NDColorMode,
 ) {
+    // Tag the array itself, not just the parameter. `NDArray::info()` resolves
+    // the layout from the `ColorMode` attribute and defaults to Mono when it is
+    // absent -- matching C ADCore, where `int colorMode = NDColorModeMono` is
+    // overwritten only from the attribute and never inferred from the dims.
+    // Publishing RGB1 frames without it made every downstream plugin read them
+    // as Mono: NDColorConvert saw source == target and passed the frame through
+    // unconverted, so `image1:ArraySize0_RBV` stayed 3 (the RGB component count)
+    // where a viewer expects the image width.
+    array.attributes.add(NDAttribute::new_static(
+        "ColorMode",
+        "Color mode",
+        NDAttrSource::Driver,
+        NDAttrValue::Int32(color_mode as i32),
+    ));
+
     let ts = array.timestamp;
     let n_dims = array.dims.len();
     let (size_x, size_y, size_z) = match n_dims {
@@ -1002,6 +1132,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             // On first frame, update device info
             if first_frame {
                 update_device_info(&ctx, &composite).await;
+                // Same hook, because intrinsics belong to the profile in use:
+                // a stream-mode change restarts the pipeline and sets
+                // first_frame, so the published values follow the mode.
+                update_intrinsics(&ctx, &composite).await;
                 first_frame = false;
             }
 

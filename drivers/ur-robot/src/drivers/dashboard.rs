@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 
 use crate::dashboard::DashboardClient;
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::registry::{self, DashboardHandle, DashboardState};
 use crate::session::DEFAULT_TIMEOUT;
 
@@ -81,6 +82,24 @@ impl DashboardParams {
             is_program_saved: base.create_param("IS_PROGRAM_SAVED", ParamType::Int32)?,
             is_in_remote_control: base.create_param("IS_IN_REMOTE_CONTROL", ParamType::Int32)?,
         })
+    }
+
+    /// The momentary commands of this port — see the
+    /// [module docs](crate::drivers#momentary-commands).
+    fn is_command(&self, reason: usize) -> bool {
+        reason == self.connect
+            || reason == self.disconnect
+            || reason == self.play
+            || reason == self.stop
+            || reason == self.pause
+            || reason == self.shutdown
+            || reason == self.close_popup
+            || reason == self.close_safety_popup
+            || reason == self.power_on
+            || reason == self.power_off
+            || reason == self.brake_release
+            || reason == self.unlock_protective_stop
+            || reason == self.restart_safety
     }
 }
 
@@ -191,6 +210,10 @@ impl PortDriver for DashboardDriver {
         let p = self.params;
         self.base.params.set_int32(reason, user.addr, value)?;
 
+        if p.is_command(reason) && value == 0 {
+            return Ok(());
+        }
+
         if reason == p.connect {
             let ok = self.try_connect();
             let connected = i32::from(ok);
@@ -289,10 +312,12 @@ pub fn start_poller(
     client: Arc<Mutex<DashboardClient>>,
     shared: DashboardHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-dashboard-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let mut updates = Vec::new();
                 let mut state = shared.get();
@@ -373,4 +398,46 @@ fn poll_once(
         ),
     ];
     Ok((updates, robot_mode))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The octet pair is the interesting negative: `POPUP` and `LOAD_URP`
+    /// look like commands but their payload is the request, and they never
+    /// reach the int32 gate anyway.
+    #[test]
+    fn the_thirteen_commands_are_commands_and_the_readbacks_are_not() {
+        let mut base = PortDriverBase::new("dash_is_command", 1, PortFlags::default());
+        let p = DashboardParams::create(&mut base).expect("params create");
+
+        for reason in [
+            p.connect,
+            p.disconnect,
+            p.play,
+            p.stop,
+            p.pause,
+            p.shutdown,
+            p.close_popup,
+            p.close_safety_popup,
+            p.power_on,
+            p.power_off,
+            p.brake_release,
+            p.unlock_protective_stop,
+            p.restart_safety,
+        ] {
+            assert!(p.is_command(reason));
+        }
+        for reason in [
+            p.is_connected,
+            p.is_running,
+            p.popup,
+            p.load_urp,
+            p.robot_mode,
+            p.is_in_remote_control,
+        ] {
+            assert!(!p.is_command(reason));
+        }
+    }
 }

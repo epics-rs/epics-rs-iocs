@@ -17,6 +17,7 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::drivers::asyn_error;
+use crate::drivers::ioc_ready::IocReady;
 use crate::error::{UrError, UrResult};
 use crate::gripper::{MoveMode, MoveParameter, ObjectStatus, RobotiqGripper, Unit};
 use crate::registry::{self, DashboardHandle};
@@ -77,6 +78,20 @@ impl GripperParams {
             position_unit: base.create_param("POSITION_UNIT", ParamType::Int32)?,
             is_calibrated: base.create_param("IS_CALIBRATED", ParamType::Int32)?,
         })
+    }
+
+    /// The momentary commands of this port — see the
+    /// [module docs](crate::drivers#momentary-commands).
+    ///
+    /// `SET_POSITION_RANGE` is here because it applies the range that
+    /// `MIN_POSITION` / `MAX_POSITION` staged; its own value is unread.
+    fn is_command(&self, reason: usize) -> bool {
+        reason == self.connect
+            || reason == self.activate
+            || reason == self.open
+            || reason == self.close
+            || reason == self.set_position_range
+            || reason == self.auto_calibrate
     }
 }
 
@@ -182,6 +197,10 @@ impl PortDriver for GripperDriver {
         let p = self.params;
         self.base.params.set_int32(reason, user.addr, value)?;
 
+        if p.is_command(reason) && value == 0 {
+            return Ok(());
+        }
+
         if !self.robot_ready() {
             return Err(asyn_error(
                 "the robot must be powered on and the dashboard connected to use the gripper",
@@ -284,10 +303,12 @@ pub fn start_poller(
     gripper: Arc<Mutex<RobotiqGripper>>,
     dashboard: DashboardHandle,
     poll_period: Duration,
+    ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("ur-gripper-poll".into())
         .spawn(move || {
+            ready.wait();
             loop {
                 let updates = {
                     let mut g = gripper.lock();
@@ -367,6 +388,35 @@ mod tests {
         assert_eq!(position_unit(3), Some(Unit::Mm));
         assert_eq!(position_unit(4), None);
         assert_eq!(position_unit(-1), None);
+    }
+
+    /// `MIN_POSITION` / `MAX_POSITION` stage the range and `POSITION_UNIT`
+    /// selects a unit by number, so zero is a legitimate write for all three;
+    /// only the `SET_POSITION_RANGE` that applies them is a command.
+    #[test]
+    fn the_six_commands_are_commands_and_the_staged_range_is_not() {
+        let mut base = PortDriverBase::new("grip_is_command", 1, PortFlags::default());
+        let p = GripperParams::create(&mut base).expect("params create");
+
+        for reason in [
+            p.connect,
+            p.activate,
+            p.open,
+            p.close,
+            p.set_position_range,
+            p.auto_calibrate,
+        ] {
+            assert!(p.is_command(reason));
+        }
+        for reason in [
+            p.min_position,
+            p.max_position,
+            p.position_unit,
+            p.set_speed,
+            p.set_force,
+        ] {
+            assert!(!p.is_command(reason));
+        }
     }
 
     #[test]

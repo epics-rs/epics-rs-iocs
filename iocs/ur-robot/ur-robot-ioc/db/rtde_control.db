@@ -34,6 +34,7 @@ record(bo, "$(P)Control:Disconnect")
     field(DESC, "Disconnects from the RTDE interface")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))DISCONNECT")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Control:Reconnect")
@@ -41,6 +42,7 @@ record(bo, "$(P)Control:Reconnect")
     field(DESC, "Tries reconnecting to the RTDE interface")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))RECONNECT")
+    field(VAL, 1)
     field(FLNK, "$(P)IO:SpeedSlider.PROC")
 }
 
@@ -49,6 +51,7 @@ record(bo, "$(P)Control:ReuploadControlScript")
     field(DESC, "Reuploads control script to controller")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))REUPLOAD_CONTROL_SCRIPT")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Control:StopControlScript")
@@ -56,6 +59,7 @@ record(bo, "$(P)Control:StopControlScript")
     field(DESC, "Stops the control script")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))STOP_CONTROL_SCRIPT")
+    field(VAL, 1)
 }
 
 #======================
@@ -128,6 +132,7 @@ record(bo, "$(P)Control:TriggerProtectiveStop")
     field(DESC, "Triggers a protective stop")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TRIGGER_PROT_STOP")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Control:stop_path")
@@ -213,6 +218,7 @@ record(bo, "$(P)Control:moveJ")
     field(DESC, "Moves joints to commanded values")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MOVEJ")
+    field(VAL, 1)
 }
 
 record(bo, "$(P)Control:waypoint_move")
@@ -261,6 +267,7 @@ record(bo, "$(P)Control:stopJ")
     field(DESC, "Moves joints to commanded values")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))STOPJ")
+    field(VAL, 1)
     field(FLNK, "$(P)Control:sync_both_cmd.PROC")
 }
 
@@ -584,6 +591,7 @@ record(bo, "$(P)Control:moveL")
     field(DESC, "Move to TCP pose linearly")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MOVEL")
+    field(VAL, 1)
 }
 
 
@@ -621,6 +629,7 @@ record(bo, "$(P)Control:stopL")
     field(DESC, "Stop linear move to TCP pose")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))STOPL")
+    field(VAL, 1)
     field(FLNK, "$(P)Control:sync_both_cmd.PROC")
 }
 
@@ -1024,6 +1033,7 @@ record(bo, "$(P)Control:RunCustomScriptFile")
     field(DESC, "Runs custom URScript on controller")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,$(TIMEOUT=1))RUN_CUSTOM_SCRIPT_FILE")
+    field(VAL, 1)
 }
 
 record(ao, "$(P)Control:CustomScriptTimeout")
