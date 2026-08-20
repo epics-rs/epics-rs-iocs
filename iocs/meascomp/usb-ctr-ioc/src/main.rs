@@ -1,7 +1,7 @@
 //! USB-CTR08 IOC binary.
 //!
 //! Usage:
-//!   cargo run -p usb-ctr-ioc -- iocs/usb-ctr-ioc/st.cmd
+//!   cargo run -p usb-ctr-ioc -- iocs/meascomp/usb-ctr-ioc/st.cmd
 
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +28,10 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("MEASCOMP", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default(
+        "MEASCOMP",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
+    );
     // scaler-rs ships scaler.db; st.cmd loads it from $(SCALER) the way
     // upstream's USBCTR st.cmd loads it from the scaler module.
     epics_rs::base::runtime::env::set_default("SCALER", epics_rs::scaler::SCALER_DB_DIR);

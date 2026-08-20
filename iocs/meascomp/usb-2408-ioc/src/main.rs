@@ -1,7 +1,7 @@
 //! USB-2408-2AO IOC binary.
 //!
 //! Usage:
-//!   cargo run -p usb-2408-ioc -- iocs/usb-2408-ioc/st.cmd
+//!   cargo run -p usb-2408-ioc -- iocs/meascomp/usb-2408-ioc/st.cmd
 
 use std::sync::{Arc, Mutex};
 
@@ -27,7 +27,10 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("MEASCOMP", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default(
+        "MEASCOMP",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
+    );
 
     let trace = Arc::new(TraceManager::new());
     let runtime: Arc<Mutex<Option<MultiFunctionRuntime>>> = Arc::new(Mutex::new(None));

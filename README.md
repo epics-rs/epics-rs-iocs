@@ -1165,10 +1165,10 @@ cargo build -p usb-ctr-ioc --release
 Connect a USB-CTR08 to a USB port, then:
 
 ```bash
-cargo run -p usb-ctr-ioc --release -- iocs/usb-ctr-ioc/st.cmd
+cargo run -p usb-ctr-ioc --release -- iocs/meascomp/usb-ctr-ioc/st.cmd
 ```
 
-Edit `iocs/usb-ctr-ioc/st.cmd` to set your device serial number:
+Edit `iocs/meascomp/usb-ctr-ioc/st.cmd` to set your device serial number:
 
 ```
 epicsEnvSet("UNIQUE_ID", "0214D582")
@@ -1230,10 +1230,10 @@ cargo build -p usb-2408-ioc --release
 ## Run
 
 ```bash
-cargo run -p usb-2408-ioc --release -- iocs/usb-2408-ioc/st.cmd
+cargo run -p usb-2408-ioc --release -- iocs/meascomp/usb-2408-ioc/st.cmd
 ```
 
-Edit `iocs/usb-2408-ioc/st.cmd` to set your device serial number:
+Edit `iocs/meascomp/usb-2408-ioc/st.cmd` to set your device serial number:
 
 ```
 epicsEnvSet("UNIQUE_ID", "01AAA83E")
