@@ -256,7 +256,7 @@ impl ReceiveDriver {
         let params = ReceiveParams::create(&mut base)?;
 
         let shared = ReceiveHandle::new();
-        registry::register_receive(port_name, shared.clone());
+        registry::register_receive(port_name, shared.clone()).map_err(asyn_error)?;
 
         let mut me = Self {
             base,

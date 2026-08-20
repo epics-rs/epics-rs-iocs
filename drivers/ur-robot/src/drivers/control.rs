@@ -1137,8 +1137,9 @@ mod tests {
     /// without a link, so the next reconnect can retry it.
     #[test]
     fn a_boot_time_tcp_offset_stages_until_a_connect_can_deliver_it() {
-        registry::register_dashboard("CTRL_B3_DASH", DashboardHandle::new("127.0.0.1"));
-        registry::register_receive("CTRL_B3_RECV", ReceiveHandle::new());
+        registry::register_dashboard("CTRL_B3_DASH", DashboardHandle::new("127.0.0.1"))
+            .expect("fresh port name");
+        registry::register_receive("CTRL_B3_RECV", ReceiveHandle::new()).expect("fresh port name");
         let mut drv =
             ControlDriver::new("CTRL_B3", "CTRL_B3_DASH", "CTRL_B3_RECV").expect("driver");
         let p = drv.params();
@@ -1181,8 +1182,10 @@ mod tests {
     /// fail, not silently pass because 1 < NUM_JOINTS).
     #[test]
     fn a_scalar_float_write_takes_address_zero_only() {
-        registry::register_dashboard("CTRL_B3_ADDR_DASH", DashboardHandle::new("127.0.0.1"));
-        registry::register_receive("CTRL_B3_ADDR_RECV", ReceiveHandle::new());
+        registry::register_dashboard("CTRL_B3_ADDR_DASH", DashboardHandle::new("127.0.0.1"))
+            .expect("fresh port name");
+        registry::register_receive("CTRL_B3_ADDR_RECV", ReceiveHandle::new())
+            .expect("fresh port name");
         let mut drv = ControlDriver::new("CTRL_B3_ADDR", "CTRL_B3_ADDR_DASH", "CTRL_B3_ADDR_RECV")
             .expect("driver");
         let p = drv.params();

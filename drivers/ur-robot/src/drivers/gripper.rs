@@ -617,7 +617,7 @@ mod tests {
         use epics_rs::asyn::interrupt::{InterruptFilter, InterruptValue};
 
         let dash = DashboardHandle::new("127.0.0.1");
-        registry::register_dashboard("GRIP_B4_DASH", dash);
+        registry::register_dashboard("GRIP_B4_DASH", dash).expect("fresh port name");
         let mut drv = GripperDriver::new("GRIP_B4", "GRIP_B4_DASH").expect("driver");
         let p = drv.params();
 
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn boot_writes_survive_to_the_first_connect() {
         let dash = DashboardHandle::new("127.0.0.1");
-        registry::register_dashboard("GRIP_B3_DASH", dash.clone());
+        registry::register_dashboard("GRIP_B3_DASH", dash.clone()).expect("fresh port name");
         let mut drv = GripperDriver::new("GRIP_B3", "GRIP_B3_DASH").expect("driver");
         let p = drv.params();
 
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn a_connect_without_a_cached_activate_leaves_the_gripper_alone() {
         let dash = DashboardHandle::new("127.0.0.1");
-        registry::register_dashboard("GRIP_B3_NOACT_DASH", dash.clone());
+        registry::register_dashboard("GRIP_B3_NOACT_DASH", dash.clone()).expect("fresh port name");
         let mut drv = GripperDriver::new("GRIP_B3_NOACT", "GRIP_B3_NOACT_DASH").expect("driver");
         let p = drv.params();
 

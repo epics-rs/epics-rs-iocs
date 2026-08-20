@@ -149,7 +149,7 @@ impl DashboardDriver {
 
         let client = Arc::new(Mutex::new(DashboardClient::new(robot_ip, DEFAULT_TIMEOUT)));
         let shared = DashboardHandle::new(robot_ip);
-        registry::register_dashboard(port_name, shared.clone());
+        registry::register_dashboard(port_name, shared.clone()).map_err(asyn_error)?;
 
         // The C++ constructor connects, then reads the three static strings.
         {
