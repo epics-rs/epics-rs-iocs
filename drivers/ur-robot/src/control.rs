@@ -6,10 +6,12 @@
 //! the script answers on `output_int_register_0`
 //! (1 = ready for a command, 2 = done with the command).
 //!
-//! Only the commands urRobot's `RTDEControl` driver issues are ported; all 23
-//! input recipes are still registered, because the controller numbers recipes by
-//! registration order and the ones we use (1, 4, 6, 8, 13, 19) sit in the middle
-//! of that sequence.
+//! All 23 input recipes are registered, because the controller numbers recipes
+//! by registration order and the ones we send on (named in [`recipe`]) sit in
+//! the middle of that sequence. Beyond the commands urRobot's `RTDEControl`
+//! driver issues, the surface carries the streaming commands (servoJ, speedJ,
+//! forceMode, the watchdog kick) and their support calls for planned-move
+//! execution — library-only, no PVs, as in C.
 
 use std::time::{Duration, Instant};
 
@@ -49,6 +51,10 @@ const JOINT_VELOCITY_MAX: f64 = 314.0 / 100.0;
 const JOINT_ACCELERATION_MAX: f64 = 40.0;
 const TOOL_VELOCITY_MAX: f64 = 3.0;
 const TOOL_ACCELERATION_MAX: f64 = 150.0;
+const SERVO_LOOKAHEAD_TIME_MIN: f64 = 0.03;
+const SERVO_LOOKAHEAD_TIME_MAX: f64 = 0.2;
+const SERVO_GAIN_MIN: f64 = 100.0;
+const SERVO_GAIN_MAX: f64 = 2000.0;
 
 /// `RuntimeState` (rtde_control_interface.h:291).
 pub mod runtime_state {
@@ -69,14 +75,26 @@ const SAFETY_BIT_EMERGENCY_STOPPED: u32 = 7;
 mod recipe {
     /// moveJ / moveL (async setpoint).
     pub const ASYNC_SETP: u8 = 1;
-    /// NO_CMD, STOP_SCRIPT, TEACH_MODE, END_TEACH_MODE, PROTECTIVE_STOP, IS_STEADY.
+    /// SERVOJ.
+    pub const SERVOJ: u8 = 2;
+    /// FORCE_MODE.
+    pub const FORCE_MODE: u8 = 3;
+    /// NO_CMD, STOP_SCRIPT, TEACH_MODE, END_TEACH_MODE, PROTECTIVE_STOP,
+    /// IS_STEADY, FORCE_MODE_STOP, ZERO_FT_SENSOR.
     pub const NO_CMD: u8 = 4;
-    /// SET_TCP, IS_POSE/JOINTS_WITHIN_SAFETY_LIMITS.
+    /// SET_TCP, IS_POSE/JOINTS_WITHIN_SAFETY_LIMITS,
+    /// GET_INVERSE_KINEMATICS_DEFAULT.
     pub const WRENCH: u8 = 6;
-    /// SPEED_STOP.
+    /// SPEED_STOP, SERVO_STOP.
     pub const FORCE_MODE_PARAMETERS: u8 = 8;
-    /// SPEEDL.
+    /// GET_INVERSE_KINEMATICS_ARGS.
+    pub const GET_INVERSE_KIN: u8 = 10;
+    /// WATCHDOG.
+    pub const WATCHDOG: u8 = 11;
+    /// SPEEDL / SPEEDJ.
     pub const SETP: u8 = 13;
+    /// MOVE_UNTIL_CONTACT.
+    pub const MOVE_UNTIL_CONTACT: u8 = 16;
     /// STOPL / STOPJ.
     pub const STOP: u8 = 19;
     /// Recipes are registered 1..=23.
@@ -470,19 +488,7 @@ impl ControlInterface {
     /// command register is always cleared before returning so the script is
     /// ready for the next command.
     fn send_command(&mut self, cmd: &RobotCommand) -> UrResult<()> {
-        if self.runtime_state()? == runtime_state::STOPPED {
-            return self.refused(RefusalReason::NotRunning);
-        }
-        if !self.is_program_running()? {
-            log::error!("ur-robot: the RTDE control script is not running");
-            return self.refused(RefusalReason::NotRunning);
-        }
-
-        // Wait for the script to be ready for a command.
-        if let Some(reason) = self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {
-            return self.refused(reason);
-        }
-
+        self.await_ready_for_command()?;
         self.write(cmd)?;
 
         if cmd.command == CommandType::StopScript {
@@ -524,6 +530,32 @@ impl ControlInterface {
         }
 
         self.send_clear_command()
+    }
+
+    /// The shared head of both send paths: refuse while the script is
+    /// stopped, absent, or not yet ready for a command.
+    fn await_ready_for_command(&mut self) -> UrResult<()> {
+        if self.runtime_state()? == runtime_state::STOPPED {
+            return self.refused(RefusalReason::NotRunning);
+        }
+        if !self.is_program_running()? {
+            log::error!("ur-robot: the RTDE control script is not running");
+            return self.refused(RefusalReason::NotRunning);
+        }
+        if let Some(reason) = self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {
+            return self.refused(reason);
+        }
+        Ok(())
+    }
+
+    /// The continuous/realtime half of the C++ `sendCommand`
+    /// (rtde_control_interface.cpp:2530-2551): SERVOJ, SPEEDJ, FORCE_MODE
+    /// and WATCHDOG are streamed setpoints, so after the ready wait the
+    /// command is sent without waiting for DONE and without a clear — a
+    /// completion handshake would stall the stream.
+    fn send_realtime_command(&mut self, cmd: &RobotCommand) -> UrResult<()> {
+        self.await_ready_for_command()?;
+        self.write(cmd)
     }
 
     /// Wait until `output_int_register_0` reads `want`, or report why it
@@ -774,6 +806,183 @@ impl ControlInterface {
             Payload::Vector(q.to_vec()),
         ))
     }
+
+    // --- realtime streaming commands ---
+
+    /// `servoJ(q, speed, acceleration, time, lookahead_time, gain)` —
+    /// recipe 2, realtime: no completion handshake. `speed` and
+    /// `acceleration` are ignored by the controller for servo moves but
+    /// range-checked as upstream does.
+    pub fn servo_j(
+        &mut self,
+        q: &[f64; 6],
+        speed: f64,
+        acceleration: f64,
+        time: f64,
+        lookahead_time: f64,
+        gain: f64,
+    ) -> UrResult<()> {
+        verify_within(speed, 0.0, JOINT_VELOCITY_MAX)?;
+        verify_within(acceleration, 0.0, JOINT_ACCELERATION_MAX)?;
+        verify_within(
+            lookahead_time,
+            SERVO_LOOKAHEAD_TIME_MIN,
+            SERVO_LOOKAHEAD_TIME_MAX,
+        )?;
+        verify_within(gain, SERVO_GAIN_MIN, SERVO_GAIN_MAX)?;
+        let mut val = q.to_vec();
+        val.extend([speed, acceleration, time, lookahead_time, gain]);
+        self.send_realtime_command(&RobotCommand::new(
+            recipe::SERVOJ,
+            CommandType::ServoJ,
+            Payload::Vector(val),
+        ))
+    }
+
+    /// `speedJ(qd, acceleration, time)` — recipe 13, realtime.
+    pub fn speed_j(&mut self, qd: &[f64; 6], acceleration: f64, time: f64) -> UrResult<()> {
+        verify_within(acceleration, 0.0, JOINT_ACCELERATION_MAX)?;
+        let mut val = qd.to_vec();
+        val.push(acceleration);
+        val.push(time);
+        self.send_realtime_command(&RobotCommand::new(
+            recipe::SETP,
+            CommandType::SpeedJ,
+            Payload::Vector(val),
+        ))
+    }
+
+    /// `servoStop(a)` — recipe 8. `a` defaults to 10.0 upstream.
+    pub fn servo_stop(&mut self, acceleration: f64) -> UrResult<()> {
+        self.send_command(&RobotCommand::new(
+            recipe::FORCE_MODE_PARAMETERS,
+            CommandType::ServoStop,
+            Payload::Vector(vec![acceleration]),
+        ))
+    }
+
+    /// `kickWatchdog()` — recipe 11, realtime. Feeds the watchdog armed by
+    /// the script's `setWatchdog`; the wire body is `NO_CMD` (see
+    /// [`RobotCommand::encode`]).
+    pub fn kick_watchdog(&mut self) -> UrResult<()> {
+        self.send_realtime_command(&RobotCommand::new(
+            recipe::WATCHDOG,
+            CommandType::Watchdog,
+            Payload::None,
+        ))
+    }
+
+    // --- force mode and force/torque sensor ---
+
+    /// `forceMode(task_frame, selection_vector, wrench, type, limits)` —
+    /// recipe 3, realtime.
+    pub fn force_mode(
+        &mut self,
+        task_frame: &[f64; 6],
+        selection_vector: &[i32; 6],
+        wrench: &[f64; 6],
+        force_mode_type: i32,
+        limits: &[f64; 6],
+    ) -> UrResult<()> {
+        let mut val = task_frame.to_vec();
+        val.extend_from_slice(wrench);
+        val.extend_from_slice(limits);
+        self.send_realtime_command(&RobotCommand::new(
+            recipe::FORCE_MODE,
+            CommandType::ForceMode,
+            Payload::ForceMode {
+                force_mode_type,
+                selection_vector: *selection_vector,
+                val,
+            },
+        ))
+    }
+
+    /// `forceModeStop()` — recipe 4.
+    pub fn force_mode_stop(&mut self) -> UrResult<()> {
+        self.send_command(&RobotCommand::new(
+            recipe::NO_CMD,
+            CommandType::ForceModeStop,
+            Payload::None,
+        ))
+    }
+
+    /// `zeroFtSensor()` — recipe 4.
+    pub fn zero_ft_sensor(&mut self) -> UrResult<()> {
+        self.send_command(&RobotCommand::new(
+            recipe::NO_CMD,
+            CommandType::ZeroFtSensor,
+            Payload::None,
+        ))
+    }
+
+    // --- kinematics and contact ---
+
+    /// `getInverseKinematics(x, qnear, max_position_error,
+    /// max_orientation_error)` — recipe 10 with a `qnear` seed, recipe 6
+    /// without one (the error bounds only reach the script with the seed,
+    /// as upstream). The solution lands in output double registers 0-5.
+    pub fn get_inverse_kinematics(
+        &mut self,
+        x: &[f64; 6],
+        qnear: Option<&[f64; 6]>,
+        max_position_error: f64,
+        max_orientation_error: f64,
+    ) -> UrResult<[f64; 6]> {
+        let cmd = match qnear {
+            Some(qnear) => {
+                let mut val = x.to_vec();
+                val.extend_from_slice(qnear);
+                val.push(max_position_error);
+                val.push(max_orientation_error);
+                RobotCommand::new(
+                    recipe::GET_INVERSE_KIN,
+                    CommandType::GetInverseKinematicsArgs,
+                    Payload::Vector(val),
+                )
+            }
+            None => RobotCommand::new(
+                recipe::WRENCH,
+                CommandType::GetInverseKinematicsDefault,
+                Payload::Vector(x.to_vec()),
+            ),
+        };
+        self.send_command(&cmd)?;
+        let snapshot = self.snapshot();
+        let mut q = [0.0; 6];
+        for (i, slot) in q.iter_mut().enumerate() {
+            *slot = snapshot
+                .output_double_register(self.register_offset + i as i32)
+                .ok_or_else(|| {
+                    UrError::Protocol(format!(
+                        "no state data for {}",
+                        self.out_double_reg(i as i32)
+                    ))
+                })?;
+        }
+        Ok(q)
+    }
+
+    /// `moveUntilContact(xd, direction, acceleration)` — recipe 16. Blocks
+    /// until the robot stops, at contact or at rest. `direction` all-zero
+    /// means contacts from any direction, as upstream; `acceleration`
+    /// defaults to 0.5 m/s^2 there.
+    pub fn move_until_contact(
+        &mut self,
+        xd: &[f64; 6],
+        direction: &[f64; 6],
+        acceleration: f64,
+    ) -> UrResult<()> {
+        verify_within(acceleration, 0.0, TOOL_ACCELERATION_MAX)?;
+        let mut val = xd.to_vec();
+        val.extend_from_slice(direction);
+        val.push(acceleration);
+        self.send_command(&RobotCommand::new(
+            recipe::MOVE_UNTIL_CONTACT,
+            CommandType::MoveUntilContact,
+            Payload::Vector(val),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -820,10 +1029,15 @@ mod tests {
     #[test]
     fn each_command_goes_to_the_recipe_the_script_listens_on() {
         assert_eq!(recipe::ASYNC_SETP, 1);
+        assert_eq!(recipe::SERVOJ, 2);
+        assert_eq!(recipe::FORCE_MODE, 3);
         assert_eq!(recipe::NO_CMD, 4);
         assert_eq!(recipe::WRENCH, 6);
         assert_eq!(recipe::FORCE_MODE_PARAMETERS, 8);
+        assert_eq!(recipe::GET_INVERSE_KIN, 10);
+        assert_eq!(recipe::WATCHDOG, 11);
         assert_eq!(recipe::SETP, 13);
+        assert_eq!(recipe::MOVE_UNTIL_CONTACT, 16);
         assert_eq!(recipe::STOP, 19);
         assert_eq!(recipe::COUNT, 23);
     }
@@ -849,5 +1063,11 @@ mod tests {
         assert!(verify_within(3.0, 0.0, TOOL_VELOCITY_MAX).is_ok());
         assert!(verify_within(-0.1, 0.0, TOOL_VELOCITY_MAX).is_err());
         assert!(verify_within(150.0, 0.0, TOOL_ACCELERATION_MAX).is_ok());
+        // Servo parameter windows (rtde_control_interface.h:36-39).
+        assert!(verify_within(0.03, SERVO_LOOKAHEAD_TIME_MIN, SERVO_LOOKAHEAD_TIME_MAX).is_ok());
+        assert!(verify_within(0.21, SERVO_LOOKAHEAD_TIME_MIN, SERVO_LOOKAHEAD_TIME_MAX).is_err());
+        assert!(verify_within(0.02, SERVO_LOOKAHEAD_TIME_MIN, SERVO_LOOKAHEAD_TIME_MAX).is_err());
+        assert!(verify_within(2000.0, SERVO_GAIN_MIN, SERVO_GAIN_MAX).is_ok());
+        assert!(verify_within(99.0, SERVO_GAIN_MIN, SERVO_GAIN_MAX).is_err());
     }
 }
