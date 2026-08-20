@@ -15,9 +15,12 @@ epicsEnvSet("PREFIX", "urExample:")
 epicsEnvSet("IP", "192.168.101.42")
 
 # Dashboard server, TCP 29999. Supplies the robot IP and power state to the
-# control and gripper ports.
+# control and gripper ports. The surface is split so a monitoring IOC can
+# load dashboard.db (status + Connect/Disconnect) without dashboard_ctrl.db
+# (Play/Stop/PowerOff/... — everything that drives the robot).
 URDashboardConfig("dash", "$(IP)", 0.1)
 dbLoadRecords("iocs/ur-robot/ur-robot-ioc/db/dashboard.db", "P=$(PREFIX),PORT=dash")
+dbLoadRecords("iocs/ur-robot/ur-robot-ioc/db/dashboard_ctrl.db", "P=$(PREFIX),PORT=dash")
 
 # RTDE receive, TCP 30004. Supplies the safety word to the control port.
 RTDEReceiveConfig("rtde_recv", "$(IP)", 0.02)
