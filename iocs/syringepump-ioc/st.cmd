@@ -48,7 +48,7 @@ asynSetTraceIOMask("$(TELD_TTY)", 0, HEX)
 # anywhere upstream).
 TeledyneDInit("$(TELD_PORT)", "$(TELD_TTY)", 0, 6)
 
-dbLoadRecords("db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=D1,PORT=$(TELD_PORT),ADDR=0")
+dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpD.template", "P=$(P),PUMP=D1:,s=SP,ta=Teledyne,ss=D1,PORT=$(TELD_PORT),ADDR=0")
 
 # ------------------------------------------------------------------
 # Teledyne H-series (demo instance -- see header comment).
@@ -59,7 +59,7 @@ drvAsynSerialPortConfigure("$(TELH_TTY)", "/dev/ttyS1", 0, 0, 0)
 asynSetTraceIOMask("$(TELH_TTY)", 0, HEX)
 TeledyneHInit("$(TELH_PORT)", "$(TELH_TTY)", 0, 6)
 
-dbLoadRecords("db/teledynePumpH.template", "s=SP,ta=Teledyne,ss=H1,PORT=$(TELH_PORT)")
+dbLoadRecords("$(SYRINGEPUMP)/db/teledynePumpH.template", "s=SP,ta=Teledyne,ss=H1,PORT=$(TELH_PORT)")
 
 # ------------------------------------------------------------------
 # ISCO -- wiring and drvModbusAsynConfigure arguments taken verbatim from
@@ -95,31 +95,31 @@ drvModbusAsynConfigure("$(ISCO_PORT)_Reg_Out_2",  "$(ISCO_PORT)", 1,  16, 100, 6
 # st.cmd exactly.
 
 # Ported from epics-modules/SyringePump/SPApp/Db/ISCOBinaryIn.substitutions via dbLoadTemplate (142 rows).
-dbLoadTemplate("db/ISCOBinaryIn.substitutions", "P=$(PREFIX)")
+dbLoadTemplate("$(SYRINGEPUMP)/db/ISCOBinaryIn.substitutions", "P=$(PREFIX)")
 
 # Ported from epics-modules/SyringePump/SPApp/Db/ISCOBinaryOut.substitutions via dbLoadTemplate (98 rows).
-dbLoadTemplate("db/ISCOBinaryOut.substitutions", "P=$(PREFIX)")
+dbLoadTemplate("$(SYRINGEPUMP)/db/ISCOBinaryOut.substitutions", "P=$(PREFIX)")
 
 # Ported from epics-modules/SyringePump/SPApp/Db/ISCOAnalogIn.substitutions via dbLoadTemplate (104 rows).
 # Upstream defect fixed in the local copy: row "D:RefillRateSP_RBV" is
 # missing the comma between the R and PORT columns present on every
 # sibling A/B/C row; see db/ISCOAnalogIn.substitutions's own header.
-dbLoadTemplate("db/ISCOAnalogIn.substitutions", "P=$(PREFIX)")
+dbLoadTemplate("$(SYRINGEPUMP)/db/ISCOAnalogIn.substitutions", "P=$(PREFIX)")
 
 # Ported from epics-modules/SyringePump/SPApp/Db/ISCOAnalogOut.substitutions via dbLoadTemplate (59 rows).
-dbLoadTemplate("db/ISCOAnalogOut.substitutions", "P=$(PREFIX)")
+dbLoadTemplate("$(SYRINGEPUMP)/db/ISCOAnalogOut.substitutions", "P=$(PREFIX)")
 
 # Load a database with other records for the controller
-dbLoadRecords("db/ISCOController.template", "P=$(PREFIX)")
+dbLoadRecords("$(SYRINGEPUMP)/db/ISCOController.template", "P=$(PREFIX)")
 
 # Load a database with other records for each pump (A, B, AB only --
 # matching upstream's own commented-out C/D/CD instantiations)
-dbLoadRecords("db/ISCOPumpN.template", "P=$(PREFIX), PUMP=A:")
-dbLoadRecords("db/ISCOPumpN.template", "P=$(PREFIX), PUMP=B:")
-#dbLoadRecords("db/ISCOPumpN.template", "P=$(PREFIX), PUMP=C:")
-#dbLoadRecords("db/ISCOPumpN.template", "P=$(PREFIX), PUMP=D:")
-dbLoadRecords("db/ISCOPumpN.template", "P=$(PREFIX), PUMP=AB:")
-#dbLoadRecords("db/ISCOPumpN.template", "P=$(PREFIX), PUMP=CD:")
+dbLoadRecords("$(SYRINGEPUMP)/db/ISCOPumpN.template", "P=$(PREFIX), PUMP=A:")
+dbLoadRecords("$(SYRINGEPUMP)/db/ISCOPumpN.template", "P=$(PREFIX), PUMP=B:")
+#dbLoadRecords("$(SYRINGEPUMP)/db/ISCOPumpN.template", "P=$(PREFIX), PUMP=C:")
+#dbLoadRecords("$(SYRINGEPUMP)/db/ISCOPumpN.template", "P=$(PREFIX), PUMP=D:")
+dbLoadRecords("$(SYRINGEPUMP)/db/ISCOPumpN.template", "P=$(PREFIX), PUMP=AB:")
+#dbLoadRecords("$(SYRINGEPUMP)/db/ISCOPumpN.template", "P=$(PREFIX), PUMP=CD:")
 
 # ------------------------------------------------------------------
 # Vindum -- wiring and drvModbusAsynConfigure arguments taken verbatim
@@ -146,36 +146,36 @@ modbusInterposeConfig("$(VINDUM_PORT)", 1, $(VTIMEOUT_MS), 0)
 # Read 31 bits starting at address 0. Function code=1. Default data type=UINT16
 drvModbusAsynConfigure("$(VINDUM_PORT)_ReadCoils", "$(VINDUM_PORT)", 1, 1, 0, 31, UINT16, $(VPOLL_MS), "Vindum")
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumReadCoils.substitutions via dbLoadTemplate (6 rows).
-dbLoadTemplate("db/VindumReadCoils.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadCoils")
+dbLoadTemplate("$(SYRINGEPUMP)/db/VindumReadCoils.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadCoils")
 
 # Write 31 bits starting at address 0. Function code=5. Default data type=UINT16
 drvModbusAsynConfigure("$(VINDUM_PORT)_WriteCoils", "$(VINDUM_PORT)", 1, 5, 0, 31, UINT16, $(VPOLL_MS), "Vindum")
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumWriteCoils.substitutions via dbLoadTemplate (27 rows).
-dbLoadTemplate("db/VindumWriteCoils.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_WriteCoils")
+dbLoadTemplate("$(SYRINGEPUMP)/db/VindumWriteCoils.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_WriteCoils")
 
 # Read 6 bits starting at address 0. Function code=2. Default data type=UINT16
 drvModbusAsynConfigure("$(VINDUM_PORT)_ReadContacts", "$(VINDUM_PORT)", 1, 2, 0, 6, UINT16, $(VPOLL_MS), "Vindum")
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumReadContacts.substitutions via dbLoadTemplate (6 rows).
-dbLoadTemplate("db/VindumReadContacts.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadContacts")
+dbLoadTemplate("$(SYRINGEPUMP)/db/VindumReadContacts.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadContacts")
 
 # Read 42 16-bit analog input registers starting at 0. Function code=4. Default data type=UINT16
 drvModbusAsynConfigure("$(VINDUM_PORT)_ReadInputRegs", "$(VINDUM_PORT)", 1, 4, 0, 42, UINT16, $(VPOLL_MS), "Vindum")
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumReadInputRegisters.substitutions via dbLoadTemplate (23 rows across 3 templates).
-dbLoadTemplate("db/VindumReadInputRegisters.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadInputRegs")
+dbLoadTemplate("$(SYRINGEPUMP)/db/VindumReadInputRegisters.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadInputRegs")
 
 # Read 46 16-bit holding registers starting at 0. Function code=3. Default data type=UINT16
 drvModbusAsynConfigure("$(VINDUM_PORT)_ReadHoldingRegs", "$(VINDUM_PORT)", 1, 3, 0, 46, UINT16, $(VPOLL_MS), "Vindum")
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumReadHoldingRegisters.substitutions via dbLoadTemplate (30 rows across 3 templates).
-dbLoadTemplate("db/VindumReadHoldingRegisters.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadHoldingRegs")
+dbLoadTemplate("$(SYRINGEPUMP)/db/VindumReadHoldingRegisters.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_ReadHoldingRegs")
 
 # Write 46 16-bit holding registers starting at 0. Function code=16. Default data type=UINT16
 drvModbusAsynConfigure("$(VINDUM_PORT)_WriteHoldingRegs", "$(VINDUM_PORT)", 1, 16, 0, 46, UINT16, $(VPOLL_MS), "Vindum")
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumWriteHoldingRegisters.substitutions via dbLoadTemplate (30 rows across 3 templates).
-dbLoadTemplate("db/VindumWriteHoldingRegisters.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_WriteHoldingRegs")
+dbLoadTemplate("$(SYRINGEPUMP)/db/VindumWriteHoldingRegisters.substitutions", "P=$(VPREFIX),PORT=$(VINDUM_PORT)_WriteHoldingRegs")
 
-dbLoadRecords("db/VindumController.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT)")
-dbLoadRecords("db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=A:")
-dbLoadRecords("db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=B:")
+dbLoadRecords("$(SYRINGEPUMP)/db/VindumController.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT)")
+dbLoadRecords("$(SYRINGEPUMP)/db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=A:")
+dbLoadRecords("$(SYRINGEPUMP)/db/VindumPumpN.template", "P=$(VPREFIX), PORT=$(VINDUM_PORT), PUMP=B:")
 
 ###############################################################################
 iocInit()

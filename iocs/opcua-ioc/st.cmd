@@ -9,7 +9,6 @@ epicsEnvSet("P",         "OPC:")
 epicsEnvSet("SESS",      "OPC1")
 epicsEnvSet("SUBS",      "SUB1")
 epicsEnvSet("OPCUA_URL", "opc.tcp://localhost:48010")
-epicsEnvSet("OPCUA",     "iocs/opcua-ioc")
 
 # Module defaults, before the sessions and the databases that pick them up.
 # (The C reads these from its .dbd `variable()` entries; this IOC's `var`

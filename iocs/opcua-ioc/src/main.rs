@@ -401,6 +401,8 @@ async fn main() -> CaResult<()> {
     let connector = Arc::new(AsyncOpcuaConnector::new());
     let registry: SharedRegistry = Registry::new(connector.clone());
 
+    epics_rs::base::runtime::env::set_default("OPCUA", env!("CARGO_MANIFEST_DIR"));
+
     let mut app = IocApplication::new();
 
     // The `opcuaItem` record type (`opcuaItemRecord.cpp`).

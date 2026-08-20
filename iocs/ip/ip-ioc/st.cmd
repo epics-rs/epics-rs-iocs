@@ -22,9 +22,9 @@ asynOctetSetOutputEos("SerialMPC", 0, "\r")
 MPCConfig("MPC1", "SerialMPC", 5, 1.0)
 
 # Supply 1 is asyn address 0, supply 2 is address 1.
-dbLoadRecords("iocs/ip/ip-ioc/db/mpc.db", "P=$(PREFIX),PUMP=ip1,PORT=MPC1,ADDR=0")
-dbLoadRecords("iocs/ip/ip-ioc/db/mpc.db", "P=$(PREFIX),PUMP=ip2,PORT=MPC1,ADDR=1")
-dbLoadRecords("iocs/ip/ip-ioc/db/tsp.db", "P=$(PREFIX),TSP=tsp1,PORT=MPC1")
+dbLoadRecords("$(IP)/db/mpc.db", "P=$(PREFIX),PUMP=ip1,PORT=MPC1,ADDR=0")
+dbLoadRecords("$(IP)/db/mpc.db", "P=$(PREFIX),PUMP=ip2,PORT=MPC1,ADDR=1")
+dbLoadRecords("$(IP)/db/tsp.db", "P=$(PREFIX),TSP=tsp1,PORT=MPC1")
 
 # --- Pfeiffer TPG261 / TPG262 gauge controller ------------------------------
 # 9600 8N1; the controller frames every line with CR/LF and expects a bare CR.
@@ -39,8 +39,8 @@ asynOctetSetInputEos("SerialTPG", 0, "\r\n")
 # command CR are written by the driver, so the port has no output EOS.
 TPG261Config("TPG1", "SerialTPG", 2.0)
 
-dbLoadRecords("iocs/ip/ip-ioc/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=TPG1,ADDR=0")
-dbLoadRecords("iocs/ip/ip-ioc/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=TPG1,ADDR=1")
+dbLoadRecords("$(IP)/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge1,PORT=TPG1,ADDR=0")
+dbLoadRecords("$(IP)/db/tpg261.db", "P=$(PREFIX),GAUGE=gauge2,PORT=TPG1,ADDR=1")
 
 # --- Televac vacuum gauge controller ----------------------------------------
 # The controller answers with a CR-terminated line; devTelevac.c relied on the
@@ -56,10 +56,10 @@ asynOctetSetOutputEos("SerialTVAC", 0, "\r")
 # TelevacConfig(portName, octetPort, numStations, numRelays, pollPeriodSeconds)
 TelevacConfig("TVAC1", "SerialTVAC", 2, 2, 1.0)
 
-dbLoadRecords("iocs/ip/ip-ioc/db/televac.db", "P=$(PREFIX),GAUGE=tv1,PORT=TVAC1,ADDR=0")
-dbLoadRecords("iocs/ip/ip-ioc/db/televac.db", "P=$(PREFIX),GAUGE=tv2,PORT=TVAC1,ADDR=1")
-dbLoadRecords("iocs/ip/ip-ioc/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly1,PORT=TVAC1,ADDR=0")
-dbLoadRecords("iocs/ip/ip-ioc/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly2,PORT=TVAC1,ADDR=1")
+dbLoadRecords("$(IP)/db/televac.db", "P=$(PREFIX),GAUGE=tv1,PORT=TVAC1,ADDR=0")
+dbLoadRecords("$(IP)/db/televac.db", "P=$(PREFIX),GAUGE=tv2,PORT=TVAC1,ADDR=1")
+dbLoadRecords("$(IP)/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly1,PORT=TVAC1,ADDR=0")
+dbLoadRecords("$(IP)/db/televac_relay.db", "P=$(PREFIX),RELAY=tvrly2,PORT=TVAC1,ADDR=1")
 
 # --- MKS / HPS SensaVac 937 gauge controller --------------------------------
 # devAiMKS.c: "set the serial port settings ... to use the correct baud rate and
@@ -77,10 +77,10 @@ MKSConfig("MKS1", "SerialMKS", 5, 1.0)
 
 # ipApp/Db/MKS.db: gauges 1 and 2 are cold cathodes, 4 and 5 Piranis. asyn
 # addresses are 0-based here, so gauge n is address n-1.
-dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=cc1,PORT=MKS1,ADDR=0")
-dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=cc2,PORT=MKS1,ADDR=1")
-dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=pr1,PORT=MKS1,ADDR=3")
-dbLoadRecords("iocs/ip/ip-ioc/db/mks.db", "P=$(PREFIX),GAUGE=pr2,PORT=MKS1,ADDR=4")
+dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=cc1,PORT=MKS1,ADDR=0")
+dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=cc2,PORT=MKS1,ADDR=1")
+dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=pr1,PORT=MKS1,ADDR=3")
+dbLoadRecords("$(IP)/db/mks.db", "P=$(PREFIX),GAUGE=pr2,PORT=MKS1,ADDR=4")
 
 # --- Heidenhain ND261 display unit ------------------------------------------
 # devAiHeidND261.c set the input EOS to "\n\n" itself; the port carries it here.
@@ -96,7 +96,7 @@ asynOctetSetInputEos("SerialND261", 0, "\n\n")
 # ND261Config(portName, octetPort, pollPeriodSeconds)
 ND261Config("ND261", "SerialND261", 1.0)
 
-dbLoadRecords("iocs/ip/ip-ioc/db/nd261.db", "P=$(PREFIX),AXIS=nd1,PORT=ND261")
+dbLoadRecords("$(IP)/db/nd261.db", "P=$(PREFIX),AXIS=nd1,PORT=ND261")
 
 # --- Eurotherm 800/2000 temperature controller ------------------------------
 # The bisync frames carry their own EOT/STX/ETX/ENQ bytes and a block check
@@ -112,4 +112,4 @@ asynSetOption("SerialEuro", 0, "stop", "1")
 # record is the controller's local address on the line (the C link's LAD=).
 EurothermConfig("EURO1", "SerialEuro", 0)
 
-dbLoadRecords("iocs/ip/ip-ioc/db/eurotherm.db", "P=$(PREFIX),ET=et1,PORT=EURO1,LADDR=1")
+dbLoadRecords("$(IP)/db/eurotherm.db", "P=$(PREFIX),ET=et1,PORT=EURO1,LADDR=1")
