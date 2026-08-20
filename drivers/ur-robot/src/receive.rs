@@ -188,6 +188,12 @@ impl ReceiveInterface {
         self.stream.as_ref().is_some_and(StateStream::is_connected)
     }
 
+    /// True while the socket is up AND a data package arrived within
+    /// `threshold` — see [`StateStream::is_alive`].
+    pub fn is_alive(&self, threshold: std::time::Duration) -> bool {
+        self.stream.as_ref().is_some_and(|s| s.is_alive(threshold))
+    }
+
     pub fn controller_version(&self) -> ControllerVersion {
         self.version
     }

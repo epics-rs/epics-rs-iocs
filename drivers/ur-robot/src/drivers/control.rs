@@ -724,7 +724,19 @@ pub fn poll_once(
         updates.push(ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(0)));
         return updates;
     }
-    updates.push(ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(1)));
+    // IS_CONNECTED reflects aliveness, not just the socket: a stale stream
+    // (open socket, packages stopped) reads 0. Unlike receive, control never
+    // reconnects on its own — a reconnect re-uploads the control script — so
+    // staleness here is reflection only; the write gate stays socket-based.
+    let alive = inner
+        .iface
+        .as_ref()
+        .is_some_and(|i| i.is_alive(crate::drivers::STALE_AFTER));
+    updates.push(ParamSetValue::new(
+        p.is_connected,
+        0,
+        ParamValue::Int32(i32::from(alive)),
+    ));
 
     let is_steady = if inner.custom_script.is_some() {
         false

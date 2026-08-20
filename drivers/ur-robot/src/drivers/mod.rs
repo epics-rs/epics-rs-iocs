@@ -42,6 +42,15 @@ pub mod runtime;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 
+/// An RTDE stream with no data package for this long is stale: the socket is
+/// open but the robot state it serves is no longer current. The default RTDE
+/// output frequency is 125 Hz (500 Hz e-Series), so one second is >100 missed
+/// packages — far past jitter, deliberately not configurable. Shared by the
+/// receive driver (staleness → reconnect) and the control driver (staleness →
+/// `IS_CONNECTED` only; control never reconnects on its own, as in C, because
+/// a reconnect re-uploads the control script).
+pub(crate) const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The `asynError` a C driver returns from `writeInt32` / `writeFloat64` /
 /// `writeOctet` when the device call failed.
 pub(crate) fn asyn_error(message: impl Into<String>) -> AsynError {

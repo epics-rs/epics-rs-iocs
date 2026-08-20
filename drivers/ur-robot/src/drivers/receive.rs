@@ -26,6 +26,47 @@ pub const NUM_JOINTS: usize = 6;
 /// (rtde_receive_driver.cpp:40).
 const SAFETY_STATUS_BITS_MASK: u32 = 0x7ff;
 
+use crate::drivers::STALE_AFTER;
+
+/// Reconnect pacing for the poll thread: the first attempt fires on the
+/// unhealthy transition, later ones back off 1 s → 2 s → 5 s (cap). Each
+/// attempt itself is bounded by the connect/`FIRST_STATE_TIMEOUT` limits
+/// inside [`ReceiveInterface::connect`]/`reconnect`.
+const RECONNECT_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+
+/// Backoff state for the poll-thread reconnect.
+struct Backoff {
+    idx: usize,
+    next: Option<std::time::Instant>,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { idx: 0, next: None }
+    }
+
+    /// Whether an attempt is due — always true before the first failure.
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.next.is_none_or(|t| now >= t)
+    }
+
+    /// Record a failed attempt: schedule the next one and escalate the delay.
+    fn failed(&mut self, now: std::time::Instant) {
+        self.next = Some(now + RECONNECT_BACKOFF[self.idx]);
+        self.idx = (self.idx + 1).min(RECONNECT_BACKOFF.len() - 1);
+    }
+
+    /// Back to healthy: the next unhealthy transition retries immediately.
+    fn reset(&mut self) {
+        self.idx = 0;
+        self.next = None;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ReceiveParams {
     pub disconnect: usize,
@@ -192,33 +233,44 @@ impl ReceiveDriver {
     /// `connected` inside `if (!isConnected())`, so processing RECONNECT on a
     /// healthy link answers `asynError`. Here a live connection is a success.
     fn try_connect(&mut self) -> bool {
-        let mut slot = self.iface.lock();
-        match slot.as_mut() {
-            Some(iface) => {
-                if iface.is_connected() {
-                    return true;
-                }
-                log::info!("ur-robot: reconnecting to the RTDE receive interface");
-                match iface.reconnect() {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log::error!("ur-robot: RTDE receive reconnect failed: {e}");
-                        false
-                    }
-                }
+        connect_or_reconnect(&mut self.iface.lock(), &self.robot_ip)
+    }
+}
+
+/// Connect (no interface yet) or reconnect (interface present but down) the
+/// receive interface in `slot`. A live connection is a success. Shared by the
+/// RECONNECT command ([`ReceiveDriver::try_connect`]) and the poll thread's
+/// automatic recovery.
+fn connect_or_reconnect(slot: &mut Option<ReceiveInterface>, robot_ip: &str) -> bool {
+    match slot.as_mut() {
+        Some(iface) => {
+            // The healthy short-circuit gates on aliveness, not the socket: a
+            // stale link (socket open, packages stopped) still answers
+            // `is_connected() == true` and must be cycled, or both the manual
+            // RECONNECT and the poll-thread recovery would no-op forever.
+            if iface.is_alive(STALE_AFTER) {
+                return true;
             }
-            None => match ReceiveInterface::connect(&self.robot_ip, false) {
-                Ok(iface) => {
-                    log::info!("ur-robot: connected to the RTDE receive interface");
-                    *slot = Some(iface);
-                    true
-                }
+            log::info!("ur-robot: reconnecting to the RTDE receive interface");
+            match iface.reconnect() {
+                Ok(()) => true,
                 Err(e) => {
-                    log::error!("ur-robot: RTDE receive connect failed: {e}");
+                    log::error!("ur-robot: RTDE receive reconnect failed: {e}");
                     false
                 }
-            },
+            }
         }
+        None => match ReceiveInterface::connect(robot_ip, false) {
+            Ok(iface) => {
+                log::info!("ur-robot: connected to the RTDE receive interface");
+                *slot = Some(iface);
+                true
+            }
+            Err(e) => {
+                log::error!("ur-robot: RTDE receive connect failed: {e}");
+                false
+            }
+        },
     }
 }
 
@@ -268,11 +320,17 @@ impl PortDriver for ReceiveDriver {
 }
 
 /// The receive poll thread (`RTDEReceive::poll`).
+///
+/// Deviation from C (which never reconnects on its own): the poll thread owns
+/// automatic recovery. An unhealthy stream — socket down OR stale per
+/// [`STALE_AFTER`] — is retried on the [`RECONNECT_BACKOFF`] schedule, so a
+/// monitoring IOC comes back by itself when the robot does.
 pub fn start_poller(
     handle: PortHandle,
     params: ReceiveParams,
     iface: Arc<Mutex<Option<ReceiveInterface>>>,
     shared: ReceiveHandle,
+    robot_ip: String,
     poll_period: Duration,
     ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
@@ -280,11 +338,29 @@ pub fn start_poller(
         .name("ur-receive-poll".into())
         .spawn(move || {
             ready.wait();
+            let mut backoff = Backoff::new();
             loop {
+                let healthy = {
+                    let slot = iface.lock();
+                    slot.as_ref().is_some_and(|i| i.is_alive(STALE_AFTER))
+                };
+                if healthy {
+                    backoff.reset();
+                } else {
+                    let now = std::time::Instant::now();
+                    if backoff.due(now) {
+                        if connect_or_reconnect(&mut iface.lock(), &robot_ip) {
+                            backoff.reset();
+                        } else {
+                            backoff.failed(now);
+                        }
+                    }
+                }
+
                 let snapshot = {
                     let slot = iface.lock();
                     slot.as_ref()
-                        .filter(|i| i.is_connected())
+                        .filter(|i| i.is_alive(STALE_AFTER))
                         .map(|i| i.snapshot())
                 };
 
@@ -487,6 +563,35 @@ mod tests {
     use super::*;
     use crate::state::Value;
     use std::collections::HashMap;
+    use std::time::Instant;
+
+    /// The pacing boundaries: an attempt is due immediately on the unhealthy
+    /// transition, then 1 s → 2 s → 5 s, capped at 5 s, and reset restores
+    /// the immediate first attempt.
+    #[test]
+    fn backoff_escalates_to_the_cap_and_resets() {
+        let mut b = Backoff::new();
+        let t0 = Instant::now();
+        assert!(b.due(t0), "first attempt is immediate");
+
+        b.failed(t0);
+        assert!(!b.due(t0 + Duration::from_millis(999)));
+        assert!(b.due(t0 + Duration::from_secs(1)));
+
+        b.failed(t0);
+        assert!(!b.due(t0 + Duration::from_millis(1999)));
+        assert!(b.due(t0 + Duration::from_secs(2)));
+
+        b.failed(t0);
+        assert!(b.due(t0 + Duration::from_secs(5)));
+        // Capped: further failures stay at 5 s.
+        b.failed(t0);
+        assert!(!b.due(t0 + Duration::from_millis(4999)));
+        assert!(b.due(t0 + Duration::from_secs(5)));
+
+        b.reset();
+        assert!(b.due(t0), "reset restores the immediate first attempt");
+    }
 
     fn params() -> ReceiveParams {
         // Distinct indices; only their identity matters to `publish`.
