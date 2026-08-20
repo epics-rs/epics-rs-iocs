@@ -10,8 +10,8 @@
 //!   client stops kicking the watchdog — the timeout that stops a jog,
 //! - the `Control:Stop` dfanout fires `Control:stopL.PROC`,
 //!   and `Control:stop_on_safety` fans out to `Control:Stop` / `Dashboard:Stop`,
-//! - `auto_moveJ_calc` / `auto_moveL_calc` fire `Control:moveJ.PROC` /
-//!   `Control:moveL.PROC`,
+//! - the `J*CmdU` / `Pose*CmdU` records FLNK `Control:moveJ.PROC` /
+//!   `Control:moveL.PROC` after writing the target,
 //! - `RobotiqGripper:MinPosition` / `MaxPosition` FLNK to
 //!   `SetPositionRange.PROC`,
 //! - `RobotiqGripper:Activate` carries `PINI="$(AUTO_ACTIVATE=YES)"`.
