@@ -397,10 +397,10 @@ record(waveform, "$(P)Receive:TargetJointCurrents")
 
 record(waveform, "$(P)Receive:TargetJointMoments")
 {
-    field(DESC, "Target joint currents")
+    field(DESC, "Target joint moments")
     field(DTYP, "asynFloat64ArrayIn")
     field(FTVL, "DOUBLE")
-    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TARGET_JOINT_CURRENTS")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TARGET_JOINT_MOMENTS")
     field(NELM, 6)
     field(SCAN, "I/O Intr")
 }

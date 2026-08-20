@@ -319,6 +319,7 @@ remain open upstream defects the port did not guess at.
 | 158 | urRobot `rtde_control_driver.cpp:526-540` — unopenable script / disconnected ScriptClient falls through to `asynSuccess` with the error flag clear | fixed-in-port (flag raised, error returned) |
 | 159 | ur_rtde `dashboard_client.cpp:342-360` — `setUserRole` switch with no `break`s: every role falls to "restricted" | observed only (urRobot never calls it; not ported) |
 | 160 | urRobot `rtde_control_driver.cpp:377-386` — comment says m→mm, code does mm→m | fixed-in-port (comment corrected) |
+| 161 | urRobot `urRobotApp/Db/rtde_receive.db:396-401` — `TargetJointMoments` INP names `TARGET_JOINT_CURRENTS` (DESC copied too): the moments PV serves the currents data | fixed-in-port (INP/DESC corrected; wiring pinned by `record_wiring.rs`); upstream PR candidate |
 | — | ur_rtde `GripperConfig::MIN_POSITION_STOP_ADJUST = -5` applied to both calibration ends (widens open, narrows closed); intended sign underivable without the Robotiq spec | unfixable-without-spec (literal kept) |
 
 ## epics-modules/ip (commits `496b5c1`…`b577ef9`)
