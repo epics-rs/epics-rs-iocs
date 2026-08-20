@@ -45,6 +45,7 @@ pub struct GripperParams {
     pub closed_position: usize,
     pub current_position: usize,
     pub move_status: usize,
+    pub grasp_state: usize,
     pub set_position_range: usize,
     pub min_position: usize,
     pub max_position: usize,
@@ -72,6 +73,7 @@ impl GripperParams {
             closed_position: base.create_param("CLOSED_POSITION", ParamType::Float64)?,
             current_position: base.create_param("CURRENT_POSITION", ParamType::Float64)?,
             move_status: base.create_param("MOVE_STATUS", ParamType::Int32)?,
+            grasp_state: base.create_param("GRASP_STATE", ParamType::Int32)?,
             set_position_range: base.create_param("SET_POSITION_RANGE", ParamType::Int32)?,
             min_position: base.create_param("MIN_POSITION", ParamType::Int32)?,
             max_position: base.create_param("MAX_POSITION", ParamType::Int32)?,
@@ -115,6 +117,7 @@ impl GripperParams {
             self.closed_position,
             self.current_position,
             self.move_status,
+            self.grasp_state,
             self.is_calibrated,
         ]
         .into_iter()
@@ -469,6 +472,11 @@ pub fn poll_once(p: GripperParams, g: &mut RobotiqGripper) -> UrResult<Vec<Param
         ParamSetValue::new(p.move_status, 0, ParamValue::Int32(move_status.raw())),
         ParamSetValue::new(p.is_stopped_inner, 0, ParamValue::Int32(i32::from(inner))),
         ParamSetValue::new(p.is_stopped_outer, 0, ParamValue::Int32(i32::from(outer))),
+        ParamSetValue::new(
+            p.grasp_state,
+            0,
+            ParamValue::Int32(grasp_state(is_active, move_status, is_open, is_closed) as i32),
+        ),
     ])
 }
 
@@ -477,6 +485,45 @@ fn stopped_flags(status: ObjectStatus) -> (bool, bool) {
         ObjectStatus::StoppedInnerObject => (true, false),
         ObjectStatus::StoppedOuterObject => (false, true),
         _ => (false, false),
+    }
+}
+
+/// The `GRASP_STATE` mbbi choices, derived per poll from device facts
+/// alone: activation, `OBJ`, and position against the calibrated ends.
+/// MISGRIP/DROPPED need command context (what was ordered vs what
+/// happened) and are deliberately the sequencer's half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraspState {
+    /// The facts prove none of the named states: an unexpected `OBJ`
+    /// value, or at target mid-stroke with no object (neither end).
+    Unknown = 0,
+    Inactive = 1,
+    Moving = 2,
+    Open = 3,
+    ClosedEmpty = 4,
+    HoldingInner = 5,
+    HoldingOuter = 6,
+}
+
+/// An inactive gripper reports whatever `OBJ` last held, so activation
+/// outranks it. `is_open` wins the `is_open && is_closed` tie that only
+/// a degenerate calibrated range (min ≥ max) can produce.
+fn grasp_state(
+    is_active: bool,
+    status: ObjectStatus,
+    is_open: bool,
+    is_closed: bool,
+) -> GraspState {
+    if !is_active {
+        return GraspState::Inactive;
+    }
+    match status {
+        ObjectStatus::Moving => GraspState::Moving,
+        ObjectStatus::StoppedInnerObject => GraspState::HoldingInner,
+        ObjectStatus::StoppedOuterObject => GraspState::HoldingOuter,
+        ObjectStatus::AtDest if is_open => GraspState::Open,
+        ObjectStatus::AtDest if is_closed => GraspState::ClosedEmpty,
+        ObjectStatus::AtDest | ObjectStatus::Other(_) => GraspState::Unknown,
     }
 }
 
@@ -699,6 +746,66 @@ mod tests {
             assert!(
                 targeted != exempt,
                 "param {reason} must be exactly one of: alarm target, command/exclusion"
+            );
+        }
+    }
+
+    /// The full (is_active, OBJ, position-class) cross product. The three
+    /// position classes are position vs the calibrated ends: at the open
+    /// end (`is_open`), mid-stroke (neither), at the closed end
+    /// (`is_closed`); `is_open && is_closed` needs a degenerate range and
+    /// is covered by the tie-break doc, not a row.
+    #[test]
+    fn the_grasp_state_boundary_table() {
+        use GraspState::*;
+        use ObjectStatus as O;
+
+        const AT_OPEN: (bool, bool) = (true, false);
+        const MID: (bool, bool) = (false, false);
+        const AT_CLOSED: (bool, bool) = (false, true);
+
+        let table = [
+            // Inactive outranks every OBJ and position.
+            (false, O::Moving, AT_OPEN, Inactive),
+            (false, O::Moving, MID, Inactive),
+            (false, O::Moving, AT_CLOSED, Inactive),
+            (false, O::StoppedInnerObject, AT_OPEN, Inactive),
+            (false, O::StoppedInnerObject, MID, Inactive),
+            (false, O::StoppedInnerObject, AT_CLOSED, Inactive),
+            (false, O::StoppedOuterObject, AT_OPEN, Inactive),
+            (false, O::StoppedOuterObject, MID, Inactive),
+            (false, O::StoppedOuterObject, AT_CLOSED, Inactive),
+            (false, O::AtDest, AT_OPEN, Inactive),
+            (false, O::AtDest, MID, Inactive),
+            (false, O::AtDest, AT_CLOSED, Inactive),
+            (false, O::Other(7), AT_OPEN, Inactive),
+            (false, O::Other(7), MID, Inactive),
+            (false, O::Other(7), AT_CLOSED, Inactive),
+            // Active: motion and object stops ignore position.
+            (true, O::Moving, AT_OPEN, Moving),
+            (true, O::Moving, MID, Moving),
+            (true, O::Moving, AT_CLOSED, Moving),
+            (true, O::StoppedInnerObject, AT_OPEN, HoldingInner),
+            (true, O::StoppedInnerObject, MID, HoldingInner),
+            (true, O::StoppedInnerObject, AT_CLOSED, HoldingInner),
+            (true, O::StoppedOuterObject, AT_OPEN, HoldingOuter),
+            (true, O::StoppedOuterObject, MID, HoldingOuter),
+            (true, O::StoppedOuterObject, AT_CLOSED, HoldingOuter),
+            // Active at target, no object: only an end position proves a
+            // named state; mid-stroke is Unknown by design.
+            (true, O::AtDest, AT_OPEN, Open),
+            (true, O::AtDest, MID, Unknown),
+            (true, O::AtDest, AT_CLOSED, ClosedEmpty),
+            (true, O::Other(7), AT_OPEN, Unknown),
+            (true, O::Other(7), MID, Unknown),
+            (true, O::Other(7), AT_CLOSED, Unknown),
+        ];
+
+        for (active, status, (open, closed), expected) in table {
+            assert_eq!(
+                grasp_state(active, status, open, closed),
+                expected,
+                "grasp_state({active}, {status:?}, {open}, {closed})"
             );
         }
     }

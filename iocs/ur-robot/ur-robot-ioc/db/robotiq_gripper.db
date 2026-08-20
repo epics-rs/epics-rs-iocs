@@ -153,6 +153,24 @@ record(mbbi, "$(P)RobotiqGripper:MoveStatus")
     field(THST, "At target destination")  field(THVL, "3")
 }
 
+# Derived per poll from device facts alone (activation, OBJ, position vs
+# the calibrated ends). MISGRIP/DROPPED need command context and belong
+# to the sequencer layer, not this record.
+record(mbbi, "$(P)RobotiqGripper:GraspState")
+{
+    field(DESC, "Derived grasp state")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))GRASP_STATE")
+    field(SCAN, "I/O Intr")
+    field(ZRST, "Unknown")  field(ZRVL, "0")
+    field(ONST, "Inactive")  field(ONVL, "1")
+    field(TWST, "Moving")  field(TWVL, "2")
+    field(THST, "Open")  field(THVL, "3")
+    field(FRST, "Closed empty")  field(FRVL, "4")
+    field(FVST, "Holding inner")  field(FVVL, "5")
+    field(SXST, "Holding outer")  field(SXVL, "6")
+}
+
 record(longin, "$(P)RobotiqGripper:MoveStatusRaw")
 {
     field(DTYP, "asynInt32")
