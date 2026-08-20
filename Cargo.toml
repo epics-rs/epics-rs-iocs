@@ -156,7 +156,7 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.26.0 (released): ports consume the released version instead of
+# epics-rs 0.26.1 (released): ports consume the released version instead of
 # the main branch. 0.24.3 -> 0.25.2 was the breaking step for this workspace
 # and the code here already carries it: `create_port_runtime` became fallible
 # (a port whose actor thread the OS refuses is now an error rather than a
@@ -165,25 +165,34 @@ members = [
 # commands spawn on either async backend, and `PvaClient::pvmonitor_handle`
 # gained an `on_conn` callback.
 #
-# 0.26.0 carries five breaking changes, none of which this workspace touches:
+# 0.26.0 carried five breaking changes, none of which this workspace touches:
 # they are internal to epics-ca-rs (`check_write_element_count` renamed
 # `check_write_request`), epics-base-rs (`AcfCell` newtype on
 # `IocApplication.acf`; the record snapshot's `description` is `PvString`),
 # epics-pva-rs and epics-bridge-rs (per-op credential fields collapse into a
 # shared `ClientCreds`). Drivers and IOCs here consume `epics_rs::asyn` and
-# `epics_rs::ad_core`, which are unchanged. What does reach us is the CA
-# client fix: a cross-typed put (e.g. `Long(1)` to an ENUM field) used to ship
-# the caller's variant under a native-type header and write a silently wrong
+# `epics_rs::ad_core`, which are unchanged. What reached us was the CA client
+# fix: a cross-typed put (e.g. `Long(1)` to an ENUM field) used to ship the
+# caller's variant under a native-type header and write a silently wrong
 # value; it now routes through `convert_to(native_type)` first.
 #
+# 0.26.1 is a patch release with no API change, and two of its fixes were
+# found in this workspace. `RequestOp::CallParamCallbacks` now fires an
+# interrupt for every address list the batch wrote -- the upstream half of
+# the RTDE receive fix in drivers/ur-robot, whose `by_addr` split is
+# redundant against 0.26.1 rather than wrong. And an NTNDArray frame no
+# longer boxes its pixels one `ScalarValue` at a time, which takes the two
+# PVA plugins on the D405/D435i IOCs from 135% to 14% of one core at
+# 640x480 @ 15 fps. `ad-plugins-rs` also moves to rust-hdf5 0.5.1.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.26.0"
-asyn-rs = "0.26.0"
-ad-core-rs = "0.26.0"
-ad-plugins-rs = "0.26.0"
+epics-rs = "0.26.1"
+asyn-rs = "0.26.1"
+ad-core-rs = "0.26.1"
+ad-plugins-rs = "0.26.1"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.26.0", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.26.1", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.26.0"
+mca-rs = "0.26.1"
