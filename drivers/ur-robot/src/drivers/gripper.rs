@@ -54,7 +54,7 @@ pub struct GripperParams {
 }
 
 impl GripperParams {
-    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    pub(crate) fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
             connect: base.create_param("CONNECT", ParamType::Int32)?,
             is_connected: base.create_param("IS_CONNECTED", ParamType::Int32)?,

@@ -40,7 +40,40 @@ pub mod ioc_ready;
 pub mod receive;
 pub mod runtime;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+
+/// The full asyn parameter table of every driver kind, keyed by the names
+/// the ioc's record-wiring test maps db files to. Each table is built by
+/// the same `Params::create` the runtime constructor calls, so it cannot
+/// drift from what a live port serves — the test checks every db
+/// `@asyn(...)DRVINFO` string against it.
+pub fn created_param_names() -> Vec<(&'static str, Vec<String>)> {
+    fn table<P>(
+        max_addr: usize,
+        create: impl FnOnce(&mut PortDriverBase) -> AsynResult<P>,
+    ) -> Vec<String> {
+        let mut base = PortDriverBase::new("wiring-check", max_addr, PortFlags::default());
+        create(&mut base).expect("a fresh parameter table accepts every create_param");
+        (0..base.params.len())
+            .map(|i| base.params.param_name(i).expect("index < len").to_string())
+            .collect()
+    }
+
+    vec![
+        ("dashboard", table(1, dashboard::DashboardParams::create)),
+        (
+            "receive",
+            table(receive::NUM_JOINTS, receive::ReceiveParams::create),
+        ),
+        ("io", table(io::NUM_CHANNELS, io::IoParams::create)),
+        (
+            "control",
+            table(control::NUM_JOINTS, control::ControlParams::create),
+        ),
+        ("gripper", table(1, gripper::GripperParams::create)),
+    ]
+}
 
 /// An RTDE stream with no data package for this long is stale: the socket is
 /// open but the robot state it serves is no longer current. The default RTDE

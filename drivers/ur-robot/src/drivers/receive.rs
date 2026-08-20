@@ -113,7 +113,7 @@ pub struct ReceiveParams {
 }
 
 impl ReceiveParams {
-    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    pub(crate) fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
             disconnect: base.create_param("DISCONNECT", ParamType::Int32)?,
             reconnect: base.create_param("RECONNECT", ParamType::Int32)?,

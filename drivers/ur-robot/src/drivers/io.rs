@@ -29,7 +29,7 @@ pub struct IoParams {
 }
 
 impl IoParams {
-    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    pub(crate) fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
             speed_slider: base.create_param("SPEED_SLIDER", ParamType::Float64)?,
             set_standard_digital_out: base

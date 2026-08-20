@@ -52,7 +52,7 @@ pub struct DashboardParams {
 }
 
 impl DashboardParams {
-    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    pub(crate) fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
             is_connected: base.create_param("IS_CONNECTED", ParamType::Int32)?,
             load_urp: base.create_param("LOAD_URP", ParamType::Octet)?,
