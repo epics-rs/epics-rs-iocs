@@ -330,7 +330,7 @@ pub fn start_poller(
 /// asynPortDriver.cpp:820), and [`publish`] writes the joint and TCP-pose
 /// elements at addresses `0..NUM_JOINTS`. Flushing address 0 alone stores the
 /// other five but consumes no changed flag for them, so `Joint2`-`Joint6` and
-/// `PoseY`-`PoseYaw` never see an `I/O Intr` and stay UDF for the life of the
+/// `PoseY`-`PoseRz` never see an `I/O Intr` and stay UDF for the life of the
 /// IOC.
 fn by_addr(updates: Vec<ParamSetValue>) -> Vec<(i32, Vec<ParamSetValue>)> {
     let mut batches: Vec<(i32, Vec<ParamSetValue>)> = Vec::new();
@@ -456,12 +456,14 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
         ));
     }
 
-    // TCP pose: x,y,z in metres -> mm; rx,ry,rz in radians -> degrees.
+    // TCP pose: x,y,z in metres -> mm; rx,ry,rz stay radians — they are a
+    // rotation vector (axis-angle scaled by the angle), not Euler angles, so
+    // a degree scaling has no meaning (upstream c02490e).
     if let Some(pose) = snap.doubles("actual_TCP_pose") {
         let converted: Vec<f64> = pose
             .iter()
             .enumerate()
-            .map(|(i, v)| if i < 3 { v * 1000.0 } else { deg(*v) })
+            .map(|(i, v)| if i < 3 { v * 1000.0 } else { *v })
             .collect();
         for (i, v) in converted.iter().enumerate() {
             updates.push(ParamSetValue::new(
@@ -586,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_pose_converts_metres_to_mm_and_radians_to_degrees() {
+    fn tcp_pose_converts_metres_to_mm_and_passes_rotation_vector_raw() {
         let p = params();
         let mut values = HashMap::new();
         values.insert(
@@ -608,7 +610,7 @@ mod tests {
         assert!((arr[0] - 100.0).abs() < 1e-9);
         assert!((arr[1] + 200.0).abs() < 1e-9);
         assert!((arr[2] - 350.0).abs() < 1e-9);
-        assert!((arr[3] - 180.0).abs() < 1e-9);
+        assert!((arr[3] - std::f64::consts::PI).abs() < 1e-9);
     }
 
     #[test]

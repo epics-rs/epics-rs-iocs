@@ -466,18 +466,12 @@ impl PortDriver for ControlDriver {
         if reason == p.joint_cmd {
             inner.cmd_joints[index] = deg_to_rad(value);
         } else if reason == p.pose_cmd {
-            // x,y,z arrive in mm; rx,ry,rz in degrees.
-            inner.cmd_pose[index] = if index >= 3 {
-                deg_to_rad(value)
-            } else {
-                value / 1000.0
-            };
+            // x,y,z arrive in mm; rx,ry,rz are a rotation vector already in
+            // radians (upstream c02490e) — no angular scaling applies.
+            inner.cmd_pose[index] = if index >= 3 { value } else { value / 1000.0 };
         } else if reason == p.jog_speed {
-            inner.jog_speeds[index] = if index >= 3 {
-                deg_to_rad(value)
-            } else {
-                value / 1000.0
-            };
+            // x,y,z arrive in mm/s; rx,ry,rz in rad/s.
+            inner.jog_speeds[index] = if index >= 3 { value } else { value / 1000.0 };
             inner.new_jog = true;
         } else if reason == p.tcp_offset {
             // x,y,z arrive in mm; rx,ry,rz are already radians.
