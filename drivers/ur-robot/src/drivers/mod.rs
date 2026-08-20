@@ -59,3 +59,33 @@ pub(crate) fn asyn_error(message: impl Into<String>) -> AsynError {
         message: message.into(),
     }
 }
+
+/// The alarm half of a poll cycle: on a health transition, the status
+/// updates that raise (link lost) or clear (link recovered) the COMM alarm
+/// on every readback `(reason, addr)` in `targets`; on a steady state,
+/// nothing. Each poll thread is the single alarm owner for its port — the
+/// C pattern is `setParamStatus(asynDisconnected)` + `callParamCallbacks()`
+/// from the poll loop, and the record-side fill-in maps `Disconnected` to
+/// COMM/INVALID (asynEpicsUtils.c:238-265), so the alarm pair is left 0
+/// here rather than duplicating that mapping.
+pub(crate) fn health_transition(
+    targets: &[(usize, i32)],
+    healthy_now: bool,
+    was_healthy: &mut bool,
+) -> Vec<epics_rs::asyn::request::ParamSetValue> {
+    if healthy_now == *was_healthy {
+        return Vec::new();
+    }
+    *was_healthy = healthy_now;
+    let status = if healthy_now {
+        AsynStatus::Success
+    } else {
+        AsynStatus::Disconnected
+    };
+    targets
+        .iter()
+        .map(|&(reason, addr)| {
+            epics_rs::asyn::request::ParamSetValue::status(reason, addr, status, 0, 0)
+        })
+        .collect()
+}

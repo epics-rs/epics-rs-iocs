@@ -176,6 +176,20 @@ impl ControlParams {
             || reason == self.jog_start
             || reason == self.jog_stop
     }
+
+    /// The device readbacks that carry the COMM alarm while the control link
+    /// is down — on this port that is `IS_STEADY` alone. Everything else is
+    /// a command, an operator setpoint/mode, IOC-side state-machine output
+    /// that stays valid through an outage (`ASYNC_MOVE_DONE`,
+    /// `MOTION_DONE_COUNT`, the waypoint/custom-script/jog state), the
+    /// health readback `IS_CONNECTED` (must stay valid at 0 — it is the one
+    /// PV that says why), or the two unpublished upstream-parity params
+    /// (`ACTUAL_Q`/`ACTUAL_TCP_POSE`, which no record binds).
+    /// `alarm_set_is_every_device_readback` enforces that a new parameter
+    /// lands in exactly one group.
+    fn alarm_targets(&self) -> Vec<(usize, i32)> {
+        vec![(self.is_steady, 0)]
+    }
 }
 
 /// Everything the write handlers and the poll thread share.
@@ -700,10 +714,13 @@ pub fn start_poller(
         .name("ur-control-poll".into())
         .spawn(move || {
             ready.wait();
+            // Starts true so an IOC that boots with the robot down raises
+            // the COMM alarm on its first cycle.
+            let mut was_healthy = true;
             loop {
                 let updates = {
                     let mut guard = inner.lock();
-                    poll_once(params, &mut guard, &receive)
+                    poll_once(params, &mut guard, &receive, &mut was_healthy)
                 };
                 let _ = handle.set_params_and_notify_blocking(0, updates);
                 std::thread::sleep(poll_period);
@@ -712,16 +729,23 @@ pub fn start_poller(
         .expect("failed to spawn the RTDE control poll thread")
 }
 
-/// One pass of the control poll loop.
+/// One pass of the control poll loop. `was_healthy` is the poll thread's
+/// health-edge memory for the COMM alarm on [`ControlParams::alarm_targets`].
 pub fn poll_once(
     p: ControlParams,
     inner: &mut ControlInner,
     receive: &ReceiveHandle,
+    was_healthy: &mut bool,
 ) -> Vec<ParamSetValue> {
     let mut updates = Vec::new();
 
     if !inner.connected() {
         updates.push(ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(0)));
+        updates.extend(crate::drivers::health_transition(
+            &p.alarm_targets(),
+            false,
+            was_healthy,
+        ));
         return updates;
     }
     // IS_CONNECTED reflects aliveness, not just the socket: a stale stream
@@ -736,6 +760,11 @@ pub fn poll_once(
         p.is_connected,
         0,
         ParamValue::Int32(i32::from(alive)),
+    ));
+    updates.extend(crate::drivers::health_transition(
+        &p.alarm_targets(),
+        alive,
+        was_healthy,
     ));
 
     let is_steady = if inner.custom_script.is_some() {
@@ -979,7 +1008,24 @@ mod tests {
         let p = params();
         let mut inner = ControlInner::default();
         let receive = ReceiveHandle::new();
-        let updates = poll_once(p, &mut inner, &receive);
+
+        // The first cycle to see the outage also raises the COMM alarm on
+        // the alarm targets (IS_STEADY).
+        let mut was_healthy = true;
+        let updates = poll_once(p, &mut inner, &receive, &mut was_healthy);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(int_update(&updates, p.is_connected), Some(0));
+        assert!(updates.iter().any(|u| matches!(
+            u,
+            ParamSetValue::Status {
+                reason,
+                status: epics_rs::asyn::error::AsynStatus::Disconnected,
+                ..
+            } if *reason == p.is_steady
+        )));
+
+        // A steady outage publishes IS_CONNECTED alone.
+        let updates = poll_once(p, &mut inner, &receive, &mut was_healthy);
         assert_eq!(updates.len(), 1);
         assert_eq!(int_update(&updates, p.is_connected), Some(0));
     }
@@ -1122,6 +1168,58 @@ mod tests {
             p.tcp_offset,
         ] {
             assert!(!p.is_command(reason));
+        }
+    }
+
+    /// Completeness of the alarm set: every parameter this driver creates is
+    /// a command, an alarm target, or one of the deliberate exclusions — a
+    /// parameter added without classification fails here instead of silently
+    /// staying NO_ALARM through an outage.
+    #[test]
+    fn alarm_set_is_every_device_readback() {
+        let mut base = PortDriverBase::new("ctrl_alarm_set", NUM_JOINTS, PortFlags::default());
+        let p = ControlParams::create(&mut base).expect("params create");
+
+        let targets = p.alarm_targets();
+        let excluded = [
+            // Health readback.
+            p.is_connected,
+            // Operator setpoints and modes.
+            p.joint_cmd,
+            p.pose_cmd,
+            p.tcp_offset,
+            p.joint_speed,
+            p.joint_acceleration,
+            p.joint_blend,
+            p.linear_speed,
+            p.linear_acceleration,
+            p.linear_blend,
+            p.teach_mode,
+            p.waypoint_move,
+            p.custom_script_file,
+            p.custom_inline_script,
+            p.custom_script_timeout,
+            p.jog_speed,
+            p.jog_acceleration,
+            // IOC-side state-machine outputs: valid through an outage.
+            p.async_move_done,
+            p.run_waypoint_action,
+            p.waypoint_action_done,
+            p.motion_done_count,
+            p.custom_script_running,
+            p.custom_script_error,
+            p.jogging,
+            // Unpublished upstream-parity params; no record binds them.
+            p.actual_q,
+            p.actual_tcp_pose,
+        ];
+        for reason in 0..base.params.len() {
+            let targeted = targets.iter().any(|(r, _)| *r == reason);
+            let exempt = excluded.contains(&reason) || p.is_command(reason);
+            assert!(
+                targeted != exempt,
+                "param {reason} must be exactly one of: alarm target, command/exclusion"
+            );
         }
     }
 }

@@ -101,6 +101,29 @@ impl DashboardParams {
             || reason == self.unlock_protective_stop
             || reason == self.restart_safety
     }
+
+    /// The poll-owned readbacks that carry the COMM alarm while the
+    /// dashboard link is down. Excluded beyond the commands: the octet
+    /// outputs (`LOAD_URP`/`POPUP` carry requests, not device state),
+    /// `IS_CONNECTED` (the health readback must stay valid at 0 — it is
+    /// the one PV that says why), and the three connect-time identity
+    /// strings (`POLYSCOPE_VERSION`/`SERIAL_NUMBER`/`ROBOT_MODEL`), which
+    /// do not go stale with the link. `alarm_set_is_every_poll_readback`
+    /// enforces that a new parameter lands in exactly one group.
+    fn alarm_targets(&self) -> Vec<(usize, i32)> {
+        [
+            self.is_running,
+            self.program_state,
+            self.robot_mode,
+            self.loaded_program,
+            self.safety_status,
+            self.is_program_saved,
+            self.is_in_remote_control,
+        ]
+        .into_iter()
+        .map(|r| (r, 0))
+        .collect()
+    }
 }
 
 /// The dashboard driver.
@@ -318,6 +341,10 @@ pub fn start_poller(
         .name("ur-dashboard-poll".into())
         .spawn(move || {
             ready.wait();
+            let alarm_targets = params.alarm_targets();
+            // Starts true so an IOC that boots with the dashboard down
+            // raises the COMM alarm on its first cycle.
+            let mut was_healthy = true;
             loop {
                 let mut updates = Vec::new();
                 let mut state = shared.get();
@@ -357,6 +384,11 @@ pub fn start_poller(
                     }
                 }
 
+                updates.extend(crate::drivers::health_transition(
+                    &alarm_targets,
+                    state.connected,
+                    &mut was_healthy,
+                ));
                 shared.set(state);
                 let _ = handle.set_params_and_notify_blocking(0, updates);
                 std::thread::sleep(poll_period);
@@ -438,6 +470,34 @@ mod tests {
             p.is_in_remote_control,
         ] {
             assert!(!p.is_command(reason));
+        }
+    }
+
+    /// Completeness of the alarm set: every parameter this driver creates is
+    /// a command, an alarm target, or one of the deliberate exclusions — a
+    /// parameter added without classification fails here instead of silently
+    /// staying NO_ALARM through an outage.
+    #[test]
+    fn alarm_set_is_every_poll_readback() {
+        let mut base = PortDriverBase::new("dash_alarm_set", 1, PortFlags::default());
+        let p = DashboardParams::create(&mut base).expect("params create");
+
+        let targets = p.alarm_targets();
+        let excluded = [
+            p.is_connected,
+            p.load_urp,
+            p.popup,
+            p.polyscope_version,
+            p.serial_number,
+            p.robot_model,
+        ];
+        for reason in 0..base.params.len() {
+            let targeted = targets.iter().any(|(r, _)| *r == reason);
+            let exempt = excluded.contains(&reason) || p.is_command(reason);
+            assert!(
+                targeted != exempt,
+                "param {reason} must be exactly one of: alarm target, command/exclusion"
+            );
         }
     }
 }

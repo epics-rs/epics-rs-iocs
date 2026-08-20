@@ -176,6 +176,61 @@ impl ReceiveParams {
     fn is_command(&self, reason: usize) -> bool {
         reason == self.disconnect || reason == self.reconnect
     }
+
+    /// Every readback `(reason, addr)` the poll thread publishes — the set
+    /// that carries the COMM alarm while the stream is down. Excluded: the
+    /// two link commands (nothing to alarm on a command), and
+    /// `IS_CONNECTED`, which is the health readback itself and must stay
+    /// valid at 0 while everything else goes COMM/INVALID — it is the one
+    /// PV that says why. `alarm_set_is_every_readback` enforces that a new
+    /// parameter lands in exactly one of the two groups.
+    fn alarm_targets(&self) -> Vec<(usize, i32)> {
+        let scalars = [
+            self.runtime_state,
+            self.robot_mode,
+            self.safety_status_bits,
+            self.controller_timestamp,
+            self.std_analog_input0,
+            self.std_analog_input1,
+            self.std_analog_output0,
+            self.std_analog_output1,
+            self.actual_joint_pos_arr,
+            self.actual_tcp_pose_arr,
+            self.digital_input_bits,
+            self.digital_output_bits,
+            self.actual_joint_velocities,
+            self.actual_joint_currents,
+            self.joint_control_currents,
+            self.actual_tcp_speed,
+            self.actual_tcp_force,
+            self.safety_mode,
+            self.joint_modes,
+            self.actual_tool_accel,
+            self.target_joint_positions,
+            self.target_joint_velocities,
+            self.target_joint_accelerations,
+            self.target_joint_currents,
+            self.target_joint_moments,
+            self.target_tcp_pose,
+            self.target_tcp_speed,
+            self.joint_temperatures,
+            self.speed_scaling,
+            self.target_speed_fraction,
+            self.actual_momentum,
+            self.actual_main_voltage,
+            self.actual_robot_voltage,
+            self.actual_robot_current,
+            self.actual_joint_voltages,
+            self.output_integer_reg12,
+        ];
+        let mut targets: Vec<(usize, i32)> = scalars.into_iter().map(|r| (r, 0)).collect();
+        // The per-joint scalars are published at every address.
+        for addr in 0..NUM_JOINTS as i32 {
+            targets.push((self.actual_joint_pos, addr));
+            targets.push((self.actual_tcp_pose, addr));
+        }
+        targets
+    }
 }
 
 /// The RTDE receive driver.
@@ -339,6 +394,11 @@ pub fn start_poller(
         .spawn(move || {
             ready.wait();
             let mut backoff = Backoff::new();
+            let alarm_targets = params.alarm_targets();
+            // Starts true so an IOC that boots with the robot down raises
+            // the COMM alarm on its first cycle instead of waiting for a
+            // connection that may never come.
+            let mut was_healthy = true;
             loop {
                 let healthy = {
                     let slot = iface.lock();
@@ -364,7 +424,7 @@ pub fn start_poller(
                         .map(|i| i.snapshot())
                 };
 
-                let updates = match &snapshot {
+                let mut updates = match &snapshot {
                     Some(snap) if !snap.is_empty() => {
                         let state = ReceiveState {
                             connected: true,
@@ -391,6 +451,17 @@ pub fn start_poller(
                     }
                 };
 
+                // Same predicate as the publish arm above, so the alarm
+                // rides the flush cycle that first sees the transition —
+                // recovery clears the alarm in the very batch that carries
+                // the fresh values.
+                let healthy_now = matches!(&snapshot, Some(s) if !s.is_empty());
+                updates.extend(crate::drivers::health_transition(
+                    &alarm_targets,
+                    healthy_now,
+                    &mut was_healthy,
+                ));
+
                 for (addr, batch) in by_addr(updates) {
                     let _ = handle.set_params_and_notify_blocking(addr, batch);
                 }
@@ -411,9 +482,7 @@ pub fn start_poller(
 fn by_addr(updates: Vec<ParamSetValue>) -> Vec<(i32, Vec<ParamSetValue>)> {
     let mut batches: Vec<(i32, Vec<ParamSetValue>)> = Vec::new();
     for u in updates {
-        let addr = match u {
-            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => addr,
-        };
+        let addr = u.addr();
         match batches.iter_mut().find(|(a, _)| *a == addr) {
             Some((_, batch)) => batch.push(u),
             None => batches.push((addr, vec![u])),
@@ -562,6 +631,7 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
 mod tests {
     use super::*;
     use crate::state::Value;
+    use epics_rs::asyn::error::AsynStatus;
     use std::collections::HashMap;
     use std::time::Instant;
 
@@ -760,9 +830,7 @@ mod tests {
     }
 
     fn addr_of(u: &ParamSetValue) -> i32 {
-        match u {
-            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => *addr,
-        }
+        u.addr()
     }
 
     #[test]
@@ -828,6 +896,75 @@ mod tests {
             driver.base.params.get_int32(params.disconnect, 0).ok(),
             Some(1)
         );
+    }
+
+    /// Completeness of the alarm set: every parameter this driver creates is
+    /// either an alarm target or one of the three deliberate exclusions
+    /// (the two link commands and the health readback). A parameter added to
+    /// `ReceiveParams` without classifying it here fails this test instead of
+    /// silently staying NO_ALARM through an outage.
+    #[test]
+    fn alarm_set_is_every_readback() {
+        let mut base = PortDriverBase::new("recv_alarm_set", NUM_JOINTS, PortFlags::default());
+        let p = ReceiveParams::create(&mut base).expect("params create");
+
+        let targets = p.alarm_targets();
+        let excluded = [p.disconnect, p.reconnect, p.is_connected];
+        for reason in 0..base.params.len() {
+            let targeted = targets.iter().any(|(r, _)| *r == reason);
+            let is_excluded = excluded.contains(&reason);
+            assert!(
+                targeted != is_excluded,
+                "param {reason} must be exactly one of: alarm target, exclusion"
+            );
+        }
+
+        // The per-joint scalars are covered at every address they publish to.
+        for per_addr in [p.actual_joint_pos, p.actual_tcp_pose] {
+            for addr in 0..NUM_JOINTS as i32 {
+                assert!(targets.contains(&(per_addr, addr)));
+            }
+        }
+    }
+
+    /// The alarm batch fires on the two health transitions and only there:
+    /// link lost raises Disconnected on every target (the record-side
+    /// fill-in maps it to COMM/INVALID), recovery clears to Success, and
+    /// both steady states stay silent.
+    #[test]
+    fn the_comm_alarm_rides_the_health_transitions_only() {
+        use crate::drivers::health_transition;
+        let p = params();
+        let targets = p.alarm_targets();
+        let mut was = true;
+
+        assert!(health_transition(&targets, true, &mut was).is_empty());
+
+        let raise = health_transition(&targets, false, &mut was);
+        assert_eq!(raise.len(), targets.len());
+        assert!(raise.iter().all(|u| matches!(
+            u,
+            ParamSetValue::Status {
+                status: AsynStatus::Disconnected,
+                alarm_status: 0,
+                alarm_severity: 0,
+                ..
+            }
+        )));
+        assert!(!was, "the edge is consumed");
+
+        assert!(health_transition(&targets, false, &mut was).is_empty());
+
+        let clear = health_transition(&targets, true, &mut was);
+        assert_eq!(clear.len(), targets.len());
+        assert!(clear.iter().all(|u| matches!(
+            u,
+            ParamSetValue::Status {
+                status: AsynStatus::Success,
+                ..
+            }
+        )));
+        assert!(was);
     }
 
     #[test]

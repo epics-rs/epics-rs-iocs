@@ -93,6 +93,34 @@ impl GripperParams {
             || reason == self.set_position_range
             || reason == self.auto_calibrate
     }
+
+    /// The device-state readbacks that carry the COMM alarm while the
+    /// gripper link is down. Excluded beyond the commands: `IS_CONNECTED`
+    /// (the health readback must stay valid at 0 — it is the one PV that
+    /// says why) and the five operator settings
+    /// (`SET_SPEED`/`SET_FORCE`/`MIN_POSITION`/`MAX_POSITION`/
+    /// `POSITION_UNIT`), which hold setpoints, not device state.
+    /// `IS_CALIBRATED` is a target although the write path publishes it:
+    /// it is device state and goes stale with the link like the rest.
+    /// `alarm_set_is_every_device_readback` enforces that a new parameter
+    /// lands in exactly one group.
+    fn alarm_targets(&self) -> Vec<(usize, i32)> {
+        [
+            self.is_open,
+            self.is_closed,
+            self.is_stopped_inner,
+            self.is_stopped_outer,
+            self.is_active,
+            self.open_position,
+            self.closed_position,
+            self.current_position,
+            self.move_status,
+            self.is_calibrated,
+        ]
+        .into_iter()
+        .map(|r| (r, 0))
+        .collect()
+    }
 }
 
 /// The four `POSITION_UNIT` mbbo choices (gripper_driver.cpp:359-380).
@@ -337,31 +365,46 @@ pub fn start_poller(
         .name("ur-gripper-poll".into())
         .spawn(move || {
             ready.wait();
+            let alarm_targets = params.alarm_targets();
+            // Starts true so an IOC that boots with the gripper down raises
+            // the COMM alarm on its first cycle.
+            let mut was_healthy = true;
             loop {
-                let updates = {
+                let (mut updates, healthy_now) = {
                     let mut g = gripper.lock();
                     if dashboard.get().robot_on() && g.is_connected() {
                         match poll_once(params, &mut g) {
-                            Ok(updates) => updates,
+                            Ok(updates) => (updates, true),
                             Err(e) => {
                                 log::error!("ur-robot: gripper poll error: {e}");
                                 g.disconnect();
-                                vec![ParamSetValue::new(
-                                    params.is_connected,
-                                    0,
-                                    ParamValue::Int32(0),
-                                )]
+                                (
+                                    vec![ParamSetValue::new(
+                                        params.is_connected,
+                                        0,
+                                        ParamValue::Int32(0),
+                                    )],
+                                    false,
+                                )
                             }
                         }
                     } else {
                         g.disconnect();
-                        vec![ParamSetValue::new(
-                            params.is_connected,
-                            0,
-                            ParamValue::Int32(0),
-                        )]
+                        (
+                            vec![ParamSetValue::new(
+                                params.is_connected,
+                                0,
+                                ParamValue::Int32(0),
+                            )],
+                            false,
+                        )
                     }
                 };
+                updates.extend(crate::drivers::health_transition(
+                    &alarm_targets,
+                    healthy_now,
+                    &mut was_healthy,
+                ));
                 let _ = handle.set_params_and_notify_blocking(0, updates);
                 std::thread::sleep(poll_period);
             }
@@ -444,6 +487,34 @@ mod tests {
             p.set_force,
         ] {
             assert!(!p.is_command(reason));
+        }
+    }
+
+    /// Completeness of the alarm set: every parameter this driver creates is
+    /// a command, an alarm target, or one of the deliberate exclusions — a
+    /// parameter added without classification fails here instead of silently
+    /// staying NO_ALARM through an outage.
+    #[test]
+    fn alarm_set_is_every_device_readback() {
+        let mut base = PortDriverBase::new("grip_alarm_set", 1, PortFlags::default());
+        let p = GripperParams::create(&mut base).expect("params create");
+
+        let targets = p.alarm_targets();
+        let excluded = [
+            p.is_connected,
+            p.set_speed,
+            p.set_force,
+            p.min_position,
+            p.max_position,
+            p.position_unit,
+        ];
+        for reason in 0..base.params.len() {
+            let targeted = targets.iter().any(|(r, _)| *r == reason);
+            let exempt = excluded.contains(&reason) || p.is_command(reason);
+            assert!(
+                targeted != exempt,
+                "param {reason} must be exactly one of: alarm target, command/exclusion"
+            );
         }
     }
 
