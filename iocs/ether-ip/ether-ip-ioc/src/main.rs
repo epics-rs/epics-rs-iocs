@@ -36,6 +36,8 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
+    epics_rs::base::runtime::env::set_default("ETHERIP", env!("CARGO_MANIFEST_DIR"));
+
     let mut app = IocApplication::new();
 
     // One dynamic factory covers every record type: the DTYP is always

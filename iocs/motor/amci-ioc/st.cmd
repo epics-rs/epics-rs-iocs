@@ -31,8 +31,8 @@ ANF2CreateController("$(ANF2)", "$(ANF2)_In", "$(ANF2)_Out", 2)
 ANF2CreateAxis("$(ANF2)", 0, "0x86280000", 100, 0, 100, 1000)
 ANF2CreateAxis("$(ANF2)", 1, "0x86000000", 100, 0, 100, 1000)
 
-dbLoadRecords("db/anf2.template", "P=$(P),M=anf2:1,N=0,PORT=$(ANF2)")
-dbLoadRecords("db/anf2.template", "P=$(P),M=anf2:2,N=1,PORT=$(ANF2)")
+dbLoadRecords("$(AMCI_IOC)/db/anf2.template", "P=$(P),M=anf2:1,N=0,PORT=$(ANF2)")
+dbLoadRecords("$(AMCI_IOC)/db/anf2.template", "P=$(P),M=anf2:2,N=1,PORT=$(ANF2)")
 
 # ------------------------------------------------------------------
 # ANG1 controller: one asyn IP port, a Modbus link, and two Modbus
@@ -48,7 +48,7 @@ drvModbusAsynConfigure("$(ANG1)_Out", "$(ANG1)_IP", 0, 6, 1024, 10, "INT16", 0, 
 # ANG1CreateController(portName, inPort, outPort, numAxes, [movingPollMs], [idlePollMs])
 ANG1CreateController("$(ANG1)", "$(ANG1)_In", "$(ANG1)_Out", 1, 100, 0)
 
-dbLoadRecords("db/ang1.template", "P=$(P),M=ang1:1,N=0,PORT=$(ANG1)")
+dbLoadRecords("$(AMCI_IOC)/db/ang1.template", "P=$(P),M=ang1:1,N=0,PORT=$(ANG1)")
 
 iocInit()
 

@@ -30,19 +30,19 @@ mw100Init("$(HANDLE)", "192.168.1.100")
 # Per-instrument system records: module presence/model/code/speed/number,
 # error/alarm summary, the four 1-second poll triggers, settings/measurement/
 # compute mode.
-dbLoadRecords("db/mw100_system.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE)")
+dbLoadRecords("$(MW100)/db/mw100_system.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE)")
 
 # One record set per configured Signal channel, per-model template matching
 # the channel's actual installed module type.
-dbLoadRecords("db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=1")
-dbLoadRecords("db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=2")
-dbLoadRecords("db/mw100_mx114_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=7")
-dbLoadRecords("db/mw100_mx115_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=8")
-dbLoadRecords("db/mw100_mx120_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=9")
-dbLoadRecords("db/mw100_mx125_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=10")
-dbLoadRecords("db/mw100_calculation_channel.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=A1")
-dbLoadRecords("db/mw100_communication_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=C1")
-dbLoadRecords("db/mw100_constant_channel.template",      "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=K1")
+dbLoadRecords("$(MW100)/db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=1")
+dbLoadRecords("$(MW100)/db/mw100_mx110_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=2")
+dbLoadRecords("$(MW100)/db/mw100_mx114_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=7")
+dbLoadRecords("$(MW100)/db/mw100_mx115_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=8")
+dbLoadRecords("$(MW100)/db/mw100_mx120_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=9")
+dbLoadRecords("$(MW100)/db/mw100_mx125_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=10")
+dbLoadRecords("$(MW100)/db/mw100_calculation_channel.template",   "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=A1")
+dbLoadRecords("$(MW100)/db/mw100_communication_channel.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=C1")
+dbLoadRecords("$(MW100)/db/mw100_constant_channel.template",      "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE),ADDRESS=K1")
 
 iocInit()
 

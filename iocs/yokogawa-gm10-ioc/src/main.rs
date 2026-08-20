@@ -32,6 +32,8 @@ async fn main() -> CaResult<()> {
 
     let registry = Arc::new(Registry::new());
 
+    epics_rs::base::runtime::env::set_default("GM10", env!("CARGO_MANIFEST_DIR"));
+
     let mut app = IocApplication::new();
     app = app.register_dynamic_device_support(device_support::factory(registry.clone()));
 

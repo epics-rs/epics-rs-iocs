@@ -8,7 +8,7 @@ IOC applications — Rust ports of the EPICS device-driver modules. Each
 device driver is an independent library crate under `drivers/`, and each
 IOC binary lives under `iocs/`. The workspace currently holds **67 driver
 crates** and **82 IOC crates**, all consuming a single pinned epics-rs
-version (**0.26.1**) declared once in the root `Cargo.toml`.
+version (**0.26.2**) declared once in the root `Cargo.toml`.
 
 > **Platform**: Linux is the primary, fully-supported target — every
 > crate builds and is tested there. CI additionally builds and tests the
@@ -44,7 +44,7 @@ same layout under `iocs/`.
 
 ```
 epics-rs-iocs/
-├── Cargo.toml                  # Workspace root — pins epics-rs 0.26.1 for all crates
+├── Cargo.toml                  # Workspace root — pins epics-rs 0.26.2 for all crates
 ├── drivers/
 │   ├── motor/                  # 27 motor-controller drivers + shared `common` crate
 │   │                           #   acs, acsmotion, acstech80, aerotech, amci, attocube,
@@ -82,15 +82,22 @@ epics-rs-iocs/
 │   ├── yokogawa-gm10/          # Yokogawa GM10 data acquisition
 │   └── yokogawa-mw100/         # Yokogawa MW100 data acquisition
 ├── iocs/                       # One IOC binary crate per device (+ st.cmd, db/, display/)
-├── db/                         # Shared EPICS templates (measComp, d435i)
 └── display/                    # Shared PyDM displays
 ```
+
+Every IOC owns its EPICS templates: they live in the IOC crate's `db/`
+(or the family's shared `db/`, e.g. `iocs/quadem/db`) and st.cmd loads
+them as `$(MACRO)/db/<file>`, where main.rs defaults the macro to the
+owning directory (`set_default("<MACRO>", env!("CARGO_MANIFEST_DIR"))`),
+so an IOC boots from any cwd. Library-shipped templates load the same
+way through the crate-exported macros (`$(ADCORE)/db`, `$(SCALER)/db`).
 
 ### Adding a New Device
 
 1. Create `drivers/<device>/` with a library crate (driver logic only, no IOC deps)
 2. Create `iocs/<device>-ioc/` with a binary crate that depends on the driver
-3. Add both to the workspace `members` in the root `Cargo.toml`
+3. Put its templates in `iocs/<device>-ioc/db/` and load them via `$(MACRO)/db/...`
+4. Add both crates to the workspace `members` in the root `Cargo.toml`
 
 ### Vendor SDKs and workspace-wide checks
 
@@ -134,7 +141,7 @@ at `$(P)$(M)` (or an axis-letter macro variant such as `$(P)$(MX)`, `$(P)$(MU)`,
 multi-axis controllers) — confirmed by grepping `record(` across all 54 `db/*.template` files in
 `iocs/motor/*/db/`: every single one is `record(motor, ...)`, with no other record type anywhere
 in the MOTOR family. Field definitions below are taken directly from the vendored
-`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.26.1/dbd/motorRecord.dbd`, mirrored at
+`motorRecord.dbd` (`~/.cargo/registry/.../motor-rs-0.26.2/dbd/motorRecord.dbd`, mirrored at
 `crates/motor-rs/dbd/motorRecord.dbd` in `epics-rs`):
 
 | Field | Type | Purpose |
@@ -223,7 +230,7 @@ has no `motor-common` dependency line, while all other 26 vendor `Cargo.toml` fi
 
 Rust port of `BISDetector.cpp` from [epics-modules/ADBruker](https://github.com/epics-modules/ADBruker). BIS is a server, not a detector: the driver sends bracketed ASCII commands over one TCP socket (`BIS_COMMAND`), listens to BIS's broadcast status on a second socket (`BIS_STATUS`), and reads acquired frames as SFRM files off a shared filesystem. `drivers/ad/bruker/src/`: `connection.rs` (BIS sockets), `protocol.rs` (command framing), `sfrm.rs` (SFRM file decode), `filename.rs`, `task.rs`, `driver.rs`.
 
-Records (`db/BIS.template`, includes `ADBase.template` + `NDFile.template`):
+Records (`iocs/ad/bruker-ioc/db/BIS.template`, includes `ADBase.template` + `NDFile.template`):
 - `ReadSFRMTimeout` (ao) — timeout waiting for the SFRM file beyond the exposure time
 - `BISStatus` (waveform, I/O Intr) — last status line BIS broadcast
 - `NumDarks` / `NumDarks_RBV` — number of dark frames
@@ -242,8 +249,8 @@ Deviation: the C driver's `mar345`-style "file" port on 49154 (never actually us
 Rust port of [epics-modules/ADCSimDetector](https://github.com/epics-modules/ADCSimDetector) (driver version 2.5.0). Not a real detector — it synthesizes one 2-D NDArray (`[MAX_SIGNALS, numTimePoints]`) per frame plus eight 1-D per-signal waveforms (sine, cosine, square, sawtooth, noise, sums), and derives `asynNDArrayDriver` rather than `ADDriver`. `drivers/ad/csimdetector/src/`: `signals.rs` (the eight pure waveform generators, unit-tested against the C expressions), `rng.rs`, `driver.rs`, `task.rs`.
 
 Records:
-- `db/ADCSimDetector.template` (includes `NDArrayBase.template`, once per detector): `TimeStep`/`_RBV`, `NumTimePoints`/`_RBV`, `AcquireTime`/`_RBV`, `ElapsedTime`
-- `db/ADCSimDetectorN.template` (loaded 8×, ADDR=0..7, one per signal): `Name`, `Amplitude`, `Offset`, `Period`, `Frequency`, `Phase`, `Noise`
+- `iocs/ad/csimdetector-ioc/db/ADCSimDetector.template` (includes `NDArrayBase.template`, once per detector): `TimeStep`/`_RBV`, `NumTimePoints`/`_RBV`, `AcquireTime`/`_RBV`, `ElapsedTime`
+- `iocs/ad/csimdetector-ioc/db/ADCSimDetectorN.template` (loaded 8×, ADDR=0..7, one per signal): `Name`, `Amplitude`, `Offset`, `Period`, `Frequency`, `Phase`, `Noise`
 
 Build/run: `cargo run -p ad-csimdetector-ioc --release -- iocs/ad/csimdetector-ioc/st.cmd`
 
@@ -255,7 +262,7 @@ Deviation (documented in st.cmd): upstream configures `dataType=7` meaning `NDFl
 
 Rust port of [epics-modules/ADEiger](https://github.com/epics-modules/ADEiger) (`eigerApp/src/{eigerDetector,restApi,eigerParam,streamApi}.cpp`). Drives Dectris Eiger detectors over the SIMPLON REST API (HTTP) for control plus a ZeroMQ stream for images. `drivers/ad/eiger/src/`: `rest.rs` (SIMPLON REST client via `ureq`), `stream.rs` (ZeroMQ via the `zeromq` crate), `bslz4.rs` + `h5.rs` (bslz4-compressed HDF5 stream decode, replacing `libhdf5`), `tiff.rs`, `param.rs`/`params.rs`, `tasks.rs`.
 
-Records — `db/eiger2.template` includes the driver's own `eigerBase.template` (1253 lines; the Eiger analog of `ADBase.template`, itself full of driver-specific SIMPLON parameters: `PhotonEnergy`, `ThresholdEnergy`, `BeamX`/`BeamY`, `DetDist`, filewriter `FWNamePattern`/`FWNImagesPerFile`/`FWState_RBV`, `MonitorState_RBV`, goniometer `Omega`/`Phi`/`Chi`/`Kappa` + increments, `Armed`, `Initialize`, `Error_RBV`, `CountCutoff_RBV`, `DeadTime_RBV`). `eiger2.template` itself adds the Eiger2-specific layer:
+Records — `iocs/ad/eiger-ioc/db/eiger2.template` includes the driver's own `eigerBase.template` (1253 lines; the Eiger analog of `ADBase.template`, itself full of driver-specific SIMPLON parameters: `PhotonEnergy`, `ThresholdEnergy`, `BeamX`/`BeamY`, `DetDist`, filewriter `FWNamePattern`/`FWNImagesPerFile`/`FWState_RBV`, `MonitorState_RBV`, goniometer `Omega`/`Phi`/`Chi`/`Kappa` + increments, `Armed`, `Initialize`, `Error_RBV`, `CountCutoff_RBV`, `DeadTime_RBV`). `eiger2.template` itself adds the Eiger2-specific layer:
 - `HVResetTime`/`_RBV`, `HVReset`, `HVState_RBV` — high-voltage control
 - `CountingMode`/`_RBV` — Normal/Retrigger
 - `Threshold1Enable`, `Threshold2Energy`, `Threshold2Enable`, `ThresholdDiffEnable` (+ `_RBV`s)
@@ -285,7 +292,7 @@ Records (`iocs/ad/mar345-ioc/db/mar345.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p mar345-ioc --release -- iocs/ad/mar345-ioc/st.cmd`
 
-Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.26.1) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
+Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.26.2) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
 
 ---
 
@@ -313,7 +320,7 @@ Deviation: the upstream template's duplicate `MarState_RBV` definition was dropp
 
 Port of `areaDetector/ADMerlin/merlinApp/src` ([epics-modules/ADMerlin](https://github.com/epics-modules/ADMerlin)). A Labview server speaks the MPX protocol over two separate TCP asyn octet ports (created by `drvAsynIPPortConfigure` in st.cmd): a request/response command channel (`$(PORT)cmd`, LF-terminated) and a push-only binary data channel (`$(PORT)data`, no EOS — MPX frames are length-delimited). `drivers/ad/merlin/src/`: `protocol.rs` (MPX framing/codec, pure + unit-tested), `image.rs` (pixel decode + Y flip), `connection.rs`.
 
-Records (`db/merlin.template`, includes only `ADBase.template` — no file plugin):
+Records (`iocs/ad/merlin-ioc/db/merlin.template`, includes only `ADBase.template` — no file plugin):
 - `TriggerMode`/`_RBV` — Internal/Trigger Enable/Trigger start rising/falling/Trigger both rising/Software
 - `ImageMode`/`_RBV` extended with Threshold and Background
 - `LabviewAsynCmd`, `LabviewAsynData` (asyn records for the two sockets)
@@ -338,7 +345,7 @@ Deviation: the shared workspace `merlin.template` drops `FileFormat`/`FileFormat
 
 Rust port of `ADMythen/mythenApp/src/mythen.cpp` ([epics-modules/ADMythen](https://github.com/epics-modules/ADMythen)). Driven over an asyn octet IP port using the M1K ASCII/binary command set; the socket itself belongs to asyn exactly as in C (`drvAsynIPPortConfigure` + CR output EOS, `noProcessEos=1` since detector replies are binary with no line-oriented input EOS). `drivers/ad/mythen/src/`: `detector.rs`, `protocol.rs`, `transport.rs`, `task.rs`.
 
-Records (`drivers/ad/mythen/db/mythen.template`, includes only `ADBase.template`):
+Records (`iocs/ad/mythen-ioc/db/mythen.template`, includes only `ADBase.template`):
 - `Setting`/`_RBV` — Cu/Mo/Ag/Cr
 - `DelayTime`/`_RBV` — delay after trigger
 - `ThresholdEnergy`/`_RBV`, `BeamEnergy`/`_RBV`
@@ -358,7 +365,7 @@ Build/run: `cargo run -p mythen-ioc --release -- iocs/ad/mythen-ioc/st.cmd`
 
 Port of `areaDetector/ADPhotonII` (`PhotonIIApp/src/PhotonII.cpp`, [epics-modules/ADPhotonII](https://github.com/epics-modules/ADPhotonII)). Driven by Bruker's `p2util` program reached over a TCP socket (a procServ port, CRLF input EOS / LF output EOS): the driver sends command lines (`set --exposure-time 1.0`, `grab --dstdir ... --count 5`, `abort`) and `p2util` answers each and, during acquisition, announces every frame it writes by naming the `.raw` file, which the driver then reads off the filesystem. `drivers/ad/photonii/src/`: `protocol.rs` (command language + frame-message parse, pure functions), `raw.rs` (`.raw` readiness test + decode), `connection.rs`, `task.rs`.
 
-Records (`db/photonII.template`, includes `ADBase.template` + `NDFile.template`):
+Records (`iocs/ad/photonii-ioc/db/photonII.template`, includes `ADBase.template` + `NDFile.template`):
 - `FileFormat` redefined to `Raw`/`Invalid`
 - `FrameType`/`_RBV` — Normal/Dark/ADC0
 - `NumDarks`/`_RBV` — frame count when FrameType is Dark or ADC0
@@ -408,7 +415,7 @@ reply on the data path).
   template's own header comment). No explicit upstream GitHub URL found in
   source, so no link is given here.
 - **Build/run:** `cargo run -p pixirad-ioc --release -- iocs/ad/pixirad-ioc/st.cmd`
-- **Records** (`db/pixirad.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
+- **Records** (`iocs/ad/pixirad-ioc/db/pixirad.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
   - `Threshold1`..`Threshold4` / `_RBV`, `ThresholdActual1`..`4_RBV`,
     `HitThreshold`/`_RBV`, `HitThresholdActual_RBV` — per-colour energy
     discriminator thresholds (keV) and what the hardware actually applied.
@@ -439,7 +446,7 @@ own PSLViewer program (a `Command;argument` TCP protocol); the driver polls
 - **Ports from:** `ADPSL` (`pslApp/Db/PSL.template`, `pslApp/src/PSL.cpp`).
   No explicit upstream GitHub URL found in source.
 - **Build/run:** `cargo run -p psl-ioc --release -- iocs/ad/psl-ioc/st.cmd`
-- **Records** (`db/PSL.template`, macros `P,R,PORT,ADDR,TIMEOUT,PSL_SERVER_PORT`):
+- **Records** (`iocs/ad/psl-ioc/db/PSL.template`, macros `P,R,PORT,ADDR,TIMEOUT,PSL_SERVER_PORT`):
   - `CameraName`/`_RBV` (mbbo/mbbi) — the choice set is populated at runtime
     from PSLViewer, so `ZRST`/`ONST`/... are deliberately left empty.
   - `TIFFComment`/`_RBV` (waveform, `CHAR[256]`) — comment string embedded in
@@ -461,7 +468,7 @@ hardware.
   decode logic mirrors ADCore's `NTNDArrayConverter`/`ntndArrayConverter.cpp`).
   https://github.com/areaDetector/pvaDriver
 - **Build/run:** `cargo run -p pva-driver-ioc --release -- iocs/ad/pva-driver-ioc/st.cmd`
-- **Records** (`db/pva.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
+- **Records** (`iocs/ad/pva-driver-ioc/db/pva.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
   - `PvName`/`_RBV` (waveform, `CHAR[256]`) — name of the upstream NTNDArray
     PV to monitor (`PINI=YES`).
   - `PvConnection_RBV` (bi, Up/Down) — channel connection state.
@@ -480,7 +487,7 @@ ramp, peaks, sine, offset+noise) with no real hardware.
   (`simDetectorApp/src/simDetector.cpp`, followed line-for-line; see the
   driver crate's `image.rs` for the four pattern generators).
 - **Build/run:** `cargo run -p ad-simdetector-ioc --release -- iocs/ad/simdetector-ioc/st.cmd`
-- **Records** (`db/simDetector.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
+- **Records** (`iocs/ad/simdetector-ioc/db/simDetector.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
   - `GainX`/`_RBV`, `GainY`/`_RBV`, `GainRed`/`_RBV`, `GainGreen`/`_RBV`,
     `GainBlue`/`_RBV`, `Offset`/`_RBV`, `Noise`/`_RBV` — per-axis/per-channel
     gain and the offset+noise mode parameters.
@@ -505,7 +512,7 @@ than camera frames.
   (`specsAnalyserApp/src/specsAnalyser.cpp`), per the driver crate's
   `Cargo.toml` header comment. https://github.com/epics-modules/specsAnalyser
 - **Build/run:** `cargo run -p specs-analyser-ioc --release -- iocs/ad/specs-analyser-ioc/st.cmd`
-- **Records** (`db/specsAnalyser.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
+- **Records** (`iocs/ad/specs-analyser-ioc/db/specsAnalyser.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
   - Acquisition control/status: `CONNECT`, `CONNECTED_RBV`, `COUNTER_RBV`,
     `SAFE_STATE`/`_RBV`, `PAUSE`/`_RBV`, `DEFINE_SPECTRUM`,
     `VALIDATE_SPECTRUM`, `SERVER_NAME_RBV`, `PROTOCOL_VERSION_RBV`.
@@ -535,7 +542,7 @@ into an areaDetector plugin chain. No acquisition thread.
 - **Ports from:** `NDDriverStdArrays`, driver version 1.3.0 —
   https://github.com/areaDetector/NDDriverStdArrays
 - **Build/run:** `cargo run -p ad-std-arrays-driver-ioc --release -- iocs/ad/std-arrays-driver-ioc/st.cmd`
-- **Records** (`db/NDDriverStdArrays.template`, macros
+- **Records** (`iocs/ad/std-arrays-driver-ioc/db/NDDriverStdArrays.template`, macros
   `P,R,PORT,ADDR,TIMEOUT,NELEMENTS,TYPE,FTVL`):
   - `CallbackMode`/`_RBV` (mbbo/mbbi: On update/On complete/On command).
   - `DoCallbacksScan` (bo, `SDIS`-gated on `Acquire`) / `DoCallbacks` (bo) —
@@ -563,7 +570,7 @@ records, plus per-chip (0-7) and per-power-rail (0-5) record replication via
   `histogram_io.cpp`, `mask_io.cpp`, `acquire.cpp`, `network_client.cpp`,
   `img_accumulation.cpp`).
 - **Build/run:** `cargo run -p timepix3-ioc --release -- iocs/ad/timepix3-ioc/st.cmd`
-- **Records** — grouped by template (all under `drivers/ad/timepix3/db/`,
+- **Records** — grouped by template (all under `iocs/ad/timepix3-ioc/db/`,
   macros `P,R,PORT,ADDR,TIMEOUT` unless noted; full field lists are large
   enough that this is a categorized sample, not exhaustive — see the
   templates for the complete set):
@@ -619,7 +626,7 @@ upstream's GraphicsMagick.
   header cites `areaDetector ADURL iocs/urlIOC/iocBoot/iocURLDriver/`).
   https://github.com/areaDetector/ADURL
 - **Build/run:** `cargo run -p url-ioc --release -- iocs/ad/url-ioc/st.cmd`
-- **Records** (`db/url.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
+- **Records** (`iocs/ad/url-ioc/db/url.template`, macros `P,R,PORT,ADDR,TIMEOUT`):
   - `URL1`..`URL10` (waveform, `CHAR[256]`, `asynOctetWrite`) — 10 selectable
     source URLs/paths, all bound to the same `URL_NAME` asyn parameter.
   - `URLSelect` (mbbo, `URL1`..`URL10`) — chooses which `URLn` record's
@@ -705,7 +712,7 @@ Ports from [`epics-modules/mca`](https://github.com/epics-modules/mca):
 - `drivers/mca-rontec` — Rontec detector driver, ported from `mcaApp/RontecSrc/drvMcaRontec.c`.
 - `drivers/mca-amptek` — Amptek DP5/PX5/DP5G/MCA8000D/TB5/DP5-X driver, ported from `mcaApp/AmptekSrc/drvAmptek.cpp`. USB (`DppLibUsb.cpp`) is feasibility-gated out (no USB crate in the workspace); serial is unported because it's an empty no-op in the upstream C driver too.
 
-The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.26.1"` — pinned because "no `epics-rs` \"mca\" feature exists yet"). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
+The actual `mcaRecord` type (channel array, ROIs, presets, elapsed-time fields, `.S1`-`.S16`-style equivalents) is not defined in this repo — it comes from the standalone `mca-rs` crate (workspace dependency, `mca-rs = "0.26.2"` — pinned because "no `epics-rs` \"mca\" feature exists yet"). `drivers/mca`'s own `mcaSum.c` (ROI summing) equivalent lives in `mca_rs::record::roi::sum_rois`, called from `McaRecord::process()`.
 
 #### Shared MCA record set
 
@@ -742,7 +749,7 @@ Ports from [`epics-modules/scaler`](https://github.com/epics-modules/scaler) —
 
 #### scaler974 records
 
-Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at `epics_rs::scaler::SCALER_DB_DIR` (the `scaler-rs` crate's own bundled `db/`, re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.26.1` per `Cargo.lock`) and loads `$(SCALER)/scaler.db`. That file instantiates one real `scalerRecord`:
+Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at the `scaler-rs` crate dir (its bundled `db/` is re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.26.2` per `Cargo.lock`) and loads `$(SCALER)/db/scaler.db`. That file instantiates one real `scalerRecord`:
 
 ```
 grecord(scaler,"$(P)$(S)") {
@@ -756,7 +763,7 @@ grecord(scaler,"$(P)$(S)") {
 ```
 plus 14 chained `bo`/`calc`/`transform` helper records (`_calcEnable`, `_calc_ctrl` (2 `bo`), `_calc1`-`_calc8` (8 `calc`), `_cts1`-`_cts4` (4 `transform`)) that derive count-rates from the record's own `.S1`-`.S16` (16-channel counts) and `.T` (elapsed-time preset) fields — confirming a 16-channel `scalerRecord`, consistent with `scaler-rs`'s sibling `scaler16.db`/`scaler32.db`/`scaler16m.db` files also present in that crate's `db/` (not loaded by this IOC).
 
-`iocs/scaler974-ioc/st.cmd` configures a serial port (`drvAsynSerialPortConfigure`, 9600/8/N/1, EOS `\r\n`/`\r` — not set by `drvScaler974` itself, per `connect.rs`'s doc, so this is the IOC's own choice pending the Ortec 974 manual), then `initScaler974("SCL1","S0",0,100)` (100 ms poll), then `dbLoadRecords("$(SCALER)/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")` followed by a `dbpf(...DTYP,"Asyn Scaler")` — DTYP is set via `dbpf` rather than a `dbLoadRecords` macro because macro-based `DTYP=` would force-overwrite every record's DTYP field in `scaler.db`, corrupting the `_calcEnable`/`_calc_ctrl` helper records' `"Soft Channel"` DTYP.
+`iocs/scaler974-ioc/st.cmd` configures a serial port (`drvAsynSerialPortConfigure`, 9600/8/N/1, EOS `\r\n`/`\r` — not set by `drvScaler974` itself, per `connect.rs`'s doc, so this is the IOC's own choice pending the Ortec 974 manual), then `initScaler974("SCL1","S0",0,100)` (100 ms poll), then `dbLoadRecords("$(SCALER)/db/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")` followed by a `dbpf(...DTYP,"Asyn Scaler")` — DTYP is set via `dbpf` rather than a `dbLoadRecords` macro because macro-based `DTYP=` would force-overwrite every record's DTYP field in `scaler.db`, corrupting the `_calcEnable`/`_calc_ctrl` helper records' `"Soft Channel"` DTYP.
 
 Build/run:
 ```
@@ -801,7 +808,7 @@ Two separate IOC binaries wire these up:
 | `digitel-ioc` | `cargo run -p digitel-ioc --release -- iocs/vac/digitel-ioc/st.cmd` | Digitel 500/1500, MPC, QPC |
 | `vacsen-ioc` | `cargo run -p vacsen-ioc --release -- iocs/vac/vacsen-ioc/st.cmd` | GP307, GP350, MM200, MX200, CC10 |
 
-Each IOC loads exactly one record instance of its custom type (`drivers/vac/db/digitelPump.db`, `drivers/vac/db/vs.db`). All device data lives as
+Each IOC loads exactly one record instance of its custom type (`iocs/vac/db/digitelPump.db`, `iocs/vac/db/vs.db`). All device data lives as
 *fields* of that one record, not as separate PVs:
 
 **`digitel` record** (`drivers/vac/src/records/digitel.rs`, DTYP `asyn DigitelPump`) — representative fields:
@@ -1165,10 +1172,10 @@ cargo build -p usb-ctr-ioc --release
 Connect a USB-CTR08 to a USB port, then:
 
 ```bash
-cargo run -p usb-ctr-ioc --release -- iocs/usb-ctr-ioc/st.cmd
+cargo run -p usb-ctr-ioc --release -- iocs/meascomp/usb-ctr-ioc/st.cmd
 ```
 
-Edit `iocs/usb-ctr-ioc/st.cmd` to set your device serial number:
+Edit `iocs/meascomp/usb-ctr-ioc/st.cmd` to set your device serial number:
 
 ```
 epicsEnvSet("UNIQUE_ID", "0214D582")
@@ -1230,10 +1237,10 @@ cargo build -p usb-2408-ioc --release
 ## Run
 
 ```bash
-cargo run -p usb-2408-ioc --release -- iocs/usb-2408-ioc/st.cmd
+cargo run -p usb-2408-ioc --release -- iocs/meascomp/usb-2408-ioc/st.cmd
 ```
 
-Edit `iocs/usb-2408-ioc/st.cmd` to set your device serial number:
+Edit `iocs/meascomp/usb-2408-ioc/st.cmd` to set your device serial number:
 
 ```
 epicsEnvSet("UNIQUE_ID", "01AAA83E")
@@ -1270,7 +1277,7 @@ caput USB2408:WaveDigRun 1
 
 # D435i RealSense areaDetector IOC
 
-An epics-rs 0.26.1 based areaDetector IOC for the Intel RealSense D435i
+An epics-rs 0.26.2 based areaDetector IOC for the Intel RealSense D435i
 camera. A single pipeline produces three NDArray outputs simultaneously
 (Color RGB8, Depth Z16, optional XYZ Pointcloud) and publishes IMU data
 as PVs.

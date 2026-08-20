@@ -30,18 +30,17 @@ epicsEnvSet("FTVL", "FLOAT")
 epicsEnvSet("TYPE", "Float32")
 
 # $(NDDRIVERSTDARRAYS) is set to this crate's root by ioc_support at IOC
-# startup. The shared workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(NDDRIVERSTDARRAYS)/../../../db:$(ADCORE)/db")
+# startup. The templates live in its db/ subdir.
 
 # Create an NDDriverStdArrays driver
 # NDDriverStdArraysConfig(portName, maxBuffers, maxMemory, priority, stackSize)
 NDDriverStdArraysConfig("$(PORT)", $(QSIZE), 0, 0)
 
-dbLoadRecords("NDDriverStdArrays.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,NELEMENTS=$(NELEMENTS),TYPE=$(TYPE),FTVL=$(FTVL)")
+dbLoadRecords("$(NDDRIVERSTDARRAYS)/db/NDDriverStdArrays.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,NELEMENTS=$(NELEMENTS),TYPE=$(TYPE),FTVL=$(FTVL)")
 
 # Standard arrays plugin, fed from the driver's array (addr 0).
 NDStdArraysConfigure("Image1", 3, 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=12000000")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=12000000")
 
 # Remaining plugin chain
 < $(NDDRIVERSTDARRAYS)/ndDriverStdArraysPlugins.cmd

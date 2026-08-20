@@ -37,7 +37,7 @@ asynSetOption("$(SERIAL)", 0, "stop",   "1")
 # AG_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])
 AG_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 100, 1000)
 
-dbLoadRecords("db/conex.template", "P=$(P),M=$(M),PORT=$(PORT),EGU=mm")
+dbLoadRecords("$(CONEX_IOC)/db/conex.template", "P=$(P),M=$(M),PORT=$(PORT),EGU=mm")
 
 iocInit()
 

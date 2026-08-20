@@ -71,6 +71,11 @@ impl Snapshot {
 struct Shared {
     snapshot: Snapshot,
     connected: bool,
+    /// When the last data package arrived; `None` until the first one. The
+    /// socket staying open while packages stop (a wedged controller, a dead
+    /// link the TCP stack has not noticed) leaves `connected == true`
+    /// forever — this is the signal that distinguishes that silence.
+    last_package: Option<Instant>,
 }
 
 /// A running RTDE output stream.
@@ -87,6 +92,7 @@ impl StateStream {
         let shared = Arc::new(Mutex::new(Shared {
             snapshot: Snapshot::default(),
             connected: true,
+            last_package: None,
         }));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -99,6 +105,7 @@ impl StateStream {
                         let mut s = thread_shared.lock();
                         s.snapshot = Snapshot::new(values);
                         s.connected = true;
+                        s.last_package = Some(Instant::now());
                     }
                     // Timed out with nothing to read: quiet, not gone.
                     Ok(None) => {}
@@ -143,6 +150,19 @@ impl StateStream {
 
     pub fn is_connected(&self) -> bool {
         self.shared.lock().connected
+    }
+
+    /// When the last data package arrived; `None` before the first one.
+    pub fn last_update(&self) -> Option<Instant> {
+        self.shared.lock().last_package
+    }
+
+    /// True while the socket is up AND a data package arrived within
+    /// `threshold`. `is_connected` alone cannot see a stream whose socket
+    /// stays open but whose packages have stopped.
+    pub fn is_alive(&self, threshold: Duration) -> bool {
+        let s = self.shared.lock();
+        s.connected && s.last_package.is_some_and(|t| t.elapsed() <= threshold)
     }
 
     /// The newest robot state. Empty until the first package arrives.
@@ -197,5 +217,34 @@ mod tests {
         assert_eq!(snap.double("no_such_variable"), None);
         assert!(!snap.is_empty());
         assert!(Snapshot::default().is_empty());
+    }
+
+    /// A thread-less stream over a hand-built `Shared`, for driving the
+    /// staleness boundaries directly.
+    fn stream_with(connected: bool, last_package: Option<Instant>) -> StateStream {
+        StateStream {
+            shared: Arc::new(Mutex::new(Shared {
+                snapshot: Snapshot::default(),
+                connected,
+                last_package,
+            })),
+            stop: Arc::new(AtomicBool::new(false)),
+            reader: None,
+        }
+    }
+
+    /// The four connected × fresh combinations: only connected-and-fresh is
+    /// alive. connected-but-stale is the wedge `is_connected` cannot see.
+    #[test]
+    fn alive_needs_both_connection_and_fresh_packages() {
+        let t = Duration::from_secs(1);
+        let fresh = Some(Instant::now());
+        let stale = Some(Instant::now() - Duration::from_secs(2));
+
+        assert!(stream_with(true, fresh).is_alive(t));
+        assert!(!stream_with(true, stale).is_alive(t), "connected-but-stale");
+        assert!(!stream_with(false, fresh).is_alive(t), "disconnected");
+        assert!(!stream_with(true, None).is_alive(t), "no package yet");
+        assert_eq!(stream_with(true, None).last_update(), None);
     }
 }

@@ -43,7 +43,6 @@ epicsEnvSet("NELEMENTS", "94965")
 # $(ADPILATUS) is set to this crate's root (iocs/ad/pilatus-ioc) by
 # ioc_support at startup; pilatus.template lives in its db/ subdir.
 # ADBase.template / NDFile.template resolve from $(ADCORE)/db.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADPILATUS)/db:$(ADCORE)/db")
 
 ###
 # Create the asyn port to talk to the Pilatus camserver on TCP port 41234.
@@ -62,11 +61,15 @@ drvAsynIPPortConfigure("camserver", "gse-pilatus1:41234")
 # correct operation.
 
 pilatusDetectorConfig("$(PORT)", "camserver", $(XSIZE), $(YSIZE), 0, 0)
-dbLoadRecords("pilatus.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,CAMSERVER_PORT=camserver")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADPILATUS)/db/pilatus.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,CAMSERVER_PORT=camserver")
 
 # Create a standard arrays plugin (image data for clients)
 NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
 
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd

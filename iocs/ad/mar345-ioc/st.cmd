@@ -43,7 +43,6 @@ epicsEnvSet("NELEMENTS", "12000000")
 # $(ADMAR345) is set to this crate's root (iocs/ad/mar345-ioc) by
 # ioc_support at startup; mar345.template lives in its db/ subdir.
 # ADBase.template / NDFile.template resolve from $(ADCORE)/db.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADMAR345)/db:$(ADCORE)/db")
 
 ###
 # Create the asyn port to talk to the MAR on TCP port 5001.
@@ -60,12 +59,16 @@ drvAsynIPPortConfigure("marServer", "gse-marip2.cars.aps.anl.gov:5001")
 # with no embedded terminator, so this EOS must be set for correct operation.
 
 mar345Config("$(PORT)", "marServer", 0, 0)
-dbLoadRecords("mar345.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,MARSERVER_PORT=marServer")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADMAR345)/db/mar345.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,MARSERVER_PORT=marServer")
 
 # Create a standard arrays plugin (image data for clients). The published
 # arrays are NDUInt16; the C example loads the record as Int16/SHORT.
 NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
 
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd

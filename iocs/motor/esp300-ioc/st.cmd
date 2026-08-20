@@ -36,7 +36,7 @@ ESP300CreateController("$(PORT)", "$(SERIAL)", 100, 1000)
 # One motor record per discovered axis (DTYP ESP300_$(PORT)_0, _1, ...).
 # Positions travel the driver boundary in EGU directly; MRES only sets the
 # record's raw-count resolution (display/deadband granularity).
-dbLoadRecords("db/esp300.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.0001,EGU=mm")
+dbLoadRecords("$(ESP300_IOC)/db/esp300.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.0001,EGU=mm")
 
 iocInit()
 

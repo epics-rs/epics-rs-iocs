@@ -21,16 +21,18 @@ epicsEnvSet("CBUFFS", "500")
 epicsEnvSet("PVNAME", "13SIM1:Pva1:Image")
 
 # $(PVADRIVERIOC) is set to this crate's root (iocs/ad/pva-driver-ioc) by
-# ioc_support at IOC startup. The shared workspace db/ lives three levels up
-# from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(PVADRIVERIOC)/../../../db:$(ADCORE)/db")
+# ioc_support at IOC startup. The templates live in its db/ subdir.
 
 # Create a pvaDriver.
 # pvaDriverConfig(portName, pvName, maxBuffers, maxMemory, priority, stackSize)
 # maxBuffers/priority/stackSize are accepted for st.cmd drop-in compatibility
 # with upstream but unused by this port -- see ioc_support.rs doc comment.
 pvaDriverConfig("$(PORT)", "$(PVNAME)", 0, 0, 0, 0)
-dbLoadRecords("pva.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(PVADRIVERIOC)/db/pva.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Load the NDStdArrays image-output plugin and the rest of the standard
 # plugin chain via the framework's commonPlugins.cmd. Unlike upstream's own

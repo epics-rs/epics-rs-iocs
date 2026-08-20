@@ -22,9 +22,8 @@ epicsEnvSet("NELEMENTS", "11000000")
 epicsEnvSet("PSL_SERVER",      "PSLServer")
 epicsEnvSet("PSL_SERVER_ADDR", "localhost:50000")
 
-# $(ADPSL) is set to this crate's root by ioc_support at startup; the shared
-# workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADPSL)/../../../db:$(ADCORE)/db")
+# $(ADPSL) is set to this crate's root by ioc_support at startup; the
+# templates live in its db/ subdir.
 
 # The PSLViewer socket. The server answers a command with one message and no
 # terminator, and the image payload is binary, so only an output EOS is set.
@@ -35,13 +34,17 @@ asynOctetSetOutputEos("$(PSL_SERVER)", 0, "\n")
 # maxBuffers, priority and stackSize are accepted and ignored.
 PSLConfig("$(PORT)", "$(PSL_SERVER)", 0, 0, 0, 0)
 
-dbLoadRecords("PSL.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,PSL_SERVER_PORT=$(PSL_SERVER)")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADPSL)/db/PSL.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,PSL_SERVER_PORT=$(PSL_SERVER)")
 
 # Standard arrays plugin fed from the PSL port. TYPE/FTVL follow the server's
 # default 16-bit mode; a camera running in 8-, 32-bit or RGB mode needs the
 # matching TYPE/FTVL here.
 NDStdArraysConfigure("Image1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
 
 < $(ADCORE)/ioc/commonPlugins.cmd
 

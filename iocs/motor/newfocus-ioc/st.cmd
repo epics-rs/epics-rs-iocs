@@ -30,7 +30,7 @@ PMNC87xxCreateController("$(PORT)", "$(ASYN)", 100, 1000)
 # One motor record per discovered channel (DTYP PMNC_$(PORT)_0, _1, ...).
 # Picomotor moves are integer steps: positions travel the driver boundary in
 # EGU (= steps) directly, so MRES=1 and EGU=steps.
-dbLoadRecords("db/newfocus.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=1,EGU=steps")
+dbLoadRecords("$(NEWFOCUS_IOC)/db/newfocus.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=1,EGU=steps")
 
 iocInit()
 

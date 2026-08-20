@@ -17,15 +17,18 @@ epicsEnvSet("TSPOINTS",  "1000")
 epicsEnvSet("BROADCAST", "164.54.160.255")
 epicsEnvSet("MODULE_ID", "0")
 
-# $(QUADEM) is set to this crate's root (iocs/quadem/nsls-em-ioc) by
-# ioc_support at IOC startup; the shared quadEM db lives one level up.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(QUADEM)/db:$(QUADEM)/../db:$(ADCORE)/db")
+# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
+# at IOC startup; every quadEM template lives in its db/ subdir.
 
 # The driver broadcasts on $(BROADCAST):37747 to find the module with the
 # given ID, then opens the TCP command (4747) and data (5757) ports itself.
 drvNSLS_EMConfigure("$(PORT)", "$(BROADCAST)", $(MODULE_ID), $(RING_SIZE))
 
-dbLoadRecords("$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
 
 # iocInit is called automatically by IocApplication after this script completes.
 #

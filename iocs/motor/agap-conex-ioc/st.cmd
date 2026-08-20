@@ -38,7 +38,7 @@ asynSetOption("$(SERIAL)", 0, "stop",   "1")
 # AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])
 AGAP_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 100, 1000)
 
-dbLoadRecords("db/agap.template", "P=$(P),MU=$(MU),MV=$(MV),PORT=$(PORT)")
+dbLoadRecords("$(AGAP_CONEX_IOC)/db/agap.template", "P=$(P),MU=$(MU),MV=$(MV),PORT=$(PORT)")
 
 iocInit()
 

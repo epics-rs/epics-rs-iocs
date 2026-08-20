@@ -37,14 +37,17 @@ epicsEnvSet("NELEMENTS_DEPTH", "921600")
 epicsEnvSet("NELEMENTS_PC",    "2764800")
 
 # $(ADD435I) is set to this crate's root (iocs/d435i-ioc) by ioc_support at
-# IOC startup. The shared workspace db/ lives two levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADD435I)/../../db:$(ADCORE)/db")
+# IOC startup. The templates live in its db/ subdir.
 
 d435iConfig("$(PORT)", "$(SERIAL)", $(XSIZE), $(YSIZE), 100000000)
 
 # Load per-port record databases
-dbLoadRecords("d435i_color.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
-dbLoadRecords("d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=$(DEPTH_PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADD435I)/db/d435i_color.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
+dbLoadRecords("$(ADD435I)/db/d435i_depth.template", "P=$(PREFIX),R=depth1:,PORT=$(DEPTH_PORT),ADDR=0,TIMEOUT=1")
 
 # Load plugin chains per port (plugin scripts live next to this st.cmd)
 < $(ADD435I)/d435iColorPlugins.cmd

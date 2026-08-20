@@ -29,7 +29,7 @@ pub struct IoParams {
 }
 
 impl IoParams {
-    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    pub(crate) fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
             speed_slider: base.create_param("SPEED_SLIDER", ParamType::Float64)?,
             set_standard_digital_out: base
@@ -116,55 +116,61 @@ impl PortDriver for IoDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let addr = user.addr;
-        let p = self.params;
-        self.base.params.set_int32(reason, addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let addr = user.addr;
+            let p = self.params;
+            self.base.params.set_int32(reason, addr, value)?;
 
-        let channel = u8::try_from(addr)
-            .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
-        let level = value != 0;
+            let channel = u8::try_from(addr)
+                .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
+            let level = value != 0;
 
-        let mut slot = self.iface.lock();
-        let Some(iface) = slot.as_mut() else {
-            return Err(asyn_error("the RTDE I/O interface is not initialised"));
-        };
+            let mut slot = self.iface.lock();
+            let Some(iface) = slot.as_mut() else {
+                return Err(asyn_error("the RTDE I/O interface is not initialised"));
+            };
 
-        let result = if reason == p.set_standard_digital_out {
-            iface.set_standard_digital_out(channel, level)
-        } else if reason == p.set_config_digital_out {
-            iface.set_configurable_digital_out(channel, level)
-        } else if reason == p.set_tool_digital_out {
-            iface.set_tool_digital_out(channel, level)
-        } else {
-            return Ok(());
-        };
-        result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
+            let result = if reason == p.set_standard_digital_out {
+                iface.set_standard_digital_out(channel, level)
+            } else if reason == p.set_config_digital_out {
+                iface.set_configurable_digital_out(channel, level)
+            } else if reason == p.set_tool_digital_out {
+                iface.set_tool_digital_out(channel, level)
+            } else {
+                return Ok(());
+            };
+            result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let addr = user.addr;
-        let p = self.params;
-        self.base.params.set_float64(reason, addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let addr = user.addr;
+            let p = self.params;
+            self.base.params.set_float64(reason, addr, value)?;
 
-        let channel = u8::try_from(addr)
-            .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
+            let channel = u8::try_from(addr)
+                .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
 
-        let mut slot = self.iface.lock();
-        let Some(iface) = slot.as_mut() else {
-            return Err(asyn_error("the RTDE I/O interface is not initialised"));
-        };
+            let mut slot = self.iface.lock();
+            let Some(iface) = slot.as_mut() else {
+                return Err(asyn_error("the RTDE I/O interface is not initialised"));
+            };
 
-        let result = if reason == p.speed_slider {
-            iface.set_speed_slider(value)
-        } else if reason == p.set_voltage_analog_out {
-            iface.set_analog_output_voltage(channel, value)
-        } else if reason == p.set_current_analog_out {
-            iface.set_analog_output_current(channel, value)
-        } else {
-            return Ok(());
-        };
-        result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
+            let result = if reason == p.speed_slider {
+                iface.set_speed_slider(value)
+            } else if reason == p.set_voltage_analog_out {
+                iface.set_analog_output_voltage(channel, value)
+            } else if reason == p.set_current_analog_out {
+                iface.set_analog_output_current(channel, value)
+            } else {
+                return Ok(());
+            };
+            result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }

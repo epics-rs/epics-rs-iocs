@@ -19,7 +19,7 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use vac::ioc::{VAC_DB_DIR, device_support_factory, vs_record_factory};
+use vac::ioc::{device_support_factory, vs_record_factory};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -31,7 +31,7 @@ async fn main() -> CaResult<()> {
         std::process::exit(1);
     };
 
-    epics_rs::base::runtime::env::set_default("VAC", VAC_DB_DIR);
+    epics_rs::base::runtime::env::set_default("VAC", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
 
     let mut app = IocApplication::new();
 

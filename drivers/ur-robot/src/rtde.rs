@@ -54,24 +54,35 @@ pub enum CommandType {
     NoCmd = 0,
     MoveJ = 1,
     MoveL = 3,
+    ForceMode = 6,
+    ForceModeStop = 7,
+    ZeroFtSensor = 8,
+    SpeedJ = 9,
     SpeedL = 10,
+    ServoJ = 11,
     SetStdDigitalOut = 13,
     SetToolDigitalOut = 14,
     SpeedStop = 15,
+    ServoStop = 16,
     TeachMode = 18,
     EndTeachMode = 19,
     SetSpeedSlider = 22,
     SetStdAnalogOut = 23,
     SetTcp = 29,
+    GetInverseKinematicsArgs = 30,
     ProtectiveStop = 31,
     StopL = 33,
     StopJ = 34,
     IsPoseWithinSafetyLimits = 36,
     IsJointsWithinSafetyLimits = 37,
+    GetInverseKinematicsDefault = 46,
     IsSteady = 47,
     SetConfDigitalOut = 48,
     SetInputIntRegister = 49,
     SetInputDoubleRegister = 50,
+    MoveUntilContact = 51,
+    /// Encoded as `NO_CMD` on the wire — see [`RobotCommand::encode`].
+    Watchdog = 99,
     StopScript = 255,
 }
 
@@ -179,8 +190,17 @@ pub enum Payload {
     /// IS_STEADY, STOP_SCRIPT).
     None,
     /// `val_` vector only (SET_TCP, IS_POSE_WITHIN_SAFETY_LIMITS,
-    /// IS_JOINTS_WITHIN_SAFETY_LIMITS, SPEED_STOP, SPEEDL).
+    /// IS_JOINTS_WITHIN_SAFETY_LIMITS, SPEED_STOP, SPEEDL, SPEEDJ, SERVOJ,
+    /// SERVO_STOP, GET_INVERSE_KINEMATICS_*, MOVE_UNTIL_CONTACT).
     Vector(Vec<f64>),
+    /// FORCE_MODE: the `force_mode_type_` int32, the six int32
+    /// `selection_vector_` entries, then `val_` = task frame ++ wrench ++
+    /// limits (rtde.cpp:206-216 runs before the `val_` append).
+    ForceMode {
+        force_mode_type: i32,
+        selection_vector: [i32; 6],
+        val: Vec<f64>,
+    },
     /// `val_` vector followed by the `async_` flag (MOVEJ, MOVEL, STOPJ, STOPL).
     VectorAsync { val: Vec<f64>, asynchronous: bool },
     /// A digital-output mask/value byte pair (SET_STD_DIGITAL_OUT,
@@ -225,11 +245,16 @@ impl RobotCommand {
     /// built first, the type-specific fields are appended, and the recipe id is
     /// finally *prepended* as a single byte (rtde.cpp:296).
     ///
-    /// `WATCHDOG` in the C++ replaces the whole buffer with `NO_CMD`; that
-    /// command is not reachable from urRobot and is not ported.
+    /// `WATCHDOG` never reaches the wire as 99: the C++ replaces the whole
+    /// command buffer with `NO_CMD` (rtde.cpp:201-204), so the script's
+    /// recipe-11 kick is a `NO_CMD` int32 addressed to the watchdog recipe.
     pub fn encode(&self) -> Vec<u8> {
+        let wire_command = match self.command {
+            CommandType::Watchdog => CommandType::NoCmd,
+            other => other,
+        };
         let mut body = Vec::new();
-        body.extend_from_slice(&(self.command as i32).to_be_bytes());
+        body.extend_from_slice(&(wire_command as i32).to_be_bytes());
 
         match &self.payload {
             Payload::None => {}
@@ -239,6 +264,17 @@ impl RobotCommand {
                 // ahead of rtde.cpp:231.
                 push_vector_nd(&mut body, val);
                 body.extend_from_slice(&(i32::from(*asynchronous)).to_be_bytes());
+            }
+            Payload::ForceMode {
+                force_mode_type,
+                selection_vector,
+                val,
+            } => {
+                body.extend_from_slice(&force_mode_type.to_be_bytes());
+                for s in selection_vector {
+                    body.extend_from_slice(&s.to_be_bytes());
+                }
+                push_vector_nd(&mut body, val);
             }
             Payload::DigitalOut { mask, value } => {
                 body.push(*mask);
@@ -499,6 +535,56 @@ mod tests {
         assert_eq!(&f[4..8], &34i32.to_be_bytes());
         assert_eq!(hex(&f[8..16]), "4000000000000000"); // packDouble(2.0)
         assert_eq!(&f[16..20], &0i32.to_be_bytes());
+    }
+
+    #[test]
+    fn servoj_is_q_then_the_five_servo_parameters() {
+        // servoJ(q, speed, accel, time, lookahead, gain) => val_ = q ++ the
+        // five parameters, recipe 2, no async flag.
+        let mut val = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        val.extend([1.05, 1.4, 0.008, 0.1, 300.0]);
+        let c = RobotCommand::new(2, CommandType::ServoJ, Payload::Vector(val));
+        let f = c.encode();
+        assert_eq!(f[3], 2); // recipe id
+        assert_eq!(&f[4..8], &11i32.to_be_bytes()); // SERVOJ
+        assert_eq!(f.len(), 3 + 1 + 4 + 11 * 8);
+        assert_eq!(hex(&f[f.len() - 8..]), "4072c00000000000"); // gain 300.0
+    }
+
+    #[test]
+    fn watchdog_kick_encodes_as_no_cmd_on_recipe_11() {
+        // rtde.cpp:201-204 replaces the WATCHDOG command buffer with NO_CMD;
+        // only the recipe id distinguishes the kick from a clear.
+        let c = RobotCommand::new(11, CommandType::Watchdog, Payload::None);
+        assert_eq!(c.encode(), vec![0x00, 0x08, 85, 11, 0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn force_mode_packs_type_then_selection_then_val() {
+        // forceMode => int32 force_mode_type, six int32 selection entries,
+        // then val_ = task frame ++ wrench ++ limits (18 doubles), recipe 3.
+        let val: Vec<f64> = (0..18).map(f64::from).collect();
+        let c = RobotCommand::new(
+            3,
+            CommandType::ForceMode,
+            Payload::ForceMode {
+                force_mode_type: 2,
+                selection_vector: [1, 0, 1, 0, 0, 1],
+                val,
+            },
+        );
+        let f = c.encode();
+        assert_eq!(f[3], 3); // recipe id
+        assert_eq!(&f[4..8], &6i32.to_be_bytes()); // FORCE_MODE
+        assert_eq!(&f[8..12], &2i32.to_be_bytes()); // force_mode_type_
+        let sel: Vec<i32> = f[12..36]
+            .chunks(4)
+            .map(|c| i32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(sel, [1, 0, 1, 0, 0, 1]);
+        assert_eq!(hex(&f[36..44]), "0000000000000000"); // val_[0] = 0.0
+        assert_eq!(hex(&f[f.len() - 8..]), "4031000000000000"); // val_[17] = 17.0
+        assert_eq!(f.len(), 3 + 1 + 4 + 4 + 24 + 18 * 8);
     }
 
     #[test]

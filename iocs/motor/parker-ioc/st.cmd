@@ -27,7 +27,7 @@ OEMCreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
 
 # One motor record per axis (DTYP OEM_$(CARD)_0, _1, ...). The driver reports
 # positions in controller counts, so MRES = 1.
-dbLoadRecords("db/oem.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(PARKER_IOC)/db/oem.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
 
 iocInit()
 

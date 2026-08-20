@@ -43,7 +43,7 @@ capaNCDT6200Configure("L1", "10.6.28.17", "10001")
 # asynrs-0221-serial-ioc-boilerplate-gap. Adding the dual-registry shim
 # these calls would need is out of scope for this task.
 
-dbLoadRecords("db/xxCapaNCDT6200.template", "dev=$(dev),Link=L0")
-dbLoadRecords("db/xxCapaMeas.template", "dev=$(dev),PORT=L1")
+dbLoadRecords("$(MICROEPSILON)/db/xxCapaNCDT6200.template", "dev=$(dev),Link=L0")
+dbLoadRecords("$(MICROEPSILON)/db/xxCapaMeas.template", "dev=$(dev),PORT=L1")
 
 iocInit()

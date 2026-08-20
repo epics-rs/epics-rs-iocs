@@ -32,9 +32,9 @@ C300CreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
 
 # One motor record per axis (DTYP C300_$(CARD)_0, _1, _2). Positions cross the
 # driver boundary in the controller's native units, so MRES = 1.
-dbLoadRecords("db/c300.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/c300.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("db/c300.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
 
 iocInit()
 

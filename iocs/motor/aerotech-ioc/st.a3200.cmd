@@ -31,7 +31,7 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\n")
 A3200AsynConfig("$(CARD)", "$(IPPORT)", 1, 1, 1, 100, 1000, 2000)
 
 # One motor record per axis. AXISNAME is the controller's axis name (X here).
-dbLoadRecords("db/a3200.template", "P=$(P),M=m1,CTRL=$(CARD),AXISNAME=X")
+dbLoadRecords("$(AEROTECH_IOC)/db/a3200.template", "P=$(P),M=m1,CTRL=$(CARD),AXISNAME=X")
 
 iocInit()
 

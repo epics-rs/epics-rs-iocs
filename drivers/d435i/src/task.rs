@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::port_handle::PortHandle;
 
-use epics_rs::ad_core::attributes::{
-    NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList,
-};
+use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};

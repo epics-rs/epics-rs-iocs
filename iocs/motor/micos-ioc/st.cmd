@@ -29,9 +29,9 @@ SMCcorvusCreateController(0, "$(IPPORT)", $(NAXES), 100, 500)
 
 # One motor record per axis (DTYP CORVUS_$(CARD)_0, _1, _2). The driver reports
 # positions in controller-native engineering units, so MRES = 1.
-dbLoadRecords("db/corvus.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/corvus.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("db/corvus.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(MICOS_IOC)/db/corvus.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(MICOS_IOC)/db/corvus.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(MICOS_IOC)/db/corvus.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
 
 iocInit()
 

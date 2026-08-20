@@ -40,9 +40,9 @@ smarActSCUCreateAxis(0, 2, 2)
 # One motor record per axis. The driver reports positions in motor-record steps
 # (1000 steps = 1 micron for linear, 1 millidegree for rotary), so MRES = 0.001
 # makes the record read directly in microns / millidegrees.
-dbLoadRecords("db/scu.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/scu.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("db/scu.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
 
 iocInit()
 

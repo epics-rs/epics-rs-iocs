@@ -17,9 +17,6 @@ use crate::device_support::vac_sen::{self, VacSen};
 use crate::records::digitel::DigitelRecord;
 use crate::records::vs::VsRecord;
 
-/// Path to the bundled database template directory.
-pub const VAC_DB_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/db");
-
 /// The `vs` record-type factory, for `IocApplication::register_record_type`.
 pub fn vs_record_factory() -> (&'static str, RecordFactory) {
     ("vs", Box::new(|| Box::new(VsRecord::default())))

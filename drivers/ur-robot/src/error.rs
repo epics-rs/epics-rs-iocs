@@ -42,6 +42,33 @@ pub enum UrError {
 
     #[error("value {value} is not within [{min}; {max}]")]
     OutOfRange { value: f64, min: f64, max: f64 },
+
+    /// The control script refused a command (C++ returns a bare `false`,
+    /// indistinguishable from a query answering "no"; here the refusal is
+    /// its own variant and carries why).
+    #[error("command refused: {reason}")]
+    CommandRefused { reason: RefusalReason },
+}
+
+/// Why the control script refused a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The program is stopped or the control script is not running.
+    NotRunning,
+    /// A protective or emergency stop is active.
+    SafetyStop,
+    /// The script did not become ready, or did not finish, in time.
+    Timeout,
+}
+
+impl std::fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotRunning => "the control script is not running",
+            Self::SafetyStop => "a protective or emergency stop is active",
+            Self::Timeout => "the control script did not respond in time",
+        })
+    }
 }
 
 pub type UrResult<T> = Result<T, UrError>;

@@ -30,7 +30,7 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\n")
 EnsembleAsynConfig("$(CARD)", "$(IPPORT)", 1, 100, 1000, 2000)
 
 # One motor record per axis. AXIS is the controller axis number (0 here).
-dbLoadRecords("db/aerotech.template", "P=$(P),M=m1,CTRL=$(CARD),AXIS=0")
+dbLoadRecords("$(AEROTECH_IOC)/db/aerotech.template", "P=$(P),M=m1,CTRL=$(CARD),AXIS=0")
 
 iocInit()
 

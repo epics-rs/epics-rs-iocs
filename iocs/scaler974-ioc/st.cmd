@@ -7,7 +7,7 @@
 # Mirrors upstream epics-modules/scaler's iocBoot/iocScalerTest/st.cmd
 # (serial port setup) plus iocsh/softScaler.iocsh's dbLoadRecords
 # convention (this driver reuses scaler-rs's own bundled db/scaler.db —
-# see main.rs's `SCALER` env var, set to `epics_rs::scaler::SCALER_DB_DIR`).
+# see main.rs's `SCALER` env var, set to the scaler-rs crate dir).
 #
 # Like delaygen/love, EOS is not set by drvScaler974 itself (see
 # connect.rs's module doc) -- consult the Ortec 974 manual for the actual
@@ -58,7 +58,7 @@ initScaler974("SCL1", "S0", 0, 100)
 # scaler record's DTYP field via dbpf afterward (still pre-iocInit, so
 # wire_device_support's dtyp read sees the corrected value) avoids the
 # blast radius entirely without editing the vendored db file.
-dbLoadRecords("$(SCALER)/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")
+dbLoadRecords("$(SCALER)/db/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")
 dbpf("scaler974:scaler1.DTYP", "Asyn Scaler")
 
 #------------------------------------------------------------------------------

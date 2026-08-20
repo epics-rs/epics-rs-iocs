@@ -36,9 +36,9 @@ smarActMCSCreateAxis(0, 2, 2)
 # One motor record per axis. The driver reports the controller's raw position in
 # nanometres (linear) / micro-degrees (rotary) with no scaling, so MRES = 1e-6
 # reads the record in millimetres (linear) / degrees (rotary).
-dbLoadRecords("db/mcs.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/mcs.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("db/mcs.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
 
 iocInit()
 

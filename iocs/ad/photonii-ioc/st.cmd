@@ -22,8 +22,7 @@ epicsEnvSet("PII_SERVER_ADDR",    "localhost:20000")
 epicsEnvSet("PII_STARTUP_SCRIPT", "/home/bruker/p2util/scripts/prep_collection.cmd")
 
 # $(ADPHOTONII) is set to this crate's root by ioc_support at startup; the
-# shared workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADPHOTONII)/../../../db:$(ADCORE)/db")
+# templates live in its db/ subdir.
 
 drvAsynIPPortConfigure("$(PII_SERVER)", "$(PII_SERVER_ADDR)", 0, 0, 0)
 asynOctetSetInputEos("$(PII_SERVER)", 0, "\r\n")
@@ -36,11 +35,15 @@ PhotonIIConfig("$(PORT)", "$(PII_SERVER)", 0, 0, 0, 0)
 # Load and run the detector preparation command file inside p2util.
 p2util("$(PORT)", "load --commands --filename $(PII_STARTUP_SCRIPT)")
 
-dbLoadRecords("photonII.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,PII_SERVER_PORT=$(PII_SERVER)")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADPHOTONII)/db/photonII.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,PII_SERVER_PORT=$(PII_SERVER)")
 
 # Standard arrays plugin fed from the PhotonII port.
 NDStdArraysConfigure("Image1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
 
 < $(ADCORE)/ioc/commonPlugins.cmd
 

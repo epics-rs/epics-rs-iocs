@@ -28,7 +28,7 @@ const CREATED: &[&str] = &[
 ];
 
 fn db_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../drivers/ad/mythen/db")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("db")
 }
 
 fn ad_core_db_dir() -> PathBuf {

@@ -30,7 +30,7 @@ phytronCreateMCC("$(CTRL)", "$(IPPORT)", $(ADDR), 100, 1000, 1000, 1)
 # MCC axes are single-digit 1..8: phytronCreateAxis(controllerName, module=0,
 # index). The axis command prefix is the index digit.
 phytronCreateAxis("$(CTRL)", 0, 1)
-dbLoadRecords("db/phytron.template", "P=$(P),M=m1,CTRL=$(CTRL),MODULE=0,INDEX=1")
+dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,CTRL=$(CTRL),MODULE=0,INDEX=1")
 
 iocInit()
 

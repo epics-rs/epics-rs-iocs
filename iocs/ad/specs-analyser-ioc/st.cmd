@@ -27,7 +27,6 @@ epicsEnvSet("NELEMENTS", "2361600")
 # (iocs/ad/specs-analyser-ioc) by ioc_support at startup;
 # specsAnalyser.template lives in its db/ subdir. ADBase.template resolves
 # from $(ADCORE)/db.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADSPECSANALYSER)/db:$(ADCORE)/db")
 
 ###
 # Create the asyn port to talk to the SPECS analyser server.
@@ -41,12 +40,16 @@ asynOctetSetInputEos("SPECS_ASYN", 0, "\n")
 asynOctetSetOutputEos("SPECS_ASYN", 0, "\n")
 
 specsAnalyserConfig("$(PORT)", "SPECS_ASYN", 0, 0)
-dbLoadRecords("specsAnalyser.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADSPECSANALYSER)/db/specsAnalyser.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Create a standard arrays plugin (image data for clients). The published
 # arrays are NDFloat64, matching the C example's TYPE=Float64/FTVL=DOUBLE.
 NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=$(NELEMENTS)")
 
 # Load all other plugins using commonPlugins.cmd (resolves under $(ADCORE)).
 < $(ADCORE)/ioc/commonPlugins.cmd

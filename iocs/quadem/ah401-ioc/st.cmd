@@ -18,9 +18,8 @@ epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "1000")
 epicsEnvSet("IP",        "164.54.160.242:10001")
 
-# $(QUADEM) is set to this crate's root (iocs/quadem/ah401-ioc) by ioc_support
-# at IOC startup; the shared quadEM db lives one level up.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(QUADEM)/db:$(QUADEM)/../db:$(ADCORE)/db")
+# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
+# at IOC startup; every quadEM template lives in its db/ subdir.
 
 # drvAsynIPPortConfigure("portName","hostInfo",priority,noAutoConnect,
 #                        noProcessEos)
@@ -30,7 +29,11 @@ asynOctetSetOutputEos("IP_$(PORT)", 0, "\r")
 
 drvAHxxxConfigure("$(PORT)", "IP_$(PORT)", $(RING_SIZE), "$(MODEL)")
 
-dbLoadRecords("$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
 
 # iocInit is called automatically by IocApplication after this script completes.
 #

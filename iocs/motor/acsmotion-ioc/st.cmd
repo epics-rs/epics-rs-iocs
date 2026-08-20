@@ -32,7 +32,7 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\r")
 AcsMotionConfig("$(CTRL)", "$(IPPORT)", $(NUMAXES), "", 1, 100, 1000)
 
 # One motor record for axis 0. DTYP = ACSMOTION_$(CTRL)_$(AXIS).
-dbLoadRecords("db/acsmotion.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+dbLoadRecords("$(ACSMOTION_IOC)/db/acsmotion.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
 
 iocInit()
 

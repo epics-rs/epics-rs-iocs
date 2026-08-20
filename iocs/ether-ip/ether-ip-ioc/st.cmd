@@ -16,8 +16,8 @@
 # the ControlLogix slot the CPU sits in (0 for a PLC-5 / CompactLogix).
 drvEtherIP_define_PLC("plc1", "127.0.0.1", 0)
 
-dbLoadRecords("iocs/ether-ip/ether-ip-ioc/db/test.db", "PLC=plc1,IOC=test")
-dbLoadRecords("iocs/ether-ip/ether-ip-ioc/db/eip_stat.db", "PLC=plc1,IOC=test,TAG=REAL")
+dbLoadRecords("$(ETHERIP)/db/test.db", "PLC=plc1,IOC=test")
+dbLoadRecords("$(ETHERIP)/db/eip_stat.db", "PLC=plc1,IOC=test,TAG=REAL")
 
 iocInit()
 

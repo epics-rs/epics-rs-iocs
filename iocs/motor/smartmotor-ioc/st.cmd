@@ -38,7 +38,7 @@ SmartMotorConfig(0, "$(SERIAL)", 100, 1000)
 
 # Motor record (DTYP SMARTMOTOR_$(CARD)_0). The SmartMotor works in encoder
 # counts, so MRES = 1 and EGU = counts.
-dbLoadRecords("db/smartmotor.template", "P=$(P),M=m1,CARD=$(CARD)")
+dbLoadRecords("$(SMARTMOTOR_IOC)/db/smartmotor.template", "P=$(P),M=m1,CARD=$(CARD)")
 
 iocInit()
 

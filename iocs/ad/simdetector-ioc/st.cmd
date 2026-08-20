@@ -24,14 +24,17 @@ epicsEnvSet("CBUFFS", "500")
 epicsEnvSet("NELEMENTS", "3145728")
 
 # $(ADSIMDETECTOR) is set to this crate's root by ioc_support at IOC startup.
-# The shared workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADSIMDETECTOR)/../../../db:$(ADCORE)/db")
+# The templates live in its db/ subdir.
 
 # simDetectorConfig(portName, maxSizeX, maxSizeY, dataType, maxBuffers, maxMemory)
 #   dataType 1 = NDUInt8; maxBuffers 0 and maxMemory 0 mean unlimited.
 simDetectorConfig("$(PORT)", $(XSIZE), $(YSIZE), 1, 0, 0)
 
-dbLoadRecords("simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Plugin chain
 < $(ADSIMDETECTOR)/simDetectorPlugins.cmd

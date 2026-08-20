@@ -135,8 +135,8 @@ members = [
     "iocs/motor/pi-ioc",
     "iocs/motor/mcb4b-ioc",
     "iocs/twincat-ads-ioc",
-    "iocs/usb-2408-ioc",
-    "iocs/usb-ctr-ioc",
+    "iocs/meascomp/usb-2408-ioc",
+    "iocs/meascomp/usb-ctr-ioc",
     "iocs/vac/vacsen-ioc",
     "iocs/vac/digitel-ioc",
     "iocs/delaygen-ioc",
@@ -150,13 +150,14 @@ members = [
     "iocs/mca-ioc",
     "iocs/mca-rontec-ioc",
     "iocs/mca-amptek-ioc",
+    "tools/ioc-conventions",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.26.1 (released): ports consume the released version instead of
+# epics-rs 0.26.2 (released): ports consume the released version instead of
 # the main branch. 0.24.3 -> 0.25.2 was the breaking step for this workspace
 # and the code here already carries it: `create_port_runtime` became fallible
 # (a port whose actor thread the OS refuses is now an error rather than a
@@ -185,14 +186,19 @@ members = [
 # PVA plugins on the D405/D435i IOCs from 135% to 14% of one core at
 # 640x480 @ 15 fps. `ad-plugins-rs` also moves to rust-hdf5 0.5.1.
 #
+# 0.26.2 carries the asyn halves the ur-robot work depends on — devBusyAsyn
+# (busy records over asynInt32, driver-clearable) and `ParamSetValue::Status`
+# (poll-thread COMM alarm pushes) — plus the aSub FTx/FTVx cell typing and
+# per-line db/acf macro expansion. Additive API only.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.26.1"
-asyn-rs = "0.26.1"
-ad-core-rs = "0.26.1"
-ad-plugins-rs = "0.26.1"
+epics-rs = "0.26.2"
+asyn-rs = "0.26.2"
+ad-core-rs = "0.26.2"
+ad-plugins-rs = "0.26.2"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.26.1", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.26.2", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.26.1"
+mca-rs = "0.26.2"

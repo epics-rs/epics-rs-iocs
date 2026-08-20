@@ -40,7 +40,7 @@ AG_UCCreateController("$(PORT)", "$(SERIAL)", 2, 100, 1000)
 AG_UCCreateAxis("$(PORT)", 0, 0, 50, -50)
 AG_UCCreateAxis("$(PORT)", 1, 0, 50, -50)
 
-dbLoadRecords("db/agilis.template", "P=$(P),M0=$(M0),M1=$(M1),PORT=$(PORT)")
+dbLoadRecords("$(AG_UC_IOC)/db/agilis.template", "P=$(P),M0=$(M0),M1=$(M1),PORT=$(PORT)")
 
 iocInit()
 

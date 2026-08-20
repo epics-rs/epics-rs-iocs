@@ -62,11 +62,11 @@ pmacCreateAxes("$(CTRL)", $(NUMAXES))
 # pmacAsynCoordCreate(csName, lowLevelPortName, lowLevelPortAddress, cs, program,
 #                     [movingPollMs], [idlePollMs])
 #pmacAsynCoordCreate("CS2", "$(PORT)", 0, 2, 10, 100, 500)
-#dbLoadRecords("db/pmac_cs.template", "P=$(P),M=cs2x,CS=CS2,AXIS=7")
+#dbLoadRecords("$(PMAC_IOC)/db/pmac_cs.template", "P=$(P),M=cs2x,CS=CS2,AXIS=7")
 
 # ---- records ----
-dbLoadRecords("db/pmac.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=1")
-dbLoadRecords("db/pmac.template", "P=$(P),M=m2,CTRL=$(CTRL),AXIS=2")
+dbLoadRecords("$(PMAC_IOC)/db/pmac.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=1")
+dbLoadRecords("$(PMAC_IOC)/db/pmac.template", "P=$(P),M=m2,CTRL=$(CTRL),AXIS=2")
 
 iocInit()
 

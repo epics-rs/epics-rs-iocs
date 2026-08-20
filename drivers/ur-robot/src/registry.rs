@@ -102,16 +102,32 @@ fn map<T>(reg: &'static Registry<T>) -> &'static Mutex<HashMap<String, T>> {
     reg.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn register_dashboard(port: &str, handle: DashboardHandle) {
-    map(&DASHBOARDS).lock().insert(port.to_string(), handle);
+/// A handle is bound into dependents at construction, so a silent overwrite
+/// would leave existing dependents reading the replaced handle while new
+/// lookups see the new one — two drivers, one name, split state. A duplicate
+/// name is therefore a registration error.
+fn register<T>(reg: &'static Registry<T>, port: &str, handle: T, kind: &str) -> Result<(), String> {
+    match map(reg).lock().entry(port.to_string()) {
+        std::collections::hash_map::Entry::Occupied(_) => {
+            Err(format!("a {kind} port named {port} is already registered"))
+        }
+        std::collections::hash_map::Entry::Vacant(v) => {
+            v.insert(handle);
+            Ok(())
+        }
+    }
+}
+
+pub fn register_dashboard(port: &str, handle: DashboardHandle) -> Result<(), String> {
+    register(&DASHBOARDS, port, handle, "dashboard")
 }
 
 pub fn dashboard(port: &str) -> Option<DashboardHandle> {
     map(&DASHBOARDS).lock().get(port).cloned()
 }
 
-pub fn register_receive(port: &str, handle: ReceiveHandle) {
-    map(&RECEIVERS).lock().insert(port.to_string(), handle);
+pub fn register_receive(port: &str, handle: ReceiveHandle) -> Result<(), String> {
+    register(&RECEIVERS, port, handle, "receive")
 }
 
 pub fn receive(port: &str) -> Option<ReceiveHandle> {
@@ -135,7 +151,7 @@ mod tests {
                 build: 108355,
             },
         });
-        register_dashboard("UR_DASH_TEST", h);
+        register_dashboard("UR_DASH_TEST", h).expect("fresh port name");
 
         let found = dashboard("UR_DASH_TEST").expect("registered dashboard");
         assert_eq!(found.ip, "192.168.1.10");
@@ -143,6 +159,25 @@ mod tests {
         assert!(found.get().robot_running());
         assert_eq!(found.get().polyscope.major, 5);
         assert!(dashboard("NO_SUCH_PORT").is_none());
+    }
+
+    #[test]
+    fn a_second_registration_under_the_same_name_errors() {
+        register_dashboard("UR_DUP_TEST", DashboardHandle::new("10.0.0.1"))
+            .expect("fresh port name");
+        let err = register_dashboard("UR_DUP_TEST", DashboardHandle::new("10.0.0.2"))
+            .expect_err("duplicate name must be refused");
+        assert!(err.contains("UR_DUP_TEST"), "{err}");
+        // The first handle survives the refused attempt.
+        assert_eq!(
+            dashboard("UR_DUP_TEST").expect("still registered").ip,
+            "10.0.0.1"
+        );
+
+        register_receive("UR_DUP_TEST", ReceiveHandle::new())
+            .expect("kinds are separate namespaces");
+        register_receive("UR_DUP_TEST", ReceiveHandle::new())
+            .expect_err("duplicate name must be refused");
     }
 
     #[test]
@@ -172,7 +207,7 @@ mod tests {
             safety_status_bits: 1,
             output_int_register_12: 7,
         });
-        register_receive("UR_RECV_TEST", h);
+        register_receive("UR_RECV_TEST", h).expect("fresh port name");
 
         let found = receive("UR_RECV_TEST").expect("registered receiver");
         let s = found.get();

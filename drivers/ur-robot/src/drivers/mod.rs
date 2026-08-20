@@ -40,7 +40,49 @@ pub mod ioc_ready;
 pub mod receive;
 pub mod runtime;
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+
+/// The full asyn parameter table of every driver kind, keyed by the names
+/// the ioc's record-wiring test maps db files to. Each table is built by
+/// the same `Params::create` the runtime constructor calls, so it cannot
+/// drift from what a live port serves — the test checks every db
+/// `@asyn(...)DRVINFO` string against it.
+pub fn created_param_names() -> Vec<(&'static str, Vec<String>)> {
+    fn table<P>(
+        max_addr: usize,
+        create: impl FnOnce(&mut PortDriverBase) -> AsynResult<P>,
+    ) -> Vec<String> {
+        let mut base = PortDriverBase::new("wiring-check", max_addr, PortFlags::default());
+        create(&mut base).expect("a fresh parameter table accepts every create_param");
+        (0..base.params.len())
+            .map(|i| base.params.param_name(i).expect("index < len").to_string())
+            .collect()
+    }
+
+    vec![
+        ("dashboard", table(1, dashboard::DashboardParams::create)),
+        (
+            "receive",
+            table(receive::NUM_JOINTS, receive::ReceiveParams::create),
+        ),
+        ("io", table(io::NUM_CHANNELS, io::IoParams::create)),
+        (
+            "control",
+            table(control::NUM_JOINTS, control::ControlParams::create),
+        ),
+        ("gripper", table(1, gripper::GripperParams::create)),
+    ]
+}
+
+/// An RTDE stream with no data package for this long is stale: the socket is
+/// open but the robot state it serves is no longer current. The default RTDE
+/// output frequency is 125 Hz (500 Hz e-Series), so one second is >100 missed
+/// packages — far past jitter, deliberately not configurable. Shared by the
+/// receive driver (staleness → reconnect) and the control driver (staleness →
+/// `IS_CONNECTED` only; control never reconnects on its own, as in C, because
+/// a reconnect re-uploads the control script).
+pub(crate) const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The `asynError` a C driver returns from `writeInt32` / `writeFloat64` /
 /// `writeOctet` when the device call failed.
@@ -49,4 +91,50 @@ pub(crate) fn asyn_error(message: impl Into<String>) -> AsynError {
         status: AsynStatus::Error,
         message: message.into(),
     }
+}
+
+/// The end-of-write flush every C handler performs: the default
+/// `asynPortDriver::write*` end with `callParamCallbacks(addr)`
+/// (asynPortDriver.cpp:2031), and every urRobot C override reaches its own
+/// call through the `skip:` label — on error exits too. Without it, a value
+/// cached by a write handler reaches I/O Intr records only at the next poll
+/// cycle, and never on the poll-less io port. The write's own error outranks
+/// a flush error.
+pub(crate) fn flush_after<T>(
+    base: &mut epics_rs::asyn::port::PortDriverBase,
+    addr: i32,
+    result: Result<T, AsynError>,
+) -> Result<T, AsynError> {
+    let flushed = base.call_param_callbacks(addr);
+    result.and_then(|v| flushed.map(|()| v))
+}
+
+/// The alarm half of a poll cycle: on a health transition, the status
+/// updates that raise (link lost) or clear (link recovered) the COMM alarm
+/// on every readback `(reason, addr)` in `targets`; on a steady state,
+/// nothing. Each poll thread is the single alarm owner for its port — the
+/// C pattern is `setParamStatus(asynDisconnected)` + `callParamCallbacks()`
+/// from the poll loop, and the record-side fill-in maps `Disconnected` to
+/// COMM/INVALID (asynEpicsUtils.c:238-265), so the alarm pair is left 0
+/// here rather than duplicating that mapping.
+pub(crate) fn health_transition(
+    targets: &[(usize, i32)],
+    healthy_now: bool,
+    was_healthy: &mut bool,
+) -> Vec<epics_rs::asyn::request::ParamSetValue> {
+    if healthy_now == *was_healthy {
+        return Vec::new();
+    }
+    *was_healthy = healthy_now;
+    let status = if healthy_now {
+        AsynStatus::Success
+    } else {
+        AsynStatus::Disconnected
+    };
+    targets
+        .iter()
+        .map(|&(reason, addr)| {
+            epics_rs::asyn::request::ParamSetValue::status(reason, addr, status, 0, 0)
+        })
+        .collect()
 }

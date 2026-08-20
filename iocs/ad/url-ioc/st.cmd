@@ -18,15 +18,18 @@ epicsEnvSet("NCHANS", "2048")
 epicsEnvSet("CBUFFS", "500")
 
 # $(ADURLIOC) is set to this crate's root (iocs/ad/url-ioc) by ioc_support at
-# IOC startup. The shared workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADURLIOC)/../../../db:$(ADCORE)/db")
+# IOC startup. The templates live in its db/ subdir.
 
 # Create a URL driver.
 # URLDriverConfig(portName, maxBuffers, maxMemory, priority, stackSize)
 # maxBuffers/priority/stackSize are accepted for st.cmd drop-in compatibility
 # with upstream but unused by this port -- see ioc_support.rs doc comment.
 URLDriverConfig("$(PORT)", 0, 0)
-dbLoadRecords("url.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADURLIOC)/db/url.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Load the NDStdArrays image-output plugin and the rest of the standard
 # plugin chain via the framework's commonPlugins.cmd. Unlike upstream's own

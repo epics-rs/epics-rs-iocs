@@ -38,7 +38,7 @@ MVP2001CreateAxis(0, 0, 512, 1000, 1)
 
 # One motor record per axis (DTYP MVP2001_$(CARD)_0). Positions cross the driver
 # boundary in the controller's native encoder counts, so MRES = 1.
-dbLoadRecords("db/mvp2001.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(MICROMO_IOC)/db/mvp2001.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
 
 iocInit()
 

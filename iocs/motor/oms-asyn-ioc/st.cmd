@@ -31,7 +31,7 @@ omsMAXnetConfig("$(CTRL)", "$(IPPORT)", "", 100, 1000, 2000)
 
 # One motor record per axis: omsCreateAxis(controllerName, axis), axis 0-based.
 omsCreateAxis("$(CTRL)", 0)
-dbLoadRecords("db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
 
 iocInit()
 
