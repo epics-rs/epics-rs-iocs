@@ -338,7 +338,7 @@ Deviation: the shared workspace `merlin.template` drops `FileFormat`/`FileFormat
 
 Rust port of `ADMythen/mythenApp/src/mythen.cpp` ([epics-modules/ADMythen](https://github.com/epics-modules/ADMythen)). Driven over an asyn octet IP port using the M1K ASCII/binary command set; the socket itself belongs to asyn exactly as in C (`drvAsynIPPortConfigure` + CR output EOS, `noProcessEos=1` since detector replies are binary with no line-oriented input EOS). `drivers/ad/mythen/src/`: `detector.rs`, `protocol.rs`, `transport.rs`, `task.rs`.
 
-Records (`drivers/ad/mythen/db/mythen.template`, includes only `ADBase.template`):
+Records (`iocs/ad/mythen-ioc/db/mythen.template`, includes only `ADBase.template`):
 - `Setting`/`_RBV` — Cu/Mo/Ag/Cr
 - `DelayTime`/`_RBV` — delay after trigger
 - `ThresholdEnergy`/`_RBV`, `BeamEnergy`/`_RBV`
@@ -563,7 +563,7 @@ records, plus per-chip (0-7) and per-power-rail (0-5) record replication via
   `histogram_io.cpp`, `mask_io.cpp`, `acquire.cpp`, `network_client.cpp`,
   `img_accumulation.cpp`).
 - **Build/run:** `cargo run -p timepix3-ioc --release -- iocs/ad/timepix3-ioc/st.cmd`
-- **Records** — grouped by template (all under `drivers/ad/timepix3/db/`,
+- **Records** — grouped by template (all under `iocs/ad/timepix3-ioc/db/`,
   macros `P,R,PORT,ADDR,TIMEOUT` unless noted; full field lists are large
   enough that this is a categorized sample, not exhaustive — see the
   templates for the complete set):

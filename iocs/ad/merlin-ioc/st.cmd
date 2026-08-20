@@ -26,8 +26,7 @@ epicsEnvSet("DATA_IPPORT",    "6342")
 epicsEnvSet("MODEL", "3")
 
 # $(ADMERLIN) is set to this crate's root by ioc_support at startup; the
-# shared workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADMERLIN)/../../../db:$(ADCORE)/db")
+# templates live in its db/ subdir.
 
 # The command channel is line-terminated; the data channel is not — MPX data
 # frames are length-delimited and carry binary pixels, so an input EOS would
@@ -43,11 +42,15 @@ drvAsynIPPortConfigure("$(DATA_PORT)", "$(MERLIN_IP):$(DATA_IPPORT)", 0, 0, 0)
 # maxBuffers, priority and stackSize are accepted and ignored.
 merlinDetectorConfig("$(PORT)", "$(COMMAND_PORT)", "$(DATA_PORT)", $(XSIZE), $(YSIZE), $(MODEL), 0, 0, 0, 0)
 
-dbLoadRecords("merlin.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,XSIZE=$(XSIZE),YSIZE=$(YSIZE)")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADMERLIN)/db/merlin.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,XSIZE=$(XSIZE),YSIZE=$(YSIZE)")
 
 # Standard arrays plugin fed from the Merlin port.
 NDStdArraysConfigure("Image1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
 
 < $(ADCORE)/ioc/commonPlugins.cmd
 

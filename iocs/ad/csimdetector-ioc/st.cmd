@@ -30,8 +30,7 @@ epicsEnvSet("CBUFFS", "500")
 epicsEnvSet("NELEMENTS", "800000")
 
 # $(ADCSIMDETECTOR) is set to this crate's root by ioc_support at IOC startup.
-# The shared workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCSIMDETECTOR)/../../../db:$(ADCORE)/db")
+# The templates live in its db/ subdir.
 
 epicsEnvSet("T1", "Sin(x)")
 epicsEnvSet("T2", "Cos(x)")
@@ -53,31 +52,35 @@ epicsEnvSet("T8", "SinSums")
 # maxBuffers 0 and maxMemory 0 mean unlimited.
 ADCSimDetectorConfig("$(PORT)", $(YSIZE), 9, 0, 0)
 
-dbLoadRecords("ADCSimDetector.template",  "P=$(PREFIX),R=det1:,  PORT=$(PORT),ADDR=0,TIMEOUT=1")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,NAME=$(T1)")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:2:,PORT=$(PORT),ADDR=1,TIMEOUT=1,NAME=$(T2)")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:3:,PORT=$(PORT),ADDR=2,TIMEOUT=1,NAME=$(T3)")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:4:,PORT=$(PORT),ADDR=3,TIMEOUT=1,NAME=$(T4)")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:5:,PORT=$(PORT),ADDR=4,TIMEOUT=1,NAME=$(T5)")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:6:,PORT=$(PORT),ADDR=5,TIMEOUT=1,NAME=$(T6)")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:7:,PORT=$(PORT),ADDR=6,TIMEOUT=1,NAME=$(T7)")
-dbLoadRecords("ADCSimDetectorN.template", "P=$(PREFIX),R=det1:8:,PORT=$(PORT),ADDR=7,TIMEOUT=1,NAME=$(T8)")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetector.template",  "P=$(PREFIX),R=det1:,  PORT=$(PORT),ADDR=0,TIMEOUT=1")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,NAME=$(T1)")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:2:,PORT=$(PORT),ADDR=1,TIMEOUT=1,NAME=$(T2)")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:3:,PORT=$(PORT),ADDR=2,TIMEOUT=1,NAME=$(T3)")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:4:,PORT=$(PORT),ADDR=3,TIMEOUT=1,NAME=$(T4)")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:5:,PORT=$(PORT),ADDR=4,TIMEOUT=1,NAME=$(T5)")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:6:,PORT=$(PORT),ADDR=5,TIMEOUT=1,NAME=$(T6)")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:7:,PORT=$(PORT),ADDR=6,TIMEOUT=1,NAME=$(T7)")
+dbLoadRecords("$(ADCSIMDETECTOR)/db/ADCSimDetectorN.template", "P=$(PREFIX),R=det1:8:,PORT=$(PORT),ADDR=7,TIMEOUT=1,NAME=$(T8)")
 
 # Standard arrays plugin, fed from the driver's 2-D array (addr 0).
 NDStdArraysConfigure("Image1", 3, 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=$(NELEMENTS)")
 
 # Time series plugin: 8 signals taken from the 2-D array.
 NDTimeSeriesConfigure("TS1", $(QSIZE), 0, "$(PORT)", 0, 8)
-dbLoadRecords("NDTimeSeries.template",  "P=$(PREFIX),R=TS:,   PORT=TS1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),NDARRAY_ADDR=0,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)det1:TimeStep CP MS,ENABLED=1")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:1:, PORT=TS1,ADDR=0,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T1)")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:2:, PORT=TS1,ADDR=1,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T2)")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:3:, PORT=TS1,ADDR=2,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T3)")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:4:, PORT=TS1,ADDR=3,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T4)")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:5:, PORT=TS1,ADDR=4,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T5)")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:6:, PORT=TS1,ADDR=5,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T6)")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:7:, PORT=TS1,ADDR=6,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T7)")
-dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:8:, PORT=TS1,ADDR=7,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T8)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeries.template",  "P=$(PREFIX),R=TS:,   PORT=TS1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),NDARRAY_ADDR=0,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)det1:TimeStep CP MS,ENABLED=1")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:1:, PORT=TS1,ADDR=0,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T1)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:2:, PORT=TS1,ADDR=1,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T2)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:3:, PORT=TS1,ADDR=2,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T3)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:4:, PORT=TS1,ADDR=3,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T4)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:5:, PORT=TS1,ADDR=4,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T5)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:6:, PORT=TS1,ADDR=5,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T6)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:7:, PORT=TS1,ADDR=6,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T7)")
+dbLoadRecords("$(ADCORE)/db/NDTimeSeriesN.template", "P=$(PREFIX),R=TS:8:, PORT=TS1,ADDR=7,TIMEOUT=1,NCHANS=$(TSPOINTS),NAME=$(T8)")
 
 # FFT plugins, one per time-series signal.
 #
@@ -89,21 +92,21 @@ dbLoadRecords("NDTimeSeriesN.template", "P=$(PREFIX),R=TS:8:, PORT=TS1,ADDR=7,TI
 # NOTE: upstream's NDFFTConfigure("FFT3", ...) line is missing its closing
 # parenthesis; it is closed here.
 NDFFTConfigure("FFT1", $(QSIZE), 0, "TS1", 0)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT1:,PORT=FFT1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=0,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T1)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT1:,PORT=FFT1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=0,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T1)")
 NDFFTConfigure("FFT2", $(QSIZE), 0, "TS1", 1)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT2:,PORT=FFT2,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=1,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T2)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT2:,PORT=FFT2,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=1,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T2)")
 NDFFTConfigure("FFT3", $(QSIZE), 0, "TS1", 2)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT3:,PORT=FFT3,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=2,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T3)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT3:,PORT=FFT3,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=2,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T3)")
 NDFFTConfigure("FFT4", $(QSIZE), 0, "TS1", 3)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT4:,PORT=FFT4,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=3,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T4)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT4:,PORT=FFT4,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=3,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T4)")
 NDFFTConfigure("FFT5", $(QSIZE), 0, "TS1", 4)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT5:,PORT=FFT5,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=4,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T5)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT5:,PORT=FFT5,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=4,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T5)")
 NDFFTConfigure("FFT6", $(QSIZE), 0, "TS1", 5)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT6:,PORT=FFT6,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=5,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T6)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT6:,PORT=FFT6,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=5,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T6)")
 NDFFTConfigure("FFT7", $(QSIZE), 0, "TS1", 6)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT7:,PORT=FFT7,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=6,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T7)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT7:,PORT=FFT7,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=6,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T7)")
 NDFFTConfigure("FFT8", $(QSIZE), 0, "TS1", 7)
-dbLoadRecords("NDFFT.template","P=$(PREFIX),R=FFT8:,PORT=FFT8,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=7,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T8)")
+dbLoadRecords("$(ADCORE)/db/NDFFT.template","P=$(PREFIX),R=FFT8:,PORT=FFT8,ADDR=0,TIMEOUT=1,NDARRAY_PORT=TS1,NDARRAY_ADDR=7,NCHANS=$(TSPOINTS),TIME_LINK=$(PREFIX)TS:TSAveragingTime_RBV CP MS,ENABLED=1,NAME=$(T8)")
 
 # Remaining plugin chain
 < $(ADCSIMDETECTOR)/csimDetectorPlugins.cmd

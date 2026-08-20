@@ -31,8 +31,7 @@ epicsEnvSet("YSIZE", "1024")
 epicsEnvSet("NELEMENTS", "411648")
 
 # $(ADPIXIRAD) is set to this crate's root by ioc_support at startup; the
-# shared workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADPIXIRAD)/../../../db:$(ADCORE)/db")
+# templates live in its db/ subdir.
 
 # The command socket. The box terminates what it sends; only an output EOS
 # is needed.
@@ -49,13 +48,17 @@ pixiradConfig("$(PORT)", "$(COMMAND_PORT)", $(DATA_PORT), $(STATUS_PORT), $(DATA
 # ship with it; these are the ones from the upstream startup script.
 pixiradAutoCal("$(PORT)", 0, 0, 7, 7, 3, 7, 1850)
 
-dbLoadRecords("pixirad.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADPIXIRAD)/db/pixirad.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Standard arrays plugin. The detector always sends 16-bit counts; a
 # multi-colour frame type makes the array 3-dimensional, so NELEMENTS has to
 # be multiplied by the number of colours to see one.
 NDStdArraysConfigure("Image1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=$(NELEMENTS)")
 
 < $(ADCORE)/ioc/commonPlugins.cmd
 

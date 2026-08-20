@@ -27,9 +27,8 @@ epicsEnvSet("BIS_HOST",       "chemmat21")
 epicsEnvSet("COMMAND_PORT",   "BIS_COMMAND")
 epicsEnvSet("STATUS_PORT",    "BIS_STATUS")
 
-# $(ADBRUKER) is set to this crate's root by ioc_support at startup; the shared
-# workspace db/ lives three levels up from there.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADBRUKER)/../../../db:$(ADCORE)/db")
+# $(ADBRUKER) is set to this crate's root by ioc_support at startup; the
+# templates live in its db/ subdir.
 
 # The command socket. BIS takes a newline-terminated command and answers with a
 # bracketed message that ends with ']' — the BIS documentation says the answers
@@ -51,12 +50,16 @@ asynOctetSetInputEos("$(STATUS_PORT)", 0, "\n")
 # maxBuffers, priority and stackSize are accepted and ignored.
 BISDetectorConfig("$(PORT)", "$(COMMAND_PORT)", "$(STATUS_PORT)", 0, 0, 0, 0)
 
-dbLoadRecords("BIS.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,BIS_PORT=$(COMMAND_PORT)")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADBRUKER)/db/BIS.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1,BIS_PORT=$(COMMAND_PORT)")
 
 # Standard arrays plugin fed from the BIS port. The driver publishes 32-bit
 # unsigned pixels, so TYPE/FTVL are Int32/LONG.
 NDStdArraysConfigure("Image1", $(QSIZE), 0, "$(PORT)", 0)
-dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=$(NELEMENTS)")
 
 < $(ADCORE)/ioc/commonPlugins.cmd
 

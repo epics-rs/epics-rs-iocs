@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use epics_rs::base::server::db_loader::{DbLoadConfig, DbRecordDef, parse_db_file};
 
 fn db_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../drivers/ad/eiger/db")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("db")
 }
 
 fn ad_core_db_dir() -> PathBuf {

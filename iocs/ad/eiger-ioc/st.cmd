@@ -20,12 +20,15 @@ epicsEnvSet("EPICS_CA_MAX_ARRAY_BYTES", "5000000")
 
 # $(ADEIGER) is set to this crate's root (iocs/ad/eiger-ioc) by ioc_support at
 # IOC startup; $(ADCORE) is exported by ad-core-rs.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(ADEIGER)/../../../drivers/ad/eiger/db")
 
 eigerDetectorConfig("$(PORT)", "$(EIGERIP)", 0)
 
 # The template must match the detector family: eiger1, eiger2 or pilatus4.
-dbLoadRecords("eiger2.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADEIGER)/db/eiger2.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Standard-arrays plugins.
 #

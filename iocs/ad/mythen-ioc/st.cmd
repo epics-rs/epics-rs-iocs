@@ -24,11 +24,14 @@ asynOctetSetOutputEos("IP_M1K", 0, "\r")
 
 # $(ADMYTHEN) is set to this crate's root (iocs/ad/mythen-ioc) by ioc_support at
 # IOC startup; $(ADCORE) is exported by ad-core-rs.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(ADMYTHEN)/../../../drivers/ad/mythen/db")
 
 mythenConfig("$(PORT)", "IP_M1K", 0)
 
-dbLoadRecords("mythen.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(ADMYTHEN)/db/mythen.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
 # Standard-arrays plugin. The detector's readout is UInt32 (one word per
 # channel), so the waveform is LONG, and it is as wide as all the modules
