@@ -35,8 +35,16 @@ async fn main() -> CaResult<()> {
     };
 
     // scaler-rs ships its own ready-to-use db/ directory (scaler.db,
-    // scaler16.db, ...) -- no template is authored in this crate.
-    epics_rs::base::runtime::env::set_default("SCALER", epics_rs::scaler::SCALER_DB_DIR);
+    // scaler16.db, ...) -- no template is authored in this crate. Its
+    // const names the db dir itself; SCALER names the crate dir so
+    // st.cmd loads follow the repo-wide $(MACRO)/db/<file> form.
+    let scaler_dir = std::path::Path::new(epics_rs::scaler::SCALER_DB_DIR)
+        .parent()
+        .expect("SCALER_DB_DIR is <crate>/db");
+    epics_rs::base::runtime::env::set_default(
+        "SCALER",
+        scaler_dir.to_str().expect("cargo paths are UTF-8"),
+    );
 
     let mut app = IocApplication::new();
 

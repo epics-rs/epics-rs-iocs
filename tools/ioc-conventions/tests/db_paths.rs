@@ -4,16 +4,15 @@
 //! (no cwd-relative, no repo-root-relative, no `..` traversal, no
 //! `EPICS_DB_INCLUDE_PATH` search), where the IOC's own Rust sources give
 //! `MACRO` a `set_default` pointing at the owning directory. Crates that
-//! ship their templates export the macro themselves: `$(ADCORE)/db/<file>`
-//! (ad-core-rs) and `$(SCALER)/<file>` (epics-rs scaler, the const is the
-//! db dir itself); for those only the form is checked here — existence is
-//! the dependency's concern.
+//! ship their templates ($(ADCORE) from ad-core-rs, $(SCALER) from
+//! scaler-rs) follow the same form; for those only the form is checked
+//! here — existence is the dependency's concern.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Macros exported by dependency crates: (name, path already ends at db).
-const EXTERNAL: &[(&str, bool)] = &[("ADCORE", false), ("SCALER", true)];
+/// Macros whose owning directory lives in a dependency crate.
+const EXTERNAL: &[&str] = &["ADCORE", "SCALER"];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -210,14 +209,10 @@ fn every_db_load_is_macro_form_and_resolvable() {
                     failures.push(format!("{at}: unclosed macro in {path:?}"));
                     continue;
                 };
-                let external = EXTERNAL.iter().find(|(n, _)| *n == name);
-                let file = match (rest.strip_prefix("/db/"), external) {
-                    (Some(file), _) => file,
-                    (None, Some((_, true))) => rest.trim_start_matches('/'),
-                    _ => {
-                        failures.push(format!("{at}: not $({name})/db/<file>: {path:?}"));
-                        continue;
-                    }
+                let external = EXTERNAL.contains(&name);
+                let Some(file) = rest.strip_prefix("/db/") else {
+                    failures.push(format!("{at}: not $({name})/db/<file>: {path:?}"));
+                    continue;
                 };
                 if file.contains('/') {
                     failures.push(format!("{at}: nested path after db/: {path:?}"));
@@ -233,7 +228,7 @@ fn every_db_load_is_macro_form_and_resolvable() {
                         Some(ioc_dir.parent().expect("ioc dir has a parent").join("db"))
                     }
                     Some(MacroTarget::ExternalConst) => None,
-                    None if external.is_some() => None,
+                    None if external => None,
                     None => {
                         failures.push(format!(
                             "{at}: $({name}) has no set_default in {}",

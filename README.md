@@ -90,7 +90,7 @@ Every IOC owns its EPICS templates: they live in the IOC crate's `db/`
 them as `$(MACRO)/db/<file>`, where main.rs defaults the macro to the
 owning directory (`set_default("<MACRO>", env!("CARGO_MANIFEST_DIR"))`),
 so an IOC boots from any cwd. Library-shipped templates load the same
-way through the crate-exported macros (`$(ADCORE)/db`, `$(SCALER)`).
+way through the crate-exported macros (`$(ADCORE)/db`, `$(SCALER)/db`).
 
 ### Adding a New Device
 
@@ -749,7 +749,7 @@ Ports from [`epics-modules/scaler`](https://github.com/epics-modules/scaler) —
 
 #### scaler974 records
 
-Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at `epics_rs::scaler::SCALER_DB_DIR` (the `scaler-rs` crate's own bundled `db/`, re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.26.1` per `Cargo.lock`) and loads `$(SCALER)/scaler.db`. That file instantiates one real `scalerRecord`:
+Not vendored in this repo: `scaler974-ioc/main.rs` points `$(SCALER)` at the `scaler-rs` crate dir (its bundled `db/` is re-exported through `epics-rs`'s `scaler` feature, pinned to `scaler-rs 0.26.2` per `Cargo.lock`) and loads `$(SCALER)/db/scaler.db`. That file instantiates one real `scalerRecord`:
 
 ```
 grecord(scaler,"$(P)$(S)") {
@@ -763,7 +763,7 @@ grecord(scaler,"$(P)$(S)") {
 ```
 plus 14 chained `bo`/`calc`/`transform` helper records (`_calcEnable`, `_calc_ctrl` (2 `bo`), `_calc1`-`_calc8` (8 `calc`), `_cts1`-`_cts4` (4 `transform`)) that derive count-rates from the record's own `.S1`-`.S16` (16-channel counts) and `.T` (elapsed-time preset) fields — confirming a 16-channel `scalerRecord`, consistent with `scaler-rs`'s sibling `scaler16.db`/`scaler32.db`/`scaler16m.db` files also present in that crate's `db/` (not loaded by this IOC).
 
-`iocs/scaler974-ioc/st.cmd` configures a serial port (`drvAsynSerialPortConfigure`, 9600/8/N/1, EOS `\r\n`/`\r` — not set by `drvScaler974` itself, per `connect.rs`'s doc, so this is the IOC's own choice pending the Ortec 974 manual), then `initScaler974("SCL1","S0",0,100)` (100 ms poll), then `dbLoadRecords("$(SCALER)/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")` followed by a `dbpf(...DTYP,"Asyn Scaler")` — DTYP is set via `dbpf` rather than a `dbLoadRecords` macro because macro-based `DTYP=` would force-overwrite every record's DTYP field in `scaler.db`, corrupting the `_calcEnable`/`_calc_ctrl` helper records' `"Soft Channel"` DTYP.
+`iocs/scaler974-ioc/st.cmd` configures a serial port (`drvAsynSerialPortConfigure`, 9600/8/N/1, EOS `\r\n`/`\r` — not set by `drvScaler974` itself, per `connect.rs`'s doc, so this is the IOC's own choice pending the Ortec 974 manual), then `initScaler974("SCL1","S0",0,100)` (100 ms poll), then `dbLoadRecords("$(SCALER)/db/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")` followed by a `dbpf(...DTYP,"Asyn Scaler")` — DTYP is set via `dbpf` rather than a `dbLoadRecords` macro because macro-based `DTYP=` would force-overwrite every record's DTYP field in `scaler.db`, corrupting the `_calcEnable`/`_calc_ctrl` helper records' `"Soft Channel"` DTYP.
 
 Build/run:
 ```

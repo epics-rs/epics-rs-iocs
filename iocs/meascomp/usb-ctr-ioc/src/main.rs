@@ -32,9 +32,17 @@ async fn main() -> CaResult<()> {
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
-    // scaler-rs ships scaler.db; st.cmd loads it from $(SCALER) the way
-    // upstream's USBCTR st.cmd loads it from the scaler module.
-    epics_rs::base::runtime::env::set_default("SCALER", epics_rs::scaler::SCALER_DB_DIR);
+    // scaler-rs ships scaler.db; st.cmd loads it from $(SCALER)/db the
+    // way upstream's USBCTR st.cmd loads it from the scaler module. The
+    // crate's const names the db dir itself; SCALER names the crate dir
+    // so the load follows the repo-wide $(MACRO)/db/<file> form.
+    let scaler_dir = std::path::Path::new(epics_rs::scaler::SCALER_DB_DIR)
+        .parent()
+        .expect("SCALER_DB_DIR is <crate>/db");
+    epics_rs::base::runtime::env::set_default(
+        "SCALER",
+        scaler_dir.to_str().expect("cargo paths are UTF-8"),
+    );
 
     let trace = Arc::new(TraceManager::new());
 
