@@ -10,8 +10,8 @@
 //!   client stops kicking the watchdog — the timeout that stops a jog,
 //! - the `Control:Stop` dfanout fires `Control:stopL.PROC`,
 //!   and `Control:stop_on_safety` fans out to `Control:Stop` / `Dashboard:Stop`,
-//! - `auto_moveJ_calc` / `auto_moveL_calc` fire `Control:moveJ.PROC` /
-//!   `Control:moveL.PROC`,
+//! - the `J*CmdU` / `Pose*CmdU` records FLNK `Control:moveJ.PROC` /
+//!   `Control:moveL.PROC` after writing the target,
 //! - `RobotiqGripper:MinPosition` / `MaxPosition` FLNK to
 //!   `SetPositionRange.PROC`,
 //! - `RobotiqGripper:Activate` carries `PINI="$(AUTO_ACTIVATE=YES)"`.
@@ -184,5 +184,55 @@ fn the_parser_finds_every_record_in_every_db_file() {
         );
         counts.insert(file, parsed.len());
     }
-    assert_eq!(counts.len(), 6, "six .db files: {counts:?}");
+    assert_eq!(counts.len(), 7, "seven .db files: {counts:?}");
+}
+
+/// The A4 split invariant: everything that drives the robot through the
+/// dashboard lives in dashboard_ctrl.db and nothing that does lives in
+/// dashboard.db, so an IOC loading only dashboard.db exposes no way to
+/// write those commands. Connect/Disconnect are the deliberate exceptions:
+/// link management a monitoring IOC still needs.
+#[test]
+fn the_dashboard_control_surface_lives_only_in_the_ctrl_file() {
+    let read = |name: &str| std::fs::read_to_string(db_dir().join(name)).expect("a readable db");
+    let out_params = |text: &str| -> Vec<String> {
+        parse(text)
+            .into_iter()
+            .filter_map(|r| r.out_param)
+            .collect()
+    };
+
+    let status_outs = out_params(&read("dashboard.db"));
+    assert_eq!(
+        status_outs,
+        vec!["CONNECT".to_string(), "DISCONNECT".to_string()],
+        "dashboard.db may carry no writable surface beyond the link pair"
+    );
+
+    let ctrl_outs = out_params(&read("dashboard_ctrl.db"));
+    for param in [
+        "PLAY",
+        "STOP",
+        "PAUSE",
+        "SHUTDOWN",
+        "CLOSE_POPUP",
+        "CLOSE_SAFETY_POPUP",
+        "POWER_ON",
+        "POWER_OFF",
+        "BRAKE_RELEASE",
+        "UNLOCK_PROTECTIVE_STOP",
+        "RESTART_SAFETY",
+        "POPUP",
+        "LOAD_URP",
+    ] {
+        assert!(
+            ctrl_outs.iter().any(|p| p == param),
+            "{param} must be in dashboard_ctrl.db"
+        );
+    }
+    assert_eq!(
+        ctrl_outs.len(),
+        13,
+        "the ctrl file is exactly the 13 commands"
+    );
 }

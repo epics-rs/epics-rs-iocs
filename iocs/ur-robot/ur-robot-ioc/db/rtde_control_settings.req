@@ -1,0 +1,32 @@
+# Port of urRobotApp/Db/rtde_control_settings.req. Upstream's last line
+# names Control:CustomScriptPath, a record that does not exist (the lso is
+# Control:CustomScriptFile), so autosave silently never saved the script
+# path — see doc/upstream-c-defects.md #221.
+$(P)Control:J1TweakVal
+$(P)Control:J2TweakVal
+$(P)Control:J3TweakVal
+$(P)Control:J4TweakVal
+$(P)Control:J5TweakVal
+$(P)Control:J6TweakVal
+
+$(P)Control:PoseXTweakVal.VAL
+$(P)Control:PoseYTweakVal.VAL
+$(P)Control:PoseZTweakVal.VAL
+
+$(P)Control:TCPOffset_X.VAL
+$(P)Control:TCPOffset_Y.VAL
+$(P)Control:TCPOffset_Z.VAL
+$(P)Control:TCPOffset_Rx.VAL
+$(P)Control:TCPOffset_Ry.VAL
+$(P)Control:TCPOffset_Rz.VAL
+
+$(P)Control:JointSpeed.VAL
+$(P)Control:JointAcceleration.VAL
+$(P)Control:JointBlend.VAL
+
+$(P)Control:LinearSpeed.VAL
+$(P)Control:LinearAcceleration.VAL
+$(P)Control:LinearBlend.VAL
+
+$(P)Control:CustomScriptTimeout.VAL
+$(P)Control:CustomScriptFile.VAL

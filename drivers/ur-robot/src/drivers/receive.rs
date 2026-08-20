@@ -26,6 +26,47 @@ pub const NUM_JOINTS: usize = 6;
 /// (rtde_receive_driver.cpp:40).
 const SAFETY_STATUS_BITS_MASK: u32 = 0x7ff;
 
+use crate::drivers::STALE_AFTER;
+
+/// Reconnect pacing for the poll thread: the first attempt fires on the
+/// unhealthy transition, later ones back off 1 s → 2 s → 5 s (cap). Each
+/// attempt itself is bounded by the connect/`FIRST_STATE_TIMEOUT` limits
+/// inside [`ReceiveInterface::connect`]/`reconnect`.
+const RECONNECT_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
+
+/// Backoff state for the poll-thread reconnect.
+struct Backoff {
+    idx: usize,
+    next: Option<std::time::Instant>,
+}
+
+impl Backoff {
+    fn new() -> Self {
+        Self { idx: 0, next: None }
+    }
+
+    /// Whether an attempt is due — always true before the first failure.
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.next.is_none_or(|t| now >= t)
+    }
+
+    /// Record a failed attempt: schedule the next one and escalate the delay.
+    fn failed(&mut self, now: std::time::Instant) {
+        self.next = Some(now + RECONNECT_BACKOFF[self.idx]);
+        self.idx = (self.idx + 1).min(RECONNECT_BACKOFF.len() - 1);
+    }
+
+    /// Back to healthy: the next unhealthy transition retries immediately.
+    fn reset(&mut self) {
+        self.idx = 0;
+        self.next = None;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ReceiveParams {
     pub disconnect: usize,
@@ -72,7 +113,7 @@ pub struct ReceiveParams {
 }
 
 impl ReceiveParams {
-    fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+    pub(crate) fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
         Ok(Self {
             disconnect: base.create_param("DISCONNECT", ParamType::Int32)?,
             reconnect: base.create_param("RECONNECT", ParamType::Int32)?,
@@ -135,6 +176,61 @@ impl ReceiveParams {
     fn is_command(&self, reason: usize) -> bool {
         reason == self.disconnect || reason == self.reconnect
     }
+
+    /// Every readback `(reason, addr)` the poll thread publishes — the set
+    /// that carries the COMM alarm while the stream is down. Excluded: the
+    /// two link commands (nothing to alarm on a command), and
+    /// `IS_CONNECTED`, which is the health readback itself and must stay
+    /// valid at 0 while everything else goes COMM/INVALID — it is the one
+    /// PV that says why. `alarm_set_is_every_readback` enforces that a new
+    /// parameter lands in exactly one of the two groups.
+    fn alarm_targets(&self) -> Vec<(usize, i32)> {
+        let scalars = [
+            self.runtime_state,
+            self.robot_mode,
+            self.safety_status_bits,
+            self.controller_timestamp,
+            self.std_analog_input0,
+            self.std_analog_input1,
+            self.std_analog_output0,
+            self.std_analog_output1,
+            self.actual_joint_pos_arr,
+            self.actual_tcp_pose_arr,
+            self.digital_input_bits,
+            self.digital_output_bits,
+            self.actual_joint_velocities,
+            self.actual_joint_currents,
+            self.joint_control_currents,
+            self.actual_tcp_speed,
+            self.actual_tcp_force,
+            self.safety_mode,
+            self.joint_modes,
+            self.actual_tool_accel,
+            self.target_joint_positions,
+            self.target_joint_velocities,
+            self.target_joint_accelerations,
+            self.target_joint_currents,
+            self.target_joint_moments,
+            self.target_tcp_pose,
+            self.target_tcp_speed,
+            self.joint_temperatures,
+            self.speed_scaling,
+            self.target_speed_fraction,
+            self.actual_momentum,
+            self.actual_main_voltage,
+            self.actual_robot_voltage,
+            self.actual_robot_current,
+            self.actual_joint_voltages,
+            self.output_integer_reg12,
+        ];
+        let mut targets: Vec<(usize, i32)> = scalars.into_iter().map(|r| (r, 0)).collect();
+        // The per-joint scalars are published at every address.
+        for addr in 0..NUM_JOINTS as i32 {
+            targets.push((self.actual_joint_pos, addr));
+            targets.push((self.actual_tcp_pose, addr));
+        }
+        targets
+    }
 }
 
 /// The RTDE receive driver.
@@ -160,7 +256,7 @@ impl ReceiveDriver {
         let params = ReceiveParams::create(&mut base)?;
 
         let shared = ReceiveHandle::new();
-        registry::register_receive(port_name, shared.clone());
+        registry::register_receive(port_name, shared.clone()).map_err(asyn_error)?;
 
         let mut me = Self {
             base,
@@ -192,33 +288,44 @@ impl ReceiveDriver {
     /// `connected` inside `if (!isConnected())`, so processing RECONNECT on a
     /// healthy link answers `asynError`. Here a live connection is a success.
     fn try_connect(&mut self) -> bool {
-        let mut slot = self.iface.lock();
-        match slot.as_mut() {
-            Some(iface) => {
-                if iface.is_connected() {
-                    return true;
-                }
-                log::info!("ur-robot: reconnecting to the RTDE receive interface");
-                match iface.reconnect() {
-                    Ok(()) => true,
-                    Err(e) => {
-                        log::error!("ur-robot: RTDE receive reconnect failed: {e}");
-                        false
-                    }
-                }
+        connect_or_reconnect(&mut self.iface.lock(), &self.robot_ip)
+    }
+}
+
+/// Connect (no interface yet) or reconnect (interface present but down) the
+/// receive interface in `slot`. A live connection is a success. Shared by the
+/// RECONNECT command ([`ReceiveDriver::try_connect`]) and the poll thread's
+/// automatic recovery.
+fn connect_or_reconnect(slot: &mut Option<ReceiveInterface>, robot_ip: &str) -> bool {
+    match slot.as_mut() {
+        Some(iface) => {
+            // The healthy short-circuit gates on aliveness, not the socket: a
+            // stale link (socket open, packages stopped) still answers
+            // `is_connected() == true` and must be cycled, or both the manual
+            // RECONNECT and the poll-thread recovery would no-op forever.
+            if iface.is_alive(STALE_AFTER) {
+                return true;
             }
-            None => match ReceiveInterface::connect(&self.robot_ip, false) {
-                Ok(iface) => {
-                    log::info!("ur-robot: connected to the RTDE receive interface");
-                    *slot = Some(iface);
-                    true
-                }
+            log::info!("ur-robot: reconnecting to the RTDE receive interface");
+            match iface.reconnect() {
+                Ok(()) => true,
                 Err(e) => {
-                    log::error!("ur-robot: RTDE receive connect failed: {e}");
+                    log::error!("ur-robot: RTDE receive reconnect failed: {e}");
                     false
                 }
-            },
+            }
         }
+        None => match ReceiveInterface::connect(robot_ip, false) {
+            Ok(iface) => {
+                log::info!("ur-robot: connected to the RTDE receive interface");
+                *slot = Some(iface);
+                true
+            }
+            Err(e) => {
+                log::error!("ur-robot: RTDE receive connect failed: {e}");
+                false
+            }
+        },
     }
 }
 
@@ -232,47 +339,56 @@ impl PortDriver for ReceiveDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let p = self.params;
-        self.base.params.set_int32(reason, user.addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            self.base.params.set_int32(reason, user.addr, value)?;
 
-        if p.is_command(reason) && value == 0 {
-            return Ok(());
-        }
+            if p.is_command(reason) && value == 0 {
+                return Ok(());
+            }
 
-        if reason == p.reconnect {
-            return if self.try_connect() {
-                Ok(())
-            } else {
-                Err(asyn_error(
-                    "could not connect to the RTDE receive interface",
-                ))
+            if reason == p.reconnect {
+                return if self.try_connect() {
+                    Ok(())
+                } else {
+                    Err(asyn_error(
+                        "could not connect to the RTDE receive interface",
+                    ))
+                };
+            }
+
+            let mut slot = self.iface.lock();
+            let Some(iface) = slot.as_mut() else {
+                return Err(asyn_error("the RTDE receive interface is not initialised"));
             };
-        }
 
-        let mut slot = self.iface.lock();
-        let Some(iface) = slot.as_mut() else {
-            return Err(asyn_error("the RTDE receive interface is not initialised"));
-        };
+            if reason == p.disconnect {
+                iface.disconnect();
+                return Ok(());
+            }
 
-        if reason == p.disconnect {
-            iface.disconnect();
-            return Ok(());
-        }
-
-        if !iface.is_connected() {
-            return Err(asyn_error("the RTDE receive interface is not connected"));
-        }
-        Ok(())
+            if !iface.is_connected() {
+                return Err(asyn_error("the RTDE receive interface is not connected"));
+            }
+            Ok(())
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }
 
 /// The receive poll thread (`RTDEReceive::poll`).
+///
+/// Deviation from C (which never reconnects on its own): the poll thread owns
+/// automatic recovery. An unhealthy stream — socket down OR stale per
+/// [`STALE_AFTER`] — is retried on the [`RECONNECT_BACKOFF`] schedule, so a
+/// monitoring IOC comes back by itself when the robot does.
 pub fn start_poller(
     handle: PortHandle,
     params: ReceiveParams,
     iface: Arc<Mutex<Option<ReceiveInterface>>>,
     shared: ReceiveHandle,
+    robot_ip: String,
     poll_period: Duration,
     ready: Arc<IocReady>,
 ) -> std::thread::JoinHandle<()> {
@@ -280,15 +396,38 @@ pub fn start_poller(
         .name("ur-receive-poll".into())
         .spawn(move || {
             ready.wait();
+            let mut backoff = Backoff::new();
+            let alarm_targets = params.alarm_targets();
+            // Starts true so an IOC that boots with the robot down raises
+            // the COMM alarm on its first cycle instead of waiting for a
+            // connection that may never come.
+            let mut was_healthy = true;
             loop {
+                let healthy = {
+                    let slot = iface.lock();
+                    slot.as_ref().is_some_and(|i| i.is_alive(STALE_AFTER))
+                };
+                if healthy {
+                    backoff.reset();
+                } else {
+                    let now = std::time::Instant::now();
+                    if backoff.due(now) {
+                        if connect_or_reconnect(&mut iface.lock(), &robot_ip) {
+                            backoff.reset();
+                        } else {
+                            backoff.failed(now);
+                        }
+                    }
+                }
+
                 let snapshot = {
                     let slot = iface.lock();
                     slot.as_ref()
-                        .filter(|i| i.is_connected())
+                        .filter(|i| i.is_alive(STALE_AFTER))
                         .map(|i| i.snapshot())
                 };
 
-                let updates = match &snapshot {
+                let mut updates = match &snapshot {
                     Some(snap) if !snap.is_empty() => {
                         let state = ReceiveState {
                             connected: true,
@@ -315,6 +454,17 @@ pub fn start_poller(
                     }
                 };
 
+                // Same predicate as the publish arm above, so the alarm
+                // rides the flush cycle that first sees the transition —
+                // recovery clears the alarm in the very batch that carries
+                // the fresh values.
+                let healthy_now = matches!(&snapshot, Some(s) if !s.is_empty());
+                updates.extend(crate::drivers::health_transition(
+                    &alarm_targets,
+                    healthy_now,
+                    &mut was_healthy,
+                ));
+
                 for (addr, batch) in by_addr(updates) {
                     let _ = handle.set_params_and_notify_blocking(addr, batch);
                 }
@@ -330,14 +480,12 @@ pub fn start_poller(
 /// asynPortDriver.cpp:820), and [`publish`] writes the joint and TCP-pose
 /// elements at addresses `0..NUM_JOINTS`. Flushing address 0 alone stores the
 /// other five but consumes no changed flag for them, so `Joint2`-`Joint6` and
-/// `PoseY`-`PoseYaw` never see an `I/O Intr` and stay UDF for the life of the
+/// `PoseY`-`PoseRz` never see an `I/O Intr` and stay UDF for the life of the
 /// IOC.
 fn by_addr(updates: Vec<ParamSetValue>) -> Vec<(i32, Vec<ParamSetValue>)> {
     let mut batches: Vec<(i32, Vec<ParamSetValue>)> = Vec::new();
     for u in updates {
-        let addr = match u {
-            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => addr,
-        };
+        let addr = u.addr();
         match batches.iter_mut().find(|(a, _)| *a == addr) {
             Some((_, batch)) => batch.push(u),
             None => batches.push((addr, vec![u])),
@@ -456,12 +604,14 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
         ));
     }
 
-    // TCP pose: x,y,z in metres -> mm; rx,ry,rz in radians -> degrees.
+    // TCP pose: x,y,z in metres -> mm; rx,ry,rz stay radians — they are a
+    // rotation vector (axis-angle scaled by the angle), not Euler angles, so
+    // a degree scaling has no meaning (upstream c02490e).
     if let Some(pose) = snap.doubles("actual_TCP_pose") {
         let converted: Vec<f64> = pose
             .iter()
             .enumerate()
-            .map(|(i, v)| if i < 3 { v * 1000.0 } else { deg(*v) })
+            .map(|(i, v)| if i < 3 { v * 1000.0 } else { *v })
             .collect();
         for (i, v) in converted.iter().enumerate() {
             updates.push(ParamSetValue::new(
@@ -484,7 +634,37 @@ fn publish(p: ReceiveParams, snap: &Snapshot) -> Vec<ParamSetValue> {
 mod tests {
     use super::*;
     use crate::state::Value;
+    use epics_rs::asyn::error::AsynStatus;
     use std::collections::HashMap;
+    use std::time::Instant;
+
+    /// The pacing boundaries: an attempt is due immediately on the unhealthy
+    /// transition, then 1 s → 2 s → 5 s, capped at 5 s, and reset restores
+    /// the immediate first attempt.
+    #[test]
+    fn backoff_escalates_to_the_cap_and_resets() {
+        let mut b = Backoff::new();
+        let t0 = Instant::now();
+        assert!(b.due(t0), "first attempt is immediate");
+
+        b.failed(t0);
+        assert!(!b.due(t0 + Duration::from_millis(999)));
+        assert!(b.due(t0 + Duration::from_secs(1)));
+
+        b.failed(t0);
+        assert!(!b.due(t0 + Duration::from_millis(1999)));
+        assert!(b.due(t0 + Duration::from_secs(2)));
+
+        b.failed(t0);
+        assert!(b.due(t0 + Duration::from_secs(5)));
+        // Capped: further failures stay at 5 s.
+        b.failed(t0);
+        assert!(!b.due(t0 + Duration::from_millis(4999)));
+        assert!(b.due(t0 + Duration::from_secs(5)));
+
+        b.reset();
+        assert!(b.due(t0), "reset restores the immediate first attempt");
+    }
 
     fn params() -> ReceiveParams {
         // Distinct indices; only their identity matters to `publish`.
@@ -586,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_pose_converts_metres_to_mm_and_radians_to_degrees() {
+    fn tcp_pose_converts_metres_to_mm_and_passes_rotation_vector_raw() {
         let p = params();
         let mut values = HashMap::new();
         values.insert(
@@ -608,7 +788,7 @@ mod tests {
         assert!((arr[0] - 100.0).abs() < 1e-9);
         assert!((arr[1] + 200.0).abs() < 1e-9);
         assert!((arr[2] - 350.0).abs() < 1e-9);
-        assert!((arr[3] - 180.0).abs() < 1e-9);
+        assert!((arr[3] - std::f64::consts::PI).abs() < 1e-9);
     }
 
     #[test]
@@ -653,9 +833,7 @@ mod tests {
     }
 
     fn addr_of(u: &ParamSetValue) -> i32 {
-        match u {
-            ParamSetValue::Value { addr, .. } | ParamSetValue::UInt32Digital { addr, .. } => *addr,
-        }
+        u.addr()
     }
 
     #[test]
@@ -721,6 +899,75 @@ mod tests {
             driver.base.params.get_int32(params.disconnect, 0).ok(),
             Some(1)
         );
+    }
+
+    /// Completeness of the alarm set: every parameter this driver creates is
+    /// either an alarm target or one of the three deliberate exclusions
+    /// (the two link commands and the health readback). A parameter added to
+    /// `ReceiveParams` without classifying it here fails this test instead of
+    /// silently staying NO_ALARM through an outage.
+    #[test]
+    fn alarm_set_is_every_readback() {
+        let mut base = PortDriverBase::new("recv_alarm_set", NUM_JOINTS, PortFlags::default());
+        let p = ReceiveParams::create(&mut base).expect("params create");
+
+        let targets = p.alarm_targets();
+        let excluded = [p.disconnect, p.reconnect, p.is_connected];
+        for reason in 0..base.params.len() {
+            let targeted = targets.iter().any(|(r, _)| *r == reason);
+            let is_excluded = excluded.contains(&reason);
+            assert!(
+                targeted != is_excluded,
+                "param {reason} must be exactly one of: alarm target, exclusion"
+            );
+        }
+
+        // The per-joint scalars are covered at every address they publish to.
+        for per_addr in [p.actual_joint_pos, p.actual_tcp_pose] {
+            for addr in 0..NUM_JOINTS as i32 {
+                assert!(targets.contains(&(per_addr, addr)));
+            }
+        }
+    }
+
+    /// The alarm batch fires on the two health transitions and only there:
+    /// link lost raises Disconnected on every target (the record-side
+    /// fill-in maps it to COMM/INVALID), recovery clears to Success, and
+    /// both steady states stay silent.
+    #[test]
+    fn the_comm_alarm_rides_the_health_transitions_only() {
+        use crate::drivers::health_transition;
+        let p = params();
+        let targets = p.alarm_targets();
+        let mut was = true;
+
+        assert!(health_transition(&targets, true, &mut was).is_empty());
+
+        let raise = health_transition(&targets, false, &mut was);
+        assert_eq!(raise.len(), targets.len());
+        assert!(raise.iter().all(|u| matches!(
+            u,
+            ParamSetValue::Status {
+                status: AsynStatus::Disconnected,
+                alarm_status: 0,
+                alarm_severity: 0,
+                ..
+            }
+        )));
+        assert!(!was, "the edge is consumed");
+
+        assert!(health_transition(&targets, false, &mut was).is_empty());
+
+        let clear = health_transition(&targets, true, &mut was);
+        assert_eq!(clear.len(), targets.len());
+        assert!(clear.iter().all(|u| matches!(
+            u,
+            ParamSetValue::Status {
+                status: AsynStatus::Success,
+                ..
+            }
+        )));
+        assert!(was);
     }
 
     #[test]

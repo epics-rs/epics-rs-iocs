@@ -183,6 +183,9 @@ async fn main() -> CaResult<()> {
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let name = string_arg(args, 0)?;
                 let ip = string_arg(args, 1)?;
+                // Unused (the io port never polls) but validated, so a bad
+                // period is rejected here exactly like on the other ports.
+                poll_arg(args, 2, 0.1)?;
                 let port =
                     create_io(&name, &ip).map_err(|e| format!("RTDEInOutConfig failed: {e}"))?;
                 register(&ports, &name, &trace, port)?;

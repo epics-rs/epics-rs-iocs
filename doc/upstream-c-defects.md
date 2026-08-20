@@ -319,6 +319,10 @@ remain open upstream defects the port did not guess at.
 | 158 | urRobot `rtde_control_driver.cpp:526-540` — unopenable script / disconnected ScriptClient falls through to `asynSuccess` with the error flag clear | fixed-in-port (flag raised, error returned) |
 | 159 | ur_rtde `dashboard_client.cpp:342-360` — `setUserRole` switch with no `break`s: every role falls to "restricted" | observed only (urRobot never calls it; not ported) |
 | 160 | urRobot `rtde_control_driver.cpp:377-386` — comment says m→mm, code does mm→m | fixed-in-port (comment corrected) |
+| 161 | urRobot `urRobotApp/Db/rtde_receive.db:396-401` — `TargetJointMoments` INP names `TARGET_JOINT_CURRENTS` (DESC copied too): the moments PV serves the currents data | fixed-in-port (INP/DESC corrected; wiring pinned by `record_wiring.rs`); upstream PR candidate |
+| 220 | ur_rtde `robotiq_gripper.cpp:98-104` — `receive()` returns one `read_some` as the whole reply: a reply split across TCP segments is truncated, two replies coalesced into one segment desync every later exchange | fixed-in-port (`transact` frames on `'\n'` with a carry-over buffer cleared on connect/disconnect; split and merge boundary tests) |
+| 221 | urRobot `urRobotApp/Db/rtde_control_settings.req:28` — names `Control:CustomScriptPath`, but the record is `Control:CustomScriptFile` (`rtde_control.db:843`): autosave silently never saves or restores the script path | fixed-in-port (the ported `.req` names `CustomScriptFile.VAL`) |
+| 222 | urRobot `urRobotApp/src/calibrate_gripper.cpp:31-32` — prints `Min (closed)` / `Max (open)`, but the device unit runs 0 = fully open to 255 = fully closed and `autoCalibrate` records min on the open sweep: both labels inverted, and an operator copying them into `MIN_POS`/`MAX_POS` learns the wrong ends | fixed-in-port (`calibrate_gripper` bin prints `Min (open)` / `Max (closed)`) |
 | — | ur_rtde `GripperConfig::MIN_POSITION_STOP_ADJUST = -5` applied to both calibration ends (widens open, narrows closed); intended sign underivable without the Robotiq spec | unfixable-without-spec (literal kept) |
 
 ## epics-modules/ip (commits `496b5c1`…`b577ef9`)
