@@ -41,8 +41,8 @@ PIJEDSConfig(0, "$(SERIAL)", 100, 1000)
 # The E-516 is a closed-loop piezo positioner: positions travel the driver
 # boundary in physical units (µm), so MRES = drive_resolution (1e-3) and
 # EGU = um. Homing and hardware limit switches are not supported.
-dbLoadRecords("db/pijeds.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/pijeds.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
 
 iocInit()
 

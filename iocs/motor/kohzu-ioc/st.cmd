@@ -41,8 +41,8 @@ SC800Config(0, "$(SERIAL)", 100, 1000)
 # One motor record per axis (DTYP SC800_$(CARD)_0, _1, ...). The SC-800 works in
 # motor steps, so MRES = 1 and EGU = steps. This example loads two axes; add
 # more (up to the model's axis count) as needed.
-dbLoadRecords("db/sc800.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/sc800.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
 
 iocInit()
 

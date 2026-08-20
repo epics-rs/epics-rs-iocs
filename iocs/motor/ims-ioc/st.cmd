@@ -32,7 +32,7 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\n")
 ImsMDrivePlusCreateController("$(MPORT)", "$(IPPORT)", "$(DEVNAME)", 100, 1000, 2000)
 
 # The single motor record. DTYP matches the motorPort.
-dbLoadRecords("db/ims.template", "P=$(P),M=m1,MPORT=$(MPORT)")
+dbLoadRecords("$(IMS_IOC)/db/ims.template", "P=$(P),M=m1,MPORT=$(MPORT)")
 
 iocInit()
 

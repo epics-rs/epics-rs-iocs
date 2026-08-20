@@ -43,7 +43,7 @@ PIC862Config($(CARD), "$(PORT)", $(ADDR), 100, 1000)
 
 # One motor record for the controller's single axis. The C-862 works in raw
 # controller counts, so MRES = 1.
-dbLoadRecords("db/pic862.template", "P=$(P),M=c862,CARD=$(CARD)")
+dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,CARD=$(CARD)")
 
 # ---- PI C-663 controller (same multi-drop bus, different address) ----
 # The C-663 is a C-862 clone: identical framing (CR out, LF+ETX in — already
@@ -58,7 +58,7 @@ PIC663Setup(8, 10)
 # \x01{addr}VE.
 PIC663Config($(CARD), "$(PORT)", $(ADDR663), 100, 1000)
 
-dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
+dbLoadRecords("$(PI_IOC)/db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 
 # ---- PI C-630 stepper chain (separate port — different protocol/framing) ----
 # The C-630 is NOT a C-862 clone: it uses a per-command 1-digit axis address
@@ -74,9 +74,9 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #PIC630Setup(8, 9, 10)
 # PIC630Config(card, asynPort, numAxes, [cur1..cur9], [movingPollMs], [idlePollMs])
 #PIC630Config(1, "serial630", 3, 5, 3, 0, 0, 0, 0, 0, 0, 0, 100, 1000)
-#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_1,CARD=1,AXIS=0")
-#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_2,CARD=1,AXIS=1")
-#dbLoadRecords("db/pic630.template", "P=$(P),M=c630_3,CARD=1,AXIS=2")
+#dbLoadRecords("$(PI_IOC)/db/pic630.template", "P=$(P),M=c630_1,CARD=1,AXIS=0")
+#dbLoadRecords("$(PI_IOC)/db/pic630.template", "P=$(P),M=c630_2,CARD=1,AXIS=1")
+#dbLoadRecords("$(PI_IOC)/db/pic630.template", "P=$(P),M=c630_3,CARD=1,AXIS=2")
 
 # ---- PI E-662 piezo controller (separate port — SCPI protocol, LF framing) --
 # Single-axis SCPI-like piezo controller (*IDN?, *ESR?, POS?, POS). No address,
@@ -89,7 +89,7 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #PIC662Setup(8, 10)
 # PIC662Config(card, asynPort, [movingPollMs], [idlePollMs])
 #PIC662Config(2, "serial662", 100, 1000)
-#dbLoadRecords("db/pic662.template", "P=$(P),M=c662,CARD=2")
+#dbLoadRecords("$(PI_IOC)/db/pic662.template", "P=$(P),M=c662,CARD=2")
 
 # ---- PI C-844 4-axis DC-servo controller (separate port — SCPI protocol) ----
 # Single-device, 4 axes selected by an "AXIS n;" prefix. *IDN?, no echo, both
@@ -102,10 +102,10 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #PIC844Setup(8, 10)
 # PIC844Config(card, asynPort, addr, [movingPollMs], [idlePollMs])
 #PIC844Config(3, "serial844", 0, 100, 1000)
-#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_1,CARD=3,AXIS=0")
-#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_2,CARD=3,AXIS=1")
-#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_3,CARD=3,AXIS=2")
-#dbLoadRecords("db/pic844.template", "P=$(P),M=c844_4,CARD=3,AXIS=3")
+#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_1,CARD=3,AXIS=0")
+#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_2,CARD=3,AXIS=1")
+#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_3,CARD=3,AXIS=2")
+#dbLoadRecords("$(PI_IOC)/db/pic844.template", "P=$(P),M=c844_4,CARD=3,AXIS=3")
 
 # ---- PI C-848 multi-axis DC-servo controller (separate port) ----------------
 # Up to 4 axes, selected by byte 5 of each command (letters A-D). Axis count is
@@ -119,8 +119,8 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 #PIC848Setup(8, 10)
 # PIC848Config(card, asynPort, addr, [movingPollMs], [idlePollMs])
 #PIC848Config(4, "serial848", 0, 100, 1000)
-#dbLoadRecords("db/pic848.template", "P=$(P),M=c848_1,CARD=4,AXIS=0")
-#dbLoadRecords("db/pic848.template", "P=$(P),M=c848_2,CARD=4,AXIS=1")
+#dbLoadRecords("$(PI_IOC)/db/pic848.template", "P=$(P),M=c848_1,CARD=4,AXIS=0")
+#dbLoadRecords("$(PI_IOC)/db/pic848.template", "P=$(P),M=c848_2,CARD=4,AXIS=1")
 
 # ---- PI E-516 piezo controller (separate serial port) ----
 # The E-516 is a 3-axis closed-loop piezo. Framing is port-owned, LF both ways
@@ -136,9 +136,9 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 # PIE516Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
 # accepted for parity but ignored (axes select by the A/B/C command letter).
 #PIE516Config($(CARD), "piezo1", 0, 100, 1000)
-#dbLoadRecords("db/pie516.template", "P=$(P),M=e516a,CARD=$(CARD),AXIS=0")
-#dbLoadRecords("db/pie516.template", "P=$(P),M=e516b,CARD=$(CARD),AXIS=1")
-#dbLoadRecords("db/pie516.template", "P=$(P),M=e516c,CARD=$(CARD),AXIS=2")
+#dbLoadRecords("$(PI_IOC)/db/pie516.template", "P=$(P),M=e516a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("$(PI_IOC)/db/pie516.template", "P=$(P),M=e516b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("$(PI_IOC)/db/pie516.template", "P=$(P),M=e516c,CARD=$(CARD),AXIS=2")
 
 # ---- PI E-517 piezo controller (separate serial port) ----
 # The E-517 is a 3-axis closed-loop piezo (digit-addressed axes 1/2/3), same
@@ -152,9 +152,9 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 # PIE517Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
 # accepted for parity but ignored.
 #PIE517Config($(CARD), "piezo2", 0, 100, 1000)
-#dbLoadRecords("db/pie517.template", "P=$(P),M=e517a,CARD=$(CARD),AXIS=0")
-#dbLoadRecords("db/pie517.template", "P=$(P),M=e517b,CARD=$(CARD),AXIS=1")
-#dbLoadRecords("db/pie517.template", "P=$(P),M=e517c,CARD=$(CARD),AXIS=2")
+#dbLoadRecords("$(PI_IOC)/db/pie517.template", "P=$(P),M=e517a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("$(PI_IOC)/db/pie517.template", "P=$(P),M=e517b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("$(PI_IOC)/db/pie517.template", "P=$(P),M=e517c,CARD=$(CARD),AXIS=2")
 
 # ---- PI E-710 DC-servo controller (separate serial port) ----
 # The E-710 is a closed-loop DC servo with up to 6 digit-addressed axes (1..6),
@@ -169,9 +169,9 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 # PIE710Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
 # the asyn/GPIB address, accepted for parity but unused on serial.
 #PIE710Config($(CARD), "piezo4", 0, 100, 1000)
-#dbLoadRecords("db/pie710.template", "P=$(P),M=e710a,CARD=$(CARD),AXIS=0")
-#dbLoadRecords("db/pie710.template", "P=$(P),M=e710b,CARD=$(CARD),AXIS=1")
-#dbLoadRecords("db/pie710.template", "P=$(P),M=e710c,CARD=$(CARD),AXIS=2")
+#dbLoadRecords("$(PI_IOC)/db/pie710.template", "P=$(P),M=e710a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("$(PI_IOC)/db/pie710.template", "P=$(P),M=e710b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("$(PI_IOC)/db/pie710.template", "P=$(P),M=e710c,CARD=$(CARD),AXIS=2")
 
 # ---- PI E-816 piezo controller (separate serial port) ----
 # The E-816 is a piezo controller with up to 12 letter-addressed axes (A..L),
@@ -186,9 +186,9 @@ dbLoadRecords("db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
 # PIE816Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - addr is
 # accepted for parity but ignored (axes select by the A..L command letter).
 #PIE816Config($(CARD), "piezo5", 0, 100, 1000)
-#dbLoadRecords("db/pie816.template", "P=$(P),M=e816a,CARD=$(CARD),AXIS=0")
-#dbLoadRecords("db/pie816.template", "P=$(P),M=e816b,CARD=$(CARD),AXIS=1")
-#dbLoadRecords("db/pie816.template", "P=$(P),M=e816c,CARD=$(CARD),AXIS=2")
+#dbLoadRecords("$(PI_IOC)/db/pie816.template", "P=$(P),M=e816a,CARD=$(CARD),AXIS=0")
+#dbLoadRecords("$(PI_IOC)/db/pie816.template", "P=$(P),M=e816b,CARD=$(CARD),AXIS=1")
+#dbLoadRecords("$(PI_IOC)/db/pie816.template", "P=$(P),M=e816c,CARD=$(CARD),AXIS=2")
 
 iocInit()
 

@@ -28,7 +28,7 @@ ACRCreateController(0, "$(IPPORT)", $(NAXES), 20, 1000)
 # One motor record per axis (DTYP ACR_$(CARD)_0, _1, ...). The driver reports
 # positions in controller counts (PPU divides commands, not readback), so
 # MRES = 1.
-dbLoadRecords("db/acr.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(PARKER_IOC)/db/acr.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
 
 iocInit()
 

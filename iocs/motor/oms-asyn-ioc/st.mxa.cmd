@@ -28,6 +28,6 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\n\r")
 omsMXAConfig("$(CTRL)", "$(IPPORT)", "", 100, 1000, 2000)
 
 omsCreateAxis("$(CTRL)", 0)
-dbLoadRecords("db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
 
 iocInit()

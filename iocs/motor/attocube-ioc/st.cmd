@@ -41,9 +41,9 @@ ANC150AsynConfig(0, "$(SERIAL)", 3, 100, 1000)
 # The ANC150 is an open-loop stepper: positions travel the driver boundary in
 # steps (EGU = steps), so MRES is 1. The record's velocity/acceleration have no
 # effect — the step rate is a controller setting read with 'getf'.
-dbLoadRecords("db/anc150.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/anc150.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("db/anc150.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
 
 iocInit()
 

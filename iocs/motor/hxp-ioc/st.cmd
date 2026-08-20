@@ -26,7 +26,7 @@ drvAsynIPPortConfigure("$(MOVE)", "$(HOST)", 0, 0, 1)
 # HXPCreateController(motorPort, pollPort, movePort, [movingPollMs], [idlePollMs])
 HXPCreateController("$(PORT)", "$(POLL)", "$(MOVE)", 100, 1000)
 
-dbLoadRecords("db/hxp.template", "P=$(P),MX=mX,MY=mY,MZ=mZ,MU=mU,MV=mV,MW=mW,PORT=$(PORT)")
+dbLoadRecords("$(HXP_IOC)/db/hxp.template", "P=$(P),MX=mX,MY=mY,MZ=mZ,MU=mU,MV=mV,MW=mW,PORT=$(PORT)")
 
 iocInit()
 

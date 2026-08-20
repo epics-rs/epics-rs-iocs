@@ -37,7 +37,7 @@ MM3000CreateController("$(PORT)", "$(SERIAL)", 100, 1000)
 # One motor record per configured axis (DTYP MM3000_$(PORT)_0, _1, ...).
 # The MM3000 wire is step-native, so MRES=1 (EGU = motor steps / encoder
 # counts) — like the AG-UC driver.
-dbLoadRecords("db/mm3000.template", "P=$(P),M=m1,N=0,PORT=$(PORT)")
+dbLoadRecords("$(MM3000_IOC)/db/mm3000.template", "P=$(P),M=m1,N=0,PORT=$(PORT)")
 
 iocInit()
 

@@ -44,8 +44,8 @@ SPiiPlusConfig(0, "$(PORT)", "DIR", 100, 1000)
 
 # One motor record per axis (DTYP SPIIPLUS_$(CARD)_0, _1, ...). The SPiiPlus
 # works in controller counts, so MRES = 1 and EGU = counts.
-dbLoadRecords("db/spiiplus.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/spiiplus.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
 
 iocInit()
 

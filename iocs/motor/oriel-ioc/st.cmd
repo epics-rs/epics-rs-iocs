@@ -39,9 +39,9 @@ EMC18011Config(0, "$(SERIAL)", 100, 1000)
 
 # One motor record per axis (DTYP EMC18011_$(CARD)_0, _1, _2). The controller
 # works in millimetres, so MRES = 1 and EGU = mm.
-dbLoadRecords("db/emc18011.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/emc18011.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("db/emc18011.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
 
 iocInit()
 

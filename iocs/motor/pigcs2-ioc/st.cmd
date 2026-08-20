@@ -33,7 +33,7 @@ PIGCS2CreateController("$(CTRL)", "$(PORT)", $(NUMAXES), 100, 1000)
 
 # One motor record for axis 0. DTYP = PIGCS2_$(CTRL)_$(AXIS), where AXIS is
 # the GCS axis name (e.g. "1"), not a bare index.
-dbLoadRecords("db/pigcs2.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=1")
+dbLoadRecords("$(PIGCS2_IOC)/db/pigcs2.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=1")
 
 iocInit()
 

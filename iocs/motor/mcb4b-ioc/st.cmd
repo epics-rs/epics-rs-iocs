@@ -38,10 +38,10 @@ asynOctetSetOutputEos("$(PORT)", -1, "\r")
 MCB4BCreateController($(CARD), "$(PORT)", $(NUM_AXES), 100, 1000)
 
 # One motor record per axis (the MCB-4B works in raw controller steps, MRES=1).
-dbLoadRecords("db/mcb4b.template", "P=$(P),M=m0,CARD=$(CARD),AXIS=0")
-dbLoadRecords("db/mcb4b.template", "P=$(P),M=m1,CARD=$(CARD),AXIS=1")
-dbLoadRecords("db/mcb4b.template", "P=$(P),M=m2,CARD=$(CARD),AXIS=2")
-dbLoadRecords("db/mcb4b.template", "P=$(P),M=m3,CARD=$(CARD),AXIS=3")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m0,CARD=$(CARD),AXIS=0")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m1,CARD=$(CARD),AXIS=1")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m2,CARD=$(CARD),AXIS=2")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m3,CARD=$(CARD),AXIS=3")
 
 iocInit()
 

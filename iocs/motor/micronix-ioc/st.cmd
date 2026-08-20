@@ -39,8 +39,8 @@ MMC200CreateController("$(PORT)", "$(SERIAL)", 2, 500, 2000, 1)
 # directly; MRES only sets the record's raw-count resolution. Set MRES to the
 # axis's physical resolution (the example matches a 2.44140625e-6 mm/microstep
 # stage).
-dbLoadRecords("db/mmc200.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
-dbLoadRecords("db/mmc200.template", "P=$(P),M=m2,N=1,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
+dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
+dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m2,N=1,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
 
 iocInit()
 

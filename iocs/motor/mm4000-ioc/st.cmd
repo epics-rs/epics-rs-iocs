@@ -37,7 +37,7 @@ MM4000CreateController("$(PORT)", "$(SERIAL)", 1, 100, 1000)
 # One motor record per axis (DTYP MM4000_$(PORT)_0, _1, ...).
 # Positions travel the driver boundary in EGU (controller units, mm/deg)
 # directly; MRES only sets the record's raw-count resolution.
-dbLoadRecords("db/mm4000.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.0001,EGU=mm")
+dbLoadRecords("$(MM4000_IOC)/db/mm4000.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.0001,EGU=mm")
 
 iocInit()
 

@@ -36,7 +36,7 @@ PM500CreateController("$(PORT)", "$(SERIAL)", 100, 1000)
 # One motor record per axis (DTYP PM500_$(PORT)_0, _1, ...).
 # Positions travel the driver boundary in EGU (controller units: microns
 # or arc-sec) directly; MRES only sets the record's raw-count resolution.
-dbLoadRecords("db/pm500.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.01,EGU=um")
+dbLoadRecords("$(PM500_IOC)/db/pm500.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.01,EGU=um")
 
 iocInit()
 

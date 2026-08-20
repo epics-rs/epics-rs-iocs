@@ -40,8 +40,8 @@ PM304Config(0, "$(SERIAL)", 2, 100, 1000)
 
 # One motor record per axis (DTYP PM304_$(CARD)_0, _1, ...). The controller
 # works in motor steps, so MRES = 1 and EGU = steps.
-dbLoadRecords("db/pm304.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/pm304.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
 
 iocInit()
 

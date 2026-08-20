@@ -20,8 +20,8 @@ motorSimConfigAxis("$(PORT)", 0, 100, -100, 0, 0)
 motorSimConfigAxis("$(PORT)", 1, 100, -100, 0, 0)
 
 # One motor record per axis (DTYP motorSim_$(PORT)_0, _1, ...).
-dbLoadRecords("db/motorsim.template", "P=$(P),M=m1,N=0,PORT=$(PORT)")
-dbLoadRecords("db/motorsim.template", "P=$(P),M=m2,N=1,PORT=$(PORT)")
+dbLoadRecords("$(MOTORSIM_IOC)/db/motorsim.template", "P=$(P),M=m1,N=0,PORT=$(PORT)")
+dbLoadRecords("$(MOTORSIM_IOC)/db/motorsim.template", "P=$(P),M=m2,N=1,PORT=$(PORT)")
 
 iocInit()
 

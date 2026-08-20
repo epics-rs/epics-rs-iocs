@@ -34,9 +34,9 @@ MCS2CreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
 # One motor record per channel (DTYP MCS2_$(CARD)_0, _1, _2). The driver reports
 # positions in nanometres (linear) / micro-degrees (rotary), so MRES = 1 and
 # EGU = nm.
-dbLoadRecords("db/mcs2.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("db/mcs2.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("db/mcs2.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
 
 iocInit()
 

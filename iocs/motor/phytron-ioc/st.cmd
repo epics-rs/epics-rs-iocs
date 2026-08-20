@@ -32,7 +32,7 @@ phytronCreatePhymotion("$(CTRL)", "$(IPPORT)", 100, 1000, 1000, 1)
 # One axis per I1AM01 module.index: phytronCreateAxis(controllerName, module,
 # index). Load one motor record per axis with matching MODULE/INDEX.
 phytronCreateAxis("$(CTRL)", 1, 1)
-dbLoadRecords("db/phytron.template", "P=$(P),M=m1,CTRL=$(CTRL),MODULE=1,INDEX=1")
+dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,CTRL=$(CTRL),MODULE=1,INDEX=1")
 
 iocInit()
 

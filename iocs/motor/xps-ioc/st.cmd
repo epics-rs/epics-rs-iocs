@@ -36,7 +36,7 @@ XPSCreateController("$(PORT)", "$(POLL)", 1, 100, 1000, 0, 0)
 # apply here.
 XPSCreateAxis("$(PORT)", "$(MOVE0)", 0, "GROUP1.POSITIONER", 1)
 
-dbLoadRecords("db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT)")
+dbLoadRecords("$(XPS_IOC)/db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT)")
 
 iocInit()
 

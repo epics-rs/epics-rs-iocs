@@ -40,7 +40,7 @@ SMC100CreateController("$(PORT)", "$(SERIAL)", 1.0, 100, 1000)
 
 # MRES only sets the record's raw-count resolution (display/deadband
 # granularity); positions travel the driver boundary in EGU directly.
-dbLoadRecords("db/smc100.template", "P=$(P),M=$(M),PORT=$(PORT),MRES=0.001,EGU=mm")
+dbLoadRecords("$(SMC100_IOC)/db/smc100.template", "P=$(P),M=$(M),PORT=$(PORT),MRES=0.001,EGU=mm")
 
 iocInit()
 
