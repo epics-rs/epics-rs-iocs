@@ -35,9 +35,11 @@ dbLoadRecords("iocs/ur-robot/ur-robot-ioc/db/rtde_io.db", "P=$(PREFIX),PORT=rtde
 RTDEControlConfig("rtde_ctrl", "dash", "rtde_recv", 0.02)
 dbLoadRecords("iocs/ur-robot/ur-robot-ioc/db/rtde_control.db", "P=$(PREFIX),PORT=rtde_ctrl")
 
-# Optional: jogging PVs. Upstream does not load these from urRobot.iocsh either
-# (docs/usage.md:115); they drive the same rtde_ctrl port.
-# dbLoadRecords("iocs/ur-robot/ur-robot-ioc/db/rtde_control_jog.db", "P=$(PREFIX),PORT=rtde_ctrl")
+# Jogging PVs on the same rtde_ctrl port. Upstream leaves these out of
+# urRobot.iocsh (docs/usage.md:115); loading them here is safe because the
+# jog parameters stage IOC-local state, so their PINI processing at boot
+# needs no link. The 1 s watchdog records ship in the db itself.
+dbLoadRecords("iocs/ur-robot/ur-robot-ioc/db/rtde_control_jog.db", "P=$(PREFIX),PORT=rtde_ctrl")
 
 # Robotiq gripper URCap, TCP 63352 on the robot's own IP.
 URGripperConfig("gripper", "dash", 0.02)
