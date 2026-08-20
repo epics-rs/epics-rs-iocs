@@ -230,12 +230,37 @@ impl PortDriver for GripperDriver {
         }
 
         let mut calibrated = None;
+        // Pre-checked open/close (upstream 558b98f, gripper_driver.cpp:218-245):
+        // a request whose end state already holds — open when already open or
+        // stopped at an outer object, close when already closed or stopped at
+        // an inner object — starts no motion, and the OPEN/CLOSE busy param is
+        // staged back to 0 so the record releases instead of waiting for a
+        // MoveStatus transition that will never come.
+        let mut refused = None;
         let result: UrResult<()> = if reason == p.activate {
             gripper.activate(false)
         } else if reason == p.open {
-            gripper.open(MoveMode::StartMove).map(|_| ())
+            (|| {
+                if gripper.is_open()?
+                    || gripper.object_detection_status()? == ObjectStatus::StoppedOuterObject
+                {
+                    log::warn!("ur-robot: gripper already open or stopped at an outer object");
+                    refused = Some(p.open);
+                    return Ok(());
+                }
+                gripper.open(MoveMode::StartMove).map(|_| ())
+            })()
         } else if reason == p.close {
-            gripper.close(MoveMode::StartMove).map(|_| ())
+            (|| {
+                if gripper.is_closed()?
+                    || gripper.object_detection_status()? == ObjectStatus::StoppedInnerObject
+                {
+                    log::warn!("ur-robot: gripper already closed or stopped at an inner object");
+                    refused = Some(p.close);
+                    return Ok(());
+                }
+                gripper.close(MoveMode::StartMove).map(|_| ())
+            })()
         } else if reason == p.set_position_range {
             gripper.set_native_position_range(min, max);
             Ok(())
@@ -267,6 +292,9 @@ impl PortDriver for GripperDriver {
 
         if let Some(v) = calibrated {
             self.base.params.set_int32(p.is_calibrated, 0, v)?;
+        }
+        if let Some(param) = refused {
+            self.base.params.set_int32(param, 0, 0)?;
         }
         result.map_err(|e| asyn_error(format!("gripper command failed: {e}")))
     }

@@ -86,7 +86,7 @@ record(bo, "$(P)RobotiqGripper:AutoCalibrate")
     field(VAL, 1)
 }
 
-record(bo, "$(P)RobotiqGripper:Open")
+record(busy, "$(P)RobotiqGripper:Open")
 {
     field(DESC, "Opens Robotiq gripper")
     field(DTYP, "asynInt32")
@@ -94,7 +94,7 @@ record(bo, "$(P)RobotiqGripper:Open")
     field(VAL, 1)
 }
 
-record(bo, "$(P)RobotiqGripper:Close")
+record(busy, "$(P)RobotiqGripper:Close")
 {
     field(DESC, "Close Robotiq gripper")
     field(DTYP, "asynInt32")
@@ -158,6 +158,20 @@ record(longin, "$(P)RobotiqGripper:MoveStatusRaw")
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))MOVE_STATUS")
     field(SCAN, "I/O Intr")
+    field(FLNK, "$(P)RobotiqGripper:clear_busy_calc.PROC")
+}
+
+record(calcout, "$(P)RobotiqGripper:clear_busy_calc") {
+    field(INPA, "$(P)RobotiqGripper:MoveStatusRaw")
+    field(OOPT, "Transition To Non-zero")
+    field(CALC, "A != 0")
+    field(OUT, "$(P)RobotiqGripper:clear_busy.PROC")
+}
+
+record(dfanout, "$(P)RobotiqGripper:clear_busy") {
+    field(DOL, 0)
+    field(OUTA, "$(P)RobotiqGripper:Open PP")
+    field(OUTB, "$(P)RobotiqGripper:Close PP")
 }
 
 record(ai, "$(P)RobotiqGripper:CurrentPosition")

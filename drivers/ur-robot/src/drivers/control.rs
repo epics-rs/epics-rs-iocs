@@ -279,6 +279,11 @@ impl ControlInner {
             0,
             ParamValue::Int32(self.motion_done_count),
         ));
+        // Release the moveJ/moveL busy records (upstream 558b98f,
+        // rtde_control_driver.hpp set_motion_task_done). Both are cleared —
+        // only one can be in flight, and the other is already 0.
+        out.push(ParamSetValue::new(p.move_j, 0, ParamValue::Int32(0)));
+        out.push(ParamSetValue::new(p.move_l, 0, ParamValue::Int32(0)));
     }
 }
 
@@ -568,8 +573,12 @@ impl PortDriver for ControlDriver {
                 } else {
                     MotionType::Cartesian
                 };
+                // The refused/accepted writes below feed the moveJ/moveL busy
+                // records: 1 on an accepted request, 0 on a refusal so the
+                // record releases immediately (upstream 558b98f).
                 if inner.pending_motion.is_some() {
                     log::warn!("ur-robot: a motion is already in progress; please wait");
+                    updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
                     return Ok(());
                 }
                 let target = match motion {
@@ -586,6 +595,7 @@ impl PortDriver for ControlDriver {
                         "ur-robot: the requested target is not within the safety limits; \
                          no action taken"
                     );
+                    updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
                     return Ok(());
                 }
                 let action = inner.waypoint_move;
@@ -596,6 +606,7 @@ impl PortDriver for ControlDriver {
                     0,
                     ParamValue::Int32(0),
                 ));
+                updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(1)));
                 return Ok(());
             }
 
@@ -1003,6 +1014,9 @@ mod tests {
         assert_eq!(inner.motion_status, MotionStatus::Done);
         assert_eq!(int_update(&updates, p.async_move_done), Some(1));
         assert_eq!(int_update(&updates, p.motion_done_count), Some(1));
+        // The moveJ/moveL busy records release on completion (558b98f).
+        assert_eq!(int_update(&updates, p.move_j), Some(0));
+        assert_eq!(int_update(&updates, p.move_l), Some(0));
 
         let mut updates = Vec::new();
         inner.motion_task_done(p, &mut updates);
