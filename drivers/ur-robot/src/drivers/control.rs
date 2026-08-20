@@ -205,8 +205,11 @@ pub struct ControlInner {
     pub cmd_joints: [f64; NUM_JOINTS],
     /// Commanded TCP pose: x,y,z metres, rx,ry,rz radians.
     pub cmd_pose: [f64; NUM_JOINTS],
-    /// TCP offset: x,y,z metres, rx,ry,rz radians.
-    pub tcp_offset: [f64; NUM_JOINTS],
+    /// TCP offset: x,y,z metres, rx,ry,rz radians. `None` until a
+    /// `TCP_OFFSET` write stages one — only then may a (re)connect deliver
+    /// it, so an IOC that never wrote an offset leaves the robot's own
+    /// setting alone.
+    pub tcp_offset: Option<[f64; NUM_JOINTS]>,
     /// Jog speeds: m/s and rad/s.
     pub jog_speeds: [f64; NUM_JOINTS],
     pub jog_acceleration: f64,
@@ -238,7 +241,7 @@ impl Default for ControlInner {
             iface: None,
             cmd_joints: [0.0; NUM_JOINTS],
             cmd_pose: [0.0; NUM_JOINTS],
-            tcp_offset: [0.0; NUM_JOINTS],
+            tcp_offset: None,
             jog_speeds: [0.0; NUM_JOINTS],
             jog_acceleration: 0.0,
             new_jog: false,
@@ -266,6 +269,20 @@ impl ControlInner {
         self.iface
             .as_ref()
             .is_some_and(ControlInterface::is_connected)
+    }
+
+    /// Deliver the staged TCP offset once the link is up (B3). PINI
+    /// processes the six `TCPOffset_*` records at boot, before any connect
+    /// can have succeeded, so the offset is carried here until the
+    /// connection owner can apply it; a failure leaves it staged for the
+    /// next reconnect.
+    fn apply_cached_settings(&mut self) {
+        let Some(offset) = self.tcp_offset else {
+            return;
+        };
+        if let Err(e) = self.iface_mut().and_then(|i| i.set_tcp(&offset)) {
+            log::error!("ur-robot: could not apply the staged TCP offset: {e}");
+        }
     }
 
     fn iface_mut(&mut self) -> UrResult<&mut ControlInterface> {
@@ -393,6 +410,7 @@ impl ControlDriver {
                 match iface.reconnect() {
                     Ok(()) => {
                         log::info!("ur-robot: reconnected to the RTDE control interface");
+                        inner.apply_cached_settings();
                         true
                     }
                     Err(e) => {
@@ -405,6 +423,7 @@ impl ControlDriver {
                 Ok(iface) => {
                     log::info!("ur-robot: connected to the RTDE control interface");
                     inner.iface = Some(iface);
+                    inner.apply_cached_settings();
                     true
                 }
                 Err(e) => {
@@ -462,11 +481,24 @@ impl PortDriver for ControlDriver {
         let p = self.params;
         self.base.params.set_float64(reason, addr, value)?;
 
+        // Only the four per-axis parameters take one address per joint; a
+        // scalar parameter written at addr 1..5 is a miswired record, not a
+        // joint index.
+        let per_axis = reason == p.joint_cmd
+            || reason == p.pose_cmd
+            || reason == p.jog_speed
+            || reason == p.tcp_offset;
+        let limit = if per_axis { NUM_JOINTS } else { 1 };
         let index = usize::try_from(addr)
             .ok()
-            .filter(|i| *i < NUM_JOINTS)
+            .filter(|i| *i < limit)
             .ok_or_else(|| asyn_error(format!("address {addr} is out of range")))?;
 
+        // Every arm below stages IOC-local state, so none of them needs the
+        // link up — PINI processes these records at boot, before any connect
+        // can have succeeded. TCP_OFFSET is the one that also reaches the
+        // device: connected, it applies now; disconnected, the staged offset
+        // waits for try_connect (C refuses the write and the offset is lost).
         let mut inner = self.inner.lock();
         if reason == p.custom_script_timeout {
             inner.custom_script_timeout = Duration::from_secs_f64(value.max(0.0));
@@ -476,10 +508,6 @@ impl PortDriver for ControlDriver {
             inner.jog_acceleration = value;
             inner.new_jog = true;
             return Ok(());
-        }
-
-        if !inner.connected() {
-            return Err(asyn_error("the RTDE control interface is not connected"));
         }
 
         if reason == p.joint_cmd {
@@ -494,14 +522,15 @@ impl PortDriver for ControlDriver {
             inner.new_jog = true;
         } else if reason == p.tcp_offset {
             // x,y,z arrive in mm; rx,ry,rz are already radians.
-            inner.tcp_offset[index] = if index >= 3 { value } else { value / 1000.0 };
-            let offset = inner.tcp_offset;
-            let iface = inner
-                .iface_mut()
-                .map_err(|e| asyn_error(format!("setTcp failed: {e}")))?;
-            iface
-                .set_tcp(&offset)
-                .map_err(|e| asyn_error(format!("setTcp failed: {e}")))?;
+            let offset = inner.tcp_offset.get_or_insert([0.0; NUM_JOINTS]);
+            offset[index] = if index >= 3 { value } else { value / 1000.0 };
+            let offset = *offset;
+            if inner.connected() {
+                inner
+                    .iface_mut()
+                    .and_then(|i| i.set_tcp(&offset))
+                    .map_err(|e| asyn_error(format!("setTcp failed: {e}")))?;
+            }
         } else if reason == p.joint_speed {
             inner.joint_speed = deg_to_rad(value);
         } else if reason == p.joint_acceleration {
@@ -1089,6 +1118,77 @@ mod tests {
         let mut updates = Vec::new();
         inner.motion_task_done(p, &mut updates);
         assert_eq!(int_update(&updates, p.motion_done_count), Some(2));
+    }
+
+    /// The boot race B3 closes for the control port: PINI writes the six
+    /// `TCPOffset_*` records (and every dynamics setting) at iocsh time,
+    /// before any connect can have succeeded. The writes stage IOC-local
+    /// state and succeed; the staged offset survives a delivery attempt
+    /// without a link, so the next reconnect can retry it.
+    #[test]
+    fn a_boot_time_tcp_offset_stages_until_a_connect_can_deliver_it() {
+        registry::register_dashboard("CTRL_B3_DASH", DashboardHandle::new("127.0.0.1"));
+        registry::register_receive("CTRL_B3_RECV", ReceiveHandle::new());
+        let mut drv =
+            ControlDriver::new("CTRL_B3", "CTRL_B3_DASH", "CTRL_B3_RECV").expect("driver");
+        let p = drv.params();
+
+        // Never written: nothing staged, and a connect must leave the
+        // robot's own offset alone.
+        assert_eq!(drv.inner().lock().tcp_offset, None);
+
+        for (addr, value) in [
+            (0, 1000.0),
+            (1, 2000.0),
+            (2, 3000.0),
+            (3, 0.1),
+            (4, 0.2),
+            (5, 0.3),
+        ] {
+            drv.write_float64(&mut AsynUser::new(p.tcp_offset).with_addr(addr), value)
+                .unwrap();
+        }
+        drv.write_float64(&mut AsynUser::new(p.joint_speed), 30.0)
+            .unwrap();
+
+        let inner = drv.inner();
+        assert_eq!(
+            inner.lock().tcp_offset,
+            Some([1.0, 2.0, 3.0, 0.1, 0.2, 0.3])
+        );
+        assert!((inner.lock().joint_speed - deg_to_rad(30.0)).abs() < 1e-12);
+
+        // A delivery attempt without a link keeps the offset staged.
+        inner.lock().apply_cached_settings();
+        assert_eq!(
+            inner.lock().tcp_offset,
+            Some([1.0, 2.0, 3.0, 0.1, 0.2, 0.3])
+        );
+    }
+
+    /// Scalar float parameters take addr 0 only; the per-axis parameters
+    /// take one address per joint (#27: a scalar write at addr 1..5 must
+    /// fail, not silently pass because 1 < NUM_JOINTS).
+    #[test]
+    fn a_scalar_float_write_takes_address_zero_only() {
+        registry::register_dashboard("CTRL_B3_ADDR_DASH", DashboardHandle::new("127.0.0.1"));
+        registry::register_receive("CTRL_B3_ADDR_RECV", ReceiveHandle::new());
+        let mut drv = ControlDriver::new("CTRL_B3_ADDR", "CTRL_B3_ADDR_DASH", "CTRL_B3_ADDR_RECV")
+            .expect("driver");
+        let p = drv.params();
+
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.joint_speed).with_addr(1), 30.0)
+                .is_err()
+        );
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.tcp_offset).with_addr(5), 0.1)
+                .is_ok()
+        );
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.tcp_offset).with_addr(6), 0.1)
+                .is_err()
+        );
     }
 
     /// A move whose start returns `Err` — a `CommandRefused` and a transport

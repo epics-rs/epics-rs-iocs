@@ -258,6 +258,12 @@ impl RobotiqGripper {
         self.socket.is_some()
     }
 
+    /// Test-only: redirect the URCap port to a fixture server.
+    #[cfg(test)]
+    pub(crate) fn set_port(&mut self, port: u16) {
+        self.port = port;
+    }
+
     pub fn connect(&mut self) -> UrResult<()> {
         let addr = (self.hostname.as_str(), self.port)
             .to_socket_addrs()

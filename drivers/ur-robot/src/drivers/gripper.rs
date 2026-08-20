@@ -201,12 +201,29 @@ impl GripperDriver {
         match gripper.connect().and_then(|()| gripper.get_var("STA")) {
             Ok(_) => {
                 log::info!("ur-robot: connected to the gripper");
+                self.apply_pending_activation(&mut gripper);
                 true
             }
             Err(e) => {
                 log::error!("ur-robot: gripper connect failed: {e}");
                 false
             }
+        }
+    }
+
+    /// Deliver a boot-time `ACTIVATE` once the link is up (B3). The PINI
+    /// `$(AUTO_ACTIVATE=YES)` write lands before any connect can have
+    /// succeeded, so the cached value is the desired state and the
+    /// connection owner delivers it here. `activate` skips itself when the
+    /// gripper is already active, so a reconnect never re-runs the
+    /// activation cycle.
+    fn apply_pending_activation(&self, gripper: &mut RobotiqGripper) {
+        let p = self.params;
+        if self.base.params.get_int32(p.activate, 0).unwrap_or(0) == 0 {
+            return;
+        }
+        if let Err(e) = gripper.activate(false) {
+            log::error!("ur-robot: deferred gripper activation failed: {e}");
         }
     }
 }
@@ -229,6 +246,42 @@ impl PortDriver for GripperDriver {
             return Ok(());
         }
 
+        // The position range and unit configure the RobotiqGripper object,
+        // which outlives every (re)connect — nothing goes on the wire. They
+        // apply regardless of the link state, so the PINI writes at boot
+        // (robot off, gripper unreachable) cannot be lost. C gates them on
+        // the connection and the boot values are lost.
+        // MIN_POSITION / MAX_POSITION only stage the range; SET_POSITION_RANGE
+        // applies it.
+        if reason == p.min_position || reason == p.max_position {
+            return Ok(());
+        }
+        if reason == p.set_position_range {
+            let min = self.base.params.get_int32(p.min_position, 0).unwrap_or(0);
+            let max = self.base.params.get_int32(p.max_position, 0).unwrap_or(0);
+            self.gripper.lock().set_native_position_range(min, max);
+            return Ok(());
+        }
+        if reason == p.position_unit {
+            match position_unit(value) {
+                Some(unit) => self.gripper.lock().set_unit(MoveParameter::Position, unit),
+                None => {
+                    log::warn!("ur-robot: position unit {value} is undefined; no action taken");
+                }
+            }
+            return Ok(());
+        }
+
+        // An ACTIVATE that arrives while the gripper is unreachable is the
+        // desired state, not an error: try_connect activates from the cached
+        // value once the link is up (the PINI `$(AUTO_ACTIVATE=YES)` write
+        // always lands before any connect can have succeeded). C errors
+        // and the boot-time activation is lost.
+        if reason == p.activate && !(self.robot_ready() && self.gripper.lock().is_connected()) {
+            log::info!("ur-robot: gripper activation deferred until the gripper connects");
+            return Ok(());
+        }
+
         if !self.robot_ready() {
             return Err(asyn_error(
                 "the robot must be powered on and the dashboard connected to use the gripper",
@@ -242,15 +295,6 @@ impl PortDriver for GripperDriver {
                 Err(asyn_error("could not connect to the gripper"))
             };
         }
-
-        // MIN_POSITION / MAX_POSITION only stage the range; SET_POSITION_RANGE
-        // applies it.
-        if reason == p.min_position || reason == p.max_position {
-            return Ok(());
-        }
-
-        let min = self.base.params.get_int32(p.min_position, 0).unwrap_or(0);
-        let max = self.base.params.get_int32(p.max_position, 0).unwrap_or(0);
 
         let mut gripper = self.gripper.lock();
         if !gripper.is_connected() {
@@ -289,20 +333,6 @@ impl PortDriver for GripperDriver {
                 }
                 gripper.close(MoveMode::StartMove).map(|_| ())
             })()
-        } else if reason == p.set_position_range {
-            gripper.set_native_position_range(min, max);
-            Ok(())
-        } else if reason == p.position_unit {
-            match position_unit(value) {
-                Some(unit) => {
-                    gripper.set_unit(MoveParameter::Position, unit);
-                    Ok(())
-                }
-                None => {
-                    log::warn!("ur-robot: position unit {value} is undefined; no action taken");
-                    Ok(())
-                }
-            }
         } else if reason == p.auto_calibrate {
             match gripper.is_active() {
                 Ok(true) => gripper.auto_calibrate(None).inspect(|()| {
@@ -332,17 +362,12 @@ impl PortDriver for GripperDriver {
         let p = self.params;
         self.base.params.set_float64(reason, user.addr, value)?;
 
-        if !self.robot_ready() {
-            return Err(asyn_error(
-                "the robot must be powered on and the dashboard connected to use the gripper",
-            ));
-        }
-
+        // SET_SPEED / SET_FORCE configure the RobotiqGripper object, which
+        // outlives every (re)connect — nothing goes on the wire until the
+        // next move. They apply regardless of the link state, so the PINI
+        // writes at boot (robot off, gripper unreachable) cannot be lost.
+        // C gates them on the connection and the boot values are lost.
         let mut gripper = self.gripper.lock();
-        if !gripper.is_connected() {
-            return Err(asyn_error("the Robotiq gripper is not connected"));
-        }
-
         if reason == p.set_speed {
             gripper.set_speed(value);
         } else if reason == p.set_force {
@@ -450,6 +475,7 @@ fn stopped_flags(status: ObjectStatus) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::DashboardState;
 
     #[test]
     fn the_position_unit_choices_map_to_the_four_units() {
@@ -488,6 +514,124 @@ mod tests {
         ] {
             assert!(!p.is_command(reason));
         }
+    }
+
+    /// A gripper fixture that answers `GET <VAR>` from a fixed map, acks
+    /// every `SET`, and records each request line it saw.
+    fn spawn_recording_gripper(
+        vars: Vec<(&'static str, i32)>,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let jh = std::thread::spawn(move || {
+            let state: std::collections::HashMap<String, i32> =
+                vars.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            let (sock, _) = listener.accept().unwrap();
+            let mut w = sock.try_clone().unwrap();
+            let mut r = BufReader::new(sock);
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let line = line.trim_end().to_string();
+                let f: Vec<&str> = line.split_whitespace().collect();
+                lines.push(line.clone());
+                match f.first().copied() {
+                    Some("GET") => {
+                        let v = state.get(f[1]).copied().unwrap_or(0);
+                        w.write_all(format!("{} {}\n", f[1], v).as_bytes()).unwrap();
+                    }
+                    Some("SET") => w.write_all(b"ack\n").unwrap(),
+                    _ => break,
+                }
+            }
+            lines
+        });
+        (port, jh)
+    }
+
+    /// The boot race B3 closes: at iocsh time the dashboard has not
+    /// connected, so every PINI write lands while the gripper is
+    /// unreachable. The settings configure the persistent gripper object
+    /// immediately, ACTIVATE is held as the desired state, and the first
+    /// successful connect delivers it.
+    #[test]
+    fn boot_writes_survive_to_the_first_connect() {
+        let dash = DashboardHandle::new("127.0.0.1");
+        registry::register_dashboard("GRIP_B3_DASH", dash.clone());
+        let mut drv = GripperDriver::new("GRIP_B3", "GRIP_B3_DASH").expect("driver");
+        let p = drv.params();
+
+        // The PINI writes: all must succeed unreachable (C errors and the
+        // values are lost).
+        drv.write_int32(&mut AsynUser::new(p.min_position), 10)
+            .unwrap();
+        drv.write_int32(&mut AsynUser::new(p.max_position), 200)
+            .unwrap();
+        drv.write_int32(&mut AsynUser::new(p.set_position_range), 1)
+            .unwrap();
+        drv.write_int32(&mut AsynUser::new(p.position_unit), 3)
+            .unwrap();
+        drv.write_float64(&mut AsynUser::new(p.set_speed), 0.5)
+            .unwrap();
+        drv.write_float64(&mut AsynUser::new(p.set_force), 0.25)
+            .unwrap();
+        drv.write_int32(&mut AsynUser::new(p.activate), 1).unwrap();
+
+        // The numeric settings reached the gripper object at write time.
+        assert_eq!(drv.gripper().lock().native_position_range(), (10, 200));
+
+        // The robot comes up; the fixture reports an already-active gripper
+        // (STA 3), so the delivered activation is its is_active probe.
+        let (port, server) = spawn_recording_gripper(vec![("STA", 3)]);
+        drv.gripper().lock().set_port(port);
+        dash.set(DashboardState {
+            connected: true,
+            robot_mode: "Robotmode: IDLE".into(),
+            ..Default::default()
+        });
+
+        drv.write_int32(&mut AsynUser::new(p.connect), 1).unwrap();
+        drop(drv);
+
+        // One STA probe from try_connect, one from the pending activation.
+        let seen = server.join().unwrap();
+        assert_eq!(
+            seen.iter().filter(|l| l.as_str() == "GET STA").count(),
+            2,
+            "expected the connect probe plus the deferred activation, saw: {seen:?}"
+        );
+    }
+
+    /// Without a cached ACTIVATE the connect must not touch the activation
+    /// state — only the try_connect STA probe goes on the wire.
+    #[test]
+    fn a_connect_without_a_cached_activate_leaves_the_gripper_alone() {
+        let dash = DashboardHandle::new("127.0.0.1");
+        registry::register_dashboard("GRIP_B3_NOACT_DASH", dash.clone());
+        let mut drv = GripperDriver::new("GRIP_B3_NOACT", "GRIP_B3_NOACT_DASH").expect("driver");
+        let p = drv.params();
+
+        let (port, server) = spawn_recording_gripper(vec![("STA", 3)]);
+        drv.gripper().lock().set_port(port);
+        dash.set(DashboardState {
+            connected: true,
+            robot_mode: "Robotmode: IDLE".into(),
+            ..Default::default()
+        });
+
+        drv.write_int32(&mut AsynUser::new(p.connect), 1).unwrap();
+        drop(drv);
+
+        let seen = server.join().unwrap();
+        assert_eq!(
+            seen.iter().filter(|l| l.as_str() == "GET STA").count(),
+            1,
+            "expected only the connect probe, saw: {seen:?}"
+        );
     }
 
     /// Completeness of the alarm set: every parameter this driver creates is
