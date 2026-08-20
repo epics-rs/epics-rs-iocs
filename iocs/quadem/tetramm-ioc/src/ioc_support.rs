@@ -85,7 +85,7 @@ fn tetramm_configure_command(
 
 /// Register the TetrAMM configure command and the octet-port verbs it needs.
 pub fn register(ioc: &mut AdIoc) {
-    epics_rs::base::runtime::env::set_default("QUADEM", env!("CARGO_MANIFEST_DIR"));
+    epics_rs::base::runtime::env::set_default("QUADEM", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
 
     for cmd in octet_port_commands(ioc.trace().clone()) {
         ioc.register_startup_command(cmd);

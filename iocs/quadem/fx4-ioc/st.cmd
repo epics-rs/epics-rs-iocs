@@ -16,16 +16,19 @@ epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "4096")
 epicsEnvSet("IP",        "164.54.161.10")
 
-# $(QUADEM) is set to this crate's root (iocs/quadem/fx4-ioc) by ioc_support at
-# IOC startup; the shared quadEM db lives one level up.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(QUADEM)/../db:$(ADCORE)/db")
+# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
+# at IOC startup; every quadEM template lives in its db/ subdir.
 
 # The driver opens ws://$(IP) itself, so there is no asyn IP port to configure.
 drvFX4Configure("$(PORT)", "$(IP)", $(RING_SIZE))
 
 # $(FXP) is the prefix of the PV server the FX4 itself publishes; the template's
 # range/bias/units records are Channel Access links to it.
-dbLoadRecords("$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), FXP=$(IP):, ADDR=0, TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), FXP=$(IP):, ADDR=0, TIMEOUT=1")
 
 # iocInit is called automatically by IocApplication after this script completes.
 #

@@ -17,9 +17,8 @@ epicsEnvSet("TSPOINTS",  "5000")
 epicsEnvSet("T4U_ADDR",  "192.168.11.90")
 epicsEnvSet("DATA_PORT", "10101")
 
-# $(QUADEM) is set to this crate's root (iocs/quadem/t4u-direct-em-ioc) by
-# ioc_support at IOC startup; the shared quadEM db lives one level up.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(QUADEM)/../db:$(ADCORE)/db")
+# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
+# at IOC startup; every quadEM template lives in its db/ subdir.
 epicsEnvSet("CALFILE", "$(QUADEM)/DBPM_Settings.ini")
 
 # Commands go to the meter's telnet port (23); data arrives as UDP datagrams on
@@ -27,7 +26,11 @@ epicsEnvSet("CALFILE", "$(QUADEM)/DBPM_Settings.ini")
 # per-range slope/offset pairs written to registers 100-107 on a range change.
 drvT4UDirect_EMConfigure("$(PORT)", "$(T4U_ADDR)", $(RING_SIZE), $(DATA_PORT), "$(CALFILE)")
 
-dbLoadRecords("$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
 
 # iocInit is called automatically by IocApplication after this script completes.
 #

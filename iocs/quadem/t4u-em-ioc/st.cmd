@@ -17,16 +17,19 @@ epicsEnvSet("TSPOINTS",   "1000")
 epicsEnvSet("QTHOST",     "127.0.0.1")
 epicsEnvSet("QTBASEPORT", "15001")
 
-# $(QUADEM) is set to this crate's root (iocs/quadem/t4u-em-ioc) by ioc_support
-# at IOC startup; the shared quadEM db lives one level up.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(QUADEM)/../db:$(ADCORE)/db")
+# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
+# at IOC startup; every quadEM template lives in its db/ subdir.
 
 # The driver opens the command port ($(QTBASEPORT)) and the data port
 # ($(QTBASEPORT) + 1) on the middle-layer host itself, as TCP_Command_$(PORT)
 # and TCP_Data_$(PORT).
 drvT4U_EMConfigure("$(PORT)", "$(QTHOST)", $(RING_SIZE), $(QTBASEPORT))
 
-dbLoadRecords("$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
+# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
+# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
 
 # iocInit is called automatically by IocApplication after this script completes.
 #
