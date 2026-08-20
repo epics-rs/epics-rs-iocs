@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use crate::dashboard::DashboardClient;
-use crate::error::{UrError, UrResult, verify_within};
+use crate::error::{RefusalReason, UrError, UrResult, verify_within};
 use crate::rtde::{CommandType, ControllerVersion, Payload, RobotCommand, default_frequency};
 use crate::script::{self, Injection, SCRIPT_PORT, ScriptClient};
 use crate::session::{DEFAULT_TIMEOUT, Session, SessionWriter};
@@ -452,27 +452,35 @@ impl ControlInterface {
         ))
     }
 
+    /// Clear the command register so the script is ready for the next
+    /// command, then report the refusal. Every refusal exit of
+    /// [`Self::send_command`] funnels through here; a clear that fails is a
+    /// transport error and wins over the refusal, as in the C++ original.
+    fn refused(&mut self, reason: RefusalReason) -> UrResult<()> {
+        self.send_clear_command()?;
+        Err(UrError::CommandRefused { reason })
+    }
+
     /// `sendCommand()` — the full handshake with the control script.
     ///
-    /// Returns `Ok(false)` when the command was refused (script not running,
-    /// safety stop, or a timeout), matching the C++ `bool` return; the command
-    /// register is always cleared before returning so the script is ready for
-    /// the next command.
-    fn send_command(&mut self, cmd: &RobotCommand) -> UrResult<bool> {
+    /// A refusal (script not running, safety stop, or a timeout) is
+    /// `Err(UrError::CommandRefused { .. })` — the C++ `bool` return made a
+    /// refusal indistinguishable from a query answering "no", and every
+    /// caller that dropped the `bool` dropped the refusal with it. The
+    /// command register is always cleared before returning so the script is
+    /// ready for the next command.
+    fn send_command(&mut self, cmd: &RobotCommand) -> UrResult<()> {
         if self.runtime_state()? == runtime_state::STOPPED {
-            self.send_clear_command()?;
-            return Ok(false);
+            return self.refused(RefusalReason::NotRunning);
         }
         if !self.is_program_running()? {
             log::error!("ur-robot: the RTDE control script is not running");
-            self.send_clear_command()?;
-            return Ok(false);
+            return self.refused(RefusalReason::NotRunning);
         }
 
         // Wait for the script to be ready for a command.
-        if !self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {
-            self.send_clear_command()?;
-            return Ok(false);
+        if let Some(reason) = self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {
+            return self.refused(reason);
         }
 
         self.write(cmd)?;
@@ -483,18 +491,15 @@ impl ControlInterface {
             let deadline = Instant::now() + EXECUTION_TIMEOUT;
             while self.is_program_running()? {
                 if self.is_stopped_by_safety()? {
-                    self.send_clear_command()?;
-                    return Ok(false);
+                    return self.refused(RefusalReason::SafetyStop);
                 }
                 if Instant::now() >= deadline {
-                    self.send_clear_command()?;
-                    return Ok(false);
+                    return self.refused(RefusalReason::Timeout);
                 }
                 std::thread::sleep(HANDSHAKE_POLL);
             }
             std::thread::sleep(HANDSHAKE_POLL);
-            self.send_clear_command()?;
-            return Ok(true);
+            return self.send_clear_command();
         }
 
         // Wait for the script to report it has finished the command.
@@ -507,36 +512,34 @@ impl ControlInterface {
             // script, and then DONE never arrives.
             if !self.is_program_running()? {
                 log::error!("ur-robot: the RTDE control script stopped mid-command");
-                self.send_clear_command()?;
-                return Ok(false);
+                return self.refused(RefusalReason::NotRunning);
             }
             if self.is_stopped_by_safety()? {
-                self.send_clear_command()?;
-                return Ok(false);
+                return self.refused(RefusalReason::SafetyStop);
             }
             if Instant::now() >= deadline {
-                self.send_clear_command()?;
-                return Ok(false);
+                return self.refused(RefusalReason::Timeout);
             }
             std::thread::sleep(HANDSHAKE_POLL);
         }
 
-        self.send_clear_command()?;
-        Ok(true)
+        self.send_clear_command()
     }
 
-    /// Wait until `output_int_register_0` reads `want`, or the deadline passes.
-    fn wait_for_state(&mut self, want: i32, timeout: Duration) -> UrResult<bool> {
+    /// Wait until `output_int_register_0` reads `want`, or report why it
+    /// never will: `None` = reached, `Some(reason)` = refusal cause. Transport
+    /// failures stay in the `Err` channel so the caller can tell them apart.
+    fn wait_for_state(&mut self, want: i32, timeout: Duration) -> UrResult<Option<RefusalReason>> {
         let deadline = Instant::now() + timeout;
         loop {
             if self.control_script_state()? == want {
-                return Ok(true);
+                return Ok(None);
             }
             if self.is_stopped_by_safety()? {
-                return Ok(false);
+                return Ok(Some(RefusalReason::SafetyStop));
             }
             if Instant::now() >= deadline {
-                return Ok(false);
+                return Ok(Some(RefusalReason::Timeout));
             }
             // Upstream's ready-for-command loop has no sleep and busy-spins.
             std::thread::sleep(HANDSHAKE_POLL);
@@ -544,12 +547,11 @@ impl ControlInterface {
     }
 
     /// A command whose result the script leaves in `output_int_register_1`.
+    /// `Ok(bool)` is the script's real answer; a refusal of the query itself
+    /// is `Err(CommandRefused)`, no longer conflated with a "no".
     fn send_query(&mut self, cmd: &RobotCommand) -> UrResult<bool> {
-        if self.send_command(cmd)? {
-            Ok(self.control_script_result()? == 1)
-        } else {
-            Ok(false)
-        }
+        self.send_command(cmd)?;
+        Ok(self.control_script_result()? == 1)
     }
 
     // --- script management ---
@@ -610,7 +612,6 @@ impl ControlInterface {
             CommandType::StopScript,
             Payload::None,
         ))
-        .map(|_| ())
     }
 
     /// Run a user URScript, wrapped so its completion bumps output int register
@@ -632,7 +633,7 @@ impl ControlInterface {
         speed: f64,
         acceleration: f64,
         asynchronous: bool,
-    ) -> UrResult<bool> {
+    ) -> UrResult<()> {
         verify_within(speed, 0.0, JOINT_VELOCITY_MAX)?;
         verify_within(acceleration, 0.0, JOINT_ACCELERATION_MAX)?;
         let mut val = q.to_vec();
@@ -652,7 +653,7 @@ impl ControlInterface {
         speed: f64,
         acceleration: f64,
         asynchronous: bool,
-    ) -> UrResult<bool> {
+    ) -> UrResult<()> {
         verify_within(speed, 0.0, TOOL_VELOCITY_MAX)?;
         verify_within(acceleration, 0.0, TOOL_ACCELERATION_MAX)?;
         let mut val = pose.to_vec();
@@ -666,7 +667,7 @@ impl ControlInterface {
     }
 
     /// `stopJ(a, async)` — recipe 19. `a` defaults to 2.0 rad/s^2 upstream.
-    pub fn stop_j(&mut self, acceleration: f64, asynchronous: bool) -> UrResult<bool> {
+    pub fn stop_j(&mut self, acceleration: f64, asynchronous: bool) -> UrResult<()> {
         self.send_command(&RobotCommand::new(
             recipe::STOP,
             CommandType::StopJ,
@@ -678,7 +679,7 @@ impl ControlInterface {
     }
 
     /// `stopL(a, async)` — recipe 19. `a` defaults to 10.0 m/s^2 upstream.
-    pub fn stop_l(&mut self, acceleration: f64, asynchronous: bool) -> UrResult<bool> {
+    pub fn stop_l(&mut self, acceleration: f64, asynchronous: bool) -> UrResult<()> {
         self.send_command(&RobotCommand::new(
             recipe::STOP,
             CommandType::StopL,
@@ -690,7 +691,7 @@ impl ControlInterface {
     }
 
     /// `speedL(xd, acceleration, time)` — recipe 13.
-    pub fn speed_l(&mut self, xd: &[f64; 6], acceleration: f64, time: f64) -> UrResult<bool> {
+    pub fn speed_l(&mut self, xd: &[f64; 6], acceleration: f64, time: f64) -> UrResult<()> {
         verify_within(acceleration, 0.0, TOOL_ACCELERATION_MAX)?;
         let mut val = xd.to_vec();
         val.push(acceleration);
@@ -703,7 +704,7 @@ impl ControlInterface {
     }
 
     /// `speedStop(a)` — recipe 8. `a` defaults to 10.0 upstream.
-    pub fn speed_stop(&mut self, acceleration: f64) -> UrResult<bool> {
+    pub fn speed_stop(&mut self, acceleration: f64) -> UrResult<()> {
         self.send_command(&RobotCommand::new(
             recipe::FORCE_MODE_PARAMETERS,
             CommandType::SpeedStop,
@@ -712,7 +713,7 @@ impl ControlInterface {
     }
 
     /// `setTcp(tcp_offset)` — recipe 6.
-    pub fn set_tcp(&mut self, tcp_offset: &[f64; 6]) -> UrResult<bool> {
+    pub fn set_tcp(&mut self, tcp_offset: &[f64; 6]) -> UrResult<()> {
         self.send_command(&RobotCommand::new(
             recipe::WRENCH,
             CommandType::SetTcp,
@@ -721,7 +722,7 @@ impl ControlInterface {
     }
 
     /// `teachMode()` — recipe 4.
-    pub fn teach_mode(&mut self) -> UrResult<bool> {
+    pub fn teach_mode(&mut self) -> UrResult<()> {
         self.send_command(&RobotCommand::new(
             recipe::NO_CMD,
             CommandType::TeachMode,
@@ -730,7 +731,7 @@ impl ControlInterface {
     }
 
     /// `endTeachMode()` — recipe 4.
-    pub fn end_teach_mode(&mut self) -> UrResult<bool> {
+    pub fn end_teach_mode(&mut self) -> UrResult<()> {
         self.send_command(&RobotCommand::new(
             recipe::NO_CMD,
             CommandType::EndTeachMode,
@@ -739,7 +740,7 @@ impl ControlInterface {
     }
 
     /// `triggerProtectiveStop()` — recipe 4.
-    pub fn trigger_protective_stop(&mut self) -> UrResult<bool> {
+    pub fn trigger_protective_stop(&mut self) -> UrResult<()> {
         self.send_command(&RobotCommand::new(
             recipe::NO_CMD,
             CommandType::ProtectiveStop,

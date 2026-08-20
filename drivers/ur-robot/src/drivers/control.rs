@@ -601,8 +601,18 @@ impl PortDriver for ControlDriver {
                 };
                 let iface = inner.iface_mut()?;
                 let within = match motion {
-                    MotionType::Joint => iface.is_joints_within_safety_limits(&target)?,
-                    MotionType::Cartesian => iface.is_pose_within_safety_limits(&target)?,
+                    MotionType::Joint => iface.is_joints_within_safety_limits(&target),
+                    MotionType::Cartesian => iface.is_pose_within_safety_limits(&target),
+                };
+                let within = match within {
+                    // A refused or failed query must release the busy record
+                    // before the error propagates, or the record stays busy
+                    // for a motion that was never queued.
+                    Err(e) => {
+                        updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
+                        return Err(e);
+                    }
+                    Ok(w) => w,
                 };
                 if !within {
                     log::warn!(
@@ -1079,6 +1089,32 @@ mod tests {
         let mut updates = Vec::new();
         inner.motion_task_done(p, &mut updates);
         assert_eq!(int_update(&updates, p.motion_done_count), Some(2));
+    }
+
+    /// A move whose start returns `Err` — a `CommandRefused` and a transport
+    /// failure take the same arm — must finish the task, not enter
+    /// `WaitingMotion`. Before the typed refusal, a refused start was
+    /// `Ok(false)` and the state machine waited on a motion the script never
+    /// ran.
+    #[test]
+    fn a_move_that_cannot_start_never_enters_waiting_motion() {
+        let p = params();
+        let mut inner = ControlInner {
+            pending_motion: Some(MotionTask {
+                motion: MotionType::Joint,
+                action: false,
+            }),
+            ..Default::default()
+        };
+        let receive = ReceiveHandle::new();
+
+        let mut updates = Vec::new();
+        drive_motion(p, &mut inner, &receive, &mut updates);
+
+        assert!(inner.pending_motion.is_none());
+        assert_eq!(inner.motion_status, MotionStatus::Done);
+        assert_eq!(int_update(&updates, p.move_j), Some(0));
+        assert_eq!(int_update(&updates, p.async_move_done), Some(1));
     }
 
     #[test]
