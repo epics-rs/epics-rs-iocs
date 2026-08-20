@@ -229,102 +229,108 @@ impl PortDriver for DashboardDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let p = self.params;
-        self.base.params.set_int32(reason, user.addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            self.base.params.set_int32(reason, user.addr, value)?;
 
-        if p.is_command(reason) && value == 0 {
-            return Ok(());
-        }
-
-        if reason == p.connect {
-            let ok = self.try_connect();
-            let connected = i32::from(ok);
-            self.base.set_int32_param(p.is_connected, 0, connected)?;
-            let mut s = self.shared.get();
-            s.connected = ok;
-            self.shared.set(s);
-            return if ok {
-                Ok(())
-            } else {
-                Err(asyn_error("could not connect to the dashboard server"))
-            };
-        }
-
-        let mut client = self.client.lock();
-        if !client.is_connected() {
-            log::warn!("ur-robot: the dashboard is disconnected; no action taken");
-            return Err(asyn_error("the dashboard is not connected"));
-        }
-
-        let result = if reason == p.play {
-            client.play()
-        } else if reason == p.stop {
-            client.stop()
-        } else if reason == p.pause {
-            client.pause()
-        } else if reason == p.disconnect {
-            client.disconnect();
-            Ok(())
-        } else if reason == p.shutdown {
-            client.shutdown()
-        } else if reason == p.close_popup {
-            client.close_popup()
-        } else if reason == p.close_safety_popup {
-            client.close_safety_popup()
-        } else if reason == p.power_on {
-            client.power_on()
-        } else if reason == p.power_off {
-            client.power_off()
-        } else if reason == p.brake_release {
-            client.brake_release()
-        } else if reason == p.unlock_protective_stop {
-            client.unlock_protective_stop()
-        } else if reason == p.restart_safety {
-            client.restart_safety()
-        } else {
-            Ok(())
-        };
-
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                log::error!("ur-robot: dashboard command failed: {e}");
-                Err(asyn_error("dashboard command failed"))
+            if p.is_command(reason) && value == 0 {
+                return Ok(());
             }
-        }
+
+            if reason == p.connect {
+                let ok = self.try_connect();
+                let connected = i32::from(ok);
+                self.base.set_int32_param(p.is_connected, 0, connected)?;
+                let mut s = self.shared.get();
+                s.connected = ok;
+                self.shared.set(s);
+                return if ok {
+                    Ok(())
+                } else {
+                    Err(asyn_error("could not connect to the dashboard server"))
+                };
+            }
+
+            let mut client = self.client.lock();
+            if !client.is_connected() {
+                log::warn!("ur-robot: the dashboard is disconnected; no action taken");
+                return Err(asyn_error("the dashboard is not connected"));
+            }
+
+            let result = if reason == p.play {
+                client.play()
+            } else if reason == p.stop {
+                client.stop()
+            } else if reason == p.pause {
+                client.pause()
+            } else if reason == p.disconnect {
+                client.disconnect();
+                Ok(())
+            } else if reason == p.shutdown {
+                client.shutdown()
+            } else if reason == p.close_popup {
+                client.close_popup()
+            } else if reason == p.close_safety_popup {
+                client.close_safety_popup()
+            } else if reason == p.power_on {
+                client.power_on()
+            } else if reason == p.power_off {
+                client.power_off()
+            } else if reason == p.brake_release {
+                client.brake_release()
+            } else if reason == p.unlock_protective_stop {
+                client.unlock_protective_stop()
+            } else if reason == p.restart_safety {
+                client.restart_safety()
+            } else {
+                Ok(())
+            };
+
+            match result {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    log::error!("ur-robot: dashboard command failed: {e}");
+                    Err(asyn_error("dashboard command failed"))
+                }
+            }
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let reason = user.reason;
-        let p = self.params;
-        let text = String::from_utf8_lossy(data)
-            .trim_end_matches('\0')
-            .to_string();
-        self.base
-            .set_string_param(reason, user.addr, text.clone())?;
+        let result: AsynResult<usize> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            let text = String::from_utf8_lossy(data)
+                .trim_end_matches('\0')
+                .to_string();
+            self.base
+                .set_string_param(reason, user.addr, text.clone())?;
 
-        let mut client = self.client.lock();
-        if !client.is_connected() {
-            log::warn!("ur-robot: the dashboard is disconnected; no action taken");
-            return Err(asyn_error("the dashboard is not connected"));
-        }
-
-        let result = if reason == p.popup {
-            client.popup(&text)
-        } else if reason == p.load_urp {
-            client.load_urp(&text)
-        } else {
-            Ok(())
-        };
-
-        match result {
-            Ok(()) => Ok(data.len()),
-            Err(e) => {
-                log::error!("ur-robot: dashboard command failed: {e}");
-                Err(asyn_error("dashboard command failed"))
+            let mut client = self.client.lock();
+            if !client.is_connected() {
+                log::warn!("ur-robot: the dashboard is disconnected; no action taken");
+                return Err(asyn_error("the dashboard is not connected"));
             }
-        }
+
+            let result = if reason == p.popup {
+                client.popup(&text)
+            } else if reason == p.load_urp {
+                client.load_urp(&text)
+            } else {
+                Ok(())
+            };
+
+            match result {
+                Ok(()) => Ok(data.len()),
+                Err(e) => {
+                    log::error!("ur-robot: dashboard command failed: {e}");
+                    Err(asyn_error("dashboard command failed"))
+                }
+            }
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }
 

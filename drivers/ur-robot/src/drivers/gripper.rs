@@ -238,142 +238,150 @@ impl PortDriver for GripperDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let p = self.params;
-        self.base.params.set_int32(reason, user.addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            self.base.params.set_int32(reason, user.addr, value)?;
 
-        if p.is_command(reason) && value == 0 {
-            return Ok(());
-        }
-
-        // The position range and unit configure the RobotiqGripper object,
-        // which outlives every (re)connect — nothing goes on the wire. They
-        // apply regardless of the link state, so the PINI writes at boot
-        // (robot off, gripper unreachable) cannot be lost. C gates them on
-        // the connection and the boot values are lost.
-        // MIN_POSITION / MAX_POSITION only stage the range; SET_POSITION_RANGE
-        // applies it.
-        if reason == p.min_position || reason == p.max_position {
-            return Ok(());
-        }
-        if reason == p.set_position_range {
-            let min = self.base.params.get_int32(p.min_position, 0).unwrap_or(0);
-            let max = self.base.params.get_int32(p.max_position, 0).unwrap_or(0);
-            self.gripper.lock().set_native_position_range(min, max);
-            return Ok(());
-        }
-        if reason == p.position_unit {
-            match position_unit(value) {
-                Some(unit) => self.gripper.lock().set_unit(MoveParameter::Position, unit),
-                None => {
-                    log::warn!("ur-robot: position unit {value} is undefined; no action taken");
-                }
+            if p.is_command(reason) && value == 0 {
+                return Ok(());
             }
-            return Ok(());
-        }
 
-        // An ACTIVATE that arrives while the gripper is unreachable is the
-        // desired state, not an error: try_connect activates from the cached
-        // value once the link is up (the PINI `$(AUTO_ACTIVATE=YES)` write
-        // always lands before any connect can have succeeded). C errors
-        // and the boot-time activation is lost.
-        if reason == p.activate && !(self.robot_ready() && self.gripper.lock().is_connected()) {
-            log::info!("ur-robot: gripper activation deferred until the gripper connects");
-            return Ok(());
-        }
+            // The position range and unit configure the RobotiqGripper object,
+            // which outlives every (re)connect — nothing goes on the wire. They
+            // apply regardless of the link state, so the PINI writes at boot
+            // (robot off, gripper unreachable) cannot be lost. C gates them on
+            // the connection and the boot values are lost.
+            // MIN_POSITION / MAX_POSITION only stage the range; SET_POSITION_RANGE
+            // applies it.
+            if reason == p.min_position || reason == p.max_position {
+                return Ok(());
+            }
+            if reason == p.set_position_range {
+                let min = self.base.params.get_int32(p.min_position, 0).unwrap_or(0);
+                let max = self.base.params.get_int32(p.max_position, 0).unwrap_or(0);
+                self.gripper.lock().set_native_position_range(min, max);
+                return Ok(());
+            }
+            if reason == p.position_unit {
+                match position_unit(value) {
+                    Some(unit) => self.gripper.lock().set_unit(MoveParameter::Position, unit),
+                    None => {
+                        log::warn!("ur-robot: position unit {value} is undefined; no action taken");
+                    }
+                }
+                return Ok(());
+            }
 
-        if !self.robot_ready() {
-            return Err(asyn_error(
-                "the robot must be powered on and the dashboard connected to use the gripper",
-            ));
-        }
+            // An ACTIVATE that arrives while the gripper is unreachable is the
+            // desired state, not an error: try_connect activates from the cached
+            // value once the link is up (the PINI `$(AUTO_ACTIVATE=YES)` write
+            // always lands before any connect can have succeeded). C errors
+            // and the boot-time activation is lost.
+            if reason == p.activate && !(self.robot_ready() && self.gripper.lock().is_connected()) {
+                log::info!("ur-robot: gripper activation deferred until the gripper connects");
+                return Ok(());
+            }
 
-        if reason == p.connect {
-            return if self.try_connect() {
-                Ok(())
+            if !self.robot_ready() {
+                return Err(asyn_error(
+                    "the robot must be powered on and the dashboard connected to use the gripper",
+                ));
+            }
+
+            if reason == p.connect {
+                return if self.try_connect() {
+                    Ok(())
+                } else {
+                    Err(asyn_error("could not connect to the gripper"))
+                };
+            }
+
+            let mut gripper = self.gripper.lock();
+            if !gripper.is_connected() {
+                return Err(asyn_error("the Robotiq gripper is not connected"));
+            }
+
+            let mut calibrated = None;
+            // Pre-checked open/close (upstream 558b98f, gripper_driver.cpp:218-245):
+            // a request whose end state already holds — open when already open or
+            // stopped at an outer object, close when already closed or stopped at
+            // an inner object — starts no motion, and the OPEN/CLOSE busy param is
+            // staged back to 0 so the record releases instead of waiting for a
+            // MoveStatus transition that will never come.
+            let mut refused = None;
+            let result: UrResult<()> = if reason == p.activate {
+                gripper.activate(false)
+            } else if reason == p.open {
+                (|| {
+                    if gripper.is_open()?
+                        || gripper.object_detection_status()? == ObjectStatus::StoppedOuterObject
+                    {
+                        log::warn!("ur-robot: gripper already open or stopped at an outer object");
+                        refused = Some(p.open);
+                        return Ok(());
+                    }
+                    gripper.open(MoveMode::StartMove).map(|_| ())
+                })()
+            } else if reason == p.close {
+                (|| {
+                    if gripper.is_closed()?
+                        || gripper.object_detection_status()? == ObjectStatus::StoppedInnerObject
+                    {
+                        log::warn!(
+                            "ur-robot: gripper already closed or stopped at an inner object"
+                        );
+                        refused = Some(p.close);
+                        return Ok(());
+                    }
+                    gripper.close(MoveMode::StartMove).map(|_| ())
+                })()
+            } else if reason == p.auto_calibrate {
+                match gripper.is_active() {
+                    Ok(true) => gripper.auto_calibrate(None).inspect(|()| {
+                        calibrated = Some(1);
+                    }),
+                    Ok(false) => Err(UrError::Protocol(
+                        "activate the gripper before auto-calibrating".into(),
+                    )),
+                    Err(e) => Err(e),
+                }
             } else {
-                Err(asyn_error("could not connect to the gripper"))
+                Ok(())
             };
-        }
+            drop(gripper);
 
-        let mut gripper = self.gripper.lock();
-        if !gripper.is_connected() {
-            return Err(asyn_error("the Robotiq gripper is not connected"));
-        }
-
-        let mut calibrated = None;
-        // Pre-checked open/close (upstream 558b98f, gripper_driver.cpp:218-245):
-        // a request whose end state already holds — open when already open or
-        // stopped at an outer object, close when already closed or stopped at
-        // an inner object — starts no motion, and the OPEN/CLOSE busy param is
-        // staged back to 0 so the record releases instead of waiting for a
-        // MoveStatus transition that will never come.
-        let mut refused = None;
-        let result: UrResult<()> = if reason == p.activate {
-            gripper.activate(false)
-        } else if reason == p.open {
-            (|| {
-                if gripper.is_open()?
-                    || gripper.object_detection_status()? == ObjectStatus::StoppedOuterObject
-                {
-                    log::warn!("ur-robot: gripper already open or stopped at an outer object");
-                    refused = Some(p.open);
-                    return Ok(());
-                }
-                gripper.open(MoveMode::StartMove).map(|_| ())
-            })()
-        } else if reason == p.close {
-            (|| {
-                if gripper.is_closed()?
-                    || gripper.object_detection_status()? == ObjectStatus::StoppedInnerObject
-                {
-                    log::warn!("ur-robot: gripper already closed or stopped at an inner object");
-                    refused = Some(p.close);
-                    return Ok(());
-                }
-                gripper.close(MoveMode::StartMove).map(|_| ())
-            })()
-        } else if reason == p.auto_calibrate {
-            match gripper.is_active() {
-                Ok(true) => gripper.auto_calibrate(None).inspect(|()| {
-                    calibrated = Some(1);
-                }),
-                Ok(false) => Err(UrError::Protocol(
-                    "activate the gripper before auto-calibrating".into(),
-                )),
-                Err(e) => Err(e),
+            if let Some(v) = calibrated {
+                self.base.params.set_int32(p.is_calibrated, 0, v)?;
             }
-        } else {
-            Ok(())
-        };
-        drop(gripper);
-
-        if let Some(v) = calibrated {
-            self.base.params.set_int32(p.is_calibrated, 0, v)?;
-        }
-        if let Some(param) = refused {
-            self.base.params.set_int32(param, 0, 0)?;
-        }
-        result.map_err(|e| asyn_error(format!("gripper command failed: {e}")))
+            if let Some(param) = refused {
+                self.base.params.set_int32(param, 0, 0)?;
+            }
+            result.map_err(|e| asyn_error(format!("gripper command failed: {e}")))
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let p = self.params;
-        self.base.params.set_float64(reason, user.addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            self.base.params.set_float64(reason, user.addr, value)?;
 
-        // SET_SPEED / SET_FORCE configure the RobotiqGripper object, which
-        // outlives every (re)connect — nothing goes on the wire until the
-        // next move. They apply regardless of the link state, so the PINI
-        // writes at boot (robot off, gripper unreachable) cannot be lost.
-        // C gates them on the connection and the boot values are lost.
-        let mut gripper = self.gripper.lock();
-        if reason == p.set_speed {
-            gripper.set_speed(value);
-        } else if reason == p.set_force {
-            gripper.set_force(value);
-        }
-        Ok(())
+            // SET_SPEED / SET_FORCE configure the RobotiqGripper object, which
+            // outlives every (re)connect — nothing goes on the wire until the
+            // next move. They apply regardless of the link state, so the PINI
+            // writes at boot (robot off, gripper unreachable) cannot be lost.
+            // C gates them on the connection and the boot values are lost.
+            let mut gripper = self.gripper.lock();
+            if reason == p.set_speed {
+                gripper.set_speed(value);
+            } else if reason == p.set_force {
+                gripper.set_force(value);
+            }
+            Ok(())
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }
 
@@ -551,6 +559,39 @@ mod tests {
             lines
         });
         (port, jh)
+    }
+
+    /// B4: every write exit flushes `call_param_callbacks` — C's `skip:`
+    /// label parity — so a value cached by a write handler reaches I/O Intr
+    /// records immediately, success and error exits alike, instead of at
+    /// the next poll cycle (or never, on a poll-less port).
+    #[test]
+    fn a_write_flushes_interrupts_on_every_exit() {
+        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptValue};
+
+        let dash = DashboardHandle::new("127.0.0.1");
+        registry::register_dashboard("GRIP_B4_DASH", dash);
+        let mut drv = GripperDriver::new("GRIP_B4", "GRIP_B4_DASH").expect("driver");
+        let p = drv.params();
+
+        let seen: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        let _sub = drv.base().interrupts.register_sync_callback(
+            InterruptFilter::default(),
+            move |iv: &InterruptValue| {
+                seen_cb.lock().unwrap().push(iv.reason);
+            },
+        );
+
+        // A successful write flushes immediately.
+        drv.write_float64(&mut AsynUser::new(p.set_speed), 0.5)
+            .unwrap();
+        assert!(seen.lock().unwrap().contains(&p.set_speed));
+
+        // An error exit (OPEN with the robot off) still flushes the value
+        // cached before the gate refused.
+        assert!(drv.write_int32(&mut AsynUser::new(p.open), 1).is_err());
+        assert!(seen.lock().unwrap().contains(&p.open));
     }
 
     /// The boot race B3 closes: at iocsh time the dashboard has not

@@ -60,6 +60,22 @@ pub(crate) fn asyn_error(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// The end-of-write flush every C handler performs: the default
+/// `asynPortDriver::write*` end with `callParamCallbacks(addr)`
+/// (asynPortDriver.cpp:2031), and every urRobot C override reaches its own
+/// call through the `skip:` label — on error exits too. Without it, a value
+/// cached by a write handler reaches I/O Intr records only at the next poll
+/// cycle, and never on the poll-less io port. The write's own error outranks
+/// a flush error.
+pub(crate) fn flush_after<T>(
+    base: &mut epics_rs::asyn::port::PortDriverBase,
+    addr: i32,
+    result: Result<T, AsynError>,
+) -> Result<T, AsynError> {
+    let flushed = base.call_param_callbacks(addr);
+    result.and_then(|v| flushed.map(|()| v))
+}
+
 /// The alarm half of a poll cycle: on a health transition, the status
 /// updates that raise (link lost) or clear (link recovered) the COMM alarm
 /// on every readback `(reason, addr)` in `targets`; on a steady state,

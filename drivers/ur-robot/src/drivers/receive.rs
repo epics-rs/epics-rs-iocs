@@ -339,38 +339,41 @@ impl PortDriver for ReceiveDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let p = self.params;
-        self.base.params.set_int32(reason, user.addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            self.base.params.set_int32(reason, user.addr, value)?;
 
-        if p.is_command(reason) && value == 0 {
-            return Ok(());
-        }
+            if p.is_command(reason) && value == 0 {
+                return Ok(());
+            }
 
-        if reason == p.reconnect {
-            return if self.try_connect() {
-                Ok(())
-            } else {
-                Err(asyn_error(
-                    "could not connect to the RTDE receive interface",
-                ))
+            if reason == p.reconnect {
+                return if self.try_connect() {
+                    Ok(())
+                } else {
+                    Err(asyn_error(
+                        "could not connect to the RTDE receive interface",
+                    ))
+                };
+            }
+
+            let mut slot = self.iface.lock();
+            let Some(iface) = slot.as_mut() else {
+                return Err(asyn_error("the RTDE receive interface is not initialised"));
             };
-        }
 
-        let mut slot = self.iface.lock();
-        let Some(iface) = slot.as_mut() else {
-            return Err(asyn_error("the RTDE receive interface is not initialised"));
-        };
+            if reason == p.disconnect {
+                iface.disconnect();
+                return Ok(());
+            }
 
-        if reason == p.disconnect {
-            iface.disconnect();
-            return Ok(());
-        }
-
-        if !iface.is_connected() {
-            return Err(asyn_error("the RTDE receive interface is not connected"));
-        }
-        Ok(())
+            if !iface.is_connected() {
+                return Err(asyn_error("the RTDE receive interface is not connected"));
+            }
+            Ok(())
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }
 

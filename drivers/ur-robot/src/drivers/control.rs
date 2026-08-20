@@ -476,267 +476,277 @@ impl PortDriver for ControlDriver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let addr = user.addr;
-        let p = self.params;
-        self.base.params.set_float64(reason, addr, value)?;
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let addr = user.addr;
+            let p = self.params;
+            self.base.params.set_float64(reason, addr, value)?;
 
-        // Only the four per-axis parameters take one address per joint; a
-        // scalar parameter written at addr 1..5 is a miswired record, not a
-        // joint index.
-        let per_axis = reason == p.joint_cmd
-            || reason == p.pose_cmd
-            || reason == p.jog_speed
-            || reason == p.tcp_offset;
-        let limit = if per_axis { NUM_JOINTS } else { 1 };
-        let index = usize::try_from(addr)
-            .ok()
-            .filter(|i| *i < limit)
-            .ok_or_else(|| asyn_error(format!("address {addr} is out of range")))?;
+            // Only the four per-axis parameters take one address per joint; a
+            // scalar parameter written at addr 1..5 is a miswired record, not a
+            // joint index.
+            let per_axis = reason == p.joint_cmd
+                || reason == p.pose_cmd
+                || reason == p.jog_speed
+                || reason == p.tcp_offset;
+            let limit = if per_axis { NUM_JOINTS } else { 1 };
+            let index = usize::try_from(addr)
+                .ok()
+                .filter(|i| *i < limit)
+                .ok_or_else(|| asyn_error(format!("address {addr} is out of range")))?;
 
-        // Every arm below stages IOC-local state, so none of them needs the
-        // link up — PINI processes these records at boot, before any connect
-        // can have succeeded. TCP_OFFSET is the one that also reaches the
-        // device: connected, it applies now; disconnected, the staged offset
-        // waits for try_connect (C refuses the write and the offset is lost).
-        let mut inner = self.inner.lock();
-        if reason == p.custom_script_timeout {
-            inner.custom_script_timeout = Duration::from_secs_f64(value.max(0.0));
-            return Ok(());
-        }
-        if reason == p.jog_acceleration {
-            inner.jog_acceleration = value;
-            inner.new_jog = true;
-            return Ok(());
-        }
-
-        if reason == p.joint_cmd {
-            inner.cmd_joints[index] = deg_to_rad(value);
-        } else if reason == p.pose_cmd {
-            // x,y,z arrive in mm; rx,ry,rz are a rotation vector already in
-            // radians (upstream c02490e) — no angular scaling applies.
-            inner.cmd_pose[index] = if index >= 3 { value } else { value / 1000.0 };
-        } else if reason == p.jog_speed {
-            // x,y,z arrive in mm/s; rx,ry,rz in rad/s.
-            inner.jog_speeds[index] = if index >= 3 { value } else { value / 1000.0 };
-            inner.new_jog = true;
-        } else if reason == p.tcp_offset {
-            // x,y,z arrive in mm; rx,ry,rz are already radians.
-            let offset = inner.tcp_offset.get_or_insert([0.0; NUM_JOINTS]);
-            offset[index] = if index >= 3 { value } else { value / 1000.0 };
-            let offset = *offset;
-            if inner.connected() {
-                inner
-                    .iface_mut()
-                    .and_then(|i| i.set_tcp(&offset))
-                    .map_err(|e| asyn_error(format!("setTcp failed: {e}")))?;
+            // Every arm below stages IOC-local state, so none of them needs the
+            // link up — PINI processes these records at boot, before any connect
+            // can have succeeded. TCP_OFFSET is the one that also reaches the
+            // device: connected, it applies now; disconnected, the staged offset
+            // waits for try_connect (C refuses the write and the offset is lost).
+            let mut inner = self.inner.lock();
+            if reason == p.custom_script_timeout {
+                inner.custom_script_timeout = Duration::from_secs_f64(value.max(0.0));
+                return Ok(());
             }
-        } else if reason == p.joint_speed {
-            inner.joint_speed = deg_to_rad(value);
-        } else if reason == p.joint_acceleration {
-            inner.joint_accel = deg_to_rad(value);
-        } else if reason == p.joint_blend {
-            inner.joint_blend = value / 1000.0;
-        } else if reason == p.linear_speed {
-            inner.linear_speed = value / 1000.0;
-        } else if reason == p.linear_acceleration {
-            inner.linear_accel = value / 1000.0;
-        } else if reason == p.linear_blend {
-            inner.linear_blend = value / 1000.0;
-        }
-        Ok(())
-    }
-
-    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let p = self.params;
-        self.base.params.set_int32(reason, user.addr, value)?;
-
-        if p.is_command(reason) && value == 0 {
-            return Ok(());
-        }
-
-        if reason == p.reconnect {
-            return if self.try_connect() {
-                Ok(())
-            } else {
-                Err(asyn_error(
-                    "could not connect to the RTDE control interface",
-                ))
-            };
-        }
-
-        if reason == p.run_custom_script_file {
-            let path = self.inner.lock().custom_script_path.clone();
-            let body = std::fs::read_to_string(&path)
-                .map_err(|e| asyn_error(format!("could not read the URScript file {path}: {e}")));
-            let body = match body {
-                Ok(body) => body,
-                Err(e) => {
-                    self.base.params.set_int32(p.custom_script_error, 0, 1)?;
-                    return Err(e);
-                }
-            };
-            return self.run_custom_script(&body, &path);
-        }
-
-        let mut inner = self.inner.lock();
-
-        if reason == p.disconnect {
-            match inner.iface.as_mut() {
-                Some(iface) => {
-                    iface.disconnect();
-                    return Ok(());
-                }
-                None => {
-                    return Err(asyn_error("the RTDE control interface is not initialised"));
-                }
-            }
-        }
-
-        // These only stage state for a later command; they do not need the link.
-        if reason == p.waypoint_move {
-            inner.waypoint_move = value != 0;
-            return Ok(());
-        }
-        if reason == p.waypoint_action_done {
-            inner.waypoint_action_done = value != 0;
-            return Ok(());
-        }
-
-        if !inner.connected() {
-            return Err(asyn_error("the RTDE control interface is not connected"));
-        }
-
-        let mut updates: Vec<ParamSetValue> = Vec::new();
-        let result: UrResult<()> = (|| {
-            if reason == p.move_j || reason == p.move_l {
-                let motion = if reason == p.move_j {
-                    MotionType::Joint
-                } else {
-                    MotionType::Cartesian
-                };
-                // The refused/accepted writes below feed the moveJ/moveL busy
-                // records: 1 on an accepted request, 0 on a refusal so the
-                // record releases immediately (upstream 558b98f).
-                if inner.pending_motion.is_some() {
-                    log::warn!("ur-robot: a motion is already in progress; please wait");
-                    updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
-                    return Ok(());
-                }
-                let target = match motion {
-                    MotionType::Joint => inner.cmd_joints,
-                    MotionType::Cartesian => inner.cmd_pose,
-                };
-                let iface = inner.iface_mut()?;
-                let within = match motion {
-                    MotionType::Joint => iface.is_joints_within_safety_limits(&target),
-                    MotionType::Cartesian => iface.is_pose_within_safety_limits(&target),
-                };
-                let within = match within {
-                    // A refused or failed query must release the busy record
-                    // before the error propagates, or the record stays busy
-                    // for a motion that was never queued.
-                    Err(e) => {
-                        updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
-                        return Err(e);
-                    }
-                    Ok(w) => w,
-                };
-                if !within {
-                    log::warn!(
-                        "ur-robot: the requested target is not within the safety limits; \
-                         no action taken"
-                    );
-                    updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
-                    return Ok(());
-                }
-                let action = inner.waypoint_move;
-                inner.pending_motion = Some(MotionTask { motion, action });
-                inner.waypoint_move = false;
-                updates.push(ParamSetValue::new(
-                    p.async_move_done,
-                    0,
-                    ParamValue::Int32(0),
-                ));
-                updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(1)));
+            if reason == p.jog_acceleration {
+                inner.jog_acceleration = value;
+                inner.new_jog = true;
                 return Ok(());
             }
 
-            if reason == p.stop_j {
-                inner.motion_task_done(p, &mut updates);
-                inner.iface_mut()?.stop_j(2.0, false)?;
-            } else if reason == p.stop_l {
-                inner.motion_task_done(p, &mut updates);
-                inner.iface_mut()?.stop_l(10.0, false)?;
-            } else if reason == p.reupload_control_script {
-                inner.iface_mut()?.reupload_script()?;
-            } else if reason == p.stop_control_script {
-                inner.iface_mut()?.stop_script()?;
-            } else if reason == p.trigger_prot_stop {
-                inner.iface_mut()?.trigger_protective_stop()?;
-            } else if reason == p.teach_mode {
-                if value != 0 {
-                    inner.iface_mut()?.teach_mode()?;
-                } else {
-                    inner.iface_mut()?.end_teach_mode()?;
+            if reason == p.joint_cmd {
+                inner.cmd_joints[index] = deg_to_rad(value);
+            } else if reason == p.pose_cmd {
+                // x,y,z arrive in mm; rx,ry,rz are a rotation vector already in
+                // radians (upstream c02490e) — no angular scaling applies.
+                inner.cmd_pose[index] = if index >= 3 { value } else { value / 1000.0 };
+            } else if reason == p.jog_speed {
+                // x,y,z arrive in mm/s; rx,ry,rz in rad/s.
+                inner.jog_speeds[index] = if index >= 3 { value } else { value / 1000.0 };
+                inner.new_jog = true;
+            } else if reason == p.tcp_offset {
+                // x,y,z arrive in mm; rx,ry,rz are already radians.
+                let offset = inner.tcp_offset.get_or_insert([0.0; NUM_JOINTS]);
+                offset[index] = if index >= 3 { value } else { value / 1000.0 };
+                let offset = *offset;
+                if inner.connected() {
+                    inner
+                        .iface_mut()
+                        .and_then(|i| i.set_tcp(&offset))
+                        .map_err(|e| asyn_error(format!("setTcp failed: {e}")))?;
                 }
-            } else if reason == p.jog_start {
-                if inner.new_jog {
-                    let speeds = inner.jog_speeds;
-                    let accel = inner.jog_acceleration;
-                    inner.iface_mut()?.speed_l(&speeds, accel, 0.01)?;
-                    inner.new_jog = false;
-                }
-                updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(1)));
-            } else if reason == p.jog_stop {
-                inner.iface_mut()?.speed_stop(10.0)?;
-                updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(0)));
+            } else if reason == p.joint_speed {
+                inner.joint_speed = deg_to_rad(value);
+            } else if reason == p.joint_acceleration {
+                inner.joint_accel = deg_to_rad(value);
+            } else if reason == p.joint_blend {
+                inner.joint_blend = value / 1000.0;
+            } else if reason == p.linear_speed {
+                inner.linear_speed = value / 1000.0;
+            } else if reason == p.linear_acceleration {
+                inner.linear_accel = value / 1000.0;
+            } else if reason == p.linear_blend {
+                inner.linear_blend = value / 1000.0;
             }
             Ok(())
         })();
-        drop(inner);
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
+    }
 
-        for u in updates {
-            if let ParamSetValue::Value {
-                reason,
-                addr,
-                value: ParamValue::Int32(value),
-            } = u
-            {
-                self.base.params.set_int32(reason, addr, value)?;
+    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        let result: AsynResult<()> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            self.base.params.set_int32(reason, user.addr, value)?;
+
+            if p.is_command(reason) && value == 0 {
+                return Ok(());
             }
-        }
-        result.map_err(|e| asyn_error(format!("RTDE control command failed: {e}")))
+
+            if reason == p.reconnect {
+                return if self.try_connect() {
+                    Ok(())
+                } else {
+                    Err(asyn_error(
+                        "could not connect to the RTDE control interface",
+                    ))
+                };
+            }
+
+            if reason == p.run_custom_script_file {
+                let path = self.inner.lock().custom_script_path.clone();
+                let body = std::fs::read_to_string(&path).map_err(|e| {
+                    asyn_error(format!("could not read the URScript file {path}: {e}"))
+                });
+                let body = match body {
+                    Ok(body) => body,
+                    Err(e) => {
+                        self.base.params.set_int32(p.custom_script_error, 0, 1)?;
+                        return Err(e);
+                    }
+                };
+                return self.run_custom_script(&body, &path);
+            }
+
+            let mut inner = self.inner.lock();
+
+            if reason == p.disconnect {
+                match inner.iface.as_mut() {
+                    Some(iface) => {
+                        iface.disconnect();
+                        return Ok(());
+                    }
+                    None => {
+                        return Err(asyn_error("the RTDE control interface is not initialised"));
+                    }
+                }
+            }
+
+            // These only stage state for a later command; they do not need the link.
+            if reason == p.waypoint_move {
+                inner.waypoint_move = value != 0;
+                return Ok(());
+            }
+            if reason == p.waypoint_action_done {
+                inner.waypoint_action_done = value != 0;
+                return Ok(());
+            }
+
+            if !inner.connected() {
+                return Err(asyn_error("the RTDE control interface is not connected"));
+            }
+
+            let mut updates: Vec<ParamSetValue> = Vec::new();
+            let result: UrResult<()> = (|| {
+                if reason == p.move_j || reason == p.move_l {
+                    let motion = if reason == p.move_j {
+                        MotionType::Joint
+                    } else {
+                        MotionType::Cartesian
+                    };
+                    // The refused/accepted writes below feed the moveJ/moveL busy
+                    // records: 1 on an accepted request, 0 on a refusal so the
+                    // record releases immediately (upstream 558b98f).
+                    if inner.pending_motion.is_some() {
+                        log::warn!("ur-robot: a motion is already in progress; please wait");
+                        updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
+                        return Ok(());
+                    }
+                    let target = match motion {
+                        MotionType::Joint => inner.cmd_joints,
+                        MotionType::Cartesian => inner.cmd_pose,
+                    };
+                    let iface = inner.iface_mut()?;
+                    let within = match motion {
+                        MotionType::Joint => iface.is_joints_within_safety_limits(&target),
+                        MotionType::Cartesian => iface.is_pose_within_safety_limits(&target),
+                    };
+                    let within = match within {
+                        // A refused or failed query must release the busy record
+                        // before the error propagates, or the record stays busy
+                        // for a motion that was never queued.
+                        Err(e) => {
+                            updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
+                            return Err(e);
+                        }
+                        Ok(w) => w,
+                    };
+                    if !within {
+                        log::warn!(
+                            "ur-robot: the requested target is not within the safety limits; \
+                         no action taken"
+                        );
+                        updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
+                        return Ok(());
+                    }
+                    let action = inner.waypoint_move;
+                    inner.pending_motion = Some(MotionTask { motion, action });
+                    inner.waypoint_move = false;
+                    updates.push(ParamSetValue::new(
+                        p.async_move_done,
+                        0,
+                        ParamValue::Int32(0),
+                    ));
+                    updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(1)));
+                    return Ok(());
+                }
+
+                if reason == p.stop_j {
+                    inner.motion_task_done(p, &mut updates);
+                    inner.iface_mut()?.stop_j(2.0, false)?;
+                } else if reason == p.stop_l {
+                    inner.motion_task_done(p, &mut updates);
+                    inner.iface_mut()?.stop_l(10.0, false)?;
+                } else if reason == p.reupload_control_script {
+                    inner.iface_mut()?.reupload_script()?;
+                } else if reason == p.stop_control_script {
+                    inner.iface_mut()?.stop_script()?;
+                } else if reason == p.trigger_prot_stop {
+                    inner.iface_mut()?.trigger_protective_stop()?;
+                } else if reason == p.teach_mode {
+                    if value != 0 {
+                        inner.iface_mut()?.teach_mode()?;
+                    } else {
+                        inner.iface_mut()?.end_teach_mode()?;
+                    }
+                } else if reason == p.jog_start {
+                    if inner.new_jog {
+                        let speeds = inner.jog_speeds;
+                        let accel = inner.jog_acceleration;
+                        inner.iface_mut()?.speed_l(&speeds, accel, 0.01)?;
+                        inner.new_jog = false;
+                    }
+                    updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(1)));
+                } else if reason == p.jog_stop {
+                    inner.iface_mut()?.speed_stop(10.0)?;
+                    updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(0)));
+                }
+                Ok(())
+            })();
+            drop(inner);
+
+            for u in updates {
+                if let ParamSetValue::Value {
+                    reason,
+                    addr,
+                    value: ParamValue::Int32(value),
+                } = u
+                {
+                    self.base.params.set_int32(reason, addr, value)?;
+                }
+            }
+            result.map_err(|e| asyn_error(format!("RTDE control command failed: {e}")))
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let reason = user.reason;
-        let p = self.params;
-        let text = String::from_utf8_lossy(data)
-            .trim_end_matches('\0')
-            .to_string();
-        self.base
-            .params
-            .set_string(reason, user.addr, text.clone())?;
+        let result: AsynResult<usize> = (|| {
+            let reason = user.reason;
+            let p = self.params;
+            let text = String::from_utf8_lossy(data)
+                .trim_end_matches('\0')
+                .to_string();
+            self.base
+                .params
+                .set_string(reason, user.addr, text.clone())?;
 
-        if reason == p.custom_script_file {
-            return if std::path::Path::new(&text).is_file() {
-                self.inner.lock().custom_script_path = text;
-                self.base.params.set_int32(p.custom_script_error, 0, 0)?;
-                Ok(data.len())
-            } else {
-                self.base.params.set_int32(p.custom_script_error, 0, 1)?;
-                Err(asyn_error(format!("no such URScript file: {text}")))
-            };
-        }
+            if reason == p.custom_script_file {
+                return if std::path::Path::new(&text).is_file() {
+                    self.inner.lock().custom_script_path = text;
+                    self.base.params.set_int32(p.custom_script_error, 0, 0)?;
+                    Ok(data.len())
+                } else {
+                    self.base.params.set_int32(p.custom_script_error, 0, 1)?;
+                    Err(asyn_error(format!("no such URScript file: {text}")))
+                };
+            }
 
-        if reason == p.custom_inline_script {
-            self.run_custom_script(&text, "(inline)")?;
-            return Ok(data.len());
-        }
+            if reason == p.custom_inline_script {
+                self.run_custom_script(&text, "(inline)")?;
+                return Ok(data.len());
+            }
 
-        Ok(data.len())
+            Ok(data.len())
+        })();
+        crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }
 
