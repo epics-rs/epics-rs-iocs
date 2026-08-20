@@ -150,6 +150,7 @@ members = [
     "iocs/mca-ioc",
     "iocs/mca-rontec-ioc",
     "iocs/mca-amptek-ioc",
+    "tools/ioc-conventions",
 ]
 
 # Single source of truth for the epics-rs crate versions every driver/IOC
