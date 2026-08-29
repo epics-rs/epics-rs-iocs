@@ -106,22 +106,18 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "octetPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "address",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "MPCConfig portName octetPort address [pollPeriod] - MPC/Digitel ion-pump controller",
@@ -150,17 +146,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "octetPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "TPG261Config portName octetPort [pollPeriod] - Pfeiffer TPG261/TPG262 gauge controller",
@@ -186,27 +179,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "octetPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "numStations",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "numRelays",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "TelevacConfig portName octetPort numStations numRelays [pollPeriod] - \
@@ -239,22 +227,18 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "octetPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "numGauges",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "MKSConfig portName octetPort numGauges [pollPeriod] - MKS/HPS SensaVac 937 \
@@ -284,17 +268,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "octetPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "ND261Config portName octetPort [pollPeriod] - Heidenhain ND261 display unit",
@@ -320,17 +301,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "octetPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "groupAddress",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "EurothermConfig portName octetPort groupAddress - Eurotherm 800/2000 \

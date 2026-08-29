@@ -233,7 +233,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "wireScale",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
                 arg_int_opt("movingPollMs"),
                 arg_int_opt("idlePollMs"),
@@ -283,7 +282,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "controllerID",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 arg_int_opt("movingPollMs"),
                 arg_int_opt("idlePollMs"),
@@ -335,7 +333,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "controllerID",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 arg_int_opt("movingPollMs"),
                 arg_int_opt("idlePollMs"),
@@ -390,7 +387,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "numAxes",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 arg_int_opt("movingPollMs"),
                 arg_int_opt("idlePollMs"),
@@ -446,22 +442,18 @@ impl NewportHolder {
                 ArgDesc {
                     name: "axis",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "hasLimits",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "forwardAmplitude",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "reverseAmplitude",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "AG_UCCreateAxis(motorPort, axis, hasLimits, forwardAmplitude, reverseAmplitude) - Add an axis to a Newport Agilis AG-UC controller",
@@ -538,7 +530,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "numAxes",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 arg_int_opt("movingPollMs"),
                 arg_int_opt("idlePollMs"),
@@ -620,13 +611,11 @@ impl NewportHolder {
                 ArgDesc {
                     name: "axis",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 arg_str_req("positionerName"),
                 ArgDesc {
                     name: "stepsPerUnit",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
             ],
             "XPSCreateAxis(motorPort, movePort, axis, positionerName, stepsPerUnit) - Add an axis to a Newport XPS controller",
@@ -696,12 +685,10 @@ impl NewportHolder {
                 ArgDesc {
                     name: "taskName",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "parameters",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
             ],
             "XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters]) - Run a TCL script file on a Newport XPS controller",
@@ -782,7 +769,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "mode",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 arg_double_opt("minPosition"),
                 arg_double_opt("maxPosition"),
@@ -859,7 +845,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "moveMode",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
             ],
             "XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode]) - Load a PVT profile for an XPS group from a CSV points file (time + one position column per group positioner; moveMode absolute|relative, default absolute)",
@@ -913,17 +898,14 @@ impl NewportHolder {
                 ArgDesc {
                     name: "ftpUser",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "ftpPassword",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "ftpDir",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
             ],
             "XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir]) - Generate the defined profile's trajectory file, FTP it to the XPS, and verify it against dynamics + soft limits",
@@ -1611,7 +1593,6 @@ impl NewportHolder {
                 ArgDesc {
                     name: "numAxes",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 arg_int_opt("movingPollMs"),
                 arg_int_opt("idlePollMs"),
@@ -1788,7 +1769,6 @@ fn arg_str_req(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::String,
-        optional: false,
     }
 }
 
@@ -1796,7 +1776,6 @@ fn arg_int_opt(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::Int,
-        optional: true,
     }
 }
 
@@ -1804,7 +1783,6 @@ fn arg_double_opt(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::Double,
-        optional: true,
     }
 }
 
@@ -1812,7 +1790,6 @@ fn arg_double_req(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::Double,
-        optional: false,
     }
 }
 

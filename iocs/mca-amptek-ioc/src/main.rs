@@ -80,22 +80,18 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "interface",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addressInfo",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "directMode",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "drvAmptekConfigure portName interface addressInfo [directMode] - \

@@ -86,27 +86,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ttyName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "priority",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noAutoConnect",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noProcessEos",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
@@ -171,22 +166,18 @@ async fn main() -> CaResult<()> {
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "serialPort",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "serialAddr",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "poll",
                 arg_type: ArgType::Int,
-                optional: false,
             },
         ],
         "initScaler974 portName serialPort serialAddr poll",

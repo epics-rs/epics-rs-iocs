@@ -56,22 +56,18 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "uniqueID",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "maxInputPoints",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "maxOutputPoints",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "MultiFunctionConfig portName uniqueID [maxInputPoints] [maxOutputPoints]",

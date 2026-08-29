@@ -27,11 +27,11 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
         ioc.register_startup_command(CommandDef::new(
             "d435iConfig",
             vec![
-                ArgDesc { name: "portName", arg_type: ArgType::String, optional: false },
-                ArgDesc { name: "serial", arg_type: ArgType::String, optional: true },
-                ArgDesc { name: "maxSizeX", arg_type: ArgType::Int, optional: true },
-                ArgDesc { name: "maxSizeY", arg_type: ArgType::Int, optional: true },
-                ArgDesc { name: "maxMemory", arg_type: ArgType::Int, optional: true },
+                ArgDesc { name: "portName", arg_type: ArgType::String },
+                ArgDesc { name: "serial", arg_type: ArgType::String },
+                ArgDesc { name: "maxSizeX", arg_type: ArgType::Int },
+                ArgDesc { name: "maxSizeY", arg_type: ArgType::Int },
+                ArgDesc { name: "maxMemory", arg_type: ArgType::Int },
             ],
             "d435iConfig portName [serial] [maxSizeX] [maxSizeY] [maxMemory]",
             move |args: &[ArgValue], _ctx: &CommandContext| {

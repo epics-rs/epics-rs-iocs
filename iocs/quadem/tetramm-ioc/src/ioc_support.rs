@@ -25,22 +25,18 @@ fn tetramm_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "QEPortName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ringBufferSize",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvTetrAMMConfigure portName QEPortName [ringBufferSize] [maxMemory]",

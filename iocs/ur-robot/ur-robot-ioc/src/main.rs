@@ -92,17 +92,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "robotIP",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "URDashboardConfig portName robotIP [pollPeriod]",
@@ -128,17 +125,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "robotIP",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "RTDEReceiveConfig portName robotIP [pollPeriod]",
@@ -166,17 +160,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "robotIP",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "RTDEInOutConfig portName robotIP [pollPeriod]",
@@ -204,22 +195,18 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "dashboardPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "receivePort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "RTDEControlConfig portName dashboardPort receivePort [pollPeriod]",
@@ -246,17 +233,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "dashboardPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "pollPeriod",
                     arg_type: ArgType::Double,
-                    optional: true,
                 },
             ],
             "URGripperConfig portName dashboardPort [pollPeriod]",

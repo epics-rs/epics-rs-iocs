@@ -71,7 +71,6 @@ async fn main() -> CaResult<()> {
             vec![ArgDesc {
                 name: "localAmsNetId",
                 arg_type: ArgType::String,
-                optional: false,
             }],
             "adsSetLocalAddress localAmsNetId",
             move |args: &[ArgValue], _ctx: &CommandContext| {
@@ -94,57 +93,46 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ipAddr",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "amsNetId",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "amsPort",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "paramTableSize",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "priority",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "disableAutoConnect",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "defaultSampleTimeMS",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "maxDelayTimeMS",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "adsTimeoutMS",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "defaultTimeSource",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "adsAsynPortDriverConfigure portName ipAddr amsNetId [amsPort] \
@@ -205,7 +193,6 @@ async fn main() -> CaResult<()> {
             vec![ArgDesc {
                 name: "name",
                 arg_type: ArgType::String,
-                optional: true,
             }],
             "adsPollInfo [name]",
             move |args: &[ArgValue], _ctx: &CommandContext| {

@@ -51,17 +51,14 @@ async fn main() -> CaResult<()> {
             ArgDesc {
                 name: "name",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ip_addr",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "slot",
                 arg_type: ArgType::Int,
-                optional: false,
             },
         ],
         "drvEtherIP_define_PLC name ip_addr slot",
@@ -83,7 +80,6 @@ async fn main() -> CaResult<()> {
         vec![ArgDesc {
             name: "milliseconds",
             arg_type: ArgType::Int,
-            optional: false,
         }],
         "EIP_timeout milliseconds",
         |args: &[ArgValue], _ctx: &CommandContext| {
@@ -102,7 +98,6 @@ async fn main() -> CaResult<()> {
         vec![ArgDesc {
             name: "bytes",
             arg_type: ArgType::Int,
-            optional: false,
         }],
         "EIP_buffer_limit bytes",
         |args: &[ArgValue], _ctx: &CommandContext| {
@@ -125,7 +120,6 @@ async fn main() -> CaResult<()> {
         vec![ArgDesc {
             name: "seconds",
             arg_type: ArgType::Double,
-            optional: false,
         }],
         "drvEtherIP_default_rate seconds",
         |args: &[ArgValue], _ctx: &CommandContext| {
@@ -148,7 +142,6 @@ async fn main() -> CaResult<()> {
         vec![ArgDesc {
             name: "level",
             arg_type: ArgType::Int,
-            optional: true,
         }],
         "drvEtherIP_report [level]",
         |args: &[ArgValue], _ctx: &CommandContext| {

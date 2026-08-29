@@ -95,27 +95,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ttyName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "priority",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noAutoConnect",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noProcessEos",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
@@ -166,17 +161,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "myport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioaddr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "DG645Config myport ioport ioaddr",
@@ -224,27 +216,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "myport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "units",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "iface",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "ColbyConfig myport ioport addr units iface",
@@ -300,17 +287,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "myport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioaddr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "CoherentSdgConfig myport ioport ioaddr",

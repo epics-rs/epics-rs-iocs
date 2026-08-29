@@ -85,17 +85,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "uniqueID",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "maxTimePoints",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "USBCTRConfig portName uniqueID [maxTimePoints]",

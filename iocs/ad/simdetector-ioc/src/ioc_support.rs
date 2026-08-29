@@ -27,32 +27,26 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "maxSizeX",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "maxSizeY",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "dataType",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "maxBuffers",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "maxMemory",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "simDetectorConfig portName [maxSizeX] [maxSizeY] [dataType] [maxBuffers] [maxMemory]",

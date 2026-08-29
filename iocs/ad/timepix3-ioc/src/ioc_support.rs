@@ -25,12 +25,10 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "serverURL",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 // C also takes maxBuffers, priority and stackSize. The Rust
                 // NDArray pool is not buffer-count limited and the background
@@ -42,7 +40,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 ArgDesc {
                     name: "maxMemory",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "ADTimePixConfig portName serverURL [maxMemory]",

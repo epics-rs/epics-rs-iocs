@@ -38,57 +38,46 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "commandPort",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "dataPortNumber",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "statusPortNumber",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxDataPortBuffers",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxSizeX",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxSizeY",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxBuffers",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "priority",
                 arg_type: ArgType::Int,
-                optional: true,
             },
             ArgDesc {
                 name: "stackSize",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "pixiradConfig portName commandPort dataPortNumber statusPortNumber \
@@ -177,42 +166,34 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ofs0",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "fs0",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "ofs2",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "fs1",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "fs2",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "Ibias",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "vbgMcalDAC",
                 arg_type: ArgType::Int,
-                optional: false,
             },
         ],
         "pixiradAutoCal portName ofs0 fs0 ofs2 fs1 fs2 Ibias vbgMcalDAC",

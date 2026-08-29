@@ -65,17 +65,14 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "addr",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "eos",
                 arg_type: ArgType::String,
-                optional: false,
             },
         ],
         format!("{name} portName addr eos"),
@@ -170,27 +167,22 @@ pub fn ahxxx_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "QEPortName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ringBufferSize",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "modelName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvAHxxxConfigure portName QEPortName ringBufferSize modelName [maxMemory]",
@@ -260,27 +252,22 @@ pub fn nsls_em_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "broadcastAddress",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "moduleID",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "ringBufferSize",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvNSLS_EMConfigure portName broadcastAddress moduleID ringBufferSize [maxMemory]",
@@ -347,22 +334,18 @@ pub fn fx4_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "FX4_IP",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ringBufferSize",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvFX4Configure portName FX4_IP ringBufferSize [maxMemory]",
@@ -418,22 +401,18 @@ pub fn pcr4_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "QEPortName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ringBufferSize",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvPCR4Configure portName QEPortName ringBufferSize [maxMemory]",
@@ -491,27 +470,22 @@ pub fn t4u_em_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "qtHostAddress",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ringBufferSize",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "basePortNum",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvT4U_EMConfigure portName qtHostAddress ringBufferSize basePortNum [maxMemory]",
@@ -572,32 +546,26 @@ pub fn t4u_direct_em_configure_command(
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "T4UAddress",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "ringBufferSize",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "basePortNum",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "cfgFileName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "maxMemory",
                 arg_type: ArgType::Int,
-                optional: true,
             },
         ],
         "drvT4UDirect_EMConfigure portName T4UAddress ringBufferSize basePortNum cfgFileName \

@@ -94,17 +94,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "maxSignals",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "period",
                     arg_type: ArgType::Double,
-                    optional: false,
                 },
             ],
             "DemoSourceConfig portName maxSignals period - start the demo signal source",
@@ -142,32 +139,26 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "inputName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "maxSignals",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "maxPoints",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "dataString",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "intervalString",
                     arg_type: ArgType::String,
-                    optional: true,
                 },
             ],
             "initFastSweep portName inputName maxSignals maxPoints [dataString] [intervalString]",

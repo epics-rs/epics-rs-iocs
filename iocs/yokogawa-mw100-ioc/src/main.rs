@@ -43,12 +43,10 @@ async fn main() -> CaResult<()> {
             ArgDesc {
                 name: "netDevice",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "address",
                 arg_type: ArgType::String,
-                optional: false,
             },
         ],
         "mw100Init netDevice address",
