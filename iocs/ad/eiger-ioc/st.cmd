@@ -26,7 +26,7 @@ eigerDetectorConfig("$(PORT)", "$(EIGERIP)", 0)
 # The template must match the detector family: eiger1, eiger2 or pilatus4.
 # Template-internal `include` lines (ADBase.template, NDArrayBase.template,
 # ...) resolve through the db search path; direct dbLoad paths stay explicit.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(ADEIGER)/db")
 
 dbLoadRecords("$(ADEIGER)/db/eiger2.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 

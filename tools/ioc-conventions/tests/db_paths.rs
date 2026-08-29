@@ -114,9 +114,36 @@ fn env_sets(text: &str) -> HashMap<String, String> {
     envs
 }
 
-/// The one sanctioned db search path, needed only for `include` lines
-/// *inside* templates (ADBase.template and friends ship with ad-core-rs).
-const CANONICAL_INCLUDE_PATH: &str = r#"epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")"#;
+/// The db search path, needed only for `include` lines *inside* templates
+/// (ADBase.template and friends ship with ad-core-rs). C resolves such
+/// includes through this path alone — not through the including file's own
+/// directory — so a module whose templates include same-dir files pairs its
+/// db dir onto the list, as C's quadEM iocTetrAMM/st.cmd:11 does with
+/// `"$(ADCORE)/db:$(QUADEM)/db"`. Sanctioned form: a colon-separated list
+/// whose every component is `$(MACRO)/db`.
+fn declares_canonical_include_path(text: &str) -> bool {
+    let Some(rest) = text.lines().find_map(|l| {
+        l.trim_start()
+            .strip_prefix(r#"epicsEnvSet("EPICS_DB_INCLUDE_PATH", ""#)
+    }) else {
+        return false;
+    };
+    let Some(value) = rest.split('"').next() else {
+        return false;
+    };
+    !value.is_empty()
+        && value.split(':').all(|c| {
+            c.strip_prefix("$(")
+                .and_then(|c| c.split_once(')'))
+                .is_some_and(|(name, tail)| {
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+                        && tail == "/db"
+                })
+        })
+}
 
 /// Does `dir/file` (transitively, within `dir`) include a template that is
 /// not present in `dir`? Such an include only resolves through the search
@@ -249,19 +276,19 @@ fn every_db_load_is_macro_form_and_resolvable() {
 
         // Template-internal `include "..."` lines resolve through the db
         // search path, not through dbLoad's explicit path. An IOC whose
-        // templates include an ADCore base template must declare exactly
-        // the canonical single-entry search path — anything else is the
-        // multi-convention drift this test exists to stop.
-        let declares = text.contains(CANONICAL_INCLUDE_PATH);
+        // templates include a shipped base template must declare the
+        // search path in the sanctioned `$(MACRO)/db` list form — anything
+        // else is the multi-convention drift this test exists to stop.
+        let declares = declares_canonical_include_path(&text);
         if text.contains("EPICS_DB_INCLUDE_PATH") && !declares {
             failures.push(format!(
-                "{}: EPICS_DB_INCLUDE_PATH set to something other than {CANONICAL_INCLUDE_PATH:?}",
+                "{}: EPICS_DB_INCLUDE_PATH is not a colon list of $(MACRO)/db components",
                 cmd.strip_prefix(&root).unwrap_or(cmd).display()
             ));
         }
         if needs_include_path && !declares {
             failures.push(format!(
-                "{}: templates have external includes but the file does not set {CANONICAL_INCLUDE_PATH:?}",
+                "{}: templates have external includes but the file does not set EPICS_DB_INCLUDE_PATH",
                 cmd.strip_prefix(&root).unwrap_or(cmd).display()
             ));
         }

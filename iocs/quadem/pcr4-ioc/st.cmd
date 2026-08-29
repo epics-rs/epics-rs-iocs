@@ -29,7 +29,7 @@ drvPCR4Configure("$(PORT)", "IP_$(PORT)", $(RING_SIZE))
 
 # Template-internal `include` lines (ADBase.template, NDArrayBase.template,
 # ...) resolve through the db search path; direct dbLoad paths stay explicit.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
 
 dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
 
