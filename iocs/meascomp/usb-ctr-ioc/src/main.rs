@@ -60,6 +60,13 @@ async fn main() -> CaResult<()> {
 
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
+    // `busy` and `transform` are opt-in on epics-rs main (dropped from the default
+    // registry with the stdRecords.dbd manifest); the db files this IOC
+    // loads use them, as a C IOC links the owning module's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    app = app.register_record_type("transform", || {
+        Box::new(epics_rs::base::server::records::transform::TransformRecord::default())
+    });
     // The scaler device support binds dynamically by DTYP at iocInit, so the
     // name is in no device menu when scaler.db's DTYP field is applied.
     // Contributing the menu here makes that assignment resolve.

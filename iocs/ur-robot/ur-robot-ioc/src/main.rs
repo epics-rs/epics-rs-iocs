@@ -80,6 +80,13 @@ async fn main() -> CaResult<()> {
     let mut app = IocApplication::new();
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
+    // `busy` and `sseq` are opt-in on epics-rs main (dropped from the default
+    // registry with the stdRecords.dbd manifest); the db files this IOC
+    // loads use them, as a C IOC links the owning module's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    app = app.register_record_type("sseq", || {
+        Box::new(epics_rs::base::server::records::sseq::SseqRecord::default())
+    });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // URDashboardConfig(port, robot_ip, poll_period)
