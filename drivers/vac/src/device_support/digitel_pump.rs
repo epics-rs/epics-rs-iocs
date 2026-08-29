@@ -1,6 +1,8 @@
 //! `devDigitelPump` — the `asyn DigitelPump` device support for the `digitel`
 //! record.
 
+use std::time::Duration;
+
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
@@ -21,6 +23,11 @@ pub const DTYP: &str = "asyn DigitelPump";
 
 /// `SIMM`'s `YES` menu index.
 const YES: u16 = 1;
+/// C `DigitelPump_TIMEOUT` (`devDigitelPump.c:63`) — both C callback paths
+/// overwrite `pasynUser->timeout` with this constant before every I/O
+/// (`devDigitelPump.c:889,1162`), so the link-parsed timeout is never used.
+const IO_TIMEOUT: Duration = Duration::from_secs(1);
+
 
 pub struct DigitelPump {
     link: AsynLink,
@@ -81,7 +88,7 @@ impl DeviceSupport for DigitelPump {
         self.io = Some(PortIo {
             handle: port.handle,
             addr: self.link.addr,
-            timeout: self.link.timeout,
+            timeout: IO_TIMEOUT,
         });
         self.err_count = initial_err_count(dev);
         self.cfg = Some(cfg);

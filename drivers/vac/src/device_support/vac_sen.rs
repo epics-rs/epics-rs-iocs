@@ -1,5 +1,7 @@
 //! `devVacSen` — the `asyn VacSen` device support for the `vs` record.
 
+use std::time::Duration;
+
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
@@ -18,6 +20,11 @@ pub const DTYP: &str = "asyn VacSen";
 
 pub struct VacSen {
     link: AsynLink,
+/// C `vacSen_TIMEOUT` (`devVacSen.c:65`) — the C callback overwrites
+/// `pasynUser->timeout` with this constant before every I/O, so the
+/// link-parsed timeout is never used.
+const IO_TIMEOUT: Duration = Duration::from_secs(3);
+
     io: Option<PortIo>,
     cfg: Option<Config>,
     /// C `pPvt->errCount`, persisted across process cycles.
@@ -74,7 +81,7 @@ impl DeviceSupport for VacSen {
         self.io = Some(PortIo {
             handle: port.handle,
             addr: self.link.addr,
-            timeout: self.link.timeout,
+            timeout: IO_TIMEOUT,
         });
         self.cfg = Some(cfg);
         Ok(())
