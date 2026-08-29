@@ -105,7 +105,7 @@ impl Worker {
             .push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
     }
 
-    fn set_str(&mut self, reason: usize, value: impl Into<String>) {
+    fn set_str(&mut self, reason: usize, value: impl Into<Vec<u8>>) {
         self.batch.push(ParamSetValue::new(
             reason,
             0,

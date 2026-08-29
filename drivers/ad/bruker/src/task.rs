@@ -287,7 +287,7 @@ async fn publish_frame(
         vec![ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet(format!("Reading from File {}", exposure.file_name)),
+            ParamValue::Octet(format!("Reading from File {}", exposure.file_name).into_bytes()),
         )],
     )
     .await;
@@ -425,7 +425,7 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet(message.clone()),
+                ParamValue::Octet(message.clone().into_bytes()),
             ));
         }
     }
@@ -449,7 +449,7 @@ async fn status_loop(ctx: StatusContext) {
         let mut updates = vec![ParamSetValue::new(
             ctx.params.status,
             0,
-            ParamValue::Octet(message),
+            ParamValue::Octet(message.into_bytes()),
         )];
         if let Some(temperature) = report.temperature {
             updates.push(ParamSetValue::new(

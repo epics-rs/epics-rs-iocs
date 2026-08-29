@@ -433,7 +433,7 @@ mod tests {
                 .port_base
                 .get_string_param(f.det.nd.driver_version, 0)
                 .unwrap(),
-            "2.5.0"
+            b"2.5.0"
         );
     }
 

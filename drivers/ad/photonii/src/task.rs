@@ -315,12 +315,12 @@ async fn publish_frame(
             ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet(format!("Reading from File {file_name}")),
+                ParamValue::Octet(format!("Reading from File {file_name}").into_bytes()),
             ),
             ParamSetValue::new(
                 ctx.ad_params.base.full_file_name,
                 0,
-                ParamValue::Octet(file_name.to_string()),
+                ParamValue::Octet(file_name.as_bytes().to_vec()),
             ),
         ],
     )
@@ -450,7 +450,7 @@ async fn finish(ctx: &AcquisitionContext, sync: &SyncIOHandle, abort: Option<Abo
         updates.push(ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet(m),
+            ParamValue::Octet(m.into_bytes()),
         ));
     }
     set_params(ctx, updates).await;

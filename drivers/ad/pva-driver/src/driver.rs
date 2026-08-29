@@ -51,11 +51,7 @@ impl PvaDriver {
         // C++ explicitly overrides NDDriverVersion with its own DRIVER_VERSION.
         // DRIVER_REVISION.DRIVER_MODIFICATION, distinct from the ad-core-rs/
         // Cargo package version ADDriverBase::new() defaults it to.
-        base.set_string_param(
-            ad.params.base.driver_version,
-            0,
-            DRIVER_VERSION_STRING,
-        )?;
+        base.set_string_param(ad.params.base.driver_version, 0, DRIVER_VERSION_STRING)?;
         // C++ uses the PvAccess protocol version (EPICS_PVA_MAJOR_VERSION.
         // EPICS_PVA_MINOR_VERSION.EPICS_PVA_MAINTENANCE_VERSION) as the SDK
         // version. `epics_pva_rs::VERSION` (this crate's own package version)
@@ -131,7 +127,7 @@ impl PortDriver for PvaDriver {
                 .ad
                 .port_base
                 .get_string_param(reason, user.addr)?
-                .to_string();
+                .to_vec();
             self.ad
                 .port_base
                 .params

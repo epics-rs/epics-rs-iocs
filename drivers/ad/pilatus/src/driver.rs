@@ -141,11 +141,9 @@ impl PortDriver for PilatusDriver {
 
         if function == params.acquire {
             if value != 0 && can_start {
-                self.ad.port_base.set_string_param(
-                    params.status_message,
-                    0,
-                    "Acquiring data",
-                )?;
+                self.ad
+                    .port_base
+                    .set_string_param(params.status_message, 0, "Acquiring data")?;
                 self.ad
                     .port_base
                     .set_int32_param(params.status, 0, ADStatus::Acquire as i32)?;

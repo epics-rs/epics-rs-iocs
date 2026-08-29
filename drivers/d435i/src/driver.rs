@@ -48,11 +48,7 @@ impl D435iColorDriver {
         base.set_string_param(ad.params.base.model, 0, "RealSense D435i")?;
         base.set_string_param(ad.params.base.serial_number, 0, "Not connected")?;
         base.set_string_param(ad.params.base.firmware_version, 0, "Unknown")?;
-        base.set_string_param(
-            ad.params.base.sdk_version,
-            0,
-            env!("CARGO_PKG_VERSION"),
-        )?;
+        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
 
         // Default stream config. The enum choices are the camera's own modes,
         // so RSStreamMode never offers one it will reject.
@@ -317,11 +313,7 @@ impl D435iDepthDriver {
         base.set_string_param(ad.params.base.model, 0, "RealSense D435i (Depth)")?;
         base.set_string_param(ad.params.base.serial_number, 0, "Not connected")?;
         base.set_string_param(ad.params.base.firmware_version, 0, "Unknown")?;
-        base.set_string_param(
-            ad.params.base.sdk_version,
-            0,
-            env!("CARGO_PKG_VERSION"),
-        )?;
+        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
 
         // Image size and ROI. The depth port has no mode of its own; it
         // follows the colour port's stream, so start it at the preferred mode.

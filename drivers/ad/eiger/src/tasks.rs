@@ -167,7 +167,7 @@ impl Shared {
                     ParamSetValue::new(reason, 0, ParamValue::Float64(value))
                 }
                 ParamUpdate::Octet(reason, value) => {
-                    ParamSetValue::new(reason, 0, ParamValue::Octet(value))
+                    ParamSetValue::new(reason, 0, ParamValue::Octet(value.into_bytes()))
                 }
             })
             .collect();

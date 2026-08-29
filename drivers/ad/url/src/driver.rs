@@ -58,11 +58,7 @@ impl URLDriver {
         // C++ explicitly overrides NDDriverVersion with its own DRIVER_VERSION.
         // DRIVER_REVISION.DRIVER_MODIFICATION, distinct from the ad-core-rs/
         // Cargo package version ADDriverBase::new() defaults it to.
-        base.set_string_param(
-            ad.params.base.driver_version,
-            0,
-            DRIVER_VERSION_STRING,
-        )?;
+        base.set_string_param(ad.params.base.driver_version, 0, DRIVER_VERSION_STRING)?;
 
         Ok(Self {
             ad,

@@ -675,14 +675,14 @@ mod tests {
                 .port_base
                 .get_string_param(f.det.params.base.driver_version, 0)
                 .unwrap(),
-            "1.3.0"
+            b"1.3.0"
         );
         assert_eq!(
             f.det
                 .port_base
                 .get_string_param(f.det.params.base.manufacturer, 0)
                 .unwrap(),
-            "NDDriverStdArrays"
+            b"NDDriverStdArrays"
         );
     }
 

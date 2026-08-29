@@ -166,7 +166,7 @@ impl MultiFunctionDriver {
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg),
+                ParamValue::Octet(msg.into_bytes()),
             );
         }
         self.base.call_param_callbacks(addr)?;
@@ -708,7 +708,7 @@ impl PortDriver for MultiFunctionDriver {
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg),
+                ParamValue::Octet(msg.into_bytes()),
             );
         }
         self.base.call_param_callbacks(addr)?;

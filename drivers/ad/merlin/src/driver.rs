@@ -85,17 +85,9 @@ impl MerlinDetector {
             .create_param("MERLIN_INIT", epics_rs::asyn::param::ParamType::Int32)?;
 
         let base = &mut ad.port_base;
-        base.set_string_param(
-            ad.params.base.manufacturer,
-            0,
-            det_type.manufacturer(),
-        )?;
+        base.set_string_param(ad.params.base.manufacturer, 0, det_type.manufacturer())?;
         base.set_string_param(ad.params.base.model, 0, det_type.model())?;
-        base.set_string_param(
-            ad.params.base.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION"),
-        )?;
+        base.set_string_param(ad.params.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
         base.set_string_param(params.select_gui, 0, det_type.gui())?;
 
         base.set_int32_param(ad.params.max_size_x, 0, max_size_x)?;

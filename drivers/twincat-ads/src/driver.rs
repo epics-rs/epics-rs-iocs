@@ -1209,7 +1209,7 @@ impl PortDriver for AdsPortDriver {
             let params = self.shared.params.lock();
             let p = param_ref(&params, user.reason).map_err(|e| asyn_err(e.to_string()))?;
             let text = match &p.value {
-                ParamValue::Octet(s) => s.as_bytes(),
+                ParamValue::Octet(s) => s.as_slice(),
                 _ => return Err(asyn_err(format!("{}: no string sample yet", p.info.raw))),
             };
             let n = text.len().min(buf.len());

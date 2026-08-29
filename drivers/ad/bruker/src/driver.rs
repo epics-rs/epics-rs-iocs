@@ -120,9 +120,10 @@ impl BrukerDetector {
     fn create_file_name(&mut self) -> AsynResult<()> {
         let p = self.ad.params.base;
         let base = &mut self.ad.port_base;
-        let path = base.get_string_param(p.file_path, 0)?.to_string();
-        let name = base.get_string_param(p.file_name, 0)?.to_string();
-        let template = base.get_string_param(p.file_template, 0)?.to_string();
+        let path = String::from_utf8_lossy(base.get_string_param(p.file_path, 0)?).into_owned();
+        let name = String::from_utf8_lossy(base.get_string_param(p.file_name, 0)?).into_owned();
+        let template =
+            String::from_utf8_lossy(base.get_string_param(p.file_template, 0)?).into_owned();
         let number = base.get_int32_param(p.file_number, 0)?;
         let auto_increment = base.get_int32_param(p.auto_increment, 0).unwrap_or(0);
 
@@ -149,15 +150,16 @@ impl BrukerDetector {
             FrameType::from_i32(self.get_i32(p.frame_type)).unwrap_or(FrameType::Normal);
         let acquire_time = self.ad.port_base.get_float64_param(p.acquire_time, 0)?;
         let num_darks = self.get_i32(self.params.num_darks);
-        let file_name = self
-            .ad
-            .port_base
-            .get_string_param(p.base.full_file_name, 0)?
-            .to_string();
+        let file_name = String::from_utf8_lossy(
+            self.ad
+                .port_base
+                .get_string_param(p.base.full_file_name, 0)?,
+        )
+        .into_owned();
 
         self.ad
             .port_base
-            .set_string_param(p.status_message, 0, "Starting exposure".into())?;
+            .set_string_param(p.status_message, 0, "Starting exposure")?;
         self.ad.port_base.call_param_callbacks(0)?;
 
         let command = protocol::acquire(frame_type, &file_name, acquire_time, num_darks);
@@ -169,11 +171,8 @@ impl BrukerDetector {
     /// `FilePath` write).
     fn check_path(&mut self) -> AsynResult<()> {
         let p = self.ad.params.base;
-        let path = self
-            .ad
-            .port_base
-            .get_string_param(p.file_path, 0)?
-            .to_string();
+        let path = String::from_utf8_lossy(self.ad.port_base.get_string_param(p.file_path, 0)?)
+            .into_owned();
         let exists = !path.is_empty() && Path::new(&path).is_dir();
         self.ad
             .port_base

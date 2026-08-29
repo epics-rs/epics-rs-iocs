@@ -113,7 +113,7 @@ impl Ctx {
     }
 
     /// C `setStringParam`.
-    pub fn set_str(&mut self, reason: usize, value: impl Into<String>) {
+    pub fn set_str(&mut self, reason: usize, value: impl Into<Vec<u8>>) {
         self.batch.updates.push(ParamSetValue::new(
             reason,
             0,

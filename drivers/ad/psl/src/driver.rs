@@ -86,11 +86,7 @@ impl PslDetector {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "PSL")?;
         base.set_string_param(ad.params.base.model, 0, "CCD")?;
-        base.set_string_param(
-            ad.params.base.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION"),
-        )?;
+        base.set_string_param(ad.params.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
         base.set_int32_param(ad.params.base.data_type, 0, NDDataType::UInt16 as u8 as i32)?;
         base.set_int32_param(ad.params.image_mode, 0, ImageMode::Single as i32)?;
         base.set_float64_param(ad.params.acquire_period, 0, 0.0)?;
@@ -369,11 +365,12 @@ impl PslDetector {
     /// Report whether the directory the server saves into exists here as well
     /// (C `checkPath`).
     fn check_path(&mut self) -> AsynResult<()> {
-        let path = self
-            .ad
-            .port_base
-            .get_string_param(self.ad.params.base.file_path, 0)?
-            .to_string();
+        let path = String::from_utf8_lossy(
+            self.ad
+                .port_base
+                .get_string_param(self.ad.params.base.file_path, 0)?,
+        )
+        .into_owned();
         let exists = !path.is_empty() && Path::new(&path).is_dir();
         self.ad.port_base.set_int32_param(
             self.ad.params.base.file_path_exists,

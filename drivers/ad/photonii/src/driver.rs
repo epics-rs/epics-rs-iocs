@@ -68,11 +68,7 @@ impl PhotonIIDetector {
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Bruker")?;
         base.set_string_param(ad.params.base.model, 0, "PhotonII")?;
-        base.set_string_param(
-            ad.params.base.driver_version,
-            0,
-            env!("CARGO_PKG_VERSION"),
-        )?;
+        base.set_string_param(ad.params.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
 
         base.set_int32_param(ad.params.max_size_x, 0, PII_SIZE_X as i32)?;
         base.set_int32_param(ad.params.max_size_y, 0, PII_SIZE_Y as i32)?;

@@ -112,11 +112,13 @@ impl TimePix3Driver {
     }
 
     fn text(&self, index: usize, addr: i32) -> String {
-        self.ad
-            .port_base
-            .get_string_param(index, addr)
-            .unwrap_or_default()
-            .to_string()
+        String::from_utf8_lossy(
+            self.ad
+                .port_base
+                .get_string_param(index, addr)
+                .unwrap_or_default(),
+        )
+        .into_owned()
     }
 
     /// Publish the HTTP status of the last request, as C's `TPX3_HTTP_CODE`
@@ -655,11 +657,9 @@ impl TimePix3Driver {
             i32::try_from(masked.len()).unwrap_or(i32::MAX),
         )?;
         if path.is_empty() {
-            self.ad.port_base.set_string_param(
-                self.p.masked_pels_export_status,
-                0,
-                "no path",
-            )?;
+            self.ad
+                .port_base
+                .set_string_param(self.p.masked_pels_export_status, 0, "no path")?;
             return Ok(());
         }
         let body = json!({

@@ -211,7 +211,8 @@ impl EigerDriver {
         base.set_int32_param(self.ad.params.max_size_y, 0, max_size_y)?;
 
         // The description is "<manufacturer> <model>".
-        let description = base.params.get_string(self.p.description, 0)?.to_string();
+        let description =
+            String::from_utf8_lossy(base.params.get_string(self.p.description, 0)?).into_owned();
         let (manufacturer, model) = match description.split_once(' ') {
             Some((m, rest)) => (m.to_string(), rest.to_string()),
             None => (description.clone(), String::new()),
@@ -274,7 +275,7 @@ impl EigerDriver {
             .port_base
             .params
             .get_string(index, 0)
-            .map(str::to_string)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     }
 
     fn put_int(&mut self, index: usize, value: i32) -> AsynResult<()> {

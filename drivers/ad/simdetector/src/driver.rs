@@ -147,11 +147,9 @@ impl PortDriver for SimDetector {
                     .set_string_param(p.status_message, 0, "Acquiring data")?;
             }
             if value == 0 && acquiring {
-                self.ad.port_base.set_string_param(
-                    p.status_message,
-                    0,
-                    "Acquisition stopped",
-                )?;
+                self.ad
+                    .port_base
+                    .set_string_param(p.status_message, 0, "Acquisition stopped")?;
                 // FIXED (doc/upstream-c-defects.md #1): upstream computes
                 // Idle/Aborted and then unconditionally overwrites it with
                 // ADStatusAcquire on the next line (simDetector.cpp:913-918),

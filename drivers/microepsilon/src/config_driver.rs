@@ -527,14 +527,12 @@ impl PortDriver for ConfigDriver {
                     )));
                 }
             }
+            .into_bytes()
         } else {
-            self.base
-                .get_string_param(user.reason, user.addr)?
-                .to_string()
+            self.base.get_string_param(user.reason, user.addr)?.to_vec()
         };
-        let bytes = text.as_bytes();
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
+        let n = text.len().min(buf.len());
+        buf[..n].copy_from_slice(&text[..n]);
         Ok(n)
     }
 

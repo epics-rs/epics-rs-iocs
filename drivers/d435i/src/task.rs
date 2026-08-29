@@ -42,7 +42,11 @@ async fn write_string(handle: &PortHandle, reason: usize, addr: i32, value: Stri
     let _ = handle
         .set_params_and_notify(
             addr,
-            vec![ParamSetValue::new(reason, addr, ParamValue::Octet(value))],
+            vec![ParamSetValue::new(
+                reason,
+                addr,
+                ParamValue::Octet(value.into_bytes()),
+            )],
         )
         .await;
 }
