@@ -135,6 +135,7 @@ fn defined() -> ProcessContext {
         time: SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: opcua::device_support::DTYP.to_string(),
+        callback_priority: epics_rs::base::runtime::task::CallbackPriority::Low,
     }
 }
 
