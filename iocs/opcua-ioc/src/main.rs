@@ -60,18 +60,14 @@ fn options(args: &[ArgValue], from: usize) -> Result<Vec<(String, String)>, Stri
     ioc::parse_options(tokens.iter().map(String::as_str))
 }
 
-fn arg(name: &'static str, arg_type: ArgType, optional: bool) -> ArgDesc {
-    ArgDesc {
-        name,
-        arg_type,
-        optional,
-    }
+fn arg(name: &'static str, arg_type: ArgType) -> ArgDesc {
+    ArgDesc { name, arg_type }
 }
 
 /// `[options]`, as `OPTION_SLOTS` optional String arguments.
 fn option_args() -> Vec<ArgDesc> {
     (0..OPTION_SLOTS)
-        .map(|_| arg("[key=value]", ArgType::String, true))
+        .map(|_| arg("[key=value]", ArgType::String))
         .collect()
 }
 
@@ -81,10 +77,7 @@ fn commands(
     connector: &Arc<AsyncOpcuaConnector>,
 ) -> IocApplication {
     // opcuaSession(name, URL, [options]) — iocshIntegration.cpp:88-140.
-    let mut args = vec![
-        arg("name", ArgType::String, false),
-        arg("URL", ArgType::String, false),
-    ];
+    let mut args = vec![arg("name", ArgType::String), arg("URL", ArgType::String)];
     args.extend(option_args());
     app = app.register_startup_command(CommandDef::new(
         "opcuaSession",
@@ -115,9 +108,9 @@ fn commands(
     // opcuaSubscription(name, session, interval, [options]) —
     // iocshIntegration.cpp:159-201.
     let mut args = vec![
-        arg("name", ArgType::String, false),
-        arg("session", ArgType::String, false),
-        arg("publishing interval [ms]", ArgType::Double, true),
+        arg("name", ArgType::String),
+        arg("session", ArgType::String),
+        arg("publishing interval [ms]", ArgType::Double),
     ];
     args.extend(option_args());
     app = app.register_startup_command(CommandDef::new(
@@ -156,7 +149,7 @@ fn commands(
     ));
 
     // opcuaOptions(pattern, [options]) — iocshIntegration.cpp:212-260.
-    let mut args = vec![arg("session/subscription", ArgType::String, false)];
+    let mut args = vec![arg("session/subscription", ArgType::String)];
     args.extend(option_args());
     app = app.register_startup_command(CommandDef::new(
         "opcuaOptions",
@@ -179,8 +172,8 @@ fn commands(
     let show = CommandDef::new(
         "opcuaShow",
         vec![
-            arg("pattern", ArgType::String, true),
-            arg("verbosity", ArgType::Int, true),
+            arg("pattern", ArgType::String),
+            arg("verbosity", ArgType::Int),
         ],
         "opcuaShow [pattern] [verbosity]",
         {
@@ -209,7 +202,7 @@ fn commands(
             "opcuaDisconnect session",
         ),
     ] {
-        let command = CommandDef::new(name, vec![arg("session", ArgType::String, false)], usage, {
+        let command = CommandDef::new(name, vec![arg("session", ArgType::String)], usage, {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let session = required(args, 0, "session")?;
@@ -228,9 +221,9 @@ fn commands(
     app = app.register_startup_command(CommandDef::new(
         "opcuaMapNamespace",
         vec![
-            arg("session", ArgType::String, false),
-            arg("namespace index", ArgType::Int, false),
-            arg("namespace URI", ArgType::String, false),
+            arg("session", ArgType::String),
+            arg("namespace index", ArgType::Int),
+            arg("namespace URI", ArgType::String),
         ],
         "opcuaMapNamespace session index URI",
         {
@@ -253,7 +246,7 @@ fn commands(
     // opcuaShowSecurity(session) — iocshIntegration.cpp:573-590.
     let show_security = CommandDef::new(
         "opcuaShowSecurity",
-        vec![arg("session", ArgType::String, true)],
+        vec![arg("session", ArgType::String)],
         "opcuaShowSecurity [session]",
         {
             let registry = registry.clone();
@@ -276,8 +269,8 @@ fn commands(
     app = app.register_startup_command(CommandDef::new(
         "opcuaClientCertificate",
         vec![
-            arg("client public cert file", ArgType::String, false),
-            arg("client private key file", ArgType::String, false),
+            arg("client public cert file", ArgType::String),
+            arg("client private key file", ArgType::String),
         ],
         "opcuaClientCertificate certfile keyfile",
         {
@@ -302,10 +295,10 @@ fn commands(
     app = app.register_startup_command(CommandDef::new(
         "opcuaSetupPKI",
         vec![
-            arg("PKI / server certs location", ArgType::String, false),
-            arg("server revocation lists location", ArgType::String, true),
-            arg("issuer certs location", ArgType::String, true),
-            arg("issuer revocation lists location", ArgType::String, true),
+            arg("PKI / server certs location", ArgType::String),
+            arg("server revocation lists location", ArgType::String),
+            arg("issuer certs location", ArgType::String),
+            arg("issuer revocation lists location", ArgType::String),
         ],
         "opcuaSetupPKI pki_root",
         {
@@ -333,7 +326,7 @@ fn commands(
     // kept are being kept, just elsewhere.
     app = app.register_startup_command(CommandDef::new(
         "opcuaSaveRejected",
-        vec![arg("location", ArgType::String, true)],
+        vec![arg("location", ArgType::String)],
         "opcuaSaveRejected [location]",
         {
             let connector = connector.clone();
@@ -368,8 +361,8 @@ fn commands(
     app = app.register_startup_command(CommandDef::new(
         "var",
         vec![
-            arg("variable", ArgType::String, false),
-            arg("value", ArgType::String, false),
+            arg("variable", ArgType::String),
+            arg("value", ArgType::String),
         ],
         "var opcua_<Variable> value",
         move |args: &[ArgValue], _ctx: &CommandContext| {
