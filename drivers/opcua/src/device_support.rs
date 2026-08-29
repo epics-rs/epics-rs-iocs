@@ -183,8 +183,8 @@ pub struct OpcuaDevice {
     /// Out-of-band PROPERTY posts — the state table the server's enumeration
     /// defines (`db_post_events(prec, &prec->val, DBE_PROPERTY)`,
     /// `devOpcua.cpp:732`).
-    property_tx: Option<mpsc::Sender<Vec<(String, EpicsValue)>>>,
-    property_rx: Option<mpsc::Receiver<Vec<(String, EpicsValue)>>>,
+    property_tx: Option<mpsc::Sender<PropertyPost>>,
+    property_rx: Option<mpsc::Receiver<PropertyPost>>,
     info: HashMap<String, String>,
     enums: EnumState,
     /// The record's UDF at the start of this cycle — the ai smoothing needs it
@@ -694,7 +694,14 @@ impl OpcuaDevice {
         self.enums.from_server = true;
         self.enums.values_defined = true;
         if let Some(tx) = &self.property_tx {
-            let _ = tx.try_send(posts);
+            // The state fields are already stored in place above, as the C++
+            // writes them in its callback; what remains is the single
+            // `db_post_events(prec, &prec->val, DBE_PROPERTY)`
+            // (`devOpcua.cpp:717-732`).
+            let _ = tx.try_send(PropertyPost {
+                writes: Vec::new(),
+                post_field: "VAL".to_string(),
+            });
         }
         Ok(())
     }
@@ -869,7 +876,7 @@ impl DeviceSupport for OpcuaDevice {
         self.notify.take()
     }
 
-    fn property_post_receiver(&mut self) -> Option<mpsc::Receiver<Vec<(String, EpicsValue)>>> {
+    fn property_post_receiver(&mut self) -> Option<mpsc::Receiver<PropertyPost>> {
         self.property_rx.take()
     }
 
