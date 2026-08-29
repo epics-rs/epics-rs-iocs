@@ -2,12 +2,12 @@
 
 use std::any::Any;
 
-use epics_rs::base::error::CaResult;
+use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::{
     AlarmSeverity, CommonFields, FieldDesc, FieldMetadataOverride, ProcessOutcome, Record,
 };
-use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue};
 
 use super::{record_fields, set_sevr, severity_of};
 
@@ -33,6 +33,10 @@ const ON: u16 = 1;
 
 #[derive(Debug, Clone)]
 pub struct VsRecord {
+    /// `field(INP,DBF_INLINK)` — the record owns the field (`vsRecord.dbd`);
+    /// the loader also mirrors the text into the common INP, which is where
+    /// device support reads it.
+    pub inp: String,
     pub tipe: u16,
     pub err: i16,
     pub prec: i16,
@@ -112,6 +116,7 @@ pub struct VsRecord {
 impl Default for VsRecord {
     fn default() -> Self {
         Self {
+            inp: String::new(),
             tipe: 0,
             err: 5,
             prec: 1,
@@ -281,12 +286,43 @@ static INDEXED_FIELDS: &[FieldDesc] = &{
 };
 
 static ALL_FIELDS: std::sync::LazyLock<Vec<FieldDesc>> = std::sync::LazyLock::new(|| {
+    // `field(INP,DBF_INLINK) special(SPC_NOMOD)` in `vsRecord.dbd`.
+    let inp = FieldDesc {
+        declared_dbf: DbfCode::Inlink,
+        ..FieldDesc::new("INP", DbFieldType::String, true)
+    };
+    // Each menu field declares `DBF_MENU` and carries its choices, as the
+    // `.dbd` does. The loader's refusal gate resolves menu names by identity
+    // against base's generated tables, so an external menu never resolves
+    // there — but its numeric arms do not decide `DBF_MENU` either, so the
+    // label reaches the apply path, which reads `menu_field_choices`.
     SCALAR_FIELDS
         .iter()
         .chain(INDEXED_FIELDS.iter())
         .cloned()
+        .chain(std::iter::once(inp))
+        .map(|mut f| {
+            f.menu = menu_of(f.name);
+            if f.menu.is_some() {
+                f.declared_dbf = DbfCode::Menu;
+            }
+            f
+        })
         .collect()
 });
+
+/// The `.dbd` menu of each menu field — the single owner both
+/// `Record::menu_field_choices` and the declared descriptors read.
+fn menu_of(field: &str) -> Option<&'static [&'static str]> {
+    match field {
+        "TYPE" => Some(TYPE_CHOICES),
+        "HHSV" | "LLSV" | "HSV" | "LSV" => Some(ALARM_SEVR),
+        "IG1S" | "IG2S" | "DGSS" | "IG1R" | "IG2R" | "DGSR" | "FLTR" => Some(OFFON),
+        "PI1S" | "PI2S" | "PDSS" | "PIG1" | "PIG2" | "PDGS" | "PFLT" => Some(OFFON),
+        _ if matches!(indexed(field), Some(("SPn" | "PSPn", _))) => Some(OFFON),
+        _ => None,
+    }
+}
 
 /// `SP<n>`/`PSP<n>` (1..=6) and `SP<n>S`/`SP<n>R`/`PS<n>S`/`PS<n>R` (1..=4).
 fn indexed(name: &str) -> Option<(&'static str, usize)> {
@@ -397,10 +433,22 @@ impl Record for VsRecord {
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        if name == "INP" {
+            return Some(EpicsValue::String(self.inp.clone().into()));
+        }
         get_scalar(self, name).or_else(|| self.get_indexed(name))
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        if name == "INP" {
+            return match value {
+                EpicsValue::String(v) => {
+                    self.inp = v.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            };
+        }
         match self.put_indexed(name, value.clone()) {
             Some(r) => r,
             None => put_scalar(self, name, value),
@@ -414,14 +462,7 @@ impl Record for VsRecord {
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "TYPE" => Some(TYPE_CHOICES),
-            "HHSV" | "LLSV" | "HSV" | "LSV" => Some(ALARM_SEVR),
-            "IG1S" | "IG2S" | "DGSS" | "IG1R" | "IG2R" | "DGSR" | "FLTR" => Some(OFFON),
-            "PI1S" | "PI2S" | "PDSS" | "PIG1" | "PIG2" | "PDGS" | "PFLT" => Some(OFFON),
-            _ if matches!(indexed(field), Some(("SPn" | "PSPn", _))) => Some(OFFON),
-            _ => None,
-        }
+        menu_of(field)
     }
 
     /// `pp(TRUE)` in `vsRecord.dbd`.

@@ -7,7 +7,7 @@ use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::{
     AlarmSeverity, CommonFields, FieldDesc, FieldMetadataOverride, ProcessOutcome, Record,
 };
-use epics_rs::base::types::{DbFieldType, EpicsValue, PvString};
+use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue, PvString};
 
 use super::{record_fields, set_sevr, severity_of};
 
@@ -63,6 +63,10 @@ const YESNO_CHOICES: &[&str] = &["NO", "YES"];
 
 #[derive(Debug, Clone)]
 pub struct DigitelRecord {
+    /// `field(INP,DBF_INLINK)` — the record owns the field
+    /// (`digitelRecord.dbd`); the loader also mirrors the text into the
+    /// common INP, which is where device support reads it.
+    pub inp: String,
     /// Controller model / firmware version (MPC/QPC only report them).
     pub modl: PvString,
     pub vers: PvString,
@@ -172,6 +176,7 @@ pub struct DigitelRecord {
 impl Default for DigitelRecord {
     fn default() -> Self {
         Self {
+            inp: String::new(),
             modl: PvString::new(),
             vers: PvString::new(),
             tipe: 0,
@@ -439,13 +444,59 @@ static STRING_FIELDS: &[FieldDesc] = &{
 };
 
 static ALL_FIELDS: std::sync::LazyLock<Vec<FieldDesc>> = std::sync::LazyLock::new(|| {
+    // `field(INP,DBF_INLINK) special(SPC_NOMOD)` in `digitelRecord.dbd`.
+    let inp = FieldDesc {
+        declared_dbf: DbfCode::Inlink,
+        ..FieldDesc::new("INP", DbFieldType::String, true)
+    };
+    // Each menu field declares `DBF_MENU` and carries its choices, as the
+    // `.dbd` does. The loader's refusal gate resolves menu names by identity
+    // against base's generated tables, so an external menu never resolves
+    // there — but its numeric arms do not decide `DBF_MENU` either, so the
+    // label reaches the apply path, which reads `menu_field_choices`.
     SCALAR_FIELDS
         .iter()
         .chain(INDEXED_FIELDS.iter())
         .chain(STRING_FIELDS.iter())
         .cloned()
+        .chain(std::iter::once(inp))
+        .map(|mut f| {
+            f.menu = menu_of(f.name);
+            if f.menu.is_some() {
+                f.declared_dbf = DbfCode::Menu;
+            }
+            f
+        })
         .collect()
 });
+
+/// The `.dbd` menu of each menu field — the single owner both
+/// `Record::menu_field_choices` and the declared descriptors read.
+fn menu_of(field: &str) -> Option<&'static [&'static str]> {
+    match field {
+        "TYPE" => Some(TYPE_CHOICES),
+        "HHSV" | "LLSV" | "HSV" | "LSV" => Some(ALARM_SEVR),
+        "DSPL" => Some(DSPL_CHOICES),
+        "KLCK" => Some(KLCK_CHOICES),
+        "MODS" | "SVMO" | "IMOD" => Some(MODS_CHOICES),
+        "MODR" => Some(MODR_CHOICES),
+        "BAKS" | "BAKR" | "IBAK" => Some(BAKS_CHOICES),
+        "CMOR" => Some(CMOR_CHOICES),
+        "PTYP" | "IPTY" => Some(PTYP_CHOICES),
+        "BKIN" | "IBKN" => Some(BKIN_CHOICES),
+        "SIMM" => Some(YESNO_CHOICES),
+        "SET1" | "SET2" | "SET3" | "SET4" | "ISP1" | "ISP2" | "ISP3" | "ISP4" | "SVS1" | "SVS2" => {
+            Some(SET1_CHOICES)
+        }
+        "S3BS" | "S3BR" | "IB3" => Some(S3BS_CHOICES),
+        _ => match indexed(field) {
+            Some(("SnMS" | "SnMR" | "IMn", _)) => Some(S1MS_CHOICES),
+            Some(("SnVS" | "SnVR" | "IIn", _)) => Some(S1VS_CHOICES),
+            Some(("SETn" | "ISPn", _)) => Some(SET1_CHOICES),
+            _ => None,
+        },
+    }
+}
 
 impl DigitelRecord {
     fn get_indexed(&self, name: &str) -> Option<EpicsValue> {
@@ -630,12 +681,24 @@ impl Record for DigitelRecord {
     }
 
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
+        if name == "INP" {
+            return Some(EpicsValue::String(self.inp.clone().into()));
+        }
         get_scalar(self, name)
             .or_else(|| self.get_indexed(name))
             .or_else(|| self.get_string(name))
     }
 
     fn put_field(&mut self, name: &str, value: EpicsValue) -> CaResult<()> {
+        if name == "INP" {
+            return match value {
+                EpicsValue::String(v) => {
+                    self.inp = v.as_str_lossy().into_owned();
+                    Ok(())
+                }
+                _ => Err(CaError::TypeMismatch(name.into())),
+            };
+        }
         if let Some(r) = self.put_indexed(name, value.clone()) {
             return r;
         }
@@ -652,28 +715,7 @@ impl Record for DigitelRecord {
     }
 
     fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        match field {
-            "TYPE" => Some(TYPE_CHOICES),
-            "HHSV" | "LLSV" | "HSV" | "LSV" => Some(ALARM_SEVR),
-            "DSPL" => Some(DSPL_CHOICES),
-            "KLCK" => Some(KLCK_CHOICES),
-            "MODS" | "SVMO" | "IMOD" => Some(MODS_CHOICES),
-            "MODR" => Some(MODR_CHOICES),
-            "BAKS" | "BAKR" | "IBAK" => Some(BAKS_CHOICES),
-            "CMOR" => Some(CMOR_CHOICES),
-            "PTYP" | "IPTY" => Some(PTYP_CHOICES),
-            "BKIN" | "IBKN" => Some(BKIN_CHOICES),
-            "SIMM" => Some(YESNO_CHOICES),
-            "SET1" | "SET2" | "SET3" | "SET4" | "ISP1" | "ISP2" | "ISP3" | "ISP4" | "SVS1"
-            | "SVS2" => Some(SET1_CHOICES),
-            "S3BS" | "S3BR" | "IB3" => Some(S3BS_CHOICES),
-            _ => match indexed(field) {
-                Some(("SnMS" | "SnMR" | "IMn", _)) => Some(S1MS_CHOICES),
-                Some(("SnVS" | "SnVR" | "IIn", _)) => Some(S1VS_CHOICES),
-                Some(("SETn" | "ISPn", _)) => Some(SET1_CHOICES),
-                _ => None,
-            },
-        }
+        menu_of(field)
     }
 
     /// `pp(TRUE)` in `digitelRecord.dbd`.
