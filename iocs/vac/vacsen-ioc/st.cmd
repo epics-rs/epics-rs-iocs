@@ -29,7 +29,7 @@ asynSetOption("GP307_1", 0, "baud",   "9600")
 asynSetOption("GP307_1", 0, "bits",   "7")
 asynSetOption("GP307_1", 0, "parity", "even")
 asynSetOption("GP307_1", 0, "stop",   "1")
-asynOctetSetInputEos ("GP307_1", 0, "\r\n")
+asynOctetSetInputEos("GP307_1", 0, "\r\n")
 asynOctetSetOutputEos("GP307_1", 0, "\r\n")
 
 dbLoadRecords("$(VAC)/db/vs.db", "P=$(P),GAUGE=GP1,PORT=GP307_1,ADDR=0,DEV=GP307,STN=0")
