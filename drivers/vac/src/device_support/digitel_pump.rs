@@ -23,13 +23,13 @@ use crate::records::digitel::DigitelRecord;
 /// `asyn DigitelPump`.
 pub const DTYP: &str = "asyn DigitelPump";
 
-/// `SIMM`'s `YES` menu index.
-const YES: u16 = 1;
 /// C `DigitelPump_TIMEOUT` (`devDigitelPump.c:63`) — both C callback paths
 /// overwrite `pasynUser->timeout` with this constant before every I/O
 /// (`devDigitelPump.c:889,1162`), so the link-parsed timeout is never used.
 const IO_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// `SIMM`'s `YES` menu index.
+const YES: u16 = 1;
 
 pub struct DigitelPump {
     link: AsynLink,
