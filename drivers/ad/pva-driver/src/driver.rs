@@ -46,25 +46,25 @@ impl PvaDriver {
         let pva_params = PvaParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "PVAccess driver".into())?;
-        base.set_string_param(ad.params.base.model, 0, "Basic PVAccess driver".into())?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "PVAccess driver")?;
+        base.set_string_param(ad.params.base.model, 0, "Basic PVAccess driver")?;
         // C++ explicitly overrides NDDriverVersion with its own DRIVER_VERSION.
         // DRIVER_REVISION.DRIVER_MODIFICATION, distinct from the ad-core-rs/
         // Cargo package version ADDriverBase::new() defaults it to.
         base.set_string_param(
             ad.params.base.driver_version,
             0,
-            DRIVER_VERSION_STRING.into(),
+            DRIVER_VERSION_STRING,
         )?;
         // C++ uses the PvAccess protocol version (EPICS_PVA_MAJOR_VERSION.
         // EPICS_PVA_MINOR_VERSION.EPICS_PVA_MAINTENANCE_VERSION) as the SDK
         // version. `epics_pva_rs::VERSION` (this crate's own package version)
         // is the equivalent constant in this port — its doc comment states it
         // mirrors pvxs's own `version_int()`.
-        base.set_string_param(ad.params.base.sdk_version, 0, epics_rs::pva::VERSION.into())?;
-        base.set_string_param(ad.params.base.serial_number, 0, "No serial number".into())?;
-        base.set_string_param(ad.params.base.firmware_version, 0, "No firmware".into())?;
-        base.set_string_param(pva_params.pv_name, 0, pv_name.into())?;
+        base.set_string_param(ad.params.base.sdk_version, 0, epics_rs::pva::VERSION)?;
+        base.set_string_param(ad.params.base.serial_number, 0, "No serial number")?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "No firmware")?;
+        base.set_string_param(pva_params.pv_name, 0, pv_name)?;
 
         Ok(Self {
             ad,

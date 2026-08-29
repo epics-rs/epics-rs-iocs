@@ -61,8 +61,8 @@ impl MarccdDriver {
         let params = ad.params;
         let base = &mut ad.port_base;
         // C constructor defaults (marCCD.cpp:1563-1574).
-        base.set_string_param(params.base.manufacturer, 0, "MAR".into())?;
-        base.set_string_param(params.base.model, 0, "CCD".into())?;
+        base.set_string_param(params.base.manufacturer, 0, "MAR")?;
+        base.set_string_param(params.base.model, 0, "CCD")?;
         base.set_int32_param(params.base.data_type, 0, NDDataType::Int16 as i32)?;
         base.set_int32_param(params.image_mode, 0, ImageMode::Single as i32)?;
         base.set_int32_param(params.trigger_mode, 0, TriggerMode::Internal as i32)?;
@@ -70,7 +70,7 @@ impl MarccdDriver {
         base.set_float64_param(params.acquire_period, 0, 0.0)?;
         base.set_int32_param(params.num_images, 0, 1)?;
         base.set_int32_param(p.overlap, 0, 0)?;
-        base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION.into())?;
+        base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION)?;
         base.set_float64_param(p.tiff_timeout, 0, 20.0)?;
 
         Ok(Self {

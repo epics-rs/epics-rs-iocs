@@ -88,15 +88,15 @@ impl MerlinDetector {
         base.set_string_param(
             ad.params.base.manufacturer,
             0,
-            det_type.manufacturer().into(),
+            det_type.manufacturer(),
         )?;
-        base.set_string_param(ad.params.base.model, 0, det_type.model().into())?;
+        base.set_string_param(ad.params.base.model, 0, det_type.model())?;
         base.set_string_param(
             ad.params.base.driver_version,
             0,
-            env!("CARGO_PKG_VERSION").into(),
+            env!("CARGO_PKG_VERSION"),
         )?;
-        base.set_string_param(params.select_gui, 0, det_type.gui().into())?;
+        base.set_string_param(params.select_gui, 0, det_type.gui())?;
 
         base.set_int32_param(ad.params.max_size_x, 0, max_size_x)?;
         base.set_int32_param(ad.params.max_size_y, 0, max_size_y)?;
@@ -161,7 +161,7 @@ impl MerlinDetector {
         base.set_string_param(
             self.ad.params.status_message,
             0,
-            "Waiting for acquire command".into(),
+            "Waiting for acquire command",
         )?;
         Ok(())
     }
@@ -433,7 +433,7 @@ impl MerlinDetector {
         if value != 0 && idle {
             let base = &mut self.ad.port_base;
             base.set_int32_param(self.ad.params.status, 0, ADStatus::Acquire as i32)?;
-            base.set_string_param(self.ad.params.status_message, 0, "Acquiring...".into())?;
+            base.set_string_param(self.ad.params.status_message, 0, "Acquiring...")?;
             base.set_int32_param(self.ad.params.num_images_counter, 0, 0)?;
 
             let mut images_to_acquire = self.get_i32(self.ad.params.num_images);
@@ -462,7 +462,7 @@ impl MerlinDetector {
                     base.set_string_param(
                         self.ad.params.status_message,
                         0,
-                        "Performing Threshold Scan...".into(),
+                        "Performing Threshold Scan...",
                     )?;
                     // The device forces one frame per step; match the PV to it.
                     base.set_int32_param(self.ad.params.num_images, 0, 1)?;

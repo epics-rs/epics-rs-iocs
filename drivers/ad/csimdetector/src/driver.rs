@@ -92,7 +92,7 @@ impl CSimDetector {
         port_base.set_float64_param(nd.pool_max_memory, 0, max_memory as f64 / MEGABYTE)?;
 
         // ADCSimDetector.cpp:93-104.
-        port_base.set_string_param(nd.driver_version, 0, DRIVER_VERSION.into())?;
+        port_base.set_string_param(nd.driver_version, 0, DRIVER_VERSION)?;
         port_base.set_int32_param(sim.num_time_points, 0, num_time_points)?;
         port_base.set_int32_param(nd.data_type, 0, data_type as u8 as i32)?;
         port_base.set_float64_param(sim.time_step, 0, 0.001)?;

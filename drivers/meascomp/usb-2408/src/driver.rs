@@ -79,7 +79,7 @@ impl MultiFunctionDriver {
         base.set_string_param(params.unique_id, 0, uid.clone())?;
         base.set_string_param(params.firmware_version, 0, fw.clone())?;
         base.set_string_param(params.ul_version, 0, ul_ver)?;
-        base.set_string_param(params.driver_version, 0, "0.1.0".into())?;
+        base.set_string_param(params.driver_version, 0, "0.1.0")?;
 
         // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
         // ulDConfigPort and ulDConfigBit reject anything else outright, so ask

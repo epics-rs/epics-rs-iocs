@@ -89,10 +89,10 @@ impl TimePix3Driver {
     fn init_params(&mut self, port_name: &str) -> AsynResult<()> {
         let server = self.http.base_url().to_string();
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.base.manufacturer, 0, "ASI".into())?;
-        base.set_string_param(self.ad.params.base.model, 0, "TimePix3".into())?;
+        base.set_string_param(self.ad.params.base.manufacturer, 0, "ASI")?;
+        base.set_string_param(self.ad.params.base.model, 0, "TimePix3")?;
         base.set_string_param(self.p.server_name, 0, server)?;
-        base.set_string_param(self.ad.params.base.port_name_self, 0, port_name.into())?;
+        base.set_string_param(self.ad.params.base.port_name_self, 0, port_name)?;
         base.set_int32_param(self.p.img_frames_to_sum, 0, 10)?;
         base.set_int32_param(self.p.img_sum_update_interval_frames, 0, 1)?;
         base.set_int32_param(self.p.prv_hst_frames_to_sum, 0, 10)?;
@@ -577,7 +577,7 @@ impl TimePix3Driver {
                 self.ad.port_base.set_string_param(
                     self.p.pixel_config_status,
                     addr,
-                    "base64 decode failed".into(),
+                    "base64 decode failed",
                 )?;
                 continue;
             };
@@ -658,7 +658,7 @@ impl TimePix3Driver {
             self.ad.port_base.set_string_param(
                 self.p.masked_pels_export_status,
                 0,
-                "no path".into(),
+                "no path",
             )?;
             return Ok(());
         }
@@ -736,7 +736,7 @@ fn new_multi_addr_base(port_name: &str, max_memory: usize) -> AsynResult<ADDrive
         },
     );
     let params = ADDriverParams::create(&mut port_base)?;
-    port_base.set_string_param(params.base.port_name_self, 0, port_name.into())?;
+    port_base.set_string_param(params.base.port_name_self, 0, port_name)?;
     port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
     port_base.set_float64_param(
         params.base.pool_max_memory,

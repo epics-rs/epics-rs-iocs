@@ -66,9 +66,9 @@ impl PilatusDriver {
 
         let params = ad.params;
         let base = &mut ad.port_base;
-        base.set_string_param(params.base.manufacturer, 0, "Dectris".into())?;
-        base.set_string_param(params.base.model, 0, "Pilatus".into())?;
-        base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION.into())?;
+        base.set_string_param(params.base.manufacturer, 0, "Dectris")?;
+        base.set_string_param(params.base.model, 0, "Pilatus")?;
+        base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION)?;
         base.set_int32_param(params.max_size_x, 0, max_size_x)?;
         base.set_int32_param(params.max_size_y, 0, max_size_y)?;
         base.set_int32_param(params.size_x, 0, max_size_x)?;
@@ -94,7 +94,7 @@ impl PilatusDriver {
         base.set_float64_param(p.th_humid_0, 0, 0.0)?;
         base.set_float64_param(p.th_humid_1, 0, 0.0)?;
         base.set_float64_param(p.th_humid_2, 0, 0.0)?;
-        base.set_string_param(p.tvx_version, 0, "Unknown".into())?;
+        base.set_string_param(p.tvx_version, 0, "Unknown")?;
         base.set_string_param(p.header_string, 0, String::new())?;
 
         Ok(Self {
@@ -144,7 +144,7 @@ impl PortDriver for PilatusDriver {
                 self.ad.port_base.set_string_param(
                     params.status_message,
                     0,
-                    "Acquiring data".into(),
+                    "Acquiring data",
                 )?;
                 self.ad
                     .port_base
@@ -154,7 +154,7 @@ impl PortDriver for PilatusDriver {
                 self.ad.port_base.set_string_param(
                     params.status_message,
                     0,
-                    "Acquisition aborted".into(),
+                    "Acquisition aborted",
                 )?;
                 self.ad
                     .port_base

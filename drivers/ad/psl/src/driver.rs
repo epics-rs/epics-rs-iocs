@@ -84,12 +84,12 @@ impl PslDetector {
         let params = PslParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "PSL".into())?;
-        base.set_string_param(ad.params.base.model, 0, "CCD".into())?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "PSL")?;
+        base.set_string_param(ad.params.base.model, 0, "CCD")?;
         base.set_string_param(
             ad.params.base.driver_version,
             0,
-            env!("CARGO_PKG_VERSION").into(),
+            env!("CARGO_PKG_VERSION"),
         )?;
         base.set_int32_param(ad.params.base.data_type, 0, NDDataType::UInt16 as u8 as i32)?;
         base.set_int32_param(ad.params.image_mode, 0, ImageMode::Single as i32)?;
@@ -154,7 +154,7 @@ impl PslDetector {
             }
         };
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.string_to_server, 0, command.into())?;
+        base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, reply.clone())?;
         Ok(reply)
     }
@@ -189,7 +189,7 @@ impl PslDetector {
         let model = model.split_whitespace().next().unwrap_or("").to_string();
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.base.model, 0, model)?;
-        base.set_string_param(self.ad.params.base.manufacturer, 0, "PSL".into())?;
+        base.set_string_param(self.ad.params.base.manufacturer, 0, "PSL")?;
 
         let reply = self.command("GetMaximumSize")?;
         let size = protocol::parse_ints(&reply);

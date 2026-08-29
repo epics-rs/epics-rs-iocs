@@ -66,12 +66,12 @@ impl PhotonIIDetector {
         let params = PhotonIIParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "Bruker".into())?;
-        base.set_string_param(ad.params.base.model, 0, "PhotonII".into())?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "Bruker")?;
+        base.set_string_param(ad.params.base.model, 0, "PhotonII")?;
         base.set_string_param(
             ad.params.base.driver_version,
             0,
-            env!("CARGO_PKG_VERSION").into(),
+            env!("CARGO_PKG_VERSION"),
         )?;
 
         base.set_int32_param(ad.params.max_size_x, 0, PII_SIZE_X as i32)?;
@@ -108,7 +108,7 @@ impl PhotonIIDetector {
             }
         };
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.string_to_server, 0, command.into())?;
+        base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, reply)?;
         Ok(())
     }

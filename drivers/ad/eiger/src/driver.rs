@@ -315,14 +315,14 @@ impl EigerDriver {
         self.ad.port_base.set_string_param(
             self.ad.params.base.driver_version,
             0,
-            env!("CARGO_PKG_VERSION").into(),
+            env!("CARGO_PKG_VERSION"),
         )
     }
 
     fn status_message(&mut self, msg: &str) -> AsynResult<()> {
         self.ad
             .port_base
-            .set_string_param(self.ad.params.status_message, 0, msg.into())
+            .set_string_param(self.ad.params.status_message, 0, msg)
     }
 
     /// Refresh the interesting status parameters (C `eigerStatus`,

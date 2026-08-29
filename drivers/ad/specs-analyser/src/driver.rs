@@ -121,7 +121,7 @@ impl SpecsAnalyserDriver {
         base.set_int32_param(p.percent_complete_iteration, 0, 0)?;
         base.set_int32_param(p.current_sample_iteration, 0, 0)?;
         base.set_float64_param(p.remaining_time, 0, 0.0)?;
-        base.set_string_param(ad.params.base.manufacturer, 0, "SPECS".into())?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "SPECS")?;
         base.set_int32_param(p.safe_state, 0, 1)?;
         base.set_float64_param(p.data_delay_max, 0, 5.0)?;
 
@@ -582,7 +582,7 @@ impl PortDriver for SpecsAnalyserDriver {
                     self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
                         addr,
-                        "Acquisition paused".into(),
+                        "Acquisition paused",
                     )?;
                 } else {
                     self.ad
@@ -595,7 +595,7 @@ impl PortDriver for SpecsAnalyserDriver {
                     self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
                         addr,
-                        "Acquiring data...".into(),
+                        "Acquiring data...",
                     )?;
                 } else {
                     self.ad
@@ -775,7 +775,7 @@ pub fn create_specs_analyser_detector(
         let _ = driver.ad.port_base.set_string_param(
             driver.ad.params.status_message,
             0,
-            "Failed to initialise - check connection".into(),
+            "Failed to initialise - check connection",
         );
     }
 
