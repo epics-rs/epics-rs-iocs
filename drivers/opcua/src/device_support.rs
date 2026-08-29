@@ -771,7 +771,10 @@ impl DeviceSupport for OpcuaDevice {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    // Every C++ init failure is a `CATCH()` that returns an `S_*` status
+    // (`devOpcua.cpp:106-108`), never touching pact — the record scans on:
+    // the `Err` shape, kept by every `?` below.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let record_type = record.record_type();
         let (op, is_output) = Op::of(record_type).ok_or_else(|| {
             CaError::LinkError(format!(
@@ -847,7 +850,7 @@ impl DeviceSupport for OpcuaDevice {
                 from_server: false,
             };
         }
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn set_record_info(&mut self, name: &str, _scan: ScanType) {

@@ -398,7 +398,10 @@ impl DeviceSupport for EtherIpDevice {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    // Every C init_record/analyze_link failure returns an `S_*` status after
+    // an errlogPrintf, never touching pact (`devEtherIP.c:884-1007,1183-1205`)
+    // — the record scans on: the `Err` shape, kept by every `?` below.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let (bits, count) = record_shape(record);
         let link = parse_link(&self.link_text, count, bits)
             .map_err(|e| CaError::InvalidValue(format!("devEtherIP: {e}")))?;
@@ -436,7 +439,7 @@ impl DeviceSupport for EtherIpDevice {
         self.link = Some(link);
         self.plc = Some(plc);
         self.tag = Some(tag);
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {

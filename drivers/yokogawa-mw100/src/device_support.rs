@@ -574,7 +574,10 @@ impl DeviceSupport for MwDevice {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    // Every C init_record failure here is a bare `return 1` — no pact,
+    // no alarm (`devMW100_ai.c`) — so the record scans on: that is the
+    // `Err` shape, and every `?` below keeps it.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let parsed = link::parse_link(&self.link_text).ok_or_else(|| {
             CaError::LinkError(format!("malformed MW100 link: '{}'", self.link_text))
         })?;
@@ -589,7 +592,7 @@ impl DeviceSupport for MwDevice {
         )?;
         seed_initial_value(&instrument, op, record)?;
         self.resolved = Some(Resolved { instrument, op });
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn set_record_info(&mut self, _name: &str, scan: ScanType) {

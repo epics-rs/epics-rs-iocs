@@ -70,7 +70,7 @@ impl DeviceSupport for DigitelPump {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let rec = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<DigitelRecord>())
@@ -78,15 +78,26 @@ impl DeviceSupport for DigitelPump {
 
         let dev = DevType::from_index(rec.tipe)
             .ok_or_else(|| CaError::FieldNotFound(format!("digitel TYPE index {}", rec.tipe)))?;
-        let cfg =
-            configure(dev, self.link.addr, &self.link.drv_info).map_err(CaError::LinkError)?;
 
-        let port = get_port(&self.link.port_name).ok_or_else(|| {
-            CaError::LinkError(format!(
-                "asyn port '{}' not found (call drvAsynSerialPortConfigure first)",
+        // Every C failure below is a `goto bad` — errlogPrintf, `pr->pact = 1`,
+        // no alarm (`devDigitelPump.c:263-269`): the record is dead, not
+        // flagged-and-scanning. The TYPE/downcast checks above stay `Err`;
+        // they have no C arm (menu/dset binding makes them unreachable).
+        let cfg = match configure(dev, self.link.addr, &self.link.drv_info) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("devDigitelPump::init {e}");
+                return Ok(DeviceInitOutcome::dead());
+            }
+        };
+
+        let Some(port) = get_port(&self.link.port_name) else {
+            eprintln!(
+                "devDigitelPump::init can't connect to serial port {}",
                 self.link.port_name
-            ))
-        })?;
+            );
+            return Ok(DeviceInitOutcome::dead());
+        };
         self.io = Some(PortIo {
             handle: port.handle,
             addr: self.link.addr,
@@ -94,7 +105,7 @@ impl DeviceSupport for DigitelPump {
         });
         self.err_count = initial_err_count(dev);
         self.cfg = Some(cfg);
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

@@ -63,7 +63,7 @@ impl DeviceSupport for VacSen {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let rec = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<VsRecord>())
@@ -71,22 +71,32 @@ impl DeviceSupport for VacSen {
 
         let dev = DevType::from_index(rec.tipe)
             .ok_or_else(|| CaError::FieldNotFound(format!("vs TYPE index {}", rec.tipe)))?;
-        let cfg =
-            configure(dev, self.link.addr, &self.link.drv_info).map_err(CaError::LinkError)?;
 
-        let port = get_port(&self.link.port_name).ok_or_else(|| {
-            CaError::LinkError(format!(
-                "asyn port '{}' not found (call drvAsynSerialPortConfigure first)",
+        // Every C failure below is a `goto bad` — errlogPrintf "record
+        // disabled", `pr->pact = 1`, no alarm (`devVacSen.c:306-314`). The
+        // TYPE/downcast checks above stay `Err`; they have no C arm.
+        let cfg = match configure(dev, self.link.addr, &self.link.drv_info) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("devVacSen::init {e}");
+                return Ok(DeviceInitOutcome::dead());
+            }
+        };
+
+        let Some(port) = get_port(&self.link.port_name) else {
+            eprintln!(
+                "devVacSen::init can't connect to serial port {}",
                 self.link.port_name
-            ))
-        })?;
+            );
+            return Ok(DeviceInitOutcome::dead());
+        };
         self.io = Some(PortIo {
             handle: port.handle,
             addr: self.link.addr,
             timeout: IO_TIMEOUT,
         });
         self.cfg = Some(cfg);
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
