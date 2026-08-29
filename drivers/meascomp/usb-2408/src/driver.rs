@@ -15,6 +15,13 @@ use crate::poller::{self, PollerState};
 use crate::wave_dig::{self, WaveDigScan, WaveDigState};
 use crate::wave_gen::{self, WaveGenScan, WaveGenState};
 
+/// C `MultiFunction::writeInt32`/`writeFloat32Array` resolve the channel
+/// through `asynPortDriver::getAddress` (drvMultiFunction.cpp:1947, 2510),
+/// which maps the no-device addr -1 to 0 (asynPortDriver.cpp:1901-1913).
+fn device_addr(addr: i32) -> i32 {
+    if addr == -1 { 0 } else { addr }
+}
+
 /// USB-2408-2AO port driver.
 pub struct MultiFunctionDriver {
     base: PortDriverBase,
@@ -226,7 +233,7 @@ impl PortDriver for MultiFunctionDriver {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let mut last_error: Option<String> = None;
         let reason = user.reason;
-        let addr = user.addr;
+        let addr = device_addr(user.addr);
 
         // The scan buffers are sized once from maxInputPoints/maxOutputPoints,
         // so a point count above that capacity must never reach the store --
@@ -647,7 +654,7 @@ impl PortDriver for MultiFunctionDriver {
         if user.reason != self.params.wave_gen_user_wf {
             return Ok(());
         }
-        let ch = user.addr as usize;
+        let ch = device_addr(user.addr) as usize;
         if ch >= MAX_ANALOG_OUT {
             return Ok(());
         }

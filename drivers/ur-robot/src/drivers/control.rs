@@ -476,9 +476,10 @@ impl PortDriver for ControlDriver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        // C resolves the joint index via getAddress (rtde_control_driver.cpp:330).
+        let addr = crate::drivers::device_addr(user.addr);
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
-            let addr = user.addr;
             let p = self.params;
             self.base.params.set_float64(reason, addr, value)?;
 
@@ -547,7 +548,7 @@ impl PortDriver for ControlDriver {
             }
             Ok(())
         })();
-        crate::drivers::flush_after(&mut self.base, user.addr, result)
+        crate::drivers::flush_after(&mut self.base, addr, result)
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {

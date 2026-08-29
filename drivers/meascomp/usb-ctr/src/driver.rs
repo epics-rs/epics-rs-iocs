@@ -15,6 +15,13 @@ use crate::poller::{self, PollerState};
 use crate::pulse_gen;
 use crate::scaler::ScalerState;
 
+/// C `USBCTR::writeInt32`/`writeFloat64` resolve the counter number through
+/// `asynPortDriver::getAddress` (drvUSBCTR.cpp:1096, 1288), which maps the
+/// no-device addr -1 to 0 (asynPortDriver.cpp:1901-1913).
+fn device_addr(addr: i32) -> i32 {
+    if addr == -1 { 0 } else { addr }
+}
+
 /// USB-CTR08 port driver.
 pub struct CtrDriver {
     base: PortDriverBase,
@@ -109,7 +116,7 @@ impl PortDriver for CtrDriver {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let mut last_error: Option<String> = None;
         let reason = user.reason;
-        let addr = user.addr;
+        let addr = device_addr(user.addr);
 
         self.base.params.set_int32(reason, addr, value)?;
 
@@ -300,7 +307,7 @@ impl PortDriver for CtrDriver {
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let mut last_error: Option<String> = None;
         let reason = user.reason;
-        let addr = user.addr;
+        let addr = device_addr(user.addr);
         self.base.params.set_float64(reason, addr, value)?;
 
         // Restart pulse generator if period or duty cycle changes while running
