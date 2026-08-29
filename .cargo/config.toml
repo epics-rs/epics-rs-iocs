@@ -1,0 +1,20 @@
+# TEMPORARY — build-test the workspace against epics-rs upstream main
+# (worktree /home/stevek/work/epics-rs-main @ origin/main). Not for commit:
+# delete this file and restore Cargo.lock to return to the published pins.
+
+[patch.crates-io]
+epics-rs = { path = "/home/stevek/work/epics-rs-main/crates/epics-rs" }
+asyn-rs = { path = "/home/stevek/work/epics-rs-main/crates/asyn-rs" }
+ad-core-rs = { path = "/home/stevek/work/epics-rs-main/crates/ad-core-rs" }
+ad-plugins-rs = { path = "/home/stevek/work/epics-rs-main/crates/ad-plugins-rs" }
+epics-base-rs = { path = "/home/stevek/work/epics-rs-main/crates/epics-base-rs" }
+epics-bridge-rs = { path = "/home/stevek/work/epics-rs-main/crates/epics-bridge-rs" }
+epics-ca-rs = { path = "/home/stevek/work/epics-rs-main/crates/epics-ca-rs" }
+epics-libcom-rs = { path = "/home/stevek/work/epics-rs-main/crates/epics-libcom-rs" }
+epics-macros-rs = { path = "/home/stevek/work/epics-rs-main/crates/epics-macros-rs" }
+epics-modbus-rs = { path = "/home/stevek/work/epics-rs-main/crates/modbus-rs" }
+epics-pva-rs = { path = "/home/stevek/work/epics-rs-main/crates/epics-pva-rs" }
+epics-rtems-boot = { path = "/home/stevek/work/epics-rs-main/crates/epics-rtems-boot" }
+mca-rs = { path = "/home/stevek/work/epics-rs-main/crates/mca-rs" }
+motor-rs = { path = "/home/stevek/work/epics-rs-main/crates/motor-rs" }
+scaler-rs = { path = "/home/stevek/work/epics-rs-main/crates/scaler-rs" }
