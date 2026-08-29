@@ -97,7 +97,8 @@ fn redeclared_records_keep_their_type() {
 fn every_tpx3_drv_info_is_one_the_driver_creates() {
     let mut unserved = Vec::new();
     for def in load_all() {
-        for (field, value) in &def.fields {
+        for fd in &def.fields {
+            let (field, value) = (&fd.name, &fd.value);
             if field != "INP" && field != "OUT" {
                 continue;
             }

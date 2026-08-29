@@ -178,7 +178,8 @@ fn every_drv_info_is_one_the_driver_can_serve() {
         "pilatus4.template",
     ] {
         for def in load(template) {
-            for (field, value) in &def.fields {
+            for fd in &def.fields {
+                let (field, value) = (&fd.name, &fd.value);
                 if field != "INP" && field != "OUT" {
                     continue;
                 }
