@@ -6,7 +6,9 @@ use std::time::Duration;
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use epics_rs::base::server::record::Record;
 use epics_rs::base::types::PvString;
 
@@ -141,8 +143,11 @@ impl DeviceSupport for DigitelPump {
 
         // Simulation mode does no wire I/O; the record's `process()` computes
         // VAL/MODR/SET/CRNT from SVMO/SVS1/SVS2/SVCR.
+        // C never reaches the dset here at all (`digitelRecord.c:309` gates
+        // `pdset->readWrite` on the simulation flag), so this return says
+        // nothing about UDF; the record's own simulation branch clears it.
         if rec.simm == YES {
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         }
 
         // C `readWrite_dg` (pact == 0) command selection: a changed control
@@ -253,12 +258,12 @@ impl DeviceSupport for DigitelPump {
             // recGblSetSevr(READ_ALARM, INVALID); udf = 0.
             rec.read_alarm = true;
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
         if self.err_count > 0 {
             // Transient error: keep the last good readings, clear UDF.
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
 
         // Full decode. Fields the reply does not rewrite keep their previous
@@ -307,7 +312,7 @@ impl DeviceSupport for DigitelPump {
         }
         rec.dev_ran = true;
 
-        Ok(DeviceReadOutcome::computed())
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

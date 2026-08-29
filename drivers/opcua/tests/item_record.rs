@@ -166,7 +166,7 @@ fn leaf_of(record: &mut OpcuaItemRecord) -> Arc<Mutex<Leaf>> {
 /// read stage (the item's action), then the record itself.
 fn process(device: &mut OpcuaDevice, record: &mut OpcuaItemRecord) {
     let outcome = device.read(record).expect("the item acts");
-    record.set_device_did_compute(outcome.did_compute);
+    record.set_device_did_compute(outcome.did_compute());
     record.process().expect("the record processes");
 }
 

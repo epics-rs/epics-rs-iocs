@@ -102,7 +102,7 @@ fn incoming(
     let outcome = device.read(record).expect("the update is delivered");
     // The framework runs the record's own conversion next when the device did
     // not compute the value itself.
-    record.set_device_did_compute(outcome.did_compute);
+    record.set_device_did_compute(outcome.did_compute());
     record.process().expect("the record processes");
 }
 

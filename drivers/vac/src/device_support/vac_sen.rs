@@ -5,7 +5,9 @@ use std::time::Duration;
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use epics_rs::base::server::record::Record;
 
 use super::PortIo;
@@ -184,12 +186,12 @@ impl DeviceSupport for VacSen {
             // recGblSetSevr(READ_ALARM, INVALID); udf = 0.
             rec.read_alarm = true;
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
         if self.err_count > 0 {
             // Transient error: keep the last good readings, clear UDF.
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
 
         // Full decode. Fields the device type does not rewrite keep their
@@ -220,7 +222,7 @@ impl DeviceSupport for VacSen {
         rec.pres = rec.val;
         rec.dev_ran = true;
 
-        Ok(DeviceReadOutcome::computed())
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
