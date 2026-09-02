@@ -106,7 +106,7 @@ fn poller_loop(
                 vec![ParamSetValue::new(
                     params.last_error_message,
                     0,
-                    ParamValue::Octet(msg.clone()),
+                    ParamValue::Octet(msg.clone().into_bytes()),
                 )],
             );
         }

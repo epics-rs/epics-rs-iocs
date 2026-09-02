@@ -90,18 +90,12 @@ pub(crate) use record_fields;
 
 /// `recGblSetSevr`'s return value, which the C `checkAlarms` routines branch on
 /// to decide whether to latch `LALM`.
-///
-/// `epics_base_rs::server::recgbl::rec_gbl_set_sevr` returns `()`, so the
-/// "did this raise the pending severity?" test is applied here — it is exactly
-/// the condition the function itself uses (`recGbl.c:258-261`).
 pub(crate) fn set_sevr(
     common: &mut epics_rs::base::server::record::CommonFields,
     stat: u16,
     sevr: epics_rs::base::server::record::AlarmSeverity,
 ) -> bool {
-    let raised = (sevr as u16) > (common.nsev as u16);
-    epics_rs::base::server::recgbl::rec_gbl_set_sevr(common, stat, sevr);
-    raised
+    epics_rs::base::server::recgbl::rec_gbl_set_sevr(common, stat, sevr)
 }
 
 /// `menu(menuAlarmSevr)` index → [`AlarmSeverity`]. A record's `HHSV`/`LLSV`/

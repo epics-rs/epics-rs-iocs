@@ -46,20 +46,7 @@ initScaler974("SCL1", "S0", 0, 100)
 # a second initScaler974 call before this record binds is a startup
 # error, by design.
 #
-# NOTE 2: DTYP is set below via dbpf, NOT as a dbLoadRecords macro. epics-
-# base-rs 0.22.1's dbLoadRecords applies a passed DTYP=... macro via
-# db_loader::override_dtyp, which force-overwrites *every* record's DTYP
-# field in the loaded file -- not just fields that reference $(DTYP) in
-# the text (real EPICS macLib only ever does textual $(...) substitution
-# and never touches a hardcoded literal). scaler.db's own helper records
-# (scaler1_calcEnable/_calc_ctrl, DTYP="Soft Channel" literal) would be
-# corrupted to DTYP="Asyn Scaler" too, breaking their soft-channel
-# classification. Loading without the DTYP macro and patching just the
-# scaler record's DTYP field via dbpf afterward (still pre-iocInit, so
-# wire_device_support's dtyp read sees the corrected value) avoids the
-# blast radius entirely without editing the vendored db file.
-dbLoadRecords("$(SCALER)/db/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),FREQ=1000000")
-dbpf("scaler974:scaler1.DTYP", "Asyn Scaler")
+dbLoadRecords("$(SCALER)/db/scaler.db", "P=scaler974:,S=scaler1,OUT=@asyn(SCL1 0 0),DTYP=Asyn Scaler,FREQ=1000000")
 
 #------------------------------------------------------------------------------
 iocInit()

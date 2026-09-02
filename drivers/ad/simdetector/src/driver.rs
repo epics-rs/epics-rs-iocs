@@ -53,12 +53,12 @@ impl SimDetector {
         let base = &mut ad.port_base;
 
         // simDetector.cpp:1093-1100
-        base.set_string_param(p.base.manufacturer, 0, "Simulated detector".into())?;
-        base.set_string_param(p.base.model, 0, "Basic simulator".into())?;
-        base.set_string_param(p.base.driver_version, 0, DRIVER_VERSION.into())?;
-        base.set_string_param(p.base.sdk_version, 0, DRIVER_VERSION.into())?;
-        base.set_string_param(p.base.serial_number, 0, "No serial number".into())?;
-        base.set_string_param(p.base.firmware_version, 0, "No firmware".into())?;
+        base.set_string_param(p.base.manufacturer, 0, "Simulated detector")?;
+        base.set_string_param(p.base.model, 0, "Basic simulator")?;
+        base.set_string_param(p.base.driver_version, 0, DRIVER_VERSION)?;
+        base.set_string_param(p.base.sdk_version, 0, DRIVER_VERSION)?;
+        base.set_string_param(p.base.serial_number, 0, "No serial number")?;
+        base.set_string_param(p.base.firmware_version, 0, "No firmware")?;
 
         // simDetector.cpp:1102-1134
         base.set_int32_param(p.max_size_x, 0, max_size_x)?;
@@ -144,14 +144,12 @@ impl PortDriver for SimDetector {
             if value != 0 && !acquiring {
                 self.ad
                     .port_base
-                    .set_string_param(p.status_message, 0, "Acquiring data".into())?;
+                    .set_string_param(p.status_message, 0, "Acquiring data")?;
             }
             if value == 0 && acquiring {
-                self.ad.port_base.set_string_param(
-                    p.status_message,
-                    0,
-                    "Acquisition stopped".into(),
-                )?;
+                self.ad
+                    .port_base
+                    .set_string_param(p.status_message, 0, "Acquisition stopped")?;
                 // FIXED (doc/upstream-c-defects.md #1): upstream computes
                 // Idle/Aborted and then unconditionally overwrites it with
                 // ADStatusAcquire on the next line (simDetector.cpp:913-918),

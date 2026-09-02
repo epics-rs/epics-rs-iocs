@@ -1,10 +1,14 @@
 //! `devDigitelPump` — the `asyn DigitelPump` device support for the `digitel`
 //! record.
 
+use std::time::Duration;
+
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use epics_rs::base::server::record::Record;
 use epics_rs::base::types::PvString;
 
@@ -18,6 +22,11 @@ use crate::records::digitel::DigitelRecord;
 
 /// `asyn DigitelPump`.
 pub const DTYP: &str = "asyn DigitelPump";
+
+/// C `DigitelPump_TIMEOUT` (`devDigitelPump.c:63`) — both C callback paths
+/// overwrite `pasynUser->timeout` with this constant before every I/O
+/// (`devDigitelPump.c:889,1162`), so the link-parsed timeout is never used.
+const IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// `SIMM`'s `YES` menu index.
 const YES: u16 = 1;
@@ -61,7 +70,7 @@ impl DeviceSupport for DigitelPump {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let rec = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<DigitelRecord>())
@@ -69,23 +78,34 @@ impl DeviceSupport for DigitelPump {
 
         let dev = DevType::from_index(rec.tipe)
             .ok_or_else(|| CaError::FieldNotFound(format!("digitel TYPE index {}", rec.tipe)))?;
-        let cfg =
-            configure(dev, self.link.addr, &self.link.drv_info).map_err(CaError::LinkError)?;
 
-        let port = get_port(&self.link.port_name).ok_or_else(|| {
-            CaError::LinkError(format!(
-                "asyn port '{}' not found (call drvAsynSerialPortConfigure first)",
+        // Every C failure below is a `goto bad` — errlogPrintf, `pr->pact = 1`,
+        // no alarm (`devDigitelPump.c:263-269`): the record is dead, not
+        // flagged-and-scanning. The TYPE/downcast checks above stay `Err`;
+        // they have no C arm (menu/dset binding makes them unreachable).
+        let cfg = match configure(dev, self.link.addr, &self.link.drv_info) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("devDigitelPump::init {e}");
+                return Ok(DeviceInitOutcome::dead());
+            }
+        };
+
+        let Some(port) = get_port(&self.link.port_name) else {
+            eprintln!(
+                "devDigitelPump::init can't connect to serial port {}",
                 self.link.port_name
-            ))
-        })?;
+            );
+            return Ok(DeviceInitOutcome::dead());
+        };
         self.io = Some(PortIo {
             handle: port.handle,
             addr: self.link.addr,
-            timeout: self.link.timeout,
+            timeout: IO_TIMEOUT,
         });
         self.err_count = initial_err_count(dev);
         self.cfg = Some(cfg);
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -134,8 +154,11 @@ impl DeviceSupport for DigitelPump {
 
         // Simulation mode does no wire I/O; the record's `process()` computes
         // VAL/MODR/SET/CRNT from SVMO/SVS1/SVS2/SVCR.
+        // C never reaches the dset here at all (`digitelRecord.c:309` gates
+        // `pdset->readWrite` on the simulation flag), so this return says
+        // nothing about UDF; the record's own simulation branch clears it.
         if rec.simm == YES {
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         }
 
         // C `readWrite_dg` (pact == 0) command selection: a changed control
@@ -246,12 +269,12 @@ impl DeviceSupport for DigitelPump {
             // recGblSetSevr(READ_ALARM, INVALID); udf = 0.
             rec.read_alarm = true;
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
         if self.err_count > 0 {
             // Transient error: keep the last good readings, clear UDF.
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
 
         // Full decode. Fields the reply does not rewrite keep their previous
@@ -300,7 +323,7 @@ impl DeviceSupport for DigitelPump {
         }
         rec.dev_ran = true;
 
-        Ok(DeviceReadOutcome::computed())
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

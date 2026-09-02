@@ -55,17 +55,17 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
     assert_eq!(
         base.get_string_param(driver.ad.params.status_message, 0)
             .unwrap(),
-        "Mythen FAILED TO CONNECT"
+        b"Mythen FAILED TO CONNECT"
     );
     assert_eq!(base.get_int32_param(driver.p.nmodules, 0).unwrap(), 0);
     assert_eq!(
         base.get_string_param(driver.p.firmware_version, 0).unwrap(),
-        ""
+        b""
     );
     // The fixed parameters C sets regardless of the detector are still there.
     assert_eq!(
         base.get_string_param(driver.ad.params.base.manufacturer, 0)
             .unwrap(),
-        "Dectris"
+        b"Dectris"
     );
 }

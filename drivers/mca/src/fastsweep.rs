@@ -509,10 +509,13 @@ impl PortDriver for FastSweepDriver {
     /// overflow fixed at source (module doc).
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         let state = self.shared.state.lock().unwrap();
-        let signal = usize::try_from(user.addr)
+        // C resolves the signal through getAddress (drvFastSweep.cpp:351),
+        // which maps the no-device addr -1 to 0 (asynPortDriver.cpp:1901-1913).
+        let addr = if user.addr == -1 { 0 } else { user.addr };
+        let signal = usize::try_from(addr)
             .ok()
             .filter(|s| *s < state.max_signals)
-            .ok_or_else(|| asyn_error(format!("signal address {} out of range", user.addr)))?;
+            .ok_or_else(|| asyn_error(format!("signal address {addr} out of range")))?;
 
         Ok(state.read_signal(signal, buf))
     }

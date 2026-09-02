@@ -1,9 +1,13 @@
 //! `devVacSen` — the `asyn VacSen` device support for the `vs` record.
 
+use std::time::Duration;
+
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use epics_rs::base::server::record::Record;
 
 use super::PortIo;
@@ -15,6 +19,11 @@ use crate::records::vs::{DGS_FIELD, IG1_FIELD, IG2_FIELD, VsRecord};
 
 /// `asyn VacSen`.
 pub const DTYP: &str = "asyn VacSen";
+
+/// C `vacSen_TIMEOUT` (`devVacSen.c:65`) — the C callback overwrites
+/// `pasynUser->timeout` with this constant before every I/O, so the
+/// link-parsed timeout is never used.
+const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct VacSen {
     link: AsynLink,
@@ -54,7 +63,7 @@ impl DeviceSupport for VacSen {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let rec = record
             .as_any_mut()
             .and_then(|a| a.downcast_mut::<VsRecord>())
@@ -62,22 +71,32 @@ impl DeviceSupport for VacSen {
 
         let dev = DevType::from_index(rec.tipe)
             .ok_or_else(|| CaError::FieldNotFound(format!("vs TYPE index {}", rec.tipe)))?;
-        let cfg =
-            configure(dev, self.link.addr, &self.link.drv_info).map_err(CaError::LinkError)?;
 
-        let port = get_port(&self.link.port_name).ok_or_else(|| {
-            CaError::LinkError(format!(
-                "asyn port '{}' not found (call drvAsynSerialPortConfigure first)",
+        // Every C failure below is a `goto bad` — errlogPrintf "record
+        // disabled", `pr->pact = 1`, no alarm (`devVacSen.c:306-314`). The
+        // TYPE/downcast checks above stay `Err`; they have no C arm.
+        let cfg = match configure(dev, self.link.addr, &self.link.drv_info) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("devVacSen::init {e}");
+                return Ok(DeviceInitOutcome::dead());
+            }
+        };
+
+        let Some(port) = get_port(&self.link.port_name) else {
+            eprintln!(
+                "devVacSen::init can't connect to serial port {}",
                 self.link.port_name
-            ))
-        })?;
+            );
+            return Ok(DeviceInitOutcome::dead());
+        };
         self.io = Some(PortIo {
             handle: port.handle,
             addr: self.link.addr,
-            timeout: self.link.timeout,
+            timeout: IO_TIMEOUT,
         });
         self.cfg = Some(cfg);
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
@@ -177,12 +196,12 @@ impl DeviceSupport for VacSen {
             // recGblSetSevr(READ_ALARM, INVALID); udf = 0.
             rec.read_alarm = true;
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
         if self.err_count > 0 {
             // Transient error: keep the last good readings, clear UDF.
             rec.dev_ran = true;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
 
         // Full decode. Fields the device type does not rewrite keep their
@@ -213,7 +232,7 @@ impl DeviceSupport for VacSen {
         rec.pres = rec.val;
         rec.dev_ran = true;
 
-        Ok(DeviceReadOutcome::computed())
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {

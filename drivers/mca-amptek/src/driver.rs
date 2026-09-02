@@ -1096,16 +1096,18 @@ impl PortDriver for AmptekDriver {
         } else if reason == self.mca[McaReason::ReadStatus as usize] {
             status = self.handle_read_status();
         } else if reason == self.amptek[AmptekReason::LoadConfigFile as usize] {
-            let file_name = self
-                .base
-                .get_string_param(self.amptek[AmptekReason::ConfigFile as usize], 0)?
-                .to_string();
+            let file_name = String::from_utf8_lossy(
+                self.base
+                    .get_string_param(self.amptek[AmptekReason::ConfigFile as usize], 0)?,
+            )
+            .into_owned();
             status = self.send_configuration_file(&file_name);
         } else if reason == self.amptek[AmptekReason::SaveConfigFile as usize] {
-            let file_name = self
-                .base
-                .get_string_param(self.amptek[AmptekReason::ConfigFile as usize], 0)?
-                .to_string();
+            let file_name = String::from_utf8_lossy(
+                self.base
+                    .get_string_param(self.amptek[AmptekReason::ConfigFile as usize], 0)?,
+            )
+            .into_owned();
             status = self.save_configuration_file(&file_name);
         } else if reason == self.amptek[AmptekReason::SCALowChannel as usize]
             || reason == self.amptek[AmptekReason::SCAHighChannel as usize]

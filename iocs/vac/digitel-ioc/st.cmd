@@ -31,7 +31,7 @@ asynSetOption("DIGITEL_1", 0, "baud",   "9600")
 asynSetOption("DIGITEL_1", 0, "bits",   "7")
 asynSetOption("DIGITEL_1", 0, "parity", "even")
 asynSetOption("DIGITEL_1", 0, "stop",   "1")
-asynOctetSetInputEos ("DIGITEL_1", 0, "\n\r")
+asynOctetSetInputEos("DIGITEL_1", 0, "\n\r")
 asynOctetSetOutputEos("DIGITEL_1", 0, "\r")
 
 dbLoadRecords("$(VAC)/db/digitelPump.db", "P=$(P),PUMP=IP1,PORT=DIGITEL_1,ADDR=0,DEV=D500,STN=0")

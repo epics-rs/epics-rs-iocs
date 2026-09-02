@@ -116,9 +116,10 @@ impl PortDriver for IoDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        // C resolves the channel via getAddress (rtde_io_driver.cpp:63).
+        let addr = crate::drivers::device_addr(user.addr);
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
-            let addr = user.addr;
             let p = self.params;
             self.base.params.set_int32(reason, addr, value)?;
 
@@ -142,13 +143,14 @@ impl PortDriver for IoDriver {
             };
             result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
         })();
-        crate::drivers::flush_after(&mut self.base, user.addr, result)
+        crate::drivers::flush_after(&mut self.base, addr, result)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        // C resolves the channel via getAddress (rtde_io_driver.cpp:99).
+        let addr = crate::drivers::device_addr(user.addr);
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
-            let addr = user.addr;
             let p = self.params;
             self.base.params.set_float64(reason, addr, value)?;
 
@@ -171,6 +173,6 @@ impl PortDriver for IoDriver {
             };
             result.map_err(|e| asyn_error(format!("RTDE I/O write failed: {e}")))
         })();
-        crate::drivers::flush_after(&mut self.base, user.addr, result)
+        crate::drivers::flush_after(&mut self.base, addr, result)
     }
 }

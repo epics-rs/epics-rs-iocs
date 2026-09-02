@@ -52,6 +52,12 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(asyn_name, move || asyn_factory());
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
+    // transform is opt-in in epics-rs (dropped from the default
+    // registry with the stdRecords.dbd manifest); the db files this IOC
+    // loads use it, as a C IOC links the owning module's .dbd.
+    app = app.register_record_type("transform", || {
+        Box::new(epics_rs::base::server::records::transform::TransformRecord::default())
+    });
     // Contribute the scaler record type's DTYP menu. The device support is
     // bound dynamically by DTYP string at iocInit (register_dynamic_device_support
     // below), which is name-blind and runs AFTER st.cmd's
@@ -86,27 +92,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ttyName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "priority",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noAutoConnect",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noProcessEos",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
@@ -171,22 +172,18 @@ async fn main() -> CaResult<()> {
             ArgDesc {
                 name: "portName",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "serialPort",
                 arg_type: ArgType::String,
-                optional: false,
             },
             ArgDesc {
                 name: "serialAddr",
                 arg_type: ArgType::Int,
-                optional: false,
             },
             ArgDesc {
                 name: "poll",
                 arg_type: ArgType::Int,
-                optional: false,
             },
         ],
         "initScaler974 portName serialPort serialAddr poll",

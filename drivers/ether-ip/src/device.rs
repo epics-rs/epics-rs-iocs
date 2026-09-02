@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc;
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::{AlarmSeverity, Record};
@@ -396,7 +398,10 @@ impl DeviceSupport for EtherIpDevice {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    // Every C init_record/analyze_link failure returns an `S_*` status after
+    // an errlogPrintf, never touching pact (`devEtherIP.c:884-1007,1183-1205`)
+    // — the record scans on: the `Err` shape, kept by every `?` below.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let (bits, count) = record_shape(record);
         let link = parse_link(&self.link_text, count, bits)
             .map_err(|e| CaError::InvalidValue(format!("devEtherIP: {e}")))?;
@@ -434,7 +439,7 @@ impl DeviceSupport for EtherIpDevice {
         self.link = Some(link);
         self.plc = Some(plc);
         self.tag = Some(tag);
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
@@ -463,11 +468,13 @@ impl DeviceSupport for EtherIpDevice {
                 Some(v) => {
                     self.no_alarm();
                     record.set_val(EpicsValue::Double(v))?;
-                    Ok(DeviceReadOutcome::computed())
+                    // C ai_read's statistics arm: udf = FALSE on success.
+                    Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
                 }
                 None => {
                     self.read_alarm();
-                    Ok(DeviceReadOutcome::computed())
+                    // C ai_read raises the alarm but leaves udf alone.
+                    Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
                 }
             };
         }
@@ -533,7 +540,15 @@ impl DeviceSupport for EtherIpDevice {
                 self.no_alarm();
                 if computed {
                     record.set_val(value)?;
-                    Ok(DeviceReadOutcome::computed())
+                    // C parity: ai_read, si_read and lsi_read write
+                    // udf = FALSE on a good read; int64in_read and wf_read
+                    // never touch udf. longin has no C dset and follows
+                    // its LINT twin int64in.
+                    let udf = match rtype {
+                        "longin" | "int64in" | "waveform" => DeviceUdf::Untouched,
+                        _ => DeviceUdf::Defined,
+                    };
+                    Ok(DeviceReadOutcome::computed(udf))
                 } else {
                     record.put_field("RVAL", value)?;
                     Ok(DeviceReadOutcome::ok())
@@ -648,7 +663,7 @@ impl EtherIpDevice {
     fn readback(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some((tag, link)) = self.bound() else {
             self.read_alarm();
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         };
         let (element, mask, forced) = (link.element, link.mask, link.forced());
         let rtype = record.record_type();
@@ -658,7 +673,7 @@ impl EtherIpDevice {
         if !data.has_value() || elements <= element {
             drop(data);
             self.read_alarm();
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         }
 
         let udf = matches!(record.get_field("UDF"), Some(EpicsValue::Char(1)));
@@ -670,7 +685,7 @@ impl EtherIpDevice {
                     let Some(plc) = cip::get_double(&data.buf, element) else {
                         drop(data);
                         self.read_alarm();
-                        return Ok(DeviceReadOutcome::computed());
+                        return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                     };
                     let val = f64_field(record, "VAL");
                     if plc != val {
@@ -686,7 +701,7 @@ impl EtherIpDevice {
                     let Some(plc) = cip::get_dint(&data.buf, element) else {
                         drop(data);
                         self.read_alarm();
-                        return Ok(DeviceReadOutcome::computed());
+                        return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                     };
                     let rval = i32_field(record, "RVAL");
                     if plc != rval {
@@ -703,7 +718,7 @@ impl EtherIpDevice {
                 let Some(plc) = cip::get_dint(&data.buf, element) else {
                     drop(data);
                     self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed());
+                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let val = i32_field(record, "VAL");
                 if plc != val {
@@ -719,7 +734,7 @@ impl EtherIpDevice {
                 let Some(plc) = cip::get_lint(&data.buf, element) else {
                     drop(data);
                     self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed());
+                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::Int64(v)) => v,
@@ -739,7 +754,7 @@ impl EtherIpDevice {
                 let Some(plc) = get_bits(&data.buf, element, mask, bits) else {
                     drop(data);
                     self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed());
+                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let rval = i32_field(record, "RVAL") as u32;
                 if plc != rval {
@@ -756,7 +771,7 @@ impl EtherIpDevice {
                 let Some(plc) = cip::get_string(&data.buf, element, max) else {
                     drop(data);
                     self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed());
+                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::String(s)) => s.to_string(),
@@ -775,13 +790,19 @@ impl EtherIpDevice {
                 log::error!("devEtherIP: unsupported output record type '{other}'");
                 drop(data);
                 self.read_alarm();
-                return Ok(DeviceReadOutcome::computed());
+                return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
             }
         }
 
         drop(data);
         self.no_alarm();
-        Ok(DeviceReadOutcome::computed())
+        // C's check_*_callbacks write udf = FALSE only when they copy the
+        // PLC value in, but their update condition includes `rec->udf`, so
+        // every pass that got this far ends with udf == 0: udf = 1 forces
+        // the copy branch (FORCE requires !udf), and the skip/force paths
+        // only run with udf already 0. The no-data and failed-get returns
+        // above never touch udf in C, hence Untouched there.
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 }
 

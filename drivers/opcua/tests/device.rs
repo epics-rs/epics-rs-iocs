@@ -102,7 +102,7 @@ fn incoming(
     let outcome = device.read(record).expect("the update is delivered");
     // The framework runs the record's own conversion next when the device did
     // not compute the value itself.
-    record.set_device_did_compute(outcome.did_compute);
+    record.set_device_did_compute(outcome.did_compute());
     record.process().expect("the record processes");
 }
 
@@ -135,6 +135,7 @@ fn defined() -> ProcessContext {
         time: SystemTime::UNIX_EPOCH,
         tsel: String::new(),
         dtyp: opcua::device_support::DTYP.to_string(),
+        callback_priority: epics_rs::base::runtime::task::CallbackPriority::Low,
     }
 }
 
@@ -443,7 +444,10 @@ fn the_servers_enumeration_fills_a_state_table_the_database_left_empty() {
         .property_post_receiver()
         .expect("mbbi posts properties");
     let posted = rx.try_recv().expect("the table was posted");
-    assert_eq!(posted.len(), 32);
+    // The device stores the fields in place; the post itself carries no
+    // writes and names VAL, C++'s db_post_events target (devOpcua.cpp:732).
+    assert!(posted.writes.is_empty());
+    assert_eq!(posted.post_field, "VAL");
     assert!(rx.try_recv().is_err());
 }
 

@@ -32,6 +32,10 @@ epicsEnvSet("TYPE", "Float32")
 # $(NDDRIVERSTDARRAYS) is set to this crate's root by ioc_support at IOC
 # startup. The templates live in its db/ subdir.
 
+# Template-internal `include` lines (ADBase.template, NDPluginBase.template,
+# ...) resolve through this path.
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
+
 # Create an NDDriverStdArrays driver
 # NDDriverStdArraysConfig(portName, maxBuffers, maxMemory, priority, stackSize)
 NDDriverStdArraysConfig("$(PORT)", $(QSIZE), 0, 0)

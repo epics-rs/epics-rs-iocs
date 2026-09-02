@@ -161,8 +161,8 @@ impl MythenDriver {
         }
 
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.base.manufacturer, 0, "Dectris".into())?;
-        base.set_string_param(self.ad.params.base.model, 0, "Mythen".into())?;
+        base.set_string_param(self.ad.params.base.manufacturer, 0, "Dectris")?;
+        base.set_string_param(self.ad.params.base.model, 0, "Mythen")?;
         base.set_string_param(self.p.firmware_version, 0, firmware.unwrap_or_default())?;
 
         base.set_int32_param(self.ad.params.max_size_x, 0, SENSOR_SIZE_X)?;
@@ -229,7 +229,7 @@ impl MythenDriver {
         };
         self.ad
             .port_base
-            .set_string_param(self.ad.params.status_message, 0, message.into())?;
+            .set_string_param(self.ad.params.status_message, 0, message)?;
 
         self.ad.port_base.call_param_callbacks(0)
     }

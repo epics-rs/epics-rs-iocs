@@ -297,9 +297,11 @@ impl DeviceWorker for TpgWorker {
             }
             if let Some(raw) = ids.as_deref() {
                 match protocol::parse_gauge_id(raw, gauge) {
-                    Ok(id) => {
-                        shared.push(ParamSetValue::new(p.gauge_id, addr, ParamValue::Octet(id)))
-                    }
+                    Ok(id) => shared.push(ParamSetValue::new(
+                        p.gauge_id,
+                        addr,
+                        ParamValue::Octet(id.into_bytes()),
+                    )),
                     Err(e) => log::error!("TPG261: gauge {gauge} id: {e}"),
                 }
             }

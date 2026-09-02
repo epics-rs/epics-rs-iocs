@@ -45,24 +45,20 @@ impl URLDriver {
         let url_params = URLParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "URL Driver".into())?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "URL Driver")?;
         // Deviation from C++ (was "GraphicsMagick"): this port decodes with the
         // `image` crate and fetches with `ureq` instead of GraphicsMagick, so the
         // literal upstream string would misidentify the backend.
-        base.set_string_param(ad.params.base.model, 0, "image-rs".into())?;
-        base.set_string_param(ad.params.base.serial_number, 0, "No serial number".into())?;
-        base.set_string_param(ad.params.base.firmware_version, 0, "No firmware".into())?;
+        base.set_string_param(ad.params.base.model, 0, "image-rs")?;
+        base.set_string_param(ad.params.base.serial_number, 0, "No serial number")?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "No firmware")?;
         // Deviation from C++ (was GraphicsMagick's `MagickLibVersionText`): no
         // equivalent version macro exists for the substituted Rust crates.
-        base.set_string_param(ad.params.base.sdk_version, 0, "image 0.25 + ureq 2".into())?;
+        base.set_string_param(ad.params.base.sdk_version, 0, "image 0.25 + ureq 2")?;
         // C++ explicitly overrides NDDriverVersion with its own DRIVER_VERSION.
         // DRIVER_REVISION.DRIVER_MODIFICATION, distinct from the ad-core-rs/
         // Cargo package version ADDriverBase::new() defaults it to.
-        base.set_string_param(
-            ad.params.base.driver_version,
-            0,
-            DRIVER_VERSION_STRING.into(),
-        )?;
+        base.set_string_param(ad.params.base.driver_version, 0, DRIVER_VERSION_STRING)?;
 
         Ok(Self {
             ad,

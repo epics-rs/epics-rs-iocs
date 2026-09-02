@@ -140,7 +140,7 @@ fn is_timeout(e: &AsynError) -> bool {
 /// needs `&mut` — so the probes get their own user, which is all the base
 /// driver reads from it (the timeout).
 fn probe_user(user: &AsynUser) -> AsynUser {
-    AsynUser::default().with_timeout(user.timeout)
+    AsynUser::default().with_timeout_opt(user.timeout)
 }
 
 /// The PMAC ethernet framing layer (C `pmacPvt` + its `asynOctet` methods).
@@ -230,7 +230,7 @@ impl PmacIpInterpose {
         // C: `status == asynTimeout && thisRead == 0 && pasynUser->timeout > 0`.
         if n == 0
             && result.as_ref().err().is_some_and(is_timeout)
-            && !user.timeout.is_zero()
+            && user.timeout.is_some_and(|t| !t.is_zero())
             && self.read_ready(user, next)
         {
             self.get_buffer(user, next, maxchars)?;

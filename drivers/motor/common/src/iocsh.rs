@@ -15,7 +15,6 @@ pub fn arg_str_req(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::String,
-        optional: false,
     }
 }
 
@@ -24,7 +23,6 @@ pub fn arg_str_opt(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::String,
-        optional: true,
     }
 }
 
@@ -33,7 +31,6 @@ pub fn arg_int_req(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::Int,
-        optional: false,
     }
 }
 
@@ -42,7 +39,6 @@ pub fn arg_int_opt(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::Int,
-        optional: true,
     }
 }
 
@@ -51,7 +47,6 @@ pub fn arg_double_req(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::Double,
-        optional: false,
     }
 }
 
@@ -60,7 +55,6 @@ pub fn arg_double_opt(name: &'static str) -> ArgDesc {
     ArgDesc {
         name,
         arg_type: ArgType::Double,
-        optional: true,
     }
 }
 

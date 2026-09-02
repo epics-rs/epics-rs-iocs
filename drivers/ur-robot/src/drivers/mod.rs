@@ -93,6 +93,16 @@ pub(crate) fn asyn_error(message: impl Into<String>) -> AsynError {
     }
 }
 
+/// The address a C handler acts on: `asynPortDriver::getAddress`
+/// (asynPortDriver.cpp:1901-1913) maps the no-device addr -1 to 0, and every
+/// urRobot handler that turns the address into a joint index or I/O channel
+/// resolves it through that call (rtde_control_driver.cpp:330,
+/// rtde_io_driver.cpp:63,99). Param-store calls need no such step — the
+/// store normalizes -1 itself.
+pub(crate) fn device_addr(addr: i32) -> i32 {
+    if addr == -1 { 0 } else { addr }
+}
+
 /// The end-of-write flush every C handler performs: the default
 /// `asynPortDriver::write*` end with `callParamCallbacks(addr)`
 /// (asynPortDriver.cpp:2031), and every urRobot C override reaches its own

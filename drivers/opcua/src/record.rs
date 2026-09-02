@@ -23,7 +23,7 @@ use std::any::Any;
 
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::record::{FieldDesc, ProcessOutcome, Record};
-use epics_rs::base::types::{DbFieldType, EpicsValue};
+use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue};
 
 use crate::queue::ProcessReason;
 use crate::registry::Binding;
@@ -44,22 +44,49 @@ const WOC_IMMEDIATE: u16 = 1;
 /// The length of a `DBF_STRING` field, minus its terminator.
 const MAX_STRING_SIZE: usize = 40;
 
+// `INP` mirrors `field(INP,DBF_INLINK)` in `opcuaItemRecord.dbd` — INP is
+// not a dbCommon field, so the loader refuses it unless the record declares
+// it. The menu fields declare `DBF_MENU` and carry their choices, as the
+// `.dbd` does: the loader's refusal gate resolves menu names by identity
+// against base's generated tables, so an external menu never resolves there —
+// but its numeric arms do not decide `DBF_MENU` either, so the label reaches
+// the apply path, which reads `menu_field_choices`.
 static FIELDS: &[FieldDesc] = &[
     FieldDesc::new("VAL", DbFieldType::ULong, false),
+    FieldDesc {
+        declared_dbf: DbfCode::Inlink,
+        ..FieldDesc::new("INP", DbFieldType::String, false)
+    },
     FieldDesc::new("SESS", DbFieldType::String, false),
     FieldDesc::new("SUBS", DbFieldType::String, false),
-    FieldDesc::new("DEFACTN", DbFieldType::Enum, false),
-    FieldDesc::new("BINI", DbFieldType::Enum, false),
+    FieldDesc {
+        declared_dbf: DbfCode::Menu,
+        menu: Some(DEF_ACTION),
+        ..FieldDesc::new("DEFACTN", DbFieldType::Enum, false)
+    },
+    FieldDesc {
+        declared_dbf: DbfCode::Menu,
+        menu: Some(BINI),
+        ..FieldDesc::new("BINI", DbFieldType::Enum, false)
+    },
     FieldDesc::new("READ", DbFieldType::Char, false),
     FieldDesc::new("WRITE", DbFieldType::Char, false),
     FieldDesc::new("STATCODE", DbFieldType::ULong, false),
     FieldDesc::new("OSTATCODE", DbFieldType::ULong, false),
     FieldDesc::new("STATTEXT", DbFieldType::String, false),
-    FieldDesc::new("WOC", DbFieldType::Enum, false),
+    FieldDesc {
+        declared_dbf: DbfCode::Menu,
+        menu: Some(WOC),
+        ..FieldDesc::new("WOC", DbFieldType::Enum, false)
+    },
 ];
 
 #[derive(Debug, Default)]
 pub struct OpcuaItemRecord {
+    /// `field(INP,DBF_INLINK)` — the record owns the field; the loader also
+    /// mirrors the text into the common INP, which is where device support
+    /// reads it.
+    pub inp: String,
     /// "Dummy Value" — the record has none. A put to it processes the record,
     /// which is one way to order the default action.
     pub val: u32,
@@ -135,6 +162,7 @@ impl Record for OpcuaItemRecord {
     fn get_field(&self, name: &str) -> Option<EpicsValue> {
         Some(match name {
             "VAL" => EpicsValue::ULong(self.val),
+            "INP" => EpicsValue::String(self.inp.clone().into()),
             "SESS" => EpicsValue::String(self.sess.clone().into()),
             "SUBS" => EpicsValue::String(self.subs.clone().into()),
             "DEFACTN" => EpicsValue::Enum(self.defactn),
@@ -153,6 +181,7 @@ impl Record for OpcuaItemRecord {
         let mismatch = || CaError::TypeMismatch(name.into());
         match name {
             "VAL" => self.val = ulong(&value).ok_or_else(mismatch)?,
+            "INP" => self.inp = string(&value).ok_or_else(mismatch)?,
             "SESS" => self.sess = string(&value).ok_or_else(mismatch)?,
             "SUBS" => self.subs = string(&value).ok_or_else(mismatch)?,
             "DEFACTN" => self.defactn = index(&value).ok_or_else(mismatch)?,

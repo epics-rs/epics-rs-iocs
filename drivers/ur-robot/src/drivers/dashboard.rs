@@ -420,10 +420,26 @@ fn poll_once(
     let updates = vec![
         ParamSetValue::new(params.is_connected, 0, ParamValue::Int32(1)),
         ParamSetValue::new(params.is_running, 0, ParamValue::Int32(i32::from(running))),
-        ParamSetValue::new(params.program_state, 0, ParamValue::Octet(program_state)),
-        ParamSetValue::new(params.robot_mode, 0, ParamValue::Octet(robot_mode.clone())),
-        ParamSetValue::new(params.loaded_program, 0, ParamValue::Octet(loaded_program)),
-        ParamSetValue::new(params.safety_status, 0, ParamValue::Octet(safety_status)),
+        ParamSetValue::new(
+            params.program_state,
+            0,
+            ParamValue::Octet(program_state.into_bytes()),
+        ),
+        ParamSetValue::new(
+            params.robot_mode,
+            0,
+            ParamValue::Octet(robot_mode.clone().into_bytes()),
+        ),
+        ParamSetValue::new(
+            params.loaded_program,
+            0,
+            ParamValue::Octet(loaded_program.into_bytes()),
+        ),
+        ParamSetValue::new(
+            params.safety_status,
+            0,
+            ParamValue::Octet(safety_status.into_bytes()),
+        ),
         ParamSetValue::new(
             params.is_program_saved,
             0,

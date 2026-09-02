@@ -44,15 +44,11 @@ impl D435iColorDriver {
         let rs_params = D435iParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "Intel".into())?;
-        base.set_string_param(ad.params.base.model, 0, "RealSense D435i".into())?;
-        base.set_string_param(ad.params.base.serial_number, 0, "Not connected".into())?;
-        base.set_string_param(ad.params.base.firmware_version, 0, "Unknown".into())?;
-        base.set_string_param(
-            ad.params.base.sdk_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "Intel")?;
+        base.set_string_param(ad.params.base.model, 0, "RealSense D435i")?;
+        base.set_string_param(ad.params.base.serial_number, 0, "Not connected")?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "Unknown")?;
+        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
 
         // Default stream config. The enum choices are the camera's own modes,
         // so RSStreamMode never offers one it will reject.
@@ -168,7 +164,7 @@ impl PortDriver for D435iColorDriver {
                 self.ad.port_base.set_string_param(
                     self.ad.params.status_message,
                     0,
-                    "Acquiring data".into(),
+                    "Acquiring data",
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Start).is_err() {
@@ -176,7 +172,7 @@ impl PortDriver for D435iColorDriver {
                     self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
                         0,
-                        "Acquisition task crashed".into(),
+                        "Acquisition task crashed",
                     )?;
                     self.ad.port_base.set_int32_param(acquire_idx, 0, 0)?;
                 }
@@ -184,7 +180,7 @@ impl PortDriver for D435iColorDriver {
                 self.ad.port_base.set_string_param(
                     self.ad.params.status_message,
                     0,
-                    "Acquisition stopped".into(),
+                    "Acquisition stopped",
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Stop).is_err() {
@@ -313,15 +309,11 @@ impl D435iDepthDriver {
         let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
 
         let base = &mut ad.port_base;
-        base.set_string_param(ad.params.base.manufacturer, 0, "Intel".into())?;
-        base.set_string_param(ad.params.base.model, 0, "RealSense D435i (Depth)".into())?;
-        base.set_string_param(ad.params.base.serial_number, 0, "Not connected".into())?;
-        base.set_string_param(ad.params.base.firmware_version, 0, "Unknown".into())?;
-        base.set_string_param(
-            ad.params.base.sdk_version,
-            0,
-            env!("CARGO_PKG_VERSION").into(),
-        )?;
+        base.set_string_param(ad.params.base.manufacturer, 0, "Intel")?;
+        base.set_string_param(ad.params.base.model, 0, "RealSense D435i (Depth)")?;
+        base.set_string_param(ad.params.base.serial_number, 0, "Not connected")?;
+        base.set_string_param(ad.params.base.firmware_version, 0, "Unknown")?;
+        base.set_string_param(ad.params.base.sdk_version, 0, env!("CARGO_PKG_VERSION"))?;
 
         // Image size and ROI. The depth port has no mode of its own; it
         // follows the colour port's stream, so start it at the preferred mode.

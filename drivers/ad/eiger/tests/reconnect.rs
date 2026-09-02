@@ -173,7 +173,7 @@ fn an_acquisition_reconnects_a_detector_that_was_offline_at_boot() {
     assert_eq!(
         base.get_string_param(driver.ad.params.status_message, 0)
             .unwrap(),
-        "Eiger FAILED TO CONNECT"
+        b"Eiger FAILED TO CONNECT"
     );
 
     // The detector comes back, and the acquisition path's probe re-reads it.
@@ -190,7 +190,7 @@ fn an_acquisition_reconnects_a_detector_that_was_offline_at_boot() {
     assert_eq!(
         base.get_string_param(driver.ad.params.status_message, 0)
             .unwrap(),
-        "",
+        b"",
         "the FAILED TO CONNECT message must be gone once the detector answers"
     );
 }

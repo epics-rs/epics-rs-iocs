@@ -354,7 +354,7 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet(message.clone()),
+                ParamValue::Octet(message.clone().into_bytes()),
             ));
         }
     }

@@ -72,7 +72,7 @@ fn int32(reason: usize, value: i32) -> ParamSetValue {
 }
 
 fn octet(reason: usize, value: &str) -> ParamSetValue {
-    ParamSetValue::new(reason, 0, ParamValue::Octet(value.to_string()))
+    ParamSetValue::new(reason, 0, ParamValue::Octet(value.as_bytes().to_vec()))
 }
 
 impl SimTaskContext {

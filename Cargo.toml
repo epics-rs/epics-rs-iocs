@@ -157,7 +157,7 @@ members = [
 # consumes. Bump here once per epics-rs release instead of editing each crate.
 # Per-crate feature sets stay in the crates (features are additive over these).
 [workspace.dependencies]
-# epics-rs 0.26.2 (released): ports consume the released version instead of
+# epics-rs 0.27.0 (released): ports consume the released version instead of
 # the main branch. 0.24.3 -> 0.25.2 was the breaking step for this workspace
 # and the code here already carries it: `create_port_runtime` became fallible
 # (a port whose actor thread the OS refuses is now an error rather than a
@@ -191,14 +191,36 @@ members = [
 # (poll-thread COMM alarm pushes) — plus the aSub FTx/FTVx cell typing and
 # per-line db/acf macro expansion. Additive API only.
 #
+# 0.27.0 lands the 2026-08-23 C-parity round: 42 public API breaks (18
+# removals, 24 signature changes), measured item-by-item in the epics-rs
+# repo's doc/breaking-2026-08-23.md. Exactly one lands here:
+# `recgbl::rec_gbl_set_sevr` now returns C's raise bool, which makes
+# drivers/vac's local `raised` recomputation in `set_sevr` redundant --
+# collapsed to return the upstream value. Nothing else in the removal or
+# signature tables is referenced by this workspace (`wait_blocking`'s
+# timeout is now honoured, but no crate here calls it). Behavioral: a
+# record's process cycle exits through `end_process_cycle` on every path,
+# and asyn bounds blocking waits by the caller's deadline.
+#
+# 0.28.0 gathers the 2026-08-25 C-parity round; no API break reaches this
+# workspace. It includes the four fixes this workspace's adaptation audit
+# sent upstream (epics-rs PR #91): iocsh tokenize takes blanks before `(`
+# as call syntax, db_loader resolves an externally-registered record
+# type's own menu tables, `AdIoc::new` registers busy/sseq itself (the
+# per-IOC registrations those AD mains carried are dropped alongside this
+# bump), and commonPlugins.cmd passes NAME=FFT1. Behavioral parity that
+# lands here: device support binds before init_record, one MacroTable
+# spans a whole include tree, and every PUT renders in the destination
+# field's shape.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.26.2"
-asyn-rs = "0.26.2"
-ad-core-rs = "0.26.2"
-ad-plugins-rs = "0.26.2"
+epics-rs = "0.28.0"
+asyn-rs = "0.28.0"
+ad-core-rs = "0.28.0"
+ad-plugins-rs = "0.28.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.26.2", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.28.0", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.26.2"
+mca-rs = "0.28.0"

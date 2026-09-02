@@ -45,7 +45,9 @@ use std::time::SystemTime;
 use async_opcua::types::Variant;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc;
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
+};
 use epics_rs::base::server::recgbl::alarm_status::{COMM_ALARM, READ_ALARM, WRITE_ALARM};
 use epics_rs::base::server::record::{ProcessContext, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
@@ -181,8 +183,8 @@ pub struct OpcuaDevice {
     /// Out-of-band PROPERTY posts — the state table the server's enumeration
     /// defines (`db_post_events(prec, &prec->val, DBE_PROPERTY)`,
     /// `devOpcua.cpp:732`).
-    property_tx: Option<mpsc::Sender<Vec<(String, EpicsValue)>>>,
-    property_rx: Option<mpsc::Receiver<Vec<(String, EpicsValue)>>>,
+    property_tx: Option<mpsc::Sender<PropertyPost>>,
+    property_rx: Option<mpsc::Receiver<PropertyPost>>,
     info: HashMap<String, String>,
     enums: EnumState,
     /// The record's UDF at the start of this cycle — the ai smoothing needs it
@@ -233,8 +235,9 @@ impl OpcuaDevice {
             bound.item.lock().request(Priority::Low, Action::Read);
         }
         // Nothing about the record's value changed on this pass, so its
-        // conversion must not run again over an unchanged RVAL.
-        Ok(DeviceReadOutcome::computed())
+        // conversion must not run again over an unchanged RVAL. The C's
+        // `reason == none` branch never touches `prec->udf` either.
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
     }
 
     /// Send whatever the item's element records have written into it (the C's
@@ -315,7 +318,10 @@ impl OpcuaDevice {
         rec.set_acted(ok);
         rec.statcode = status.bits();
         rec.stattext = truncate(&status.to_string(), 40).to_string();
-        Ok(DeviceReadOutcome::computed())
+        // UDF belongs to the record here: `opcua_action_item` never writes it,
+        // the record support's `readwrite` wrapper clears it on dset success
+        // (`opcuaItemRecord.cpp:159-162`) — which is what `set_acted` ports.
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
     }
 
     /// The record's value goes to the server (`opcua_write_*`, the
@@ -413,6 +419,27 @@ impl OpcuaDevice {
         }
     }
 
+    /// What the C leaf overload that pops this record's updates does to
+    /// `prec->udf` on a pop that delivers no usable value: the generic scalar
+    /// template clears it before even looking at the update's reason
+    /// (`DataElementOpen62541Leaf.h:718`), so every failure — readFailure,
+    /// connectionLoss, a bad status, an unconvertible value, even a popped
+    /// write completion — still says "defined"; the string and array overloads
+    /// only write it when a value actually lands
+    /// (`DataElementOpen62541Leaf.cpp:436`, `:581`, `:675`).
+    fn popped_udf(&self) -> DeviceUdf {
+        match self.op {
+            Op::Int32
+            | Op::Int64
+            | Op::UInt32Rval
+            | Op::Bo
+            | Op::MbboDirect
+            | Op::Enum
+            | Op::Analog => DeviceUdf::Defined,
+            Op::String | Op::LongString | Op::Array | Op::Item => DeviceUdf::Untouched,
+        }
+    }
+
     /// One update the record popped.
     fn deliver(&mut self, update: Update, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.timestamp = Some(update.timestamp);
@@ -427,18 +454,18 @@ impl OpcuaDevice {
         match update.reason {
             ProcessReason::ReadFailure => {
                 self.alarm = Some((READ_ALARM, INVALID));
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(self.popped_udf()))
             }
             ProcessReason::WriteFailure => {
                 self.alarm = Some((WRITE_ALARM, INVALID));
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(self.popped_udf()))
             }
             ProcessReason::ConnectionLoss => {
                 self.alarm = Some((COMM_ALARM, INVALID));
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(self.popped_udf()))
             }
             // The write reached the server; nothing about the record changes.
-            ProcessReason::WriteComplete => Ok(DeviceReadOutcome::computed()),
+            ProcessReason::WriteComplete => Ok(DeviceReadOutcome::computed(self.popped_udf())),
             // `bini=write`: the item is asking the record to send its own value.
             ProcessReason::WriteRequest => {
                 if self.is_output {
@@ -449,7 +476,9 @@ impl OpcuaDevice {
                         self.record_name
                     );
                 }
-                Ok(DeviceReadOutcome::computed())
+                // The C's `reason == writeRequest` arm is the write branch of
+                // the write dset — it requests the write and pops nothing.
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
             }
             // The item record's READ asks for a fresh value.
             //
@@ -475,11 +504,11 @@ impl OpcuaDevice {
         // A bad status carries no value (`DataElementOpen62541Leaf.h:730-734`).
         if update.status.is_bad() {
             self.alarm = Some((READ_ALARM, INVALID));
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(self.popped_udf()));
         }
         let Some(data) = update.data else {
             self.alarm = Some((READ_ALARM, INVALID));
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(self.popped_udf()));
         };
         if update.status.is_uncertain() {
             self.alarm = Some((READ_ALARM, MINOR));
@@ -491,7 +520,17 @@ impl OpcuaDevice {
             Err(e) => {
                 log::error!("{}: incoming data unusable: {e}", self.record_name);
                 self.alarm = Some((READ_ALARM, INVALID));
-                Ok(DeviceReadOutcome::computed())
+                // The C clears UDF even on a failed conversion: the scalar
+                // template cleared it at the pop and the array overload clears
+                // it right after its failed type switch
+                // (`DataElementOpen62541Leaf.cpp:581` — the FTVL=CHAR overload,
+                // `:675`, does not, a per-FTVL split not visible here); only
+                // the string overload writes it on success alone (`:436`).
+                let udf = match self.op {
+                    Op::String | Op::LongString | Op::Item => DeviceUdf::Untouched,
+                    _ => DeviceUdf::Defined,
+                };
+                Ok(DeviceReadOutcome::computed(udf))
             }
         }
     }
@@ -508,12 +547,12 @@ impl OpcuaDevice {
             Op::Int32 => {
                 let v: i32 = value::read_scalar(data, choices).map_err(err)?;
                 put(record, "VAL", EpicsValue::Long(v))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Int64 => {
                 let v: i64 = value::read_scalar(data, choices).map_err(err)?;
                 put(record, "VAL", EpicsValue::Int64(v))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             // bi's ZSV/OSV and mbbiDirect's bits come out of the record's own
             // RVAL -> VAL conversion, which is what `ok()` asks it to run.
@@ -529,27 +568,27 @@ impl OpcuaDevice {
             Op::Bo | Op::MbboDirect => {
                 let v: u32 = value::read_scalar(data, choices).map_err(err)?;
                 raw_readback(record, v)?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Enum => self.store_enum(data, choices, record),
             Op::Analog => self.store_analog(data, choices, record),
             Op::String => {
                 let v = value::read_string(data, choices).map_err(err)?;
                 put(record, "VAL", EpicsValue::String(truncate(&v, 39).into()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             // lsi/lso clamp the string to SIZV themselves and set LEN from it.
             Op::LongString => {
                 let v = value::read_string(data, choices).map_err(err)?;
                 put(record, "VAL", EpicsValue::CharArray(v.into_bytes()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Array => {
                 store_array(data, record)?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             // The item record takes no value from the node — its elements do.
-            Op::Item => Ok(DeviceReadOutcome::computed()),
+            Op::Item => Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched)),
         }
     }
 
@@ -570,7 +609,7 @@ impl OpcuaDevice {
             put(record, "RVAL", EpicsValue::ULong(raw))?;
             let index = u16::try_from(raw).unwrap_or(u16::MAX);
             put(record, "VAL", EpicsValue::Enum(index))?;
-            return Ok(DeviceReadOutcome::computed());
+            return Ok(DeviceReadOutcome::computed(DeviceUdf::Defined));
         }
         if self.is_output {
             // The record's readback does the mask, the shift and the state
@@ -584,7 +623,7 @@ impl OpcuaDevice {
             // RVAL keeps the raw the server sent, masked
             // (`mbbo.rs:893-903`).
             raw_readback(record, raw)?;
-            Ok(DeviceReadOutcome::computed())
+            Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
         } else {
             // mbbi converts RVAL itself: mask, shift, state lookup
             // (`mbbiRecord.c::convert`).
@@ -655,7 +694,14 @@ impl OpcuaDevice {
         self.enums.from_server = true;
         self.enums.values_defined = true;
         if let Some(tx) = &self.property_tx {
-            let _ = tx.try_send(posts);
+            // The state fields are already stored in place above, as the C++
+            // writes them in its callback; what remains is the single
+            // `db_post_events(prec, &prec->val, DBE_PROPERTY)`
+            // (`devOpcua.cpp:717-732`).
+            let _ = tx.try_send(PropertyPost {
+                writes: Vec::new(),
+                post_field: "VAL".to_string(),
+            });
         }
         Ok(())
     }
@@ -685,7 +731,14 @@ impl OpcuaDevice {
                     return Err("the record has no float64 readback".to_string());
                 }
             }
-            return Ok(DeviceReadOutcome::computed());
+            // `prec->udf = std::isnan(prec->val)` (`devOpcua.cpp:686`), over
+            // the VAL the record's readback just rebuilt.
+            let udf = if double(record, "VAL").is_ok_and(f64::is_nan) {
+                DeviceUdf::Undefined
+            } else {
+                DeviceUdf::Defined
+            };
+            return Ok(DeviceReadOutcome::computed(udf));
         }
 
         if converts {
@@ -714,8 +767,9 @@ impl OpcuaDevice {
         } else {
             old * smoo + v * (1.0 - smoo)
         };
+        // `prec->udf = 0` (`devOpcua.cpp:607`).
         put(record, "VAL", EpicsValue::Double(value))?;
-        Ok(DeviceReadOutcome::computed())
+        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 }
 
@@ -724,7 +778,10 @@ impl DeviceSupport for OpcuaDevice {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    // Every C++ init failure is a `CATCH()` that returns an `S_*` status
+    // (`devOpcua.cpp:106-108`), never touching pact — the record scans on:
+    // the `Err` shape, kept by every `?` below.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let record_type = record.record_type();
         let (op, is_output) = Op::of(record_type).ok_or_else(|| {
             CaError::LinkError(format!(
@@ -800,7 +857,7 @@ impl DeviceSupport for OpcuaDevice {
                 from_server: false,
             };
         }
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn set_record_info(&mut self, name: &str, _scan: ScanType) {
@@ -819,7 +876,7 @@ impl DeviceSupport for OpcuaDevice {
         self.notify.take()
     }
 
-    fn property_post_receiver(&mut self) -> Option<mpsc::Receiver<Vec<(String, EpicsValue)>>> {
+    fn property_post_receiver(&mut self) -> Option<mpsc::Receiver<PropertyPost>> {
         self.property_rx.take()
     }
 
@@ -840,8 +897,9 @@ impl DeviceSupport for OpcuaDevice {
             Some((update, _)) => self.deliver(update, record),
             // An output record reaches the read stage only on an I/O Intr pulse,
             // which is only fired for an update — an empty queue means another
-            // pass already took it.
-            None if self.is_output => Ok(DeviceReadOutcome::computed()),
+            // pass already took it. No pop, so nothing said about UDF (the C
+            // leaf returns 1 untouched on an empty queue).
+            None if self.is_output => Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched)),
             // The C's `reason == none` on an input record: start a read.
             None => self.request_read(),
         }

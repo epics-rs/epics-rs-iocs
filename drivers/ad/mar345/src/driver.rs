@@ -69,8 +69,8 @@ impl Mar345Driver {
         // C constructor defaults (mar345.cpp:745-766).
         base.set_int32_param(params.max_size_x, 0, MAX_DIM)?;
         base.set_int32_param(params.max_size_y, 0, MAX_DIM)?;
-        base.set_string_param(params.base.manufacturer, 0, "MAR".into())?;
-        base.set_string_param(params.base.model, 0, "345".into())?;
+        base.set_string_param(params.base.manufacturer, 0, "MAR")?;
+        base.set_string_param(params.base.model, 0, "345")?;
         base.set_int32_param(params.base.data_type, 0, NDDataType::Int16 as i32)?;
         base.set_int32_param(params.image_mode, 0, ImageMode::Single as i32)?;
         base.set_int32_param(params.trigger_mode, 0, TriggerMode::Internal as i32)?;

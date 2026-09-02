@@ -96,17 +96,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "serialPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "serialPortAddress",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "RontecConfig portName serialPort serialPortAddress",

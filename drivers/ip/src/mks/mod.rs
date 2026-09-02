@@ -165,8 +165,12 @@ impl MksWorker {
             let code = protocol::gauge_type_field(&types, gauge).unwrap_or("");
             let gauge_type = GaugeType::from_code(code);
             let mut values = vec![
-                ParamSetValue::new(p.units, addr, ParamValue::Octet(units.clone())),
-                ParamSetValue::new(p.gauge_type, addr, ParamValue::Octet(code.to_string())),
+                ParamSetValue::new(p.units, addr, ParamValue::Octet(units.clone().into_bytes())),
+                ParamSetValue::new(
+                    p.gauge_type,
+                    addr,
+                    ParamValue::Octet(code.as_bytes().to_vec()),
+                ),
             ];
             match gauge_type {
                 Some(gauge_type) => {

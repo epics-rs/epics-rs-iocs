@@ -344,7 +344,13 @@ fn a_stop_during_the_exposure_publishes_no_frame() {
         fixture.wait_int32(ad.status, ADStatus::Idle as i32, Duration::from_secs(5)),
         ADStatus::Idle as i32
     );
-    // Nothing was published, so the array counter was never touched: it is
-    // still undefined, as it is at boot.
-    assert!(fixture.sync.read_int32(ad.base.array_counter).is_err());
+    // Nothing was published, so the array counter still holds the 0 the
+    // constructor seeds (asynNDArrayDriver parity since ad-core-rs 0.27.0).
+    assert_eq!(
+        fixture
+            .sync
+            .read_int32(ad.base.array_counter)
+            .expect("seeded at boot"),
+        0
+    );
 }

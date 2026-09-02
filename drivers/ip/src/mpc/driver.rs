@@ -303,7 +303,7 @@ impl MpcWorker {
             Ok(payload) => values.push(ParamSetValue::new(
                 p.status,
                 addr,
-                ParamValue::Octet(payload),
+                ParamValue::Octet(payload.into_bytes()),
             )),
             Err(e) => log::error!("MPC: read status failed: {e}"),
         }
@@ -320,7 +320,7 @@ impl MpcWorker {
                 values.push(ParamSetValue::new(
                     p.pressure_egu,
                     addr,
-                    ParamValue::Octet(reading.egu),
+                    ParamValue::Octet(reading.egu.into_bytes()),
                 ));
             }
             Err(e) => log::error!("MPC: read pressure failed: {e}"),
@@ -394,7 +394,7 @@ impl MpcWorker {
             Ok(payload) => values.push(ParamSetValue::new(
                 p.tsp_status,
                 addr,
-                ParamValue::Octet(payload),
+                ParamValue::Octet(payload.into_bytes()),
             )),
             Err(e) => log::error!("MPC: read TSP status failed: {e}"),
         }

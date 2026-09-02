@@ -202,7 +202,7 @@ async fn handle_command(
                             vec![ParamSetValue::new(
                                 ctx.pva.pv_name,
                                 0,
-                                ParamValue::Octet(current_pv_name.clone()),
+                                ParamValue::Octet(current_pv_name.clone().into_bytes()),
                             )],
                         )
                         .await;

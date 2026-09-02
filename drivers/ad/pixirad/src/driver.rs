@@ -80,9 +80,9 @@ impl PixiradDetector {
         let p = ad.params;
 
         let base = &mut ad.port_base;
-        base.set_string_param(p.base.manufacturer, 0, "Pixirad".into())?;
-        base.set_string_param(p.base.model, 0, sensor.build.model_name().into())?;
-        base.set_string_param(p.base.driver_version, 0, env!("CARGO_PKG_VERSION").into())?;
+        base.set_string_param(p.base.manufacturer, 0, "Pixirad")?;
+        base.set_string_param(p.base.model, 0, sensor.build.model_name())?;
+        base.set_string_param(p.base.driver_version, 0, env!("CARGO_PKG_VERSION"))?;
         base.set_int32_param(p.size_x, 0, max_size_x)?;
         base.set_int32_param(p.size_y, 0, max_size_y)?;
         base.set_int32_param(p.base.array_size_x, 0, max_size_x)?;
@@ -177,8 +177,8 @@ impl PixiradDetector {
             }
         };
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.status_message, 0, message.into())?;
-        base.set_string_param(self.ad.params.string_to_server, 0, command.into())?;
+        base.set_string_param(self.ad.params.status_message, 0, message)?;
+        base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, exchange.reply.clone())?;
         Ok(exchange.reply)
     }

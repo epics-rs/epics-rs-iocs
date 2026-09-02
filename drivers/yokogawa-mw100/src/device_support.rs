@@ -25,7 +25,9 @@
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+};
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
@@ -572,7 +574,10 @@ impl DeviceSupport for MwDevice {
         DTYP
     }
 
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    // Every C init_record failure here is a bare `return 1` — no pact,
+    // no alarm (`devMW100_ai.c`) — so the record scans on: that is the
+    // `Err` shape, and every `?` below keeps it.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let parsed = link::parse_link(&self.link_text).ok_or_else(|| {
             CaError::LinkError(format!("malformed MW100 link: '{}'", self.link_text))
         })?;
@@ -587,7 +592,7 @@ impl DeviceSupport for MwDevice {
         )?;
         seed_initial_value(&instrument, op, record)?;
         self.resolved = Some(Resolved { instrument, op });
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     fn set_record_info(&mut self, _name: &str, scan: ScanType) {
@@ -610,7 +615,7 @@ impl DeviceSupport for MwDevice {
                 }
                 let v = instrument.analog_get(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::Double(v))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::IntegerVal(channel) => {
                 if !is_io_intr {
@@ -618,7 +623,7 @@ impl DeviceSupport for MwDevice {
                 }
                 let v = instrument.integer_get(channel);
                 record.put_field("VAL", EpicsValue::Long(v))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::BinaryVal(channel) => {
                 if !is_io_intr {
@@ -693,42 +698,42 @@ impl DeviceSupport for MwDevice {
                     "VAL",
                     EpicsValue::String(instrument.peer_address.clone().into()),
                 )?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::ModuleModel(module) => {
                 let v = instrument.module_model(module);
                 record.put_field("VAL", EpicsValue::Long(v))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::ModuleNumber(module) => {
                 let v = instrument.module_number(module);
                 record.put_field("VAL", EpicsValue::Long(v))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::ModuleCode(module) => {
                 let v = instrument.module_code(module);
                 record.put_field("VAL", EpicsValue::String(v.into()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::ModuleString(module) => {
                 let v = instrument.module_string(module);
                 record.put_field("VAL", EpicsValue::String(v.into()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::Unit(addr) => {
                 let v = instrument.channel_get_egu(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::String(v.into()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::ErrorText(channel) => {
                 let v = instrument.get_error(channel);
                 record.put_field("VAL", EpicsValue::String(v.into()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::Expr(channel) => {
                 let v = instrument.channel_get_expr(channel);
                 record.put_field("VAL", EpicsValue::String(v.into()))?;
-                Ok(DeviceReadOutcome::computed())
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Operation::AnalogSet(_)
             | Operation::BinarySet(_)
@@ -1249,7 +1254,7 @@ mod tests {
         device.set_record_info("TEST:AI", ScanType::IoIntr);
 
         let outcome = device.read(&mut record).unwrap();
-        assert!(outcome.did_compute);
+        assert!(outcome.did_compute());
         assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Double(1.234)));
     }
 

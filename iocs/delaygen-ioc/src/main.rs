@@ -46,6 +46,12 @@ async fn main() -> CaResult<()> {
 
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
+    // transform is opt-in in epics-rs (dropped from the default
+    // registry with the stdRecords.dbd manifest); the db files this IOC
+    // loads use it, as a C IOC links the owning module's .dbd.
+    app = app.register_record_type("transform", || {
+        Box::new(epics_rs::base::server::records::transform::TransformRecord::default())
+    });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
@@ -95,27 +101,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ttyName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "priority",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noAutoConnect",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noProcessEos",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
@@ -166,17 +167,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "myport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioaddr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "DG645Config myport ioport ioaddr",
@@ -224,27 +222,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "myport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "units",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "iface",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "ColbyConfig myport ioport addr units iface",
@@ -300,17 +293,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "myport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioaddr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "CoherentSdgConfig myport ioport ioaddr",

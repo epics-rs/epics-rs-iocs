@@ -30,7 +30,7 @@
 //! the `block_in_place` panic older versions had (see
 //! `drivers/microepsilon/src/data_driver.rs`'s `park_on` discussion).
 use epics_rs::base::error::{CaError, CaResult};
-use epics_rs::base::server::device_support::{DeviceReadOutcome, DeviceSupport};
+use epics_rs::base::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_rs::base::server::record::Record;
 use epics_rs::base::types::EpicsValue;
 
@@ -218,13 +218,21 @@ impl DeviceSupport for DevMcaAsyn {
     /// which only yields a field the first time a *later* `caput` changes
     /// it. Without this, a driver never learns a setup field's db-loaded
     /// value (e.g. `NUSE`) until a client explicitly rewrites it after boot.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<()> {
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         for reason in McaReason::ALL {
             let req = DrvUserRequest::new(reason.drv_info(), self.addr);
-            let info: DrvUserInfo = self
-                .handle
-                .drv_user_create_blocking(&req)
-                .map_err(asyn_to_ca)?;
+            // C `findDrvInfo` failure is a `goto bad` — pact=1, no alarm
+            // (`devMcaAsyn.c:184-209`).
+            let info: DrvUserInfo = match self.handle.drv_user_create_blocking(&req) {
+                Ok(info) => info,
+                Err(e) => {
+                    eprintln!(
+                        "devMcaAsyn::init_record drvInfo '{}': {e}",
+                        reason.drv_info()
+                    );
+                    return Ok(DeviceInitOutcome::dead());
+                }
+            };
             self.reasons[reason as usize] = info.reason;
         }
 
@@ -243,9 +251,11 @@ impl DeviceSupport for DevMcaAsyn {
             McaCommand::PresetSweeps(mca.pswp),
             McaCommand::AcquireMode(mca.mode as i32),
         ] {
-            self.send_command(command).map_err(asyn_to_ca)?;
+            // C discards every one of these send_msg statuses
+            // (`mcaRecord.c:464-487`).
+            let _ = self.send_command(command);
         }
-        Ok(())
+        Ok(DeviceInitOutcome::Live)
     }
 
     /// One process cycle, restructured from C's `send_msg` + `asynCallback`

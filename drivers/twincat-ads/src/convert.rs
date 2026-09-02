@@ -225,9 +225,9 @@ pub fn decode_array(
 
 /// A PLC `STRING` is a NUL-terminated byte array in a fixed-size slot; the
 /// bytes past the NUL are stale and must not reach the record.
-fn decode_plc_string(data: &[u8]) -> String {
+fn decode_plc_string(data: &[u8]) -> Vec<u8> {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    String::from_utf8_lossy(&data[..end]).into_owned()
+    data[..end].to_vec()
 }
 
 /// A scalar written from EPICS, before it is narrowed to the PLC's type.
@@ -491,7 +491,7 @@ mod tests {
         // The PLC sends the whole fixed-size slot; the tail is stale data.
         let raw = b"Hello\0\xff\xfe garbage";
         match decode_array(AdsType::String, raw, ParamType::Octet).unwrap() {
-            ParamValue::Octet(s) => assert_eq!(s, "Hello"),
+            ParamValue::Octet(s) => assert_eq!(s, b"Hello"),
             other => panic!("{other:?}"),
         }
     }

@@ -81,17 +81,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "cfgPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ioAddr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "CapaNCDT6200ConfigInit cfgPort ioPort ioAddr",
@@ -154,17 +151,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "IPaddress",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "IPport",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "capaNCDT6200Configure portName IPaddress IPport",

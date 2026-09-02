@@ -105,12 +105,12 @@ impl NdStdArraysDriver {
         port_base.set_int32_param(params.status, 0, ADStatus::Idle as i32)?;
 
         // NDDriverStdArrays constructor (NDDriverStdArrays.cpp:70-86).
-        port_base.set_string_param(params.base.manufacturer, 0, "NDDriverStdArrays".into())?;
-        port_base.set_string_param(params.base.model, 0, "Software Detector".into())?;
-        port_base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION.into())?;
-        port_base.set_string_param(params.base.sdk_version, 0, DRIVER_VERSION.into())?;
-        port_base.set_string_param(params.base.serial_number, 0, "No serial number".into())?;
-        port_base.set_string_param(params.base.firmware_version, 0, "No firmware".into())?;
+        port_base.set_string_param(params.base.manufacturer, 0, "NDDriverStdArrays")?;
+        port_base.set_string_param(params.base.model, 0, "Software Detector")?;
+        port_base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION)?;
+        port_base.set_string_param(params.base.sdk_version, 0, DRIVER_VERSION)?;
+        port_base.set_string_param(params.base.serial_number, 0, "No serial number")?;
+        port_base.set_string_param(params.base.firmware_version, 0, "No firmware")?;
         port_base.set_int32_param(params.image_mode, 0, ImageMode::Single as i32)?;
         port_base.set_int32_param(params.num_images, 0, 100)?;
         port_base.set_int32_param(ndsa.callback_mode, 0, CallbackMode::OnUpdate as i32)?;
@@ -675,14 +675,14 @@ mod tests {
                 .port_base
                 .get_string_param(f.det.params.base.driver_version, 0)
                 .unwrap(),
-            "1.3.0"
+            b"1.3.0"
         );
         assert_eq!(
             f.det
                 .port_base
                 .get_string_param(f.det.params.base.manufacturer, 0)
                 .unwrap(),
-            "NDDriverStdArrays"
+            b"NDDriverStdArrays"
         );
     }
 

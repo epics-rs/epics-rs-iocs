@@ -15,6 +15,13 @@ use crate::poller::{self, PollerState};
 use crate::wave_dig::{self, WaveDigScan, WaveDigState};
 use crate::wave_gen::{self, WaveGenScan, WaveGenState};
 
+/// C `MultiFunction::writeInt32`/`writeFloat32Array` resolve the channel
+/// through `asynPortDriver::getAddress` (drvMultiFunction.cpp:1947, 2510),
+/// which maps the no-device addr -1 to 0 (asynPortDriver.cpp:1901-1913).
+fn device_addr(addr: i32) -> i32 {
+    if addr == -1 { 0 } else { addr }
+}
+
 /// USB-2408-2AO port driver.
 pub struct MultiFunctionDriver {
     base: PortDriverBase,
@@ -79,7 +86,7 @@ impl MultiFunctionDriver {
         base.set_string_param(params.unique_id, 0, uid.clone())?;
         base.set_string_param(params.firmware_version, 0, fw.clone())?;
         base.set_string_param(params.ul_version, 0, ul_ver)?;
-        base.set_string_param(params.driver_version, 0, "0.1.0".into())?;
+        base.set_string_param(params.driver_version, 0, "0.1.0")?;
 
         // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
         // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
@@ -166,7 +173,7 @@ impl MultiFunctionDriver {
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg),
+                ParamValue::Octet(msg.into_bytes()),
             );
         }
         self.base.call_param_callbacks(addr)?;
@@ -226,7 +233,7 @@ impl PortDriver for MultiFunctionDriver {
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let mut last_error: Option<String> = None;
         let reason = user.reason;
-        let addr = user.addr;
+        let addr = device_addr(user.addr);
 
         // The scan buffers are sized once from maxInputPoints/maxOutputPoints,
         // so a point count above that capacity must never reach the store --
@@ -647,7 +654,7 @@ impl PortDriver for MultiFunctionDriver {
         if user.reason != self.params.wave_gen_user_wf {
             return Ok(());
         }
-        let ch = user.addr as usize;
+        let ch = device_addr(user.addr) as usize;
         if ch >= MAX_ANALOG_OUT {
             return Ok(());
         }
@@ -708,7 +715,7 @@ impl PortDriver for MultiFunctionDriver {
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg),
+                ParamValue::Octet(msg.into_bytes()),
             );
         }
         self.base.call_param_callbacks(addr)?;

@@ -66,27 +66,22 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "portName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "ttyName",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "priority",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noAutoConnect",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
                 ArgDesc {
                     name: "noProcessEos",
                     arg_type: ArgType::Int,
-                    optional: true,
                 },
             ],
             "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
@@ -148,17 +143,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "lovPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "serPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "serAddr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
             ],
             "LoveInit lovPort serPort serAddr",
@@ -208,17 +200,14 @@ async fn main() -> CaResult<()> {
                 ArgDesc {
                     name: "lovPort",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "addr",
                     arg_type: ArgType::Int,
-                    optional: false,
                 },
                 ArgDesc {
                     name: "model",
                     arg_type: ArgType::String,
-                    optional: false,
                 },
             ],
             "LoveConfig lovPort addr model",
