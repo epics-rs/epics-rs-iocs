@@ -202,14 +202,25 @@ members = [
 # record's process cycle exits through `end_process_cycle` on every path,
 # and asyn bounds blocking waits by the caller's deadline.
 #
+# 0.28.0 gathers the 2026-08-25 C-parity round; no API break reaches this
+# workspace. It includes the four fixes this workspace's adaptation audit
+# sent upstream (epics-rs PR #91): iocsh tokenize takes blanks before `(`
+# as call syntax, db_loader resolves an externally-registered record
+# type's own menu tables, `AdIoc::new` registers busy/sseq itself (the
+# per-IOC registrations those AD mains carried are dropped alongside this
+# bump), and commonPlugins.cmd passes NAME=FFT1. Behavioral parity that
+# lands here: device support binds before init_record, one MacroTable
+# spans a whole include tree, and every PUT renders in the destination
+# field's shape.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.27.0"
-asyn-rs = "0.27.0"
-ad-core-rs = "0.27.0"
-ad-plugins-rs = "0.27.0"
+epics-rs = "0.28.0"
+asyn-rs = "0.28.0"
+ad-core-rs = "0.28.0"
+ad-plugins-rs = "0.28.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.27.0", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.28.0", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.27.0"
+mca-rs = "0.28.0"
