@@ -94,7 +94,7 @@ async fn main() -> CaResult<()> {
     let mut app = IocApplication::new();
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
-    // scalcout is opt-in on epics-rs main (dropped from the default
+    // scalcout is opt-in in epics-rs (dropped from the default
     // registry with the stdRecords.dbd manifest); the db files this IOC
     // loads use it, as a C IOC links the owning module's .dbd.
     app = app.register_record_type("scalcout", || {

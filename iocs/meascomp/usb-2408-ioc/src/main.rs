@@ -39,7 +39,7 @@ async fn main() -> CaResult<()> {
 
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
-    // busy is opt-in on epics-rs main (dropped from the default
+    // busy is opt-in in epics-rs (dropped from the default
     // registry with the stdRecords.dbd manifest); the db files this IOC
     // loads use it, as a C IOC links the owning module's .dbd.
     app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));

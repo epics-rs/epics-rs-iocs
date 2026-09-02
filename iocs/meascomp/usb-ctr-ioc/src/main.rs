@@ -60,7 +60,7 @@ async fn main() -> CaResult<()> {
 
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
-    // `busy` and `transform` are opt-in on epics-rs main (dropped from the default
+    // `busy` and `transform` are opt-in in epics-rs (dropped from the default
     // registry with the stdRecords.dbd manifest); the db files this IOC
     // loads use them, as a C IOC links the owning module's .dbd.
     app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));

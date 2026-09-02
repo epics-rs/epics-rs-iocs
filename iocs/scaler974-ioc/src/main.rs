@@ -52,7 +52,7 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(asyn_name, move || asyn_factory());
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
-    // transform is opt-in on epics-rs main (dropped from the default
+    // transform is opt-in in epics-rs (dropped from the default
     // registry with the stdRecords.dbd manifest); the db files this IOC
     // loads use it, as a C IOC links the owning module's .dbd.
     app = app.register_record_type("transform", || {
