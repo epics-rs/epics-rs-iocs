@@ -123,13 +123,17 @@ pub fn decode(buf: &[u8]) -> Result<TiffImage, TiffError> {
         NDDataType::UInt8 => NDDataBuffer::U8(strip.to_vec()),
         NDDataType::UInt16 => NDDataBuffer::U16(
             strip
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         ),
         _ => NDDataBuffer::U32(
             strip
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),

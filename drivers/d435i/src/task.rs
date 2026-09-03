@@ -544,7 +544,9 @@ async fn process_depth_frame(
 
     // Reinterpret as u16 (RealSense USB protocol is little-endian)
     let pixels: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
 

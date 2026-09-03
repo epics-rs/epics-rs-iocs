@@ -409,7 +409,7 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
             [single] => out.push(*single as u8),
             digits if digits.len() % 2 == 1 => return None,
             digits => {
-                for pair in digits.chunks_exact(2) {
+                for pair in digits.as_chunks::<2>().0 {
                     out.push(((pair[0] << 4) | pair[1]) as u8);
                 }
             }

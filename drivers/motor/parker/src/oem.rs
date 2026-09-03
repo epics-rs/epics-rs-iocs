@@ -268,12 +268,12 @@ impl AsynMotor for OemAxis {
 
         let mut new_base = self.encoder_base;
         let mut new_direction = self.direction;
-        let new_position;
-        if done {
+
+        let new_position = if done {
             // Position readback (skip the leading status char).
             let pr = ctrl.query(&format!("{addr}PR"))?;
             new_base = atof(pr.get(1..).unwrap_or(""));
-            new_position = new_base;
+            new_base
         } else {
             // Live step count in hex (skip the leading char); "*F" flags negative.
             let w3 = ctrl.query(&format!("{addr}W3"))?;
@@ -284,8 +284,8 @@ impl AsynMotor for OemAxis {
             } else {
                 new_direction = true;
             }
-            new_position = new_base + step;
-        }
+            new_base + step
+        };
 
         // Switch status (character flags at fixed offsets 6 and 7).
         let is = ctrl.query(&format!("{addr}IS"))?;

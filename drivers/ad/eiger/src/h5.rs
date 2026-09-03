@@ -318,7 +318,9 @@ mod tests {
         };
         let out = bslz4_filter(&desc, &chunk, 4).unwrap();
         let got: Vec<u32> = out
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(got, pixels);
