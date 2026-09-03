@@ -616,6 +616,11 @@ mod tests {
     fn a_write_flushes_interrupts_on_every_exit() {
         use epics_rs::asyn::interrupt::{InterruptFilter, InterruptValue};
 
+        // Since 0.28.1 `call_param_callbacks` is gated on `interruptAccept`,
+        // which a real IOC opens at the iocInit/scan_run barrier. This test
+        // drives the write path directly, so it opens the gate itself.
+        epics_rs::base::runtime::interrupt_accept::set_interrupts_accepted(true);
+
         let dash = DashboardHandle::new("127.0.0.1");
         registry::register_dashboard("GRIP_B4_DASH", dash).expect("fresh port name");
         let mut drv = GripperDriver::new("GRIP_B4", "GRIP_B4_DASH").expect("driver");

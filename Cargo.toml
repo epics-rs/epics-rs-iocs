@@ -213,14 +213,23 @@ members = [
 # spans a whole include tree, and every PUT renders in the destination
 # field's shape.
 #
+# 0.28.1 is a patch release with no API change. What reaches this
+# workspace is boot-time behavior: `call_param_callbacks` is gated on
+# interruptAccept so parameters a driver seeds before iocInit reach CA
+# clients once records are wired, record init defers to the iocInit
+# barrier, and the CA server snapshots record fields under the record's
+# dbScanLock analogue. busy/sseq registration moved from `AdIoc::new`
+# into `register_all_plugins` — `AdIoc::new` calls it unconditionally,
+# so the AD mains here still need no registrations of their own.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.28.0"
-asyn-rs = "0.28.0"
-ad-core-rs = "0.28.0"
-ad-plugins-rs = "0.28.0"
+epics-rs = "0.28.1"
+asyn-rs = "0.28.1"
+ad-core-rs = "0.28.1"
+ad-plugins-rs = "0.28.1"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.28.0", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.28.1", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.28.0"
+mca-rs = "0.28.1"
