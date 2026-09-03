@@ -24,19 +24,25 @@ pub fn decode_payload(header: &ImageHeader, payload: &[u8]) -> Result<NDDataBuff
         NDDataType::UInt8 => NDDataBuffer::U8(payload.to_vec()),
         NDDataType::UInt16 => NDDataBuffer::U16(
             payload
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         ),
         NDDataType::UInt32 => NDDataBuffer::U32(
             payload
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),
         NDDataType::Float32 => NDDataBuffer::F32(
             payload
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),

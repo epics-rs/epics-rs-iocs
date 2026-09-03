@@ -254,7 +254,9 @@ mod tests {
 
         let decoded = decode_blocks(payload, n, 2, 0).expect("decode");
         let decoded: Vec<u16> = decoded
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_ne_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(decoded, values);
@@ -309,7 +311,9 @@ mod tests {
             panic!("expected U32");
         };
         let ours: Vec<u32> = ours
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(ours, values);
@@ -348,7 +352,9 @@ mod tests {
 
         let decoded = decode_with_header(&framed, 2, Some(n * 2)).unwrap();
         let decoded: Vec<u16> = decoded
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_ne_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(decoded, values);

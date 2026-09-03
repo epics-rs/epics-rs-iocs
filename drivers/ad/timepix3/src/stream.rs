@@ -246,11 +246,15 @@ impl Pending {
 fn decode_be(payload: &[u8], format: PixelFormat) -> Vec<u32> {
     match format {
         PixelFormat::UInt16 => payload
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
             .collect(),
         PixelFormat::UInt32 => payload
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
     }

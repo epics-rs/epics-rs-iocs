@@ -53,7 +53,9 @@ pub fn decode_raw(bytes: &[u8]) -> Result<NDDataBuffer, RawError> {
         });
     }
     let pixels: Vec<i32> = bytes
-        .chunks_exact(PII_PIXEL_BYTES)
+        .as_chunks::<PII_PIXEL_BYTES>()
+        .0
+        .iter()
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     Ok(NDDataBuffer::I32(pixels))

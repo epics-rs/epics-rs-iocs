@@ -299,7 +299,9 @@ pub fn decode_reg(reg_num: i32, reg_val: u32) -> Option<RegUpdate> {
 /// (`tr_len / 6`).
 pub fn parse_reg_records(payload: &[u8]) -> Vec<(i32, u32)> {
     payload
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|c| {
             let num = u16::from_le_bytes([c[0], c[1]]) as i32;
             let val = u32::from_le_bytes([c[2], c[3], c[4], c[5]]);
@@ -524,7 +526,9 @@ pub fn decode_samples(
     cal: &ChannelCal,
 ) -> Vec<[f64; QE_MAX_INPUTS]> {
     image
-        .chunks_exact(4 * QE_MAX_INPUTS)
+        .as_chunks::<{ 4 * QE_MAX_INPUTS }>()
+        .0
+        .iter()
         .map(|sample| {
             let mut out = [0.0f64; QE_MAX_INPUTS];
             for (ch, slot) in out.iter_mut().enumerate() {

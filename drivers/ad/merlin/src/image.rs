@@ -51,9 +51,11 @@ pub fn decode_image(
     Ok(match bpp {
         1 => NDDataBuffer::U8(out),
         2 => NDDataBuffer::U16(
-            out.chunks_exact(2)
+            out.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| {
-                    let b = [c[0], c[1]];
+                    let b = *c;
                     if swap {
                         u16::from_be_bytes(b)
                     } else {
@@ -63,9 +65,11 @@ pub fn decode_image(
                 .collect(),
         ),
         _ => NDDataBuffer::U32(
-            out.chunks_exact(4)
+            out.as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| {
-                    let b = [c[0], c[1], c[2], c[3]];
+                    let b = *c;
                     if swap {
                         u32::from_be_bytes(b)
                     } else {
@@ -106,9 +110,11 @@ pub fn decode_profiles(
         return Err(MpxError::BadBodySize((offset + needed) as i64));
     }
     let words: Vec<u32> = body[offset..offset + needed]
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|c| {
-            let b: [u8; 8] = c.try_into().expect("chunks_exact(8)");
+            let b: [u8; 8] = *c;
             let v = if swap {
                 u64::from_be_bytes(b)
             } else {

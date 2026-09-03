@@ -135,13 +135,17 @@ fn buffer_from_bytes(bytes: &[u8], data_type: NDDataType) -> Result<NDDataBuffer
         NDDataType::UInt8 => NDDataBuffer::U8(bytes.to_vec()),
         NDDataType::UInt16 => NDDataBuffer::U16(
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         ),
         NDDataType::UInt32 => NDDataBuffer::U32(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect(),
         ),

@@ -142,7 +142,9 @@ pub fn decode_raw_readout(nmodules: usize, nbits: i32, data: &[u32]) -> Vec<u32>
 /// Reinterpret a readout reply as little-endian 32-bit words.
 pub fn words_from_bytes(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
