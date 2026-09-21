@@ -222,14 +222,42 @@ members = [
 # into `register_all_plugins` — `AdIoc::new` calls it unconditionally,
 # so the AD mains here still need no registrations of their own.
 #
+# 0.29.0's one break -- five epics-base-rs entries lose their `depth`
+# argument -- reaches nothing here: `process_record_with_links`,
+# `process_record_readback`, `process_record_continuation` and
+# `read_link_value_soft` have no caller in this tree. What 0.29.x lands
+# is record behavior: monitor state advances on every value-class post
+# even when `mlis` is empty, so a move that finished with no `.DMOV`
+# subscriber no longer leaves the next subscriber's 1->0 transition
+# comparing equal and dropped.
+#
+# 0.30.0 is the first bump since 0.27.0 whose breaks reach code here --
+# five lines in three crates. `NDArrayDriverBase::attributes` and
+# `attr_functions` fold into one `DriverAttributes` that `ADDriverBase`
+# owns too, so drivers/ad/timepix3's `ADDriverBase` literal gains an
+# `attributes` field; the record trait's `multi_input_links` returns
+# `&'static [(&'static str, &'static str)]`, which drivers/vac's digitel
+# impl returns directly since its table is already a literal; and
+# `ProcessContext<'a>` carries a lifetime, drops `tsel` and borrows
+# `dtyp` rather than owning a `String`, which drivers/opcua's test
+# context follows. `PvDatabase::get_record` returning `Arc<RecordCell>`,
+# the `CommonFields` amsg/namsg/bkpt retyping (drivers/vac's literals
+# compile unchanged) and macLib's move to
+# `epics_libcom_rs::runtime::mac_lib` reach nothing here. Behavioral:
+# `Task::enqueue` no longer takes a callback-ring slot, so the asyn boot
+# flush stops overflowing the 2000-slot ring about one boot in six and
+# leaving I/O Intr records permanently without updates; a process cycle
+# costs 0.65 us against 0.29.3's 7.7 us; and an `ADDriverBase` detector
+# can load an attributes file at all.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.28.1"
-asyn-rs = "0.28.1"
-ad-core-rs = "0.28.1"
-ad-plugins-rs = "0.28.1"
+epics-rs = "0.30.0"
+asyn-rs = "0.30.0"
+ad-core-rs = "0.30.0"
+ad-plugins-rs = "0.30.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.28.1", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.30.0", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.28.1"
+mca-rs = "0.30.0"

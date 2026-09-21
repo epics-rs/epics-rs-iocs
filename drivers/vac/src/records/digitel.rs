@@ -806,7 +806,7 @@ impl Record for DigitelRecord {
     /// `SLMO`/`SLS1`/`SLS2`/`SLCR`. The framework fetches all five every cycle;
     /// the extra four fetches are inert outside the simulation branch, which is
     /// the only consumer of `SVMO`/`SVS1`/`SVS2`/`SVCR`.
-    fn multi_input_links(&self) -> &[(&'static str, &'static str)] {
+    fn multi_input_links(&self) -> &'static [(&'static str, &'static str)] {
         &[
             ("SIML", "SIMM"),
             ("SLMO", "SVMO"),

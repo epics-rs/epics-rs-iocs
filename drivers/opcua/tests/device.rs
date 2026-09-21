@@ -125,7 +125,7 @@ fn field(record: &dyn Record, name: &str) -> EpicsValue {
 
 /// The per-cycle state the framework pushes into device support, for a record
 /// whose value is no longer undefined.
-fn defined() -> ProcessContext {
+fn defined() -> ProcessContext<'static> {
     ProcessContext {
         udf: false,
         udfs: AlarmSeverity::Invalid,
@@ -133,8 +133,7 @@ fn defined() -> ProcessContext {
         phas: 0,
         tse: 0,
         time: SystemTime::UNIX_EPOCH,
-        tsel: String::new(),
-        dtyp: opcua::device_support::DTYP.to_string(),
+        dtyp: opcua::device_support::DTYP,
         callback_priority: epics_rs::base::runtime::task::CallbackPriority::Low,
     }
 }
