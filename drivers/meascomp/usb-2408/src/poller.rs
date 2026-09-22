@@ -41,7 +41,8 @@ struct PollSnapshot {
     // wave_gen / wave_dig status
     wave_gen_running: bool,
     wave_gen_current_point: usize,
-    wave_gen_just_stopped: bool,
+    /// The generation of a generator scan that went idle this cycle.
+    wave_gen_ended: Option<u64>,
     wave_dig_running: bool,
     wave_dig_current_point: usize,
     /// The generation of a digitizer scan that went idle this cycle.
@@ -70,10 +71,14 @@ fn poller_loop(
         // C publishes the time from the previous loop top to this one, so
         // POLL_TIME_MS is the real cycle time, sleep included.
         let now = Instant::now();
-        let _ = handle.write_float64_blocking(
-            params.poll_time_ms,
+        publish(
+            &handle,
             0,
-            now.duration_since(cycle_start).as_secs_f64() * 1000.0,
+            vec![ParamSetValue::new(
+                params.poll_time_ms,
+                0,
+                ParamValue::Float64(now.duration_since(cycle_start).as_secs_f64() * 1000.0),
+            )],
         );
         cycle_start = now;
 
@@ -113,13 +118,13 @@ fn poller_loop(
                 }
 
                 if let Ok(mut st) = state.lock() {
-                    let wg_was_running = st.wave_gen.running;
                     if st.wave_gen.running {
-                        wave_gen::read_wave_gen(&dev, &mut st.wave_gen);
+                        if wave_gen::read_wave_gen(&dev, &mut st.wave_gen) {
+                            snap.wave_gen_ended = Some(st.wave_gen.generation);
+                        }
                         snap.wave_gen_current_point = st.wave_gen.current_point;
                     }
                     snap.wave_gen_running = st.wave_gen.running;
-                    snap.wave_gen_just_stopped = wg_was_running && !st.wave_gen.running;
 
                     if st.wave_dig.running {
                         if wave_dig::read_wave_dig(&dev, &mut st.wave_dig) {
@@ -214,25 +219,43 @@ fn poller_loop(
         }
         for (counter, value) in snapshot.counters.iter().enumerate() {
             if let Some(v) = value {
-                let _ =
-                    handle.write_int32_blocking(params.counter_value, counter as i32, *v as i32);
+                let addr = counter as i32;
+                publish(
+                    &handle,
+                    addr,
+                    vec![ParamSetValue::new(
+                        params.counter_value,
+                        addr,
+                        ParamValue::Int32(*v as i32),
+                    )],
+                );
             }
         }
-        if snapshot.wave_gen_running || snapshot.wave_gen_just_stopped {
-            let _ = handle.write_int32_blocking(
-                params.wave_gen_current_point,
+        if snapshot.wave_gen_running {
+            publish(
+                &handle,
                 0,
-                snapshot.wave_gen_current_point as i32,
+                vec![ParamSetValue::new(
+                    params.wave_gen_current_point,
+                    0,
+                    ParamValue::Int32(snapshot.wave_gen_current_point as i32),
+                )],
             );
-            if snapshot.wave_gen_just_stopped {
-                let _ = handle.write_int32_blocking(params.wave_gen_run, 0, 0);
+            // C stopWaveGen from the poll: the driver ends the scan -- Run,
+            // the outputs put back -- if it is still the one that went idle.
+            if let Some(generation) = snapshot.wave_gen_ended {
+                let _ = handle.write_int32_blocking(params.wave_gen_scan_end, 0, generation as i32);
             }
         }
         if snapshot.wave_dig_running {
-            let _ = handle.write_int32_blocking(
-                params.wave_dig_current_point,
+            publish(
+                &handle,
                 0,
-                snapshot.wave_dig_current_point as i32,
+                vec![ParamSetValue::new(
+                    params.wave_dig_current_point,
+                    0,
+                    ParamValue::Int32(snapshot.wave_dig_current_point as i32),
+                )],
             );
             // C stopWaveDig from the poll: the driver ends the scan -- data,
             // Run, auto-restart -- if it is still the one that went idle.
@@ -279,6 +302,12 @@ fn poller_loop(
             .unwrap_or(50.0);
         std::thread::sleep(poll_sleep(poll_ms));
     }
+}
+
+/// Store readbacks and run their callbacks, without going through the
+/// driver's write handlers: a readback is not a command.
+fn publish(handle: &PortHandle, addr: i32, updates: Vec<ParamSetValue>) {
+    let _ = handle.set_params_and_notify_blocking(addr, updates);
 }
 
 /// C `epicsThreadSleep(pollTime/1000.)`: the fraction of a millisecond is

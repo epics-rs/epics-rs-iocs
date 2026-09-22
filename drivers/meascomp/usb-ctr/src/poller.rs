@@ -66,10 +66,14 @@ fn poller_loop(
         // C publishes the time from the previous loop top to this one, so
         // POLL_TIME_MS is the real cycle time, sleep included.
         let now = Instant::now();
-        let _ = handle.write_float64_blocking(
-            params.poll_time_ms,
+        publish(
+            &handle,
             0,
-            now.duration_since(cycle_start).as_secs_f64() * 1000.0,
+            vec![ParamSetValue::new(
+                params.poll_time_ms,
+                0,
+                ParamValue::Float64(now.duration_since(cycle_start).as_secs_f64() * 1000.0),
+            )],
         );
         cycle_start = now;
 
@@ -149,42 +153,64 @@ fn poller_loop(
         }
         if let Some(counts) = snapshot.scaler_done_snapshot {
             for (i, c) in counts.iter().enumerate() {
-                let _ = handle.write_int32_blocking(params.counter_value, i as i32, *c as i32);
+                let addr = i as i32;
+                publish(
+                    &handle,
+                    addr,
+                    vec![ParamSetValue::new(
+                        params.counter_value,
+                        addr,
+                        ParamValue::Int32(*c as i32),
+                    )],
+                );
             }
         } else if snapshot.mcs_running {
-            let _ = handle.write_int32_blocking(
-                params.mcs_current_point,
+            publish(
+                &handle,
                 0,
-                snapshot.mcs_current_point as i32,
+                vec![ParamSetValue::new(
+                    params.mcs_current_point,
+                    0,
+                    ParamValue::Int32(snapshot.mcs_current_point as i32),
+                )],
             );
             // C readMCS sets the elapsed times on every counter address, so a
-            // per-counter mca record sees them too.
+            // per-counter mca record sees them too, and clears MCA_ACQUIRING
+            // on every counter address once the scan has ended.
             for addr in 0..MAX_MCS_COUNTERS as i32 {
-                let _ = handle.write_float64_blocking(
-                    params.mca_elapsed_real,
-                    addr,
-                    snapshot.mcs_elapsed,
-                );
-                let _ = handle.write_float64_blocking(
-                    params.mca_elapsed_live,
-                    addr,
-                    snapshot.mcs_elapsed,
-                );
-            }
-            if snapshot.mcs_just_stopped {
-                // C clears it on every counter address, where each mca
-                // record reads it.
-                for addr in 0..snapshot.num_counters as i32 {
-                    let _ = handle.write_int32_blocking(params.mca_acquiring, addr, 0);
+                let mut updates = vec![
+                    ParamSetValue::new(
+                        params.mca_elapsed_real,
+                        addr,
+                        ParamValue::Float64(snapshot.mcs_elapsed),
+                    ),
+                    ParamSetValue::new(
+                        params.mca_elapsed_live,
+                        addr,
+                        ParamValue::Float64(snapshot.mcs_elapsed),
+                    ),
+                ];
+                if snapshot.mcs_just_stopped && (addr as usize) < snapshot.num_counters {
+                    updates.push(ParamSetValue::new(
+                        params.mca_acquiring,
+                        addr,
+                        ParamValue::Int32(0),
+                    ));
                 }
+                publish(&handle, addr, updates);
             }
         } else {
             for (counter, value) in snapshot.counters.iter().enumerate() {
                 if let Some(v) = value {
-                    let _ = handle.write_int32_blocking(
-                        params.counter_value,
-                        counter as i32,
-                        *v as i32,
+                    let addr = counter as i32;
+                    publish(
+                        &handle,
+                        addr,
+                        vec![ParamSetValue::new(
+                            params.counter_value,
+                            addr,
+                            ParamValue::Int32(*v as i32),
+                        )],
                     );
                 }
             }
@@ -200,6 +226,12 @@ fn poller_loop(
             .unwrap_or(50.0);
         std::thread::sleep(poll_sleep(poll_ms));
     }
+}
+
+/// Store readbacks and run their callbacks, without going through the
+/// driver's write handlers: a readback is not a command.
+fn publish(handle: &PortHandle, addr: i32, updates: Vec<ParamSetValue>) {
+    let _ = handle.set_params_and_notify_blocking(addr, updates);
 }
 
 /// C `epicsThreadSleep(pollTime/1000.)`: the fraction of a millisecond is

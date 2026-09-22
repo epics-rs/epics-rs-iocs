@@ -859,7 +859,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** DAC output differs from C whenever Amplitude ≠ 1 or Offset ≠ 0; a short user WF plays repeatedly.
 - **Class:** ref-faithful. **Live:** static.
 
-## PP-95 [LOW] Poller publishes Run=0 through `write_int32`, re-running stop logic — OPEN
+## PP-95 [LOW] Poller publishes Run=0 through `write_int32`, re-running stop logic — FIXED
 - **Rust:** `poller.rs:222,232` `write_int32_blocking(wave_{gen,dig}_run, 0, 0)` after releasing the state lock → `driver.rs:414/325` → `stop_wave_*`.
 - **C:** `drvMultiFunction.cpp:2678-2680,2730-2732` stop under the driver lock inside the poll; Run=0 via `setIntegerParam`.
 - **Impact:** a client that restarts immediately on completion can have its new scan stopped (and the AO restore of PP-87 re-run). Timing-dependent.

@@ -432,6 +432,11 @@ impl MultiFunctionDriver {
             saved,
         )
         .map_err(|e| format!("start_wave_gen error: {e}"))?;
+        // C startWaveGen: Run is 1 once the scan is running.
+        self.base
+            .params
+            .set_int32(self.params.wave_gen_run, 0, 1)
+            .map_err(|e| e.to_string())?;
         self.base
             .params
             .set_float64(self.params.wave_gen_dwell_actual, 0, generator.dwell_actual)
@@ -445,6 +450,13 @@ impl MultiFunctionDriver {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// C `stopWaveGen`: Run back to 0, the scan stopped, and the outputs it
+    /// drove put back.
+    fn stop_generator(&mut self, dev: &DaqDevice, generator: &mut WaveGenState) {
+        let _ = self.base.params.set_int32(self.params.wave_gen_run, 0, 0);
+        wave_gen::stop_wave_gen(dev, generator);
     }
 
     /// A waveform parameter changed: redefine `channel`'s waveform and, if the
@@ -462,7 +474,7 @@ impl MultiFunctionDriver {
             .define_waveform(&mut st.wave_gen, channel, updates)
             .err();
         if st.wave_gen.running {
-            wave_gen::stop_wave_gen(&dev, &mut st.wave_gen);
+            self.stop_generator(&dev, &mut st.wave_gen);
             if let Err(e) = self.start_generator(&dev, &mut st.wave_gen, updates) {
                 failure = Some(e);
                 let _ = self.base.params.set_int32(self.params.wave_gen_run, 0, 0);
@@ -884,8 +896,18 @@ impl PortDriver for MultiFunctionDriver {
                     // reading "Run" -- it follows this parameter back to Stop.
                     self.base.params.set_int32(reason, addr, 0)?;
                 }
-            } else if value == 0 {
-                wave_gen::stop_wave_gen(&dev, &mut st.wave_gen);
+            } else if value == 0 && st.wave_gen.running {
+                self.stop_generator(&dev, &mut st.wave_gen);
+            }
+        } else if reason == self.params.wave_gen_scan_end {
+            // The poller saw generator scan `value` go idle: end it here, the
+            // one owner of that transition. A report about an earlier scan is
+            // ignored.
+            let (device, state) = (self.device.clone(), self.state.clone());
+            let dev = device.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            if st.wave_gen.running && st.wave_gen.generation as i32 == value {
+                self.stop_generator(&dev, &mut st.wave_gen);
             }
         }
 

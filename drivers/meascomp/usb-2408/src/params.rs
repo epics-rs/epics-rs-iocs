@@ -94,6 +94,9 @@ pub struct MultiFunctionParams {
     pub wave_gen_retrigger: usize,
     pub wave_gen_trigger_count: usize,
     pub wave_gen_run: usize,
+    /// Internal, no record: the poller's report that generator scan
+    /// `value` (its generation) went idle, for the driver to end it.
+    pub wave_gen_scan_end: usize,
     pub wave_gen_user_time_wf: usize,
     pub wave_gen_int_time_wf: usize,
     pub wave_gen_wave_type: usize,
@@ -194,6 +197,7 @@ impl MultiFunctionParams {
             wave_gen_retrigger: base.create_param("WAVEGEN_RETRIGGER", ParamType::Int32)?,
             wave_gen_trigger_count: base.create_param("WAVEGEN_TRIGGER_COUNT", ParamType::Int32)?,
             wave_gen_run: base.create_param("WAVEGEN_RUN", ParamType::Int32)?,
+            wave_gen_scan_end: base.create_param("WAVEGEN_SCAN_END", ParamType::Int32)?,
             wave_gen_user_time_wf: base
                 .create_param("WAVEGEN_USER_TIME_WF", ParamType::Float32Array)?,
             wave_gen_int_time_wf: base

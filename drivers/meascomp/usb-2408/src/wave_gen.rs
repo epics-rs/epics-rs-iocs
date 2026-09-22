@@ -31,6 +31,9 @@ pub struct WaveGenState {
     /// C `waveGenUserTimeBuffer_` / `waveGenIntTimeBuffer_`.
     pub user_time_buffer: Vec<f32>,
     pub int_time_buffer: Vec<f32>,
+    /// Bumped by every start, so a report that an earlier scan ended can
+    /// never end a later one.
+    pub generation: u64,
 }
 
 impl WaveGenState {
@@ -48,6 +51,7 @@ impl WaveGenState {
             int_buffers: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
             user_time_buffer: vec![0.0; max_points],
             int_time_buffer: vec![0.0; max_points],
+            generation: 0,
         }
     }
 }
@@ -304,18 +308,21 @@ pub fn start_wave_gen(
 
     state.dwell_actual = if rate > 0.0 { 1.0 / rate } else { 0.001 };
     state.running = true;
+    state.generation = state.generation.wrapping_add(1);
 
     log::info!("WaveGen started: ch{first_chan}-{last_chan}, {num_points} pts, rate={rate:.0} Hz");
     Ok(())
 }
 
-/// Read waveform generator status. Called from poller.
-pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
+/// C pollerThread's generator block: the current point, and whether the scan
+/// has gone idle. Ending it (Run back to 0, the outputs put back) is the
+/// driver's transition, not this read's.
+pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) -> bool {
     // C skips the rest of the cycle on a status error (goto error).
     let report = device.analog_out_scan_status();
     if let Some(e) = report.error {
         log::warn!("WaveGen scan status error: {e}");
-        return;
+        return false;
     }
     let (status, xfer) = (report.status, report.xfer);
 
@@ -323,9 +330,7 @@ pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
         state.current_point = (xfer.current_index as usize / state.num_chans) + 1;
     }
 
-    if status == SS_IDLE {
-        stop_wave_gen(device, state);
-    }
+    status == SS_IDLE
 }
 
 /// Stop the waveform generator and restore saved output values.
