@@ -44,10 +44,8 @@ struct PollSnapshot {
     wave_gen_just_stopped: bool,
     wave_dig_running: bool,
     wave_dig_current_point: usize,
-    wave_dig_just_stopped: bool,
-    /// Array callbacks for the digitized data, built while the state lock is
-    /// held and pushed after it is released.
-    wave_dig_arrays: Vec<ParamSetValue>,
+    /// The generation of a digitizer scan that went idle this cycle.
+    wave_dig_ended: Option<u64>,
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
     ai_temp: [Option<f64>; MAX_ANALOG_IN],
@@ -123,16 +121,13 @@ fn poller_loop(
                     snap.wave_gen_running = st.wave_gen.running;
                     snap.wave_gen_just_stopped = wg_was_running && !st.wave_gen.running;
 
-                    let wd_was_running = st.wave_dig.running;
                     if st.wave_dig.running {
-                        wave_dig::read_wave_dig(&dev, &mut st.wave_dig);
+                        if wave_dig::read_wave_dig(&dev, &mut st.wave_dig) {
+                            snap.wave_dig_ended = Some(st.wave_dig.generation);
+                        }
                         snap.wave_dig_current_point = st.wave_dig.current_point;
                     }
                     snap.wave_dig_running = st.wave_dig.running;
-                    snap.wave_dig_just_stopped = wd_was_running && !st.wave_dig.running;
-                    if snap.wave_dig_just_stopped {
-                        snap.wave_dig_arrays = wave_dig::waveform_updates(&params, &st.wave_dig);
-                    }
 
                     if !st.wave_dig.running {
                         for ch in 0..MAX_ANALOG_IN {
@@ -233,17 +228,16 @@ fn poller_loop(
                 let _ = handle.write_int32_blocking(params.wave_gen_run, 0, 0);
             }
         }
-        if snapshot.wave_dig_running || snapshot.wave_dig_just_stopped {
+        if snapshot.wave_dig_running {
             let _ = handle.write_int32_blocking(
                 params.wave_dig_current_point,
                 0,
                 snapshot.wave_dig_current_point as i32,
             );
-            if snapshot.wave_dig_just_stopped {
-                let _ = handle.write_int32_blocking(params.wave_dig_run, 0, 0);
-                // The scan is complete: hand the acquired points to the
-                // waveform records, as C stopWaveDig does through readWaveDig.
-                let _ = handle.set_params_and_notify_blocking(0, snapshot.wave_dig_arrays.clone());
+            // C stopWaveDig from the poll: the driver ends the scan -- data,
+            // Run, auto-restart -- if it is still the one that went idle.
+            if let Some(generation) = snapshot.wave_dig_ended {
+                let _ = handle.write_int32_blocking(params.wave_dig_scan_end, 0, generation as i32);
             }
         } else {
             // Every sample is a callback, changed or not, as C forces with

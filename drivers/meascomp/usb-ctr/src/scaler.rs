@@ -129,13 +129,11 @@ pub fn start_scaler(
 pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState, num_counters: usize) {
     // C readScaler polls the scan only for its position; the scan status
     // itself never ends a count -- only a preset does.
-    let xfer = match device.counter_in_scan_status() {
-        Ok((_, xfer)) => xfer,
-        Err(e) => {
-            log::warn!("scaler scan status error: {e}");
-            return;
-        }
-    };
+    let report = device.counter_in_scan_status();
+    if let Some(e) = &report.error {
+        log::warn!("scaler scan status error: {e}");
+    }
+    let xfer = report.xfer;
     let buf_len = (num_counters * SAMPLES_PER_COUNTER).min(state.scan_buffer.len());
     let Some((counts, done)) = scan_sets(
         &state.scan_buffer[..buf_len],

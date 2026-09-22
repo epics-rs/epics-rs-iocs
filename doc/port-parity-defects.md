@@ -840,7 +840,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** channels behind a narrower first-channel range clip; a wider one loses resolution.
 - **Class:** ref-faithful. **Live:** static (needs a known input).
 
-## PP-92 [MED] Three disagreeing end-of-scan paths instead of C's single `stopWaveDig` — OPEN
+## PP-92 [MED] Three disagreeing end-of-scan paths instead of C's single `stopWaveDig` — FIXED
 - **Rust:** auto-restart (`wave_dig.rs:219-262`) fires no VoltWF/AbsTimeWF callbacks and reuses stale settings; manual Stop (`driver.rs:406-408`) delivers no partial data; a scan-status error (`wave_dig.rs:186-192`) returns early with `running` stuck true, freezing Run, CurrentPoint and the scalar AI/TC polling (`poller.rs:126`).
 - **C:** `drvMultiFunction.cpp:1861-1882` clears Run, `readWaveDig` callbacks, `ulAInScanStop`, then `startWaveDig()` (re-reads all params) if AutoRestart; poller continues after a status error (`:2695-2732`).
 - **Impact:** AutoRestart never delivers completed scans; Stop discards data; one scan error freezes the digitizer and all AI records.

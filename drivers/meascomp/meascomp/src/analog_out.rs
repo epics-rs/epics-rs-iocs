@@ -1,7 +1,7 @@
 use uldaq_sys::*;
 
 use crate::device::DaqDevice;
-use crate::error::{self, Result};
+use crate::error::{self, Result, ScanStatusReport};
 
 /// Scalar arguments of C `ulAOutScan`, grouped for
 /// [`DaqDevice::analog_out_scan`]. The in/out `rate` and the data buffer stay
@@ -67,11 +67,11 @@ impl DaqDevice {
     }
 
     /// Get analog output scan status.
-    pub fn analog_out_scan_status(&self) -> Result<(i32, TransferStatus)> {
+    pub fn analog_out_scan_status(&self) -> ScanStatusReport {
         let mut status: i32 = 0;
         let mut xfer = TransferStatus::default();
-        error::check(unsafe { ulAOutScanStatus(self.handle(), &mut status, &mut xfer) })?;
-        Ok((status, xfer))
+        let code = unsafe { ulAOutScanStatus(self.handle(), &mut status, &mut xfer) };
+        ScanStatusReport::new(code, status, xfer)
     }
 
     /// Stop an analog output scan.

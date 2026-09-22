@@ -372,15 +372,16 @@ pub struct McsReadout {
 /// trigger or clock must still stop at PresetReal, and one that libuldaq
 /// rejected at start is idle from the first read.
 pub fn read_mcs(device: &DaqDevice, state: &mut McsState, preset_real: f64) -> McsReadout {
-    match device.daq_in_scan_status() {
-        Ok((status, xfer)) => {
-            if status == SS_IDLE {
-                state.running = false;
-            }
-            copy_transferred_points(state, xfer.current_index);
-        }
-        Err(e) => log::warn!("MCS scan status error: {e}"),
+    // C uses the scan state whatever the status call returned: a scan that
+    // ended on a transfer error is idle, and ends like any other.
+    let report = device.daq_in_scan_status();
+    if let Some(e) = &report.error {
+        log::warn!("MCS scan status error: {e}");
     }
+    if report.status == SS_IDLE {
+        state.running = false;
+    }
+    copy_transferred_points(state, report.xfer.current_index);
 
     let elapsed = state.elapsed_secs();
     if state.running && preset_real > 0.0 && elapsed >= preset_real {

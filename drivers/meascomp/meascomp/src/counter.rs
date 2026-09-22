@@ -1,7 +1,7 @@
 use uldaq_sys::*;
 
 use crate::device::DaqDevice;
-use crate::error::{self, Result};
+use crate::error::{self, Result, ScanStatusReport};
 
 /// Per-counter arguments of C `ulCConfigScan`, grouped for
 /// [`DaqDevice::counter_config_scan`] (everything but the counter number).
@@ -86,11 +86,11 @@ impl DaqDevice {
     }
 
     /// Get counter scan status.
-    pub fn counter_in_scan_status(&self) -> Result<(i32, TransferStatus)> {
+    pub fn counter_in_scan_status(&self) -> ScanStatusReport {
         let mut status: i32 = 0;
         let mut xfer = TransferStatus::default();
-        error::check(unsafe { ulCInScanStatus(self.handle(), &mut status, &mut xfer) })?;
-        Ok((status, xfer))
+        let code = unsafe { ulCInScanStatus(self.handle(), &mut status, &mut xfer) };
+        ScanStatusReport::new(code, status, xfer)
     }
 
     /// Stop a counter input scan.
@@ -123,11 +123,11 @@ impl DaqDevice {
     }
 
     /// Get DAQ input scan status.
-    pub fn daq_in_scan_status(&self) -> Result<(i32, TransferStatus)> {
+    pub fn daq_in_scan_status(&self) -> ScanStatusReport {
         let mut status: i32 = 0;
         let mut xfer = TransferStatus::default();
-        error::check(unsafe { ulDaqInScanStatus(self.handle(), &mut status, &mut xfer) })?;
-        Ok((status, xfer))
+        let code = unsafe { ulDaqInScanStatus(self.handle(), &mut status, &mut xfer) };
+        ScanStatusReport::new(code, status, xfer)
     }
 
     /// Stop a DAQ input scan.

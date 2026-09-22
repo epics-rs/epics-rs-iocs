@@ -207,7 +207,22 @@ impl MultiFunctionDriver {
         if let Some(update) = time_wf {
             wave_arrays.push(update);
         }
+        // C delivers each channel's arrays with that channel's callbacks, so
+        // every address an update names gets its callbacks now, not at the
+        // poller's next sweep.
+        let mut touched: Vec<i32> = wave_arrays
+            .iter()
+            .filter_map(|u| match u {
+                ParamSetValue::Value { addr: a, .. } if *a != addr => Some(*a),
+                _ => None,
+            })
+            .collect();
+        touched.sort_unstable();
+        touched.dedup();
         let last_error = self.apply_updates(wave_arrays).or(last_error);
+        for a in touched {
+            self.base.call_param_callbacks(a)?;
+        }
         if let Some(msg) = &last_error {
             log::error!("{msg}");
             let _ = self.base.params.set_value(
@@ -454,6 +469,102 @@ impl MultiFunctionDriver {
             }
         }
         failure
+    }
+
+    /// C `startWaveDig`: read every digitizer setting and start the scan,
+    /// publishing the actual dwell and total time -- or, when the device
+    /// refuses, the dwell C reports for that (see [`wave_dig::start_wave_dig`]).
+    fn start_digitizer(&mut self, dev: &DaqDevice, dig: &mut WaveDigState) -> Result<(), String> {
+        let get_i32 = |base: &PortDriverBase, reason| {
+            base.get_int32_param(reason, 0).map_err(|e| e.to_string())
+        };
+        let flag = |base: &PortDriverBase, reason| get_i32(base, reason).map(|v| v != 0);
+        let first_chan = get_i32(&self.base, self.params.wave_dig_first_chan)?.max(0) as usize;
+        let num_chans = get_i32(&self.base, self.params.wave_dig_num_chans)?.max(0) as usize;
+        let num_points = get_i32(&self.base, self.params.wave_dig_num_points)?.max(0) as usize;
+        let dwell = self
+            .base
+            .get_float64_param(self.params.wave_dig_dwell, 0)
+            .map_err(|e| e.to_string())?;
+        let input_mode = get_i32(&self.base, self.params.analog_in_mode)?;
+        let mut ranges = [uldaq_sys::BIP10VOLTS; MAX_ANALOG_IN];
+        for (ch, range) in ranges.iter_mut().enumerate() {
+            *range = self
+                .base
+                .get_int32_param(self.params.analog_in_range, ch as i32)
+                .map_err(|e| e.to_string())?;
+        }
+        let scan = WaveDigScan {
+            first_chan,
+            num_chans,
+            num_points,
+            dwell,
+            input_mode,
+            ranges,
+            ext_trigger: flag(&self.base, self.params.wave_dig_ext_trigger)?,
+            ext_clock: flag(&self.base, self.params.wave_dig_ext_clock)?,
+            continuous: flag(&self.base, self.params.wave_dig_continuous)?,
+            retrigger: flag(&self.base, self.params.wave_dig_retrigger)?,
+            burst_mode: flag(&self.base, self.params.wave_dig_burst_mode)?,
+        };
+        self.base
+            .params
+            .set_int32(self.params.wave_dig_current_point, 0, 0)
+            .map_err(|e| e.to_string())?;
+        let started = wave_dig::start_wave_dig(dev, dig, &scan);
+        let dwell_actual = match &started {
+            Ok(d) => Some(*d),
+            Err(e) => e.dwell_actual,
+        };
+        if let Some(d) = dwell_actual {
+            self.base
+                .params
+                .set_float64(self.params.wave_dig_dwell_actual, 0, d)
+                .map_err(|e| e.to_string())?;
+        }
+        match started {
+            Ok(d) => {
+                self.base
+                    .params
+                    .set_int32(self.params.wave_dig_run, 0, 1)
+                    .map_err(|e| e.to_string())?;
+                self.base
+                    .params
+                    .set_float64(self.params.wave_dig_total_time, 0, d * num_points as f64)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Err(e) => Err(format!("start_wave_dig error: {}", e.message)),
+        }
+    }
+
+    /// C `stopWaveDig`, the single end of every digitizer scan -- a Stop, a
+    /// finished one-shot, a scan the device dropped: Run goes back to 0, the
+    /// points acquired go to the waveform records, the scan is stopped, and
+    /// with AutoRestart a new scan starts from the current settings.
+    fn stop_digitizer(
+        &mut self,
+        dev: &DaqDevice,
+        dig: &mut WaveDigState,
+        updates: &mut Vec<ParamSetValue>,
+    ) -> Option<String> {
+        let _ = self.base.params.set_int32(self.params.wave_dig_run, 0, 0);
+        let _ = self.base.params.set_int32(
+            self.params.wave_dig_current_point,
+            0,
+            dig.current_point as i32,
+        );
+        updates.extend(wave_dig::waveform_updates(&self.params, dig));
+        wave_dig::stop_wave_dig(dev, dig);
+        let auto_restart = self
+            .base
+            .get_int32_param(self.params.wave_dig_auto_restart, 0)
+            .unwrap_or(0)
+            != 0;
+        if auto_restart {
+            return self.start_digitizer(dev, dig).err();
+        }
+        None
     }
 
     /// C `computeWaveDigTimes`: the digitizer time base from the requested
@@ -736,100 +847,27 @@ impl PortDriver for MultiFunctionDriver {
             let dev = self.device.lock().unwrap();
             last_error = self.apply_tc_config(&dev, addr);
         } else if reason == self.params.wave_dig_run {
-            let dev = self.device.lock().unwrap();
-            let mut st = self.state.lock().unwrap();
+            let (device, state) = (self.device.clone(), self.state.clone());
+            let dev = device.lock().unwrap();
+            let mut st = state.lock().unwrap();
             // C parity (drvMultiFunction.cpp:2086-2091): start only when idle,
-            // stop only when running. The busy record echoes the driver's own
-            // value back, so an unguarded start would hit ERR_ALREADY_ACTIVE.
+            // stop only when running.
             if value != 0 && !st.wave_dig.running {
-                let first_chan = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_first_chan, 0)?
-                    as usize;
-                let num_chans = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_num_chans, 0)?
-                    as usize;
-                let num_points = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_num_points, 0)?
-                    as usize;
-                let dwell = self.base.get_float64_param(self.params.wave_dig_dwell, 0)?;
-                let input_mode = self.base.get_int32_param(self.params.analog_in_mode, 0)?;
-                let mut ranges = [uldaq_sys::BIP10VOLTS; MAX_ANALOG_IN];
-                for (ch, range) in ranges.iter_mut().enumerate() {
-                    *range = self
-                        .base
-                        .get_int32_param(self.params.analog_in_range, ch as i32)?;
+                if let Err(e) = self.start_digitizer(&dev, &mut st.wave_dig) {
+                    last_error = Some(e);
+                    self.base.params.set_int32(reason, addr, 0)?;
                 }
-                let ext_trig = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_ext_trigger, 0)?
-                    != 0;
-                let ext_clk = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_ext_clock, 0)?
-                    != 0;
-                let cont = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_continuous, 0)?
-                    != 0;
-                let retrig = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_retrigger, 0)?
-                    != 0;
-                let burst = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_burst_mode, 0)?
-                    != 0;
-                st.wave_dig.auto_restart = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_auto_restart, 0)?
-                    != 0;
-
-                match wave_dig::start_wave_dig(
-                    &dev,
-                    &mut st.wave_dig,
-                    &WaveDigScan {
-                        first_chan,
-                        num_chans,
-                        num_points,
-                        dwell,
-                        input_mode,
-                        ranges,
-                        ext_trigger: ext_trig,
-                        ext_clock: ext_clk,
-                        continuous: cont,
-                        retrigger: retrig,
-                        burst_mode: burst,
-                    },
-                ) {
-                    Ok(dwell_actual) => {
-                        self.base.params.set_float64(
-                            self.params.wave_dig_dwell_actual,
-                            0,
-                            dwell_actual,
-                        )?;
-                        self.base.params.set_float64(
-                            self.params.wave_dig_total_time,
-                            0,
-                            dwell_actual * num_points as f64,
-                        )?;
-                    }
-                    Err(e) => {
-                        if let Some(dwell_actual) = e.dwell_actual {
-                            self.base.params.set_float64(
-                                self.params.wave_dig_dwell_actual,
-                                0,
-                                dwell_actual,
-                            )?;
-                        }
-                        last_error = Some(format!("start_wave_dig error: {}", e.message));
-                        self.base.params.set_int32(reason, addr, 0)?;
-                    }
-                }
-            } else if value == 0 {
-                wave_dig::stop_wave_dig(&dev, &mut st.wave_dig);
+            } else if value == 0 && st.wave_dig.running {
+                last_error = self.stop_digitizer(&dev, &mut st.wave_dig, &mut wave_arrays);
+            }
+        } else if reason == self.params.wave_dig_scan_end {
+            // The poller saw scan `value` go idle: end it here, the one owner
+            // of that transition. A report about an earlier scan is ignored.
+            let (device, state) = (self.device.clone(), self.state.clone());
+            let dev = device.lock().unwrap();
+            let mut st = state.lock().unwrap();
+            if st.wave_dig.running && st.wave_dig.generation as i32 == value {
+                last_error = self.stop_digitizer(&dev, &mut st.wave_dig, &mut wave_arrays);
             }
         } else if reason == self.params.wave_dig_read_wf {
             let st = self.state.lock().unwrap();

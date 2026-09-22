@@ -42,3 +42,28 @@ pub fn check(code: uldaq_sys::UlError) -> Result<()> {
         Err(MeasCompError::from_code(code))
     }
 }
+
+/// What a `ul*ScanStatus` call reported. libuldaq fills the scan state and
+/// transfer position even when it also returns an error -- a scan that ended
+/// on a transfer error is reported `SS_IDLE` together with that error -- so
+/// the error travels beside them instead of replacing them.
+#[derive(Debug, Clone)]
+pub struct ScanStatusReport {
+    pub status: i32,
+    pub xfer: uldaq_sys::TransferStatus,
+    pub error: Option<MeasCompError>,
+}
+
+impl ScanStatusReport {
+    pub(crate) fn new(
+        code: uldaq_sys::UlError,
+        status: i32,
+        xfer: uldaq_sys::TransferStatus,
+    ) -> Self {
+        Self {
+            status,
+            xfer,
+            error: check(code).err(),
+        }
+    }
+}

@@ -311,13 +311,13 @@ pub fn start_wave_gen(
 
 /// Read waveform generator status. Called from poller.
 pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
-    let (status, xfer) = match device.analog_out_scan_status() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("WaveGen scan status error: {e}");
-            return;
-        }
-    };
+    // C skips the rest of the cycle on a status error (goto error).
+    let report = device.analog_out_scan_status();
+    if let Some(e) = report.error {
+        log::warn!("WaveGen scan status error: {e}");
+        return;
+    }
+    let (status, xfer) = (report.status, report.xfer);
 
     if state.num_chans > 0 && xfer.current_index >= 0 {
         state.current_point = (xfer.current_index as usize / state.num_chans) + 1;
