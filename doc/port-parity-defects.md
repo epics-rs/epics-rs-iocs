@@ -867,17 +867,17 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 
 ## Found by the post-fix live pass
 
-## PP-96 [MED] Neither meascomp IOC registers the asyn iocsh commands
+## PP-96 [MED] Neither meascomp IOC registers the asyn iocsh commands — FIXED
 - **Rust:** `usb-ctr-ioc/src/main.rs`, `usb-2408-ioc/src/main.rs` never call `iocsh::register_asyn_commands`.
 - **C:** `measCompAppInclude.dbd:2` includes `asyn.dbd`, so both IOCs carry asyn's shell commands; `iocUSBCTR/st.cmd:28` and `iocUSB2408/st.cmd:21` show `asynSetTraceMask` for debugging.
 - **Impact:** the PP-73 `report()` is unreachable (`asynReport` → "Command 'asynReport' not registered."); no `asynSetTraceMask`/`asynSetTraceIOMask` on either port.
 - **Class:** contract. **Live:** confirmed.
 
-## PP-97 [MED] The asyn record's trace and exception source is a TraceManager the port never reads
+## PP-97 [MED] The asyn record's trace and exception source is a TraceManager the port never reads — FIXED
 - **Rust:** `usb-ctr-ioc/src/main.rs:50,135-139`, `usb-2408-ioc/src/main.rs:38,102-106` register the port with a fresh `TraceManager::new()`; the port itself was built by `create_port_runtime(.., RuntimeConfig::default())`, which binds it to `PortServices::global()`.
 - **C:** one trace block and one exception list per port (`dpCommonInit`), read by the asyn record and `asynSetTrace*` alike.
 - **Impact:** `$(P)MCS:Asyn` TMSK/TIOM change a trace manager no port reads, and the record's exception subscription (`entry.trace.exception_manager()`) finds no exception list, so connect/enable changes never reach it.
-- **Class:** contract. **Live:** see fix commit.
+- **Class:** contract. **Live:** confirmed — before the fix `exceptionUsers 0` and `MCS:Asyn.TMSK` stayed 9 after `asynSetTraceMask USBCTR_1 -1 0x21`; after it `exceptionUsers 1`, TMSK reads back 33, and ENBL follows `asynEnable`.
 
 ## Live hardware verification (2026-09-22)
 
@@ -897,6 +897,26 @@ IOCs: `usb-ctr-ioc` (CA 5064) and `usb-2408-ioc` (CA 5074), release build of
 - 2408 DIO open-drain: Lo 15 → Li 240 — pass
 - 2408 wave digitizer 2 ch × 500 pts × 2 ms → CurrentPoint 500, DwellActual 0.002 — pass
 - 2408 wave generator internal sine one-shot 200 pts → Run returns to Stop, CurrentPoint 200; continuous run and stop — pass (output voltage not measurable)
+
+Post-fix pass (release build of the fix branch, autosave dirs wiped first):
+
+- Both IOCs iocInit with no WARN/ERROR lines (209 / 200 records CTR stock / mca variant) — pass
+- CTR init: Model USB-CTR08, TrigMode Rising edge, Dwell 0.1, SNL_Connected, Bd1-4 In / 5-8 Out — pass
+- CTR pulse 1e9 Hz → Frequency_RBV 4.8e7, Run MINOR; 1 kHz / 25 % → Width_RBV 2.5e-4 — pass
+- CTR DIO Lo 255 → Li 240 (only Out bits driven) — pass
+- CTR scaler TP 1 s never completes (counter 0 unwired, as C); MCS start while counting refused with an alarm; CNT 0 stops — pass
+- CTR MCS 100 × 10 ms: Rising/High level wait on the idle trigger input, Low level completes in 1.007 s, CurrentChannel 100, AbsTimeWF in EPICS-epoch seconds — pass
+- CTR autosave: 54 PVs restored and written (Bd4, Dwell 0.02 → TimeWF step 0.02, Point0Action, PrescaleCounter, TrigMode, Period); DutyCycle lost — fail, fixed by `2a25b72` (upstream #228), re-run pass (DutyCycle 0.3, Width 2.43e-4 after restart)
+- CTR Delay 60 s → ERR_BAD_INITIAL_DELAY — fail, fixed by `eb93f93` (upstream #229), re-run pass (Delay_RBV 44.7392, running)
+- CTR `asynReport` → not registered — fail, fixed by `7551c48` (PP-96), re-run pass (port block, then the driver section, as `drvUSBCTR.cpp:1550-1569`)
+- CTR mca-record variant (`meascomp_mca.template`): mca1 NORD 100, ERTM 1.037, DWEL 0.01 after a 100-point run — pass
+- 2408 init: TC Type J, Rate 60, Ao1 RVAL 32768 (0 V), WaveDigNumChans 1, WaveGen1 Sin wave — pass
+- 2408 Ai1Type TC → Ti1 finite (open input), Ai1 INVALID; back to Volts → Ai1 NO_ALARM — pass
+- 2408 AO 5 V → 49151, −12 V → DRVL −10 V / 0, TweakUp 0.5 V, write during generation INVALID, Pulse → Return drives 0 V after the write — pass
+- 2408 generator one-shot 1000 pts × 1 ms → Stop at CurrentPoint 1000, DAC restored to 32768; InternalWF peak-to-peak 2 → ±1 — pass
+- 2408 digitizer 100 pts, Dwell 0.001 at Ai Rate 60 → DwellActual 0.01732, CurrentPoint 100, Stop — pass; TimeWF step 0.001 (upstream #230, unchanged)
+- 2408 autosave: 215 PVs restored (TC type, range, rate, generator type, digitizer channels and dwells); Ao VAL not saved, as C — pass
+- 2408 `asynReport`: base report then the board section, as `drvMultiFunction.cpp:2861-2862` — pass
 
 ## Review Log — 2026-09-22 (wave 4)
 
@@ -924,3 +944,48 @@ Themes:
 
 FFI layer (`uldaq-sys`) is clean: 165 constants, 4 struct layouts and 45
 prototypes verified against `uldaq.h` with a compiled dump.
+
+## Fix commits (wave 4)
+
+usb-ctr: PP-44 `7f74af6`, PP-45 `fc39392`, PP-46 `4846670`, PP-47 `316c795`,
+PP-48 `ed1e238`, PP-49 `55ab3ff`, PP-50 `586ae77`, PP-51 `d47e220`,
+PP-52 `23f6b19`, PP-53 `57a434d`, PP-54 `2c5a9d0`, PP-55 `ad703e5` +
+`163d1ab`, PP-56 `fba12a0`, PP-57 `5d6fade`, PP-58 `4c58cd6`, PP-59
+`4ee82a7`, PP-61 `a192e3d`, PP-63 `c3bb5d5`.
+
+Shared / db: PP-60 `a694cfe`, PP-62 `3222e3a`, PP-64 `547e35e` + `85dd909`,
+PP-65 `f60b81d`, PP-66 `efef6aa`, PP-67 `727e73d`, PP-68 `dc44c68`, PP-69
+`85f7f1c`, PP-70 `509e846`, PP-71 `38f6abe`, PP-72 `19b9eb0`, PP-73
+`fa23aea`, PP-74 `c9fb56e`, PP-75 `f2eb9b3`, PP-76 `846c75c`, PP-77
+`e338622`, PP-96 `7551c48`, PP-97 `b2f2e7c`.
+
+usb-2408: PP-78 `23ade62`, PP-79 `b45a9da`, PP-80 `c28f62d`, PP-81
+`d1ebb1d`, PP-82 `6e11d4a` reverted by `42d59c9` (DEFERRED), PP-83
+`a6e5837`, PP-84 `51893c9`, PP-85 `e3bbb8c`, PP-86 `e9e8f74`, PP-87
+`d4382e3`, PP-88 `0b52fd5`, PP-89 `e80c12a`, PP-90 `23e8da3`, PP-91
+`4f58cae`, PP-92 `652452d`, PP-93 `8895b1f`, PP-94 `5e65b23`, PP-95
+`bc6c1de`.
+
+Upstream defects fixed in the port: #228 `2a25b72`, #229 `eb93f93`.
+
+## Review Log — 2026-09-22 (wave 4 fix round)
+
+51 of 52 findings fixed; PP-82 deferred. Two fixes needed a follow-up once
+live: `163d1ab` (PP-55: the StartAll busy wedged because asyn-rs I/O Intr
+delivers only a write's last value, so the driver's 1→0 Acquiring pulse
+never reached HardwareAcquiring) and `85dd909` (PP-64: the CP dwell calcs
+wrote dwell 0 at iocInit). The post-fix live pass on both boards added
+PP-96/97 and upstream #228-230; #230 (time axes built from the requested
+dwell) is left as C has it pending a decision on what `TimeWF` means.
+
+Blocked on epics-rs 0.30, not fixable here: async write completion drops
+the write error and a readback that arrives while the record is PACT
+(PP-82); I/O Intr coalesces within-write value changes (worked around in
+the MCS db, `163d1ab`); autosave builds its save sets at iocInit, so
+`create_monitor_set` must precede `iocInit()` in st.cmd.
+
+Outside meascomp, the PP-96/97 anchors also hit other IOC mains:
+`register_asyn_commands` is missing from ur-robot, mca-amptek, mca, ip and
+twincat-ads, and 12 more mains register ports with a fresh
+`TraceManager::new()`. Not classified in this round.
+
