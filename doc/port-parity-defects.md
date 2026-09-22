@@ -751,7 +751,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 
 ## usb-2408 — AI / TC / AO / DIO
 
-## PP-78 [HIGH] Analog-output record takes raw DAC counts; C's takes volts — OPEN
+## PP-78 [HIGH] Analog-output record takes raw DAC counts; C's takes volts — FIXED
 - **Rust:** `meascomp_analog_out.template:1-5` `ao` asynInt32 with no LINR/EGUL/EGUF/DRVL/DRVH; no `get_bounds` override (asyn-rs default (0,0)); `driver.rs:263-279` `ulAOut(…, AOUT_FF_NOSCALEDATA, value)`.
 - **C:** `drvMultiFunction.cpp:1920-1928` `getBounds` 0..65535; `measCompAnalogOut.template:1-17` LINR LINEAR; `USB2408.substitutions:135-137` EGU/DRV ±10.
 - **Impact:** `caput Ao1 5` gives +5 V in C and DAC code 5 (≈ −9.998 V) in Rust; `caput Ao1 0` drives −10 V; any negative volts fails with ERR_BAD_DA_VAL; no ±10 V clamp; TweakVal steps in counts. Fix needs both the record fields and a `get_bounds` for ANALOG_OUT_VALUE.

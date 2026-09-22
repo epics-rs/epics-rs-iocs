@@ -326,6 +326,23 @@ impl PortDriver for MultiFunctionDriver {
         &mut self.base
     }
 
+    /// C `getBounds` (drvMultiFunction.cpp:1920-1937): the raw span of the
+    /// DAC and the ADC, so an ao/ai record with LINR=LINEAR converts volts to
+    /// counts and back.
+    fn get_bounds_int32(&self, user: &AsynUser) -> AsynResult<(i32, i32)> {
+        let resolution = if user.reason == self.params.analog_out_value {
+            self.dac_resolution
+        } else if user.reason == self.params.analog_in_value {
+            self.adc_resolution
+        } else {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "no bounds for this parameter".into(),
+            });
+        };
+        Ok((0, ((1i64 << resolution) - 1) as i32))
+    }
+
     /// C `MultiFunction::report`: the asynPortDriver report, then the board
     /// and what this port drives on it.
     fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {

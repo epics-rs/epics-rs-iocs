@@ -1263,8 +1263,8 @@ caput USB2408:Ai1Type 1          # Switch to TC mode
 caput USB2408:Ti1TCType 1        # J-type thermocouple
 caget USB2408:Ti1
 
-# Set analog output 1 to mid-scale
-caput USB2408:Ao1 32768
+# Set analog output 1 to 2.5 V (the record is in volts, +/-10 V)
+caput USB2408:Ao1 2.5
 
 # Start waveform digitizer (8 channels, 1000 points)
 caput USB2408:WaveDigNumPoints 1000
