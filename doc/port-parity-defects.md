@@ -787,7 +787,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** a J sensor on a fresh IOC reads tens of °C off.
 - **Class:** ref-faithful. **Live:** confirmed `Ti1TCType` = K on a fresh IOC.
 
-## PP-84 [LOW] AiMode offers "Pseudo-diff", which the USB-2408 rejects — OPEN
+## PP-84 [LOW] AiMode offers "Pseudo-diff", which the USB-2408 rejects — FIXED
 - **Rust:** `meascomp_analog_in_mode.template:8` `TWVL 3` passed straight to `ulAIn` (`poller.rs:72-74,134-147`).
 - **C:** `measCompAnalogInMode.template:7-10` only 0/1; `drvMultiFunction.cpp:1989` maps to DIFF/SE; device supports only those (`AiUsb24xx.cpp:66-67`).
 - **Impact:** every voltage read fails with ERR_BAD_INPUT_MODE and the Ai records freeze on their last value.

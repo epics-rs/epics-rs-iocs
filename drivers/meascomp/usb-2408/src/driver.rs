@@ -409,6 +409,15 @@ impl PortDriver for MultiFunctionDriver {
             value.clamp(1, self.max_input_points as i32)
         } else if reason == self.params.wave_gen_num_points {
             value.clamp(1, self.max_output_points as i32)
+        } else if reason == self.params.analog_in_mode {
+            // The USB-2408 has only differential and single-ended inputs; C
+            // takes anything but differential as single-ended
+            // (drvMultiFunction.cpp:1989), so no other mode reaches ulAIn.
+            if value == uldaq_sys::AI_DIFFERENTIAL {
+                uldaq_sys::AI_DIFFERENTIAL
+            } else {
+                uldaq_sys::AI_SINGLE_ENDED
+            }
         } else {
             value
         };
