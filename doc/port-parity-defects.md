@@ -627,7 +627,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** values C clamps are rejected by libuldaq (`TmrDevice.cpp:61-75`), the generator is left stopped while Run reads Run.
 - **Class:** ref-faithful. **Live:** confirmed — Frequency 1e9 / DutyCycle 1.5 / Delay 100 and Frequency 0.001 all passed through (RBVs 1e-9, 1.5, 100) and returned "uldaq error 58: Invalid frequency specified".
 
-## PP-59 [MED] Timers not stopped at init; "running" inferred from the PULSE_RUN setpoint — OPEN
+## PP-59 [MED] Timers not stopped at init; "running" inferred from the PULSE_RUN setpoint — FIXED
 - **Rust:** constructor `driver.rs:38-104` never calls `ulTmrPulseOutStop`; running state is the Run param set before the hardware call (`:121,128,318-322`).
 - **C:** `drvUSBCTR.cpp:427-430` stops all 4 timers at construction; `pulseGenRunning_[]` set only after a successful start (`:490`), gating stop (`:1106`) and restarts (`:1112,1295`).
 - **Impact:** after an IOC restart a generator left running keeps pulsing while Run shows Stop; after a rejected start, a later Period/Duty write starts the output without Run being re-written.

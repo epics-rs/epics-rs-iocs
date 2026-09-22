@@ -33,6 +33,11 @@ pub struct CtrDriver {
     /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
     /// `DPIOT_BITIO`). The USB-CTR08 reports `DPIOT_BITIO`.
     dio_configurable: bool,
+    /// Whether each timer is actually generating, C `pulseGenRunning_`.
+    /// Only [`CtrDriver::start_pulse_generator`] sets it, once the device has
+    /// accepted the start, and only [`CtrDriver::stop_pulse_generator`]
+    /// clears it -- the PULSE_RUN setpoint is what was asked for, not this.
+    pulse_running: [bool; NUM_TIMERS],
 }
 
 impl CtrDriver {
@@ -85,6 +90,15 @@ impl CtrDriver {
             base.set_uint32_param(params.digital_input, 0, data as u32, 0xFFFF_FFFF, 0)?;
         }
 
+        // Put the pulse generators in a known state, as C's constructor does:
+        // a timer left running by a previous IOC would otherwise keep
+        // pulsing while its Run record reads Stop.
+        for timer in 0..NUM_TIMERS as i32 {
+            if let Err(e) = pulse_gen::stop(&device, timer) {
+                log::error!("pulse_gen stop({timer}) error: {e}");
+            }
+        }
+
         let state = Arc::new(Mutex::new(PollerState {
             scaler: ScalerState::new(),
             mcs: McsState::new(max_time_points),
@@ -99,11 +113,75 @@ impl CtrDriver {
             state,
             max_time_points,
             dio_configurable,
+            pulse_running: [false; NUM_TIMERS],
         })
     }
 }
 
 impl CtrDriver {
+    /// C `startPulseGenerator`: start `timer` from its parameters, write the
+    /// timing the device actually runs back to them, and only then mark it
+    /// running.
+    fn start_pulse_generator(&mut self, dev: &DaqDevice, timer: i32) -> Result<(), String> {
+        if timer < 0 || timer as usize >= NUM_TIMERS {
+            return Err(format!("pulse generator {timer} does not exist"));
+        }
+        let get_f64 = |reason| {
+            self.base
+                .get_float64_param(reason, timer)
+                .map_err(|e| e.to_string())
+        };
+        let period = get_f64(self.params.pulse_period)?;
+        let duty = get_f64(self.params.pulse_duty_cycle)?;
+        let delay = get_f64(self.params.pulse_delay)?;
+        let get_i32 = |reason| {
+            self.base
+                .get_int32_param(reason, timer)
+                .map_err(|e| e.to_string())
+        };
+        let count = get_i32(self.params.pulse_count)? as u64;
+        let idle = get_i32(self.params.pulse_idle_state)?;
+        let (actual_period, actual_duty, actual_delay) =
+            pulse_gen::start(dev, timer, period, duty, delay, count, idle)
+                .map_err(|e| format!("pulse_gen start error: {e}"))?;
+        self.pulse_running[timer as usize] = true;
+        let _ = self
+            .base
+            .set_float64_param(self.params.pulse_period, timer, actual_period);
+        let _ = self
+            .base
+            .set_float64_param(self.params.pulse_duty_cycle, timer, actual_duty);
+        let _ = self
+            .base
+            .set_float64_param(self.params.pulse_delay, timer, actual_delay);
+        Ok(())
+    }
+
+    /// C `stopPulseGenerator`: the timer counts as stopped whether or not the
+    /// stop command itself succeeds.
+    fn stop_pulse_generator(&mut self, dev: &DaqDevice, timer: i32) -> Result<(), String> {
+        if let Some(running) = self.pulse_running.get_mut(timer as usize) {
+            *running = false;
+        }
+        pulse_gen::stop(dev, timer).map_err(|e| format!("pulse_gen stop error: {e}"))
+    }
+
+    /// C's restart on a timing change: stop and start again, but only a timer
+    /// that is really running.
+    fn restart_pulse_generator(&mut self, dev: &DaqDevice, timer: i32) -> Option<String> {
+        if !self
+            .pulse_running
+            .get(timer as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let stopped = self.stop_pulse_generator(dev, timer);
+        let started = self.start_pulse_generator(dev, timer);
+        stopped.and(started).err()
+    }
+
     /// Common tail of every write: run the callbacks, then report a failure
     /// the way C does -- `asynError` back to the record, so it alarms --
     /// besides publishing it on LAST_ERROR_MESSAGE.
@@ -143,56 +221,28 @@ impl PortDriver for CtrDriver {
 
         self.base.params.set_int32(reason, addr, value)?;
 
-        if reason == self.params.pulse_run
-            || reason == self.params.pulse_count
-            || reason == self.params.pulse_idle_state
-        {
-            let dev = self.device.lock().unwrap();
-            let running = self.base.get_int32_param(self.params.pulse_run, addr)? != 0;
-            if running {
-                // Stop first if restarting due to parameter change
-                if reason != self.params.pulse_run
-                    && let Err(e) = pulse_gen::stop(&dev, addr)
-                {
-                    last_error = Some(format!("pulse_gen stop error: {e}"));
-                }
-                let period = self
-                    .base
-                    .get_float64_param(self.params.pulse_period, addr)?;
-                let duty = self
-                    .base
-                    .get_float64_param(self.params.pulse_duty_cycle, addr)?;
-                let delay = self.base.get_float64_param(self.params.pulse_delay, addr)?;
-                let count = self.base.get_int32_param(self.params.pulse_count, addr)? as u64;
-                let idle = self
-                    .base
-                    .get_int32_param(self.params.pulse_idle_state, addr)?;
-                match pulse_gen::start(&dev, addr, period, duty, delay, count, idle) {
-                    Ok((actual_period, actual_duty, actual_delay)) => {
-                        // Write back actual values from hardware
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_period,
-                            addr,
-                            actual_period,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_duty_cycle,
-                            addr,
-                            actual_duty,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_delay,
-                            addr,
-                            actual_delay,
-                        );
-                    }
-                    Err(e) => last_error = Some(format!("pulse_gen start error: {e}")),
-                }
-            } else if reason == self.params.pulse_run
-                && let Err(e) = pulse_gen::stop(&dev, addr)
+        if reason == self.params.pulse_run {
+            let device = self.device.clone();
+            let dev = device.lock().unwrap();
+            // C starts even when it believes the timer runs: with Count != 0
+            // there is no way to know that it has finished.
+            let result = if value != 0 {
+                self.start_pulse_generator(&dev, addr)
+            } else if self
+                .pulse_running
+                .get(addr as usize)
+                .copied()
+                .unwrap_or(false)
             {
-                last_error = Some(format!("pulse_gen stop error: {e}"));
-            }
+                self.stop_pulse_generator(&dev, addr)
+            } else {
+                Ok(())
+            };
+            last_error = result.err();
+        } else if reason == self.params.pulse_count || reason == self.params.pulse_idle_state {
+            let device = self.device.clone();
+            let dev = device.lock().unwrap();
+            last_error = self.restart_pulse_generator(&dev, addr);
         } else if reason == self.params.counter_reset {
             // Any write resets, as C's ulCLoad(CRT_LOAD, 0) does.
             let dev = self.device.lock().unwrap();
@@ -325,53 +375,14 @@ impl PortDriver for CtrDriver {
         let addr = device_addr(user.addr);
         self.base.params.set_float64(reason, addr, value)?;
 
-        // Restart pulse generator if period or duty cycle changes while running
+        // A timing change restarts a running pulse generator with it.
         if reason == self.params.pulse_period
             || reason == self.params.pulse_duty_cycle
             || reason == self.params.pulse_delay
         {
-            let running = self
-                .base
-                .get_int32_param(self.params.pulse_run, addr)
-                .unwrap_or(0)
-                != 0;
-            if running {
-                let dev = self.device.lock().unwrap();
-                if let Err(e) = pulse_gen::stop(&dev, addr) {
-                    last_error = Some(format!("pulse_gen stop error: {e}"));
-                }
-                let period = self
-                    .base
-                    .get_float64_param(self.params.pulse_period, addr)?;
-                let duty = self
-                    .base
-                    .get_float64_param(self.params.pulse_duty_cycle, addr)?;
-                let delay = self.base.get_float64_param(self.params.pulse_delay, addr)?;
-                let count = self.base.get_int32_param(self.params.pulse_count, addr)? as u64;
-                let idle = self
-                    .base
-                    .get_int32_param(self.params.pulse_idle_state, addr)?;
-                match pulse_gen::start(&dev, addr, period, duty, delay, count, idle) {
-                    Ok((actual_period, actual_duty, actual_delay)) => {
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_period,
-                            addr,
-                            actual_period,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_duty_cycle,
-                            addr,
-                            actual_duty,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_delay,
-                            addr,
-                            actual_delay,
-                        );
-                    }
-                    Err(e) => last_error = Some(format!("pulse_gen restart error: {e}")),
-                }
-            }
+            let device = self.device.clone();
+            let dev = device.lock().unwrap();
+            last_error = self.restart_pulse_generator(&dev, addr);
         }
 
         self.finish_write(addr, last_error)
