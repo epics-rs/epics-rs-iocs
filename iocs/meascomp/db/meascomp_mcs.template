@@ -214,8 +214,8 @@ record(busy, "$(P)MCS:ClientWait") {
 record(ao, "$(P)MCS:Dwell") {
     field(DTYP, "asynFloat64")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_DWELL_TIME")
-    field(PREC, "6")
-    field(VAL,  "0.001")
+    field(PREC, "4")
+    field(VAL,  "0.1")
     field(PINI, "YES")
 }
 
@@ -223,7 +223,7 @@ record(ao, "$(P)MCS:Dwell") {
 record(ai, "$(P)MCS:Dwell_RBV") {
     field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),0,1.0)MCA_DWELL_TIME")
-    field(PREC, "6")
+    field(PREC, "4")
     field(SCAN, "I/O Intr")
 }
 
@@ -315,11 +315,11 @@ record(mbbo, "$(P)MCS:Point0Action") {
     field(PINI, "YES")
 }
 
-record(mbbo, "$(P)MCS:ChannelAdvance") {
+record(bo, "$(P)MCS:ChannelAdvance") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADV_SOURCE")
-    field(ZRST, "Internal")  field(ZRVL, "0")
-    field(ONST, "External")  field(ONVL, "1")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
     field(PINI, "YES")
 }
 

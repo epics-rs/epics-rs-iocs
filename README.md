@@ -1266,7 +1266,7 @@ caget USB2408:Ti1
 # Set analog output 1 to 2.5 V (the record is in volts, +/-10 V)
 caput USB2408:Ao1 2.5
 
-# Start waveform digitizer (8 channels, 1000 points)
+# Start waveform digitizer (1 channel, the default, 1000 points)
 caput USB2408:WaveDigNumPoints 1000
 caput USB2408:WaveDigDwell 0.001
 caput USB2408:WaveDigRun 1

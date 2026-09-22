@@ -96,7 +96,8 @@ impl MultiFunctionDriver {
         for ch in 0..MAX_ANALOG_OUT {
             base.set_int32_param(params.wave_gen_enable, ch as i32, 1)?;
         }
-        base.set_int32_param(params.wave_dig_num_chans, 0, MAX_ANALOG_IN as i32)?;
+        // One channel, as the NumChans menu's first state.
+        base.set_int32_param(params.wave_dig_num_chans, 0, 1)?;
         base.set_int32_param(params.analog_in_mode, 0, uldaq_sys::AI_DIFFERENTIAL)?;
 
         for ch in 0..MAX_ANALOG_IN {

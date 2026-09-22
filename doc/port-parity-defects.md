@@ -744,7 +744,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** C OPIs, scripts and autosave files fail against the Rust IOC.
 - **Class:** contract. **Live:** confirmed `USB2408:WaveGen1Type` and `USB2408:WaveGenFrequency` not found.
 
-## PP-77 [LOW] Record types/menus/defaults changed (digitizer channels, TC filter, MCS dwell) — OPEN
+## PP-77 [LOW] Record types/menus/defaults changed (digitizer channels, TC filter, MCS dwell) — FIXED
 - **Rust:** `meascomp_wave_dig.template:23-39` FirstChan/NumChans longout, NumChans default 8 (`driver.rs:67`); `meascomp_temperature.template:34-39` Filter "Off"(0)/"On"(1); `meascomp_mcs.template:143-149` Dwell VAL 0.001.
 - **C:** `measCompWaveformDig.template:20-67` mbbo, NumChans raw = index+1, default 1 channel; `measCompTemperatureIn.template:49-58` "Filter"(0)/"No filter"(0x400); `measCompMCS.template:114-120` Dwell 0.1.
 - **Impact:** numeric NumChans writes differ by one; the default 8-channel × 1 ms digitizer run always fails (PP-90) where C's 1-channel default runs.

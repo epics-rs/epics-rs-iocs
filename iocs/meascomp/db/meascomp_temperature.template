@@ -33,12 +33,13 @@ record(mbbo, "$(P)$(R)Scale") {
     field(PINI, "YES")
 }
 
-record(bo, "$(P)$(R)Filter") {
+# Upstream's UL-for-Windows filter codes; the Linux driver does not use them.
+record(mbbo, "$(P)$(R)Filter") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)TEMPERATURE_FILTER")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZRVL, "0")      field(ZRST, "Filter")
+    field(ONVL, "0x400")  field(ONST, "No filter")
 }
 
 record(bo, "$(P)$(R)OpenTCDetect") {

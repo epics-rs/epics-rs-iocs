@@ -20,21 +20,33 @@ record(longout, "$(P)WaveDigNumPoints") {
     field(PINI, "YES")
 }
 
-record(longout, "$(P)WaveDigFirstChan") {
+# First channel and channel count as upstream's menus: the state is the
+# 1-based channel label, the raw value what the driver takes.
+record(mbbo, "$(P)WaveDigFirstChan") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_FIRST_CHAN")
-    field(VAL,  "0")
-    field(DRVL, "0")
-    field(DRVH, "7")
+    field(ZRVL, "0")  field(ZRST, "1")
+    field(ONVL, "1")  field(ONST, "2")
+    field(TWVL, "2")  field(TWST, "3")
+    field(THVL, "3")  field(THST, "4")
+    field(FRVL, "4")  field(FRST, "5")
+    field(FVVL, "5")  field(FVST, "6")
+    field(SXVL, "6")  field(SXST, "7")
+    field(SVVL, "7")  field(SVST, "8")
     field(PINI, "YES")
 }
 
-record(longout, "$(P)WaveDigNumChans") {
+record(mbbo, "$(P)WaveDigNumChans") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_NUM_CHANS")
-    field(VAL,  "8")
-    field(DRVL, "1")
-    field(DRVH, "8")
+    field(ZRVL, "1")  field(ZRST, "1")
+    field(ONVL, "2")  field(ONST, "2")
+    field(TWVL, "3")  field(TWST, "3")
+    field(THVL, "4")  field(THST, "4")
+    field(FRVL, "5")  field(FRST, "5")
+    field(FVVL, "6")  field(FVST, "6")
+    field(SXVL, "7")  field(SXST, "7")
+    field(SVVL, "8")  field(SVST, "8")
     field(PINI, "YES")
 }
 
@@ -141,7 +153,7 @@ record(waveform, "$(P)WaveDigAbsTimeWF") {
 # Hand the points acquired so far to the VoltWF records. The driver does this
 # by itself when a scan completes, so this is only needed to watch a scan in
 # progress; SDIS keeps it from polling while stopped.
-record(bo, "$(P)WaveDigReadWF") {
+record(busy, "$(P)WaveDigReadWF") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_READ_WF")
     field(ZNAM, "Done")
