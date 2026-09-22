@@ -64,9 +64,18 @@ fn poller_loop(
 ) {
     let mut prev_digital_input: u64 = 0;
     let mut force_callback = true;
+    let mut cycle_start = Instant::now();
 
     loop {
-        let start = Instant::now();
+        // C publishes the time from the previous loop top to this one, so
+        // POLL_TIME_MS is the real cycle time, sleep included.
+        let now = Instant::now();
+        let _ = handle.write_float64_blocking(
+            params.poll_time_ms,
+            0,
+            now.duration_since(cycle_start).as_secs_f64() * 1000.0,
+        );
+        cycle_start = now;
 
         // ---- Phase 1: read config params (no device lock) ----
         let input_mode = handle
@@ -253,13 +262,32 @@ fn poller_loop(
             let _ = handle.call_param_callbacks_blocking(addr);
         }
 
-        let elapsed = start.elapsed();
-        let _ =
-            handle.write_float64_blocking(params.poll_time_ms, 0, elapsed.as_secs_f64() * 1000.0);
-
         let poll_ms = handle
             .read_float64_blocking(params.poll_sleep_ms, 0)
             .unwrap_or(50.0);
-        std::thread::sleep(Duration::from_millis(poll_ms as u64));
+        std::thread::sleep(poll_sleep(poll_ms));
+    }
+}
+
+/// C `epicsThreadSleep(pollTime/1000.)`: the fraction of a millisecond is
+/// kept, and a negative or non-finite POLL_SLEEP_MS sleeps not at all.
+fn poll_sleep(poll_ms: f64) -> Duration {
+    Duration::try_from_secs_f64(poll_ms / 1000.0).unwrap_or(Duration::ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fractional_poll_sleep_is_kept() {
+        assert_eq!(poll_sleep(0.5), Duration::from_micros(500));
+        assert_eq!(poll_sleep(50.0), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn an_unusable_poll_sleep_does_not_sleep() {
+        assert_eq!(poll_sleep(-1.0), Duration::ZERO);
+        assert_eq!(poll_sleep(f64::NAN), Duration::ZERO);
     }
 }

@@ -692,7 +692,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** `caput …Reset 0` / `SyncWrite 0` do nothing in Rust.
 - **Class:** ref-faithful. **Live:** static.
 
-## PP-69 [LOW] POLL_TIME_MS reports work time, not cycle time; sub-ms POLL_SLEEP_MS truncated (both drivers) — OPEN
+## PP-69 [LOW] POLL_TIME_MS reports work time, not cycle time; sub-ms POLL_SLEEP_MS truncated (both drivers) — FIXED
 - **Rust:** `usb-ctr/src/poller.rs:62,175-177,182`, `usb-2408/src/poller.rs:69,256-258,263`.
 - **C:** `drvUSBCTR.cpp:1494,1501-1503,1539`, `drvMultiFunction.cpp:2599-2601,2851` (cycle time incl. sleep; exact float sleep).
 - **Impact:** PollTimeMS reads far below PollSleepMS; `PollSleepMS=0.5` busy-loops.
