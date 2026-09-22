@@ -757,7 +757,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** `caput Ao1 5` gives +5 V in C and DAC code 5 (≈ −9.998 V) in Rust; `caput Ao1 0` drives −10 V; any negative volts fails with ERR_BAD_DA_VAL; no ±10 V clamp; TweakVal steps in counts. Fix needs both the record fields and a `get_bounds` for ANALOG_OUT_VALUE.
 - **Class:** contract. **Live:** confirmed — every negative put (−0.5, −9.9, −10) returned "uldaq error 56: Invalid D/A output value specified"; positive volts were accepted as counts. Both DACs were left at code 32768 (≈0 V) after testing.
 
-## PP-79 [HIGH] AI data rate never programmed: every conversion at 3750 S/s instead of 60 S/s — OPEN
+## PP-79 [HIGH] AI data rate never programmed: every conversion at 3750 S/s instead of 60 S/s — FIXED
 - **Rust:** ANALOG_IN_RATE created (`params.rs:132`) but `write_int32` has no branch; `meascomp/src/analog_in.rs:43` `ai_set_config_dbl` has no caller; no `Ai<n>Rate` record; `auto_settings.req:4` notes it dropped.
 - **C:** `drvMultiFunction.cpp:1994-2001` `ulAISetConfigDbl(AI_CFG_CHAN_DATA_RATE, ch, value)` on the 2408 (`:1140-1146`); `measCompAnalogIn.template:31-37` Rate PINI VAL 60.
 - **Impact:** libuldaq default `CHR_3750` (`AiUsb24xx.cpp:986-987`) applies to `ulAIn`, `ulTIn` and the scan queue: no 50/60 Hz rejection, higher noise, and a much shorter digitizer minimum period than C allows.

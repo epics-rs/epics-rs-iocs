@@ -476,6 +476,16 @@ impl PortDriver for MultiFunctionDriver {
                 // pushed while it was a voltage channel, so push them now.
                 last_error = self.apply_tc_config(&dev, addr);
             }
+        } else if reason == self.params.analog_in_rate {
+            // C: the per-channel ADC data rate (samples/s), which sets the
+            // conversion time and the 50/60 Hz rejection of every read on the
+            // channel, ulAIn, ulTIn and the scan queue alike.
+            let dev = self.device.lock().unwrap();
+            if let Err(e) =
+                dev.ai_set_config_dbl(uldaq_sys::AI_CFG_CHAN_DATA_RATE, addr as u32, value as f64)
+            {
+                last_error = Some(format!("ai_set_config_dbl data_rate error: {e}"));
+            }
         } else if reason == self.params.thermocouple_type
             || reason == self.params.thermocouple_open_detect
         {

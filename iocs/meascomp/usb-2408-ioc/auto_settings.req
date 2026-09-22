@@ -1,7 +1,7 @@
 # Settings restored at the next start of usb-2408-ioc.
 # Ported from upstream USB2408_settings.req and the per-template
 # measComp*_settings.req files it includes, minus the records this port does
-# not have (Ao Return/Pulse, Ao SyncMaster, Ai Rate).
+# not have (Ao Return/Pulse, Ao SyncMaster).
 #
 # Macros: P (record prefix)
 
@@ -20,20 +20,28 @@ $(P)AiMode
 
 $(P)Ai1Range
 $(P)Ai1Type
+$(P)Ai1Rate
 $(P)Ai2Range
 $(P)Ai2Type
+$(P)Ai2Rate
 $(P)Ai3Range
 $(P)Ai3Type
+$(P)Ai3Rate
 $(P)Ai4Range
 $(P)Ai4Type
+$(P)Ai4Rate
 $(P)Ai5Range
 $(P)Ai5Type
+$(P)Ai5Rate
 $(P)Ai6Range
 $(P)Ai6Type
+$(P)Ai6Rate
 $(P)Ai7Range
 $(P)Ai7Type
+$(P)Ai7Rate
 $(P)Ai8Range
 $(P)Ai8Type
+$(P)Ai8Rate
 
 $(P)Ti1Scale
 $(P)Ti1TCType

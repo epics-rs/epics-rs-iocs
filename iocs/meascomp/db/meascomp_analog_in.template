@@ -26,3 +26,11 @@ record(mbbo, "$(P)$(R)Type") {
     field(ONST, "TC deg.")   field(ONVL, "1")
     field(PINI, "YES")
 }
+
+# ADC data rate in samples/s; 60 rejects 60 Hz pickup.
+record(ao, "$(P)$(R)Rate") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_RATE")
+    field(VAL,  "$(RATE=60)")
+    field(PINI, "YES")
+}
