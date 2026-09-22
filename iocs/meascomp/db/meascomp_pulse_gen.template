@@ -93,7 +93,7 @@ record(calc, "$(P)$(R)Frequency_RBV") {
 
 record(calcout, "$(P)$(R)CalcWidth") {
     field(INPA, "$(P)$(R)Period_RBV  CP MS")
-    field(INPB, "$(P)$(R)DutyCycle_RBV  NPP MS")
+    field(INPB, "$(P)$(R)DutyCycle_RBV  CP MS")
     field(CALC, "A*B")
     field(OUT,  "$(P)$(R)Width.VAL  NPP MS")
 }
@@ -112,7 +112,7 @@ record(calcout, "$(P)$(R)CalcDutyCycle") {
 
 record(calc, "$(P)$(R)Width_RBV") {
     field(INPA, "$(P)$(R)Period_RBV  CP MS")
-    field(INPB, "$(P)$(R)DutyCycle_RBV  NPP MS")
+    field(INPB, "$(P)$(R)DutyCycle_RBV  CP MS")
     field(CALC, "A*B")
     field(PREC, "$(PREC=4)")
 }

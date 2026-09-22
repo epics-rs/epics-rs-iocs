@@ -87,7 +87,7 @@ record(ao, "$(P)WaveGenUserFrequency") {
 
 record(calcout, "$(P)WaveGenCalcUserDwell") {
     field(INPA, "$(P)WaveGenUserFrequency  NPP MS")
-    field(INPB, "$(P)WaveGenUserNumPoints  NPP MS")
+    field(INPB, "$(P)WaveGenUserNumPoints  CP MS")
     field(CALC, "(A>0&&B>0)?1/(A*B):0")
     field(OUT,  "$(P)WaveGenUserDwell.VAL  PP MS")
 }
@@ -115,7 +115,7 @@ record(ao, "$(P)WaveGenIntFrequency") {
 
 record(calcout, "$(P)WaveGenCalcIntDwell") {
     field(INPA, "$(P)WaveGenIntFrequency  NPP MS")
-    field(INPB, "$(P)WaveGenIntNumPoints  NPP MS")
+    field(INPB, "$(P)WaveGenIntNumPoints  CP MS")
     field(CALC, "(A>0&&B>0)?1/(A*B):0")
     field(OUT,  "$(P)WaveGenIntDwell.VAL  PP MS")
 }

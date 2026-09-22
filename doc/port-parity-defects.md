@@ -660,7 +660,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** on a CTR04 the poller calls `ulCIn(4..7)` every cycle (ERR_BAD_CTR), the scaler never starts, the MCS wedges (PP-46).
 - **Class:** unimpl. **Live:** `USBCTR:MCS:Model` not found; CTR04 effects static.
 
-## PP-64 [LOW] Derived calc records miss CP/FLNK links (Width, generator dwell) — OPEN
+## PP-64 [LOW] Derived calc records miss CP/FLNK links (Width, generator dwell) — FIXED
 - **Rust:** `meascomp_pulse_gen.template:94-99,113-118` CalcWidth/Width_RBV CP on Period_RBV only (DutyCycle_RBV NPP); `meascomp_wave_gen.template:88-93,116-121` CalcUserDwell/CalcIntDwell INPB NumPoints NPP.
 - **C:** `measCompPulseGen.template:87-95,127-133` DutyCycle FLNK CalcWidth, Width_RBV CP on both; `measCompWaveformGen.template:158,206` NumPoints CP.
 - **Impact:** Width/Width_RBV stay 0 from boot and stale after DutyCycle-only changes; NumPoints changes don't rescale dwell.
