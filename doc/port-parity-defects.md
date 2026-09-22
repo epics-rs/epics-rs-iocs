@@ -1010,7 +1010,8 @@ write on the now CANBLOCK 2408 in WRITE/INVALID. The workspace moves in
 binds every main's asyn commands to `PortManager::global()`, `491d9ba`
 returns the autosave sets to after iocInit, and `b74017e` re-applies PP-82.
 
-Found against 0.30.1, open in epics-rs:
+Found against 0.30.1, open in epics-rs (filed as #112, #113, #114 in that
+order):
 - On a non-blocking asyn port every output write reaches the driver twice.
   `write_begin` completes it with `submit_blocking` and returns `Ok(None)`
   (asyn-rs `adapter.rs:2653-2658`); epics-base-rs reads `Ok(None)` as "no
