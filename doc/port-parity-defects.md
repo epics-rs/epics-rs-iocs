@@ -553,11 +553,12 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** any rejected scan wedges HardwareAcquiring and the Acquiring busy until a manual StopAll.
 - **Class:** ref-indep. **Live:** confirmed — `Dwell=1e-6` → "uldaq error 22", HardwareAcquiring/Acquiring stuck at 1 for 2 s until StopAll.
 
-## PP-47 [MED] Scaler counter scan at 10 kHz instead of 100 Hz; SS_IDLE ends the count — OPEN
+## PP-47 [MED] Scaler counter scan at 10 kHz instead of 100 Hz; SS_IDLE ends the count — FIXED
 - **Rust:** `scaler.rs:79` `rate = 10000.0` into `ulCInScan(…,20,…, SO_CONTINUOUS|SO_SINGLEIO, CINSCAN_FF_CTR64_BIT)`; `scaler.rs:144` stops and reports done on `status == SS_IDLE`.
 - **C:** `drvUSBCTR.cpp:892-893,933-935` `rate = 100`; `readScaler` (`:976-986`) completes only on a preset.
 - **Impact:** 100× the SINGLEIO USB transfers; a scan overrun that goes idle is reported to the scalerRecord as a completed count with partial data.
 - **Class:** ref-faithful. **Live:** log shows "Scaler started, rate=10000 Hz"; completion not observable (counter 0 unwired).
+- **Also fixed with it:** C readScaler takes the counts of the first complete ring set that reaches a preset (`:970-987`); the port always took the last set.
 
 ## PP-48 [MED] `read_mcs` early returns skip SS_IDLE / PresetReal detection; PresetReal latched at start — FIXED
 - **Rust:** `mcs.rs:226-232` returns on status error, `:234-236` returns while `current_total_count == 0`, both before the done test `:258-261`; `driver.rs:199-201` reads `MCA_PRESET_REAL_TIME` only at start.
