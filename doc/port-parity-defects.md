@@ -865,6 +865,20 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** a client that restarts immediately on completion can have its new scan stopped (and the AO restore of PP-87 re-run). Timing-dependent.
 - **Class:** ref-indep. **Live:** static.
 
+## Found by the post-fix live pass
+
+## PP-96 [MED] Neither meascomp IOC registers the asyn iocsh commands
+- **Rust:** `usb-ctr-ioc/src/main.rs`, `usb-2408-ioc/src/main.rs` never call `iocsh::register_asyn_commands`.
+- **C:** `measCompAppInclude.dbd:2` includes `asyn.dbd`, so both IOCs carry asyn's shell commands; `iocUSBCTR/st.cmd:28` and `iocUSB2408/st.cmd:21` show `asynSetTraceMask` for debugging.
+- **Impact:** the PP-73 `report()` is unreachable (`asynReport` → "Command 'asynReport' not registered."); no `asynSetTraceMask`/`asynSetTraceIOMask` on either port.
+- **Class:** contract. **Live:** confirmed.
+
+## PP-97 [MED] The asyn record's trace and exception source is a TraceManager the port never reads
+- **Rust:** `usb-ctr-ioc/src/main.rs:50,135-139`, `usb-2408-ioc/src/main.rs:38,102-106` register the port with a fresh `TraceManager::new()`; the port itself was built by `create_port_runtime(.., RuntimeConfig::default())`, which binds it to `PortServices::global()`.
+- **C:** one trace block and one exception list per port (`dpCommonInit`), read by the asyn record and `asynSetTrace*` alike.
+- **Impact:** `$(P)MCS:Asyn` TMSK/TIOM change a trace manager no port reads, and the record's exception subscription (`entry.trace.exception_manager()`) finds no exception list, so connect/enable changes never reach it.
+- **Class:** contract. **Live:** see fix commit.
+
 ## Live hardware verification (2026-09-22)
 
 IOCs: `usb-ctr-ioc` (CA 5064) and `usb-2408-ioc` (CA 5074), release build of
