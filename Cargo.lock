@@ -4816,6 +4816,7 @@ name = "usb-2408"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "epics-rs",
  "log",
  "meascomp",
@@ -4839,6 +4840,7 @@ name = "usb-ctr"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "epics-rs",
  "log",
  "mca",

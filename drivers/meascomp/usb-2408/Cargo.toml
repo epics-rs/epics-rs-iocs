@@ -10,4 +10,5 @@ meascomp = { path = "../meascomp" }
 epics-rs = { workspace = true, features = ["asyn"] }
 parking_lot = "0.12"
 log = "0.4"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 anyhow = "1.0"

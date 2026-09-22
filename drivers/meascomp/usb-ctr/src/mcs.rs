@@ -34,6 +34,8 @@ pub struct McsState {
     pub scan_points: usize,
     /// 1 when the scan's first point is skipped, else 0.
     pub skip: usize,
+    /// C `MCSErased_`: set by an erase, cleared by a start. Reported only.
+    pub erased: bool,
 }
 
 impl McsState {
@@ -57,6 +59,7 @@ impl McsState {
             chan_map: Vec::new(),
             scan_points: 0,
             skip: 0,
+            erased: false,
         }
     }
 }
@@ -81,6 +84,7 @@ pub fn erase_mcs(state: &mut McsState) {
     }
     state.current_point = 0;
     state.start_time = current_time_secs();
+    state.erased = true;
 }
 
 /// C `computeMCSTimes`: the relative time base `i * dwell` over the
@@ -197,6 +201,7 @@ pub fn start_mcs(
     state.counter_enable = counter_enable;
     // C sets startTime_ before starting the hardware.
     state.start_time = current_time_secs();
+    state.erased = false;
     let max_pts = state.max_points.min(num_points);
     // C Skip acquires numPoints+1 and never stores the first.
     state.skip = usize::from(point0_action == Point0Action::Skip);

@@ -36,6 +36,34 @@ fn mca_data_read(buf: &mut [i32], src: &[i32], num_channels: usize, current_poin
     buf.len().min(current_point).max(1)
 }
 
+/// What asyn-rs's default `PortDriver::report` prints, which an override
+/// cannot call (C `asynPortDriver::report`, asynPortDriver.cpp:3677-3710):
+/// the port, its timestamp and parameter library, and at level 3 its
+/// interrupt clients. This port has no octet interface, so no EOS lines.
+fn write_port_report(base: &PortDriverBase, out: &mut dyn std::fmt::Write, level: i32) {
+    let _ = writeln!(out, "Port: {}", base.port_name);
+    if level >= 1 {
+        let ts = chrono::DateTime::<chrono::Local>::from(base.current_timestamp());
+        let _ = writeln!(out, "  Timestamp: {}", ts.format("%Y/%m/%d %H:%M:%S%.3f"));
+        base.report_params(out, level);
+    }
+    if level >= 3 {
+        for f in base.interrupts.clients() {
+            let iface = f.iface.map_or("any", |i| i.interrupt_label());
+            let addr = f.addr.map_or("any".to_string(), |a| a.to_string());
+            let reason = f.reason.map_or("any".to_string(), |r| r.to_string());
+            let _ = write!(
+                out,
+                "    {iface} callback client addr={addr}, reason={reason}"
+            );
+            if let Some(mask) = f.uint32_mask {
+                let _ = write!(out, ", mask=0x{mask:x}");
+            }
+            let _ = writeln!(out);
+        }
+    }
+}
+
 /// USB-CTR08 port driver.
 pub struct CtrDriver {
     base: PortDriverBase,
@@ -271,6 +299,35 @@ impl PortDriver for CtrDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C `USBCTR::report`: the timers, scaler and MCS state, then the
+    /// asynPortDriver report.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(out, "  Port: {}", self.base.port_name);
+        if level >= 1 {
+            let _ = writeln!(out, "  Pulse generators:");
+            for (i, running) in self.pulse_running.iter().enumerate() {
+                let _ = writeln!(out, "    {i}: Running:{}", u8::from(*running));
+            }
+            let st = self.state.lock().unwrap();
+            let _ = writeln!(out, "  numCounters: {}", st.num_counters);
+            let _ = writeln!(out, "  Scaler:");
+            let _ = writeln!(out, "    Running: {}", u8::from(st.scaler.running));
+            for i in 0..st.num_counters {
+                let _ = writeln!(
+                    out,
+                    "    {i}: preset={}, count={}",
+                    st.scaler.presets[i], st.scaler.counts[i]
+                );
+            }
+            let _ = writeln!(out, "  MCS:");
+            let _ = writeln!(out, "    Running: {}", u8::from(st.mcs.running));
+            let _ = writeln!(out, "    maxTimePoints: {}", self.max_time_points);
+            let _ = writeln!(out, "    MCSErased: {}", u8::from(st.mcs.erased));
+            let _ = writeln!(out, "    currentPoint: {}", st.mcs.current_point);
+        }
+        write_port_report(&self.base, out, level);
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {

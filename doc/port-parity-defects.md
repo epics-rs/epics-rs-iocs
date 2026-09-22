@@ -719,7 +719,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** with both boards attached, an empty UNIQUE_ID binds either IOC to whichever board enumerates first.
 - **Class:** ref-indep. **Live:** static (would contend for the attached boards).
 
-## PP-73 [LOW] No `report()` override in either driver — OPEN
+## PP-73 [LOW] No `report()` override in either driver — FIXED
 - **Rust:** neither `usb-ctr` nor `usb-2408` implements `PortDriver::report`.
 - **C:** `drvUSBCTR.cpp:1545-1570`, `drvMultiFunction.cpp:2856-2915`.
 - **Impact:** `asynReport` shows no pulse-gen/scaler/MCS/waveform runtime state.

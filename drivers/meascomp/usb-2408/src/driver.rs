@@ -23,6 +23,34 @@ fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
+/// What asyn-rs's default `PortDriver::report` prints, which an override
+/// cannot call (C `asynPortDriver::report`, asynPortDriver.cpp:3677-3710):
+/// the port, its timestamp and parameter library, and at level 3 its
+/// interrupt clients. This port has no octet interface, so no EOS lines.
+fn write_port_report(base: &PortDriverBase, out: &mut dyn std::fmt::Write, level: i32) {
+    let _ = writeln!(out, "Port: {}", base.port_name);
+    if level >= 1 {
+        let ts = chrono::DateTime::<chrono::Local>::from(base.current_timestamp());
+        let _ = writeln!(out, "  Timestamp: {}", ts.format("%Y/%m/%d %H:%M:%S%.3f"));
+        base.report_params(out, level);
+    }
+    if level >= 3 {
+        for f in base.interrupts.clients() {
+            let iface = f.iface.map_or("any", |i| i.interrupt_label());
+            let addr = f.addr.map_or("any".to_string(), |a| a.to_string());
+            let reason = f.reason.map_or("any".to_string(), |r| r.to_string());
+            let _ = write!(
+                out,
+                "    {iface} callback client addr={addr}, reason={reason}"
+            );
+            if let Some(mask) = f.uint32_mask {
+                let _ = write!(out, ", mask=0x{mask:x}");
+            }
+            let _ = writeln!(out);
+        }
+    }
+}
+
 /// USB-2408-2AO port driver.
 pub struct MultiFunctionDriver {
     base: PortDriverBase,
@@ -34,6 +62,9 @@ pub struct MultiFunctionDriver {
     /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
     /// `DPIOT_BITIO`). The USB-2408 reports `DPIOT_NONCONFIG`.
     dio_configurable: bool,
+    /// C `ADCResolution_` / `DACResolution_`, from the device.
+    adc_resolution: i64,
+    dac_resolution: i64,
 }
 
 impl MultiFunctionDriver {
@@ -99,6 +130,12 @@ impl MultiFunctionDriver {
             device.digital_port_io_type(0),
             Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
         );
+        let adc_resolution = device
+            .ai_get_info(uldaq_sys::AI_INFO_RESOLUTION, 0)
+            .unwrap_or(0);
+        let dac_resolution = device
+            .ao_get_info(uldaq_sys::AO_INFO_RESOLUTION, 0)
+            .unwrap_or(0);
 
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
         // The poller only pushes on a changed bit, and its one forced first
@@ -124,6 +161,8 @@ impl MultiFunctionDriver {
             max_input_points,
             max_output_points,
             dio_configurable,
+            adc_resolution,
+            dac_resolution,
         })
     }
 }
@@ -285,6 +324,53 @@ impl PortDriver for MultiFunctionDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C `MultiFunction::report`: the asynPortDriver report, then the board
+    /// and what this port drives on it.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        write_port_report(&self.base, out, level);
+        let board_type = self
+            .base
+            .get_int32_param(self.params.model_number, 0)
+            .unwrap_or(0);
+        let board_name = self
+            .base
+            .get_string_param(self.params.model_name, 0)
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "  Port: {}, board ID={board_type}, board type={board_name}",
+            self.base.port_name
+        );
+        if level >= 1 {
+            let _ = writeln!(out, "  analog inputs      = {MAX_ANALOG_IN}");
+            let _ = writeln!(out, "  analog input bits  = {}", self.adc_resolution);
+            let _ = writeln!(out, "  analog outputs     = {MAX_ANALOG_OUT}");
+            let _ = writeln!(out, "  analog output bits = {}", self.dac_resolution);
+            let _ = writeln!(out, "  temperature inputs = {MAX_ANALOG_IN}");
+            let _ = writeln!(out, "  digital I/O ports  = 1");
+            let _ = writeln!(out, "  digital I/O port     0");
+            let _ = writeln!(out, "    I/O port              = {}", uldaq_sys::AUXPORT);
+            let _ = writeln!(out, "    I/O bits              = {NUM_IO_BITS}");
+            let configurable = u8::from(self.dio_configurable);
+            let _ = writeln!(out, "    I/O bit configurable  = {configurable}");
+            let _ = writeln!(out, "    I/O port configurable = {configurable}");
+            let _ = writeln!(out, "    I/O port mask         = 0x{PORT_MASK:x}");
+            let _ = writeln!(out, "  timers             = 0");
+            let _ = write!(out, "  # counters         = {MAX_COUNTERS}");
+            let _ = write!(out, "  first counter      = 0");
+            let _ = write!(out, "  counterCounts = ");
+            for i in 0..MAX_COUNTERS as i32 {
+                let counts = self
+                    .base
+                    .get_int32_param(self.params.counter_value, i)
+                    .unwrap_or(0);
+                let _ = write!(out, " {counts}");
+            }
+            let _ = writeln!(out);
+        }
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
