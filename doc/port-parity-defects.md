@@ -675,7 +675,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **C:** `iocBoot/save_restore.cmd:23,28-34` per-IOC `autosave/` relative to each iocBoot dir.
 - **Impact:** nothing is ever saved or restored (the "restore across a restart" feature `0b243c7` is dead); when launched from an IOC dir both IOCs would write the same `auto_settings.sav` and restore each other's PVs.
 - **Class:** ref-indep. **Live:** confirmed — after ~9 min of changes on both IOCs with a 30 s monitor set, `iocs/meascomp/autosave/` is empty and `iocs/meascomp/*.req` does not exist.
-- **Second cause (found while fixing):** epics-rs 0.30 snapshots the autosave configuration when the script's `iocInit()` runs `perform_build` (`epics-base-rs` `ioc_app.rs:1088,1222`), so a `create_monitor_set` after `iocInit()` — C's usual order — is never scheduled. Same ordering in `iocs/d435i-ioc/st.d435i.cmd`, `st.d405.cmd`; all four moved before `iocInit()`. The framework-side deviation from C autosave stays open in epics-rs.
+- **Second cause (found while fixing):** epics-rs 0.30 snapshots the autosave configuration when the script's `iocInit()` runs `perform_build` (`epics-base-rs` `ioc_app.rs:1088,1222`), so a `create_monitor_set` after `iocInit()` — C's usual order — is never scheduled. Same ordering in `iocs/d435i-ioc/st.d435i.cmd`, `st.d405.cmd`; all four moved before `iocInit()`. The framework-side deviation from C autosave stays open in epics-rs. (epics-rs 0.30.1 adds a later set to the running manager; the four scripts are back in C's order in `491d9ba`.)
 
 ## PP-66 [MED] Output records lack the PINI C relies on; restored values never reach the driver — FIXED (FAMILY)
 - **Rust:** no PINI on `meascomp_pulse_gen.template:1` Run (also no OSV MINOR, not in `auto_settings.req`) and `:60` IdleState; `meascomp_counter.template:7` Reset (no `VAL 1`); `meascomp_binary_out.template:1` Bo (no PHAS 2); `meascomp_analog_out.template:1` Ao (no PHAS 2/VAL 0); `meascomp_temperature.template:34,41` Filter/OpenTCDetect; `meascomp_wave_dig.template:69-102` ExtTrigger/ExtClock/Continuous/AutoRestart/BurstMode; `meascomp_wave_gen.template:143-162` ExtTrigger/ExtClock/Continuous. epics-rs pass-1 restore writes VAL without processing (`save_set.rs:342-447`).
@@ -776,12 +776,13 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** libuldaq rejects the write (ERR_ALREADY_ACTIVE, `AoDevice.cpp:282-283`), so the device is unaffected, but the record shows no alarm and its VAL no longer matches the DAC.
 - **Class:** ref-faithful. **Live:** confirmed — `Ao1=40000` during a continuous run → "uldaq error 16: A background process is already in progress", record NO_ALARM.
 
-## PP-82 [MED] USB-2408 port declared non-blocking; C declares ASYN_CANBLOCK — DEFERRED (blocked on epics-rs)
+## PP-82 [MED] USB-2408 port declared non-blocking; C declares ASYN_CANBLOCK — FIXED (on epics-rs 0.30.1)
 - **Rust:** `driver.rs:48-52` `can_block: false`; writes do USB I/O and take the device mutex the poller holds for its whole sweep (`poller.rs:93-173`).
 - **C:** `drvMultiFunction.cpp:821` `ASYN_MULTIDEVICE | ASYN_CANBLOCK` (USBCTR deliberately omits it, `drvUSBCTR.cpp:259-260`).
 - **Impact:** a CA put or scan thread blocks for a poll sweep (tens of ms; ≈300 ms once PP-79 sets 60 S/s), and blocking USB I/O runs on a tokio worker.
 - **Class:** contract. **Live:** static.
 - **Why deferred (tried, reverted):** with `can_block: true` the port runs on asyn-rs's async write completion, which in 0.30 (a) never turns a failed write into WRITE_ALARM (`AsynAsyncWriteCompletion::wait`, `asyn-rs-0.30.0/src/adapter.rs:1017-1027`) and (b) discards a driver readback that arrives while the record is still PACT (`adapter.rs:406-418`). Live: a refused `Ao1` write during generation raised no alarm, and a refused `WaveGenRun`/`WaveDigRun` stayed at Run with `caput -c` timing out. That breaks PP-67 and every busy record's failure path, which is worse than a put blocking for one poll sweep. Re-apply once epics-rs completes async writes with the error and the pending readback, as C asyn's second process pass does.
+- **Resolved:** the lost alarm was epics-base-rs dropping `WriteCompletion::wait`'s result (`processing.rs:5581-5587`, `let _`), not the adapter; 0.30.1 carries it into the completing pass. Re-applied in `b74017e`. Live: a refused `Ao1` write during generation → WRITE/INVALID; `caput -c WaveDigRun 1` on a good run returns when the scan ends (0.56 s for 20 × 20 ms). A refused start (Dwell 1e-6 → DwellActual −9999) leaves `WaveDigRun` at Run with WRITE/INVALID and `caput -c` times out; that is C's behaviour, since C `writeInt32` sets `WAVEDIG_RUN` to the written 1 first (`drvMultiFunction.cpp:1948`) and `startWaveDig`'s failure return (`:1849`) never clears it, so (b) is not a gap here.
 
 ## PP-83 [LOW] Default thermocouple type K; C defaults to J — FIXED
 - **Rust:** `driver.rs:74` `TC_K`; `meascomp_temperature.template:19` `VAL 1`.
@@ -879,6 +880,12 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** `$(P)MCS:Asyn` TMSK/TIOM change a trace manager no port reads, and the record's exception subscription (`entry.trace.exception_manager()`) finds no exception list, so connect/enable changes never reach it.
 - **Class:** contract. **Live:** confirmed — before the fix `exceptionUsers 0` and `MCS:Asyn.TMSK` stayed 9 after `asynSetTraceMask USBCTR_1 -1 0x21`; after it `exceptionUsers 1`, TMSK reads back 33, and ENBL follows `asynEnable`.
 
+## PP-98 [LOW] Neither driver prints C's asynPrint trace lines — OPEN
+- **Rust:** `usb-ctr`, `usb-2408` report through `log` only and never call `PortDriverBase::trace_print`.
+- **C:** 20 `asynPrint` sites: `drvUSBCTR.cpp:492,658,748,968,988,1220,1385` (TRACE_FLOW) and `:1246,1308,1360` (TRACEIO_DRIVER); `drvMultiFunction.cpp:1476,1694,1853,1896` (TRACE_FLOW) and `:1304,2203,2320,2419,2672,2709` (TRACEIO_DRIVER).
+- **Impact:** `asynSetTraceMask <port> -1 DRIVER|FLOW` shows only epics-rs's own lines; the written values, scan starts and poll readings C traces never appear.
+- **Class:** unimpl. **Live:** confirmed on epics-rs 0.30.1 — mask 0x9 on USBCTR_1 (port and addr 0), an MCS Dwell write printed no line.
+
 ## Live hardware verification (2026-09-22)
 
 IOCs: `usb-ctr-ioc` (CA 5064) and `usb-2408-ioc` (CA 5074), release build of
@@ -960,7 +967,8 @@ PP-65 `f60b81d`, PP-66 `efef6aa`, PP-67 `727e73d`, PP-68 `dc44c68`, PP-69
 `e338622`, PP-96 `7551c48`, PP-97 `b2f2e7c`.
 
 usb-2408: PP-78 `23ade62`, PP-79 `b45a9da`, PP-80 `c28f62d`, PP-81
-`d1ebb1d`, PP-82 `6e11d4a` reverted by `42d59c9` (DEFERRED), PP-83
+`d1ebb1d`, PP-82 `6e11d4a` reverted by `42d59c9`, re-applied `b74017e` on
+epics-rs 0.30.1, PP-83
 `a6e5837`, PP-84 `51893c9`, PP-85 `e3bbb8c`, PP-86 `e9e8f74`, PP-87
 `d4382e3`, PP-88 `0b52fd5`, PP-89 `e80c12a`, PP-90 `23e8da3`, PP-91
 `4f58cae`, PP-92 `652452d`, PP-93 `8895b1f`, PP-94 `5e65b23`, PP-95
@@ -989,3 +997,33 @@ Outside meascomp, the PP-96/97 anchors also hit other IOC mains:
 twincat-ads, and 12 more mains register ports with a fresh
 `TraceManager::new()`. Not classified in this round.
 
+## Review Log — 2026-09-22 (epics-rs 0.30.1)
+
+0.30.1 closes the seven items this port filed, and all seven hold on the
+boards: `asynReport` with no per-main registration and `nDevices 9` on
+USBCTR_1; the asyn record's TMSK landing on addr 0 and reading back the
+shell's mask, `exceptionUsers 1`, ENBL following `asynEnable`; FLOW and
+TRACEIO_DEVICE lines; `create_monitor_set` after iocInit writing its `.sav`;
+HardwareAcquiring seeing the 1 of a complete-run start; a refused `Ao1`
+write on the now CANBLOCK 2408 in WRITE/INVALID. The workspace moves in
+`3e4a079` (`register_port` loses its trace argument, 38 calls), `eeb8b30`
+binds every main's asyn commands to `PortManager::global()`, `491d9ba`
+returns the autosave sets to after iocInit, and `b74017e` re-applies PP-82.
+
+Found against 0.30.1, open in epics-rs:
+- On a non-blocking asyn port every output write reaches the driver twice.
+  `write_begin` completes it with `submit_blocking` and returns `Ok(None)`
+  (asyn-rs `adapter.rs:2653-2658`); epics-base-rs reads `Ok(None)` as "no
+  async support" and calls `write()` (`processing.rs:5615-5616`), which
+  submits again (`adapter.rs:2550`). On USBCTR_1 one Period put restarts
+  the pulse generator twice and one DoStartAll delivers MCA_ACQUIRING
+  1,0,1,0 (an I/O Intr probe counted 4 processes). Present in 0.30.0 as
+  well, where the coalescing mailbox hid the second pulse.
+- `asynSetTrace*` set the mask on the registering `PortManager`'s trace
+  (`iocsh.rs:1053`), not the named port's `PortHandle::trace()`, so an IOC
+  that registers the commands with its own manager misses every driver port.
+- `PortServices::new(trace)` re-points the passed trace's exception sink
+  (`services.rs:44-47`); services built on a shared trace detach it from the
+  global exception list (quadem's octet commands did; fixed in `eeb8b30`).
+
+PP-98 (the drivers' missing asynPrint lines) is new and open.
