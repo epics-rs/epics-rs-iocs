@@ -964,10 +964,15 @@ impl PortDriver for MultiFunctionDriver {
         } else if reason == self.params.thermocouple_open_detect && self.is_thermocouple(addr) {
             let dev = self.device.lock().unwrap();
             last_error = self.set_open_detect(&dev, addr);
-        } else if reason == self.params.trigger_mode && is_supported_trigger_mode(value) {
+        } else if reason == self.params.trigger_mode {
             // Cached for the scans, as C's Linux build caches it
-            // (drvMultiFunction.cpp:2073-2083).
-            self.info("writeInt32", "Setting trigger mode");
+            // (drvMultiFunction.cpp:2073-2083); a mode mapTriggerType has no
+            // uldaq trigger for is refused as C refuses it.
+            if is_supported_trigger_mode(value) {
+                self.info("writeInt32", "Setting trigger mode");
+            } else {
+                last_error = Some(format!("unsupported trigger mode {value}"));
+            }
         } else if reason == self.params.wave_dig_trigger_count {
             self.info("writeInt32", "Setting waveDig trigger count");
         } else if reason == self.params.wave_gen_trigger_count {
