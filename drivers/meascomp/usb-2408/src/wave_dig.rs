@@ -296,6 +296,20 @@ pub fn waveform_updates(params: &MultiFunctionParams, state: &WaveDigState) -> V
     updates
 }
 
+/// A time base over `num_points` at `dwell` into `buffer`, as the array
+/// callback on `reason` -- how every digitizer and generator time axis is
+/// published, from the requested dwell when one is written and from the
+/// dwell the device runs at when a scan starts (upstream-c-defects #230).
+pub fn time_update(
+    buffer: &mut [f32],
+    reason: usize,
+    num_points: usize,
+    dwell: f64,
+) -> ParamSetValue {
+    let n = compute_times(buffer, num_points, dwell);
+    ParamSetValue::new(reason, 0, ParamValue::Float32Array(buffer[..n].into()))
+}
+
 /// C `computeWaveDigTimes` / `computeWaveGenTimes`: the relative time base
 /// `i * dwell` over `num_points`, bounded by the buffer. Returns the number
 /// of points written, which is also the length of the array callback.
@@ -310,6 +324,20 @@ pub fn compute_times(buffer: &mut [f32], num_points: usize, dwell: f64) -> usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_time_update_carries_the_axis_it_computed() {
+        let mut buf = [9.0f32; 4];
+        match time_update(&mut buf, 7, 3, 0.5) {
+            ParamSetValue::Value {
+                reason: 7,
+                addr: 0,
+                value: ParamValue::Float32Array(axis),
+            } => assert_eq!(&axis[..], &[0.0, 0.5, 1.0]),
+            _ => panic!("not a Float32Array update on reason 7"),
+        }
+        assert_eq!(buf, [0.0, 0.5, 1.0, 9.0]);
+    }
 
     #[test]
     fn absolute_time_counts_from_the_epics_epoch() {

@@ -171,7 +171,8 @@ record(bo, "$(P)MCS:ClearReadAll") {
 }
 
 # Time bases. The relative one is pushed by the driver whenever Dwell is
-# written (C computeMCSTimes); the absolute one is read with the spectra.
+# written (C computeMCSTimes), and again with the dwell the clock runs at when
+# a scan starts; the absolute one is read with the spectra.
 record(waveform, "$(P)MCS:TimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)MCS_TIME_WF")

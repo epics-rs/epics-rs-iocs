@@ -133,7 +133,8 @@ record(longout, "$(P)WaveDigTriggerCount") {
     field(PINI, "YES")
 }
 
-# Time base, recomputed by the driver whenever a scan starts.
+# Time base: from Dwell when Dwell or NumPoints is written, and again from
+# the dwell the device runs at (DwellActual) when a scan starts.
 record(waveform, "$(P)WaveDigTimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEDIG_TIME_WF")

@@ -275,6 +275,23 @@ impl CtrDriver {
         Ok(())
     }
 
+    /// C `computeMCSTimes`: MCS_TIME_WF over the configured points at
+    /// `dwell`. Called whenever MCA_DWELL_TIME is written -- by a client, and
+    /// by the scan start with the dwell the clock actually runs, which C
+    /// writes back without recomputing the axis (upstream-c-defects #230).
+    fn publish_mcs_times(&mut self, mcs: &mut McsState, dwell: f64) -> AsynResult<()> {
+        let num_points = self
+            .base
+            .get_int32_param(self.params.mca_num_channels, 0)?
+            .max(0) as usize;
+        let n = mcs::compute_times(mcs, num_points, dwell);
+        self.base.params.set_value(
+            self.params.mcs_time_wf,
+            0,
+            ParamValue::Float32Array(mcs.time_buffer[..n].into()),
+        )
+    }
+
     /// Log a failure and publish it on LAST_ERROR_MESSAGE. It reaches the
     /// record as asynError only through [`CtrDriver::finish_write`].
     fn report_error(&mut self, msg: String) {
@@ -482,9 +499,11 @@ impl PortDriver for CtrDriver {
                 ) {
                     self.report_error(format!("start_mcs error: {e}"));
                 }
+                let actual_dwell = st.mcs.dwell_time;
                 self.base
                     .params
-                    .set_float64(self.params.mca_dwell_time, 0, st.mcs.dwell_time)?;
+                    .set_float64(self.params.mca_dwell_time, 0, actual_dwell)?;
+                self.publish_mcs_times(&mut st.mcs, actual_dwell)?;
                 self.base
                     .params
                     .set_int32(self.params.mcs_current_point, 0, 0)?;
@@ -664,20 +683,9 @@ impl PortDriver for CtrDriver {
         } else if reason == self.params.mca_dwell_time {
             // C computeMCSTimes: the time base follows the dwell as soon as
             // it is written, not only once a scan starts.
-            let num_points = self
-                .base
-                .get_int32_param(self.params.mca_num_channels, 0)?
-                .max(0) as usize;
-            let times = {
-                let mut st = self.state.lock().unwrap();
-                let n = mcs::compute_times(&mut st.mcs, num_points, value);
-                st.mcs.time_buffer[..n].to_vec()
-            };
-            self.base.params.set_value(
-                self.params.mcs_time_wf,
-                0,
-                ParamValue::Float32Array(times.into()),
-            )?;
+            let state = self.state.clone();
+            let mut st = state.lock().unwrap();
+            self.publish_mcs_times(&mut st.mcs, value)?;
         }
 
         self.finish_write(

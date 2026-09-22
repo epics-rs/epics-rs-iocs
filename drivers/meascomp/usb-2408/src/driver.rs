@@ -495,6 +495,25 @@ impl MultiFunctionDriver {
                 generator.dwell_actual
             ),
         );
+        // The axis of the waveform now playing follows the dwell it plays
+        // at, which the device may have rounded (upstream-c-defects #230).
+        let (time_buffer, time_wf) = if first_is_user {
+            (
+                &mut generator.user_time_buffer,
+                self.params.wave_gen_user_time_wf,
+            )
+        } else {
+            (
+                &mut generator.int_time_buffer,
+                self.params.wave_gen_int_time_wf,
+            )
+        };
+        updates.push(wave_dig::time_update(
+            time_buffer,
+            time_wf,
+            num_points,
+            generator.dwell_actual,
+        ));
         self.base
             .params
             .set_float64(self.params.wave_gen_dwell_actual, 0, generator.dwell_actual)
@@ -546,7 +565,12 @@ impl MultiFunctionDriver {
     /// C `startWaveDig`: read every digitizer setting and start the scan,
     /// publishing the actual dwell and total time -- or, when the device
     /// refuses, the dwell C reports for that (see [`wave_dig::start_wave_dig`]).
-    fn start_digitizer(&mut self, dev: &DaqDevice, dig: &mut WaveDigState) -> Result<(), String> {
+    fn start_digitizer(
+        &mut self,
+        dev: &DaqDevice,
+        dig: &mut WaveDigState,
+        updates: &mut Vec<ParamSetValue>,
+    ) -> Result<(), String> {
         let get_i32 = |base: &PortDriverBase, reason| {
             base.get_int32_param(reason, 0).map_err(|e| e.to_string())
         };
@@ -623,6 +647,15 @@ impl MultiFunctionDriver {
                         s.dwell_actual * num_points as f64,
                     )
                     .map_err(|e| e.to_string())?;
+                // The time axis of the samples this scan takes follows the
+                // dwell it runs at, not the one asked for (upstream-c-defects
+                // #230).
+                updates.push(wave_dig::time_update(
+                    &mut dig.time_buffer,
+                    self.params.wave_dig_time_wf,
+                    num_points,
+                    s.dwell_actual,
+                ));
                 Ok(())
             }
             Err(e) => Err(format!("start_wave_dig error: {}", e.message)),
@@ -656,7 +689,7 @@ impl MultiFunctionDriver {
             .unwrap_or(0)
             != 0;
         if auto_restart {
-            return self.start_digitizer(dev, dig).err();
+            return self.start_digitizer(dev, dig, updates).err();
         }
         None
     }
@@ -674,11 +707,11 @@ impl MultiFunctionDriver {
             .get_float64_param(self.params.wave_dig_dwell, 0)
             .unwrap_or(0.0);
         let mut st = self.state.lock().unwrap();
-        let n = wave_dig::compute_times(&mut st.wave_dig.time_buffer, num_points, dwell);
-        ParamSetValue::new(
+        wave_dig::time_update(
+            &mut st.wave_dig.time_buffer,
             self.params.wave_dig_time_wf,
-            0,
-            ParamValue::Float32Array(st.wave_dig.time_buffer[..n].into()),
+            num_points,
+            dwell,
         )
     }
 
@@ -696,19 +729,20 @@ impl MultiFunctionDriver {
             get_dwell(self.params.wave_gen_int_dwell),
         );
         let mut st = self.state.lock().unwrap();
-        let n = wave_dig::compute_times(&mut st.wave_gen.user_time_buffer, user.0, user.1);
-        let user_wf = ParamSetValue::new(
-            self.params.wave_gen_user_time_wf,
-            0,
-            ParamValue::Float32Array(st.wave_gen.user_time_buffer[..n].into()),
-        );
-        let n = wave_dig::compute_times(&mut st.wave_gen.int_time_buffer, int.0, int.1);
-        let int_wf = ParamSetValue::new(
-            self.params.wave_gen_int_time_wf,
-            0,
-            ParamValue::Float32Array(st.wave_gen.int_time_buffer[..n].into()),
-        );
-        vec![user_wf, int_wf]
+        vec![
+            wave_dig::time_update(
+                &mut st.wave_gen.user_time_buffer,
+                self.params.wave_gen_user_time_wf,
+                user.0,
+                user.1,
+            ),
+            wave_dig::time_update(
+                &mut st.wave_gen.int_time_buffer,
+                self.params.wave_gen_int_time_wf,
+                int.0,
+                int.1,
+            ),
+        ]
     }
 
     /// C `isThermocouple`: `chan` is configured as a thermocouple input. The
@@ -984,7 +1018,7 @@ impl PortDriver for MultiFunctionDriver {
             // C parity (drvMultiFunction.cpp:2086-2091): start only when idle,
             // stop only when running.
             if value != 0 && !st.wave_dig.running {
-                if let Err(e) = self.start_digitizer(&dev, &mut st.wave_dig) {
+                if let Err(e) = self.start_digitizer(&dev, &mut st.wave_dig, &mut wave_arrays) {
                     last_error = Some(e);
                     self.base.params.set_int32(reason, addr, 0)?;
                 }

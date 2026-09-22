@@ -127,6 +127,9 @@ record(calcout, "$(P)WaveGenCalcIntDwell") {
     field(OUT,  "$(P)WaveGenIntDwell.VAL  PP MS")
 }
 
+# Time bases of the user and internal waveforms: from their Dwell when it is
+# written, and the one in use again from the dwell the generator runs at when
+# a scan starts.
 record(waveform, "$(P)WaveGenUserTimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_USER_TIME_WF")
