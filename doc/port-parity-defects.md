@@ -880,11 +880,18 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** `$(P)MCS:Asyn` TMSK/TIOM change a trace manager no port reads, and the record's exception subscription (`entry.trace.exception_manager()`) finds no exception list, so connect/enable changes never reach it.
 - **Class:** contract. **Live:** confirmed — before the fix `exceptionUsers 0` and `MCS:Asyn.TMSK` stayed 9 after `asynSetTraceMask USBCTR_1 -1 0x21`; after it `exceptionUsers 1`, TMSK reads back 33, and ENBL follows `asynEnable`.
 
-## PP-98 [LOW] Neither driver prints C's asynPrint trace lines — OPEN
+## PP-98 [LOW] Neither driver prints C's asynPrint trace lines — FIXED
 - **Rust:** `usb-ctr`, `usb-2408` report through `log` only and never call `PortDriverBase::trace_print`.
-- **C:** 20 `asynPrint` sites: `drvUSBCTR.cpp:492,658,748,968,988,1220,1385` (TRACE_FLOW) and `:1246,1308,1360` (TRACEIO_DRIVER); `drvMultiFunction.cpp:1476,1694,1853,1896` (TRACE_FLOW) and `:1304,2203,2320,2419,2672,2709` (TRACEIO_DRIVER).
+- **C:** 22 `asynPrint` sites: `drvUSBCTR.cpp:492,658,748,968,988,1220,1385,1407,1419` (TRACE_FLOW) and `:1246,1308,1360` (TRACEIO_DRIVER); `drvMultiFunction.cpp:1476,1694,1853,1896` (TRACE_FLOW) and `:1304,2203,2320,2419,2672,2709` (TRACEIO_DRIVER), `:1304` being `reportError`'s Info line behind 32 success paths. `drvUSBCTR.cpp:658` is Windows-only and `drvMultiFunction.cpp:1476` is the pulse generator the USB-2408 lacks.
 - **Impact:** `asynSetTraceMask <port> -1 DRIVER|FLOW` shows only epics-rs's own lines; the written values, scan starts and poll readings C traces never appear.
 - **Class:** unimpl. **Live:** confirmed on epics-rs 0.30.1 — mask 0x9 on USBCTR_1 (port and addr 0), an MCS Dwell write printed no line.
+- **Fixed:** `c45603e`. Live with mask 0x19 on both ports: each C line appears in C's wording (pulse start, write lines, erase, `readMCS`/`readScaler` getStatus, both `readInt32Array` lines, scaler read; on the 2408 the Info lines of AOut, data rate, input mode/type, TC type, open detect, trigger count, DOut/DBitOut, AOutScan/ALoadQueue/AInScan, stop lines, generator/digitizer status, `readWaveDig`, `Calling TIn`). Each CTR write line appears twice: that is epics-rs #112, which the trace now shows directly.
+
+## PP-99 [LOW] USB-2408 stores a TRIGGER_MODE that C refuses — FIXED
+- **Rust:** `driver.rs` `write_int32` stored any TRIGGER_MODE value.
+- **C:** `writeInt32` → `mapTriggerType` returns −1 for the two hysteresis gates and anything outside 0..19 (`drvMultiFunction.cpp:1405-1435`), and the write returns asynError (`:2211`).
+- **Impact:** none today (no USB-2408 record writes TRIGGER_MODE); a future one would take an unmappable mode without an alarm.
+- **Class:** ref-faithful. **Live:** static. **Fixed:** `7ef4286`.
 
 ## Live hardware verification (2026-09-22)
 
@@ -964,11 +971,11 @@ Shared / db: PP-60 `a694cfe`, PP-62 `3222e3a`, PP-64 `547e35e` + `85dd909`,
 PP-65 `f60b81d`, PP-66 `efef6aa`, PP-67 `727e73d`, PP-68 `dc44c68`, PP-69
 `85f7f1c`, PP-70 `509e846`, PP-71 `38f6abe`, PP-72 `19b9eb0`, PP-73
 `fa23aea`, PP-74 `c9fb56e`, PP-75 `f2eb9b3`, PP-76 `846c75c`, PP-77
-`e338622`, PP-96 `7551c48`, PP-97 `b2f2e7c`.
+`e338622`, PP-96 `7551c48`, PP-97 `b2f2e7c`, PP-98 `c45603e`.
 
 usb-2408: PP-78 `23ade62`, PP-79 `b45a9da`, PP-80 `c28f62d`, PP-81
 `d1ebb1d`, PP-82 `6e11d4a` reverted by `42d59c9`, re-applied `b74017e` on
-epics-rs 0.30.1, PP-83
+epics-rs 0.30.1, PP-99 `7ef4286`, PP-83
 `a6e5837`, PP-84 `51893c9`, PP-85 `e3bbb8c`, PP-86 `e9e8f74`, PP-87
 `d4382e3`, PP-88 `0b52fd5`, PP-89 `e80c12a`, PP-90 `23e8da3`, PP-91
 `4f58cae`, PP-92 `652452d`, PP-93 `8895b1f`, PP-94 `5e65b23`, PP-95
@@ -1027,4 +1034,5 @@ order):
   (`services.rs:44-47`); services built on a shared trace detach it from the
   global exception list (quadem's octet commands did; fixed in `eeb8b30`).
 
-PP-98 (the drivers' missing asynPrint lines) is new and open.
+PP-98 (the drivers' missing asynPrint lines) is new; fixed in `c45603e`,
+with PP-99 (`7ef4286`) found while porting its trigger-mode line.
