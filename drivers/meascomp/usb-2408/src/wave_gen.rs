@@ -68,21 +68,36 @@ pub const WAVE_TYPE_SAWTOOTH: i32 = 3;
 pub const WAVE_TYPE_PULSE: i32 = 4;
 pub const WAVE_TYPE_RANDOM: i32 = 5;
 
+/// One channel's internal-waveform settings, read from its WaveGen records.
+#[derive(Clone, Copy, Debug)]
+pub struct WaveShape {
+    pub wave_type: i32,
+    /// Peak-to-peak volts.
+    pub amplitude: f64,
+    pub offset: f64,
+    /// Pulse width and delay, in seconds.
+    pub pulse_width: f64,
+    pub pulse_delay: f64,
+    /// WAVEGEN_INT_DWELL: the pulse times are counted in samples of it.
+    pub dwell: f64,
+}
+
 /// Generate an internal waveform of the given type.
 ///
 /// `amplitude` is peak-to-peak, as C `defineWaveform` takes it: sin, square,
 /// sawtooth and random span `offset +/- amplitude/2`; the pulse goes from
 /// `offset` to `offset + amplitude`. Samples are `f32`, C's
 /// `waveGenIntBuffer_` precision, so the DAC codes they convert to match.
-pub fn generate_waveform(
-    wave_type: i32,
-    num_points: usize,
-    amplitude: f64,
-    offset: f64,
-    pulse_width: f64,
-) -> Vec<f32> {
+pub fn generate_waveform(shape: &WaveShape, num_points: usize) -> Vec<f32> {
+    let WaveShape {
+        wave_type,
+        amplitude,
+        offset,
+        pulse_width,
+        pulse_delay,
+        dwell,
+    } = *shape;
     let mut data = vec![0.0f32; num_points];
-    let n = num_points as f64;
     let base = offset - amplitude / 2.0;
     // C divides by numPoints-1 so the sine's last point closes the period and
     // the sawtooth ends exactly at base + amplitude; a 1-point waveform keeps
@@ -112,9 +127,27 @@ pub fn generate_waveform(
             }
         }
         WAVE_TYPE_PULSE => {
-            let pulse_samples = ((pulse_width * n) as usize).max(1).min(num_points);
+            // C: width and delay are times, rounded to whole samples of the
+            // internal dwell, and at least one sample is left low
+            // (drvMultiFunction.cpp:1556-1566).
+            let n = num_points as i64;
+            let mut n_pulse = (pulse_width / dwell + 0.5) as i64;
+            let mut n_delay = (pulse_delay / dwell + 0.5) as i64;
+            if n_pulse < 1 {
+                n_pulse = 1;
+            }
+            if n_pulse >= n - 1 {
+                n_pulse = n - 1;
+            }
+            if n_delay + n_pulse >= n - 1 {
+                n_delay = n - n_pulse - 1;
+            }
+            if n_delay < 0 {
+                n_delay = 0;
+            }
             for (i, d) in data.iter_mut().enumerate() {
-                *d = if i < pulse_samples {
+                let i = i as i64;
+                *d = if i >= n_delay && i < n_delay + n_pulse {
                     (offset + amplitude) as f32
                 } else {
                     offset as f32
@@ -316,6 +349,37 @@ pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
 mod tests {
     use super::*;
 
+    fn shape(
+        wave_type: i32,
+        amplitude: f64,
+        offset: f64,
+        pulse_width: f64,
+        pulse_delay: f64,
+        dwell: f64,
+    ) -> WaveShape {
+        WaveShape {
+            wave_type,
+            amplitude,
+            offset,
+            pulse_width,
+            pulse_delay,
+            dwell,
+        }
+    }
+
+    #[test]
+    fn a_pulse_is_timed_in_samples_of_the_dwell_after_its_delay() {
+        // 0.25 s wide after 0.2 s at 0.1 s per sample: 2 low, 3 high, rest low.
+        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 0.25, 0.2, 0.1), 10);
+        assert_eq!(data, vec![0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_delay_never_pushes_the_pulse_off_the_end() {
+        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 2.0, 10.0, 1.0), 6);
+        assert_eq!(data, vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+    }
+
     #[test]
     fn dac_conversion_spans_the_bipolar_range() {
         let mut data = [-10.0, 0.0, 10.0];
@@ -337,7 +401,7 @@ mod tests {
     fn an_unset_wave_type_is_all_zeros() {
         // WAVE_TYPE_USER has no internal shape: the driver fills it from
         // WAVEGEN_USER_WF, and an unwritten one must stay at 0 V.
-        let data = generate_waveform(WAVE_TYPE_USER, 8, 5.0, 1.0, 0.5);
+        let data = generate_waveform(&shape(WAVE_TYPE_USER, 5.0, 1.0, 0.5, 0.0, 1.0), 8);
         assert_eq!(data, vec![0.0; 8]);
     }
 
@@ -353,14 +417,14 @@ mod tests {
 
     #[test]
     fn a_sawtooth_ends_at_the_top_of_its_span() {
-        let data = generate_waveform(WAVE_TYPE_SAWTOOTH, 4, 2.0, 0.0, 0.5);
+        let data = generate_waveform(&shape(WAVE_TYPE_SAWTOOTH, 2.0, 0.0, 0.5, 0.0, 1.0), 4);
         assert_eq!(data[0], -1.0);
         assert_eq!(data[3], 1.0);
     }
 
     #[test]
     fn a_sine_period_closes_on_its_last_point() {
-        let data = generate_waveform(WAVE_TYPE_SIN, 5, 2.0, 0.0, 0.5);
+        let data = generate_waveform(&shape(WAVE_TYPE_SIN, 2.0, 0.0, 0.5, 0.0, 1.0), 5);
         assert!(data[4].abs() < 1e-6, "last point {}", data[4]);
         assert!((data[1] - 1.0).abs() < 1e-6, "quarter period {}", data[1]);
     }
@@ -368,20 +432,20 @@ mod tests {
     #[test]
     fn a_square_wave_is_half_high_half_low_around_the_offset() {
         // 2 V peak-to-peak about 1 V: 2 V then 0 V (C base + amplitude, base).
-        let data = generate_waveform(WAVE_TYPE_SQUARE, 4, 2.0, 1.0, 0.5);
+        let data = generate_waveform(&shape(WAVE_TYPE_SQUARE, 2.0, 1.0, 0.5, 0.0, 1.0), 4);
         assert_eq!(data, vec![2.0, 2.0, 0.0, 0.0]);
     }
 
     #[test]
     fn a_sine_swings_half_the_amplitude_about_the_offset() {
-        let data = generate_waveform(WAVE_TYPE_SIN, 5, 2.0, 0.0, 0.5);
+        let data = generate_waveform(&shape(WAVE_TYPE_SIN, 2.0, 0.0, 0.5, 0.0, 1.0), 5);
         let peak = data.iter().cloned().fold(f32::MIN, f32::max);
         assert!((peak - 1.0).abs() < 1e-6, "peak {peak}");
     }
 
     #[test]
     fn a_sawtooth_starts_half_the_amplitude_below_the_offset() {
-        let data = generate_waveform(WAVE_TYPE_SAWTOOTH, 4, 2.0, 0.0, 0.5);
+        let data = generate_waveform(&shape(WAVE_TYPE_SAWTOOTH, 2.0, 0.0, 0.5, 0.0, 1.0), 4);
         assert!(data.iter().all(|v| (-1.0..=1.0).contains(v)));
     }
 
@@ -389,15 +453,15 @@ mod tests {
     fn a_pulse_is_at_least_one_sample_wide() {
         // A pulse width that rounds to zero samples must still produce a
         // pulse, not a flat line at the offset.
-        let data = generate_waveform(WAVE_TYPE_PULSE, 10, 1.0, 0.0, 0.0);
+        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 0.0, 0.0, 1.0), 10);
         assert_eq!(data[0], 1.0);
         assert_eq!(&data[1..], &[0.0; 9]);
     }
 
     #[test]
-    fn a_pulse_wider_than_the_waveform_stays_high() {
-        let data = generate_waveform(WAVE_TYPE_PULSE, 4, 1.0, 0.0, 2.0);
-        assert_eq!(data, vec![1.0; 4]);
+    fn a_pulse_wider_than_the_waveform_leaves_one_sample_low() {
+        let data = generate_waveform(&shape(WAVE_TYPE_PULSE, 1.0, 0.0, 10.0, 0.0, 1.0), 4);
+        assert_eq!(data, vec![1.0, 1.0, 1.0, 0.0]);
     }
 
     #[test]
@@ -409,7 +473,7 @@ mod tests {
             WAVE_TYPE_PULSE,
             WAVE_TYPE_RANDOM,
         ] {
-            let data = generate_waveform(wave_type, 1, 1.0, 0.0, 0.5);
+            let data = generate_waveform(&shape(wave_type, 1.0, 0.0, 0.5, 0.0, 1.0), 1);
             assert_eq!(data.len(), 1);
             assert!(data[0].is_finite());
         }

@@ -718,9 +718,12 @@ impl PortDriver for MultiFunctionDriver {
                         let offset = self
                             .base
                             .get_float64_param(self.params.wave_gen_offset, ch)?;
-                        let pw = self
+                        let pulse_width = self
                             .base
                             .get_float64_param(self.params.wave_gen_pulse_width, ch)?;
+                        let pulse_delay = self
+                            .base
+                            .get_float64_param(self.params.wave_gen_pulse_delay, ch)?;
                         if wave_type == wave_gen::WAVE_TYPE_USER {
                             // A user waveform shorter than the scan is repeated;
                             // an absent one leaves the channel at zero volts.
@@ -732,10 +735,20 @@ impl PortDriver for MultiFunctionDriver {
                             });
                         } else {
                             per_chan.push(
-                                wave_gen::generate_waveform(wave_type, num_points, amp, offset, pw)
-                                    .into_iter()
-                                    .map(f64::from)
-                                    .collect(),
+                                wave_gen::generate_waveform(
+                                    &wave_gen::WaveShape {
+                                        wave_type,
+                                        amplitude: amp,
+                                        offset,
+                                        pulse_width,
+                                        pulse_delay,
+                                        dwell,
+                                    },
+                                    num_points,
+                                )
+                                .into_iter()
+                                .map(f64::from)
+                                .collect(),
                             );
                         }
                     }

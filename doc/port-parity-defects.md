@@ -814,7 +814,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** with only WaveGen1 enabled, every stop drives AO2 to DAC code 0 (−10 V) or a stale value, silently overriding Ao2 while its record shows the old value.
 - **Class:** ref-indep. **Live:** static (output not observable); this session's one-shot and continuous runs with WaveGen2 disabled would have driven AO2 to code 0 on stop — AO2 was re-written to 32768 afterwards.
 
-## PP-88 [MED] Pulse width treated as a fraction; PULSE_DELAY ignored — OPEN (regression of PP-41, fix never merged)
+## PP-88 [MED] Pulse width treated as a fraction; PULSE_DELAY ignored — FIXED (regression of PP-41, fix never merged)
 - **Rust:** `wave_gen.rs:96-105` `pulse_samples = pulse_width * n`, high from sample 0; `driver.rs:536-551` never reads `WAVEGEN_PULSE_DELAY`.
 - **C:** `drvMultiFunction.cpp:1557-1565` `nPulse = pulseWidth/dwell + 0.5`, `nDelay = pulseDelay/dwell + 0.5`, clamped to leave ≥ 1 low sample.
 - **Impact:** wrong pulse length, no delay, all-high when width ≥ period.
