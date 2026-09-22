@@ -289,7 +289,7 @@ impl PortDriver for CtrDriver {
         Ok(n)
     }
 
-    /// MCS absolute time base (seconds since the epoch, per acquired point).
+    /// MCS absolute time base (seconds past the EPICS epoch, per acquired point).
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
         if user.reason != self.params.mcs_abs_time_wf {
             return Ok(0);

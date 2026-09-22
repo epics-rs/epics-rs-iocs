@@ -698,7 +698,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** PollTimeMS reads far below PollSleepMS; `PollSleepMS=0.5` busy-loops.
 - **Class:** contract. **Live:** confirmed — PollSleepMS 50, PollTimeMS 1.65 (CTR) / 28.6 (2408).
 
-## PP-70 [MED] Absolute-time waveforms use the Unix epoch instead of the EPICS epoch (both drivers) — OPEN
+## PP-70 [MED] Absolute-time waveforms use the Unix epoch instead of the EPICS epoch (both drivers) — FIXED
 - **Rust:** `usb-2408/src/wave_dig.rs:215,275-280`, `usb-ctr/src/mcs.rs:279-284` `duration_since(UNIX_EPOCH)`.
 - **C:** `drvMultiFunction.cpp:2716-2726`, `drvUSBCTR.cpp:782` `now.secPastEpoch + nsec/1e9` (1990 epoch).
 - **Impact:** every AbsTimeWF element is +631152000 s off C.
