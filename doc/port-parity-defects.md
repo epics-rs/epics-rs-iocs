@@ -738,7 +738,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** C OPIs/clients lose these readbacks. Driver-side gaps behind some of them are PP-57, PP-63, PP-79, PP-93.
 - **Class:** unimpl. **Live:** confirmed not found: `USBCTR:MCS:Model`, `USBCTR:Bo1_RBV`, `USB2408:Bo1_RBV`, `USB2408:WaveGen1InternalWF`, `USB2408:Ai1Rate`.
 
-## PP-76 [LOW] Record names and state strings diverge from the C templates — OPEN
+## PP-76 [LOW] Record names and state strings diverge from the C templates — FIXED
 - **Rust:** `meascomp_wave_gen.template:16` `WaveGenFreq`; `meascomp_wave_gen_n.template:4` `$(R)WaveType` ("User/Sin/…"); bo states "Off/On" on WaveDig/WaveGen ExtTrigger/ExtClock/AutoRestart/BurstMode, WaveGen Enable, Ti OpenTCDetect; TCType "J".."N".
 - **C:** `measCompWaveformGen.template:78` `Frequency`; `measCompWaveformGenN.template:39-56` `$(R)Type` ("Sin wave", …); "Internal/External", "Disable/Enable"; "Type J".."Type N".
 - **Impact:** C OPIs, scripts and autosave files fail against the Rust IOC.

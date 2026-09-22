@@ -217,13 +217,13 @@ $(P)WaveGenRetrigger
 $(P)WaveGenTriggerCount
 
 $(P)WaveGen1Enable
-$(P)WaveGen1WaveType
+$(P)WaveGen1Type
 $(P)WaveGen1PulseWidth
 $(P)WaveGen1PulseDelay
 $(P)WaveGen1Amplitude
 $(P)WaveGen1Offset
 $(P)WaveGen2Enable
-$(P)WaveGen2WaveType
+$(P)WaveGen2Type
 $(P)WaveGen2PulseWidth
 $(P)WaveGen2PulseDelay
 $(P)WaveGen2Amplitude

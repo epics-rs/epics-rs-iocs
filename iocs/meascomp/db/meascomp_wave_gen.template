@@ -13,7 +13,7 @@ record(busy, "$(P)WaveGenRun") {
 
 # Readback of the frequency in use; set it through UserFrequency or
 # IntFrequency below, whichever matches the selected wave type.
-record(ai, "$(P)WaveGenFreq") {
+record(ai, "$(P)WaveGenFrequency") {
     field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_FREQ")
     field(PREC, "3")
@@ -151,16 +151,16 @@ record(bo, "$(P)WaveGenExtTrigger") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_TRIGGER")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
 }
 
 record(bo, "$(P)WaveGenExtClock") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_CLOCK")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
 }
 
 record(bo, "$(P)WaveGenContinuous") {

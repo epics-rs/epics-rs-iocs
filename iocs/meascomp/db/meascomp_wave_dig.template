@@ -70,16 +70,16 @@ record(bo, "$(P)WaveDigExtTrigger") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_EXT_TRIGGER")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
 }
 
 record(bo, "$(P)WaveDigExtClock") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_EXT_CLOCK")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
 }
 
 record(bo, "$(P)WaveDigContinuous") {
@@ -94,16 +94,16 @@ record(bo, "$(P)WaveDigAutoRestart") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_AUTO_RESTART")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
 }
 
 record(bo, "$(P)WaveDigBurstMode") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEDIG_BURST_MODE")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
 }
 
 record(bo, "$(P)WaveDigRetrigger") {
