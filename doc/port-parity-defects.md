@@ -775,11 +775,12 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** libuldaq rejects the write (ERR_ALREADY_ACTIVE, `AoDevice.cpp:282-283`), so the device is unaffected, but the record shows no alarm and its VAL no longer matches the DAC.
 - **Class:** ref-faithful. **Live:** confirmed — `Ao1=40000` during a continuous run → "uldaq error 16: A background process is already in progress", record NO_ALARM.
 
-## PP-82 [MED] USB-2408 port declared non-blocking; C declares ASYN_CANBLOCK — FIXED
+## PP-82 [MED] USB-2408 port declared non-blocking; C declares ASYN_CANBLOCK — DEFERRED (blocked on epics-rs)
 - **Rust:** `driver.rs:48-52` `can_block: false`; writes do USB I/O and take the device mutex the poller holds for its whole sweep (`poller.rs:93-173`).
 - **C:** `drvMultiFunction.cpp:821` `ASYN_MULTIDEVICE | ASYN_CANBLOCK` (USBCTR deliberately omits it, `drvUSBCTR.cpp:259-260`).
 - **Impact:** a CA put or scan thread blocks for a poll sweep (tens of ms; ≈300 ms once PP-79 sets 60 S/s), and blocking USB I/O runs on a tokio worker.
 - **Class:** contract. **Live:** static.
+- **Why deferred (tried, reverted):** with `can_block: true` the port runs on asyn-rs's async write completion, which in 0.30 (a) never turns a failed write into WRITE_ALARM (`AsynAsyncWriteCompletion::wait`, `asyn-rs-0.30.0/src/adapter.rs:1017-1027`) and (b) discards a driver readback that arrives while the record is still PACT (`adapter.rs:406-418`). Live: a refused `Ao1` write during generation raised no alarm, and a refused `WaveGenRun`/`WaveDigRun` stayed at Run with `caput -c` timing out. That breaks PP-67 and every busy record's failure path, which is worse than a put blocking for one poll sweep. Re-apply once epics-rs completes async writes with the error and the pending readback, as C asyn's second process pass does.
 
 ## PP-83 [LOW] Default thermocouple type K; C defaults to J — FIXED
 - **Rust:** `driver.rs:74` `TC_K`; `meascomp_temperature.template:19` `VAL 1`.
