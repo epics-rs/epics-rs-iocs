@@ -332,12 +332,15 @@ fn scan_stop(device: &DaqDevice) {
     }
 }
 
-/// Stop MCS acquisition.
-pub fn stop_mcs(device: &DaqDevice, state: &mut McsState) {
-    if state.running {
-        scan_stop(device);
-        state.running = false;
+/// C `stopMCS` on a forced stop: the scan is marked stopped first, then one
+/// last [`read_mcs`] collects every point transferred since the previous
+/// poll and stops the hardware. `None` if no scan was running.
+pub fn stop_mcs(device: &DaqDevice, state: &mut McsState) -> Option<McsReadout> {
+    if !state.running {
+        return None;
     }
+    state.running = false;
+    Some(read_mcs(device, state, 0.0))
 }
 
 /// Seconds past the EPICS epoch (1990-01-01), as C's

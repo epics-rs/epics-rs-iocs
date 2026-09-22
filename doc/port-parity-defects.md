@@ -565,7 +565,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** with an external trigger/clock not yet seen, PresetReal never stops the run; mid-run PresetReal changes are ignored.
 - **Class:** ref-faithful. **Live:** static (no trigger source).
 
-## PP-49 [MED] MCA_STOP_ACQUIRE does not drain transferred points — OPEN
+## PP-49 [MED] MCA_STOP_ACQUIRE does not drain transferred points — FIXED
 - **Rust:** `driver.rs:225-232` → `mcs::stop_mcs` (`mcs.rs:270-277`) calls `ulDaqInScanStop` only.
 - **C:** `drvUSBCTR.cpp:853-858` forced stop runs a final `readMCS()` (copies points, updates CurrentPoint/elapsed) before `ulDaqInScanStop`.
 - **Impact:** up to one poll period of points is lost and CurrentChannel is stale after StopAll.

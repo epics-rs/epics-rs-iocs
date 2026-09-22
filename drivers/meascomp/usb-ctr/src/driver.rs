@@ -189,6 +189,34 @@ impl CtrDriver {
         stopped.and(started).err()
     }
 
+    /// Publish an MCS readout as C `readMCS` does: the current point, the
+    /// elapsed times on every counter address, and MCA_ACQUIRING back to 0
+    /// once the scan has ended. `addr`'s callbacks are left to the caller.
+    fn apply_mcs_readout(&mut self, readout: &mcs::McsReadout, addr: i32) -> AsynResult<()> {
+        self.base.params.set_int32(
+            self.params.mcs_current_point,
+            0,
+            readout.current_point as i32,
+        )?;
+        for i in 0..MAX_MCS_COUNTERS as i32 {
+            self.base
+                .params
+                .set_float64(self.params.mca_elapsed_real, i, readout.elapsed)?;
+            self.base
+                .params
+                .set_float64(self.params.mca_elapsed_live, i, readout.elapsed)?;
+        }
+        if readout.finished {
+            self.base
+                .params
+                .set_int32(self.params.mca_acquiring, 0, 0)?;
+        }
+        for i in (0..MAX_MCS_COUNTERS as i32).filter(|i| *i != addr) {
+            self.base.call_param_callbacks(i)?;
+        }
+        Ok(())
+    }
+
     /// Log a failure and publish it on LAST_ERROR_MESSAGE. It reaches the
     /// record as asynError only through [`CtrDriver::finish_write`].
     fn report_error(&mut self, msg: String) {
@@ -318,12 +346,13 @@ impl PortDriver for CtrDriver {
                     .set_int32(self.params.mca_acquiring, 0, 1)?;
             }
         } else if reason == self.params.mca_stop_acquire {
-            let dev = self.device.lock().unwrap();
-            let mut st = self.state.lock().unwrap();
-            mcs::stop_mcs(&dev, &mut st.mcs);
-            self.base
-                .params
-                .set_int32(self.params.mca_acquiring, 0, 0)?;
+            let readout = {
+                let dev = self.device.lock().unwrap();
+                mcs::stop_mcs(&dev, &mut self.state.lock().unwrap().mcs)
+            };
+            if let Some(readout) = readout {
+                self.apply_mcs_readout(&readout, addr)?;
+            }
         } else if reason == self.params.mca_erase {
             mcs::erase_mcs(&mut self.state.lock().unwrap().mcs);
             // C eraseMCS publishes the reset on every counter address.
