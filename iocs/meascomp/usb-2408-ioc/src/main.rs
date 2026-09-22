@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::services::PortServices;
 use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
@@ -47,6 +49,13 @@ async fn main() -> CaResult<()> {
     // loads use it, as a C IOC links the owning module's .dbd.
     app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
+    // asynReport, asynSetTraceMask & co.: a C measComp IOC has them through
+    // asyn.dbd (measCompAppInclude.dbd). The manager shares the services
+    // create_port_runtime binds every port to, so the commands reach the
+    // port's own trace and exception state.
+    let port_manager = Arc::new(PortManager::with_services(PortServices::global()));
+    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     let autosave_config = Arc::new(Mutex::new(
         epics_rs::base::server::autosave::startup::AutosaveStartupConfig::new(),
