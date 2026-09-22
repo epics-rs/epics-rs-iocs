@@ -697,13 +697,16 @@ impl PortDriver for MultiFunctionDriver {
                         .get_int32_param(self.params.wave_gen_retrigger, 0)?
                         != 0;
 
-                    // Save current AO values for restore on stop
-                    let mut saved = vec![0.0f64; MAX_ANALOG_OUT];
-                    for ch in 0..MAX_ANALOG_OUT as i32 {
-                        saved[ch as usize] = self
-                            .base
-                            .get_int32_param(self.params.analog_out_value, ch)?
-                            as f64;
+                    // Save the value of each output the scan drives, C's
+                    // waveGenSavedOutput, to put back when it ends.
+                    let mut saved = [None; MAX_ANALOG_OUT];
+                    for ch in first_chan..=last_chan {
+                        if self.base.get_int32_param(self.params.wave_gen_enable, ch)? != 0 {
+                            saved[ch as usize] = Some(f64::from(
+                                self.base
+                                    .get_int32_param(self.params.analog_out_value, ch)?,
+                            ));
+                        }
                     }
 
                     // Build per-channel waveforms, then interleave for ulAOutScan
@@ -778,7 +781,7 @@ impl PortDriver for MultiFunctionDriver {
                             retrigger: retrig,
                         },
                         &waveform,
-                        &saved,
+                        saved,
                     ) {
                         last_error = Some(format!("start_wave_gen error: {e}"));
                         self.base.params.set_int32(reason, addr, 0)?;

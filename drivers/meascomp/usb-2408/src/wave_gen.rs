@@ -12,8 +12,10 @@ pub struct WaveGenState {
     pub current_point: usize,
     /// Output buffer for ulAOutScan.
     pub scan_buffer: Vec<f64>,
-    /// Saved output values to restore after stop.
-    pub saved_outputs: [f64; MAX_ANALOG_OUT],
+    /// DAC value of each channel the running scan drives, saved at start and
+    /// written back at stop. `None` for a channel not in the scan, which the
+    /// stop therefore never touches.
+    pub saved_outputs: [Option<f64>; MAX_ANALOG_OUT],
     pub dwell_actual: f64,
     /// Per-channel user-defined waveform in volts, C `waveGenUserBuffer_`:
     /// `max_points` long and zero until written; a write replaces only the
@@ -36,7 +38,7 @@ impl WaveGenState {
             num_points: max_points,
             current_point: 0,
             scan_buffer: Vec::new(),
-            saved_outputs: [0.0; MAX_ANALOG_OUT],
+            saved_outputs: [None; MAX_ANALOG_OUT],
             dwell_actual: 0.001,
             user_buffers: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
             max_points,
@@ -235,7 +237,7 @@ pub fn start_wave_gen(
     state: &mut WaveGenState,
     scan: &WaveGenScan,
     waveform_data: &[f64],
-    saved_outputs: &[f64],
+    saved_outputs: [Option<f64>; MAX_ANALOG_OUT],
 ) -> Result<(), String> {
     let WaveGenScan {
         first_chan,
@@ -253,13 +255,8 @@ pub fn start_wave_gen(
     state.num_points = num_points;
     state.current_point = 0;
 
-    // Save current outputs for restore on stop
-    for ch in first_chan..=last_chan {
-        let idx = ch as usize;
-        if idx < MAX_ANALOG_OUT && idx < saved_outputs.len() {
-            state.saved_outputs[idx] = saved_outputs[idx];
-        }
-    }
+    // The outputs to put back when the scan ends.
+    state.saved_outputs = saved_outputs;
 
     let total = num_chans * num_points;
     state.scan_buffer = if waveform_data.len() >= total {
@@ -333,14 +330,14 @@ pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState) {
         if let Err(e) = device.analog_out_scan_stop() {
             log::warn!("WaveGen scan stop error: {e}");
         }
-        // Restore saved outputs
-        for ch in 0..MAX_ANALOG_OUT {
-            let _ = device.analog_out(
-                ch as i32,
-                BIP10VOLTS,
-                AOUT_FF_NOSCALEDATA,
-                state.saved_outputs[ch],
-            );
+        // C stopWaveGen puts back only the channels the scan drove
+        // (drvMultiFunction.cpp:1721-1733); any other output keeps its value.
+        for (ch, saved) in state.saved_outputs.iter_mut().enumerate() {
+            if let Some(value) = saved.take()
+                && let Err(e) = device.analog_out(ch as i32, BIP10VOLTS, AOUT_FF_NOSCALEDATA, value)
+            {
+                log::warn!("WaveGen restore AO{ch} error: {e}");
+            }
         }
         state.running = false;
     }

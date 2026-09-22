@@ -808,7 +808,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** every internal waveform is 2× the C voltage — over-drive risk.
 - **Class:** ref-faithful. **Live:** static (no AO→AI loopback).
 
-## PP-87 [HIGH] Generator stop rewrites every AO channel, including channels not in the scan — OPEN
+## PP-87 [HIGH] Generator stop rewrites every AO channel, including channels not in the scan — FIXED
 - **Rust:** `wave_gen.rs:161-167` saves only `first..=last`; `stop_wave_gen` (`:242-249`) writes `saved_outputs[ch]` for all `ch in 0..MAX_ANALOG_OUT`; `saved_outputs` starts `[0.0; 2]` (`:34`).
 - **C:** `drvMultiFunction.cpp:1721-1733` restores only enabled channels.
 - **Impact:** with only WaveGen1 enabled, every stop drives AO2 to DAC code 0 (−10 V) or a stale value, silently overriding Ao2 while its record shows the old value.
