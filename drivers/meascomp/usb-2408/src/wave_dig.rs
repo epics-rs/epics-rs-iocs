@@ -29,7 +29,8 @@ pub struct WaveDigState {
     pub dwell_actual: f64,
     // Saved parameters for auto-restart
     pub input_mode: i32,
-    pub range: i32,
+    /// Each channel's ANALOG_IN_RANGE, by absolute channel.
+    pub ranges: [i32; MAX_ANALOG_IN],
     pub options: i32,
 }
 
@@ -52,7 +53,7 @@ impl WaveDigState {
             time_buffer: vec![0.0; max_points],
             dwell_actual: 0.001,
             input_mode: AI_DIFFERENTIAL,
-            range: BIP10VOLTS,
+            ranges: [BIP10VOLTS; MAX_ANALOG_IN],
             options: SO_DEFAULTIO,
         }
     }
@@ -66,7 +67,8 @@ pub struct WaveDigScan {
     pub num_points: usize,
     pub dwell: f64,
     pub input_mode: i32,
-    pub range: i32,
+    /// Each channel's ANALOG_IN_RANGE, by absolute channel.
+    pub ranges: [i32; MAX_ANALOG_IN],
     pub ext_trigger: bool,
     pub ext_clock: bool,
     pub continuous: bool,
@@ -99,7 +101,7 @@ pub fn start_wave_dig(
         num_points,
         dwell,
         input_mode,
-        range,
+        ranges,
         ext_trigger,
         ext_clock,
         continuous,
@@ -114,16 +116,9 @@ pub fn start_wave_dig(
     let total_samples = num_chans * num_points;
     state.scan_buffer.resize(total_samples, 0.0);
 
-    // Load input queue for multi-channel scanning (required by uldaq)
-    let mut queue = Vec::with_capacity(num_chans);
-    for i in 0..num_chans {
-        queue.push(AiQueueElement {
-            channel: (first_chan + i) as i32,
-            input_mode,
-            range,
-            ..AiQueueElement::default()
-        });
-    }
+    // C startWaveDig: the queue gives every scanned channel its own range
+    // (drvMultiFunction.cpp:1787-1802).
+    let queue = scan_queue(first_chan, num_chans, input_mode, &ranges);
     device
         .analog_in_load_queue(&queue)
         .map_err(|e| WaveDigStartError {
@@ -152,7 +147,7 @@ pub fn start_wave_dig(
 
     // Save for auto-restart
     state.input_mode = input_mode;
-    state.range = range;
+    state.ranges = ranges;
     state.options = options;
 
     let scanned = device.analog_in_scan(
@@ -160,7 +155,9 @@ pub fn start_wave_dig(
             low_chan: first_chan as i32,
             high_chan: (first_chan + num_chans - 1) as i32,
             input_mode,
-            range,
+            // The loaded queue sets each channel's range; C passes
+            // BIP10VOLTS here.
+            range: BIP10VOLTS,
             samples_per_chan: num_points as i32,
             options,
             flags: AINSCAN_FF_DEFAULT,
@@ -189,6 +186,24 @@ pub fn start_wave_dig(
         first_chan + num_chans - 1
     );
     Ok(dwell_actual)
+}
+
+/// The `ulAInLoadQueue` entries for `num_chans` channels from `first_chan`,
+/// each with its own range.
+fn scan_queue(
+    first_chan: usize,
+    num_chans: usize,
+    input_mode: i32,
+    ranges: &[i32; MAX_ANALOG_IN],
+) -> Vec<AiQueueElement> {
+    (first_chan..first_chan + num_chans)
+        .map(|chan| AiQueueElement {
+            channel: chan as i32,
+            input_mode,
+            range: ranges.get(chan).copied().unwrap_or(BIP10VOLTS),
+            ..AiQueueElement::default()
+        })
+        .collect()
 }
 
 /// Number of complete scan points behind `current_index`.
@@ -244,15 +259,12 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
         if state.auto_restart {
             state.current_point = 0;
             // Reload queue with saved parameters
-            let mut queue = Vec::with_capacity(state.num_chans);
-            for i in 0..state.num_chans {
-                queue.push(AiQueueElement {
-                    channel: (state.first_chan + i) as i32,
-                    input_mode: state.input_mode,
-                    range: state.range,
-                    ..AiQueueElement::default()
-                });
-            }
+            let queue = scan_queue(
+                state.first_chan,
+                state.num_chans,
+                state.input_mode,
+                &state.ranges,
+            );
             if let Err(e) = device.analog_in_load_queue(&queue) {
                 log::warn!("WaveDig auto-restart: queue reload failed: {e}");
             } else {
@@ -267,7 +279,7 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
                         low_chan: state.first_chan as i32,
                         high_chan: (state.first_chan + state.num_chans - 1) as i32,
                         input_mode: state.input_mode,
-                        range: state.range,
+                        range: BIP10VOLTS,
                         samples_per_chan: state.num_points as i32,
                         options: state.options,
                         flags: AINSCAN_FF_DEFAULT,
@@ -355,6 +367,15 @@ mod tests {
             .as_secs_f64();
         let offset = unix - current_time_secs();
         assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
+
+    #[test]
+    fn every_queued_channel_keeps_its_own_range() {
+        let mut ranges = [BIP10VOLTS; MAX_ANALOG_IN];
+        ranges[2] = BIP1VOLTS;
+        let queue = scan_queue(1, 3, AI_DIFFERENTIAL, &ranges);
+        let got: Vec<_> = queue.iter().map(|q| (q.channel, q.range)).collect();
+        assert_eq!(got, vec![(1, BIP10VOLTS), (2, BIP1VOLTS), (3, BIP10VOLTS)]);
     }
 
     #[test]

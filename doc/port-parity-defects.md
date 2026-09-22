@@ -834,7 +834,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** a rejected rate leaves DwellActual stale.
 - **Class:** ref-faithful. **Live:** confirmed — `NumChans 8, Dwell 0.001` → "uldaq error 22", DwellActual stayed 0.002 from the previous run (C: −9999).
 
-## PP-91 [MED] Digitizer queue uses the first channel's range for every channel — OPEN
+## PP-91 [MED] Digitizer queue uses the first channel's range for every channel — FIXED
 - **Rust:** `driver.rs:346-348` `range = ANALOG_IN_RANGE[first_chan]`; `wave_dig.rs:103-111` same range in every `AiQueueElement`.
 - **C:** `drvMultiFunction.cpp:1787-1802` per-channel `gainArray[i] = analogInRange_[firstChan+i]`.
 - **Impact:** channels behind a narrower first-channel range clip; a wider one loses resolution.

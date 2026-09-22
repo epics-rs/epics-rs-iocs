@@ -756,9 +756,12 @@ impl PortDriver for MultiFunctionDriver {
                     as usize;
                 let dwell = self.base.get_float64_param(self.params.wave_dig_dwell, 0)?;
                 let input_mode = self.base.get_int32_param(self.params.analog_in_mode, 0)?;
-                let range = self
-                    .base
-                    .get_int32_param(self.params.analog_in_range, first_chan as i32)?;
+                let mut ranges = [uldaq_sys::BIP10VOLTS; MAX_ANALOG_IN];
+                for (ch, range) in ranges.iter_mut().enumerate() {
+                    *range = self
+                        .base
+                        .get_int32_param(self.params.analog_in_range, ch as i32)?;
+                }
                 let ext_trig = self
                     .base
                     .get_int32_param(self.params.wave_dig_ext_trigger, 0)?
@@ -793,7 +796,7 @@ impl PortDriver for MultiFunctionDriver {
                         num_points,
                         dwell,
                         input_mode,
-                        range,
+                        ranges,
                         ext_trigger: ext_trig,
                         ext_clock: ext_clk,
                         continuous: cont,
