@@ -306,8 +306,8 @@ pass still owed before push.
 - **branch `caucus/MXSR5DMPDZ/proto-fix-c74a3f6f-1`:** PP-30 `d526968`, PP-31 `e885106`, PP-32 `80d6e18`, PP-33 `50331d8`, PP-34 `650dd8f`, PP-35 `31b3a14`.
 
 Not fixed: PP-23 (deferred — needs device manual); PP-37/38/39 (observations).
-PP-40/41/42 (measComp live) are **FIXED** inside the completion port — see the
-measComp completion status block below for commits/branches.
+PP-40/41/42 (measComp live) were recorded **FIXED** inside the completion port, but
+those branches were never merged — see the wave-4 status correction (2026-09-22).
 
 Partial gap noted: PP-20's *input flush before re-read* is not reproduced —
 `SyncIOHandle` exposes no flush primitive; the tolerate-one-failure debounce (the
@@ -337,7 +337,7 @@ noted (all benign). The systemic "raw uldaq const vs CBW_* menu" risk the
 usb-2408 auditor flagged is **resolved**: the db mbbo menus carry uldaq ordinals
 (`Range +/-10V → 5 = BIP10VOLTS`), matching the driver's pass-through — correct.
 
-## PP-40 [HIGH] usb-2408 internal-waveform amplitude is 2× too large — FIXED
+## PP-40 [HIGH] usb-2408 internal-waveform amplitude is 2× too large — FIX NEVER MERGED (re-opened as PP-86)
 
 - **Rust:** `drivers/meascomp/usb-2408/src/wave_gen.rs:66,72-74,80,99` — uses full `amplitude` as peak (`offset + amplitude*sin`, square `offset±amplitude`, saw/random full-span).
 - **C:** `drvMultiFunction.cpp:1542,1546,1549-1550,1554,1568-1570` — `AMPLITUDE` is peak-to-peak: `amplitude/2` about the offset.
@@ -345,7 +345,7 @@ usb-2408 auditor flagged is **resolved**: the db mbbo menus carry uldaq ordinals
 - **Family:** usb-2408 wave_gen (all four internal wave types).
 - **Fix:** halve the amplitude about the offset, matching C's peak-to-peak semantics.
 
-## PP-41 [MED] usb-2408 cluster (live, within ported wave/AO/AI scope) — FIXED (1 LOW sub DEFERRED)
+## PP-41 [MED] usb-2408 cluster (live, within ported wave/AO/AI scope) — FIX NEVER MERGED (partly re-landed on main; open subs re-opened as PP-60/81/88/89/90)
 
 Each sub-finding has an existing record and is a real divergence:
 - **WAVEGEN_ENABLE ignored** — `driver.rs:329-330` hardcodes first/last chan = 0..MAX; C iterates enabled channels and errors if none (`drvMultiFunction.cpp:1603-1636`).
@@ -357,7 +357,7 @@ Each sub-finding has an existing record and is a real divergence:
 
 **DEFERRED (wave-dig `ERR_BAD_RATE` → `-9999` dwell-actual sentinel):** C returns `-9999` for the actual-dwell when `ulDaqOutScan` reports `ERR_BAD_RATE`. Implementing the guard needs the uldaq `UlError::ERR_BAD_RATE` numeric value. `uldaq.h` is **not installed** anywhere on this machine (searched machine-wide 2026-07-19); the constant is absent from `drivers/meascomp/uldaq-sys/src/lib.rs` (a curated subset). Per the no-guessing rule the value was not hardcoded. **Blocked on:** the path to `uldaq.h`/libuldaq SDK header, or that header being installed — then add `ERR_BAD_RATE` to `uldaq-sys` and implement. Authorization alone is insufficient; the value's source is required.
 
-## PP-42 [MED] usb-ctr cluster (live, within ported MCS/pulse/counter scope) — FIXED
+## PP-42 [MED] usb-ctr cluster (live, within ported MCS/pulse/counter scope) — FIX NEVER MERGED (partly re-landed on main; open subs re-opened as PP-45/51/57/58/60/63)
 
 - **MCS `SINGLEIO` threshold dropped** — `mcs.rs:164` always `SO_SINGLEIO`; C uses `SO_DEFAULTIO` and adds `SO_SINGLEIO` only when `dwell >= 0.01` (`drvUSBCTR.cpp:674,678-679`) — short-dwell high-rate scans lose data.
 - **Pulse-generator input clamps dropped** — `pulse_gen.rs:17-26` passes frequency/duty/delay raw; C clamps to `[0.023,48e6]`/`[.0001,.9999]`/`[0,67.11]` (`:466-472`). `PULSE_*` records exist.
@@ -407,7 +407,7 @@ Awaiting user decision — no work started.
 
 ---
 
-# measComp unported subsystems — COMPLETED (user decision 2026-07-19)
+# measComp unported subsystems — COMPLETED (user decision 2026-07-19) — STATUS CORRECTED 2026-09-22: branches never merged, see wave 4
 
 **Status: DONE.** Both completion ports finished and verified on their branches
 (per-crate `fmt`/`clippy -D warnings`/`nextest` green; full-workspace pass still
@@ -450,7 +450,7 @@ fixed as part of the completion, grounded in `drvUSBCTR.cpp`.
 
 ---
 
-## PP-43 [LOW] usb-ctr MCS time-waveform not recomputed on `MCA_DWELL_TIME` write — FIXED
+## PP-43 [LOW] usb-ctr MCS time-waveform not recomputed on `MCA_DWELL_TIME` write — FIX NEVER MERGED (re-opened in PP-71)
 
 - **Rust:** `drivers/meascomp/usb-ctr` computes the MCS time waveform only at `start_mcs`.
 - **C:** `drvUSBCTR.cpp:1302-1304` — `writeFloat64` recomputes the time waveform and does
@@ -485,10 +485,422 @@ acs (MCB4B), acsmotion, amci, aerotech (both variants), oms-asyn, parker/acr, ph
 
 ### Audit deferred — upstream absent locally
 
-measComp / usb-2408 / usb-ctr — the measComp C module is **not present** on this machine, so these three ports could not be audited. Provide the measComp source path to complete them.
+measComp / usb-2408 / usb-ctr — superseded: audited in the third wave (2026-07-19) and the fourth wave (2026-09-22) against `~/codes/measComp`.
 
 ### Scope-limited audits (siblings not yet covered)
 
 - **newport** — only `smc100` audited; `agap`/`agilis`/`conex`/`esp300`/`hxp`/`mm3000`/`mm4000`/`pm500`/`pmnc`/`xps` not yet swept.
 - **pi** — C-series (c862/c848/c844/c663/c662/c630) + E-series (prior round) audited; any other PI model not covered.
 - **npoint** — only `c300` audited, not `lc400`.
+
+---
+
+# Fourth wave — measComp C-parity audit + live hardware, 2026-09-22
+
+Codex-style C→Rust audit of `usb-ctr`, `usb-2408`, `meascomp`, `uldaq-sys`
+and `iocs/meascomp/*` against measComp R4-4 HEAD
+(`drvUSBCTR.cpp`, `drvMultiFunction.cpp`, `measCompApp/Db`, `iocBoot`),
+libuldaq 1.2.1 source and the now-installed `/usr/local/include/uldaq.h`.
+Five read-only panels (A usb-ctr MCS/MCA/scaler, B usb-ctr
+counter/pulse/DIO/init, C usb-2408 AI/TC/AO/DIO, D usb-2408 waveform
+gen/dig, E wrapper/FFI/db/st.cmd) produced 68 raw findings; 16 cross-panel
+duplicates were merged, leaving PP-44..PP-95 (52). Rust side is `main`
+`cc61da4`.
+
+Both boards were exercised live on this host: USB-CTR08 `01DAB0FB`
+(09db:0127) and USB-2408-2AO `01DA523D` (09db:00fe), each IOC on its own
+CA port. No loopback wiring exists between outputs and inputs (timer
+outputs → counter inputs: 0 counts at 1 kHz; AO → AI: no change), so
+findings whose only observable is an output voltage or an external count
+are marked "static".
+
+**Status correction for PP-40..PP-43 and the "COMPLETED" block.** None of
+the 16 commits cited there (`fe0091b 782434d 8e2794a 2d7bbae 13b3600
+a48e827 346be12 5e11e4b 0057eab cde36a1 be5845c 50dce47 a934a56 5967d4b
+f603139 42d27b3`) exists in this repository; the `caucus/MXSR5DMPDZ/*`
+branches were never merged. `main`'s MCS/scaler/waveform features came
+from the later independent PR #12. Every sub-item was re-checked on
+`main`: those still open are re-opened below and tagged
+**regression of PP-4x (fix never merged)**. Sub-items that do hold on
+`main`: PP-41 WAVEGEN_ENABLE iteration, AI read gated on channel type
+(`d7be812`), Volts→TC reprogram and isThermocouple guard (`546c66d`);
+PP-42 MCS re-entry guard and elapsed-time publish. PP-42's
+`ulCClear` vs `ulCLoad(CRT_LOAD,0)` question is settled as equivalent
+(`CtrUsbCtrx.cpp:104-107`, `CtrUsb24xx.cpp:58-60`).
+
+Class legend (per `port-translation-lessons.md`): **ref-indep** =
+defect regardless of C; **ref-faithful** = adopt C's posture;
+**contract** = C db/wire contract; **unimpl** = C feature absent.
+**Live** = result on the attached hardware, or "static".
+
+## usb-ctr — MCS / MCA / scaler
+
+## PP-44 [HIGH] Scaler arm never loads counter-0 output-compare registers — OPEN
+- **Rust:** `usb-ctr/src/scaler.rs:69-76` loads only `CRT_MAX_LIMIT` for presets > 0; no `CRT_OUTPUT_VAL0/VAL1` in the scaler path (only MCS, `mcs.rs:186-187`).
+- **C:** `drvUSBCTR.cpp:1061-1081` `setScalerPresets` (called from `scalerArm_`, `:1174`) loads `CRT_OUTPUT_VAL0=0`, `CRT_OUTPUT_VAL1=PR1` on counter 0 every arm.
+- **Impact:** C0O (documented gate for counters 1-7) never switches at PR1; after any MCS start VAL1 stays 0xFFFFFFFF. The preset is enforced only in software one poll late, so S2..S8 over-count.
+- **Class:** unimpl. **Live:** static (needs C0O→C1GT wiring).
+
+## PP-45 [HIGH] MCS/scaler mutual exclusion, already-complete start and NumChannels clamp absent — OPEN (partial regression of PP-42)
+- **Rust:** `scaler_dev.rs:38-44,61-72` reset/arm have no MCS-running check; `driver.rs:183-185` starts on `value != 0 && !already_running` only; no `MCA_NUM_CHANNELS` branch; `poller.rs:74-86` services only the scaler when both run.
+- **C:** `drvUSBCTR.cpp:1160,1171` scaler reset/arm skipped while `MCSRunning_`; `:1185-1188` MCS start refused (asynError) while `scalerRunning_`; `:1191-1198` already-complete start toggles `mcaAcquiring_` 1→0 without starting; `:1235-1240` clamp to `maxTimePoints_`; `:1184` start on any value.
+- **Impact:** a scaler count during an MCS zeroes all counters mid-bin then hits `ERR_ALREADY_ACTIVE`; StartAll after a completed, un-erased run re-acquires over the data; `NuseAll > MaxChannels` is not clamped.
+- **Class:** unimpl. **Live:** confirmed — after a completed 300-point run, `StartAll` restarted from 0 (CurrentChannel 50 at 0.5 s).
+
+## PP-46 [HIGH] `start_mcs` failure leaves MCA_ACQUIRING=1 forever — OPEN
+- **Rust:** `mcs.rs:125-138,189-198` return early via `?`, `running` stays false; `driver.rs:206-223` then sets `mca_acquiring=1` unconditionally; the poller calls `read_mcs` only when `running` (`poller.rs:79`).
+- **C:** `drvUSBCTR.cpp:556-560,704-709` log and continue, `:713-714` set `MCSRunning_`; the next `readMCS` sees SS_IDLE (`:751-753`) and clears `mcaAcquiring_` (`:802-806`).
+- **Impact:** any rejected scan wedges HardwareAcquiring and the Acquiring busy until a manual StopAll.
+- **Class:** ref-indep. **Live:** confirmed — `Dwell=1e-6` → "uldaq error 22", HardwareAcquiring/Acquiring stuck at 1 for 2 s until StopAll.
+
+## PP-47 [MED] Scaler counter scan at 10 kHz instead of 100 Hz; SS_IDLE ends the count — OPEN
+- **Rust:** `scaler.rs:79` `rate = 10000.0` into `ulCInScan(…,20,…, SO_CONTINUOUS|SO_SINGLEIO, CINSCAN_FF_CTR64_BIT)`; `scaler.rs:144` stops and reports done on `status == SS_IDLE`.
+- **C:** `drvUSBCTR.cpp:892-893,933-935` `rate = 100`; `readScaler` (`:976-986`) completes only on a preset.
+- **Impact:** 100× the SINGLEIO USB transfers; a scan overrun that goes idle is reported to the scalerRecord as a completed count with partial data.
+- **Class:** ref-faithful. **Live:** log shows "Scaler started, rate=10000 Hz"; completion not observable (counter 0 unwired).
+
+## PP-48 [MED] `read_mcs` early returns skip SS_IDLE / PresetReal detection; PresetReal latched at start — OPEN
+- **Rust:** `mcs.rs:226-232` returns on status error, `:234-236` returns while `current_total_count == 0`, both before the done test `:258-261`; `driver.rs:199-201` reads `MCA_PRESET_REAL_TIME` only at start.
+- **C:** `drvUSBCTR.cpp:751-753,788-794` evaluate SS_IDLE and `elapsed >= presetReal` every poll, re-reading `presetReal`.
+- **Impact:** with an external trigger/clock not yet seen, PresetReal never stops the run; mid-run PresetReal changes are ignored.
+- **Class:** ref-faithful. **Live:** static (no trigger source).
+
+## PP-49 [MED] MCA_STOP_ACQUIRE does not drain transferred points — OPEN
+- **Rust:** `driver.rs:225-232` → `mcs::stop_mcs` (`mcs.rs:270-277`) calls `ulDaqInScanStop` only.
+- **C:** `drvUSBCTR.cpp:853-858` forced stop runs a final `readMCS()` (copies points, updates CurrentPoint/elapsed) before `ulDaqInScanStop`.
+- **Impact:** up to one poll period of points is lost and CurrentChannel is stale after StopAll.
+- **Class:** unimpl. **Live:** static.
+
+## PP-50 [MED] `eraseMCS` does not publish resets and wipes time bases C keeps — OPEN
+- **Rust:** `mcs.rs:67-74`, `driver.rs:233-236` zero buffers incl. `time_buffer`/`abs_time_buffer`, set `current_point=0` without setting `MCS_CURRENT_POINT`, elapsed params, or `start_time`.
+- **C:** `drvUSBCTR.cpp:823-843` sets CurrentPoint 0, elapsed live/real/counts 0 on all addrs with callbacks, resets `startTime_`, clears only `MCSBuffer_`.
+- **Impact:** after EraseAll, CurrentChannel/ElapsedReal keep old values; an erase mid-run does not restart the PresetReal clock.
+- **Class:** ref-faithful. **Live:** confirmed — after EraseAll, CurrentChannel=100 and ElapsedReal=1.037 unchanged.
+
+## PP-51 [MED] SO_SINGLEIO forced at every dwell — OPEN (regression of PP-42, fix never merged)
+- **Rust:** `mcs.rs:171` `let mut options = SO_SINGLEIO;`.
+- **C:** `drvUSBCTR.cpp:674-679` `SO_DEFAULTIO`, `SO_SINGLEIO` only when `dwell >= 0.01` (libuldaq picks BLOCKIO above 1 kHz, `DaqIUsbBase.cpp:160`).
+- **Impact:** short-dwell MCS does one USB transfer per scan, risking overrun.
+- **Class:** ref-faithful. **Live:** static.
+
+## PP-52 [MED] TRIGGER_MODE is a bool gating SO_EXTTRIGGER; `ulDaqInSetTrigger` never called — OPEN (regression, fix never merged)
+- **Rust:** `meascomp_mcs.template:173-179` bo Internal/External; `driver.rs:195` `trigger_mode != 0`; `mcs.rs:175-177` adds `SO_EXTTRIGGER` only then; no TRIGGER_MODE branch in `write_int32`; `meascomp/src/counter.rs:139` `daq_in_set_trigger` has no caller.
+- **C:** `measCompMCS.template:293-305` mbbo raw 0/1/6/7; `drvUSBCTR.cpp:1129-1148` → `TRIG_POS_EDGE/NEG_EDGE/HIGH/LOW` via `ulDaqInSetTrigger`; `:680-681` always `SO_EXTTRIGGER`.
+- **Impact:** mode 0 free-runs in Rust but waits for a rising edge in C; mode 1 is rising in Rust, falling in C; level modes unreachable.
+- **Class:** ref-faithful. **Live:** consistent — `TrigMode=Internal` acquired immediately with the trigger input unconnected (C would wait).
+
+## PP-53 [MED] Point0Action Skip and external-advance prescale unimplemented — OPEN (regression, fix never merged)
+- **Rust:** `driver.rs:202-205` `point0_no_clear = action != 0` (Skip→NoClear, no `numPoints+1`, no drop); `mcs.rs:90-92,104` discards `prescale` under a comment wrongly claiming C ignores it; `MCS_PRESCALE_COUNTER` never read; no `Point0Action`/`PrescaleCounter` records.
+- **C:** `drvUSBCTR.cpp:607,761-763` Skip; `:579-603` prescale counter programming; `measCompMCS.template:242-274`.
+- **Impact:** `MCS:Prescale` has no device effect; Skip mode unreachable.
+- **Class:** unimpl. **Live:** confirmed PVs absent.
+
+## PP-54 [MED] drvMca param contract broken; mca record not registered — OPEN (regression, fix never merged)
+- **Rust:** `params.rs:114-118` renamed params (`MCA_CH_ADVANCE_SOURCE`, `MCA_PRESET_REAL_TIME`, `MCA_ELAPSED_REAL_TIME`, …) and 11 drvMca params absent; `usb-ctr-ioc/src/main.rs:57-69` does not register `mca`.
+- **C:** `drvUSBCTR.cpp:331-351` creates all 21 drvMca.h params; C st.cmd offers `simple_mca.db` (`DTYP=asynMCA`); `devMcaAsyn` resolves all 21 (`dev_mca_asyn.rs:221-234`).
+- **Impact:** the documented optional mca-record configuration cannot load.
+- **Class:** contract. **Live:** static.
+
+## PP-55 [MED] MCS readout/busy record protocol diverges from C — OPEN
+- **Rust:** `meascomp_mcs.template:75-101` ReadAll/ReadAllOnce FLNK → ReadFanout → ClearAcquiring; ReadAll no SCAN/SDIS; `:19-24` EraseAll no FLNK; `:54-58` SetAcquiring no `VAL 1`, no FLNK to SetClientWait (`:131-137` unreachable).
+- **C:** `measCompMCS.template:83-90` ReadAll SCAN "1 second", SDIS Acquiring; `:12-19` EraseAll FLNK ReadAllOnce; `:30-45,150-158` StartAll→SetAcquiring(VAL 1)→SetClientWait; `USBCTR_SNL.st` clears Acquiring only on HardwareAcquiring 1→0.
+- **Impact:** a ReadAll mid-run releases the Acquiring busy early (`caput -c` returns before data); no 1 Hz spectrum refresh; spectra stale after erase; ClientWait never raised; on a fresh IOC StartAll writes 0 into Acquiring.
+- **Class:** contract. **Live:** confirmed — `ReadAll` mid-run set Acquiring=Done while HardwareAcquiring=Acquiring.
+
+## PP-56 [LOW] MCS readout element counts swapped vs C — OPEN
+- **Rust:** `driver.rs:267` MCA_DATA `n = min(buf, src, num_channels)`; `:298-303` AbsTimeWF `n = min(…, current_point)` (comment "as C readMCS reports them" is wrong).
+- **C:** `drvUSBCTR.cpp:1403-1406` MCA_DATA `min(numRead, currentPoint)`, min 1; `:1473,1481-1482` AbsTimeWF `min(nElements, mcaNumChannels)`.
+- **Impact:** spectrum NORD = NuseAll mid-run (C: acquired points); AbsTimeWF NORD the reverse.
+- **Class:** ref-faithful. **Live:** not distinguishable after a completed run (both 100).
+
+## PP-57 [LOW] MCS actual dwell never written back; `Dwell_RBV` missing — OPEN (regression of PP-42 LOW, fix never merged)
+- **Rust:** the in/out `rate` from `ulDaqInScan` (`mcs.rs:189-198`) is only logged; no `MCS:Dwell_RBV` record.
+- **C:** `drvUSBCTR.cpp:711` `setDoubleParam(mcaDwellTime_, 1./rate)`; `measCompMCS.template:122-127` Dwell_RBV.
+- **Impact:** the clock-quantized dwell is never shown.
+- **Class:** unimpl. **Live:** confirmed PV absent.
+
+## usb-ctr — pulse generators, counters, DIO, init
+
+## PP-58 [MED] Pulse-generator input clamps missing — OPEN (regression of PP-42, fix never merged)
+- **Rust:** `pulse_gen.rs:17-21,28` passes frequency (1000 Hz fallback for period ≤ 0), duty and delay raw to `ulTmrPulseOutStart`.
+- **C:** `drvUSBCTR.cpp:465-472` clamps frequency to [0.023, 48e6], duty to [.0001, .9999], delay to [0, 67.11].
+- **Impact:** values C clamps are rejected by libuldaq (`TmrDevice.cpp:61-75`), the generator is left stopped while Run reads Run.
+- **Class:** ref-faithful. **Live:** confirmed — Frequency 1e9 / DutyCycle 1.5 / Delay 100 and Frequency 0.001 all passed through (RBVs 1e-9, 1.5, 100) and returned "uldaq error 58: Invalid frequency specified".
+
+## PP-59 [MED] Timers not stopped at init; "running" inferred from the PULSE_RUN setpoint — OPEN
+- **Rust:** constructor `driver.rs:38-104` never calls `ulTmrPulseOutStop`; running state is the Run param set before the hardware call (`:121,128,318-322`).
+- **C:** `drvUSBCTR.cpp:427-430` stops all 4 timers at construction; `pulseGenRunning_[]` set only after a successful start (`:490`), gating stop (`:1106`) and restarts (`:1112,1295`).
+- **Impact:** after an IOC restart a generator left running keeps pulsing while Run shows Stop; after a rejected start, a later Period/Duty write starts the output without Run being re-written.
+- **Class:** ref-faithful. **Live:** static (output not observable).
+
+## PP-60 [MED] DIGITAL_OUTPUT writes ignore the direction mask (both drivers) — OPEN (regression of PP-41/PP-42 LOW, fix never merged)
+- **Rust:** `usb-ctr/src/driver.rs:382-393` and `usb-2408/src/driver.rs:677-688` call `ulDBitOut` for every bit in `mask`.
+- **C:** `drvUSBCTR.cpp:1344-1348` and `drvMultiFunction.cpp:2383-2413` write only `mask & outMask & direction` (2408: one `ulDOut` when the whole port is output).
+- **Impact:** CTR: writes to input bits fail with error 51 and pollute LastErrorMessage; 2408: bits C treats as inputs are driven (see PP-62).
+- **Family:** both drivers' `write_uint32_digital` DIGITAL_OUTPUT branch; no other site.
+- **Class:** ref-faithful. **Live:** confirmed on CTR — `Lo=165` with all bits In → "digital_bit_out error: uldaq error 51".
+
+## PP-61 [MED] USB-CTR boot DIO directions differ from C — OPEN
+- **Rust:** `usb-ctr-ioc/st.cmd:49-52` `VAL=0` for Bd5..Bd8; `driver.rs:76-80` forces `ulDConfigPort(AUXPORT, DD_INPUT)` in the constructor.
+- **C:** `USBCTR.substitutions:56-59` Bd5..Bd8 `VAL=1`; constructor (`:255-439`) never configures direction.
+- **Impact:** outputs unusable by default; every restart tri-states bits wired as outputs until the Bd PINI runs.
+- **Class:** ref-faithful. **Live:** confirmed Bd1..Bd8 all In on a fresh IOC.
+
+## PP-62 [MED] USB-2408 digital-direction model missing — OPEN
+- **Rust:** `usb-2408/src/driver.rs:689-708` a direction write on the non-configurable port only sets LAST_ERROR_MESSAGE; `usb-2408-ioc/st.cmd:60-61` loads no Bd records.
+- **C:** AUXPORT is `DPIOT_NONCONFIG` (`DioUsb24xx.cpp:15`); a direction write does `ulDBitOut(port,i,0)` per masked bit ("set open collector output to 0", `drvMultiFunction.cpp:2369-2376`) and stores the mask used by the output gate; `USB2408.substitutions:48-60` Bd1-4=In, Bd5-8=Out, PINI.
+- **Impact:** Bo1-4/Lo bits 0-3 drive open-drain outputs C never drives; C releases bits 0-3 at iocInit, Rust leaves the latched state.
+- **Class:** ref-faithful. **Live:** confirmed `Lo=15` pulls DIO0-3 low (Li 255→240).
+
+## PP-63 [MED] No model detection: MODEL param/record missing, counters hardcoded to 8 — OPEN (regression of PP-42, fix never merged)
+- **Rust:** `params.rs:7` `MAX_COUNTERS=8` used by `scaler_dev.rs:83-85`, `scaler.rs:37,85,115`, `poller.rs:87`, `mcs.rs:116-124`; no MODEL param.
+- **C:** `drvUSBCTR.cpp:362-372` MODEL + `numCounters_` 8 (CTR08) / 4 (CTR04), bounds `:544,687,895,921`, `scalerChannels_` (`:418`); `measCompMCS.template:282-291` Model mbbi.
+- **Impact:** on a CTR04 the poller calls `ulCIn(4..7)` every cycle (ERR_BAD_CTR), the scaler never starts, the MCS wedges (PP-46).
+- **Class:** unimpl. **Live:** `USBCTR:MCS:Model` not found; CTR04 effects static.
+
+## PP-64 [LOW] Derived calc records miss CP/FLNK links (Width, generator dwell) — OPEN
+- **Rust:** `meascomp_pulse_gen.template:94-99,113-118` CalcWidth/Width_RBV CP on Period_RBV only (DutyCycle_RBV NPP); `meascomp_wave_gen.template:88-93,116-121` CalcUserDwell/CalcIntDwell INPB NumPoints NPP.
+- **C:** `measCompPulseGen.template:87-95,127-133` DutyCycle FLNK CalcWidth, Width_RBV CP on both; `measCompWaveformGen.template:158,206` NumPoints CP.
+- **Impact:** Width/Width_RBV stay 0 from boot and stale after DutyCycle-only changes; NumPoints changes don't rescale dwell.
+- **Class:** ref-indep. **Live:** confirmed — at startup Period 0.001, DutyCycle 0.5, Width/Width_RBV 0.
+
+## Cross-driver (both IOCs / shared db)
+
+## PP-65 [HIGH] Autosave non-functional since `9b794e6`; both IOCs share one save path — OPEN
+- **Rust:** `usb-ctr-ioc/src/main.rs:31-34`, `usb-2408-ioc/src/main.rs:30-33` set `MEASCOMP` to `CARGO_MANIFEST_DIR/..` (`iocs/meascomp`); both st.cmd `set_requestfile_path("$(MEASCOMP)")` / `set_savefile_path("$(MEASCOMP)/autosave")` / `auto_settings.sav`; `auto_settings.req` lives in each IOC dir. Before `9b794e6` `MEASCOMP` was the IOC dir.
+- **C:** `iocBoot/save_restore.cmd:23,28-34` per-IOC `autosave/` relative to each iocBoot dir.
+- **Impact:** nothing is ever saved or restored (the "restore across a restart" feature `0b243c7` is dead); when launched from an IOC dir both IOCs would write the same `auto_settings.sav` and restore each other's PVs.
+- **Class:** ref-indep. **Live:** confirmed — after ~9 min of changes on both IOCs with a 30 s monitor set, `iocs/meascomp/autosave/` is empty and `iocs/meascomp/*.req` does not exist.
+
+## PP-66 [MED] Output records lack the PINI C relies on; restored values never reach the driver — OPEN (FAMILY)
+- **Rust:** no PINI on `meascomp_pulse_gen.template:1` Run (also no OSV MINOR, not in `auto_settings.req`) and `:60` IdleState; `meascomp_counter.template:7` Reset (no `VAL 1`); `meascomp_binary_out.template:1` Bo (no PHAS 2); `meascomp_analog_out.template:1` Ao (no PHAS 2/VAL 0); `meascomp_temperature.template:34,41` Filter/OpenTCDetect; `meascomp_wave_dig.template:69-102` ExtTrigger/ExtClock/Continuous/AutoRestart/BurstMode; `meascomp_wave_gen.template:143-162` ExtTrigger/ExtClock/Continuous. epics-rs pass-1 restore writes VAL without processing (`save_set.rs:342-447`).
+- **C:** all `PINI YES`: `measCompPulseGen.template:8,181`, `measCompCounter.template:8` (VAL 1), `measCompBinaryOut.template:1` (PHAS 2), `measCompAnalogOut.template:2-4` (PHAS 2, VAL 0), `measCompTemperatureIn.template:49,60`, `measCompWaveformDig.template:135-213`, `measCompWaveformGen.template:216-247`; `measCompPulseGen_settings.req:6` saves Run.
+- **Impact (once PP-65 is fixed):** restored Continuous/ExtTrigger/OpenTCDetect/IdleState display but the driver keeps 0; counters not zeroed at boot; DACs and DIO outputs not driven at boot; running pulse generators not resumed.
+- **Family:** every output record listed in either `auto_settings.req`; a test asserting PINI on each would close it.
+- **Class:** contract. **Live:** static (autosave itself broken, PP-65).
+
+## PP-67 [MED] Write failures never return asynError, so records never alarm (both drivers) — OPEN (FAMILY)
+- **Rust:** `usb-ctr/src/driver.rs:238-247,360-369,418-427` and `usb-2408/src/driver.rs:160-181` (`finish_write`), `:619,722` log to LAST_ERROR_MESSAGE then return `Ok(())`; restart stop errors dropped (`let _ = pulse_gen::stop`, `:132,325`).
+- **C:** `drvUSBCTR.cpp:1254,1316,1368`, `drvMultiFunction.cpp:2211` et al. `return (status==0) ? asynSuccess : asynError`.
+- **Impact:** failed pulse start, counter reset, DIO write or scan start leaves the record NO_ALARM; the failure is visible only in the `LastErrorMessage` waveform (a Rust addition — C never writes `lastErrorMessage_`), which is also never cleared on success.
+- **Class:** contract. **Live:** confirmed — every failure in this session (errors 15, 16, 22, 51, 56, 58) left the written record NO_ALARM; LastErrorMessage kept the last error after later successful writes.
+
+## PP-68 [LOW] Zero-value writes ignored where C acts on any write — OPEN
+- **Rust:** `usb-ctr/src/driver.rs:171-177` and `usb-2408/src/driver.rs:258` COUNTER_RESET only `if value != 0`; `usb-2408/src/driver.rs:282` ANALOG_OUT_SYNC_WRITE; `:410` WAVEDIG_READ_WF.
+- **C:** `drvUSBCTR.cpp:1119-1126`, `drvMultiFunction.cpp:2063-2071,2159-2161` act on every write.
+- **Impact:** `caput …Reset 0` / `SyncWrite 0` do nothing in Rust.
+- **Class:** ref-faithful. **Live:** static.
+
+## PP-69 [LOW] POLL_TIME_MS reports work time, not cycle time; sub-ms POLL_SLEEP_MS truncated (both drivers) — OPEN
+- **Rust:** `usb-ctr/src/poller.rs:62,175-177,182`, `usb-2408/src/poller.rs:69,256-258,263`.
+- **C:** `drvUSBCTR.cpp:1494,1501-1503,1539`, `drvMultiFunction.cpp:2599-2601,2851` (cycle time incl. sleep; exact float sleep).
+- **Impact:** PollTimeMS reads far below PollSleepMS; `PollSleepMS=0.5` busy-loops.
+- **Class:** contract. **Live:** confirmed — PollSleepMS 50, PollTimeMS 1.65 (CTR) / 28.6 (2408).
+
+## PP-70 [MED] Absolute-time waveforms use the Unix epoch instead of the EPICS epoch (both drivers) — OPEN
+- **Rust:** `usb-2408/src/wave_dig.rs:215,275-280`, `usb-ctr/src/mcs.rs:279-284` `duration_since(UNIX_EPOCH)`.
+- **C:** `drvMultiFunction.cpp:2716-2726`, `drvUSBCTR.cpp:782` `now.secPastEpoch + nsec/1e9` (1990 epoch).
+- **Impact:** every AbsTimeWF element is +631152000 s off C.
+- **Class:** contract. **Live:** confirmed — `WaveDigAbsTimeWF[0]` and `MCS:AbsTimeWF[0]` = 1.79004e9 (Unix now 1790036774; EPICS epoch now 1158884774).
+
+## PP-71 [LOW] Time-base waveforms not recomputed on dwell/point-count writes (both drivers) — OPEN (includes PP-43, fix never merged)
+- **Rust:** `usb-ctr/src/driver.rs:307-370` no `MCA_DWELL_TIME` branch (time WF built only in `start_mcs`, `mcs.rs:205`); `usb-2408` WAVEDIG_TIME_WF built only on a successful Run (`wave_dig.rs:159-162`); WaveGenUser/IntTimeWF Passive, no PINI, never computed (`meascomp_wave_gen.template:123-135`, `driver.rs:624-650`).
+- **C:** `drvUSBCTR.cpp:1302-1304` → `computeMCSTimes` (`:873-885`); `drvMultiFunction.cpp:2097-2105,2308-2310` `computeWaveDigTimes`, `:2196-2199,2313-2316` `computeWaveGenTimes`, all with I/O Intr callbacks.
+- **Impact:** time axes are zero/stale until a run and don't follow Dwell/NumPoints changes; generator time axes never populate.
+- **Class:** ref-faithful. **Live:** confirmed — after `WaveGenUserDwell=0.002`, `WaveGenUserTimeWF`/`IntTimeWF` read all zeros.
+
+## PP-72 [LOW] Empty uniqueID opens the first enumerated device — OPEN
+- **Rust:** `meascomp/src/device.rs:37-38` `if unique_id.is_empty() { descriptors[0].clone() }`.
+- **C:** `measCompDiscover.cpp:169-182,208` exact match or -1; constructors abort (`drvUSBCTR.cpp:274-278`, `drvMultiFunction.cpp:838-842`).
+- **Impact:** with both boards attached, an empty UNIQUE_ID binds either IOC to whichever board enumerates first.
+- **Class:** ref-indep. **Live:** static (would contend for the attached boards).
+
+## PP-73 [LOW] No `report()` override in either driver — OPEN
+- **Rust:** neither `usb-ctr` nor `usb-2408` implements `PortDriver::report`.
+- **C:** `drvUSBCTR.cpp:1545-1570`, `drvMultiFunction.cpp:2856-2915`.
+- **Impact:** `asynReport` shows no pulse-gen/scaler/MCS/waveform runtime state.
+- **Class:** unimpl. **Live:** static.
+
+## PP-74 [LOW] Wrapper C-string buffers are `[0i8; N]` — OPEN
+- **Rust:** `meascomp/src/error.rs:15`, `device.rs:89,106`.
+- **C:** libuldaq supports Raspberry Pi OS (`README.md:15`), where `c_char` is `u8`.
+- **Impact:** the crate does not compile on aarch64/armv7 Linux.
+- **Class:** ref-indep. **Live:** static.
+
+## PP-75 [LOW] C records missing from the Rust IOCs — OPEN
+- **Rust:** no `Bo<n>_RBV`, `WaveGen<n>InternalWF`, `MCS:Dwell_RBV`, `MCS:Model`, `MCS:SNL_Connected`, `MCS:Asyn`, `Ao<n>Return`/`Ao<n>Pulse`, `Ai<n>Rate`.
+- **C:** `measCompBinaryOut.template:15-25`, `measCompWaveformGenN.template:15-22`, `measCompMCS.template:5-10,122-127,282-291,320-322`, `measCompAnalogOut.template:27-47`, `measCompAnalogIn.template:31-37`.
+- **Impact:** C OPIs/clients lose these readbacks. Driver-side gaps behind some of them are PP-57, PP-63, PP-79, PP-93.
+- **Class:** unimpl. **Live:** confirmed not found: `USBCTR:MCS:Model`, `USBCTR:Bo1_RBV`, `USB2408:Bo1_RBV`, `USB2408:WaveGen1InternalWF`, `USB2408:Ai1Rate`.
+
+## PP-76 [LOW] Record names and state strings diverge from the C templates — OPEN
+- **Rust:** `meascomp_wave_gen.template:16` `WaveGenFreq`; `meascomp_wave_gen_n.template:4` `$(R)WaveType` ("User/Sin/…"); bo states "Off/On" on WaveDig/WaveGen ExtTrigger/ExtClock/AutoRestart/BurstMode, WaveGen Enable, Ti OpenTCDetect; TCType "J".."N".
+- **C:** `measCompWaveformGen.template:78` `Frequency`; `measCompWaveformGenN.template:39-56` `$(R)Type` ("Sin wave", …); "Internal/External", "Disable/Enable"; "Type J".."Type N".
+- **Impact:** C OPIs, scripts and autosave files fail against the Rust IOC.
+- **Class:** contract. **Live:** confirmed `USB2408:WaveGen1Type` and `USB2408:WaveGenFrequency` not found.
+
+## PP-77 [LOW] Record types/menus/defaults changed (digitizer channels, TC filter, MCS dwell) — OPEN
+- **Rust:** `meascomp_wave_dig.template:23-39` FirstChan/NumChans longout, NumChans default 8 (`driver.rs:67`); `meascomp_temperature.template:34-39` Filter "Off"(0)/"On"(1); `meascomp_mcs.template:143-149` Dwell VAL 0.001.
+- **C:** `measCompWaveformDig.template:20-67` mbbo, NumChans raw = index+1, default 1 channel; `measCompTemperatureIn.template:49-58` "Filter"(0)/"No filter"(0x400); `measCompMCS.template:114-120` Dwell 0.1.
+- **Impact:** numeric NumChans writes differ by one; the default 8-channel × 1 ms digitizer run always fails (PP-90) where C's 1-channel default runs.
+- **Class:** contract. **Live:** confirmed default NumChans=8; `NumChans 8, Dwell 0.001` → "uldaq error 22".
+
+## usb-2408 — AI / TC / AO / DIO
+
+## PP-78 [HIGH] Analog-output record takes raw DAC counts; C's takes volts — OPEN
+- **Rust:** `meascomp_analog_out.template:1-5` `ao` asynInt32 with no LINR/EGUL/EGUF/DRVL/DRVH; no `get_bounds` override (asyn-rs default (0,0)); `driver.rs:263-279` `ulAOut(…, AOUT_FF_NOSCALEDATA, value)`.
+- **C:** `drvMultiFunction.cpp:1920-1928` `getBounds` 0..65535; `measCompAnalogOut.template:1-17` LINR LINEAR; `USB2408.substitutions:135-137` EGU/DRV ±10.
+- **Impact:** `caput Ao1 5` gives +5 V in C and DAC code 5 (≈ −9.998 V) in Rust; `caput Ao1 0` drives −10 V; any negative volts fails with ERR_BAD_DA_VAL; no ±10 V clamp; TweakVal steps in counts. Fix needs both the record fields and a `get_bounds` for ANALOG_OUT_VALUE.
+- **Class:** contract. **Live:** confirmed — every negative put (−0.5, −9.9, −10) returned "uldaq error 56: Invalid D/A output value specified"; positive volts were accepted as counts. Both DACs were left at code 32768 (≈0 V) after testing.
+
+## PP-79 [HIGH] AI data rate never programmed: every conversion at 3750 S/s instead of 60 S/s — OPEN
+- **Rust:** ANALOG_IN_RATE created (`params.rs:132`) but `write_int32` has no branch; `meascomp/src/analog_in.rs:43` `ai_set_config_dbl` has no caller; no `Ai<n>Rate` record; `auto_settings.req:4` notes it dropped.
+- **C:** `drvMultiFunction.cpp:1994-2001` `ulAISetConfigDbl(AI_CFG_CHAN_DATA_RATE, ch, value)` on the 2408 (`:1140-1146`); `measCompAnalogIn.template:31-37` Rate PINI VAL 60.
+- **Impact:** libuldaq default `CHR_3750` (`AiUsb24xx.cpp:986-987`) applies to `ulAIn`, `ulTIn` and the scan queue: no 50/60 Hz rejection, higher noise, and a much shorter digitizer minimum period than C allows.
+- **Class:** unimpl. **Live:** static (no call site); noise not compared against spec.
+
+## PP-80 [MED] AI/TC records lose C's averaging and forced callbacks; two `ulAIn` per channel — OPEN
+- **Rust:** `meascomp_analog_in.template:1-6`, `meascomp_temperature.template:1-6` asynFloat64 I/O Intr, no averaging; `poller.rs:238-249` post only changed values; `poller.rs:134-151` two `ulAIn` per voltage channel (NOSCALEDATA + scaled; ANALOG_IN_VALUE has no record).
+- **C:** `measCompAnalogIn.template:1-12` asynInt32Average, `measCompTemperatureIn.template:1-7` asynFloat64Average, SCAN 1 second; forced callback every poll (`:2784-2785,2832-2833`); one `ulAIn(NOSCALEDATA)` per channel (`:2779`).
+- **Impact:** single samples at poll rate instead of a 1 s mean (≈√20 more noise, ≈20× monitor traffic); unchanging values (−9999, railed inputs) freeze their timestamp; double ADC time per sweep.
+- **Class:** contract. **Live:** confirmed — `camonitor USB2408:Ai1` delivered 38 updates in 3 s (C: 3).
+
+## PP-81 [MED] Immediate AO write not refused while the generator runs — OPEN (regression of PP-41, fix never merged)
+- **Rust:** `driver.rs:263-279` calls `ulAOut` without checking `wave_gen.running`.
+- **C:** `drvMultiFunction.cpp:2130-2135` refuses with `asynError` and never calls `ulAOut`.
+- **Impact:** libuldaq rejects the write (ERR_ALREADY_ACTIVE, `AoDevice.cpp:282-283`), so the device is unaffected, but the record shows no alarm and its VAL no longer matches the DAC.
+- **Class:** ref-faithful. **Live:** confirmed — `Ao1=40000` during a continuous run → "uldaq error 16: A background process is already in progress", record NO_ALARM.
+
+## PP-82 [MED] USB-2408 port declared non-blocking; C declares ASYN_CANBLOCK — OPEN
+- **Rust:** `driver.rs:48-52` `can_block: false`; writes do USB I/O and take the device mutex the poller holds for its whole sweep (`poller.rs:93-173`).
+- **C:** `drvMultiFunction.cpp:821` `ASYN_MULTIDEVICE | ASYN_CANBLOCK` (USBCTR deliberately omits it, `drvUSBCTR.cpp:259-260`).
+- **Impact:** a CA put or scan thread blocks for a poll sweep (tens of ms; ≈300 ms once PP-79 sets 60 S/s), and blocking USB I/O runs on a tokio worker.
+- **Class:** contract. **Live:** static.
+
+## PP-83 [LOW] Default thermocouple type K; C defaults to J — OPEN
+- **Rust:** `driver.rs:74` `TC_K`; `meascomp_temperature.template:19` `VAL 1`.
+- **C:** `drvMultiFunction.cpp:1281-1283` `TC_TYPE_J`; template index 0 = Type J; libuldaq default `TC_J`.
+- **Impact:** a J sensor on a fresh IOC reads tens of °C off.
+- **Class:** ref-faithful. **Live:** confirmed `Ti1TCType` = K on a fresh IOC.
+
+## PP-84 [LOW] AiMode offers "Pseudo-diff", which the USB-2408 rejects — OPEN
+- **Rust:** `meascomp_analog_in_mode.template:8` `TWVL 3` passed straight to `ulAIn` (`poller.rs:72-74,134-147`).
+- **C:** `measCompAnalogInMode.template:7-10` only 0/1; `drvMultiFunction.cpp:1989` maps to DIFF/SE; device supports only those (`AiUsb24xx.cpp:66-67`).
+- **Impact:** every voltage read fails with ERR_BAD_INPUT_MODE and the Ai records freeze on their last value.
+- **Class:** ref-indep. **Live:** confirmed — `AiMode=2` → "uldaq error 15: Invalid input mode specified" on every channel, every poll.
+
+## PP-85 [LOW] USB-2408 poller logs every error every cycle — OPEN
+- **Rust:** `usb-2408/src/poller.rs:94-103,178-190` warn + rewrite LAST_ERROR_MESSAGE each cycle, no recovery message.
+- **C:** `drvMultiFunction.cpp:2619-2625,2645-2650` report only on `!prevStatus`; `:2843-2846` "Device returned to normal status".
+- **Impact:** a persistent error floods stderr (hundreds of lines/s).
+- **Family:** `usb-ctr/src/poller.rs:100-102` has the same per-cycle logging, but C `USBCTR::pollerThread` (`drvUSBCTR.cpp:1512-1515`) also prints every cycle — distinct, not a divergence.
+- **Class:** ref-faithful. **Live:** confirmed — 336 WARN lines within ~1 s in Pseudo-diff mode.
+
+## usb-2408 — waveform generator / digitizer
+
+## PP-86 [HIGH] Internal waveform amplitude used as peak instead of peak-to-peak — OPEN (regression of PP-40, fix never merged)
+- **Rust:** `wave_gen.rs:77-114` sin/square/sawtooth/random swing `offset ± amplitude`; unit tests `wave_gen.rs:284-293` assert the regressed values.
+- **C:** `drvMultiFunction.cpp:1542,1546,1549-1550,1554,1568-1570` span `offset ± amplitude/2` (pulse is full amplitude in both).
+- **Impact:** every internal waveform is 2× the C voltage — over-drive risk.
+- **Class:** ref-faithful. **Live:** static (no AO→AI loopback).
+
+## PP-87 [HIGH] Generator stop rewrites every AO channel, including channels not in the scan — OPEN
+- **Rust:** `wave_gen.rs:161-167` saves only `first..=last`; `stop_wave_gen` (`:242-249`) writes `saved_outputs[ch]` for all `ch in 0..MAX_ANALOG_OUT`; `saved_outputs` starts `[0.0; 2]` (`:34`).
+- **C:** `drvMultiFunction.cpp:1721-1733` restores only enabled channels.
+- **Impact:** with only WaveGen1 enabled, every stop drives AO2 to DAC code 0 (−10 V) or a stale value, silently overriding Ao2 while its record shows the old value.
+- **Class:** ref-indep. **Live:** static (output not observable); this session's one-shot and continuous runs with WaveGen2 disabled would have driven AO2 to code 0 on stop — AO2 was re-written to 32768 afterwards.
+
+## PP-88 [MED] Pulse width treated as a fraction; PULSE_DELAY ignored — OPEN (regression of PP-41, fix never merged)
+- **Rust:** `wave_gen.rs:96-105` `pulse_samples = pulse_width * n`, high from sample 0; `driver.rs:536-551` never reads `WAVEGEN_PULSE_DELAY`.
+- **C:** `drvMultiFunction.cpp:1557-1565` `nPulse = pulseWidth/dwell + 0.5`, `nDelay = pulseDelay/dwell + 0.5`, clamped to leave ≥ 1 low sample.
+- **Impact:** wrong pulse length, no delay, all-high when width ≥ period.
+- **Class:** ref-faithful. **Live:** static.
+
+## PP-89 [LOW] Sin/sawtooth period divisor `n` instead of `numPoints-1`; different random generator — OPEN (regression of PP-41 LOW, fix never merged)
+- **Rust:** `wave_gen.rs:79,93,108-112`.
+- **C:** `drvMultiFunction.cpp:1545,1553,1569-1570` (`srand(1); rand()`), float32 staging (`:1506,1660`).
+- **Impact:** DAC codes differ from C at every point.
+- **Class:** ref-faithful. **Live:** static.
+
+## PP-90 [MED] Wave-dig ERR_BAD_RATE never sets the −9999 DwellActual sentinel — OPEN (PP-41 DEFERRED item, now unblocked)
+- **Rust:** `wave_dig.rs:140-154` discards the `UlError` code; `WAVEDIG_DWELL_ACTUAL` not written on failure; `uldaq-sys` has no `ERR_BAD_RATE`.
+- **C:** `drvMultiFunction.cpp:1836,1842-1846` `-9999` on `ERR_BAD_RATE`; `ERR_BAD_RATE = 22` (`/usr/local/include/uldaq.h:164`).
+- **Impact:** a rejected rate leaves DwellActual stale.
+- **Class:** ref-faithful. **Live:** confirmed — `NumChans 8, Dwell 0.001` → "uldaq error 22", DwellActual stayed 0.002 from the previous run (C: −9999).
+
+## PP-91 [MED] Digitizer queue uses the first channel's range for every channel — OPEN
+- **Rust:** `driver.rs:346-348` `range = ANALOG_IN_RANGE[first_chan]`; `wave_dig.rs:103-111` same range in every `AiQueueElement`.
+- **C:** `drvMultiFunction.cpp:1787-1802` per-channel `gainArray[i] = analogInRange_[firstChan+i]`.
+- **Impact:** channels behind a narrower first-channel range clip; a wider one loses resolution.
+- **Class:** ref-faithful. **Live:** static (needs a known input).
+
+## PP-92 [MED] Three disagreeing end-of-scan paths instead of C's single `stopWaveDig` — OPEN
+- **Rust:** auto-restart (`wave_dig.rs:219-262`) fires no VoltWF/AbsTimeWF callbacks and reuses stale settings; manual Stop (`driver.rs:406-408`) delivers no partial data; a scan-status error (`wave_dig.rs:186-192`) returns early with `running` stuck true, freezing Run, CurrentPoint and the scalar AI/TC polling (`poller.rs:126`).
+- **C:** `drvMultiFunction.cpp:1861-1882` clears Run, `readWaveDig` callbacks, `ulAInScanStop`, then `startWaveDig()` (re-reads all params) if AutoRestart; poller continues after a status error (`:2695-2732`).
+- **Impact:** AutoRestart never delivers completed scans; Stop discards data; one scan error freezes the digitizer and all AI records.
+- **Family:** the scan-status-error early return also exists at `usb-ctr/src/mcs.rs:226` (PP-48) and `scaler.rs:103`.
+- **Class:** ref-faithful. **Live:** static.
+
+## PP-93 [MED] Waveform-parameter writes never run `defineWaveform`: no INT_WF, readbacks stale, no live restart — OPEN (partial regression of the "COMPLETED" user/internal-array item)
+- **Rust:** `driver.rs:233-620` has no branch for WAVE_TYPE, USER/INT_NUM_POINTS, ENABLE, EXT_*, CONTINUOUS, USER/INT_DWELL, PULSE_*, AMPLITUDE, OFFSET; `WAVEGEN_INT_WF` (`params.rs:201`) never written, `read_float32_array` returns 0 for it (`:635-636`).
+- **C:** `drvMultiFunction.cpp:2171-2183,2294-2305` `defineWaveform(addr)` and, while running, stop+start; `defineWaveform` updates NUM_POINTS/DWELL/FREQ and fires INT_WF (`:1520-1573`).
+- **Impact:** amplitude/type/enable changes during a continuous run take effect only after a manual Stop/Run; WaveGenNumPoints/Dwell/Freq stale until Run; no internal-waveform preview.
+- **Class:** unimpl. **Live:** confirmed — WaveGenFreq/NumPoints/Dwell stayed 0/2048/0 after `IntNumPoints=200, IntDwell=0.001` until Run published 5/200/0.001.
+
+## PP-94 [MED] User waveform ignores Amplitude/Offset, repeats a short buffer, accepts oversize writes — OPEN
+- **Rust:** `driver.rs:539-547` `user[i % user.len()]` unscaled; `write_float32_array` (`:653-665`) truncates and returns Ok.
+- **C:** `drvMultiFunction.cpp:1652-1660` `user*amplitude + offset`; short write leaves the rest of the buffer; `:2513-2518` oversize → asynError. (Upstream `i`/`k` index bug at `:1653`, see `upstream-c-defects.md`.)
+- **Impact:** DAC output differs from C whenever Amplitude ≠ 1 or Offset ≠ 0; a short user WF plays repeatedly.
+- **Class:** ref-faithful. **Live:** static.
+
+## PP-95 [LOW] Poller publishes Run=0 through `write_int32`, re-running stop logic — OPEN
+- **Rust:** `poller.rs:222,232` `write_int32_blocking(wave_{gen,dig}_run, 0, 0)` after releasing the state lock → `driver.rs:414/325` → `stop_wave_*`.
+- **C:** `drvMultiFunction.cpp:2678-2680,2730-2732` stop under the driver lock inside the poll; Run=0 via `setIntegerParam`.
+- **Impact:** a client that restarts immediately on completion can have its new scan stopped (and the AO restore of PP-87 re-run). Timing-dependent.
+- **Class:** ref-indep. **Live:** static.
+
+## Live hardware verification (2026-09-22)
+
+IOCs: `usb-ctr-ioc` (CA 5064) and `usb-2408-ioc` (CA 5074), release build of
+`cc61da4`, stock st.cmd. Results not already cited above:
+
+- `list-devices`: both boards found (USB-CTR08 `01DAB0FB`, USB-2408-2AO `01DA523D`) — pass
+- Both IOCs iocInit with no warnings (190 / 175 records) — pass
+- Device info (ModelName, ModelNumber 295/254, FirmwareVersion 0.10/1.01, UniqueID, ULVersion 1.2.0) — pass
+- CTR pulse generator 1234.5 Hz / 25 % → Frequency_RBV 1234.5, Period_RBV 0.000810042 — pass
+- CTR counter Reset (Counter5 1 → 0) — pass
+- CTR DIO with bits Out: Lo 165 → Li 165; Bo2 → 167 — pass
+- CTR MCS internal advance, 100 pts × 10 ms → ElapsedReal 1.037, CurrentChannel 100, TimeWF 0, 0.01, … — pass
+- CTR scaler count TP=1 s: never completes — expected without counter-0 clock wiring (C identical); arm/stop path works
+- 2408 AI 8 ch Differential, ranges ±10 V … ±0.078 V, Single-ended — pass
+- 2408 TC on Ai1: open-TC detect On → −9999, Off → finite garbage (open input) — pass
+- 2408 DIO open-drain: Lo 15 → Li 240 — pass
+- 2408 wave digitizer 2 ch × 500 pts × 2 ms → CurrentPoint 500, DwellActual 0.002 — pass
+- 2408 wave generator internal sine one-shot 200 pts → Run returns to Stop, CurrentPoint 200; continuous run and stop — pass (output voltage not measurable)
+
+## Review Log — 2026-09-22 (wave 4)
+
+52 findings (8 HIGH / 27 MED / 17 LOW) from 68 raw across 5 panels; 16
+merged as cross-panel duplicates. 27 are live-confirmed on the attached
+hardware, the rest are static (no loopback wiring).
+Independence split: 8 ref-indep, 23 ref-faithful, 11 contract, 10 unimpl.
+16 are regressions of PP-40..43 / the COMPLETED block whose fixes were
+never merged (PP-45 part, 51, 52, 53, 54, 57, 58, 60, 63, 71, 81, 86, 88,
+89, 90, 93 part).
+
+Themes:
+- **Unmerged fix branches.** The wave-3 inventory recorded FIXED against
+  branches that never reached `main`; nothing verified the claims on
+  `main`. This is the single largest source of open items.
+- **db contract drift from the C templates** (PP-55, 64, 66, 75, 76, 77,
+  78): missing PINI/PHAS, raw-count AO, renamed PVs, dropped CP links.
+  The Rust templates were re-authored instead of derived from the C ones.
+- **Error propagation** (PP-46, 67, 90, 92): uldaq failures are logged to a
+  Rust-only waveform while records stay NO_ALARM and state flags wedge.
+- **Missing device configuration calls** (PP-44, 52, 53, 79): C issues
+  `ulCLoad(OUTPUT_VAL*)`, `ulDaqInSetTrigger`, `ulAISetConfigDbl(DATA_RATE)`
+  that the port never makes.
+- **Autosave dead since `9b794e6`** (PP-65) masks PP-66 today.
+
+FFI layer (`uldaq-sys`) is clean: 165 constants, 4 struct layouts and 45
+prototypes verified against `uldaq.h` with a compiled dump.
