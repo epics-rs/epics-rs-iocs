@@ -124,14 +124,14 @@ record(waveform, "$(P)WaveGenUserTimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_USER_TIME_WF")
     field(FTVL, "FLOAT")
-    field(NELM, "$(WGEN_POINTS=2048)")
+    field(NELM, "$(WGEN_POINTS=2048)")    field(SCAN, "I/O Intr")
 }
 
 record(waveform, "$(P)WaveGenIntTimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_INT_TIME_WF")
     field(FTVL, "FLOAT")
-    field(NELM, "$(WGEN_POINTS=2048)")
+    field(NELM, "$(WGEN_POINTS=2048)")    field(SCAN, "I/O Intr")
 }
 
 record(longin, "$(P)WaveGenCurrentPoint") {

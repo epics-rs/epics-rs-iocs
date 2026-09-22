@@ -705,7 +705,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** every AbsTimeWF element is +631152000 s off C.
 - **Class:** contract. **Live:** confirmed — `WaveDigAbsTimeWF[0]` and `MCS:AbsTimeWF[0]` = 1.79004e9 (Unix now 1790036774; EPICS epoch now 1158884774).
 
-## PP-71 [LOW] Time-base waveforms not recomputed on dwell/point-count writes (both drivers) — OPEN (includes PP-43, fix never merged)
+## PP-71 [LOW] Time-base waveforms not recomputed on dwell/point-count writes (both drivers) — FIXED (includes PP-43, fix never merged)
 - **Rust:** `usb-ctr/src/driver.rs:307-370` no `MCA_DWELL_TIME` branch (time WF built only in `start_mcs`, `mcs.rs:205`); `usb-2408` WAVEDIG_TIME_WF built only on a successful Run (`wave_dig.rs:159-162`); WaveGenUser/IntTimeWF Passive, no PINI, never computed (`meascomp_wave_gen.template:123-135`, `driver.rs:624-650`).
 - **C:** `drvUSBCTR.cpp:1302-1304` → `computeMCSTimes` (`:873-885`); `drvMultiFunction.cpp:2097-2105,2308-2310` `computeWaveDigTimes`, `:2196-2199,2313-2316` `computeWaveGenTimes`, all with I/O Intr callbacks.
 - **Impact:** time axes are zero/stale until a run and don't follow Dwell/NumPoints changes; generator time axes never populate.

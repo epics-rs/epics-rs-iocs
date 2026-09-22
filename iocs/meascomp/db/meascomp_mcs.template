@@ -105,12 +105,14 @@ record(bo, "$(P)MCS:ClearAcquiring") {
     field(OUT,  "$(P)MCS:Acquiring  PP")
 }
 
-# Time bases, read on demand through the fan-out above.
+# Time bases. The relative one is pushed by the driver whenever Dwell is
+# written (C computeMCSTimes); both are also read through the fan-out above.
 record(waveform, "$(P)MCS:TimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)MCS_TIME_WF")
     field(FTVL, "FLOAT")
     field(NELM, "$(MAX_POINTS=2048)")
+    field(SCAN, "I/O Intr")
 }
 
 record(waveform, "$(P)MCS:AbsTimeWF") {

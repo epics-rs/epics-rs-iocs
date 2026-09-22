@@ -158,11 +158,6 @@ pub fn start_wave_dig(
     state.dwell_actual = 1.0 / rate;
     state.running = true;
 
-    // Compute time waveform
-    for i in 0..num_points {
-        state.time_buffer[i] = (i as f64 * state.dwell_actual) as f32;
-    }
-
     log::info!(
         "WaveDig started: ch{first_chan}-{}, {num_points} pts, rate={rate:.0} Hz",
         first_chan + num_chans - 1
@@ -311,15 +306,15 @@ pub fn waveform_updates(params: &MultiFunctionParams, state: &WaveDigState) -> V
     updates
 }
 
-/// Array callback for the dwell-derived time base. C
-/// `MultiFunction::computeWaveDigTimes`.
-pub fn time_wf_update(params: &MultiFunctionParams, state: &WaveDigState) -> ParamSetValue {
-    let n = state.num_points.min(state.time_buffer.len());
-    ParamSetValue::new(
-        params.wave_dig_time_wf,
-        0,
-        ParamValue::Float32Array(state.time_buffer[..n].into()),
-    )
+/// C `computeWaveDigTimes` / `computeWaveGenTimes`: the relative time base
+/// `i * dwell` over `num_points`, bounded by the buffer. Returns the number
+/// of points written, which is also the length of the array callback.
+pub fn compute_times(buffer: &mut [f32], num_points: usize, dwell: f64) -> usize {
+    let n = num_points.min(buffer.len());
+    for (i, t) in buffer[..n].iter_mut().enumerate() {
+        *t = (i as f64 * dwell) as f32;
+    }
+    n
 }
 
 #[cfg(test)]
@@ -334,6 +329,14 @@ mod tests {
             .as_secs_f64();
         let offset = unix - current_time_secs();
         assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
+
+    #[test]
+    fn the_time_base_follows_the_dwell_over_the_scan_length() {
+        let mut buf = [0.0f32; 8];
+        assert_eq!(compute_times(&mut buf, 3, 0.25), 3);
+        assert_eq!(&buf[..3], &[0.0, 0.25, 0.5]);
+        assert_eq!(compute_times(&mut buf, 100, 1.0), 8);
     }
 
     #[test]

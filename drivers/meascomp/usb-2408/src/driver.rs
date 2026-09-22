@@ -187,6 +187,56 @@ impl MultiFunctionDriver {
         }
     }
 
+    /// C `computeWaveDigTimes`: the digitizer time base from the requested
+    /// WAVEDIG_DWELL over WAVEDIG_NUM_POINTS, as an array callback.
+    fn wave_dig_time_update(&self) -> ParamSetValue {
+        let num_points = self
+            .base
+            .get_int32_param(self.params.wave_dig_num_points, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let dwell = self
+            .base
+            .get_float64_param(self.params.wave_dig_dwell, 0)
+            .unwrap_or(0.0);
+        let mut st = self.state.lock().unwrap();
+        let n = wave_dig::compute_times(&mut st.wave_dig.time_buffer, num_points, dwell);
+        ParamSetValue::new(
+            self.params.wave_dig_time_wf,
+            0,
+            ParamValue::Float32Array(st.wave_dig.time_buffer[..n].into()),
+        )
+    }
+
+    /// C `computeWaveGenTimes`: both generator time bases, each from its own
+    /// point count and dwell, as array callbacks.
+    fn wave_gen_time_updates(&self) -> Vec<ParamSetValue> {
+        let get_points = |reason| self.base.get_int32_param(reason, 0).unwrap_or(0).max(0) as usize;
+        let get_dwell = |reason| self.base.get_float64_param(reason, 0).unwrap_or(0.0);
+        let user = (
+            get_points(self.params.wave_gen_user_num_points),
+            get_dwell(self.params.wave_gen_user_dwell),
+        );
+        let int = (
+            get_points(self.params.wave_gen_int_num_points),
+            get_dwell(self.params.wave_gen_int_dwell),
+        );
+        let mut st = self.state.lock().unwrap();
+        let n = wave_dig::compute_times(&mut st.wave_gen.user_time_buffer, user.0, user.1);
+        let user_wf = ParamSetValue::new(
+            self.params.wave_gen_user_time_wf,
+            0,
+            ParamValue::Float32Array(st.wave_gen.user_time_buffer[..n].into()),
+        );
+        let n = wave_dig::compute_times(&mut st.wave_gen.int_time_buffer, int.0, int.1);
+        let int_wf = ParamSetValue::new(
+            self.params.wave_gen_int_time_wf,
+            0,
+            ParamValue::Float32Array(st.wave_gen.int_time_buffer[..n].into()),
+        );
+        vec![user_wf, int_wf]
+    }
+
     /// Push THERMOCOUPLE_TYPE and THERMOCOUPLE_OPEN_DETECT for `chan` to the
     /// device.
     ///
@@ -407,7 +457,6 @@ impl PortDriver for MultiFunctionDriver {
                         0,
                         st.wave_dig.dwell_actual * num_points as f64,
                     )?;
-                    time_wf = Some(wave_dig::time_wf_update(&self.params, &st.wave_dig));
                 }
             } else if value == 0 {
                 wave_dig::stop_wave_dig(&dev, &mut st.wave_dig);
@@ -600,6 +649,17 @@ impl PortDriver for MultiFunctionDriver {
             }
         }
 
+        // C recomputes the time bases on a point-count write
+        // (drvMultiFunction.cpp:2104, :2195-2198), not only when a scan starts.
+        if reason == self.params.wave_dig_num_points {
+            time_wf = Some(self.wave_dig_time_update());
+        }
+        if reason == self.params.wave_gen_user_num_points
+            || reason == self.params.wave_gen_int_num_points
+        {
+            wave_arrays.extend(self.wave_gen_time_updates());
+        }
+
         self.finish_write(addr, last_error, wave_arrays, time_wf)
     }
 
@@ -619,38 +679,83 @@ impl PortDriver for MultiFunctionDriver {
                 .set_float64(self.params.wave_gen_dwell, 0, dwell)?;
         }
 
-        self.base.call_param_callbacks(addr)?;
-        Ok(())
+        // C recomputes the time bases on a dwell write (drvMultiFunction.cpp:
+        // 2308-2316).
+        let mut wave_arrays = Vec::new();
+        let mut time_wf = None;
+        if reason == self.params.wave_dig_dwell {
+            time_wf = Some(self.wave_dig_time_update());
+        }
+        if reason == self.params.wave_gen_user_dwell || reason == self.params.wave_gen_int_dwell {
+            wave_arrays.extend(self.wave_gen_time_updates());
+        }
+
+        self.finish_write(addr, None, wave_arrays, time_wf)
     }
 
-    /// Generator time bases: WAVEGEN_USER_TIME_WF and WAVEGEN_INT_TIME_WF,
-    /// each `i * dwell` over its own point count. C computeWaveGenTimes.
+    /// C `readFloat32Array`: the generator arrays run to WAVEGEN_NUM_POINTS,
+    /// the digitizer time base to WAVEDIG_NUM_POINTS.
     fn read_float32_array(&mut self, user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
-        let (points_param, dwell_param) = if user.reason == self.params.wave_gen_user_time_wf {
-            (
-                self.params.wave_gen_user_num_points,
-                self.params.wave_gen_user_dwell,
-            )
-        } else if user.reason == self.params.wave_gen_int_time_wf {
-            (
-                self.params.wave_gen_int_num_points,
-                self.params.wave_gen_int_dwell,
-            )
+        let reason = user.reason;
+        let points_param = if reason == self.params.wave_dig_time_wf {
+            self.params.wave_dig_num_points
         } else {
-            return Ok(0);
+            self.params.wave_gen_num_points
         };
-        let num_points = (self
+        let num_points = self
             .base
             .get_int32_param(points_param, 0)
             .unwrap_or(0)
-            .max(0) as usize)
-            .min(self.max_output_points)
-            .min(buf.len());
-        let dwell = self.base.get_float64_param(dwell_param, 0).unwrap_or(0.0);
-        for (i, slot) in buf[..num_points].iter_mut().enumerate() {
-            *slot = (i as f64 * dwell) as f32;
-        }
-        Ok(num_points)
+            .max(0) as usize;
+        let st = self.state.lock().unwrap();
+        let user_wf: Vec<f32>;
+        let src: &[f32] = if reason == self.params.wave_gen_user_time_wf {
+            &st.wave_gen.user_time_buffer
+        } else if reason == self.params.wave_gen_int_time_wf {
+            &st.wave_gen.int_time_buffer
+        } else if reason == self.params.wave_dig_time_wf {
+            &st.wave_dig.time_buffer
+        } else if reason == self.params.wave_gen_user_wf {
+            let ch = device_addr(user.addr) as usize;
+            let Some(wf) = st.wave_gen.user_waveforms.get(ch) else {
+                return Ok(0);
+            };
+            user_wf = wf.iter().map(|v| *v as f32).collect();
+            &user_wf
+        } else {
+            return Ok(0);
+        };
+        let n = buf.len().min(num_points).min(src.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        Ok(n)
+    }
+
+    /// C `readFloat64Array`: a digitized channel or the absolute time base,
+    /// up to WAVEDIG_NUM_POINTS.
+    fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
+        let num_points = self
+            .base
+            .get_int32_param(self.params.wave_dig_num_points, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let st = self.state.lock().unwrap();
+        let src: &[f64] = if user.reason == self.params.wave_dig_volt_wf {
+            let Some(chan) = st
+                .wave_dig
+                .channel_buffers
+                .get(device_addr(user.addr) as usize)
+            else {
+                return Ok(0);
+            };
+            chan
+        } else if user.reason == self.params.wave_dig_abs_time_wf {
+            &st.wave_dig.abs_time_buffer
+        } else {
+            return Ok(0);
+        };
+        let n = buf.len().min(num_points).min(src.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        Ok(n)
     }
 
     /// Load a user-defined generator waveform (volts) for one channel.

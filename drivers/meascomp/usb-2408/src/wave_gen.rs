@@ -21,6 +21,10 @@ pub struct WaveGenState {
     /// Capacity the port was configured with; a user waveform is truncated to
     /// it so it can never outrun the scan buffer.
     pub max_points: usize,
+    /// Relative time bases for the user-defined and internal timing pairs,
+    /// C `waveGenUserTimeBuffer_` / `waveGenIntTimeBuffer_`.
+    pub user_time_buffer: Vec<f32>,
+    pub int_time_buffer: Vec<f32>,
 }
 
 impl WaveGenState {
@@ -35,6 +39,8 @@ impl WaveGenState {
             dwell_actual: 0.001,
             user_waveforms: vec![Vec::new(); MAX_ANALOG_OUT],
             max_points,
+            user_time_buffer: vec![0.0; max_points],
+            int_time_buffer: vec![0.0; max_points],
         }
     }
 }

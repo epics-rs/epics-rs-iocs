@@ -75,11 +75,15 @@ pub fn erase_mcs(state: &mut McsState) {
     state.current_point = 0;
 }
 
-/// Compute the time waveform based on dwell time.
-pub fn compute_times(state: &mut McsState) {
-    for i in 0..state.max_points {
-        state.time_buffer[i] = (i as f64 * state.dwell_time) as f32;
+/// C `computeMCSTimes`: the relative time base `i * dwell` over the
+/// `num_points` the scan is set to (bounded by the buffer). Returns how many
+/// points it wrote, which is also how many the MCS_TIME_WF callback carries.
+pub fn compute_times(state: &mut McsState, num_points: usize, dwell: f64) -> usize {
+    let n = num_points.min(state.time_buffer.len());
+    for (i, t) in state.time_buffer[..n].iter_mut().enumerate() {
+        *t = (i as f64 * dwell) as f32;
     }
+    n
 }
 
 /// Acquisition settings for [`start_mcs`], read from the MCA/MCS records.
@@ -226,7 +230,6 @@ pub fn start_mcs(
     state.current_point = 0;
     state.start_time = current_time_secs();
 
-    compute_times(state);
     log::info!(
         "MCS started: {} counters, {} points, dwell={dwell_time:.6}s, rate={rate:.0}",
         state.num_counters_enabled,
@@ -322,6 +325,15 @@ mod tests {
             .as_secs_f64();
         let offset = unix - current_time_secs();
         assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
+
+    #[test]
+    fn the_time_base_follows_the_dwell_over_the_scan_length() {
+        let mut st = McsState::new(8);
+        assert_eq!(compute_times(&mut st, 4, 0.5), 4);
+        assert_eq!(&st.time_buffer[..4], &[0.0, 0.5, 1.0, 1.5]);
+        // Never past the buffer, however many points are asked for.
+        assert_eq!(compute_times(&mut st, 100, 1.0), 8);
     }
 
     #[test]

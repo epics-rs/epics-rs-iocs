@@ -395,6 +395,23 @@ impl PortDriver for CtrDriver {
             let device = self.device.clone();
             let dev = device.lock().unwrap();
             last_error = self.restart_pulse_generator(&dev, addr);
+        } else if reason == self.params.mca_dwell_time {
+            // C computeMCSTimes: the time base follows the dwell as soon as
+            // it is written, not only once a scan starts.
+            let num_points = self
+                .base
+                .get_int32_param(self.params.mca_num_channels, 0)?
+                .max(0) as usize;
+            let times = {
+                let mut st = self.state.lock().unwrap();
+                let n = mcs::compute_times(&mut st.mcs, num_points, value);
+                st.mcs.time_buffer[..n].to_vec()
+            };
+            self.base.params.set_value(
+                self.params.mcs_time_wf,
+                0,
+                ParamValue::Float32Array(times.into()),
+            )?;
         }
 
         self.finish_write(addr, last_error)
