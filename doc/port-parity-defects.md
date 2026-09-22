@@ -559,7 +559,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** 100× the SINGLEIO USB transfers; a scan overrun that goes idle is reported to the scalerRecord as a completed count with partial data.
 - **Class:** ref-faithful. **Live:** log shows "Scaler started, rate=10000 Hz"; completion not observable (counter 0 unwired).
 
-## PP-48 [MED] `read_mcs` early returns skip SS_IDLE / PresetReal detection; PresetReal latched at start — OPEN
+## PP-48 [MED] `read_mcs` early returns skip SS_IDLE / PresetReal detection; PresetReal latched at start — FIXED
 - **Rust:** `mcs.rs:226-232` returns on status error, `:234-236` returns while `current_total_count == 0`, both before the done test `:258-261`; `driver.rs:199-201` reads `MCA_PRESET_REAL_TIME` only at start.
 - **C:** `drvUSBCTR.cpp:751-753,788-794` evaluate SS_IDLE and `elapsed >= presetReal` every poll, re-reading `presetReal`.
 - **Impact:** with an external trigger/clock not yet seen, PresetReal never stops the run; mid-run PresetReal changes are ignored.

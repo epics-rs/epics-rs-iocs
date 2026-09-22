@@ -11,12 +11,10 @@ use crate::params::*;
 /// MCS (Multi-Channel Scaler) acquisition state.
 pub struct McsState {
     pub running: bool,
-    pub acquiring: bool,
     pub num_counters_enabled: usize,
     pub max_points: usize,
     pub current_point: usize,
     pub start_time: f64,
-    pub preset_real_time: f64,
     pub dwell_time: f64,
 
     /// Scan buffer for ulDaqInScan (f64 values).
@@ -41,12 +39,10 @@ impl McsState {
         }
         Self {
             running: false,
-            acquiring: false,
             num_counters_enabled: 0,
             max_points,
             current_point: 0,
             start_time: 0.0,
-            preset_real_time: 0.0,
             dwell_time: 0.001,
             scan_buffer: Vec::new(),
             mcs_buffers,
@@ -231,7 +227,6 @@ pub fn start_mcs(
     started.map_err(|e| format!("daq_in_scan error: {e}"))?;
 
     state.running = true;
-    state.acquiring = true;
     state.current_point = 0;
     state.start_time = current_time_secs();
 
@@ -253,29 +248,57 @@ pub fn points_transferred(current_index: i64, n_chans: usize, max_points: usize)
     (current_index as usize / n_chans + 1).min(max_points)
 }
 
-/// Read MCS data from the scan buffer. Called from poller when running.
-pub fn read_mcs(device: &DaqDevice, state: &mut McsState) {
-    let (status, xfer) = match device.daq_in_scan_status() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("MCS scan status error: {e}");
-            return;
+/// What one poll of the scan found, for the poller to publish (C `readMCS`
+/// sets these parameters itself; here the owner of the parameters applies
+/// them).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct McsReadout {
+    pub current_point: usize,
+    /// Seconds since the scan was started or last erased.
+    pub elapsed: f64,
+    /// The scan ended during this read: MCA_ACQUIRING goes back to 0.
+    pub finished: bool,
+}
+
+/// C `readMCS`: copy every point transferred since the last read, then end
+/// the scan if the hardware has gone idle or PresetReal has run out.
+///
+/// Both end conditions are checked on every read, whether or not the scan
+/// has transferred anything yet -- a scan still waiting for its external
+/// trigger or clock must still stop at PresetReal, and one that libuldaq
+/// rejected at start is idle from the first read.
+pub fn read_mcs(device: &DaqDevice, state: &mut McsState, preset_real: f64) -> McsReadout {
+    match device.daq_in_scan_status() {
+        Ok((status, xfer)) => {
+            if status == SS_IDLE {
+                state.running = false;
+            }
+            copy_transferred_points(state, xfer.current_index);
         }
-    };
-
-    if xfer.current_total_count == 0 {
-        return;
+        Err(e) => log::warn!("MCS scan status error: {e}"),
     }
 
+    let elapsed = state.elapsed_secs();
+    if state.running && preset_real > 0.0 && elapsed >= preset_real {
+        state.running = false;
+    }
+    let finished = !state.running;
+    if finished {
+        scan_stop(device);
+    }
+    McsReadout {
+        current_point: state.current_point,
+        elapsed,
+        finished,
+    }
+}
+
+/// Copy the points behind `current_index` that have not been copied yet into
+/// the per-counter spectra, stamping each with the time it was read.
+fn copy_transferred_points(state: &mut McsState, current_index: i64) {
     let n_chans = state.num_counters_enabled;
-    if n_chans == 0 || xfer.current_index < 0 {
-        return;
-    }
-
-    let last_point = points_transferred(xfer.current_index, n_chans, state.max_points);
+    let last_point = points_transferred(current_index, n_chans, state.max_points);
     let now = current_time_secs();
-
-    // Copy new data points
     while state.current_point < last_point {
         let buf_offset = state.current_point * n_chans;
         for (scan_idx, &ctr_idx) in state.chan_map.iter().enumerate() {
@@ -285,25 +308,18 @@ pub fn read_mcs(device: &DaqDevice, state: &mut McsState) {
         state.abs_time_buffer[state.current_point] = now;
         state.current_point += 1;
     }
+}
 
-    // Check if done
-    let elapsed = now - state.start_time;
-    let done = status == SS_IDLE
-        || state.current_point >= state.max_points
-        || (state.preset_real_time > 0.0 && elapsed >= state.preset_real_time);
-
-    if done {
-        stop_mcs(device, state);
-        state.acquiring = false;
+fn scan_stop(device: &DaqDevice) {
+    if let Err(e) = device.daq_in_scan_stop() {
+        log::warn!("MCS daq_in_scan_stop error: {e}");
     }
 }
 
 /// Stop MCS acquisition.
 pub fn stop_mcs(device: &DaqDevice, state: &mut McsState) {
     if state.running {
-        if let Err(e) = device.daq_in_scan_stop() {
-            log::warn!("MCS daq_in_scan_stop error: {e}");
-        }
+        scan_stop(device);
         state.running = false;
     }
 }
@@ -330,6 +346,31 @@ mod tests {
             .as_secs_f64();
         let offset = unix - current_time_secs();
         assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
+
+    #[test]
+    fn transferred_points_are_copied_once_per_counter() {
+        let mut st = McsState::new(4);
+        st.num_counters_enabled = 2;
+        st.chan_map = vec![0, 8];
+        st.scan_buffer = vec![10.0, 1.0, 20.0, 2.0, 30.0, 3.0];
+        // Index 3 is the last sample of point 1: two points are complete.
+        copy_transferred_points(&mut st, 3);
+        assert_eq!(st.current_point, 2);
+        assert_eq!(&st.mcs_buffers[0][..2], &[10, 20]);
+        assert_eq!(&st.mcs_buffers[8][..2], &[1, 2]);
+        // A later read picks up where this one stopped.
+        copy_transferred_points(&mut st, 5);
+        assert_eq!(st.current_point, 3);
+        assert_eq!(st.mcs_buffers[0][2], 30);
+    }
+
+    #[test]
+    fn nothing_transferred_copies_nothing() {
+        let mut st = McsState::new(4);
+        st.num_counters_enabled = 2;
+        copy_transferred_points(&mut st, -1);
+        assert_eq!(st.current_point, 0);
     }
 
     #[test]

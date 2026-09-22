@@ -277,9 +277,6 @@ impl PortDriver for CtrDriver {
                 let enable = self
                     .base
                     .get_uint32_param(self.params.mcs_counter_enable, 0)?;
-                st.mcs.preset_real_time = self
-                    .base
-                    .get_float64_param(self.params.mca_preset_real, 0)?;
                 let point0_no_clear = self
                     .base
                     .get_int32_param(self.params.mcs_point0_action, 0)?
@@ -312,7 +309,6 @@ impl PortDriver for CtrDriver {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
             mcs::stop_mcs(&dev, &mut st.mcs);
-            st.mcs.acquiring = false;
             self.base
                 .params
                 .set_int32(self.params.mca_acquiring, 0, 0)?;

@@ -72,6 +72,12 @@ fn poller_loop(
         );
         cycle_start = now;
 
+        // C readMCS re-reads PresetReal on every poll, so a change mid-scan
+        // takes effect.
+        let preset_real = handle
+            .read_float64_blocking(params.mca_preset_real, 0)
+            .unwrap_or(0.0);
+
         // ---- Phase 1: uldaq reads (device lock held) ----
         let snapshot = {
             let mut snap = PollSnapshot::default();
@@ -89,12 +95,11 @@ fn poller_loop(
                             snap.scaler_done_snapshot = Some(st.scaler.counts);
                         }
                     } else if st.mcs.running {
-                        let mcs_was_acquiring = st.mcs.acquiring;
-                        mcs::read_mcs(&dev, &mut st.mcs);
+                        let readout = mcs::read_mcs(&dev, &mut st.mcs, preset_real);
                         snap.mcs_running = true;
-                        snap.mcs_current_point = st.mcs.current_point;
-                        snap.mcs_just_stopped = mcs_was_acquiring && !st.mcs.acquiring;
-                        snap.mcs_elapsed = st.mcs.elapsed_secs();
+                        snap.mcs_current_point = readout.current_point;
+                        snap.mcs_just_stopped = readout.finished;
+                        snap.mcs_elapsed = readout.elapsed;
                     } else {
                         for counter in 0..num_counters {
                             match dev.counter_in(counter as i32) {
