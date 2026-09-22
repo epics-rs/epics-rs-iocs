@@ -9,6 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::error::CaResult;
 use epics_rs::scaler::device_support::scaler_asyn::ScalerDriver;
 use epics_rs::scaler::records::scaler::MAX_SCALER_CHANNELS;
@@ -17,6 +19,7 @@ use meascomp::device::DaqDevice;
 use crate::params::MAX_COUNTERS;
 use crate::poller::PollerState;
 use crate::scaler;
+use crate::trace::{self, DRIVER};
 
 /// The USB-CTR08's 8 counters as a `scalerRecord`.
 ///
@@ -26,11 +29,22 @@ use crate::scaler;
 pub struct CtrScalerDriver {
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
+    /// The USB-CTR port, whose trace a read prints through as C's
+    /// `readInt32Array(scalerRead_)` does on the scaler record's asynUser.
+    port: PortHandle,
 }
 
 impl CtrScalerDriver {
-    pub fn new(device: Arc<Mutex<DaqDevice>>, state: Arc<Mutex<PollerState>>) -> Self {
-        Self { device, state }
+    pub fn new(
+        device: Arc<Mutex<DaqDevice>>,
+        state: Arc<Mutex<PollerState>>,
+        port: PortHandle,
+    ) -> Self {
+        Self {
+            device,
+            state,
+            port,
+        }
     }
 }
 
@@ -54,6 +68,25 @@ impl ScalerDriver for CtrScalerDriver {
         for (i, c) in st.scaler.counts.iter().enumerate() {
             counts[i] = *c as u32;
         }
+        let d = counts.map(|c| c as i32);
+        trace::print(
+            &self.port,
+            Some(0),
+            TraceMask::FLOW,
+            format_args!(
+                "{DRIVER}:readInt32Array: scalerReadCommand: read {} chans, \
+                 data={} {} {} {} {} {} {} {}",
+                counts.len(),
+                d[0],
+                d[1],
+                d[2],
+                d[3],
+                d[4],
+                d[5],
+                d[6],
+                d[7]
+            ),
+        );
         Ok(())
     }
 

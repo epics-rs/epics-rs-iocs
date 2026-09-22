@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -5,6 +6,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use meascomp::device::DaqDevice;
@@ -15,6 +17,7 @@ use crate::params::*;
 use crate::poller::{self, PollerState};
 use crate::pulse_gen;
 use crate::scaler::ScalerState;
+use crate::trace::{DRIVER, GetStatus};
 
 /// C `USBCTR::writeInt32`/`writeFloat64` resolve the counter number through
 /// `asynPortDriver::getAddress` (drvUSBCTR.cpp:1096, 1288), which maps the
@@ -193,6 +196,15 @@ impl CtrDriver {
             pulse_gen::start(dev, timer, period, duty, delay, count, idle)
                 .map_err(|e| format!("pulse_gen start error: {e}"))?;
         self.pulse_running[timer as usize] = true;
+        self.base.trace_print(
+            TraceMask::FLOW,
+            &format!(
+                "{DRIVER}:startPulseGenerator: started pulse generator {timer} actual \
+                 frequency={:.6}, actual period={actual_period:.6}, actual duty \
+                 cycle={actual_duty:.6}, actual delay={actual_delay:.6}",
+                1.0 / actual_period
+            ),
+        );
         let _ = self
             .base
             .set_float64_param(self.params.pulse_period, timer, actual_period);
@@ -274,16 +286,32 @@ impl CtrDriver {
         );
     }
 
-    /// Common tail of every write: run the callbacks, then report a failure
-    /// the way C does -- `asynError` back to the record, so it alarms --
-    /// besides publishing it on LAST_ERROR_MESSAGE.
-    fn finish_write(&mut self, addr: i32, last_error: Option<String>) -> AsynResult<()> {
+    /// Common tail of every write: run the callbacks, then report the
+    /// outcome the way C does -- on success `function`'s TRACEIO_DRIVER line
+    /// with what it `wrote`, on failure `asynError` back to the record, so it
+    /// alarms, besides publishing it on LAST_ERROR_MESSAGE.
+    fn finish_write(
+        &mut self,
+        user: &AsynUser,
+        addr: i32,
+        last_error: Option<String>,
+        function: &str,
+        wrote: fmt::Arguments<'_>,
+    ) -> AsynResult<()> {
         if let Some(msg) = &last_error {
             self.report_error(msg.clone());
         }
         self.base.call_param_callbacks(addr)?;
         match last_error {
-            None => Ok(()),
+            None => {
+                user.print(
+                    TraceMask::IO_DRIVER,
+                    file!(),
+                    line!(),
+                    format_args!("{DRIVER}:{function}, port {}, {wrote}", self.base.port_name),
+                );
+                Ok(())
+            }
             Some(message) => Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message,
@@ -473,6 +501,10 @@ impl PortDriver for CtrDriver {
                 mcs::stop_mcs(&dev, &mut self.state.lock().unwrap().mcs)
             };
             if let Some(readout) = readout {
+                self.base.trace_print(
+                    TraceMask::FLOW,
+                    &GetStatus("readMCS", readout.position).to_string(),
+                );
                 self.apply_mcs_readout(&readout, addr)?;
             }
         } else if reason == self.params.mca_num_channels {
@@ -490,6 +522,15 @@ impl PortDriver for CtrDriver {
                 )?;
             }
         } else if reason == self.params.mca_erase {
+            user.print(
+                TraceMask::FLOW,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER}:writeInt32: [{} addr={addr}]: erased",
+                    self.base.port_name
+                ),
+            );
             mcs::erase_mcs(&mut self.state.lock().unwrap().mcs);
             // C eraseMCS publishes the reset on every counter address.
             self.base
@@ -511,27 +552,58 @@ impl PortDriver for CtrDriver {
             }
         }
 
-        self.finish_write(addr, last_error)
+        self.finish_write(
+            user,
+            addr,
+            last_error,
+            "writeInt32",
+            format_args!("function={reason}, wrote {value} to address {addr}"),
+        )
     }
 
     /// MCS spectrum readout. C `USBCTR::readInt32Array` / the `mcaReadData`
     /// the mca record and SIS38XX_waveform.template both go through: the data
     /// lives in McsState::mcs_buffers and only leaves the driver here.
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+        let signal = user.addr;
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "{DRIVER}:readInt32Array: entry, command={}, signal={signal}, numRead={}, \
+                 &data={:p}",
+                user.reason,
+                buf.len(),
+                buf.as_ptr()
+            ),
+        );
         if user.reason != self.params.mca_data {
             return Ok(0);
         }
-        let counter = user.addr as usize;
         let num_channels = self
             .base
             .get_int32_param(self.params.mca_num_channels, 0)
             .unwrap_or(0)
             .max(0) as usize;
         let st = self.state.lock().unwrap();
-        let Some(src) = st.mcs.mcs_buffers.get(counter) else {
+        let Some(src) = st.mcs.mcs_buffers.get(signal as usize) else {
             return Ok(0);
         };
-        Ok(mca_data_read(buf, src, num_channels, st.mcs.current_point))
+        let current_point = st.mcs.current_point;
+        let num_actual = mca_data_read(buf, src, num_channels, current_point);
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "{DRIVER}:readInt32Array: [signal={signal}]: read {num_actual} chans \
+                 (numRead={}, numCopy={}, currentPoint={current_point}, nChans={num_channels})",
+                buf.len(),
+                buf.len().min(num_channels)
+            ),
+        );
+        Ok(num_actual)
     }
 
     /// MCS time base (seconds from the start of the scan).
@@ -608,7 +680,13 @@ impl PortDriver for CtrDriver {
             )?;
         }
 
-        self.finish_write(addr, last_error)
+        self.finish_write(
+            user,
+            addr,
+            last_error,
+            "writeFloat64",
+            format_args!("wrote {value:.6} to address {addr}"),
+        )
     }
 
     fn write_uint32_digital(
@@ -656,7 +734,28 @@ impl PortDriver for CtrDriver {
 
         self.base.params.set_uint32(reason, addr, value, mask, 0)?;
 
-        self.finish_write(addr, last_error)
+        // C's trace prints `outValue` as its per-bit loop leaves it -- the
+        // level of the last bit on an output write, 0 on a direction write --
+        // and the direction it read for an output write (drvUSBCTR.cpp:1339-1348,
+        // :1358-1362); a direction write prints the direction now in effect.
+        let out_value = if reason == self.params.digital_output {
+            (value >> (NUM_IO_BITS - 1)) & 1
+        } else {
+            0
+        };
+        let direction = self
+            .base
+            .get_uint32_param(self.params.digital_direction, 0)?;
+        self.finish_write(
+            user,
+            addr,
+            last_error,
+            "writeUInt32Digital",
+            format_args!(
+                "wrote outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, \
+                 direction=0x{direction:x}"
+            ),
+        )
     }
 }
 

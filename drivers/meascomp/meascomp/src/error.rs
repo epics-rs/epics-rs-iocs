@@ -66,4 +66,24 @@ impl ScanStatusReport {
             error: check(code).err(),
         }
     }
+
+    /// The four numbers C's pollers `asynPrint` after this call.
+    pub fn position(&self) -> ScanPosition {
+        ScanPosition {
+            code: self.error.as_ref().map_or(ERR_NO_ERROR, |e| e.code),
+            status: self.status,
+            total_count: self.xfer.current_total_count,
+            index: self.xfer.current_index,
+        }
+    }
+}
+
+/// A scan-status call as C traces it: the libuldaq return code, the scan
+/// state, and the transfer position (`currentTotalCount`, `currentIndex`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanPosition {
+    pub code: uldaq_sys::UlError,
+    pub status: i32,
+    pub total_count: u64,
+    pub index: i64,
 }

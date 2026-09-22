@@ -3,6 +3,7 @@ pub mod analog_out;
 pub mod driver;
 pub mod params;
 pub mod poller;
+mod trace;
 pub mod wave_dig;
 pub mod wave_gen;
 

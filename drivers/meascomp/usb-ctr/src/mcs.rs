@@ -4,6 +4,7 @@ use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
 
 use meascomp::counter::CounterScanConfig;
 use meascomp::device::DaqDevice;
+use meascomp::error::ScanPosition;
 use uldaq_sys::*;
 
 use crate::params::*;
@@ -362,6 +363,8 @@ pub struct McsReadout {
     pub elapsed: f64,
     /// The scan ended during this read: MCA_ACQUIRING goes back to 0.
     pub finished: bool,
+    /// What the status call returned, which C `readMCS` traces.
+    pub position: ScanPosition,
 }
 
 /// C `readMCS`: copy every point transferred since the last read, then end
@@ -395,6 +398,7 @@ pub fn read_mcs(device: &DaqDevice, state: &mut McsState, preset_real: f64) -> M
         current_point: state.current_point,
         elapsed,
         finished,
+        position: report.position(),
     }
 }
 

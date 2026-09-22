@@ -61,12 +61,6 @@ pub fn start(
     // C: period = 1./frequency from what the device actually runs.
     let actual_period = 1.0 / timing.frequency;
 
-    log::info!(
-        "PulseGen {timer}: freq={:.1} Hz, duty={:.3}, delay={:.6} s, count={count}",
-        timing.frequency,
-        timing.duty_cycle,
-        timing.initial_delay,
-    );
     Ok((actual_period, timing.duty_cycle, timing.initial_delay))
 }
 

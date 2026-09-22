@@ -126,6 +126,7 @@ async fn main() -> CaResult<()> {
                 *scaler_slot.lock().unwrap() = Some(CtrScalerDriver::new(
                     ctr_rt.device.clone(),
                     ctr_rt.state.clone(),
+                    ctr_rt.port_handle().clone(),
                 ));
 
                 let port_handle = ctr_rt.port_handle().clone();

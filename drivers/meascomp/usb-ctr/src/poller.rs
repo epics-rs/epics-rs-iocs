@@ -4,12 +4,14 @@ use std::time::{Duration, Instant};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
 use crate::mcs::{self, McsState};
 use crate::params::*;
 use crate::scaler::{self, ScalerState};
+use crate::trace::{self, DRIVER, GetStatus};
 
 /// Shared state between driver and poller.
 pub struct PollerState {
@@ -96,12 +98,36 @@ fn poller_loop(
                     let num_counters = st.num_counters;
                     snap.num_counters = num_counters;
                     if st.scaler.running {
-                        scaler::read_scaler(&dev, &mut st.scaler, num_counters);
+                        let read = scaler::read_scaler(&dev, &mut st.scaler, num_counters);
+                        trace::print(
+                            &handle,
+                            None,
+                            TraceMask::FLOW,
+                            format_args!("{}", GetStatus("readScaler", read.position)),
+                        );
+                        if let Some(last_index) = read.last_index {
+                            trace::print(
+                                &handle,
+                                None,
+                                TraceMask::FLOW,
+                                format_args!(
+                                    "{DRIVER}::readScaler lastIndex={last_index}, \
+                                     scalerCounts_[0]={}, scalerPresetCounts_[0]={}",
+                                    st.scaler.counts[0] as i32, st.scaler.presets[0]
+                                ),
+                            );
+                        }
                         if st.scaler.done {
                             snap.scaler_done_snapshot = Some(st.scaler.counts);
                         }
                     } else if st.mcs.running {
                         let readout = mcs::read_mcs(&dev, &mut st.mcs, preset_real);
+                        trace::print(
+                            &handle,
+                            None,
+                            TraceMask::FLOW,
+                            format_args!("{}", GetStatus("readMCS", readout.position)),
+                        );
                         snap.mcs_running = true;
                         snap.mcs_current_point = readout.current_point;
                         snap.mcs_just_stopped = readout.finished;

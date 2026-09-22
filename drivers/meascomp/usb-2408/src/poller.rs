@@ -4,10 +4,12 @@ use std::time::{Duration, Instant};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
 use crate::params::*;
+use crate::trace::{self, DRIVER};
 use crate::wave_dig::{self, WaveDigState};
 use crate::wave_gen::{self, WaveGenState};
 
@@ -119,7 +121,19 @@ fn poller_loop(
 
                 if let Ok(mut st) = state.lock() {
                     if st.wave_gen.running {
-                        if wave_gen::read_wave_gen(&dev, &mut st.wave_gen) {
+                        let (p, ended) = wave_gen::read_wave_gen(&dev, &mut st.wave_gen);
+                        if p.code == uldaq_sys::ERR_NO_ERROR {
+                            trace::print(
+                                &handle,
+                                TraceMask::IO_DRIVER,
+                                format_args!(
+                                    "{DRIVER}::pollerThread waveform generator status, \
+                                     aoStatus={}, aoCount={}, aoIndex={}",
+                                    p.status, p.total_count, p.index
+                                ),
+                            );
+                        }
+                        if ended {
                             snap.wave_gen_ended = Some(st.wave_gen.generation);
                         }
                         snap.wave_gen_current_point = st.wave_gen.current_point;
@@ -127,7 +141,19 @@ fn poller_loop(
                     snap.wave_gen_running = st.wave_gen.running;
 
                     if st.wave_dig.running {
-                        if wave_dig::read_wave_dig(&dev, &mut st.wave_dig) {
+                        let (p, ended) = wave_dig::read_wave_dig(&dev, &mut st.wave_dig);
+                        if p.code == uldaq_sys::ERR_NO_ERROR {
+                            trace::print(
+                                &handle,
+                                TraceMask::IO_DRIVER,
+                                format_args!(
+                                    "{DRIVER}::pollerThread waveform digitizer status, \
+                                     aiStatus={}, aiCount={}, aiIndex={}",
+                                    p.status, p.total_count, p.index
+                                ),
+                            );
+                        }
+                        if ended {
                             snap.wave_dig_ended = Some(st.wave_dig.generation);
                         }
                         snap.wave_dig_current_point = st.wave_dig.current_point;
@@ -157,20 +183,31 @@ fn poller_loop(
                             } else {
                                 // An open or broken thermocouple is expected,
                                 // not an error: ulTIn reports it as -9999.
-                                match dev.temperature_in(
+                                let temp = match dev.temperature_in(
                                     ch_i,
                                     tc_scales[ch],
                                     uldaq_sys::TIN_FF_DEFAULT,
                                 ) {
-                                    Ok(temp) => snap.ai_temp[ch] = Some(temp),
-                                    Err(e) => {
-                                        if e.code == uldaq_sys::ERR_OPEN_CONNECTION {
-                                            snap.ai_temp[ch] = Some(-9999.0);
-                                        } else {
-                                            snap.errors.push(format!("TIn({ch}): {e}"));
-                                        }
+                                    Ok(temp) => Some(temp),
+                                    Err(e) if e.code == uldaq_sys::ERR_OPEN_CONNECTION => {
+                                        Some(-9999.0)
                                     }
+                                    Err(e) => {
+                                        snap.errors.push(format!("TIn({ch}): {e}"));
+                                        None
+                                    }
+                                };
+                                // C reports every TIn it counts as a success,
+                                // an open thermocouple included
+                                // (drvMultiFunction.cpp:2822-2834).
+                                if temp.is_some() {
+                                    trace::print(
+                                        &handle,
+                                        TraceMask::IO_DRIVER,
+                                        format_args!("{DRIVER}::pollerThread Info: Calling TIn"),
+                                    );
                                 }
+                                snap.ai_temp[ch] = temp;
                             }
                         }
                     }

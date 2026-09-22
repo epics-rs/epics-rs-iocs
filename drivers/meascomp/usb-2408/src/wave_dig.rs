@@ -6,6 +6,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
+use meascomp::error::ScanPosition;
 use uldaq_sys::*;
 
 use crate::params::*;
@@ -82,13 +83,19 @@ pub struct WaveDigStartError {
     pub dwell_actual: Option<f64>,
 }
 
-/// Start the waveform digitizer (analog input scan). Returns the actual
-/// dwell the device runs at.
+/// A started scan: the dwell the device runs at and the scan options used.
+#[derive(Debug, Clone, Copy)]
+pub struct WaveDigStarted {
+    pub dwell_actual: f64,
+    pub options: i32,
+}
+
+/// Start the waveform digitizer (analog input scan).
 pub fn start_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
     scan: &WaveDigScan,
-) -> Result<f64, WaveDigStartError> {
+) -> Result<WaveDigStarted, WaveDigStartError> {
     let WaveDigScan {
         first_chan,
         num_chans,
@@ -170,12 +177,10 @@ pub fn start_wave_dig(
     state.dwell_actual = dwell_actual;
     state.running = true;
     state.generation = state.generation.wrapping_add(1);
-
-    log::info!(
-        "WaveDig started: ch{first_chan}-{}, {num_points} pts, rate={rate:.0} Hz",
-        first_chan + num_chans - 1
-    );
-    Ok(dwell_actual)
+    Ok(WaveDigStarted {
+        dwell_actual,
+        options,
+    })
 }
 
 /// The `ulAInLoadQueue` entries for `num_chans` channels from `first_chan`,
@@ -213,14 +218,16 @@ pub fn points_transferred(current_index: i64, n_chans: usize, num_points: usize)
 /// last poll, and tell whether the scan has gone idle -- which it also is
 /// when libuldaq reports a transfer error with the status. Ending the scan
 /// (Run back to 0, the data delivered, the scan stopped, an auto-restart)
-/// is the driver's one transition, not this read's.
-pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> bool {
+/// is the driver's one transition, not this read's. The status call's result
+/// comes back too, for the line C traces.
+pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> (ScanPosition, bool) {
     let report = device.analog_in_scan_status();
     if let Some(e) = &report.error {
         log::warn!("WaveDig scan status error: {e}");
     }
+    let position = report.position();
     let n_chans = state.num_chans;
-    let last_point = points_transferred(report.xfer.current_index, n_chans, state.num_points);
+    let last_point = points_transferred(position.index, n_chans, state.num_points);
     let now = current_time_secs();
     while state.current_point < last_point {
         let buf_offset = state.current_point * n_chans;
@@ -233,16 +240,22 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> bool {
         state.abs_time_buffer[state.current_point] = now;
         state.current_point += 1;
     }
-    report.status == SS_IDLE
+    (position, position.status == SS_IDLE)
 }
 
-/// Stop the waveform digitizer.
-pub fn stop_wave_dig(device: &DaqDevice, state: &mut WaveDigState) {
-    if state.running {
-        if let Err(e) = device.analog_in_scan_stop() {
+/// Stop the waveform digitizer. True when the stop call ran and succeeded,
+/// which C reports with a `Stopping AIn scan` line.
+pub fn stop_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> bool {
+    if !state.running {
+        return false;
+    }
+    state.running = false;
+    match device.analog_in_scan_stop() {
+        Ok(()) => true,
+        Err(e) => {
             log::warn!("WaveDig scan stop error: {e}");
+            false
         }
-        state.running = false;
     }
 }
 
