@@ -49,6 +49,16 @@ record(ao, "$(P)$(R)PulseWidth") {
     field(PINI, "YES")
 }
 
+# The internal waveform the driver computed for this channel, pushed on every
+# change of its shape.
+record(waveform, "$(P)$(R)InternalWF") {
+    field(DTYP, "asynFloat32ArrayIn")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_INT_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(WGEN_POINTS=2048)")
+    field(SCAN, "I/O Intr")
+}
+
 # User-defined waveform in volts, used when WaveType is "User", scaled by
 # Amplitude and shifted by Offset. The scan plays WaveGenUserNumPoints of it;
 # points never written stay 0 V.

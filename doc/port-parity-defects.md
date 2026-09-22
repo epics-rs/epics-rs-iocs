@@ -845,7 +845,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Family:** the scan-status-error early return also exists at `usb-ctr/src/mcs.rs:226` (PP-48) and `scaler.rs:103`.
 - **Class:** ref-faithful. **Live:** static.
 
-## PP-93 [MED] Waveform-parameter writes never run `defineWaveform`: no INT_WF, readbacks stale, no live restart — OPEN (partial regression of the "COMPLETED" user/internal-array item)
+## PP-93 [MED] Waveform-parameter writes never run `defineWaveform`: no INT_WF, readbacks stale, no live restart — FIXED (partial regression of the "COMPLETED" user/internal-array item)
 - **Rust:** `driver.rs:233-620` has no branch for WAVE_TYPE, USER/INT_NUM_POINTS, ENABLE, EXT_*, CONTINUOUS, USER/INT_DWELL, PULSE_*, AMPLITUDE, OFFSET; `WAVEGEN_INT_WF` (`params.rs:201`) never written, `read_float32_array` returns 0 for it (`:635-636`).
 - **C:** `drvMultiFunction.cpp:2171-2183,2294-2305` `defineWaveform(addr)` and, while running, stop+start; `defineWaveform` updates NUM_POINTS/DWELL/FREQ and fires INT_WF (`:1520-1573`).
 - **Impact:** amplitude/type/enable changes during a continuous run take effect only after a manual Stop/Run; WaveGenNumPoints/Dwell/Freq stale until Run; no internal-waveform preview.
