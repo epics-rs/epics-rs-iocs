@@ -589,7 +589,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** mode 0 free-runs in Rust but waits for a rising edge in C; mode 1 is rising in Rust, falling in C; level modes unreachable.
 - **Class:** ref-faithful. **Live:** consistent — `TrigMode=Internal` acquired immediately with the trigger input unconnected (C would wait).
 
-## PP-53 [MED] Point0Action Skip and external-advance prescale unimplemented — OPEN (regression, fix never merged)
+## PP-53 [MED] Point0Action Skip and external-advance prescale unimplemented — FIXED (regression, fix never merged)
 - **Rust:** `driver.rs:202-205` `point0_no_clear = action != 0` (Skip→NoClear, no `numPoints+1`, no drop); `mcs.rs:90-92,104` discards `prescale` under a comment wrongly claiming C ignores it; `MCS_PRESCALE_COUNTER` never read; no `Point0Action`/`PrescaleCounter` records.
 - **C:** `drvUSBCTR.cpp:607,761-763` Skip; `:579-603` prescale counter programming; `measCompMCS.template:242-274`.
 - **Impact:** `MCS:Prescale` has no device effect; Skip mode unreachable.

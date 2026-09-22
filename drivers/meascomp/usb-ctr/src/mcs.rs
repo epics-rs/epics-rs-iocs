@@ -29,6 +29,11 @@ pub struct McsState {
     pub counter_enable: u32,
     /// Mapping from scan channel index to counter number.
     pub chan_map: Vec<usize>,
+    /// Points the running scan transfers: the requested ones, plus the
+    /// leading point [`Point0Action::Skip`] throws away.
+    pub scan_points: usize,
+    /// 1 when the scan's first point is skipped, else 0.
+    pub skip: usize,
 }
 
 impl McsState {
@@ -50,6 +55,8 @@ impl McsState {
             time_buffer: vec![0.0; max_points],
             counter_enable: 0x1FF, // all 9 enabled by default
             chan_map: Vec::new(),
+            scan_points: 0,
+            skip: 0,
         }
     }
 }
@@ -87,6 +94,32 @@ pub fn compute_times(state: &mut McsState, num_points: usize, dwell: f64) -> usi
     n
 }
 
+/// What happens to the first time point, C `MCSPoint0Action_t`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Point0Action {
+    /// The counters are cleared at the start, so point 0 counts from there.
+    Clear,
+    /// Not cleared: point 0 holds everything counted since the last clear.
+    NoClear,
+    /// One extra point is acquired and thrown away, so every stored point
+    /// spans a full channel-advance interval.
+    Skip,
+}
+
+impl Point0Action {
+    /// MCS_POINT0_ACTION's value; C treats anything but 1 and 2 as Clear.
+    pub fn from_param(value: i32) -> Self {
+        match value {
+            1 => Self::NoClear,
+            2 => Self::Skip,
+            _ => Self::Clear,
+        }
+    }
+}
+
+/// External channel advance, as MCA_CH_ADVANCE_SOURCE encodes it.
+pub const CHANNEL_ADVANCE_EXTERNAL: i32 = 1;
+
 /// Acquisition settings for [`start_mcs`], read from the MCA/MCS records.
 #[derive(Clone, Copy, Debug)]
 pub struct McsScan {
@@ -94,10 +127,11 @@ pub struct McsScan {
     pub dwell_time: f64,
     pub counter_enable: u32,
     pub ch_advance_source: i32,
-    /// Accepted but not implemented (matches C++ drvUSBCTR, which ignores
-    /// prescale for MCS).
+    /// With external channel advance and a prescale above 1, the advance
+    /// is divided down by `prescale_counter`.
     pub prescale: i32,
-    pub point0_no_clear: bool,
+    pub prescale_counter: i32,
+    pub point0_action: Point0Action,
 }
 
 /// Dwell at and above which C reads the scan one sample at a time
@@ -155,14 +189,18 @@ pub fn start_mcs(
         dwell_time,
         counter_enable,
         ch_advance_source,
-        prescale: _,
-        point0_no_clear,
+        prescale,
+        prescale_counter,
+        point0_action,
     } = *scan;
     state.dwell_time = dwell_time;
     state.counter_enable = counter_enable;
     // C sets startTime_ before starting the hardware.
     state.start_time = current_time_secs();
     let max_pts = state.max_points.min(num_points);
+    // C Skip acquires numPoints+1 and never stores the first.
+    state.skip = usize::from(point0_action == Point0Action::Skip);
+    state.scan_points = max_pts + state.skip;
 
     // Build channel descriptor list from enabled counters
     let mut chan_descs = Vec::new();
@@ -216,7 +254,7 @@ pub fn start_mcs(
     state.chan_map = chan_map;
 
     // Allocate scan buffer
-    let total_samples = state.num_counters_enabled * max_pts;
+    let total_samples = state.num_counters_enabled * state.scan_points;
     state.scan_buffer.resize(total_samples, 0.0);
 
     // C passes 1/dwell as is; a zero or negative dwell is libuldaq's to
@@ -226,7 +264,7 @@ pub fn start_mcs(
     let options = scan_options(dwell_time, ch_advance_source != 0);
 
     let mut flags = DAQINSCAN_FF_DEFAULT;
-    if point0_no_clear {
+    if point0_action == Point0Action::NoClear {
         flags |= DAQINSCAN_FF_NOCLEAR;
     }
 
@@ -238,9 +276,45 @@ pub fn start_mcs(
         }
     }
 
+    // C: with external channel advance the advance input can be divided
+    // down -- the prescale counter counts it, and its output (wired to the
+    // channel-advance input) pulses every `prescale` edges
+    // (drvUSBCTR.cpp:579-603).
+    if ch_advance_source == CHANNEL_ADVANCE_EXTERNAL && prescale > 1 {
+        let top = (prescale - 1) as u64;
+        if let Err(e) = device.counter_clear(prescale_counter) {
+            fail(format!(
+                "prescale counter_clear({prescale_counter}) error: {e}"
+            ));
+        }
+        for (register, value) in [
+            (CRT_OUTPUT_VAL0, 0),
+            (CRT_OUTPUT_VAL1, top),
+            (CRT_MAX_LIMIT, top),
+        ] {
+            if let Err(e) = device.counter_load(prescale_counter, register, value) {
+                fail(format!("prescale counter_load({register}) error: {e}"));
+            }
+        }
+        if let Err(e) = device.counter_config_scan(
+            prescale_counter,
+            &CounterScanConfig {
+                measurement_type: CMT_COUNT,
+                measurement_mode: CMM_OUTPUT_ON | CMM_RANGE_LIMIT_ON,
+                edge_detection: CED_RISING_EDGE,
+                tick_size: CTS_TICK_20PT83ns,
+                debounce_mode: CDM_NONE,
+                debounce_time: CDT_DEBOUNCE_0ns,
+                flags: CF_DEFAULT,
+            },
+        ) {
+            fail(format!("prescale counter_config_scan error: {e}"));
+        }
+    }
+
     let started = device.daq_in_scan(
         &chan_descs,
-        max_pts as i32,
+        state.scan_points as i32,
         &mut rate,
         options,
         flags,
@@ -320,12 +394,14 @@ pub fn read_mcs(device: &DaqDevice, state: &mut McsState, preset_real: f64) -> M
 
 /// Copy the points behind `current_index` that have not been copied yet into
 /// the per-counter spectra, stamping each with the time it was read.
+/// With [`Point0Action::Skip`] scan point `k + 1` is stored as point `k`,
+/// as C's `inPtr = currentPoint + 1` does.
 fn copy_transferred_points(state: &mut McsState, current_index: i64) {
     let n_chans = state.num_counters_enabled;
-    let last_point = points_transferred(current_index, n_chans, state.max_points);
+    let last_point = points_transferred(current_index, n_chans, state.scan_points);
     let now = current_time_secs();
-    while state.current_point < last_point {
-        let buf_offset = state.current_point * n_chans;
+    while state.current_point + state.skip < last_point && state.current_point < state.max_points {
+        let buf_offset = (state.current_point + state.skip) * n_chans;
         for (scan_idx, &ctr_idx) in state.chan_map.iter().enumerate() {
             state.mcs_buffers[ctr_idx][state.current_point] =
                 state.scan_buffer[buf_offset + scan_idx] as i32;
@@ -377,9 +453,34 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_first_point_is_never_stored() {
+        let mut st = McsState::new(2);
+        st.num_counters_enabled = 1;
+        st.chan_map = vec![0];
+        st.skip = 1;
+        st.scan_points = 3;
+        st.scan_buffer = vec![100.0, 1.0, 2.0];
+        // Only the leading point has arrived: nothing to store yet.
+        copy_transferred_points(&mut st, 0);
+        assert_eq!(st.current_point, 0);
+        copy_transferred_points(&mut st, 2);
+        assert_eq!(st.current_point, 2);
+        assert_eq!(st.mcs_buffers[0], vec![1, 2]);
+    }
+
+    #[test]
+    fn point0_action_follows_the_c_values() {
+        assert_eq!(Point0Action::from_param(0), Point0Action::Clear);
+        assert_eq!(Point0Action::from_param(1), Point0Action::NoClear);
+        assert_eq!(Point0Action::from_param(2), Point0Action::Skip);
+        assert_eq!(Point0Action::from_param(9), Point0Action::Clear);
+    }
+
+    #[test]
     fn transferred_points_are_copied_once_per_counter() {
         let mut st = McsState::new(4);
         st.num_counters_enabled = 2;
+        st.scan_points = 4;
         st.chan_map = vec![0, 8];
         st.scan_buffer = vec![10.0, 1.0, 20.0, 2.0, 30.0, 3.0];
         // Index 3 is the last sample of point 1: two points are complete.

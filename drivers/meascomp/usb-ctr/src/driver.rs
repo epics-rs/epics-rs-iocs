@@ -366,10 +366,13 @@ impl PortDriver for CtrDriver {
                 let enable = self
                     .base
                     .get_uint32_param(self.params.mcs_counter_enable, 0)?;
-                let point0_no_clear = self
+                let point0_action = mcs::Point0Action::from_param(
+                    self.base
+                        .get_int32_param(self.params.mcs_point0_action, 0)?,
+                );
+                let prescale_counter = self
                     .base
-                    .get_int32_param(self.params.mcs_point0_action, 0)?
-                    != 0;
+                    .get_int32_param(self.params.mcs_prescale_counter, 0)?;
                 let num_counters = st.num_counters;
                 // C startMCS never fails the write: a rejected scan shows up
                 // as a scan that ends at once, not as a WRITE alarm.
@@ -382,7 +385,8 @@ impl PortDriver for CtrDriver {
                         counter_enable: enable,
                         ch_advance_source: ch_adv,
                         prescale,
-                        point0_no_clear,
+                        prescale_counter,
+                        point0_action,
                     },
                     num_counters,
                 ) {

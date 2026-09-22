@@ -39,6 +39,8 @@ $(P)PulseGen4IdleState
 $(P)MCS:PresetReal
 $(P)MCS:Dwell
 $(P)MCS:Prescale
+$(P)MCS:PrescaleCounter
+$(P)MCS:Point0Action
 $(P)MCS:ChannelAdvance
 $(P)MCS:TrigMode
 $(P)MCS:NuseAll

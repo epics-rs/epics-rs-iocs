@@ -222,6 +222,30 @@ record(longin, "$(P)MCS:CurrentChannel") {
     field(SCAN, "I/O Intr")
 }
 
+# Counter that divides an external channel advance by Prescale.
+record(mbbo, "$(P)MCS:PrescaleCounter") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCS_PRESCALE_COUNTER")
+    field(ZRVL, "0")  field(ZRST, "CTR0")
+    field(ONVL, "1")  field(ONST, "CTR1")
+    field(TWVL, "2")  field(TWST, "CTR2")
+    field(THVL, "3")  field(THST, "CTR3")
+    field(FRVL, "4")  field(FRST, "CTR4")
+    field(FVVL, "5")  field(FVST, "CTR5")
+    field(SXVL, "6")  field(SXST, "CTR6")
+    field(SVVL, "7")  field(SVST, "CTR7")
+    field(PINI, "YES")
+}
+
+record(mbbo, "$(P)MCS:Point0Action") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCS_POINT0_ACTION")
+    field(ZRVL, "0")  field(ZRST, "Clear")
+    field(ONVL, "1")  field(ONST, "No clear")
+    field(TWVL, "2")  field(TWST, "Skip")
+    field(PINI, "YES")
+}
+
 record(mbbo, "$(P)MCS:ChannelAdvance") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADVANCE_SOURCE")
