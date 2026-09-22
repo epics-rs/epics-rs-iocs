@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::services::PortServices;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -37,7 +36,10 @@ async fn main() -> CaResult<()> {
     // here, so the two meascomp IOCs never share a request or save file.
     epics_rs::base::runtime::env::set_default("USB_2408_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
+    // The asyn record takes its trace masks and exception list from the
+    // registry entry, so the entry must carry the trace manager the port
+    // runs on: create_port_runtime binds it to PortServices::global().
+    let trace = PortServices::global().trace().clone();
     let runtime: Arc<Mutex<Option<MultiFunctionRuntime>>> = Arc::new(Mutex::new(None));
 
     let mut app = IocApplication::new();

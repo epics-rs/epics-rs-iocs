@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::services::PortServices;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -49,7 +48,10 @@ async fn main() -> CaResult<()> {
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
-    let trace = Arc::new(TraceManager::new());
+    // The asyn record takes its trace masks and exception list from the
+    // registry entry, so the entry must carry the trace manager the port
+    // runs on: create_port_runtime binds it to PortServices::global().
+    let trace = PortServices::global().trace().clone();
 
     // Runtime kept alive by being captured in the startup command closure
     let runtime: Arc<Mutex<Option<CtrRuntime>>> = Arc::new(Mutex::new(None));
