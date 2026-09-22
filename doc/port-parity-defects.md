@@ -583,7 +583,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** short-dwell MCS does one USB transfer per scan, risking overrun.
 - **Class:** ref-faithful. **Live:** static.
 
-## PP-52 [MED] TRIGGER_MODE is a bool gating SO_EXTTRIGGER; `ulDaqInSetTrigger` never called — OPEN (regression, fix never merged)
+## PP-52 [MED] TRIGGER_MODE is a bool gating SO_EXTTRIGGER; `ulDaqInSetTrigger` never called — FIXED (regression, fix never merged)
 - **Rust:** `meascomp_mcs.template:173-179` bo Internal/External; `driver.rs:195` `trigger_mode != 0`; `mcs.rs:175-177` adds `SO_EXTTRIGGER` only then; no TRIGGER_MODE branch in `write_int32`; `meascomp/src/counter.rs:139` `daq_in_set_trigger` has no caller.
 - **C:** `measCompMCS.template:293-305` mbbo raw 0/1/6/7; `drvUSBCTR.cpp:1129-1148` → `TRIG_POS_EDGE/NEG_EDGE/HIGH/LOW` via `ulDaqInSetTrigger`; `:680-681` always `SO_EXTTRIGGER`.
 - **Impact:** mode 0 free-runs in Rust but waits for a rising edge in C; mode 1 is rising in Rust, falling in C; level modes unreachable.

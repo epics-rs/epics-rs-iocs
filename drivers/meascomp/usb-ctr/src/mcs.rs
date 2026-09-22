@@ -97,7 +97,6 @@ pub struct McsScan {
     /// Accepted but not implemented (matches C++ drvUSBCTR, which ignores
     /// prescale for MCS).
     pub prescale: i32,
-    pub ext_trigger: bool,
     pub point0_no_clear: bool,
 }
 
@@ -106,10 +105,12 @@ pub struct McsScan {
 /// short-dwell, high-rate scan needs to keep up.
 pub const SINGLEIO_THRESHOLD_TIME: f64 = 0.01;
 
-/// The transfer and clock options C `startMCS` gives `ulDaqInScan`
-/// (drvUSBCTR.cpp:674-679).
+/// The transfer, clock and trigger options C `startMCS` gives `ulDaqInScan`
+/// (drvUSBCTR.cpp:674-681). The scan is always triggered; TRIGGER_MODE
+/// chooses the condition, and "Low level" with nothing wired to the trigger
+/// input is how an untriggered scan is run.
 pub fn scan_options(dwell_time: f64, external_advance: bool) -> i32 {
-    let mut options = SO_DEFAULTIO;
+    let mut options = SO_DEFAULTIO | SO_EXTTRIGGER;
     if external_advance {
         options |= SO_EXTCLOCK;
     }
@@ -117,6 +118,18 @@ pub fn scan_options(dwell_time: f64, external_advance: bool) -> i32 {
         options |= SO_SINGLEIO;
     }
     options
+}
+
+/// C's TRIGGER_MODE values (the UL for Windows codes) mapped to uldaq's
+/// trigger types (drvUSBCTR.cpp:1133-1144).
+pub fn trigger_type(mode: i32) -> Option<i32> {
+    match mode {
+        0 => Some(TRIG_POS_EDGE),
+        1 => Some(TRIG_NEG_EDGE),
+        6 => Some(TRIG_HIGH),
+        7 => Some(TRIG_LOW),
+        _ => None,
+    }
 }
 
 /// Start MCS acquisition using DaqInScan.
@@ -143,7 +156,6 @@ pub fn start_mcs(
         counter_enable,
         ch_advance_source,
         prescale: _,
-        ext_trigger,
         point0_no_clear,
     } = *scan;
     state.dwell_time = dwell_time;
@@ -211,10 +223,7 @@ pub fn start_mcs(
     // reject, not a cue to run at some other rate.
     let mut rate = 1.0 / dwell_time;
 
-    let mut options = scan_options(dwell_time, ch_advance_source != 0);
-    if ext_trigger {
-        options |= SO_EXTTRIGGER;
-    }
+    let options = scan_options(dwell_time, ch_advance_source != 0);
 
     let mut flags = DAQINSCAN_FF_DEFAULT;
     if point0_no_clear {
@@ -417,14 +426,23 @@ mod tests {
 
     #[test]
     fn a_long_dwell_is_read_one_sample_at_a_time() {
-        assert_eq!(scan_options(0.01, false), SO_SINGLEIO);
-        assert_eq!(scan_options(1.0, false), SO_SINGLEIO);
+        assert_eq!(scan_options(0.01, false), SO_EXTTRIGGER | SO_SINGLEIO);
+        assert_eq!(scan_options(1.0, false), SO_EXTTRIGGER | SO_SINGLEIO);
     }
 
     #[test]
     fn a_short_dwell_leaves_the_transfer_mode_to_libuldaq() {
-        assert_eq!(scan_options(0.001, false), SO_DEFAULTIO);
-        assert_eq!(scan_options(1e-6, true), SO_DEFAULTIO | SO_EXTCLOCK);
+        assert_eq!(scan_options(0.001, false), SO_EXTTRIGGER);
+        assert_eq!(scan_options(1e-6, true), SO_EXTTRIGGER | SO_EXTCLOCK);
+    }
+
+    #[test]
+    fn each_trigger_mode_selects_its_condition() {
+        assert_eq!(trigger_type(0), Some(TRIG_POS_EDGE));
+        assert_eq!(trigger_type(1), Some(TRIG_NEG_EDGE));
+        assert_eq!(trigger_type(6), Some(TRIG_HIGH));
+        assert_eq!(trigger_type(7), Some(TRIG_LOW));
+        assert_eq!(trigger_type(2), None);
     }
 
     #[test]

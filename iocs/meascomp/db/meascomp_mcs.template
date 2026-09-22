@@ -189,11 +189,15 @@ record(longout, "$(P)MCS:Prescale") {
     field(PINI, "YES")
 }
 
-record(bo, "$(P)MCS:TrigMode") {
+# The MCS always runs triggered. For an untriggered scan leave the trigger
+# input unconnected and choose "Low level", which is always satisfied.
+record(mbbo, "$(P)MCS:TrigMode") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)TRIGGER_MODE")
-    field(ZNAM, "Internal")
-    field(ONAM, "External")
+    field(ZRVL, "0")  field(ZRST, "Rising edge")
+    field(ONVL, "1")  field(ONST, "Falling edge")
+    field(TWVL, "6")  field(TWST, "High level")
+    field(THVL, "7")  field(THST, "Low level")
     field(PINI, "YES")
 }
 

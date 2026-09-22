@@ -297,6 +297,23 @@ impl PortDriver for CtrDriver {
             let device = self.device.clone();
             let dev = device.lock().unwrap();
             last_error = self.restart_pulse_generator(&dev, addr);
+        } else if reason == self.params.trigger_mode {
+            // C sets the trigger condition when the mode is written; the scan
+            // itself always runs with SO_EXTTRIGGER.
+            let trig_type = mcs::trigger_type(value).unwrap_or_else(|| {
+                self.report_error(format!("unsupported trigger mode {value}"));
+                uldaq_sys::TRIG_LOW
+            });
+            let dev = self.device.lock().unwrap();
+            if let Err(e) = dev.daq_in_set_trigger(
+                trig_type,
+                uldaq_sys::DaqInChanDescriptor::default(),
+                0.0,
+                0.0,
+                0,
+            ) {
+                last_error = Some(format!("daq_in_set_trigger error: {e}"));
+            }
         } else if reason == self.params.counter_reset {
             // Any write resets, as C's ulCLoad(CRT_LOAD, 0) does.
             let dev = self.device.lock().unwrap();
@@ -346,7 +363,6 @@ impl PortDriver for CtrDriver {
                     .base
                     .get_int32_param(self.params.mca_ch_advance_source, 0)?;
                 let prescale = self.base.get_int32_param(self.params.mca_prescale, 0)?;
-                let trigger = self.base.get_int32_param(self.params.trigger_mode, 0)? != 0;
                 let enable = self
                     .base
                     .get_uint32_param(self.params.mcs_counter_enable, 0)?;
@@ -366,7 +382,6 @@ impl PortDriver for CtrDriver {
                         counter_enable: enable,
                         ch_advance_source: ch_adv,
                         prescale,
-                        ext_trigger: trigger,
                         point0_no_clear,
                     },
                     num_counters,
