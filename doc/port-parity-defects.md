@@ -577,7 +577,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** after EraseAll, CurrentChannel/ElapsedReal keep old values; an erase mid-run does not restart the PresetReal clock.
 - **Class:** ref-faithful. **Live:** confirmed — after EraseAll, CurrentChannel=100 and ElapsedReal=1.037 unchanged.
 
-## PP-51 [MED] SO_SINGLEIO forced at every dwell — OPEN (regression of PP-42, fix never merged)
+## PP-51 [MED] SO_SINGLEIO forced at every dwell — FIXED (regression of PP-42, fix never merged)
 - **Rust:** `mcs.rs:171` `let mut options = SO_SINGLEIO;`.
 - **C:** `drvUSBCTR.cpp:674-679` `SO_DEFAULTIO`, `SO_SINGLEIO` only when `dwell >= 0.01` (libuldaq picks BLOCKIO above 1 kHz, `DaqIUsbBase.cpp:160`).
 - **Impact:** short-dwell MCS does one USB transfer per scan, risking overrun.

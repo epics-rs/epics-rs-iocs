@@ -96,6 +96,24 @@ pub struct McsScan {
     pub point0_no_clear: bool,
 }
 
+/// Dwell at and above which C reads the scan one sample at a time
+/// (drvUSBCTR.cpp:101); below it libuldaq picks block transfers, which a
+/// short-dwell, high-rate scan needs to keep up.
+pub const SINGLEIO_THRESHOLD_TIME: f64 = 0.01;
+
+/// The transfer and clock options C `startMCS` gives `ulDaqInScan`
+/// (drvUSBCTR.cpp:674-679).
+pub fn scan_options(dwell_time: f64, external_advance: bool) -> i32 {
+    let mut options = SO_DEFAULTIO;
+    if external_advance {
+        options |= SO_EXTCLOCK;
+    }
+    if dwell_time >= SINGLEIO_THRESHOLD_TIME {
+        options |= SO_SINGLEIO;
+    }
+    options
+}
+
 /// Start MCS acquisition using DaqInScan.
 pub fn start_mcs(
     device: &DaqDevice,
@@ -178,10 +196,7 @@ pub fn start_mcs(
         1000.0
     };
 
-    let mut options = SO_SINGLEIO;
-    if ch_advance_source != 0 {
-        options |= SO_EXTCLOCK;
-    }
+    let mut options = scan_options(dwell_time, ch_advance_source != 0);
     if ext_trigger {
         options |= SO_EXTTRIGGER;
     }
@@ -308,6 +323,18 @@ mod tests {
             .as_secs_f64();
         let offset = unix - current_time_secs();
         assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
+
+    #[test]
+    fn a_long_dwell_is_read_one_sample_at_a_time() {
+        assert_eq!(scan_options(0.01, false), SO_SINGLEIO);
+        assert_eq!(scan_options(1.0, false), SO_SINGLEIO);
+    }
+
+    #[test]
+    fn a_short_dwell_leaves_the_transfer_mode_to_libuldaq() {
+        assert_eq!(scan_options(0.001, false), SO_DEFAULTIO);
+        assert_eq!(scan_options(1e-6, true), SO_DEFAULTIO | SO_EXTCLOCK);
     }
 
     #[test]
