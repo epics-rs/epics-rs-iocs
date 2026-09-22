@@ -851,7 +851,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** amplitude/type/enable changes during a continuous run take effect only after a manual Stop/Run; WaveGenNumPoints/Dwell/Freq stale until Run; no internal-waveform preview.
 - **Class:** unimpl. **Live:** confirmed — WaveGenFreq/NumPoints/Dwell stayed 0/2048/0 after `IntNumPoints=200, IntDwell=0.001` until Run published 5/200/0.001.
 
-## PP-94 [MED] User waveform ignores Amplitude/Offset, repeats a short buffer, accepts oversize writes — OPEN
+## PP-94 [MED] User waveform ignores Amplitude/Offset, repeats a short buffer, accepts oversize writes — FIXED
 - **Rust:** `driver.rs:539-547` `user[i % user.len()]` unscaled; `write_float32_array` (`:653-665`) truncates and returns Ok.
 - **C:** `drvMultiFunction.cpp:1652-1660` `user*amplitude + offset`; short write leaves the rest of the buffer; `:2513-2518` oversize → asynError. (Upstream `i`/`k` index bug at `:1653`, see `upstream-c-defects.md`.)
 - **Impact:** DAC output differs from C whenever Amplitude ≠ 1 or Offset ≠ 0; a short user WF plays repeatedly.

@@ -707,7 +707,7 @@ impl PortDriver for MultiFunctionDriver {
                     }
 
                     // Build per-channel waveforms, then interleave for ulAOutScan
-                    let mut per_chan = Vec::with_capacity(MAX_ANALOG_OUT);
+                    let mut per_chan: Vec<Vec<f64>> = Vec::with_capacity(MAX_ANALOG_OUT);
                     for ch in first_chan..=last_chan {
                         let wave_type = self
                             .base
@@ -725,14 +725,17 @@ impl PortDriver for MultiFunctionDriver {
                             .base
                             .get_float64_param(self.params.wave_gen_pulse_delay, ch)?;
                         if wave_type == wave_gen::WAVE_TYPE_USER {
-                            // A user waveform shorter than the scan is repeated;
-                            // an absent one leaves the channel at zero volts.
-                            let user = &st.wave_gen.user_waveforms[ch as usize];
-                            per_chan.push(if user.is_empty() {
-                                vec![0.0; num_points]
-                            } else {
-                                (0..num_points).map(|i| user[i % user.len()]).collect()
-                            });
+                            // C: the channel's own Amplitude and Offset scale
+                            // the stored volts, over exactly UserNumPoints
+                            // samples of the buffer (drvMultiFunction.cpp:
+                            // 1652-1660, taken at the absolute channel).
+                            let user = &st.wave_gen.user_buffers[ch as usize];
+                            per_chan.push(
+                                user[..num_points]
+                                    .iter()
+                                    .map(|v| f64::from(*v) * amp + offset)
+                                    .collect(),
+                            );
                         } else {
                             per_chan.push(
                                 wave_gen::generate_waveform(
@@ -856,7 +859,6 @@ impl PortDriver for MultiFunctionDriver {
             .unwrap_or(0)
             .max(0) as usize;
         let st = self.state.lock().unwrap();
-        let user_wf: Vec<f32>;
         let src: &[f32] = if reason == self.params.wave_gen_user_time_wf {
             &st.wave_gen.user_time_buffer
         } else if reason == self.params.wave_gen_int_time_wf {
@@ -864,12 +866,14 @@ impl PortDriver for MultiFunctionDriver {
         } else if reason == self.params.wave_dig_time_wf {
             &st.wave_dig.time_buffer
         } else if reason == self.params.wave_gen_user_wf {
-            let ch = device_addr(user.addr) as usize;
-            let Some(wf) = st.wave_gen.user_waveforms.get(ch) else {
+            let Some(wf) = st
+                .wave_gen
+                .user_buffers
+                .get(device_addr(user.addr) as usize)
+            else {
                 return Ok(0);
             };
-            user_wf = wf.iter().map(|v| *v as f32).collect();
-            &user_wf
+            wf
         } else {
             return Ok(0);
         };
@@ -906,7 +910,10 @@ impl PortDriver for MultiFunctionDriver {
         Ok(n)
     }
 
-    /// Load a user-defined generator waveform (volts) for one channel.
+    /// Load a user-defined generator waveform (volts) for one channel, C
+    /// `writeFloat32Array` (drvMultiFunction.cpp:2504-2529): the points
+    /// written replace the head of the buffer, and more than it holds is
+    /// refused rather than cut short.
     fn write_float32_array(&mut self, user: &AsynUser, data: &[f32]) -> AsynResult<()> {
         if user.reason != self.params.wave_gen_user_wf {
             return Ok(());
@@ -916,8 +923,18 @@ impl PortDriver for MultiFunctionDriver {
             return Ok(());
         }
         let mut st = self.state.lock().unwrap();
-        let n = data.len().min(st.wave_gen.max_points);
-        st.wave_gen.user_waveforms[ch] = data[..n].iter().map(|v| *v as f64).collect();
+        let buffer = &mut st.wave_gen.user_buffers[ch];
+        if data.len() > buffer.len() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!(
+                    "{} points written, the waveform holds {}",
+                    data.len(),
+                    buffer.len()
+                ),
+            });
+        }
+        buffer[..data.len()].copy_from_slice(data);
         Ok(())
     }
 

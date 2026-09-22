@@ -49,8 +49,9 @@ record(ao, "$(P)$(R)PulseWidth") {
     field(PINI, "YES")
 }
 
-# User-defined waveform in volts, used when WaveType is "User". A waveform
-# shorter than WaveGenNumPoints is repeated to fill the scan.
+# User-defined waveform in volts, used when WaveType is "User", scaled by
+# Amplitude and shifted by Offset. The scan plays WaveGenUserNumPoints of it;
+# points never written stay 0 V.
 record(waveform, "$(P)$(R)UserWF") {
     field(DTYP, "asynFloat32ArrayOut")
     field(INP,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_USER_WF")

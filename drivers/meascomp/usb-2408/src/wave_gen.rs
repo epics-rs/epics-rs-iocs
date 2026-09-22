@@ -15,9 +15,10 @@ pub struct WaveGenState {
     /// Saved output values to restore after stop.
     pub saved_outputs: [f64; MAX_ANALOG_OUT],
     pub dwell_actual: f64,
-    /// Per-channel user-defined waveform, in volts, as written to
-    /// WAVEGEN_USER_WF. Used when a channel's WAVEGEN_WAVE_TYPE is `User`.
-    pub user_waveforms: Vec<Vec<f64>>,
+    /// Per-channel user-defined waveform in volts, C `waveGenUserBuffer_`:
+    /// `max_points` long and zero until written; a write replaces only the
+    /// points it carries. Used when a channel's WAVEGEN_WAVE_TYPE is `User`.
+    pub user_buffers: Vec<Vec<f32>>,
     /// Capacity the port was configured with; a user waveform is truncated to
     /// it so it can never outrun the scan buffer.
     pub max_points: usize,
@@ -37,7 +38,7 @@ impl WaveGenState {
             scan_buffer: Vec::new(),
             saved_outputs: [0.0; MAX_ANALOG_OUT],
             dwell_actual: 0.001,
-            user_waveforms: vec![Vec::new(); MAX_ANALOG_OUT],
+            user_buffers: vec![vec![0.0; max_points]; MAX_ANALOG_OUT],
             max_points,
             user_time_buffer: vec![0.0; max_points],
             int_time_buffer: vec![0.0; max_points],
