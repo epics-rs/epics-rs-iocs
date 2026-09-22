@@ -23,6 +23,19 @@ fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
 }
 
+/// C `readInt32Array(mcaData_)` (drvUSBCTR.cpp:1395-1406): the whole
+/// configured spectrum is copied, so the array is right even where it was
+/// never cleared, but only the points acquired so far are reported -- at
+/// least one, so NORD never drops to 0.
+fn mca_data_read(buf: &mut [i32], src: &[i32], num_channels: usize, current_point: usize) -> usize {
+    if buf.is_empty() {
+        return 0;
+    }
+    let n_copy = buf.len().min(num_channels).min(src.len());
+    buf[..n_copy].copy_from_slice(&src[..n_copy]);
+    buf.len().min(current_point).max(1)
+}
+
 /// USB-CTR08 port driver.
 pub struct CtrDriver {
     base: PortDriverBase,
@@ -434,9 +447,7 @@ impl PortDriver for CtrDriver {
         let Some(src) = st.mcs.mcs_buffers.get(counter) else {
             return Ok(0);
         };
-        let n = buf.len().min(src.len()).min(num_channels);
-        buf[..n].copy_from_slice(&src[..n]);
-        Ok(n)
+        Ok(mca_data_read(buf, src, num_channels, st.mcs.current_point))
     }
 
     /// MCS time base (seconds from the start of the scan).
@@ -464,12 +475,18 @@ impl PortDriver for CtrDriver {
         if user.reason != self.params.mcs_abs_time_wf {
             return Ok(0);
         }
+        let num_channels = self
+            .base
+            .get_int32_param(self.params.mca_num_channels, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
         let st = self.state.lock().unwrap();
-        // Points actually acquired, as C readMCS reports them.
+        // C readFloat64Array: the configured number of time points
+        // (drvUSBCTR.cpp:1473-1482), not the acquired ones.
         let n = buf
             .len()
             .min(st.mcs.abs_time_buffer.len())
-            .min(st.mcs.current_point);
+            .min(num_channels);
         buf[..n].copy_from_slice(&st.mcs.abs_time_buffer[..n]);
         Ok(n)
     }
@@ -607,4 +624,31 @@ pub fn create_usb_ctr(
         state,
         _poller_handle: poller_handle,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_spectrum_reports_only_the_points_acquired() {
+        let src = [5, 6, 7, 8];
+        let mut buf = [0; 4];
+        assert_eq!(mca_data_read(&mut buf, &src, 4, 2), 2);
+        // The whole configured spectrum is still copied.
+        assert_eq!(buf, [5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn an_empty_spectrum_still_reports_one_point() {
+        let mut buf = [9; 4];
+        assert_eq!(mca_data_read(&mut buf, &[0; 4], 4, 0), 1);
+    }
+
+    #[test]
+    fn a_spectrum_never_copies_past_the_configured_points() {
+        let mut buf = [0; 4];
+        assert_eq!(mca_data_read(&mut buf, &[1, 2, 3, 4], 2, 4), 4);
+        assert_eq!(buf, [1, 2, 0, 0]);
+    }
 }

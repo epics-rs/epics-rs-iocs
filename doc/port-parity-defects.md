@@ -607,7 +607,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** a ReadAll mid-run releases the Acquiring busy early (`caput -c` returns before data); no 1 Hz spectrum refresh; spectra stale after erase; ClientWait never raised; on a fresh IOC StartAll writes 0 into Acquiring.
 - **Class:** contract. **Live:** confirmed — `ReadAll` mid-run set Acquiring=Done while HardwareAcquiring=Acquiring.
 
-## PP-56 [LOW] MCS readout element counts swapped vs C — OPEN
+## PP-56 [LOW] MCS readout element counts swapped vs C — FIXED
 - **Rust:** `driver.rs:267` MCA_DATA `n = min(buf, src, num_channels)`; `:298-303` AbsTimeWF `n = min(…, current_point)` (comment "as C readMCS reports them" is wrong).
 - **C:** `drvUSBCTR.cpp:1403-1406` MCA_DATA `min(numRead, currentPoint)`, min 1; `:1473,1481-1482` AbsTimeWF `min(nElements, mcaNumChannels)`.
 - **Impact:** spectrum NORD = NuseAll mid-run (C: acquired points); AbsTimeWF NORD the reverse.
