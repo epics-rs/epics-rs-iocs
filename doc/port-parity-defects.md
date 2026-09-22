@@ -781,7 +781,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** a CA put or scan thread blocks for a poll sweep (tens of ms; ≈300 ms once PP-79 sets 60 S/s), and blocking USB I/O runs on a tokio worker.
 - **Class:** contract. **Live:** static.
 
-## PP-83 [LOW] Default thermocouple type K; C defaults to J — OPEN
+## PP-83 [LOW] Default thermocouple type K; C defaults to J — FIXED
 - **Rust:** `driver.rs:74` `TC_K`; `meascomp_temperature.template:19` `VAL 1`.
 - **C:** `drvMultiFunction.cpp:1281-1283` `TC_TYPE_J`; template index 0 = Type J; libuldaq default `TC_J`.
 - **Impact:** a J sensor on a fresh IOC reads tens of °C off.

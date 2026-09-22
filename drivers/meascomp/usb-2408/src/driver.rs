@@ -107,7 +107,8 @@ impl MultiFunctionDriver {
             base.set_int32_param(params.analog_in_type, ch as i32, 0)?;
             base.set_int32_param(params.analog_in_range, ch as i32, uldaq_sys::BIP10VOLTS)?;
             base.set_int32_param(params.temperature_scale, ch as i32, uldaq_sys::TS_CELSIUS)?;
-            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_K)?;
+            // Type J, as C's constructor and libuldaq default to.
+            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
         }
 
         // Device info

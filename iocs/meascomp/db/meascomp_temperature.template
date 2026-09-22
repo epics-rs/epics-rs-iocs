@@ -18,7 +18,7 @@ record(mbbo, "$(P)$(R)TCType") {
     field(FVST, "S")  field(FVVL, "6")
     field(SXST, "B")  field(SXVL, "7")
     field(SVST, "N")  field(SVVL, "8")
-    field(VAL,  "1")
+    field(VAL,  "0")
     field(PINI, "YES")
 }
 
