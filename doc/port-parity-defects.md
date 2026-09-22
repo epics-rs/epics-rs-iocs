@@ -607,6 +607,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **C:** `measCompMCS.template:83-90` ReadAll SCAN "1 second", SDIS Acquiring; `:12-19` EraseAll FLNK ReadAllOnce; `:30-45,150-158` StartAll→SetAcquiring(VAL 1)→SetClientWait; `USBCTR_SNL.st` clears Acquiring only on HardwareAcquiring 1→0.
 - **Impact:** a ReadAll mid-run releases the Acquiring busy early (`caput -c` returns before data); no 1 Hz spectrum refresh; spectra stale after erase; ClientWait never raised; on a fresh IOC StartAll writes 0 into Acquiring.
 - **Class:** contract. **Live:** confirmed — `ReadAll` mid-run set Acquiring=Done while HardwareAcquiring=Acquiring.
+- **Found while fixing (live):** a StartAll on a run that already has all its points wedged Acquiring at 1. The driver pulses MCA_ACQUIRING 1 → 0 inside the write (C `:1191-1198`), which upstream's SNL sees through CA monitors; epics-rs asyn-rs delivers plain I/O Intr through a coalescing mailbox (`asyn-rs-0.30.0/src/interrupt.rs:214-215`), so the record only ever sees the final 0 and AcquireDone never fires. The db now raises Acquiring before the start and reads MCA_ACQUIRING back after it (StartSeq/StartCheck). The framework deviation from C asyn's per-record ring stays open in epics-rs.
 
 ## PP-56 [LOW] MCS readout element counts swapped vs C — FIXED
 - **Rust:** `driver.rs:267` MCA_DATA `n = min(buf, src, num_channels)`; `:298-303` AbsTimeWF `n = min(…, current_point)` (comment "as C readMCS reports them" is wrong).

@@ -24,13 +24,47 @@ record(bo, "$(P)MCS:EraseStart") {
     field(FLNK, "$(P)MCS:StartAll.PROC")
 }
 
+# Raise Acquiring, issue the start, then read back what the start did. A
+# start that does not leave the hardware acquiring -- a run that already has
+# all its points, or one refused while the scaler counts -- finishes at once.
+# Upstream's SNL program sees the driver's MCA_ACQUIRING 1 -> 0 pulse for the
+# complete run, but a pulse inside one write reaches an epics-rs I/O Intr
+# record only as its final value, so the database reads the state instead.
 record(bo, "$(P)MCS:StartAll") {
+    field(ZNAM, "Done")
+    field(ONAM, "Start")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:StartSeq")
+}
+
+record(seq, "$(P)MCS:StartSeq") {
+    field(SELM, "All")
+    field(DOL1, "1")  field(LNK1, "$(P)MCS:SetAcquiring.PROC  PP")
+    field(DOL2, "1")  field(LNK2, "$(P)MCS:DoStartAll.PROC  PP")
+    field(DOL3, "1")  field(LNK3, "$(P)MCS:StartCheck.PROC  PP")
+}
+
+record(bi, "$(P)MCS:StartCheck") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_ACQUIRING")
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+    field(FLNK, "$(P)MCS:StartCheckDone")
+}
+
+record(calcout, "$(P)MCS:StartCheckDone") {
+    field(INPA, "$(P)MCS:StartCheck  NPP NMS")
+    field(CALC, "A")
+    field(OOPT, "When Zero")
+    field(OUT,  "$(P)MCS:FinishAcquire.PROC  PP")
+}
+
+record(bo, "$(P)MCS:DoStartAll") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_START_ACQUIRE")
     field(ZNAM, "Done")
     field(ONAM, "Start")
     field(VAL,  "1")
-    field(FLNK, "$(P)MCS:SetAcquiring.PROC")
 }
 
 record(bo, "$(P)MCS:SetAcquiring") {
