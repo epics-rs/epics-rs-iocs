@@ -150,6 +150,7 @@ record(longin, "$(P)WaveGenCurrentPoint") {
 record(bo, "$(P)WaveGenExtTrigger") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_TRIGGER")
+    field(PINI, "YES")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
@@ -157,6 +158,7 @@ record(bo, "$(P)WaveGenExtTrigger") {
 record(bo, "$(P)WaveGenExtClock") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_CLOCK")
+    field(PINI, "YES")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
@@ -164,6 +166,7 @@ record(bo, "$(P)WaveGenExtClock") {
 record(bo, "$(P)WaveGenContinuous") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_CONTINUOUS")
+    field(PINI, "YES")
     field(ZNAM, "One-shot")
     field(ONAM, "Continuous")
 }

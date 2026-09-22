@@ -1,8 +1,11 @@
 record(bo, "$(P)$(R)Run") {
+    field(PINI, "YES")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_RUN")
     field(ZNAM, "Stop")
+    field(ZSV,  "NO_ALARM")
     field(ONAM, "Run")
+    field(OSV,  "MINOR")
 }
 
 record(ao, "$(P)$(R)Period") {
@@ -58,10 +61,12 @@ record(longout, "$(P)$(R)Count") {
 }
 
 record(bo, "$(P)$(R)IdleState") {
+    field(PINI, "YES")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)PULSE_IDLE_STATE")
     field(ZNAM, "Low")
     field(ONAM, "High")
+    field(VAL,  "0")
 }
 
 ###################################################################

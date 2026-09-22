@@ -2,6 +2,10 @@
 # (0..65535 on the USB-2408-2AO), as upstream measCompAnalogOut.template does
 # with USB2408.substitutions' +/-10 V limits.
 record(ao, "$(P)$(R)") {
+    field(PINI, "$(PINI=YES)")
+    # PHAS 2: the Range record processes first at iocInit.
+    field(PHAS, "2")
+    field(VAL,  "$(VAL=0)")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_VALUE")
     field(LINR, "LINEAR")

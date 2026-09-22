@@ -36,6 +36,7 @@ record(mbbo, "$(P)$(R)Scale") {
 record(bo, "$(P)$(R)Filter") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)TEMPERATURE_FILTER")
+    field(PINI, "YES")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
@@ -43,6 +44,7 @@ record(bo, "$(P)$(R)Filter") {
 record(bo, "$(P)$(R)OpenTCDetect") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)THERMOCOUPLE_OPEN_DETECT")
+    field(PINI, "YES")
     field(ZNAM, "Off")
     field(ONAM, "On")
 }
