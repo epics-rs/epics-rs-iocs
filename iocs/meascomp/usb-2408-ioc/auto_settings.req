@@ -1,7 +1,7 @@
 # Settings restored at the next start of usb-2408-ioc.
 # Ported from upstream USB2408_settings.req and the per-template
 # measComp*_settings.req files it includes, minus the records this port does
-# not have (Ao Return/Pulse, Ao SyncMaster).
+# not have (Ao SyncMaster: the USB-2408-2AO rejects AO_CFG_SYNC_MODE).
 #
 # Macros: P (record prefix)
 
@@ -159,9 +159,39 @@ $(P)Ti8.SCAN
 $(P)Ao1Range
 $(P)Ao1TweakVal
 $(P)Ao1SyncEnable
+$(P)Ao1Pulse
+$(P)Ao1.DRVL
+$(P)Ao1.DRVH
+$(P)Ao1.LOPR
+$(P)Ao1.HOPR
+$(P)Ao1.EGUF
+$(P)Ao1.EGUL
+$(P)Ao1.PREC
+$(P)Ao1Return.DRVL
+$(P)Ao1Return.DRVH
+$(P)Ao1Return.LOPR
+$(P)Ao1Return.HOPR
+$(P)Ao1Return.EGUF
+$(P)Ao1Return.EGUL
+$(P)Ao1Return.PREC
 $(P)Ao2Range
 $(P)Ao2TweakVal
 $(P)Ao2SyncEnable
+$(P)Ao2Pulse
+$(P)Ao2.DRVL
+$(P)Ao2.DRVH
+$(P)Ao2.LOPR
+$(P)Ao2.HOPR
+$(P)Ao2.EGUF
+$(P)Ao2.EGUL
+$(P)Ao2.PREC
+$(P)Ao2Return.DRVL
+$(P)Ao2Return.DRVH
+$(P)Ao2Return.LOPR
+$(P)Ao2Return.HOPR
+$(P)Ao2Return.EGUF
+$(P)Ao2Return.EGUL
+$(P)Ao2Return.PREC
 
 $(P)WaveDigNumPoints
 $(P)WaveDigFirstChan

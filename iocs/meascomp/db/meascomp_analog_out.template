@@ -17,6 +17,34 @@ record(ao, "$(P)$(R)") {
     field(HOPR, "$(HOPR=10.)")
     field(EGU,  "V")
     field(PREC, "$(PREC=4)")
+    field(FLNK, "$(P)$(R)Return.PROC  PP MS")
+}
+
+###################################################################
+# Pulse: with Pulse set, every write to $(P)$(R) is followed by    #
+# Return's value, so the output pulses to it and comes back.       #
+###################################################################
+record(ao, "$(P)$(R)Return") {
+    field(DTYP, "asynInt32")
+    field(DISV, "0")
+    field(SDIS, "$(P)$(R)Pulse.VAL  NPP NMS")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_VALUE")
+    field(OMSL, "closed_loop")
+    field(LINR, "LINEAR")
+    field(EGUL, "$(EGUL=-10.)")
+    field(DRVL, "$(DRVL=-10.)")
+    field(LOPR, "$(LOPR=-10.)")
+    field(EGUF, "$(EGUF=10.)")
+    field(DRVH, "$(DRVH=10.)")
+    field(HOPR, "$(HOPR=10.)")
+    field(EGU,  "V")
+    field(PREC, "$(PREC=4)")
+    field(VAL,  "$(VAL=0)")
+}
+
+record(bo, "$(P)$(R)Pulse") {
+    field(ZNAM, "Normal")
+    field(ONAM, "Pulse")
 }
 
 record(mbbo, "$(P)$(R)Range") {

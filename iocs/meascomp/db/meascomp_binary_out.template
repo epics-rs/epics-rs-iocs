@@ -8,3 +8,11 @@ record(bo, "$(P)$(R)") {
     field(ZNAM, "Low")
     field(ONAM, "High")
 }
+
+record(bi, "$(P)$(R)_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_INPUT")
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+    field(SCAN, "I/O Intr")
+}

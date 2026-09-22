@@ -732,7 +732,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** the crate does not compile on aarch64/armv7 Linux.
 - **Class:** ref-indep. **Live:** static.
 
-## PP-75 [LOW] C records missing from the Rust IOCs — OPEN
+## PP-75 [LOW] C records missing from the Rust IOCs — FIXED
 - **Rust:** no `Bo<n>_RBV`, `WaveGen<n>InternalWF`, `MCS:Dwell_RBV`, `MCS:Model`, `MCS:SNL_Connected`, `MCS:Asyn`, `Ao<n>Return`/`Ao<n>Pulse`, `Ai<n>Rate`.
 - **C:** `measCompBinaryOut.template:15-25`, `measCompWaveformGenN.template:15-22`, `measCompMCS.template:5-10,122-127,282-291,320-322`, `measCompAnalogOut.template:27-47`, `measCompAnalogIn.template:31-37`.
 - **Impact:** C OPIs/clients lose these readbacks. Driver-side gaps behind some of them are PP-57, PP-63, PP-79, PP-93.

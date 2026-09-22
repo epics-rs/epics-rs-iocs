@@ -6,6 +6,17 @@
 # 1 -> 0 transition read them and only then release Acquiring -- is done by
 # the DoReadAll / AcquireDone / FinishAcquire records below.
 
+# Upstream's SNL program sets this when it has connected; here the database
+# itself does that job, so it is connected from the start.
+record(bi, "$(P)MCS:SNL_Connected") {
+    field(ZNAM, "Not connected")
+    field(ZSV,  "MAJOR")
+    field(ONAM, "Connected")
+    field(OSV,  "NO_ALARM")
+    field(VAL,  "1")
+    field(PINI, "YES")
+}
+
 record(bo, "$(P)MCS:EraseAll") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_ERASE")
@@ -374,4 +385,9 @@ record(bo, "$(P)MCS:MCSDIOEnable") {
     field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
     field(OUT,  "$(P)MCS:MCSCounterEnable.B8 PP")
     field(PINI, "YES")
+}
+
+# asyn record for debugging
+record(asyn, "$(P)MCS:Asyn") {
+    field(PORT, "$(PORT)")
 }
