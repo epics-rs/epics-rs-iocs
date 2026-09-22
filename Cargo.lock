@@ -4841,6 +4841,7 @@ dependencies = [
  "anyhow",
  "epics-rs",
  "log",
+ "mca",
  "meascomp",
  "parking_lot",
  "uldaq-sys",
@@ -4853,6 +4854,8 @@ dependencies = [
  "asyn-rs",
  "env_logger",
  "epics-rs",
+ "mca",
+ "mca-rs",
  "tokio",
  "usb-ctr",
 ]

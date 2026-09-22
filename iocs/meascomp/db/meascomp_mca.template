@@ -1,0 +1,12 @@
+# One counter's MCS spectrum as an mca record, the alternative to
+# meascomp_mcs_n.template's waveform (upstream simple_mca.db with
+# DTYP=asynMCA). Load either these or the waveforms for a counter.
+# Macros: P (prefix), R (record name), PORT (asyn port), ADDR (counter),
+#         MAX_POINTS (time points allocated by USBCTRConfig), PREC
+record(mca, "$(P)$(R)") {
+    field(DTYP, "asynMCA")
+    field(INP,  "@asyn($(PORT),$(ADDR))")
+    field(NMAX, "$(MAX_POINTS=2048)")
+    field(NUSE, "$(MAX_POINTS=2048)")
+    field(PREC, "$(PREC=3)")
+}

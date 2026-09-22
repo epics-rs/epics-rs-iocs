@@ -203,7 +203,7 @@ record(mbbo, "$(P)MCS:TrigMode") {
 
 record(ao, "$(P)MCS:PresetReal") {
     field(DTYP, "asynFloat64")
-    field(OUT,  "@asyn($(PORT),0,1.0)MCA_PRESET_REAL_TIME")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_PRESET_REAL")
     field(PREC, "3")
     field(VAL,  "0")
     field(PINI, "YES")
@@ -211,7 +211,7 @@ record(ao, "$(P)MCS:PresetReal") {
 
 record(ai, "$(P)MCS:ElapsedReal") {
     field(DTYP, "asynFloat64")
-    field(INP,  "@asyn($(PORT),0,1.0)MCA_ELAPSED_REAL_TIME")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_ELAPSED_REAL")
     field(PREC, "3")
     field(SCAN, "I/O Intr")
 }
@@ -248,7 +248,7 @@ record(mbbo, "$(P)MCS:Point0Action") {
 
 record(mbbo, "$(P)MCS:ChannelAdvance") {
     field(DTYP, "asynInt32")
-    field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADVANCE_SOURCE")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADV_SOURCE")
     field(ZRST, "Internal")  field(ZRVL, "0")
     field(ONST, "External")  field(ONVL, "1")
     field(PINI, "YES")

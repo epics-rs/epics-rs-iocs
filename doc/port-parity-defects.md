@@ -595,7 +595,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** `MCS:Prescale` has no device effect; Skip mode unreachable.
 - **Class:** unimpl. **Live:** confirmed PVs absent.
 
-## PP-54 [MED] drvMca param contract broken; mca record not registered — OPEN (regression, fix never merged)
+## PP-54 [MED] drvMca param contract broken; mca record not registered — FIXED (regression, fix never merged)
 - **Rust:** `params.rs:114-118` renamed params (`MCA_CH_ADVANCE_SOURCE`, `MCA_PRESET_REAL_TIME`, `MCA_ELAPSED_REAL_TIME`, …) and 11 drvMca params absent; `usb-ctr-ioc/src/main.rs:57-69` does not register `mca`.
 - **C:** `drvUSBCTR.cpp:331-351` creates all 21 drvMca.h params; C st.cmd offers `simple_mca.db` (`DTYP=asynMCA`); `devMcaAsyn` resolves all 21 (`dev_mca_asyn.rs:221-234`).
 - **Impact:** the documented optional mca-record configuration cannot load.

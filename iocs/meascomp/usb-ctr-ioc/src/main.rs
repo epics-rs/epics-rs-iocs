@@ -61,6 +61,10 @@ async fn main() -> CaResult<()> {
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
 
+    // The optional mca-record form of the MCS spectra (meascomp_mca.template).
+    let (mca_name, mca_factory) = mca_rs::mca_record_factory();
+    app = app.register_record_type(mca_name, move || mca_factory());
+
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
     // `busy` and `transform` are opt-in in epics-rs (dropped from the default
@@ -156,6 +160,16 @@ async fn main() -> CaResult<()> {
             ) as Box<dyn DeviceSupport>)
         });
     }
+
+    // Binds every mca record with DTYP "asynMCA" to the port its INP names,
+    // as upstream's devMcaAsyn does.
+    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+        if ctx.dtyp != mca::interface::ASYN_MCA_DTYP {
+            return None;
+        }
+        let dev = mca::dev_mca_asyn::connect(ctx.inp)?;
+        Some(Box::new(dev) as Box<dyn DeviceSupport>)
+    });
 
     app.startup_script(&script)
         .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)

@@ -1,6 +1,7 @@
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
+use mca::interface::McaReason;
 
 /// 8 counters + 1 digital I/O channel in MCS mode.
 pub const MAX_MCS_COUNTERS: usize = 9;
@@ -93,11 +94,13 @@ pub struct CtrParams {
     pub mca_acquiring: usize,
     pub mca_elapsed_real: usize,
     pub mca_elapsed_live: usize,
+    pub mca_elapsed_counts: usize,
     pub mca_prescale: usize,
 }
 
 impl CtrParams {
     pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+        let mca = McaReason::create_params(base)?;
         Ok(Self {
             model_name: base.create_param("MODEL_NAME", ParamType::Octet)?,
             model_number: base.create_param("MODEL_NUMBER", ParamType::Int32)?,
@@ -135,18 +138,22 @@ impl CtrParams {
             mcs_prescale_counter: base.create_param("MCS_PRESCALE_COUNTER", ParamType::Int32)?,
             mcs_point0_action: base.create_param("MCS_POINT0_ACTION", ParamType::Int32)?,
 
-            mca_start_acquire: base.create_param("MCA_START_ACQUIRE", ParamType::Int32)?,
-            mca_stop_acquire: base.create_param("MCA_STOP_ACQUIRE", ParamType::Int32)?,
-            mca_erase: base.create_param("MCA_ERASE", ParamType::Int32)?,
-            mca_data: base.create_param("MCA_DATA", ParamType::Int32Array)?,
-            mca_num_channels: base.create_param("MCA_NUM_CHANNELS", ParamType::Int32)?,
-            mca_dwell_time: base.create_param("MCA_DWELL_TIME", ParamType::Float64)?,
-            mca_ch_advance_source: base.create_param("MCA_CH_ADVANCE_SOURCE", ParamType::Int32)?,
-            mca_preset_real: base.create_param("MCA_PRESET_REAL_TIME", ParamType::Float64)?,
-            mca_acquiring: base.create_param("MCA_ACQUIRING", ParamType::Int32)?,
-            mca_elapsed_real: base.create_param("MCA_ELAPSED_REAL_TIME", ParamType::Float64)?,
-            mca_elapsed_live: base.create_param("MCA_ELAPSED_LIVE_TIME", ParamType::Float64)?,
-            mca_prescale: base.create_param("MCA_PRESCALE", ParamType::Int32)?,
+            // All 21 drvMca.h parameters under their drvMca.h names, as C
+            // creates them (drvUSBCTR.cpp:331-351): an mca record's
+            // devMcaAsyn resolves every one of them at init.
+            mca_start_acquire: mca[McaReason::StartAcquire as usize],
+            mca_stop_acquire: mca[McaReason::StopAcquire as usize],
+            mca_erase: mca[McaReason::Erase as usize],
+            mca_data: mca[McaReason::Data as usize],
+            mca_num_channels: mca[McaReason::NumChannels as usize],
+            mca_dwell_time: mca[McaReason::DwellTime as usize],
+            mca_ch_advance_source: mca[McaReason::ChannelAdvanceSource as usize],
+            mca_preset_real: mca[McaReason::PresetRealTime as usize],
+            mca_acquiring: mca[McaReason::Acquiring as usize],
+            mca_elapsed_real: mca[McaReason::ElapsedRealTime as usize],
+            mca_elapsed_live: mca[McaReason::ElapsedLiveTime as usize],
+            mca_elapsed_counts: mca[McaReason::ElapsedCounts as usize],
+            mca_prescale: mca[McaReason::Prescale as usize],
         })
     }
 }

@@ -117,7 +117,7 @@ impl Point0Action {
     }
 }
 
-/// External channel advance, as MCA_CH_ADVANCE_SOURCE encodes it.
+/// External channel advance, as MCA_CH_ADV_SOURCE encodes it.
 pub const CHANNEL_ADVANCE_EXTERNAL: i32 = 1;
 
 /// Acquisition settings for [`start_mcs`], read from the MCA/MCS records.

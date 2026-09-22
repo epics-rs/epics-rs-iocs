@@ -48,6 +48,7 @@ struct PollSnapshot {
     /// Seconds since the MCS scan started; C readMCS keeps
     /// mcaElapsedRealTime/LiveTime on every counter address.
     mcs_elapsed: f64,
+    num_counters: usize,
     errors: Vec<String>,
 }
 
@@ -89,6 +90,7 @@ fn poller_loop(
 
                 if let Ok(mut st) = state.lock() {
                     let num_counters = st.num_counters;
+                    snap.num_counters = num_counters;
                     if st.scaler.running {
                         scaler::read_scaler(&dev, &mut st.scaler, num_counters);
                         if st.scaler.done {
@@ -170,7 +172,11 @@ fn poller_loop(
                 );
             }
             if snapshot.mcs_just_stopped {
-                let _ = handle.write_int32_blocking(params.mca_acquiring, 0, 0);
+                // C clears it on every counter address, where each mca
+                // record reads it.
+                for addr in 0..snapshot.num_counters as i32 {
+                    let _ = handle.write_int32_blocking(params.mca_acquiring, addr, 0);
+                }
             }
         } else {
             for (counter, value) in snapshot.counters.iter().enumerate() {

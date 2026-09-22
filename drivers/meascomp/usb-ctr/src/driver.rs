@@ -220,9 +220,14 @@ impl CtrDriver {
                 .set_float64(self.params.mca_elapsed_live, i, readout.elapsed)?;
         }
         if readout.finished {
-            self.base
-                .params
-                .set_int32(self.params.mca_acquiring, 0, 0)?;
+            // C clears it on every counter address, where each mca record
+            // reads it.
+            let num_counters = self.state.lock().unwrap().num_counters;
+            for i in 0..num_counters as i32 {
+                self.base
+                    .params
+                    .set_int32(self.params.mca_acquiring, i, 0)?;
+            }
         }
         for i in (0..MAX_MCS_COUNTERS as i32).filter(|i| *i != addr) {
             self.base.call_param_callbacks(i)?;
@@ -440,6 +445,9 @@ impl PortDriver for CtrDriver {
                 self.base
                     .params
                     .set_float64(self.params.mca_elapsed_live, i, 0.0)?;
+                self.base
+                    .params
+                    .set_float64(self.params.mca_elapsed_counts, i, 0.0)?;
                 if i != addr {
                     self.base.call_param_callbacks(i)?;
                 }
