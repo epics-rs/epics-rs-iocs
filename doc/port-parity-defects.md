@@ -547,7 +547,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** a scaler count during an MCS zeroes all counters mid-bin then hits `ERR_ALREADY_ACTIVE`; StartAll after a completed, un-erased run re-acquires over the data; `NuseAll > MaxChannels` is not clamped.
 - **Class:** unimpl. **Live:** confirmed — after a completed 300-point run, `StartAll` restarted from 0 (CurrentChannel 50 at 0.5 s).
 
-## PP-46 [HIGH] `start_mcs` failure leaves MCA_ACQUIRING=1 forever — OPEN
+## PP-46 [HIGH] `start_mcs` failure leaves MCA_ACQUIRING=1 forever — FIXED
 - **Rust:** `mcs.rs:125-138,189-198` return early via `?`, `running` stays false; `driver.rs:206-223` then sets `mca_acquiring=1` unconditionally; the poller calls `read_mcs` only when `running` (`poller.rs:79`).
 - **C:** `drvUSBCTR.cpp:556-560,704-709` log and continue, `:713-714` set `MCSRunning_`; the next `readMCS` sees SS_IDLE (`:751-753`) and clears `mcaAcquiring_` (`:802-806`).
 - **Impact:** any rejected scan wedges HardwareAcquiring and the Acquiring busy until a manual StopAll.

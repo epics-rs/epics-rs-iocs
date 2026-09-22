@@ -189,17 +189,23 @@ impl CtrDriver {
         stopped.and(started).err()
     }
 
+    /// Log a failure and publish it on LAST_ERROR_MESSAGE. It reaches the
+    /// record as asynError only through [`CtrDriver::finish_write`].
+    fn report_error(&mut self, msg: String) {
+        log::error!("{msg}");
+        let _ = self.base.params.set_value(
+            self.params.last_error_message,
+            0,
+            ParamValue::Octet(msg.into_bytes()),
+        );
+    }
+
     /// Common tail of every write: run the callbacks, then report a failure
     /// the way C does -- `asynError` back to the record, so it alarms --
     /// besides publishing it on LAST_ERROR_MESSAGE.
     fn finish_write(&mut self, addr: i32, last_error: Option<String>) -> AsynResult<()> {
         if let Some(msg) = &last_error {
-            log::error!("{msg}");
-            let _ = self.base.params.set_value(
-                self.params.last_error_message,
-                0,
-                ParamValue::Octet(msg.clone().into_bytes()),
-            );
+            self.report_error(msg.clone());
         }
         self.base.call_param_callbacks(addr)?;
         match last_error {
@@ -264,8 +270,9 @@ impl PortDriver for CtrDriver {
         } else if reason == self.params.mca_start_acquire {
             let already_running = self.state.lock().unwrap().mcs.running;
             if value != 0 && !already_running {
-                let dev = self.device.lock().unwrap();
-                let mut st = self.state.lock().unwrap();
+                let (device, state) = (self.device.clone(), self.state.clone());
+                let dev = device.lock().unwrap();
+                let mut st = state.lock().unwrap();
                 let num_channels =
                     self.base.get_int32_param(self.params.mca_num_channels, 0)? as usize;
                 let dwell = self.base.get_float64_param(self.params.mca_dwell_time, 0)?;
@@ -282,7 +289,9 @@ impl PortDriver for CtrDriver {
                     .get_int32_param(self.params.mcs_point0_action, 0)?
                     != 0;
                 let num_counters = st.num_counters;
-                if let Err(e) = mcs::start_mcs(
+                // C startMCS never fails the write: a rejected scan shows up
+                // as a scan that ends at once, not as a WRITE alarm.
+                if let Some(e) = mcs::start_mcs(
                     &dev,
                     &mut st.mcs,
                     &McsScan {
@@ -296,11 +305,14 @@ impl PortDriver for CtrDriver {
                     },
                     num_counters,
                 ) {
-                    last_error = Some(format!("start_mcs error: {e}"));
+                    self.report_error(format!("start_mcs error: {e}"));
                 }
                 self.base
                     .params
                     .set_float64(self.params.mca_dwell_time, 0, st.mcs.dwell_time)?;
+                self.base
+                    .params
+                    .set_int32(self.params.mcs_current_point, 0, 0)?;
                 self.base
                     .params
                     .set_int32(self.params.mca_acquiring, 0, 1)?;

@@ -120,12 +120,23 @@ pub fn scan_options(dwell_time: f64, external_advance: bool) -> i32 {
 }
 
 /// Start MCS acquisition using DaqInScan.
+///
+/// C `startMCS`: every uldaq failure is logged and the start carries on, and
+/// the scan is marked running whatever `ulDaqInScan` returned. A scan that
+/// did not start is idle from the first `read_mcs`, which ends it like any
+/// finished one -- so MCA_ACQUIRING always comes back to 0. Returns the last
+/// failure, for LAST_ERROR_MESSAGE.
 pub fn start_mcs(
     device: &DaqDevice,
     state: &mut McsState,
     scan: &McsScan,
     num_counters: usize,
-) -> Result<(), String> {
+) -> Option<String> {
+    let mut failure: Option<String> = None;
+    let mut fail = |msg: String| {
+        log::error!("{msg}");
+        failure = Some(msg);
+    };
     let McsScan {
         num_points,
         dwell_time,
@@ -137,6 +148,8 @@ pub fn start_mcs(
     } = *scan;
     state.dwell_time = dwell_time;
     state.counter_enable = counter_enable;
+    // C sets startTime_ before starting the hardware.
+    state.start_time = current_time_secs();
     let max_pts = state.max_points.min(num_points);
 
     // Build channel descriptor list from enabled counters
@@ -154,21 +167,21 @@ pub fn start_mcs(
                 | CMM_CLEAR_ON_READ
                 | CMM_GATING_ON
                 | CMM_INVERT_GATE;
-            if i < num_counters {
-                device
-                    .counter_config_scan(
-                        i as i32,
-                        &CounterScanConfig {
-                            measurement_type: CMT_COUNT,
-                            measurement_mode: mode,
-                            edge_detection: CED_RISING_EDGE,
-                            tick_size: CTS_TICK_20PT83ns,
-                            debounce_mode: CDM_NONE,
-                            debounce_time: CDT_DEBOUNCE_0ns,
-                            flags: CF_DEFAULT,
-                        },
-                    )
-                    .map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
+            if i < num_counters
+                && let Err(e) = device.counter_config_scan(
+                    i as i32,
+                    &CounterScanConfig {
+                        measurement_type: CMT_COUNT,
+                        measurement_mode: mode,
+                        edge_detection: CED_RISING_EDGE,
+                        tick_size: CTS_TICK_20PT83ns,
+                        debounce_mode: CDM_NONE,
+                        debounce_time: CDT_DEBOUNCE_0ns,
+                        flags: CF_DEFAULT,
+                    },
+                )
+            {
+                fail(format!("counter_config_scan({i}) error: {e}"));
             }
 
             let (channel, chan_type) = if i == DIGITAL_IO_COUNTER {
@@ -210,8 +223,11 @@ pub fn start_mcs(
 
     // Clear counter 0 output registers to prevent scaler presets from
     // interfering with MCS acquisition (matches C++ drvUSBCTR.cpp).
-    let _ = device.counter_load(0, CRT_OUTPUT_VAL0, 0);
-    let _ = device.counter_load(0, CRT_OUTPUT_VAL1, 0xFFFFFFFF);
+    for (register, value) in [(CRT_OUTPUT_VAL0, 0), (CRT_OUTPUT_VAL1, 0xFFFF_FFFF)] {
+        if let Err(e) = device.counter_load(0, register, value) {
+            fail(format!("counter_load({register}) error: {e}"));
+        }
+    }
 
     let started = device.daq_in_scan(
         &chan_descs,
@@ -224,18 +240,18 @@ pub fn start_mcs(
     // The clock divides the dwell down to what it can do; C writes that
     // actual dwell back to MCA_DWELL_TIME whether or not the scan started.
     state.dwell_time = 1.0 / rate;
-    started.map_err(|e| format!("daq_in_scan error: {e}"))?;
+    match started {
+        Ok(()) => log::info!(
+            "MCS started: {} counters, {} points, dwell={dwell_time:.6}s, rate={rate:.0}",
+            state.num_counters_enabled,
+            max_pts
+        ),
+        Err(e) => fail(format!("daq_in_scan error: {e}")),
+    }
 
     state.running = true;
     state.current_point = 0;
-    state.start_time = current_time_secs();
-
-    log::info!(
-        "MCS started: {} counters, {} points, dwell={dwell_time:.6}s, rate={rate:.0}",
-        state.num_counters_enabled,
-        max_pts
-    );
-    Ok(())
+    failure
 }
 
 /// Number of complete scan points behind `current_index`; see
