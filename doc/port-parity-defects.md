@@ -763,7 +763,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** libuldaq default `CHR_3750` (`AiUsb24xx.cpp:986-987`) applies to `ulAIn`, `ulTIn` and the scan queue: no 50/60 Hz rejection, higher noise, and a much shorter digitizer minimum period than C allows.
 - **Class:** unimpl. **Live:** static (no call site); noise not compared against spec.
 
-## PP-80 [MED] AI/TC records lose C's averaging and forced callbacks; two `ulAIn` per channel — OPEN
+## PP-80 [MED] AI/TC records lose C's averaging and forced callbacks; two `ulAIn` per channel — FIXED
 - **Rust:** `meascomp_analog_in.template:1-6`, `meascomp_temperature.template:1-6` asynFloat64 I/O Intr, no averaging; `poller.rs:238-249` post only changed values; `poller.rs:134-151` two `ulAIn` per voltage channel (NOSCALEDATA + scaled; ANALOG_IN_VALUE has no record).
 - **C:** `measCompAnalogIn.template:1-12` asynInt32Average, `measCompTemperatureIn.template:1-7` asynFloat64Average, SCAN 1 second; forced callback every poll (`:2784-2785,2832-2833`); one `ulAIn(NOSCALEDATA)` per channel (`:2779`).
 - **Impact:** single samples at poll rate instead of a 1 s mean (≈√20 more noise, ≈20× monitor traffic); unchanging values (−9999, railed inputs) freeze their timestamp; double ADC time per sweep.

@@ -50,7 +50,6 @@ struct PollSnapshot {
     wave_dig_arrays: Vec<ParamSetValue>,
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
-    ai_volts: [Option<f64>; MAX_ANALOG_IN],
     ai_temp: [Option<f64>; MAX_ANALOG_IN],
     // Errors to log after releasing the lock.
     errors: Vec<String>,
@@ -140,6 +139,9 @@ fn poller_loop(
                             // ERR_BAD_RANGE and ulTIn rejects a voltage one.
                             // C drvMultiFunction skips each the same way.
                             if in_types[ch] == 0 {
+                                // C reads raw counts once; the record's LINR
+                                // conversion over the driver's ADC bounds
+                                // turns them into volts.
                                 match dev.analog_in(
                                     ch_i,
                                     input_mode,
@@ -148,15 +150,6 @@ fn poller_loop(
                                 ) {
                                     Ok(raw) => snap.ai_raw[ch] = Some(raw as i32),
                                     Err(e) => snap.errors.push(format!("AIn({ch}): {e}")),
-                                }
-                                match dev.analog_in(
-                                    ch_i,
-                                    input_mode,
-                                    in_ranges[ch],
-                                    uldaq_sys::AIN_FF_DEFAULT,
-                                ) {
-                                    Ok(volts) => snap.ai_volts[ch] = Some(volts),
-                                    Err(e) => snap.errors.push(format!("AIn scaled({ch}): {e}")),
                                 }
                             } else {
                                 // An open or broken thermocouple is expected,
@@ -244,16 +237,32 @@ fn poller_loop(
                 let _ = handle.set_params_and_notify_blocking(0, snapshot.wave_dig_arrays.clone());
             }
         } else {
+            // Every sample is a callback, changed or not, as C forces with
+            // its set(v+1)/set(v) pair: the averaging records must count each
+            // poll, and an unchanging reading must keep its timestamp moving.
             for ch in 0..MAX_ANALOG_IN {
+                let addr = ch as i32;
+                let mut updates = Vec::new();
                 if let Some(raw) = snapshot.ai_raw[ch] {
-                    let _ = handle.write_int32_blocking(params.analog_in_value, ch as i32, raw);
-                }
-                if let Some(v) = snapshot.ai_volts[ch] {
-                    let _ = handle.write_float64_blocking(params.voltage_in_value, ch as i32, v);
+                    let reason = params.analog_in_value;
+                    updates.push(ParamSetValue::new(
+                        reason,
+                        addr,
+                        ParamValue::Int32(raw.wrapping_add(1)),
+                    ));
+                    updates.push(ParamSetValue::new(reason, addr, ParamValue::Int32(raw)));
                 }
                 if let Some(t) = snapshot.ai_temp[ch] {
-                    let _ =
-                        handle.write_float64_blocking(params.temperature_in_value, ch as i32, t);
+                    let reason = params.temperature_in_value;
+                    updates.push(ParamSetValue::new(
+                        reason,
+                        addr,
+                        ParamValue::Float64(t + 1.0),
+                    ));
+                    updates.push(ParamSetValue::new(reason, addr, ParamValue::Float64(t)));
+                }
+                if !updates.is_empty() {
+                    let _ = handle.set_params_and_notify_blocking(addr, updates);
                 }
             }
         }

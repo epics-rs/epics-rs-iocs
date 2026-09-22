@@ -1,8 +1,10 @@
+# The mean of every poll's reading over SCAN (upstream
+# measCompTemperatureIn.template).
 record(ai, "$(P)$(R)") {
-    field(DTYP, "asynFloat64")
+    field(SCAN, "$(SCAN=1 second)")
+    field(DTYP, "asynFloat64Average")
     field(INP,  "@asyn($(PORT),$(ADDR),1.0)TEMPERATURE_IN_VALUE")
-    field(PREC, "2")
-    field(SCAN, "I/O Intr")
+    field(PREC, "$(PREC=2)")
 }
 
 record(mbbo, "$(P)$(R)TCType") {
