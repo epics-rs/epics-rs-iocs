@@ -15,26 +15,28 @@ $(P)Bd6
 $(P)Bd7
 $(P)Bd8
 
+# DutyCycle, not upstream's Width: CalcWidth derives Width from DutyCycle
+# and overwrites it at init (doc/upstream-c-defects.md #228).
 $(P)PulseGen1Period
-$(P)PulseGen1Width
+$(P)PulseGen1DutyCycle
 $(P)PulseGen1Delay
 $(P)PulseGen1Count
 $(P)PulseGen1IdleState
 $(P)PulseGen1Run
 $(P)PulseGen2Period
-$(P)PulseGen2Width
+$(P)PulseGen2DutyCycle
 $(P)PulseGen2Delay
 $(P)PulseGen2Count
 $(P)PulseGen2IdleState
 $(P)PulseGen2Run
 $(P)PulseGen3Period
-$(P)PulseGen3Width
+$(P)PulseGen3DutyCycle
 $(P)PulseGen3Delay
 $(P)PulseGen3Count
 $(P)PulseGen3IdleState
 $(P)PulseGen3Run
 $(P)PulseGen4Period
-$(P)PulseGen4Width
+$(P)PulseGen4DutyCycle
 $(P)PulseGen4Delay
 $(P)PulseGen4Count
 $(P)PulseGen4IdleState

@@ -153,3 +153,43 @@ fn every_restored_driver_setting_is_written_at_init() {
     }
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
+
+/// Record-writing link fields: an output link names the record whose value
+/// it sets (`FLNK` and a fanout's `LNKn` only process, `INP*`/`DOL*` read).
+fn is_output_link(rtype: &str, field: &str) -> bool {
+    field == "OUT"
+        || (field.len() == 4 && field.starts_with("OUT"))
+        || (rtype != "fanout" && field.len() == 4 && field.starts_with("LNK"))
+}
+
+/// A soft record that another record writes holds derived state: at init the
+/// writer recomputes it from the driver-bound source and the restored value
+/// is lost (C's measCompPulseGen_settings.req restored Width, which CalcWidth
+/// overwrites from DutyCycle). The setting to restore is the source.
+#[test]
+fn no_restored_soft_record_is_written_by_another_record() {
+    let mut derived = Vec::new();
+    for ioc in IOCS {
+        let loaded = load(ioc);
+        for name in loaded.restored.iter().filter(|n| !n.contains('.')) {
+            let Some(record) = loaded.records.get(name) else {
+                continue;
+            };
+            if record.field("DTYP").is_some() {
+                continue;
+            }
+            for (writer, other) in &loaded.records {
+                for (field, link) in &other.fields {
+                    let target = link.split_whitespace().next().unwrap_or("");
+                    let target = target.split('.').next().unwrap_or("");
+                    if is_output_link(&other.rtype, field) && target == name {
+                        derived.push(format!(
+                            "{ioc}: {name} is restored but {writer}.{field} writes it"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(derived.is_empty(), "{}", derived.join("\n"));
+}
