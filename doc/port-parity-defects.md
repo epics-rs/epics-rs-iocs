@@ -646,7 +646,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** outputs unusable by default; every restart tri-states bits wired as outputs until the Bd PINI runs.
 - **Class:** ref-faithful. **Live:** confirmed Bd1..Bd8 all In on a fresh IOC.
 
-## PP-62 [MED] USB-2408 digital-direction model missing — OPEN
+## PP-62 [MED] USB-2408 digital-direction model missing — FIXED
 - **Rust:** `usb-2408/src/driver.rs:689-708` a direction write on the non-configurable port only sets LAST_ERROR_MESSAGE; `usb-2408-ioc/st.cmd:60-61` loads no Bd records.
 - **C:** AUXPORT is `DPIOT_NONCONFIG` (`DioUsb24xx.cpp:15`); a direction write does `ulDBitOut(port,i,0)` per masked bit ("set open collector output to 0", `drvMultiFunction.cpp:2369-2376`) and stores the mask used by the output gate; `USB2408.substitutions:48-60` Bd1-4=In, Bd5-8=Out, PINI.
 - **Impact:** Bo1-4/Lo bits 0-3 drive open-drain outputs C never drives; C releases bits 0-3 at iocInit, Rust leaves the latched state.

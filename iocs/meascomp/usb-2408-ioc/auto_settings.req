@@ -7,6 +7,15 @@
 
 $(P)PollSleepMS
 
+$(P)Bd1
+$(P)Bd2
+$(P)Bd3
+$(P)Bd4
+$(P)Bd5
+$(P)Bd6
+$(P)Bd7
+$(P)Bd8
+
 $(P)AiMode
 
 $(P)Ai1Range

@@ -700,8 +700,17 @@ impl PortDriver for MultiFunctionDriver {
             }
         } else if reason == self.params.digital_direction {
             if !self.dio_configurable {
-                last_error =
-                    Some("digital direction is fixed on this model; ignoring write".to_string());
+                // The USB-2408 AUXPORT is open-collector with no direction
+                // control. C "Cannot program direction. Set open collector
+                // output to 0" (drvMultiFunction.cpp:2369-2376): each masked
+                // bit is released, and the stored mask is what the
+                // DIGITAL_OUTPUT gate then honours.
+                let dev = self.device.lock().unwrap();
+                for bit in (0..NUM_IO_BITS).filter(|bit| mask & (1 << bit) != 0) {
+                    if let Err(e) = dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, false) {
+                        last_error = Some(format!("digital_bit_out error: {e}"));
+                    }
+                }
             } else {
                 let dev = self.device.lock().unwrap();
                 for bit in 0..NUM_IO_BITS {
