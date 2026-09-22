@@ -427,7 +427,12 @@ impl PortDriver for MultiFunctionDriver {
                 .base
                 .get_int32_param(self.params.analog_out_sync_enable, 0)
                 .unwrap_or(0);
-            if sync_enable == 0 {
+            if sync_enable == 0 && self.state.lock().unwrap().wave_gen.running {
+                // C refuses before touching the DAC (drvMultiFunction.cpp:
+                // 2131-2135): the generator owns both outputs while it runs.
+                last_error =
+                    Some("cannot write analog outputs while waveform generator is running".into());
+            } else if sync_enable == 0 {
                 let dev = self.device.lock().unwrap();
                 let range = self
                     .base

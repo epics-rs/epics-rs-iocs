@@ -769,7 +769,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** single samples at poll rate instead of a 1 s mean (≈√20 more noise, ≈20× monitor traffic); unchanging values (−9999, railed inputs) freeze their timestamp; double ADC time per sweep.
 - **Class:** contract. **Live:** confirmed — `camonitor USB2408:Ai1` delivered 38 updates in 3 s (C: 3).
 
-## PP-81 [MED] Immediate AO write not refused while the generator runs — OPEN (regression of PP-41, fix never merged)
+## PP-81 [MED] Immediate AO write not refused while the generator runs — FIXED (regression of PP-41, fix never merged)
 - **Rust:** `driver.rs:263-279` calls `ulAOut` without checking `wave_gen.running`.
 - **C:** `drvMultiFunction.cpp:2130-2135` refuses with `asynError` and never calls `ulAOut`.
 - **Impact:** libuldaq rejects the write (ERR_ALREADY_ACTIVE, `AoDevice.cpp:282-283`), so the device is unaffected, but the record shows no alarm and its VAL no longer matches the DAC.
