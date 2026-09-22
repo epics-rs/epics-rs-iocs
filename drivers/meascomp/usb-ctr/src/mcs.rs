@@ -66,13 +66,18 @@ impl McsState {
 }
 
 /// Erase all MCS buffers.
+///
+/// C `eraseMCS`: the spectra go back to zero and the elapsed-time clock
+/// restarts -- also mid-scan, so an erase during a run restarts PresetReal.
+/// The time bases are left as they are; they depend on the dwell, not on
+/// the data. The caller publishes MCS_CURRENT_POINT and the zeroed elapsed
+/// times.
 pub fn erase_mcs(state: &mut McsState) {
     for buf in &mut state.mcs_buffers {
         buf.iter_mut().for_each(|v| *v = 0);
     }
-    state.abs_time_buffer.iter_mut().for_each(|v| *v = 0.0);
-    state.time_buffer.iter_mut().for_each(|v| *v = 0.0);
     state.current_point = 0;
+    state.start_time = current_time_secs();
 }
 
 /// C `computeMCSTimes`: the relative time base `i * dwell` over the
@@ -325,6 +330,20 @@ mod tests {
             .as_secs_f64();
         let offset = unix - current_time_secs();
         assert!((offset - 631_152_000.0).abs() < 1.0, "offset {offset}");
+    }
+
+    #[test]
+    fn an_erase_clears_the_spectra_but_keeps_the_time_base() {
+        let mut st = McsState::new(4);
+        compute_times(&mut st, 4, 0.5);
+        st.mcs_buffers[0][2] = 7;
+        st.current_point = 3;
+        st.start_time = 0.0;
+        erase_mcs(&mut st);
+        assert_eq!(st.mcs_buffers[0], vec![0; 4]);
+        assert_eq!(st.current_point, 0);
+        assert_eq!(&st.time_buffer[..], &[0.0, 0.5, 1.0, 1.5]);
+        assert!(st.elapsed_secs() < 1.0, "the elapsed clock restarted");
     }
 
     #[test]

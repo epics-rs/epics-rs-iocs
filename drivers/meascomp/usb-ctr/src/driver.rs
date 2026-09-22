@@ -317,8 +317,22 @@ impl PortDriver for CtrDriver {
                 .params
                 .set_int32(self.params.mca_acquiring, 0, 0)?;
         } else if reason == self.params.mca_erase {
-            let mut st = self.state.lock().unwrap();
-            mcs::erase_mcs(&mut st.mcs);
+            mcs::erase_mcs(&mut self.state.lock().unwrap().mcs);
+            // C eraseMCS publishes the reset on every counter address.
+            self.base
+                .params
+                .set_int32(self.params.mcs_current_point, 0, 0)?;
+            for i in 0..MAX_MCS_COUNTERS as i32 {
+                self.base
+                    .params
+                    .set_float64(self.params.mca_elapsed_real, i, 0.0)?;
+                self.base
+                    .params
+                    .set_float64(self.params.mca_elapsed_live, i, 0.0)?;
+                if i != addr {
+                    self.base.call_param_callbacks(i)?;
+                }
+            }
         }
 
         self.finish_write(addr, last_error)

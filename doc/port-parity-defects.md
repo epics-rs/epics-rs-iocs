@@ -571,7 +571,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** up to one poll period of points is lost and CurrentChannel is stale after StopAll.
 - **Class:** unimpl. **Live:** static.
 
-## PP-50 [MED] `eraseMCS` does not publish resets and wipes time bases C keeps — OPEN
+## PP-50 [MED] `eraseMCS` does not publish resets and wipes time bases C keeps — FIXED
 - **Rust:** `mcs.rs:67-74`, `driver.rs:233-236` zero buffers incl. `time_buffer`/`abs_time_buffer`, set `current_point=0` without setting `MCS_CURRENT_POINT`, elapsed params, or `start_time`.
 - **C:** `drvUSBCTR.cpp:823-843` sets CurrentPoint 0, elapsed live/real/counts 0 on all addrs with callbacks, resets `startTime_`, clears only `MCSBuffer_`.
 - **Impact:** after EraseAll, CurrentChannel/ElapsedReal keep old values; an erase mid-run does not restart the PresetReal clock.
