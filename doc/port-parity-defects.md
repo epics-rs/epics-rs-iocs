@@ -666,6 +666,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **C:** `measCompPulseGen.template:87-95,127-133` DutyCycle FLNK CalcWidth, Width_RBV CP on both; `measCompWaveformGen.template:158,206` NumPoints CP.
 - **Impact:** Width/Width_RBV stay 0 from boot and stale after DutyCycle-only changes; NumPoints changes don't rescale dwell.
 - **Class:** ref-indep. **Live:** confirmed — at startup Period 0.001, DutyCycle 0.5, Width/Width_RBV 0.
+- **Found while fixing (live):** with NumPoints CP, CalcIntDwell/CalcUserDwell fired at iocInit while their frequency input was still 0 and wrote a zero dwell to the driver, so the generator failed every start with ERR_BAD_RATE. C's calcs are saved by their init order; the four dwell/frequency calcouts now write only a non-zero result.
 
 ## Cross-driver (both IOCs / shared db)
 
