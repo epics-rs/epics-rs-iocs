@@ -893,6 +893,13 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** none today (no USB-2408 record writes TRIGGER_MODE); a future one would take an unmappable mode without an alarm.
 - **Class:** ref-faithful. **Live:** static. **Fixed:** `7ef4286`.
 
+## PP-100 [LOW] Neither driver prints C's ASYN_TRACE_ERROR lines — FIXED
+- **Rust:** every failure goes to `log::error!`/`log::warn!` in the port's own words (`usb-ctr` `driver.rs` `report_error`, `mcs.rs`, `scaler.rs`; `usb-2408` `driver.rs` `finish_write`, `wave_gen.rs`, `wave_dig.rs`, `poller.rs`); the 2408's `ulAOutScanStop`/`ulAInScanStop` failures are only logged, and both drivers' array handlers answer an unknown reason or address with 0 elements.
+- **C:** `drvUSBCTR.cpp` 26 sites, 23 of them built on Linux (`:481-1514`: each uldaq call's error line, the three closing "ERROR writing" lines `:1250,1312,1364`, the array refusals `:1425,1449,1476`, the poller's `cbDIn` `:1514`); `drvMultiFunction.cpp` `reportError`'s two ERROR forms (`:1306-1318`) behind 34 call sites, and 19 direct sites, of which `:1232,1245` (board-family dispatch) and `:1373,2816` (Windows-enum mapping the port's records do not use) do not apply. `stopWaveGen`/`stopWaveDig` return the scan stop's status to `writeInt32` (`:1735`, `:1878-1882`); the poller discards it and prints a failing call only when the previous cycle succeeded, except `ulTIn` every cycle (`:2616-2846`).
+- **Impact:** `asynSetTraceMask` ERROR (on by default) showed no driver failure at all; a refused scan start, a failed write or a dead USB link was visible only in `RUST_LOG` output, never in C's words.
+- **Class:** unimpl. **Live:** static.
+- **Fixed:** `a378283`. Live on 0.30.1 with the default mask: 2408 trigger mode 2 → `mapTriggerType unsupported cbwTriggerType=2`, `writeInt32 Error: Setting trigger mode`, closing line status=-1, WRITE/INVALID; WaveDigNumPoints 5000 → C's line, no alarm; WaveDig dwell 1e-6 → `startWaveDig Error: Calling AInScan, err=22`, DwellActual −9999; no enabled channels → `startWaveGen: ERROR no enabled channels`; Ao1 during generation → C's refusal line and no closing line; IntNumPoints 3000 → `defineWaveform: ERROR numPoints=3000 …` with the int32 and float64 closing lines; array reads at addr 3 / 9 → `readFloat32Array: ERROR: addr=3 max=1`, `readFloat64Array: ERROR: addr=9 max=7`. CTR MCS start while the scaler counts → C's refusal and closing line; MCS dwell 1e-9 → `startMCS error calling ulDaqInScan, … status=22`, no alarm as C; trigger value 3 → `unsupported trigger value=3`; `readInt32Array: got illegal command 17`. Not exercised: poller errors (need a USB fault), pulse-generator and scaler call failures, the `writeFloat32Array` refusals (the UserWF put never reaches the driver on 0.30.1, see the epics-rs list below). The Rust fails a write whose `defineWaveform` refused (since PP-93) and one whose TC open-detect write failed; C discards both statuses, so there the Rust prints the closing ERROR line where C prints the TRACEIO_DRIVER one.
+
 ## Live hardware verification (2026-09-22)
 
 IOCs: `usb-ctr-ioc` (CA 5064) and `usb-2408-ioc` (CA 5074), release build of
@@ -1035,5 +1042,14 @@ order):
   (`services.rs:44-47`); services built on a shared trace detach it from the
   global exception list (quadem's octet commands did; fixed in `eeb8b30`).
 
+Found against 0.30.1, not filed yet:
+- A waveform record with DTYP `asyn*ArrayOut` and its link in INP, the form
+  C's measComp db uses for `WaveGen<n>UserWF`, runs as an input: asyn-rs
+  takes an INP link as output only for `asynOctetWrite`/`asynOctetWriteBinary`
+  (`adapter.rs:3204-3209`). A put of 0.5, 0.25, 0.125 to `WaveGen1UserWF`
+  reads back 2048 zeros and `writeFloat32Array` is never called, so no user
+  waveform can be loaded.
+
 PP-98 (the drivers' missing asynPrint lines) is new; fixed in `c45603e`,
-with PP-99 (`7ef4286`) found while porting its trigger-mode line.
+with PP-99 (`7ef4286`) found while porting its trigger-mode line. PP-100
+(the missing ASYN_TRACE_ERROR lines) is fixed in `a378283`.
