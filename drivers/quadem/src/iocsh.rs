@@ -13,7 +13,6 @@ use epics_rs::ad_core::ioc::{GenericDriverContext, PluginManager};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
@@ -107,14 +106,16 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
 }
 
 /// The four startup verbs a quadEM `st.cmd` uses before its `drv*Configure`
-/// call: create the octet port, then frame it.
-pub fn octet_port_commands(trace: Arc<TraceManager>) -> Vec<CommandDef> {
+/// call: create the octet port, then frame it. The ports are bound to the
+/// process services every driver port runs on, as C's one `pasynBase`;
+/// `PortServices::new` would also re-point the shared trace's exception sink.
+pub fn octet_port_commands() -> Vec<CommandDef> {
     vec![
         epics_rs::asyn::iocsh::drv_asyn_ip_port_configure_command(
-            epics_rs::asyn::services::PortServices::new(trace.clone()),
+            epics_rs::asyn::services::PortServices::global(),
         ),
         epics_rs::asyn::iocsh::drv_asyn_serial_port_configure_command(
-            epics_rs::asyn::services::PortServices::new(trace),
+            epics_rs::asyn::services::PortServices::global(),
         ),
         eos_command("asynOctetSetInputEos", true),
         eos_command("asynOctetSetOutputEos", false),

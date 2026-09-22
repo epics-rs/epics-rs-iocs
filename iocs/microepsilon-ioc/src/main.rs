@@ -6,7 +6,6 @@
 //! Usage:
 //!   cargo run -p microepsilon-ioc -- st.cmd
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record;
@@ -59,7 +58,7 @@ async fn main() -> CaResult<()> {
     // `microepsilon::connect::connect_octet` (the `.proto`'s fixed
     // InTerminator/OutTerminator), not via iocsh -- see
     // `motor-port-eos-ownership`'s "driver-programmatic EOS" case.
-    let port_manager = Arc::new(PortManager::new());
+    let port_manager = PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // CapaNCDT6200ConfigInit(cfgPort, ioPort, ioAddr) -- no upstream C

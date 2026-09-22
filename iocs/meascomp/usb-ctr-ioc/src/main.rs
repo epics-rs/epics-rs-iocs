@@ -5,8 +5,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::manager::PortManager;
-use epics_rs::asyn::services::PortServices;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -78,15 +76,9 @@ async fn main() -> CaResult<()> {
     // Contributing the menu here makes that assignment resolve.
     epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
 
-    // Universal asyn device support
+    // Universal asyn device support, and with it asyn.dbd's shell commands
+    // (asynReport, asynSetTraceMask, ...) on PortManager::global().
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
-
-    // asynReport, asynSetTraceMask & co.: a C measComp IOC has them through
-    // asyn.dbd (measCompAppInclude.dbd). The manager shares the services
-    // create_port_runtime binds every port to, so the commands reach the
-    // port's own trace and exception state.
-    let port_manager = Arc::new(PortManager::with_services(PortServices::global()));
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // Autosave
     let autosave_config = Arc::new(Mutex::new(

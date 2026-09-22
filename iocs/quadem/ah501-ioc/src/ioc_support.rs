@@ -15,7 +15,7 @@ use quadem::iocsh::{ahxxx_configure_command, octet_port_commands};
 pub fn register(ioc: &mut AdIoc) {
     epics_rs::base::runtime::env::set_default("QUADEM", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
 
-    for cmd in octet_port_commands(ioc.trace().clone()) {
+    for cmd in octet_port_commands() {
         ioc.register_startup_command(cmd);
     }
 

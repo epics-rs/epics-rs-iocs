@@ -9,8 +9,6 @@
 //!   cargo run -p smaract-ioc -- st.cmd        # MCS2
 //!   cargo run -p smaract-ioc -- st.scu.cmd    # SCU
 
-use std::sync::Arc;
-
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -39,7 +37,7 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(motor_name, motor_factory);
 
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // SmarAct iocsh commands (MCS2 + SCU + MCS) + motor device support.

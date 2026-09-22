@@ -80,7 +80,7 @@ async fn main() -> CaResult<()> {
     // IOC hit exactly that failure before this was simplified to a single
     // `register_asyn_commands` call); not applied to the other IOC crates
     // carrying the same now-redundant/broken shim, out of scope here.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager.clone());
 
     // RontecConfig(portName,serialPort,serialPortAddress) -- C
