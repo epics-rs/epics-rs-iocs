@@ -991,7 +991,8 @@ delivers only a write's last value, so the driver's 1→0 Acquiring pulse
 never reached HardwareAcquiring) and `85dd909` (PP-64: the CP dwell calcs
 wrote dwell 0 at iocInit). The post-fix live pass on both boards added
 PP-96/97 and upstream #228-230; #230 (time axes built from the requested
-dwell) is left as C has it pending a decision on what `TimeWF` means.
+dwell) was left as C has it pending a decision on what `TimeWF` means, then
+fixed in `fb63cb5` once the axis was settled as the one each scan runs at.
 
 Blocked on epics-rs 0.30, not fixable here: async write completion drops
 the write error and a readback that arrives while the record is PACT
