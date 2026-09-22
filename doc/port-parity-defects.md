@@ -793,7 +793,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** every voltage read fails with ERR_BAD_INPUT_MODE and the Ai records freeze on their last value.
 - **Class:** ref-indep. **Live:** confirmed — `AiMode=2` → "uldaq error 15: Invalid input mode specified" on every channel, every poll.
 
-## PP-85 [LOW] USB-2408 poller logs every error every cycle — OPEN
+## PP-85 [LOW] USB-2408 poller logs every error every cycle — FIXED
 - **Rust:** `usb-2408/src/poller.rs:94-103,178-190` warn + rewrite LAST_ERROR_MESSAGE each cycle, no recovery message.
 - **C:** `drvMultiFunction.cpp:2619-2625,2645-2650` report only on `!prevStatus`; `:2843-2846` "Device returned to normal status".
 - **Impact:** a persistent error floods stderr (hundreds of lines/s).

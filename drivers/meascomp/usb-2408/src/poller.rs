@@ -64,6 +64,9 @@ fn poller_loop(
     let mut prev_digital_input: u64 = 0;
     let mut force_callback = true;
     let mut cycle_start = Instant::now();
+    // C prevStatus: whether the previous cycle failed. A failure is
+    // reported once when it starts and once when it clears, not every poll.
+    let mut prev_failed = false;
 
     loop {
         // C publishes the time from the previous loop top to this one, so
@@ -177,19 +180,25 @@ fn poller_loop(
         }; // device lock released here
 
         // ---- Phase 3: log + write results (no device lock) ----
-        for msg in &snapshot.errors {
-            log::warn!("USB-2408 poller {msg}");
-        }
-        if let Some(msg) = snapshot.errors.last() {
-            let _ = handle.set_params_and_notify_blocking(
-                0,
-                vec![ParamSetValue::new(
-                    params.last_error_message,
+        let failed = !snapshot.errors.is_empty();
+        if failed && !prev_failed {
+            for msg in &snapshot.errors {
+                log::warn!("USB-2408 poller {msg}");
+            }
+            if let Some(msg) = snapshot.errors.last() {
+                let _ = handle.set_params_and_notify_blocking(
                     0,
-                    ParamValue::Octet(msg.clone().into_bytes()),
-                )],
-            );
+                    vec![ParamSetValue::new(
+                        params.last_error_message,
+                        0,
+                        ParamValue::Octet(msg.clone().into_bytes()),
+                    )],
+                );
+            }
+        } else if !failed && prev_failed {
+            log::warn!("USB-2408 poller: device returned to normal status");
         }
+        prev_failed = failed;
 
         if let Some(data) = snapshot.digital_input {
             let changed = data ^ prev_digital_input;
