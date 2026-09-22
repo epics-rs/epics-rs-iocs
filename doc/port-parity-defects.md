@@ -541,7 +541,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** C0O (documented gate for counters 1-7) never switches at PR1; after any MCS start VAL1 stays 0xFFFFFFFF. The preset is enforced only in software one poll late, so S2..S8 over-count.
 - **Class:** unimpl. **Live:** static (needs C0O→C1GT wiring).
 
-## PP-45 [HIGH] MCS/scaler mutual exclusion, already-complete start and NumChannels clamp absent — OPEN (partial regression of PP-42)
+## PP-45 [HIGH] MCS/scaler mutual exclusion, already-complete start and NumChannels clamp absent — FIXED (partial regression of PP-42)
 - **Rust:** `scaler_dev.rs:38-44,61-72` reset/arm have no MCS-running check; `driver.rs:183-185` starts on `value != 0 && !already_running` only; no `MCA_NUM_CHANNELS` branch; `poller.rs:74-86` services only the scaler when both run.
 - **C:** `drvUSBCTR.cpp:1160,1171` scaler reset/arm skipped while `MCSRunning_`; `:1185-1188` MCS start refused (asynError) while `scalerRunning_`; `:1191-1198` already-complete start toggles `mcaAcquiring_` 1→0 without starting; `:1235-1240` clamp to `maxTimePoints_`; `:1184` start on any value.
 - **Impact:** a scaler count during an MCS zeroes all counters mid-bin then hits `ERR_ALREADY_ACTIVE`; StartAll after a completed, un-erased run re-acquires over the data; `NuseAll > MaxChannels` is not clamped.

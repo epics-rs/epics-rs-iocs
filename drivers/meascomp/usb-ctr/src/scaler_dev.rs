@@ -35,9 +35,14 @@ impl CtrScalerDriver {
 }
 
 impl ScalerDriver for CtrScalerDriver {
+    /// C skips a scaler reset or arm while the MCS runs (drvUSBCTR.cpp:1160,
+    /// 1171): the counters belong to the scan until it ends.
     fn reset(&mut self) -> CaResult<()> {
         let dev = self.device.lock().unwrap();
         let mut st = self.state.lock().unwrap();
+        if st.mcs.running {
+            return Ok(());
+        }
         let num_counters = st.num_counters;
         scaler::reset_scaler(&dev, &mut st.scaler, num_counters);
         st.scaler.presets = [0; MAX_COUNTERS];
@@ -63,6 +68,9 @@ impl ScalerDriver for CtrScalerDriver {
     fn arm(&mut self, start: bool) -> CaResult<()> {
         let dev = self.device.lock().unwrap();
         let mut st = self.state.lock().unwrap();
+        if st.mcs.running {
+            return Ok(());
+        }
         if start {
             let num_counters = st.num_counters;
             if let Err(e) = scaler::start_scaler(&dev, &mut st.scaler, num_counters) {

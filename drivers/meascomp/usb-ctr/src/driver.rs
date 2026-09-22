@@ -296,8 +296,33 @@ impl PortDriver for CtrDriver {
                 last_error = Some(format!("digital_out error: {e}"));
             }
         } else if reason == self.params.mca_start_acquire {
-            let already_running = self.state.lock().unwrap().mcs.running;
-            if value != 0 && !already_running {
+            // C writeInt32(mcaStartAcquire_), drvUSBCTR.cpp:1184-1204, on any
+            // written value: the scaler and the MCS share the counters, so a
+            // start while the scaler counts is refused; one while the MCS runs
+            // is a no-op; and a run that already has all its points is not
+            // acquired over -- MCA_ACQUIRING is pulsed 1 -> 0 instead, so a
+            // client waiting on it is released.
+            let (scaler_running, mcs_running, current_point) = {
+                let st = self.state.lock().unwrap();
+                (st.scaler.running, st.mcs.running, st.mcs.current_point)
+            };
+            let num_time_points = self
+                .base
+                .get_int32_param(self.params.mca_num_channels, 0)?
+                .max(0) as usize;
+            if scaler_running {
+                last_error = Some("cannot start the MCS while the scaler is counting".into());
+            } else if mcs_running {
+                // Already acquiring: nothing to start.
+            } else if current_point >= num_time_points {
+                self.base
+                    .params
+                    .set_int32(self.params.mca_acquiring, 0, 1)?;
+                self.base.call_param_callbacks(0)?;
+                self.base
+                    .params
+                    .set_int32(self.params.mca_acquiring, 0, 0)?;
+            } else {
                 let (device, state) = (self.device.clone(), self.state.clone());
                 let dev = device.lock().unwrap();
                 let mut st = state.lock().unwrap();
@@ -346,12 +371,29 @@ impl PortDriver for CtrDriver {
                     .set_int32(self.params.mca_acquiring, 0, 1)?;
             }
         } else if reason == self.params.mca_stop_acquire {
-            let readout = {
+            // A stop while the scaler counts belongs to the scaler, not here.
+            let readout = if self.state.lock().unwrap().scaler.running {
+                None
+            } else {
                 let dev = self.device.lock().unwrap();
                 mcs::stop_mcs(&dev, &mut self.state.lock().unwrap().mcs)
             };
             if let Some(readout) = readout {
                 self.apply_mcs_readout(&readout, addr)?;
+            }
+        } else if reason == self.params.mca_num_channels {
+            // The per-counter buffers hold maxTimePoints; C clamps the
+            // request to that and only reports it (drvUSBCTR.cpp:1229-1241).
+            if value > self.max_time_points as i32 {
+                self.report_error(format!(
+                    "{value} channels requested, the maximum is {}",
+                    self.max_time_points
+                ));
+                self.base.params.set_int32(
+                    self.params.mca_num_channels,
+                    0,
+                    self.max_time_points as i32,
+                )?;
             }
         } else if reason == self.params.mca_erase {
             mcs::erase_mcs(&mut self.state.lock().unwrap().mcs);
