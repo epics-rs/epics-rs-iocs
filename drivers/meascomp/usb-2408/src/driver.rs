@@ -784,7 +784,7 @@ impl PortDriver for MultiFunctionDriver {
                     .get_int32_param(self.params.wave_dig_auto_restart, 0)?
                     != 0;
 
-                if let Err(e) = wave_dig::start_wave_dig(
+                match wave_dig::start_wave_dig(
                     &dev,
                     &mut st.wave_dig,
                     &WaveDigScan {
@@ -801,19 +801,29 @@ impl PortDriver for MultiFunctionDriver {
                         burst_mode: burst,
                     },
                 ) {
-                    last_error = Some(format!("start_wave_dig error: {e}"));
-                    self.base.params.set_int32(reason, addr, 0)?;
-                } else {
-                    self.base.params.set_float64(
-                        self.params.wave_dig_dwell_actual,
-                        0,
-                        st.wave_dig.dwell_actual,
-                    )?;
-                    self.base.params.set_float64(
-                        self.params.wave_dig_total_time,
-                        0,
-                        st.wave_dig.dwell_actual * num_points as f64,
-                    )?;
+                    Ok(dwell_actual) => {
+                        self.base.params.set_float64(
+                            self.params.wave_dig_dwell_actual,
+                            0,
+                            dwell_actual,
+                        )?;
+                        self.base.params.set_float64(
+                            self.params.wave_dig_total_time,
+                            0,
+                            dwell_actual * num_points as f64,
+                        )?;
+                    }
+                    Err(e) => {
+                        if let Some(dwell_actual) = e.dwell_actual {
+                            self.base.params.set_float64(
+                                self.params.wave_dig_dwell_actual,
+                                0,
+                                dwell_actual,
+                            )?;
+                        }
+                        last_error = Some(format!("start_wave_dig error: {}", e.message));
+                        self.base.params.set_int32(reason, addr, 0)?;
+                    }
                 }
             } else if value == 0 {
                 wave_dig::stop_wave_dig(&dev, &mut st.wave_dig);

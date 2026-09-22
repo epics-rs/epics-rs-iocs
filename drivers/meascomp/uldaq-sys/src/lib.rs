@@ -20,6 +20,8 @@ pub const ERR_DEV_NOT_FOUND: UlError = 6;
 pub const ERR_DEV_NOT_CONNECTED: UlError = 7;
 pub const ERR_ALREADY_ACTIVE: UlError = 16;
 pub const ERR_TIMEDOUT: UlError = 20;
+/// The requested scan rate is outside what the device can do.
+pub const ERR_BAD_RATE: UlError = 22;
 /// ulTIn on an open or broken thermocouple; the value returned is -9999.
 pub const ERR_OPEN_CONNECTION: UlError = 85;
 pub const ERR_TEMP_OUT_OF_RANGE: UlError = 91;

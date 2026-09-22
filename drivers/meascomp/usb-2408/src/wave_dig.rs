@@ -74,12 +74,25 @@ pub struct WaveDigScan {
     pub burst_mode: bool,
 }
 
-/// Start the waveform digitizer (analog input scan).
+/// C's WAVEDIG_DWELL_ACTUAL for a scan the device refused its rate for.
+pub const BAD_RATE_DWELL: f64 = -9999.0;
+
+/// A refused start. `dwell_actual` is `Some` when `ulAInScan` itself ran:
+/// C publishes the dwell it ended with, or [`BAD_RATE_DWELL`], after any
+/// outcome of that call, but nothing when the queue load failed before it.
+#[derive(Debug)]
+pub struct WaveDigStartError {
+    pub message: String,
+    pub dwell_actual: Option<f64>,
+}
+
+/// Start the waveform digitizer (analog input scan). Returns the actual
+/// dwell the device runs at.
 pub fn start_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
     scan: &WaveDigScan,
-) -> Result<(), String> {
+) -> Result<f64, WaveDigStartError> {
     let WaveDigScan {
         first_chan,
         num_chans,
@@ -113,7 +126,10 @@ pub fn start_wave_dig(
     }
     device
         .analog_in_load_queue(&queue)
-        .map_err(|e| format!("analog_in_load_queue error: {e}"))?;
+        .map_err(|e| WaveDigStartError {
+            message: format!("analog_in_load_queue error: {e}"),
+            dwell_actual: None,
+        })?;
 
     let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
 
@@ -139,30 +155,40 @@ pub fn start_wave_dig(
     state.range = range;
     state.options = options;
 
-    device
-        .analog_in_scan(
-            &AInScanConfig {
-                low_chan: first_chan as i32,
-                high_chan: (first_chan + num_chans - 1) as i32,
-                input_mode,
-                range,
-                samples_per_chan: num_points as i32,
-                options,
-                flags: AINSCAN_FF_DEFAULT,
-            },
-            &mut rate,
-            &mut state.scan_buffer,
-        )
-        .map_err(|e| format!("analog_in_scan error: {e}"))?;
+    let scanned = device.analog_in_scan(
+        &AInScanConfig {
+            low_chan: first_chan as i32,
+            high_chan: (first_chan + num_chans - 1) as i32,
+            input_mode,
+            range,
+            samples_per_chan: num_points as i32,
+            options,
+            flags: AINSCAN_FF_DEFAULT,
+        },
+        &mut rate,
+        &mut state.scan_buffer,
+    );
+    // C drvMultiFunction.cpp:1836-1846: the dwell the rate came back as, or
+    // -9999 when the device rejected the rate outright.
+    let dwell_actual = match &scanned {
+        Err(e) if e.code == ERR_BAD_RATE => BAD_RATE_DWELL,
+        _ => 1.0 / rate,
+    };
+    if let Err(e) = scanned {
+        return Err(WaveDigStartError {
+            message: format!("analog_in_scan error: {e}"),
+            dwell_actual: Some(dwell_actual),
+        });
+    }
 
-    state.dwell_actual = 1.0 / rate;
+    state.dwell_actual = dwell_actual;
     state.running = true;
 
     log::info!(
         "WaveDig started: ch{first_chan}-{}, {num_points} pts, rate={rate:.0} Hz",
         first_chan + num_chans - 1
     );
-    Ok(())
+    Ok(dwell_actual)
 }
 
 /// Number of complete scan points behind `current_index`.

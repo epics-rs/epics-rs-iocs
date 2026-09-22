@@ -828,7 +828,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** DAC codes differ from C at every point.
 - **Class:** ref-faithful. **Live:** static.
 
-## PP-90 [MED] Wave-dig ERR_BAD_RATE never sets the −9999 DwellActual sentinel — OPEN (PP-41 DEFERRED item, now unblocked)
+## PP-90 [MED] Wave-dig ERR_BAD_RATE never sets the −9999 DwellActual sentinel — FIXED (PP-41 DEFERRED item, now unblocked)
 - **Rust:** `wave_dig.rs:140-154` discards the `UlError` code; `WAVEDIG_DWELL_ACTUAL` not written on failure; `uldaq-sys` has no `ERR_BAD_RATE`.
 - **C:** `drvMultiFunction.cpp:1836,1842-1846` `-9999` on `ERR_BAD_RATE`; `ERR_BAD_RATE = 22` (`/usr/local/include/uldaq.h:164`).
 - **Impact:** a rejected rate leaves DwellActual stale.
