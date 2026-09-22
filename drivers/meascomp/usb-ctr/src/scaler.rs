@@ -33,8 +33,12 @@ impl ScalerState {
 }
 
 /// Configure counters and start the continuous counter scan for scaler mode.
-pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), String> {
-    let num_counters = MAX_COUNTERS as i32;
+pub fn start_scaler(
+    device: &DaqDevice,
+    state: &mut ScalerState,
+    num_counters: usize,
+) -> Result<(), String> {
+    let num_counters = num_counters as i32;
 
     // Configure each counter for counting mode
     for i in 0..num_counters {
@@ -67,7 +71,7 @@ pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), S
     }
 
     // Set presets as max limits
-    for i in 0..MAX_COUNTERS {
+    for i in 0..num_counters as usize {
         if state.presets[i] > 0 {
             device
                 .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
@@ -77,6 +81,10 @@ pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), S
 
     // Start continuous counter scan
     let mut rate = 10000.0; // Will be adjusted by driver
+    let samples = num_counters as usize * 20;
+    if state.scan_buffer.len() < samples {
+        state.scan_buffer.resize(samples, 0);
+    }
 
     device
         .counter_in_scan(
@@ -88,7 +96,7 @@ pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), S
                 flags: CINSCAN_FF_CTR64_BIT,
             },
             &mut rate,
-            &mut state.scan_buffer,
+            &mut state.scan_buffer[..samples],
         )
         .map_err(|e| format!("counter_in_scan error: {e}"))?;
 
@@ -99,7 +107,7 @@ pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), S
 }
 
 /// Read latest counter values from the scan buffer. Check for preset completion.
-pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState) {
+pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState, num_counters: usize) {
     let (status, xfer) = match device.counter_in_scan_status() {
         Ok(v) => v,
         Err(e) => {
@@ -112,8 +120,7 @@ pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState) {
         return;
     }
 
-    let num_counters = MAX_COUNTERS;
-    let buf_len = state.scan_buffer.len();
+    let buf_len = (num_counters * 20).min(state.scan_buffer.len());
     if buf_len == 0 || xfer.current_index < 0 {
         return;
     }
@@ -158,9 +165,9 @@ pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState) {
 }
 
 /// Reset all counters to zero.
-pub fn reset_scaler(device: &DaqDevice, state: &mut ScalerState) {
+pub fn reset_scaler(device: &DaqDevice, state: &mut ScalerState, num_counters: usize) {
     stop_scaler(device, state);
-    for i in 0..MAX_COUNTERS {
+    for i in 0..num_counters {
         state.counts[i] = 0;
         if let Err(e) = device.counter_clear(i as i32) {
             log::warn!("counter_clear({i}) error: {e}");

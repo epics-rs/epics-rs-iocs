@@ -65,6 +65,12 @@ impl CtrDriver {
         let fw = device.firmware_version().unwrap_or_default();
         let ul_ver = DaqDevice::ul_version().unwrap_or_default();
 
+        let model =
+            CtrModel::from_product_name(&product_name).ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("{product_name} is not a USB-CTR08 or USB-CTR04"),
+            })?;
+        base.set_int32_param(params.model, 0, model as i32)?;
         base.set_string_param(params.model_name, 0, product_name.clone())?;
         base.set_int32_param(params.model_number, 0, product_id as i32)?;
         base.set_string_param(params.unique_id, 0, uid.clone())?;
@@ -100,6 +106,7 @@ impl CtrDriver {
         }
 
         let state = Arc::new(Mutex::new(PollerState {
+            num_counters: model.num_counters(),
             scaler: ScalerState::new(),
             mcs: McsState::new(max_time_points),
         }));
@@ -277,6 +284,7 @@ impl PortDriver for CtrDriver {
                     .base
                     .get_int32_param(self.params.mcs_point0_action, 0)?
                     != 0;
+                let num_counters = st.num_counters;
                 if let Err(e) = mcs::start_mcs(
                     &dev,
                     &mut st.mcs,
@@ -289,6 +297,7 @@ impl PortDriver for CtrDriver {
                         ext_trigger: trigger,
                         point0_no_clear,
                     },
+                    num_counters,
                 ) {
                     last_error = Some(format!("start_mcs error: {e}"));
                 }

@@ -97,7 +97,12 @@ pub struct McsScan {
 }
 
 /// Start MCS acquisition using DaqInScan.
-pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Result<(), String> {
+pub fn start_mcs(
+    device: &DaqDevice,
+    state: &mut McsState,
+    scan: &McsScan,
+    num_counters: usize,
+) -> Result<(), String> {
     let McsScan {
         num_points,
         dwell_time,
@@ -115,7 +120,10 @@ pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Re
     let mut chan_descs = Vec::new();
     let mut chan_map = Vec::new();
 
-    for i in 0..MAX_MCS_COUNTERS {
+    // The board's counters, then the digital I/O channel: C scans only the
+    // counters the model has (numCounters_), whatever the enable mask says.
+    let channels = (0..num_counters).chain(std::iter::once(DIGITAL_IO_COUNTER));
+    for i in channels {
         if counter_enable & (1 << i) != 0 {
             // Configure counter for MCS (matches C++ drvUSBCTR startMCS)
             let mode = CMM_OUTPUT_ON
@@ -123,7 +131,7 @@ pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Re
                 | CMM_CLEAR_ON_READ
                 | CMM_GATING_ON
                 | CMM_INVERT_GATE;
-            if i < MAX_COUNTERS {
+            if i < num_counters {
                 device
                     .counter_config_scan(
                         i as i32,

@@ -652,7 +652,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** Bo1-4/Lo bits 0-3 drive open-drain outputs C never drives; C releases bits 0-3 at iocInit, Rust leaves the latched state.
 - **Class:** ref-faithful. **Live:** confirmed `Lo=15` pulls DIO0-3 low (Li 255→240).
 
-## PP-63 [MED] No model detection: MODEL param/record missing, counters hardcoded to 8 — OPEN (regression of PP-42, fix never merged)
+## PP-63 [MED] No model detection: MODEL param/record missing, counters hardcoded to 8 — FIXED (regression of PP-42, fix never merged)
 - **Rust:** `params.rs:7` `MAX_COUNTERS=8` used by `scaler_dev.rs:83-85`, `scaler.rs:37,85,115`, `poller.rs:87`, `mcs.rs:116-124`; no MODEL param.
 - **C:** `drvUSBCTR.cpp:362-372` MODEL + `numCounters_` 8 (CTR08) / 4 (CTR04), bounds `:544,687,895,921`, `scalerChannels_` (`:418`); `measCompMCS.template:282-291` Model mbbi.
 - **Impact:** on a CTR04 the poller calls `ulCIn(4..7)` every cycle (ERR_BAD_CTR), the scaler never starts, the MCS wedges (PP-46).

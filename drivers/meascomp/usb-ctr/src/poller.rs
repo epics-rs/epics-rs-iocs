@@ -13,6 +13,8 @@ use crate::scaler::{self, ScalerState};
 
 /// Shared state between driver and poller.
 pub struct PollerState {
+    /// C `numCounters_`, fixed by the board model at construction.
+    pub num_counters: usize,
     pub scaler: ScalerState,
     pub mcs: McsState,
 }
@@ -80,8 +82,9 @@ fn poller_loop(
                 }
 
                 if let Ok(mut st) = state.lock() {
+                    let num_counters = st.num_counters;
                     if st.scaler.running {
-                        scaler::read_scaler(&dev, &mut st.scaler);
+                        scaler::read_scaler(&dev, &mut st.scaler, num_counters);
                         if st.scaler.done {
                             snap.scaler_done_snapshot = Some(st.scaler.counts);
                         }
@@ -93,7 +96,7 @@ fn poller_loop(
                         snap.mcs_just_stopped = mcs_was_acquiring && !st.mcs.acquiring;
                         snap.mcs_elapsed = st.mcs.elapsed_secs();
                     } else {
-                        for counter in 0..MAX_COUNTERS {
+                        for counter in 0..num_counters {
                             match dev.counter_in(counter as i32) {
                                 Ok(value) => snap.counters[counter] = Some(value as i64),
                                 Err(e) => snap.errors.push(format!("CIn({counter}): {e}")),

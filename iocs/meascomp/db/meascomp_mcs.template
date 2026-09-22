@@ -157,6 +157,15 @@ record(longout, "$(P)MCS:NuseAll") {
     field(PINI, "YES")
 }
 
+record(mbbi, "$(P)MCS:Model") {
+    field(DESC, "Model")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MODEL")
+    field(ZRVL, "0")  field(ZRST, "USB-CTR08")
+    field(ONVL, "1")  field(ONST, "USB-CTR04")
+    field(PINI, "YES")
+}
+
 record(longin, "$(P)MCS:MaxChannels") {
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),0,1.0)MCS_MAX_POINTS")
