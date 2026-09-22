@@ -69,6 +69,10 @@ pub const WAVE_TYPE_PULSE: i32 = 4;
 pub const WAVE_TYPE_RANDOM: i32 = 5;
 
 /// Generate an internal waveform of the given type.
+///
+/// `amplitude` is peak-to-peak, as C `defineWaveform` takes it: sin, square,
+/// sawtooth and random span `offset +/- amplitude/2`; the pulse goes from
+/// `offset` to `offset + amplitude`.
 pub fn generate_waveform(
     wave_type: i32,
     num_points: usize,
@@ -78,25 +82,26 @@ pub fn generate_waveform(
 ) -> Vec<f64> {
     let mut data = vec![0.0f64; num_points];
     let n = num_points as f64;
+    let base = offset - amplitude / 2.0;
 
     match wave_type {
         WAVE_TYPE_SIN => {
             for (i, d) in data.iter_mut().enumerate() {
-                *d = offset + amplitude * (2.0 * std::f64::consts::PI * i as f64 / n).sin();
+                *d = offset + amplitude / 2.0 * (2.0 * std::f64::consts::PI * i as f64 / n).sin();
             }
         }
         WAVE_TYPE_SQUARE => {
             for (i, d) in data.iter_mut().enumerate() {
                 *d = if i < num_points / 2 {
-                    offset + amplitude
+                    base + amplitude
                 } else {
-                    offset - amplitude
+                    base
                 };
             }
         }
         WAVE_TYPE_SAWTOOTH => {
             for (i, d) in data.iter_mut().enumerate() {
-                *d = offset + amplitude * (2.0 * i as f64 / n - 1.0);
+                *d = base + amplitude * i as f64 / n;
             }
         }
         WAVE_TYPE_PULSE => {
@@ -115,7 +120,7 @@ pub fn generate_waveform(
             for d in &mut data {
                 seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let frac = (seed >> 33) as f64 / (1u64 << 31) as f64; // 0..1
-                *d = offset + amplitude * (2.0 * frac - 1.0);
+                *d = base + amplitude * frac;
             }
         }
         _ => {
@@ -288,14 +293,23 @@ mod tests {
 
     #[test]
     fn a_square_wave_is_half_high_half_low_around_the_offset() {
+        // 2 V peak-to-peak about 1 V: 2 V then 0 V (C base + amplitude, base).
         let data = generate_waveform(WAVE_TYPE_SQUARE, 4, 2.0, 1.0, 0.5);
-        assert_eq!(data, vec![3.0, 3.0, -1.0, -1.0]);
+        assert_eq!(data, vec![2.0, 2.0, 0.0, 0.0]);
     }
 
     #[test]
-    fn a_sawtooth_spans_offset_plus_or_minus_amplitude() {
+    fn a_sine_swings_half_the_amplitude_about_the_offset() {
+        let data = generate_waveform(WAVE_TYPE_SIN, 4, 2.0, 0.0, 0.5);
+        let peak = data.iter().cloned().fold(f64::MIN, f64::max);
+        assert!((peak - 1.0).abs() < 1e-12, "peak {peak}");
+    }
+
+    #[test]
+    fn a_sawtooth_starts_half_the_amplitude_below_the_offset() {
         let data = generate_waveform(WAVE_TYPE_SAWTOOTH, 4, 2.0, 0.0, 0.5);
-        assert_eq!(data, vec![-2.0, -1.0, 0.0, 1.0]);
+        assert_eq!(data[0], -1.0);
+        assert!(data.iter().all(|v| (-1.0..=1.0).contains(v)));
     }
 
     #[test]

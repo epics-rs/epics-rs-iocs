@@ -802,7 +802,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 
 ## usb-2408 — waveform generator / digitizer
 
-## PP-86 [HIGH] Internal waveform amplitude used as peak instead of peak-to-peak — OPEN (regression of PP-40, fix never merged)
+## PP-86 [HIGH] Internal waveform amplitude used as peak instead of peak-to-peak — FIXED (regression of PP-40, fix never merged)
 - **Rust:** `wave_gen.rs:77-114` sin/square/sawtooth/random swing `offset ± amplitude`; unit tests `wave_gen.rs:284-293` assert the regressed values.
 - **C:** `drvMultiFunction.cpp:1542,1546,1549-1550,1554,1568-1570` span `offset ± amplitude/2` (pulse is full amplitude in both).
 - **Impact:** every internal waveform is 2× the C voltage — over-drive risk.
