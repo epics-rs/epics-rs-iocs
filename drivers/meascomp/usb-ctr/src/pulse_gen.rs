@@ -3,12 +3,18 @@ use meascomp::error::Result;
 use meascomp::timer::PulseTiming;
 use uldaq_sys::*;
 
+/// The clock libuldaq runs the USB-CTR timers from (UsbCtrx.cpp:21).
+const CLOCK_FREQUENCY: f64 = 96e6;
+
 /// Frequency, duty-cycle and delay bounds C `startPulseGenerator` clamps to
-/// (drvUSBCTR.cpp:87-90).
+/// (drvUSBCTR.cpp:87-90), except the delay: C's 67.11 s is 2^32 ticks of a
+/// 64 MHz clock, but the delay goes to the timer as a u32 count of this one
+/// (TmrUsb1208hs.cpp:71,95) and libuldaq rejects anything longer
+/// (TmrDevice.cpp:72-75).
 pub const MIN_FREQUENCY: f64 = 0.023;
 pub const MAX_FREQUENCY: f64 = 48e6;
 pub const MIN_DELAY: f64 = 0.0;
-pub const MAX_DELAY: f64 = 67.11;
+pub const MAX_DELAY: f64 = u32::MAX as f64 / CLOCK_FREQUENCY;
 
 /// The timing C hands to `ulTmrPulseOutStart`: the requested period, duty
 /// cycle and delay pulled into what the timer can do (drvUSBCTR.cpp:465-472),
@@ -102,5 +108,13 @@ mod tests {
     fn the_delay_is_pulled_into_its_range() {
         assert_eq!(clamp_timing(0.001, 0.5, -5.0).initial_delay, MIN_DELAY);
         assert_eq!(clamp_timing(0.001, 0.5, 100.0).initial_delay, MAX_DELAY);
+    }
+
+    #[test]
+    fn the_longest_delay_fits_the_timer_count() {
+        // libuldaq truncates delay * clock to an integer tick count and
+        // refuses one above UINT_MAX (TmrDevice.cpp:72-75).
+        assert!((MAX_DELAY * CLOCK_FREQUENCY) as u64 <= u64::from(u32::MAX));
+        assert!(((MAX_DELAY + 1e-6) * CLOCK_FREQUENCY) as u64 > u64::from(u32::MAX));
     }
 }
