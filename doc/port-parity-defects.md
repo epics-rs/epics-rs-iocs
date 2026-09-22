@@ -601,7 +601,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** the documented optional mca-record configuration cannot load.
 - **Class:** contract. **Live:** static.
 
-## PP-55 [MED] MCS readout/busy record protocol diverges from C — OPEN
+## PP-55 [MED] MCS readout/busy record protocol diverges from C — FIXED
 - **Rust:** `meascomp_mcs.template:75-101` ReadAll/ReadAllOnce FLNK → ReadFanout → ClearAcquiring; ReadAll no SCAN/SDIS; `:19-24` EraseAll no FLNK; `:54-58` SetAcquiring no `VAL 1`, no FLNK to SetClientWait (`:131-137` unreachable).
 - **C:** `measCompMCS.template:83-90` ReadAll SCAN "1 second", SDIS Acquiring; `:12-19` EraseAll FLNK ReadAllOnce; `:30-45,150-158` StartAll→SetAcquiring(VAL 1)→SetClientWait; `USBCTR_SNL.st` clears Acquiring only on HardwareAcquiring 1→0.
 - **Impact:** a ReadAll mid-run releases the Acquiring busy early (`caput -c` returns before data); no 1 Hz spectrum refresh; spectra stale after erase; ClientWait never raised; on a fresh IOC StartAll writes 0 into Acquiring.

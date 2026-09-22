@@ -1,12 +1,52 @@
 # MCS (Multi-Channel Scaler) control records
 # Macros: P (prefix), PORT (asyn port)
+#
+# The record fields are upstream measCompMCS.template's. What upstream's
+# USBCTR_SNL.st does -- read the spectra on DoReadAll, and on the hardware's
+# 1 -> 0 transition read them and only then release Acquiring -- is done by
+# the DoReadAll / AcquireDone / FinishAcquire records below.
+
+record(bo, "$(P)MCS:EraseAll") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_ERASE")
+    field(ZNAM, "Done")
+    field(ONAM, "Erase")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:ReadAllOnce")
+}
+
+record(bo, "$(P)MCS:EraseStart") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_ERASE")
+    field(ZNAM, "Done")
+    field(ONAM, "Erase")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:StartAll.PROC")
+}
 
 record(bo, "$(P)MCS:StartAll") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_START_ACQUIRE")
     field(ZNAM, "Done")
     field(ONAM, "Start")
-    field(FLNK, "$(P)MCS:SetAcquiring")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:SetAcquiring.PROC")
+}
+
+record(bo, "$(P)MCS:SetAcquiring") {
+    field(OUT,  "$(P)MCS:Acquiring PP MS")
+    field(ZNAM, "Done")
+    field(ONAM, "Set")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:SetClientWait.PROC")
+}
+
+# What a client waits on: set with StartAll, cleared only after the spectra
+# have been re-read, so `caput -c $(P)MCS:EraseStart 1` returns with the data
+# already in the spectrum records.
+record(busy, "$(P)MCS:Acquiring") {
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
 }
 
 record(bo, "$(P)MCS:StopAll") {
@@ -14,13 +54,7 @@ record(bo, "$(P)MCS:StopAll") {
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_STOP_ACQUIRE")
     field(ZNAM, "Done")
     field(ONAM, "Stop")
-}
-
-record(bo, "$(P)MCS:EraseAll") {
-    field(DTYP, "asynInt32")
-    field(OUT,  "@asyn($(PORT),0,1.0)MCA_ERASE")
-    field(ZNAM, "Done")
-    field(ONAM, "Erase")
+    field(VAL,  "1")
 }
 
 # What the driver is doing right now.
@@ -33,52 +67,39 @@ record(bi, "$(P)MCS:HardwareAcquiring") {
     field(FLNK, "$(P)MCS:AcquireDone")
 }
 
-# What a client waits on. Set when acquisition starts and cleared only after
-# the spectra have been re-read, so `caput -c $(P)MCS:EraseStart 1` returns
-# with the data already in the waveform records. Upstream gets this ordering
-# from USBCTR_SNL.st; the same fan-out done in the database needs no
-# sequencer.
-record(busy, "$(P)MCS:Acquiring") {
-    field(ZNAM, "Done")
-    field(ONAM, "Acquiring")
-}
-
 # Fires once on the hardware's 1 -> 0 transition.
 record(calcout, "$(P)MCS:AcquireDone") {
     field(INPA, "$(P)MCS:HardwareAcquiring  NPP NMS")
     field(CALC, "A")
     field(OOPT, "Transition To Zero")
-    field(OUT,  "$(P)MCS:DoReadAll  PP")
+    field(OUT,  "$(P)MCS:FinishAcquire.PROC  PP")
 }
 
-record(bo, "$(P)MCS:SetAcquiring") {
-    field(ZNAM, "Done")
-    field(ONAM, "Acquiring")
-    field(OUT,  "$(P)MCS:Acquiring  PP")
-}
-
-# Erase, mark acquiring, start -- in that order.
-record(seq, "$(P)MCS:EraseStart") {
+# Read every spectrum, then release Acquiring -- in that order, as the SNL
+# program's HardwareAcquiring handler does. Nothing else clears Acquiring.
+record(seq, "$(P)MCS:FinishAcquire") {
     field(SELM, "All")
-    field(DOL1, "1")  field(LNK1, "$(P)MCS:EraseAll  PP")
-    field(DOL2, "1")  field(LNK2, "$(P)MCS:SetAcquiring  PP")
-    field(DOL3, "1")  field(LNK3, "$(P)MCS:StartAll  PP")
+    field(DOL1, "1")  field(LNK1, "$(P)MCS:ReadAllOnce.PROC  PP")
+    field(DOL2, "0")  field(LNK2, "$(P)MCS:Acquiring  PP")
 }
 
-# Re-read every spectrum plus the time bases, then release Acquiring.
-record(bo, "$(P)MCS:DoReadAll") {
-    field(ZNAM, "Done")
-    field(ONAM, "Read")
-    field(FLNK, "$(P)MCS:ReadFanout")
-}
-
+# Refreshes the spectra once a second while acquiring.
 record(bo, "$(P)MCS:ReadAll") {
+    field(SCAN, "1 second")
+    field(DISV, "0")
+    field(SDIS, "$(P)MCS:Acquiring NPP NMS")
     field(ZNAM, "Done")
     field(ONAM, "Read")
-    field(FLNK, "$(P)MCS:ReadFanout")
+    field(FLNK, "$(P)MCS:ReadAllOnce")
 }
 
 record(bo, "$(P)MCS:ReadAllOnce") {
+    field(VAL,  "1")
+    field(OUT,  "$(P)MCS:DoReadAll.VAL PP MS")
+}
+
+# Reads the spectra and the absolute time base; it never touches Acquiring.
+record(bo, "$(P)MCS:DoReadAll") {
     field(ZNAM, "Done")
     field(ONAM, "Read")
     field(FLNK, "$(P)MCS:ReadFanout")
@@ -95,18 +116,17 @@ record(fanout, "$(P)MCS:ReadFanout") {
     field(LNK6, "$(P)MCS:mca7  PP")
     field(LNK7, "$(P)MCS:mca8  PP")
     field(LNK8, "$(P)MCS:mca9  PP")
-    field(LNK9, "$(P)MCS:TimeWF  PP")
-    field(LNKA, "$(P)MCS:AbsTimeWF  PP")
-    field(FLNK, "$(P)MCS:ClearAcquiring")
+    field(LNK9, "$(P)MCS:AbsTimeWF  PP")
+    field(FLNK, "$(P)MCS:ClearReadAll")
 }
 
-record(bo, "$(P)MCS:ClearAcquiring") {
+record(bo, "$(P)MCS:ClearReadAll") {
     field(VAL,  "0")
-    field(OUT,  "$(P)MCS:Acquiring  PP")
+    field(OUT,  "$(P)MCS:DoReadAll.VAL  NPP")
 }
 
 # Time bases. The relative one is pushed by the driver whenever Dwell is
-# written (C computeMCSTimes); both are also read through the fan-out above.
+# written (C computeMCSTimes); the absolute one is read with the spectra.
 record(waveform, "$(P)MCS:TimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)MCS_TIME_WF")
@@ -122,19 +142,23 @@ record(waveform, "$(P)MCS:AbsTimeWF") {
     field(NELM, "$(MAX_POINTS=2048)")
 }
 
-# A client that needs to be released only after it has consumed the data sets
+# A client that must be released only after it has consumed the data sets
 # EnableClientWait; ClientWait is then raised with Acquiring and the client
 # clears it when done.
 record(bo, "$(P)MCS:EnableClientWait") {
+    field(PINI, "YES")
     field(ZNAM, "Disable")
     field(ONAM, "Enable")
 }
 
 record(bo, "$(P)MCS:SetClientWait") {
-    field(VAL,  "1")
-    field(SDIS, "$(P)MCS:EnableClientWait  NPP NMS")
     field(DISV, "0")
-    field(OUT,  "$(P)MCS:ClientWait  PP")
+    field(SDIS, "$(P)MCS:EnableClientWait NPP NMS")
+    field(OMSL, "closed_loop")
+    field(DOL,  "1")
+    field(OUT,  "$(P)MCS:ClientWait PP MS")
+    field(ONAM, "SetClientWait")
+    field(ZNAM, "Done")
 }
 
 record(busy, "$(P)MCS:ClientWait") {
