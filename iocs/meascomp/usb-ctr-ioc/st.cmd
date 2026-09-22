@@ -41,15 +41,16 @@ dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi8,
 dbLoadRecords("$(MEASCOMP)/db/meascomp_long_in.template",  "P=$(PREFIX),R=Li,PORT=$(PORT),ADDR=0,MASK=0xFF")
 dbLoadRecords("$(MEASCOMP)/db/meascomp_long_out.template", "P=$(PREFIX),R=Lo,PORT=$(PORT),ADDR=0,MASK=0xFF")
 
-# Digital I/O bit directions (0=input, 1=output)
+# Digital I/O bit directions (0=input, 1=output); bits 0-3 in, 4-7 out as in
+# upstream USBCTR.substitutions.
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd1,PORT=$(PORT),ADDR=0,MASK=0x01,VAL=0")
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd2,PORT=$(PORT),ADDR=0,MASK=0x02,VAL=0")
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd3,PORT=$(PORT),ADDR=0,MASK=0x04,VAL=0")
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd4,PORT=$(PORT),ADDR=0,MASK=0x08,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd5,PORT=$(PORT),ADDR=0,MASK=0x10,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd6,PORT=$(PORT),ADDR=0,MASK=0x20,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd7,PORT=$(PORT),ADDR=0,MASK=0x40,VAL=0")
-dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd8,PORT=$(PORT),ADDR=0,MASK=0x80,VAL=0")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd5,PORT=$(PORT),ADDR=0,MASK=0x10,VAL=1")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd6,PORT=$(PORT),ADDR=0,MASK=0x20,VAL=1")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd7,PORT=$(PORT),ADDR=0,MASK=0x40,VAL=1")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd8,PORT=$(PORT),ADDR=0,MASK=0x80,VAL=1")
 
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo1,PORT=$(PORT),ADDR=0,MASK=0x01")
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo2,PORT=$(PORT),ADDR=0,MASK=0x02")

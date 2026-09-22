@@ -91,16 +91,14 @@ impl MultiFunctionDriver {
 
         // Only a DPIOT_IO / DPIOT_BITIO port accepts a direction change;
         // ulDConfigPort and ulDConfigBit reject anything else outright, so ask
-        // the device instead of assuming.
+        // the device instead of assuming. The directions themselves are left
+        // to the Bd records' PINI, as C's constructor leaves them: forcing
+        // the port to input here would float every output bit from here
+        // until iocInit.
         let dio_configurable = matches!(
             device.digital_port_io_type(0),
             Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
         );
-        if dio_configurable
-            && let Err(e) = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT)
-        {
-            log::error!("digital_config_port error: {e}");
-        }
 
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
         // The poller only pushes on a changed bit, and its one forced first

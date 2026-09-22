@@ -640,7 +640,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Family:** both drivers' `write_uint32_digital` DIGITAL_OUTPUT branch; no other site.
 - **Class:** ref-faithful. **Live:** confirmed on CTR — `Lo=165` with all bits In → "digital_bit_out error: uldaq error 51".
 
-## PP-61 [MED] USB-CTR boot DIO directions differ from C — OPEN
+## PP-61 [MED] USB-CTR boot DIO directions differ from C — FIXED
 - **Rust:** `usb-ctr-ioc/st.cmd:49-52` `VAL=0` for Bd5..Bd8; `driver.rs:76-80` forces `ulDConfigPort(AUXPORT, DD_INPUT)` in the constructor.
 - **C:** `USBCTR.substitutions:56-59` Bd5..Bd8 `VAL=1`; constructor (`:255-439`) never configures direction.
 - **Impact:** outputs unusable by default; every restart tri-states bits wired as outputs until the Bd PINI runs.
