@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -104,6 +104,30 @@ impl CtrDriver {
     }
 }
 
+impl CtrDriver {
+    /// Common tail of every write: run the callbacks, then report a failure
+    /// the way C does -- `asynError` back to the record, so it alarms --
+    /// besides publishing it on LAST_ERROR_MESSAGE.
+    fn finish_write(&mut self, addr: i32, last_error: Option<String>) -> AsynResult<()> {
+        if let Some(msg) = &last_error {
+            log::error!("{msg}");
+            let _ = self.base.params.set_value(
+                self.params.last_error_message,
+                0,
+                ParamValue::Octet(msg.clone().into_bytes()),
+            );
+        }
+        self.base.call_param_callbacks(addr)?;
+        match last_error {
+            None => Ok(()),
+            Some(message) => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message,
+            }),
+        }
+    }
+}
+
 impl PortDriver for CtrDriver {
     fn base(&self) -> &PortDriverBase {
         &self.base
@@ -128,8 +152,10 @@ impl PortDriver for CtrDriver {
             let running = self.base.get_int32_param(self.params.pulse_run, addr)? != 0;
             if running {
                 // Stop first if restarting due to parameter change
-                if reason != self.params.pulse_run {
-                    let _ = pulse_gen::stop(&dev, addr);
+                if reason != self.params.pulse_run
+                    && let Err(e) = pulse_gen::stop(&dev, addr)
+                {
+                    last_error = Some(format!("pulse_gen stop error: {e}"));
                 }
                 let period = self
                     .base
@@ -235,16 +261,7 @@ impl PortDriver for CtrDriver {
             mcs::erase_mcs(&mut st.mcs);
         }
 
-        if let Some(msg) = last_error {
-            log::error!("{msg}");
-            let _ = self.base.params.set_value(
-                self.params.last_error_message,
-                0,
-                ParamValue::Octet(msg.into_bytes()),
-            );
-        }
-        self.base.call_param_callbacks(addr)?;
-        Ok(())
+        self.finish_write(addr, last_error)
     }
 
     /// MCS spectrum readout. C `USBCTR::readInt32Array` / the `mcaReadData`
@@ -322,7 +339,9 @@ impl PortDriver for CtrDriver {
                 != 0;
             if running {
                 let dev = self.device.lock().unwrap();
-                let _ = pulse_gen::stop(&dev, addr);
+                if let Err(e) = pulse_gen::stop(&dev, addr) {
+                    last_error = Some(format!("pulse_gen stop error: {e}"));
+                }
                 let period = self
                     .base
                     .get_float64_param(self.params.pulse_period, addr)?;
@@ -357,16 +376,7 @@ impl PortDriver for CtrDriver {
             }
         }
 
-        if let Some(msg) = last_error {
-            log::error!("{msg}");
-            let _ = self.base.params.set_value(
-                self.params.last_error_message,
-                0,
-                ParamValue::Octet(msg.into_bytes()),
-            );
-        }
-        self.base.call_param_callbacks(addr)?;
-        Ok(())
+        self.finish_write(addr, last_error)
     }
 
     fn write_uint32_digital(
@@ -415,16 +425,7 @@ impl PortDriver for CtrDriver {
 
         self.base.params.set_uint32(reason, addr, value, mask, 0)?;
 
-        if let Some(msg) = last_error {
-            log::error!("{msg}");
-            let _ = self.base.params.set_value(
-                self.params.last_error_message,
-                0,
-                ParamValue::Octet(msg.into_bytes()),
-            );
-        }
-        self.base.call_param_callbacks(addr)?;
-        Ok(())
+        self.finish_write(addr, last_error)
     }
 }
 

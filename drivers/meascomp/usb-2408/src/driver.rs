@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
@@ -152,8 +152,9 @@ impl MultiFunctionDriver {
         None
     }
 
-    /// Common tail of `write_int32`: apply the collected array updates, report
-    /// the failure (if any) on LAST_ERROR_MESSAGE, and run the callbacks.
+    /// Common tail of every write: apply the collected array updates, report
+    /// the failure (if any) on LAST_ERROR_MESSAGE, run the callbacks, and
+    /// return the failure as `asynError`.
     ///
     /// An early return in the middle of a write must still come through here,
     /// or the message it just set would never reach the record.
@@ -168,16 +169,23 @@ impl MultiFunctionDriver {
             wave_arrays.push(update);
         }
         let last_error = self.apply_updates(wave_arrays).or(last_error);
-        if let Some(msg) = last_error {
+        if let Some(msg) = &last_error {
             log::error!("{msg}");
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg.into_bytes()),
+                ParamValue::Octet(msg.clone().into_bytes()),
             );
         }
         self.base.call_param_callbacks(addr)?;
-        Ok(())
+        // C returns asynError on any failed write, so the record alarms.
+        match last_error {
+            None => Ok(()),
+            Some(message) => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message,
+            }),
+        }
     }
 
     /// Push THERMOCOUPLE_TYPE and THERMOCOUPLE_OPEN_DETECT for `chan` to the
@@ -710,16 +718,7 @@ impl PortDriver for MultiFunctionDriver {
 
         self.base.params.set_uint32(reason, addr, value, mask, 0)?;
 
-        if let Some(msg) = last_error {
-            log::error!("{msg}");
-            let _ = self.base.params.set_value(
-                self.params.last_error_message,
-                0,
-                ParamValue::Octet(msg.into_bytes()),
-            );
-        }
-        self.base.call_param_callbacks(addr)?;
-        Ok(())
+        self.finish_write(addr, last_error, Vec::new(), None)
     }
 }
 

@@ -680,7 +680,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Family:** every output record listed in either `auto_settings.req`; a test asserting PINI on each would close it.
 - **Class:** contract. **Live:** static (autosave itself broken, PP-65).
 
-## PP-67 [MED] Write failures never return asynError, so records never alarm (both drivers) — OPEN (FAMILY)
+## PP-67 [MED] Write failures never return asynError, so records never alarm (both drivers) — FIXED (FAMILY)
 - **Rust:** `usb-ctr/src/driver.rs:238-247,360-369,418-427` and `usb-2408/src/driver.rs:160-181` (`finish_write`), `:619,722` log to LAST_ERROR_MESSAGE then return `Ok(())`; restart stop errors dropped (`let _ = pulse_gen::stop`, `:132,325`).
 - **C:** `drvUSBCTR.cpp:1254,1316,1368`, `drvMultiFunction.cpp:2211` et al. `return (status==0) ? asynSuccess : asynError`.
 - **Impact:** failed pulse start, counter reset, DIO write or scan start leaves the record NO_ALARM; the failure is visible only in the `LastErrorMessage` waveform (a Rust addition — C never writes `lastErrorMessage_`), which is also never cleared on success.
