@@ -263,7 +263,8 @@ impl PortDriver for MultiFunctionDriver {
         let mut wave_arrays: Vec<ParamSetValue> = Vec::new();
         let mut time_wf: Option<ParamSetValue> = None;
 
-        if reason == self.params.counter_reset && value != 0 {
+        // Command params act on any written value, as C's do.
+        if reason == self.params.counter_reset {
             let dev = self.device.lock().unwrap();
             if let Err(e) = dev.counter_clear(addr) {
                 last_error = Some(format!("counter_clear error: {e}"));
@@ -287,28 +288,26 @@ impl PortDriver for MultiFunctionDriver {
             }
         } else if reason == self.params.analog_out_sync_write {
             // Simultaneous write of all analog outputs
-            if value != 0 {
-                let dev = self.device.lock().unwrap();
-                let mut values = vec![0.0f64; MAX_ANALOG_OUT];
-                let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
-                for ch in 0..MAX_ANALOG_OUT {
-                    values[ch] = self
-                        .base
-                        .get_int32_param(self.params.analog_out_value, ch as i32)?
-                        as f64;
-                    ranges[ch] = self
-                        .base
-                        .get_int32_param(self.params.analog_out_range, ch as i32)?;
-                }
-                if let Err(e) = dev.analog_out_array(
-                    0,
-                    (MAX_ANALOG_OUT - 1) as i32,
-                    &ranges,
-                    uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
-                    &mut values,
-                ) {
-                    last_error = Some(format!("analog_out_array error: {e}"));
-                }
+            let dev = self.device.lock().unwrap();
+            let mut values = vec![0.0f64; MAX_ANALOG_OUT];
+            let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
+            for ch in 0..MAX_ANALOG_OUT {
+                values[ch] = self
+                    .base
+                    .get_int32_param(self.params.analog_out_value, ch as i32)?
+                    as f64;
+                ranges[ch] = self
+                    .base
+                    .get_int32_param(self.params.analog_out_range, ch as i32)?;
+            }
+            if let Err(e) = dev.analog_out_array(
+                0,
+                (MAX_ANALOG_OUT - 1) as i32,
+                &ranges,
+                uldaq_sys::AOUTARRAY_FF_NOSCALEDATA,
+                &mut values,
+            ) {
+                last_error = Some(format!("analog_out_array error: {e}"));
             }
         } else if reason == self.params.analog_in_type {
             let dev = self.device.lock().unwrap();
@@ -415,10 +414,8 @@ impl PortDriver for MultiFunctionDriver {
                 wave_dig::stop_wave_dig(&dev, &mut st.wave_dig);
             }
         } else if reason == self.params.wave_dig_read_wf {
-            if value != 0 {
-                let st = self.state.lock().unwrap();
-                wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig);
-            }
+            let st = self.state.lock().unwrap();
+            wave_arrays = wave_dig::waveform_updates(&self.params, &st.wave_dig);
         } else if reason == self.params.wave_gen_run {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();

@@ -195,11 +195,10 @@ impl PortDriver for CtrDriver {
                 last_error = Some(format!("pulse_gen stop error: {e}"));
             }
         } else if reason == self.params.counter_reset {
-            if value != 0 {
-                let dev = self.device.lock().unwrap();
-                if let Err(e) = dev.counter_clear(addr) {
-                    last_error = Some(format!("counter_clear error: {e}"));
-                }
+            // Any write resets, as C's ulCLoad(CRT_LOAD, 0) does.
+            let dev = self.device.lock().unwrap();
+            if let Err(e) = dev.counter_clear(addr) {
+                last_error = Some(format!("counter_clear error: {e}"));
             }
         } else if reason == self.params.digital_output {
             let dev = self.device.lock().unwrap();

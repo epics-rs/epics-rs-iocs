@@ -686,7 +686,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** failed pulse start, counter reset, DIO write or scan start leaves the record NO_ALARM; the failure is visible only in the `LastErrorMessage` waveform (a Rust addition — C never writes `lastErrorMessage_`), which is also never cleared on success.
 - **Class:** contract. **Live:** confirmed — every failure in this session (errors 15, 16, 22, 51, 56, 58) left the written record NO_ALARM; LastErrorMessage kept the last error after later successful writes.
 
-## PP-68 [LOW] Zero-value writes ignored where C acts on any write — OPEN
+## PP-68 [LOW] Zero-value writes ignored where C acts on any write — FIXED
 - **Rust:** `usb-ctr/src/driver.rs:171-177` and `usb-2408/src/driver.rs:258` COUNTER_RESET only `if value != 0`; `usb-2408/src/driver.rs:282` ANALOG_OUT_SYNC_WRITE; `:410` WAVEDIG_READ_WF.
 - **C:** `drvUSBCTR.cpp:1119-1126`, `drvMultiFunction.cpp:2063-2071,2159-2161` act on every write.
 - **Impact:** `caput …Reset 0` / `SyncWrite 0` do nothing in Rust.
