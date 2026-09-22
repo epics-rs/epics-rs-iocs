@@ -32,6 +32,9 @@ async fn main() -> CaResult<()> {
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
+    // This IOC's own directory: its auto_settings.req and autosave/ live
+    // here, so the two meascomp IOCs never share a request or save file.
+    epics_rs::base::runtime::env::set_default("USB_CTR_IOC", env!("CARGO_MANIFEST_DIR"));
     // scaler-rs ships scaler.db; st.cmd loads it from $(SCALER)/db the
     // way upstream's USBCTR st.cmd loads it from the scaler module. The
     // crate's const names the db dir itself; SCALER names the crate dir

@@ -31,6 +31,9 @@ async fn main() -> CaResult<()> {
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
+    // This IOC's own directory: its auto_settings.req and autosave/ live
+    // here, so the two meascomp IOCs never share a request or save file.
+    epics_rs::base::runtime::env::set_default("USB_2408_IOC", env!("CARGO_MANIFEST_DIR"));
 
     let trace = Arc::new(TraceManager::new());
     let runtime: Arc<Mutex<Option<MultiFunctionRuntime>>> = Arc::new(Mutex::new(None));

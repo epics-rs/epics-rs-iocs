@@ -666,11 +666,12 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 
 ## Cross-driver (both IOCs / shared db)
 
-## PP-65 [HIGH] Autosave non-functional since `9b794e6`; both IOCs share one save path — OPEN
+## PP-65 [HIGH] Autosave non-functional since `9b794e6`; both IOCs share one save path — FIXED
 - **Rust:** `usb-ctr-ioc/src/main.rs:31-34`, `usb-2408-ioc/src/main.rs:30-33` set `MEASCOMP` to `CARGO_MANIFEST_DIR/..` (`iocs/meascomp`); both st.cmd `set_requestfile_path("$(MEASCOMP)")` / `set_savefile_path("$(MEASCOMP)/autosave")` / `auto_settings.sav`; `auto_settings.req` lives in each IOC dir. Before `9b794e6` `MEASCOMP` was the IOC dir.
 - **C:** `iocBoot/save_restore.cmd:23,28-34` per-IOC `autosave/` relative to each iocBoot dir.
 - **Impact:** nothing is ever saved or restored (the "restore across a restart" feature `0b243c7` is dead); when launched from an IOC dir both IOCs would write the same `auto_settings.sav` and restore each other's PVs.
 - **Class:** ref-indep. **Live:** confirmed — after ~9 min of changes on both IOCs with a 30 s monitor set, `iocs/meascomp/autosave/` is empty and `iocs/meascomp/*.req` does not exist.
+- **Second cause (found while fixing):** epics-rs 0.30 snapshots the autosave configuration when the script's `iocInit()` runs `perform_build` (`epics-base-rs` `ioc_app.rs:1088,1222`), so a `create_monitor_set` after `iocInit()` — C's usual order — is never scheduled. Same ordering in `iocs/d435i-ioc/st.d435i.cmd`, `st.d405.cmd`; all four moved before `iocInit()`. The framework-side deviation from C autosave stays open in epics-rs.
 
 ## PP-66 [MED] Output records lack the PINI C relies on; restored values never reach the driver — OPEN (FAMILY)
 - **Rust:** no PINI on `meascomp_pulse_gen.template:1` Run (also no OSV MINOR, not in `auto_settings.req`) and `:60` IdleState; `meascomp_counter.template:7` Reset (no `VAL 1`); `meascomp_binary_out.template:1` Bo (no PHAS 2); `meascomp_analog_out.template:1` Ao (no PHAS 2/VAL 0); `meascomp_temperature.template:34,41` Filter/OpenTCDetect; `meascomp_wave_dig.template:69-102` ExtTrigger/ExtClock/Continuous/AutoRestart/BurstMode; `meascomp_wave_gen.template:143-162` ExtTrigger/ExtClock/Continuous. epics-rs pass-1 restore writes VAL without processing (`save_set.rs:342-447`).
