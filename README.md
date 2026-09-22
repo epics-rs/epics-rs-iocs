@@ -1181,10 +1181,9 @@ Edit `iocs/meascomp/usb-ctr-ioc/st.cmd` to set your device serial number:
 epicsEnvSet("UNIQUE_ID", "0214D582")
 ```
 
-An empty `UNIQUE_ID` connects to the first available device, which is
-**not safe when multiple MCC devices are plugged in** — both this IOC
-and `usb-2408-ioc` would grab the same `descriptors[0]`. Always set
-`UNIQUE_ID` explicitly in multi-device setups.
+`UNIQUE_ID` must match a connected board exactly; an empty or unknown
+ID fails `USBCTRConfig`, as upstream `measCompDiscover` does, so an IOC
+never binds to whichever board happens to enumerate first.
 
 To list all connected MCC devices and their UNIQUE_IDs:
 

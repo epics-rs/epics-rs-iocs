@@ -709,7 +709,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** time axes are zero/stale until a run and don't follow Dwell/NumPoints changes; generator time axes never populate.
 - **Class:** ref-faithful. **Live:** confirmed — after `WaveGenUserDwell=0.002`, `WaveGenUserTimeWF`/`IntTimeWF` read all zeros.
 
-## PP-72 [LOW] Empty uniqueID opens the first enumerated device — OPEN
+## PP-72 [LOW] Empty uniqueID opens the first enumerated device — FIXED
 - **Rust:** `meascomp/src/device.rs:37-38` `if unique_id.is_empty() { descriptors[0].clone() }`.
 - **C:** `measCompDiscover.cpp:169-182,208` exact match or -1; constructors abort (`drvUSBCTR.cpp:274-278`, `drvMultiFunction.cpp:838-842`).
 - **Impact:** with both boards attached, an empty UNIQUE_ID binds either IOC to whichever board enumerates first.

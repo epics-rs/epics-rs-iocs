@@ -17,8 +17,6 @@ pub struct DaqDevice {
 
 impl DaqDevice {
     /// Discover all MCC DAQ devices and connect to the one matching `unique_id`.
-    ///
-    /// If `unique_id` is empty, connects to the first device found.
     pub fn connect(unique_id: &str) -> Result<Self> {
         let mut descriptors = vec![DaqDeviceDescriptor::default(); MAX_DEVICES];
         let mut num_devs = MAX_DEVICES as u32;
@@ -34,21 +32,12 @@ impl DaqDevice {
             });
         }
 
-        let descriptor = if unique_id.is_empty() {
-            descriptors[0].clone()
-        } else {
-            descriptors[..num_devs as usize]
-                .iter()
-                .find(|d| {
-                    let id = unsafe { CStr::from_ptr(d.unique_id.as_ptr()) }.to_string_lossy();
-                    id == unique_id
-                })
-                .cloned()
-                .ok_or_else(|| error::MeasCompError {
-                    code: ERR_DEV_NOT_FOUND,
-                    message: format!("device with uniqueID '{unique_id}' not found"),
-                })?
-        };
+        let descriptor = find_descriptor(&descriptors[..num_devs as usize], unique_id)
+            .cloned()
+            .ok_or_else(|| error::MeasCompError {
+                code: ERR_DEV_NOT_FOUND,
+                message: format!("device with uniqueID '{unique_id}' not found"),
+            })?;
 
         let handle = unsafe { ulCreateDaqDevice(descriptor.clone()) };
         if handle == 0 {
@@ -121,6 +110,21 @@ impl Drop for DaqDevice {
     }
 }
 
+/// The inventory entry whose uniqueID is exactly `unique_id`.
+///
+/// C `measCompDiscover.cpp:169-182` accepts only an exact match, so an empty
+/// ID matches no board: with a USB-CTR08 and a USB-2408 on the same bus, an
+/// IOC must never bind to whichever one enumerates first.
+fn find_descriptor<'a>(
+    descriptors: &'a [DaqDeviceDescriptor],
+    unique_id: &str,
+) -> Option<&'a DaqDeviceDescriptor> {
+    descriptors.iter().find(|d| {
+        let id = unsafe { CStr::from_ptr(d.unique_id.as_ptr()) }.to_string_lossy();
+        id == unique_id
+    })
+}
+
 /// Discover all connected MCC DAQ devices without connecting.
 pub fn discover_devices() -> Result<Vec<(String, String, u32)>> {
     let mut descriptors = vec![DaqDeviceDescriptor::default(); MAX_DEVICES];
@@ -142,4 +146,36 @@ pub fn discover_devices() -> Result<Vec<(String, String, u32)>> {
             (name, id, d.product_id)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(id: &str) -> DaqDeviceDescriptor {
+        let mut d = DaqDeviceDescriptor::default();
+        for (slot, b) in d.unique_id.iter_mut().zip(id.bytes()) {
+            *slot = b as c_char;
+        }
+        d
+    }
+
+    #[test]
+    fn an_exact_unique_id_selects_its_device() {
+        let devs = [descriptor("01DAB0FB"), descriptor("01DA523D")];
+        let found = find_descriptor(&devs, "01DA523D").expect("present");
+        assert!(std::ptr::eq(found, &devs[1]));
+    }
+
+    #[test]
+    fn an_empty_unique_id_selects_no_device() {
+        let devs = [descriptor("01DAB0FB"), descriptor("01DA523D")];
+        assert!(find_descriptor(&devs, "").is_none());
+    }
+
+    #[test]
+    fn a_prefix_is_not_a_match() {
+        let devs = [descriptor("01DAB0FB")];
+        assert!(find_descriptor(&devs, "01DA").is_none());
+    }
 }
