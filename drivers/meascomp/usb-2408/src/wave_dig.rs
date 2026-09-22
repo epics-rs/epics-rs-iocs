@@ -6,7 +6,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 use meascomp::analog_in::AInScanConfig;
 use meascomp::device::DaqDevice;
-use meascomp::error::ScanPosition;
+use meascomp::error::{self, MeasCompError, ScanPosition};
 use uldaq_sys::*;
 
 use crate::params::*;
@@ -74,13 +74,17 @@ pub struct WaveDigScan {
 /// C's WAVEDIG_DWELL_ACTUAL for a scan the device refused its rate for.
 pub const BAD_RATE_DWELL: f64 = -9999.0;
 
-/// A refused start. `dwell_actual` is `Some` when `ulAInScan` itself ran:
-/// C publishes the dwell it ended with, or [`BAD_RATE_DWELL`], after any
-/// outcome of that call, but nothing when the queue load failed before it.
+/// A refused start, by the call that refused it.
 #[derive(Debug)]
-pub struct WaveDigStartError {
-    pub message: String,
-    pub dwell_actual: Option<f64>,
+pub enum WaveDigStartError {
+    /// `ulAInLoadQueue` failed, so `ulAInScan` never ran.
+    Queue(MeasCompError),
+    /// `ulAInScan` refused the scan. C publishes the dwell it ended with, or
+    /// [`BAD_RATE_DWELL`], after any outcome of that call.
+    Scan {
+        error: MeasCompError,
+        dwell_actual: f64,
+    },
 }
 
 /// A started scan: the dwell the device runs at and the scan options used.
@@ -122,10 +126,7 @@ pub fn start_wave_dig(
     let queue = scan_queue(first_chan, num_chans, input_mode, &ranges);
     device
         .analog_in_load_queue(&queue)
-        .map_err(|e| WaveDigStartError {
-            message: format!("analog_in_load_queue error: {e}"),
-            dwell_actual: None,
-        })?;
+        .map_err(WaveDigStartError::Queue)?;
 
     let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
 
@@ -167,10 +168,10 @@ pub fn start_wave_dig(
         Err(e) if e.code == ERR_BAD_RATE => BAD_RATE_DWELL,
         _ => 1.0 / rate,
     };
-    if let Err(e) = scanned {
-        return Err(WaveDigStartError {
-            message: format!("analog_in_scan error: {e}"),
-            dwell_actual: Some(dwell_actual),
+    if let Err(error) = scanned {
+        return Err(WaveDigStartError::Scan {
+            error,
+            dwell_actual,
         });
     }
 
@@ -219,12 +220,9 @@ pub fn points_transferred(current_index: i64, n_chans: usize, num_points: usize)
 /// when libuldaq reports a transfer error with the status. Ending the scan
 /// (Run back to 0, the data delivered, the scan stopped, an auto-restart)
 /// is the driver's one transition, not this read's. The status call's result
-/// comes back too, for the line C traces.
+/// comes back too, for the line C traces and, on an error, reports.
 pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> (ScanPosition, bool) {
     let report = device.analog_in_scan_status();
-    if let Some(e) = &report.error {
-        log::warn!("WaveDig scan status error: {e}");
-    }
     let position = report.position();
     let n_chans = state.num_chans;
     let last_point = points_transferred(position.index, n_chans, state.num_points);
@@ -243,20 +241,14 @@ pub fn read_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> (ScanPosit
     (position, position.status == SS_IDLE)
 }
 
-/// Stop the waveform digitizer. True when the stop call ran and succeeded,
-/// which C reports with a `Stopping AIn scan` line.
-pub fn stop_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> bool {
+/// Stop the waveform digitizer: the stop call's result, which C reports as
+/// `Stopping AIn scan` -- `None` when no scan was running to stop.
+pub fn stop_wave_dig(device: &DaqDevice, state: &mut WaveDigState) -> Option<error::Result<()>> {
     if !state.running {
-        return false;
+        return None;
     }
     state.running = false;
-    match device.analog_in_scan_stop() {
-        Ok(()) => true,
-        Err(e) => {
-            log::warn!("WaveDig scan stop error: {e}");
-            false
-        }
-    }
+    Some(device.analog_in_scan_stop())
 }
 
 /// Seconds past the EPICS epoch (1990-01-01), as C's

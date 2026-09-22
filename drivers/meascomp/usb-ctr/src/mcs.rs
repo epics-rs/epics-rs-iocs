@@ -4,10 +4,11 @@ use epics_rs::base::runtime::general_time::EPICS_EPOCH_UNIX_SECS;
 
 use meascomp::counter::CounterScanConfig;
 use meascomp::device::DaqDevice;
-use meascomp::error::ScanPosition;
+use meascomp::error::{MeasCompError, ScanPosition};
 use uldaq_sys::*;
 
 use crate::params::*;
+use crate::trace::DRIVER;
 
 /// MCS (Multi-Channel Scaler) acquisition state.
 pub struct McsState {
@@ -176,19 +177,16 @@ pub fn trigger_type(mode: i32) -> Option<i32> {
 /// C `startMCS`: every uldaq failure is logged and the start carries on, and
 /// the scan is marked running whatever `ulDaqInScan` returned. A scan that
 /// did not start is idle from the first `read_mcs`, which ends it like any
-/// finished one -- so MCA_ACQUIRING always comes back to 0. Returns the last
-/// failure, for LAST_ERROR_MESSAGE.
+/// finished one -- so MCA_ACQUIRING always comes back to 0. Returns C's
+/// ASYN_TRACE_ERROR line for each failure, for the caller to print.
 pub fn start_mcs(
     device: &DaqDevice,
     state: &mut McsState,
     scan: &McsScan,
     num_counters: usize,
-) -> Option<String> {
-    let mut failure: Option<String> = None;
-    let mut fail = |msg: String| {
-        log::error!("{msg}");
-        failure = Some(msg);
-    };
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut fail = |line: String| failures.push(line);
     let McsScan {
         num_points,
         dwell_time,
@@ -237,7 +235,10 @@ pub fn start_mcs(
                     },
                 )
             {
-                fail(format!("counter_config_scan({i}) error: {e}"));
+                fail(format!(
+                    "{DRIVER}::startMCS error calling cbCConfigScan, counter={i}, mode=0x{mode:x}, {}",
+                    status_error(&e)
+                ));
             }
 
             let (channel, chan_type) = if i == DIGITAL_IO_COUNTER {
@@ -278,7 +279,10 @@ pub fn start_mcs(
     // interfering with MCS acquisition (matches C++ drvUSBCTR.cpp).
     for (register, value) in [(CRT_OUTPUT_VAL0, 0), (CRT_OUTPUT_VAL1, 0xFFFF_FFFF)] {
         if let Err(e) = device.counter_load(0, register, value) {
-            fail(format!("counter_load({register}) error: {e}"));
+            fail(format!(
+                "{DRIVER}::startMCS error calling cbCLoad32, reg=OUTPUTVALREG, value=0, {}",
+                status_error(&e)
+            ));
         }
     }
 
@@ -288,9 +292,12 @@ pub fn start_mcs(
     // (drvUSBCTR.cpp:579-603).
     if ch_advance_source == CHANNEL_ADVANCE_EXTERNAL && prescale > 1 {
         let top = (prescale - 1) as u64;
+        // C keeps only the configure call's status here (drvUSBCTR.cpp:
+        // 583-602); the clear and loads are reported in the same form.
         if let Err(e) = device.counter_clear(prescale_counter) {
             fail(format!(
-                "prescale counter_clear({prescale_counter}) error: {e}"
+                "{DRIVER}::startMCS error calling ulCClear, counter={prescale_counter}, {}",
+                status_error(&e)
             ));
         }
         for (register, value) in [
@@ -299,14 +306,19 @@ pub fn start_mcs(
             (CRT_MAX_LIMIT, top),
         ] {
             if let Err(e) = device.counter_load(prescale_counter, register, value) {
-                fail(format!("prescale counter_load({register}) error: {e}"));
+                fail(format!(
+                    "{DRIVER}::startMCS error calling ulCLoad, counter={prescale_counter}, \
+                     reg={register}, value={value}, {}",
+                    status_error(&e)
+                ));
             }
         }
+        let mode = CMM_OUTPUT_ON | CMM_RANGE_LIMIT_ON;
         if let Err(e) = device.counter_config_scan(
             prescale_counter,
             &CounterScanConfig {
                 measurement_type: CMT_COUNT,
-                measurement_mode: CMM_OUTPUT_ON | CMM_RANGE_LIMIT_ON,
+                measurement_mode: mode,
                 edge_detection: CED_RISING_EDGE,
                 tick_size: CTS_TICK_20PT83ns,
                 debounce_mode: CDM_NONE,
@@ -314,7 +326,11 @@ pub fn start_mcs(
                 flags: CF_DEFAULT,
             },
         ) {
-            fail(format!("prescale counter_config_scan error: {e}"));
+            fail(format!(
+                "{DRIVER}::startMCS error calling cbCConfigScan, counter={prescale_counter}, \
+                 mode=0x{mode:x}, {}",
+                status_error(&e)
+            ));
         }
     }
 
@@ -335,12 +351,23 @@ pub fn start_mcs(
             state.num_counters_enabled,
             max_pts
         ),
-        Err(e) => fail(format!("daq_in_scan error: {e}")),
+        Err(e) => fail(format!(
+            "{DRIVER}::startMCS error calling ulDaqInScan, numChans={}, numPoints={}, \
+             rate={rate:.6}, options=0x{options:x}, flags=0x{flags:x}, {}",
+            chan_descs.len(),
+            state.scan_points,
+            status_error(&e)
+        )),
     }
 
     state.running = true;
     state.current_point = 0;
-    failure
+    failures
+}
+
+/// C's `status=%d, error=%s` tail, from libuldaq's code and message.
+pub(crate) fn status_error(e: &MeasCompError) -> String {
+    format!("status={}, error={}", e.code, e.message)
 }
 
 /// Number of complete scan points behind `current_index`; see
@@ -356,7 +383,7 @@ pub fn points_transferred(current_index: i64, n_chans: usize, max_points: usize)
 /// What one poll of the scan found, for the poller to publish (C `readMCS`
 /// sets these parameters itself; here the owner of the parameters applies
 /// them).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct McsReadout {
     pub current_point: usize,
     /// Seconds since the scan was started or last erased.
@@ -365,6 +392,9 @@ pub struct McsReadout {
     pub finished: bool,
     /// What the status call returned, which C `readMCS` traces.
     pub position: ScanPosition,
+    /// C `stopMCS`'s ASYN_TRACE_ERROR line, when the scan ended here and
+    /// stopping it failed.
+    pub stop_error: Option<String>,
 }
 
 /// C `readMCS`: copy every point transferred since the last read, then end
@@ -376,11 +406,9 @@ pub struct McsReadout {
 /// rejected at start is idle from the first read.
 pub fn read_mcs(device: &DaqDevice, state: &mut McsState, preset_real: f64) -> McsReadout {
     // C uses the scan state whatever the status call returned: a scan that
-    // ended on a transfer error is idle, and ends like any other.
+    // ended on a transfer error is idle, and ends like any other. C prints
+    // no error for the call; its status is in the FLOW line.
     let report = device.daq_in_scan_status();
-    if let Some(e) = &report.error {
-        log::warn!("MCS scan status error: {e}");
-    }
     if report.status == SS_IDLE {
         state.running = false;
     }
@@ -391,14 +419,13 @@ pub fn read_mcs(device: &DaqDevice, state: &mut McsState, preset_real: f64) -> M
         state.running = false;
     }
     let finished = !state.running;
-    if finished {
-        scan_stop(device);
-    }
+    let stop_error = if finished { scan_stop(device) } else { None };
     McsReadout {
         current_point: state.current_point,
         elapsed,
         finished,
         position: report.position(),
+        stop_error,
     }
 }
 
@@ -421,10 +448,14 @@ fn copy_transferred_points(state: &mut McsState, current_index: i64) {
     }
 }
 
-fn scan_stop(device: &DaqDevice) {
-    if let Err(e) = device.daq_in_scan_stop() {
-        log::warn!("MCS daq_in_scan_stop error: {e}");
-    }
+/// C `stopMCS`'s stop call; its ASYN_TRACE_ERROR line if it failed.
+fn scan_stop(device: &DaqDevice) -> Option<String> {
+    device.daq_in_scan_stop().err().map(|e| {
+        format!(
+            "{DRIVER}::stopMCS ERROR calling cbStopBackground(CTRFUNCTION), {}",
+            status_error(&e)
+        )
+    })
 }
 
 /// C `stopMCS` on a forced stop: the scan is marked stopped first, then one

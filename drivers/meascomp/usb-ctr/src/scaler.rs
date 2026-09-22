@@ -3,7 +3,9 @@ use meascomp::device::DaqDevice;
 use meascomp::error::ScanPosition;
 use uldaq_sys::*;
 
+use crate::mcs::status_error;
 use crate::params::*;
+use crate::trace::DRIVER;
 
 /// Shared scaler state between the driver (arm/reset) and poller (read/done).
 pub struct ScalerState {
@@ -47,15 +49,32 @@ fn load_presets(
         if state.presets[i] > 0 {
             device
                 .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
-                .map_err(|e| format!("counter_load MAX_LIMIT({i}) error: {e}"))?;
+                .map_err(|e| {
+                    format!(
+                        "{DRIVER}::setScalerPresets error calling cbCLoad32, counter={i}, \
+                         presetCounts={}, {}",
+                        state.presets[i],
+                        status_error(&e)
+                    )
+                })?;
         }
     }
-    device
-        .counter_load(0, CRT_OUTPUT_VAL0, 0)
-        .map_err(|e| format!("counter_load OUTPUT_VAL0 error: {e}"))?;
+    device.counter_load(0, CRT_OUTPUT_VAL0, 0).map_err(|e| {
+        format!(
+            "{DRIVER}::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL0REG0, value=0, {}",
+            status_error(&e)
+        )
+    })?;
     device
         .counter_load(0, CRT_OUTPUT_VAL1, state.presets[0])
-        .map_err(|e| format!("counter_load OUTPUT_VAL1 error: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "{DRIVER}::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL1REG0, \
+                 value={}, {}",
+                state.presets[0],
+                status_error(&e)
+            )
+        })?;
     Ok(())
 }
 
@@ -95,12 +114,19 @@ pub fn start_scaler(
                     flags: CF_DEFAULT,
                 },
             )
-            .map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "{DRIVER}::startScaler error calling ulCConfigScan, counter={i}, \
+                     mode=0x{mode:x}, {}",
+                    status_error(&e)
+                )
+            })?;
     }
 
     // Start continuous counter scan
     // C startScaler: 20 samples per counter at 100 Hz, continuous.
-    let mut rate = 100.0;
+    const RATE: f64 = 100.0;
+    let mut rate = RATE;
     let samples = num_counters as usize * SAMPLES_PER_COUNTER;
     if state.scan_buffer.len() < samples {
         state.scan_buffer.resize(samples, 0);
@@ -118,7 +144,17 @@ pub fn start_scaler(
             &mut rate,
             &mut state.scan_buffer[..samples],
         )
-        .map_err(|e| format!("counter_in_scan error: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "{DRIVER}::startScaler error calling ulCInScan, firstCounter=0, lastCounter={}, \
+                 samplesPerCounter={SAMPLES_PER_COUNTER}, rate={RATE}, options=0x{:x}, \
+                 flags=0x{:x}, {}",
+                num_counters - 1,
+                SO_CONTINUOUS | SO_SINGLEIO,
+                CINSCAN_FF_CTR64_BIT,
+                status_error(&e)
+            )
+        })?;
 
     state.running = true;
     state.done = false;
@@ -127,21 +163,21 @@ pub fn start_scaler(
 }
 
 /// What one C `readScaler` saw, for the lines it traces: the status call,
-/// and the start of the last complete sample set (`None` before the first).
+/// the start of the last complete sample set (`None` before the first), and
+/// `stopScaler`'s ASYN_TRACE_ERROR line if a preset ended the count and the
+/// stop failed.
 pub struct ScalerRead {
     pub position: ScanPosition,
     pub last_index: Option<usize>,
+    pub stop_error: Option<String>,
 }
 
 /// Read latest counter values from the scan buffer. Check for preset completion.
 pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState, num_counters: usize) -> ScalerRead {
     // C readScaler polls the scan only for its position; the scan status
-    // itself never ends a count -- only a preset does.
-    let report = device.counter_in_scan_status();
-    if let Some(e) = &report.error {
-        log::warn!("scaler scan status error: {e}");
-    }
-    let position = report.position();
+    // itself never ends a count -- only a preset does. C prints no error for
+    // the call; its status is in the FLOW line.
+    let position = device.counter_in_scan_status().position();
     let buf_len = (num_counters * SAMPLES_PER_COUNTER).min(state.scan_buffer.len());
     let Some((counts, done, last_index)) = scan_sets(
         &state.scan_buffer[..buf_len],
@@ -152,16 +188,19 @@ pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState, num_counters: us
         return ScalerRead {
             position,
             last_index: None,
+            stop_error: None,
         };
     };
     state.counts[..num_counters].copy_from_slice(&counts[..num_counters]);
+    let mut stop_error = None;
     if done {
-        stop_scaler(device, state);
+        stop_error = stop_scaler(device, state);
         state.done = true;
     }
     ScalerRead {
         position,
         last_index: Some(last_index),
+        stop_error,
     }
 }
 
@@ -201,26 +240,41 @@ fn scan_sets(
     Some((counts, false, last_index))
 }
 
-/// Stop the counter scan.
-pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState) {
-    if state.running {
-        if let Err(e) = device.counter_in_scan_stop() {
-            log::warn!("scaler scan stop error: {e}");
-        }
-        state.running = false;
+/// Stop the counter scan; C `stopScaler`'s ASYN_TRACE_ERROR line if the
+/// stop call failed.
+pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState) -> Option<String> {
+    if !state.running {
+        return None;
     }
+    state.running = false;
+    device.counter_in_scan_stop().err().map(|e| {
+        format!(
+            "{DRIVER}::stopScaler ERROR calling cbStopBackground(CTRFUNCTION), {}",
+            status_error(&e)
+        )
+    })
 }
 
 /// Reset all counters to zero.
-pub fn reset_scaler(device: &DaqDevice, state: &mut ScalerState, num_counters: usize) {
-    stop_scaler(device, state);
+/// Returns the ASYN_TRACE_ERROR line of each call that failed: C's
+/// `resetScaler` is only `stopScaler`; the clears are reported in its form.
+pub fn reset_scaler(
+    device: &DaqDevice,
+    state: &mut ScalerState,
+    num_counters: usize,
+) -> Vec<String> {
+    let mut failures: Vec<String> = stop_scaler(device, state).into_iter().collect();
     for i in 0..num_counters {
         state.counts[i] = 0;
         if let Err(e) = device.counter_clear(i as i32) {
-            log::warn!("counter_clear({i}) error: {e}");
+            failures.push(format!(
+                "{DRIVER}::resetScaler error calling ulCClear, counter={i}, {}",
+                status_error(&e)
+            ));
         }
     }
     state.done = false;
+    failures
 }
 
 #[cfg(test)]

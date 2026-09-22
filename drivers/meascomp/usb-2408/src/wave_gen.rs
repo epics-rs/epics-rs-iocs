@@ -1,6 +1,6 @@
 use meascomp::analog_out::AOutScanConfig;
 use meascomp::device::DaqDevice;
-use meascomp::error::ScanPosition;
+use meascomp::error::{self, ScanPosition};
 use uldaq_sys::*;
 
 use crate::params::*;
@@ -240,14 +240,15 @@ pub struct WaveGenScan {
     pub retrigger: bool,
 }
 
-/// Start the waveform generator (analog output scan).
+/// Start the waveform generator (analog output scan), returning the scan
+/// options it runs with.
 pub fn start_wave_gen(
     device: &DaqDevice,
     state: &mut WaveGenState,
     scan: &WaveGenScan,
     waveform_data: &[f64],
     saved_outputs: [Option<f64>; MAX_ANALOG_OUT],
-) -> Result<i32, String> {
+) -> error::Result<i32> {
     let WaveGenScan {
         first_chan,
         last_chan,
@@ -292,20 +293,18 @@ pub fn start_wave_gen(
         options |= SO_RETRIGGER;
     }
 
-    device
-        .analog_out_scan(
-            &AOutScanConfig {
-                low_chan: first_chan,
-                high_chan: last_chan,
-                range,
-                samples_per_chan: num_points as i32,
-                options,
-                flags: AOUTSCAN_FF_NOSCALEDATA,
-            },
-            &mut rate,
-            &mut state.scan_buffer,
-        )
-        .map_err(|e| format!("analog_out_scan error: {e}"))?;
+    device.analog_out_scan(
+        &AOutScanConfig {
+            low_chan: first_chan,
+            high_chan: last_chan,
+            range,
+            samples_per_chan: num_points as i32,
+            options,
+            flags: AOUTSCAN_FF_NOSCALEDATA,
+        },
+        &mut rate,
+        &mut state.scan_buffer,
+    )?;
 
     state.dwell_actual = if rate > 0.0 { 1.0 / rate } else { 0.001 };
     state.running = true;
@@ -314,15 +313,14 @@ pub fn start_wave_gen(
 }
 
 /// C pollerThread's generator block: the current point, and whether the scan
-/// has gone idle -- with what the status call returned, which C traces.
-/// Ending the scan (Run back to 0, the outputs put back) is the driver's
-/// transition, not this read's.
+/// has gone idle -- with what the status call returned, which C traces and,
+/// on an error, reports. Ending the scan (Run back to 0, the outputs put
+/// back) is the driver's transition, not this read's.
 pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) -> (ScanPosition, bool) {
     let report = device.analog_out_scan_status();
     let position = report.position();
     // C skips the rest of the cycle on a status error (goto error).
-    if let Some(e) = report.error {
-        log::warn!("WaveGen scan status error: {e}");
+    if report.error.is_some() {
         return (position, false);
     }
     if state.num_chans > 0 && position.index >= 0 {
@@ -332,26 +330,30 @@ pub fn read_wave_gen(device: &DaqDevice, state: &mut WaveGenState) -> (ScanPosit
 }
 
 /// Stop the waveform generator and restore saved output values. Returns the
-/// channels put back, each of which C reports with a `calling AOut` line.
-pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState) -> Vec<usize> {
-    let mut restored = Vec::new();
-    if state.running {
-        if let Err(e) = device.analog_out_scan_stop() {
-            log::warn!("WaveGen scan stop error: {e}");
-        }
-        // C stopWaveGen puts back only the channels the scan drove
-        // (drvMultiFunction.cpp:1721-1733); any other output keeps its value.
-        for (ch, saved) in state.saved_outputs.iter_mut().enumerate() {
-            if let Some(value) = saved.take() {
-                match device.analog_out(ch as i32, BIP10VOLTS, AOUT_FF_NOSCALEDATA, value) {
-                    Ok(()) => restored.push(ch),
-                    Err(e) => log::warn!("WaveGen restore AO{ch} error: {e}"),
-                }
-            }
-        }
-        state.running = false;
+/// scan stop's result and each put-back channel's `ulAOut` result, which C
+/// reports one by one as `calling AOut`; a generator that is not running is
+/// left alone.
+pub fn stop_wave_gen(
+    device: &DaqDevice,
+    state: &mut WaveGenState,
+) -> (error::Result<()>, Vec<error::Result<()>>) {
+    if !state.running {
+        return (Ok(()), Vec::new());
     }
-    restored
+    let stopped = device.analog_out_scan_stop();
+    // C stopWaveGen puts back only the channels the scan drove
+    // (drvMultiFunction.cpp:1721-1733); any other output keeps its value.
+    let restored = state
+        .saved_outputs
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(ch, saved)| {
+            let value = saved.take()?;
+            Some(device.analog_out(ch as i32, BIP10VOLTS, AOUT_FF_NOSCALEDATA, value))
+        })
+        .collect();
+    state.running = false;
+    (stopped, restored)
 }
 
 #[cfg(test)]

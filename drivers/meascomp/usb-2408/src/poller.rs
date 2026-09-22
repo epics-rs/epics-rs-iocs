@@ -7,6 +7,7 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
+use meascomp::error::MeasCompError;
 
 use crate::params::*;
 use crate::trace::{self, DRIVER};
@@ -52,8 +53,32 @@ struct PollSnapshot {
     // Analog inputs (only populated when wave_dig is not running)
     ai_raw: [Option<i32>; MAX_ANALOG_IN],
     ai_temp: [Option<f64>; MAX_ANALOG_IN],
-    // Errors to log after releasing the lock.
-    errors: Vec<String>,
+    /// The C lines of the first call that failed this cycle. C prints them
+    /// only when the previous cycle did not fail, and only that call's,
+    /// since it abandons the cycle there (`goto error`).
+    failure: Vec<String>,
+    /// The first ulTIn failure's line. C prints every one as it happens,
+    /// every cycle, so it is printed on the spot; it fails the cycle all
+    /// the same.
+    tin_failure: Option<String>,
+}
+
+impl PollSnapshot {
+    /// Keep a failed call's C lines, if it is the cycle's first failure.
+    fn failed(&mut self, lines: Vec<String>) {
+        if self.failure.is_empty() {
+            self.failure = lines;
+        }
+    }
+}
+
+/// C `reportError(err, "pollerThread", message)` for a failed call
+/// (drvMultiFunction.cpp:1315-1318).
+fn error_line(message: &str, e: &MeasCompError) -> String {
+    format!(
+        "{DRIVER}::pollerThread Error: {message}, err={} {}",
+        e.code, e.message
+    )
 }
 
 fn poller_loop(
@@ -109,13 +134,18 @@ fn poller_loop(
             if let Ok(dev) = device.lock() {
                 match dev.digital_in(uldaq_sys::AUXPORT) {
                     Ok(data) => snap.digital_input = Some(data),
-                    Err(e) => snap.errors.push(format!("DIn: {e}")),
+                    // C adds the index of the port that failed
+                    // (drvMultiFunction.cpp:2620-2623).
+                    Err(e) => snap.failed(vec![
+                        error_line("Calling DIn", &e),
+                        "portNumber=0".to_string(),
+                    ]),
                 }
 
                 for counter in 0..MAX_COUNTERS {
                     match dev.counter_in(counter as i32) {
                         Ok(value) => snap.counters[counter] = Some(value as i64),
-                        Err(e) => snap.errors.push(format!("CIn({counter}): {e}")),
+                        Err(e) => snap.failed(vec![error_line("Calling CIn", &e)]),
                     }
                 }
 
@@ -132,6 +162,11 @@ fn poller_loop(
                                     p.status, p.total_count, p.index
                                 ),
                             );
+                        } else {
+                            snap.failed(vec![error_line(
+                                "Calling AOutScanStatus",
+                                &MeasCompError::from_code(p.code),
+                            )]);
                         }
                         if ended {
                             snap.wave_gen_ended = Some(st.wave_gen.generation);
@@ -152,6 +187,11 @@ fn poller_loop(
                                     p.status, p.total_count, p.index
                                 ),
                             );
+                        } else {
+                            snap.failed(vec![error_line(
+                                "Calling AInScanStatus",
+                                &MeasCompError::from_code(p.code),
+                            )]);
                         }
                         if ended {
                             snap.wave_dig_ended = Some(st.wave_dig.generation);
@@ -178,7 +218,11 @@ fn poller_loop(
                                     uldaq_sys::AIN_FF_NOSCALEDATA,
                                 ) {
                                     Ok(raw) => snap.ai_raw[ch] = Some(raw as i32),
-                                    Err(e) => snap.errors.push(format!("AIn({ch}): {e}")),
+                                    // C's USB-2408 branch fails the cycle on
+                                    // it without a line of its own; the one C
+                                    // prints for the USB-TEMP-AI's ulAIn
+                                    // (drvMultiFunction.cpp:2754) says which.
+                                    Err(e) => snap.failed(vec![error_line("Calling AIn", &e)]),
                                 }
                             } else {
                                 // An open or broken thermocouple is expected,
@@ -193,7 +237,13 @@ fn poller_loop(
                                         Some(-9999.0)
                                     }
                                     Err(e) => {
-                                        snap.errors.push(format!("TIn({ch}): {e}"));
+                                        let line = error_line("Calling TIn", &e);
+                                        trace::print(
+                                            &handle,
+                                            TraceMask::ERROR,
+                                            format_args!("{line}"),
+                                        );
+                                        snap.tin_failure.get_or_insert(line);
                                         None
                                     }
                                 };
@@ -216,24 +266,28 @@ fn poller_loop(
             snap
         }; // device lock released here
 
-        // ---- Phase 3: log + write results (no device lock) ----
-        let failed = !snapshot.errors.is_empty();
+        // ---- Phase 3: report + write results (no device lock) ----
+        let failed = !snapshot.failure.is_empty() || snapshot.tin_failure.is_some();
         if failed && !prev_failed {
-            for msg in &snapshot.errors {
-                log::warn!("USB-2408 poller {msg}");
+            for line in &snapshot.failure {
+                trace::print(&handle, TraceMask::ERROR, format_args!("{line}"));
             }
-            if let Some(msg) = snapshot.errors.last() {
+            if let Some(line) = snapshot.failure.first().or(snapshot.tin_failure.as_ref()) {
                 let _ = handle.set_params_and_notify_blocking(
                     0,
                     vec![ParamSetValue::new(
                         params.last_error_message,
                         0,
-                        ParamValue::Octet(msg.clone().into_bytes()),
+                        ParamValue::Octet(line.clone().into_bytes()),
                     )],
                 );
             }
         } else if !failed && prev_failed {
-            log::warn!("USB-2408 poller: device returned to normal status");
+            trace::print(
+                &handle,
+                TraceMask::ERROR,
+                format_args!("{DRIVER}::pollerThread Error: Device returned to normal status"),
+            );
         }
         prev_failed = failed;
 
@@ -361,6 +415,29 @@ mod tests {
     fn a_fractional_poll_sleep_is_kept() {
         assert_eq!(poll_sleep(0.5), Duration::from_micros(500));
         assert_eq!(poll_sleep(50.0), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_cycle_keeps_only_its_first_failure() {
+        let mut snap = PollSnapshot::default();
+        snap.failed(vec!["DIn".to_string(), "portNumber=0".to_string()]);
+        snap.failed(vec!["CIn".to_string()]);
+        assert_eq!(snap.failure, ["DIn", "portNumber=0"]);
+    }
+
+    #[test]
+    fn a_failed_call_is_reported_in_c_words() {
+        let e = MeasCompError {
+            code: uldaq_sys::ERR_DEV_NOT_CONNECTED,
+            message: "Device not connected".to_string(),
+        };
+        assert_eq!(
+            error_line("Calling CIn", &e),
+            format!(
+                "MultiFunction::pollerThread Error: Calling CIn, err={} Device not connected",
+                uldaq_sys::ERR_DEV_NOT_CONNECTED
+            )
+        );
     }
 
     #[test]

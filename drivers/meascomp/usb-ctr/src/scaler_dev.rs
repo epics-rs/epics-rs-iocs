@@ -48,6 +48,13 @@ impl CtrScalerDriver {
     }
 }
 
+impl CtrScalerDriver {
+    /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`.
+    fn error(&self, line: &str) {
+        trace::print(&self.port, None, TraceMask::ERROR, format_args!("{line}"));
+    }
+}
+
 impl ScalerDriver for CtrScalerDriver {
     /// C skips a scaler reset or arm while the MCS runs (drvUSBCTR.cpp:1160,
     /// 1171): the counters belong to the scan until it ends.
@@ -58,7 +65,9 @@ impl ScalerDriver for CtrScalerDriver {
             return Ok(());
         }
         let num_counters = st.num_counters;
-        scaler::reset_scaler(&dev, &mut st.scaler, num_counters);
+        for line in scaler::reset_scaler(&dev, &mut st.scaler, num_counters) {
+            self.error(&line);
+        }
         st.scaler.presets = [0; MAX_COUNTERS];
         Ok(())
     }
@@ -104,13 +113,14 @@ impl ScalerDriver for CtrScalerDriver {
         if st.mcs.running {
             return Ok(());
         }
-        if start {
+        let failure = if start {
             let num_counters = st.num_counters;
-            if let Err(e) = scaler::start_scaler(&dev, &mut st.scaler, num_counters) {
-                log::error!("start_scaler error: {e}");
-            }
+            scaler::start_scaler(&dev, &mut st.scaler, num_counters).err()
         } else {
-            scaler::stop_scaler(&dev, &mut st.scaler);
+            scaler::stop_scaler(&dev, &mut st.scaler)
+        };
+        if let Some(line) = failure {
+            self.error(&line);
         }
         Ok(())
     }

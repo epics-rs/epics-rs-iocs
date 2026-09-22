@@ -91,7 +91,10 @@ fn poller_loop(
             if let Ok(dev) = device.lock() {
                 match dev.digital_in(uldaq_sys::AUXPORT) {
                     Ok(data) => snap.digital_input = Some(data),
-                    Err(e) => snap.errors.push(format!("DIn: {e}")),
+                    Err(e) => snap.errors.push(format!(
+                        "{DRIVER}:pollerThread: ERROR calling cbDIn, status={}",
+                        e.code
+                    )),
                 }
 
                 if let Ok(mut st) = state.lock() {
@@ -105,6 +108,7 @@ fn poller_loop(
                             TraceMask::FLOW,
                             format_args!("{}", GetStatus("readScaler", read.position)),
                         );
+                        snap.errors.extend(read.stop_error);
                         if let Some(last_index) = read.last_index {
                             trace::print(
                                 &handle,
@@ -128,6 +132,7 @@ fn poller_loop(
                             TraceMask::FLOW,
                             format_args!("{}", GetStatus("readMCS", readout.position)),
                         );
+                        snap.errors.extend(readout.stop_error);
                         snap.mcs_running = true;
                         snap.mcs_current_point = readout.current_point;
                         snap.mcs_just_stopped = readout.finished;
@@ -136,7 +141,13 @@ fn poller_loop(
                         for counter in 0..num_counters {
                             match dev.counter_in(counter as i32) {
                                 Ok(value) => snap.counters[counter] = Some(value as i64),
-                                Err(e) => snap.errors.push(format!("CIn({counter}): {e}")),
+                                // C does not check ulCIn; reported in the
+                                // form of its DIn line.
+                                Err(e) => snap.errors.push(format!(
+                                    "{DRIVER}:pollerThread: ERROR calling ulCIn, counter={counter}, \
+                                     status={}",
+                                    e.code
+                                )),
                             }
                         }
                     }
@@ -146,8 +157,9 @@ fn poller_loop(
         }; // device lock released here
 
         // ---- Phase 2: log + write results (no device lock) ----
+        // C prints its DIn failure on every cycle it happens.
         for msg in &snapshot.errors {
-            log::warn!("CTR poller {msg}");
+            trace::print(&handle, None, TraceMask::ERROR, format_args!("{msg}"));
         }
         if let Some(msg) = snapshot.errors.last() {
             let _ = handle.set_params_and_notify_blocking(
