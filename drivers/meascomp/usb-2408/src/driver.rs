@@ -731,9 +731,12 @@ impl PortDriver for MultiFunctionDriver {
                                 (0..num_points).map(|i| user[i % user.len()]).collect()
                             });
                         } else {
-                            per_chan.push(wave_gen::generate_waveform(
-                                wave_type, num_points, amp, offset, pw,
-                            ));
+                            per_chan.push(
+                                wave_gen::generate_waveform(wave_type, num_points, amp, offset, pw)
+                                    .into_iter()
+                                    .map(f64::from)
+                                    .collect(),
+                            );
                         }
                     }
                     // Interleave: [ch0_pt0, ch1_pt0, ch0_pt1, ch1_pt1, ...]

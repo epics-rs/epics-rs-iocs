@@ -72,55 +72,62 @@ pub const WAVE_TYPE_RANDOM: i32 = 5;
 ///
 /// `amplitude` is peak-to-peak, as C `defineWaveform` takes it: sin, square,
 /// sawtooth and random span `offset +/- amplitude/2`; the pulse goes from
-/// `offset` to `offset + amplitude`.
+/// `offset` to `offset + amplitude`. Samples are `f32`, C's
+/// `waveGenIntBuffer_` precision, so the DAC codes they convert to match.
 pub fn generate_waveform(
     wave_type: i32,
     num_points: usize,
     amplitude: f64,
     offset: f64,
     pulse_width: f64,
-) -> Vec<f64> {
-    let mut data = vec![0.0f64; num_points];
+) -> Vec<f32> {
+    let mut data = vec![0.0f32; num_points];
     let n = num_points as f64;
     let base = offset - amplitude / 2.0;
+    // C divides by numPoints-1 so the sine's last point closes the period and
+    // the sawtooth ends exactly at base + amplitude; a 1-point waveform keeps
+    // a well-defined 0 phase instead of C's 0/0.
+    let span = num_points.saturating_sub(1).max(1) as f64;
 
     match wave_type {
         WAVE_TYPE_SIN => {
+            let scale = 2.0 * std::f64::consts::PI / span;
             for (i, d) in data.iter_mut().enumerate() {
-                *d = offset + amplitude / 2.0 * (2.0 * std::f64::consts::PI * i as f64 / n).sin();
+                *d = (offset + amplitude / 2.0 * (i as f64 * scale).sin()) as f32;
             }
         }
         WAVE_TYPE_SQUARE => {
             for (i, d) in data.iter_mut().enumerate() {
                 *d = if i < num_points / 2 {
-                    base + amplitude
+                    (base + amplitude) as f32
                 } else {
-                    base
+                    base as f32
                 };
             }
         }
         WAVE_TYPE_SAWTOOTH => {
+            let scale = 1.0 / span;
             for (i, d) in data.iter_mut().enumerate() {
-                *d = base + amplitude * i as f64 / n;
+                *d = (base + amplitude * i as f64 * scale) as f32;
             }
         }
         WAVE_TYPE_PULSE => {
             let pulse_samples = ((pulse_width * n) as usize).max(1).min(num_points);
             for (i, d) in data.iter_mut().enumerate() {
                 *d = if i < pulse_samples {
-                    offset + amplitude
+                    (offset + amplitude) as f32
                 } else {
-                    offset
+                    offset as f32
                 };
             }
         }
         WAVE_TYPE_RANDOM => {
-            // Simple pseudo-random using a basic LCG
-            let mut seed: u64 = 12345;
+            // C: srand(1) then rand() per point, so every run -- and every
+            // C IOC -- emits the same sequence.
+            let mut rng = GlibcRand::new(1);
+            let scale = amplitude / GlibcRand::RAND_MAX as f64;
             for d in &mut data {
-                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let frac = (seed >> 33) as f64 / (1u64 << 31) as f64; // 0..1
-                *d = base + amplitude * frac;
+                *d = (base + rng.next() as f64 * scale) as f32;
             }
         }
         _ => {
@@ -129,6 +136,49 @@ pub fn generate_waveform(
         }
     }
     data
+}
+
+/// glibc's `rand()` (the TYPE_3 additive-feedback generator `srand` seeds),
+/// the one C `defineWaveform` draws its random waveform from on Linux.
+struct GlibcRand {
+    r: [u32; 34],
+    i: usize,
+}
+
+impl GlibcRand {
+    const RAND_MAX: u32 = 0x7FFF_FFFF;
+
+    fn new(seed: u32) -> Self {
+        let mut r = [0u32; 34];
+        r[0] = seed;
+        for i in 1..31 {
+            // r[i] = (16807 * r[i-1]) % 2147483647, as a signed 32-bit word.
+            let v = (16807 * r[i - 1] as i32 as i64) % 2_147_483_647;
+            r[i] = if v < 0 { v + 2_147_483_647 } else { v } as u32;
+        }
+        for i in 31..34 {
+            r[i] = r[i - 31];
+        }
+        let mut rng = Self { r, i: 0 };
+        // glibc discards the first 310 outputs of a fresh seed.
+        for _ in 0..310 {
+            rng.step();
+        }
+        rng
+    }
+
+    /// r[k] = r[k-31] + r[k-3] over a 34-word ring.
+    fn step(&mut self) -> u32 {
+        let k = self.i;
+        let v = self.r[(k + 34 - 31) % 34].wrapping_add(self.r[(k + 34 - 3) % 34]);
+        self.r[k % 34] = v;
+        self.i = (k + 1) % 34;
+        v
+    }
+
+    fn next(&mut self) -> u32 {
+        self.step() >> 1
+    }
 }
 
 /// Generation settings for [`start_wave_gen`], read from the WaveGen records.
@@ -292,6 +342,30 @@ mod tests {
     }
 
     #[test]
+    fn the_random_sequence_is_glibc_rand_after_srand_1() {
+        let mut rng = GlibcRand::new(1);
+        let first: Vec<u32> = (0..5).map(|_| rng.next()).collect();
+        assert_eq!(
+            first,
+            vec![1804289383, 846930886, 1681692777, 1714636915, 1957747793]
+        );
+    }
+
+    #[test]
+    fn a_sawtooth_ends_at_the_top_of_its_span() {
+        let data = generate_waveform(WAVE_TYPE_SAWTOOTH, 4, 2.0, 0.0, 0.5);
+        assert_eq!(data[0], -1.0);
+        assert_eq!(data[3], 1.0);
+    }
+
+    #[test]
+    fn a_sine_period_closes_on_its_last_point() {
+        let data = generate_waveform(WAVE_TYPE_SIN, 5, 2.0, 0.0, 0.5);
+        assert!(data[4].abs() < 1e-6, "last point {}", data[4]);
+        assert!((data[1] - 1.0).abs() < 1e-6, "quarter period {}", data[1]);
+    }
+
+    #[test]
     fn a_square_wave_is_half_high_half_low_around_the_offset() {
         // 2 V peak-to-peak about 1 V: 2 V then 0 V (C base + amplitude, base).
         let data = generate_waveform(WAVE_TYPE_SQUARE, 4, 2.0, 1.0, 0.5);
@@ -300,15 +374,14 @@ mod tests {
 
     #[test]
     fn a_sine_swings_half_the_amplitude_about_the_offset() {
-        let data = generate_waveform(WAVE_TYPE_SIN, 4, 2.0, 0.0, 0.5);
-        let peak = data.iter().cloned().fold(f64::MIN, f64::max);
-        assert!((peak - 1.0).abs() < 1e-12, "peak {peak}");
+        let data = generate_waveform(WAVE_TYPE_SIN, 5, 2.0, 0.0, 0.5);
+        let peak = data.iter().cloned().fold(f32::MIN, f32::max);
+        assert!((peak - 1.0).abs() < 1e-6, "peak {peak}");
     }
 
     #[test]
     fn a_sawtooth_starts_half_the_amplitude_below_the_offset() {
         let data = generate_waveform(WAVE_TYPE_SAWTOOTH, 4, 2.0, 0.0, 0.5);
-        assert_eq!(data[0], -1.0);
         assert!(data.iter().all(|v| (-1.0..=1.0).contains(v)));
     }
 

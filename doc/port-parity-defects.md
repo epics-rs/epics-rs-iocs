@@ -820,7 +820,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** wrong pulse length, no delay, all-high when width ≥ period.
 - **Class:** ref-faithful. **Live:** static.
 
-## PP-89 [LOW] Sin/sawtooth period divisor `n` instead of `numPoints-1`; different random generator — OPEN (regression of PP-41 LOW, fix never merged)
+## PP-89 [LOW] Sin/sawtooth period divisor `n` instead of `numPoints-1`; different random generator — FIXED (regression of PP-41 LOW, fix never merged)
 - **Rust:** `wave_gen.rs:79,93,108-112`.
 - **C:** `drvMultiFunction.cpp:1545,1553,1569-1570` (`srand(1); rand()`), float32 staging (`:1506,1660`).
 - **Impact:** DAC codes differ from C at every point.
