@@ -621,7 +621,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 
 ## usb-ctr — pulse generators, counters, DIO, init
 
-## PP-58 [MED] Pulse-generator input clamps missing — OPEN (regression of PP-42, fix never merged)
+## PP-58 [MED] Pulse-generator input clamps missing — FIXED (regression of PP-42, fix never merged)
 - **Rust:** `pulse_gen.rs:17-21,28` passes frequency (1000 Hz fallback for period ≤ 0), duty and delay raw to `ulTmrPulseOutStart`.
 - **C:** `drvUSBCTR.cpp:465-472` clamps frequency to [0.023, 48e6], duty to [.0001, .9999], delay to [0, 67.11].
 - **Impact:** values C clamps are rejected by libuldaq (`TmrDevice.cpp:61-75`), the generator is left stopped while Run reads Run.
