@@ -100,8 +100,7 @@ dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=Wave
 set_requestfile_path("$(USB_2408_IOC)")
 set_savefile_path("$(USB_2408_IOC)/autosave")
 set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
-# Before iocInit: epics-rs builds the save sets from this configuration when
-# iocInit runs, so a create_monitor_set after it is never scheduled.
-create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
 
 iocInit()
+
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
