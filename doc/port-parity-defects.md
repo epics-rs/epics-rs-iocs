@@ -721,7 +721,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** `asynReport` shows no pulse-gen/scaler/MCS/waveform runtime state.
 - **Class:** unimpl. **Live:** static.
 
-## PP-74 [LOW] Wrapper C-string buffers are `[0i8; N]` — OPEN
+## PP-74 [LOW] Wrapper C-string buffers are `[0i8; N]` — FIXED
 - **Rust:** `meascomp/src/error.rs:15`, `device.rs:89,106`.
 - **C:** libuldaq supports Raspberry Pi OS (`README.md:15`), where `c_char` is `u8`.
 - **Impact:** the crate does not compile on aarch64/armv7 Linux.

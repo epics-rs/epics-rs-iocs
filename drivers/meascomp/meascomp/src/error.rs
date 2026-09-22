@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 use std::fmt;
 
 use uldaq_sys::{self, ERR_MSG_LEN, ERR_NO_ERROR};
@@ -12,7 +12,7 @@ pub struct MeasCompError {
 
 impl MeasCompError {
     pub fn from_code(code: uldaq_sys::UlError) -> Self {
-        let mut buf = [0i8; ERR_MSG_LEN];
+        let mut buf = [0 as c_char; ERR_MSG_LEN];
         unsafe {
             uldaq_sys::ulGetErrMsg(code, buf.as_mut_ptr());
         }

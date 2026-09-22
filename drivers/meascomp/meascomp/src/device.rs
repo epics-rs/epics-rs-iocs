@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 
 use uldaq_sys::*;
 
@@ -86,7 +86,7 @@ impl DaqDevice {
     }
 
     pub fn firmware_version(&self) -> Result<String> {
-        let mut buf = [0i8; 256];
+        let mut buf = [0 as c_char; 256];
         let mut len = buf.len() as u32;
         error::check(unsafe {
             ulDevGetConfigStr(
@@ -103,7 +103,7 @@ impl DaqDevice {
     }
 
     pub fn ul_version() -> Result<String> {
-        let mut buf = [0i8; 256];
+        let mut buf = [0 as c_char; 256];
         let mut len = buf.len() as u32;
         error::check(unsafe { ulGetInfoStr(UL_INFO_VER_STR, 0, buf.as_mut_ptr(), &mut len) })?;
         Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }
