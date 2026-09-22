@@ -6,6 +6,8 @@ pub const MAX_ANALOG_IN: usize = 8;
 pub const MAX_ANALOG_OUT: usize = 2;
 pub const MAX_COUNTERS: usize = 2;
 pub const NUM_IO_BITS: usize = 8;
+/// Every AUXPORT bit (C `digitalIOMask_`).
+pub const PORT_MASK: u32 = (1 << NUM_IO_BITS) - 1;
 pub const MAX_SIGNALS: usize = 64; // same as C++ MAX_TEMPERATURE_IN
 
 /// Parameter indices for the USB-2408-2AO driver.

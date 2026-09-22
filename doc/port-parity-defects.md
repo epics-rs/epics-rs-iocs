@@ -633,7 +633,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** after an IOC restart a generator left running keeps pulsing while Run shows Stop; after a rejected start, a later Period/Duty write starts the output without Run being re-written.
 - **Class:** ref-faithful. **Live:** static (output not observable).
 
-## PP-60 [MED] DIGITAL_OUTPUT writes ignore the direction mask (both drivers) — OPEN (regression of PP-41/PP-42 LOW, fix never merged)
+## PP-60 [MED] DIGITAL_OUTPUT writes ignore the direction mask (both drivers) — FIXED (regression of PP-41/PP-42 LOW, fix never merged)
 - **Rust:** `usb-ctr/src/driver.rs:382-393` and `usb-2408/src/driver.rs:677-688` call `ulDBitOut` for every bit in `mask`.
 - **C:** `drvUSBCTR.cpp:1344-1348` and `drvMultiFunction.cpp:2383-2413` write only `mask & outMask & direction` (2408: one `ulDOut` when the whole port is output).
 - **Impact:** CTR: writes to input bits fail with error 51 and pollute LastErrorMessage; 2408: bits C treats as inputs are driven (see PP-62).

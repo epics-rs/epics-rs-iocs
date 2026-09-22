@@ -9,6 +9,7 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
 use meascomp::device::DaqDevice;
+use meascomp::digital_io::output_bits;
 
 use crate::params::*;
 use crate::poller::{self, PollerState};
@@ -680,13 +681,19 @@ impl PortDriver for MultiFunctionDriver {
         let addr = user.addr;
 
         if reason == self.params.digital_output {
+            let direction = self
+                .base
+                .get_uint32_param(self.params.digital_direction, 0)?;
             let dev = self.device.lock().unwrap();
-            for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
-                    let bit_val = (value >> bit) & 1;
-                    if let Err(e) =
-                        dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0)
-                    {
+            if mask & direction == PORT_MASK {
+                // Every bit is an output and every bit is written: one word
+                // write, as C does.
+                if let Err(e) = dev.digital_out(uldaq_sys::AUXPORT, (value & mask) as u64) {
+                    last_error = Some(format!("digital_out error: {e}"));
+                }
+            } else {
+                for (bit, level) in output_bits(value, mask, direction, NUM_IO_BITS) {
+                    if let Err(e) = dev.digital_bit_out(uldaq_sys::AUXPORT, bit, level) {
                         last_error = Some(format!("digital_bit_out error: {e}"));
                     }
                 }
