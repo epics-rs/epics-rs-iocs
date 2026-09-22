@@ -47,7 +47,6 @@ use std::time::Duration;
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -72,8 +71,6 @@ async fn main() -> CaResult<()> {
     };
 
     epics_rs::base::runtime::env::set_default("SYRINGEPUMP", env!("CARGO_MANIFEST_DIR"));
-
-    let trace = Arc::new(TraceManager::new());
 
     let mut app = IocApplication::new();
 
@@ -186,7 +183,7 @@ async fn main() -> CaResult<()> {
     // (ISCO/Vindum wiring goes entirely through these -- see this file's
     // module doc for the scope-split rationale).
     let runtime_handle = epics_rs::base::runtime::task::runtime_handle();
-    app = modbus_rs::ioc::register_modbus_commands(app, runtime_handle, trace.clone());
+    app = modbus_rs::ioc::register_modbus_commands(app, runtime_handle);
 
     // TeledyneDInit(port, serPort, serAddr, unit) -- creates a D-series
     // TeledyneDriver on a pre-configured octet port. No separate *Config
@@ -195,7 +192,6 @@ async fn main() -> CaResult<()> {
     // template instantiation created the record (see driver.rs's module
     // doc), and `unit` is a per-driver-instance constant set once here.
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "TeledyneDInit",
             vec![
@@ -245,7 +241,6 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -257,7 +252,6 @@ async fn main() -> CaResult<()> {
     // TeledyneHInit(port, serPort, serAddr, unit) -- same as TeledyneDInit,
     // H-series.
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "TeledyneHInit",
             vec![
@@ -307,7 +301,6 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
                 )
                 .map_err(|e| e.to_string())?;
 

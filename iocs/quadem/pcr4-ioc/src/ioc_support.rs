@@ -18,7 +18,7 @@ pub fn register(ioc: &mut AdIoc) {
     }
 
     let runtime: Arc<Mutex<Option<Pcr4Runtime>>> = Arc::new(Mutex::new(None));
-    let cmd = pcr4_configure_command(ioc.mgr().clone(), ioc.trace().clone(), runtime.clone());
+    let cmd = pcr4_configure_command(ioc.mgr().clone(), runtime.clone());
     ioc.register_startup_command(cmd);
 
     // Keep the runtime (read thread, callback thread, port actor) alive.

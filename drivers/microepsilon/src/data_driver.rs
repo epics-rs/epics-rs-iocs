@@ -129,7 +129,6 @@ use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::AlarmSeverity;
@@ -611,12 +610,7 @@ fn resolve_tcp_port(ip_port: &str) -> AsynResult<u16> {
 /// self-handle the reader thread needs (see [`DataDriver::self_handle`]), and
 /// register only the outer port -- the `_RBK` port stays unregistered/
 /// invisible, matching C.
-pub fn configure(
-    port_name: &str,
-    ip_address: &str,
-    ip_port: &str,
-    trace: Arc<TraceManager>,
-) -> AsynResult<()> {
+pub fn configure(port_name: &str, ip_address: &str, ip_port: &str) -> AsynResult<()> {
     if port_name.is_empty() || ip_address.is_empty() {
         return Err(AsynError::Status {
             status: AsynStatus::Error,
@@ -640,7 +634,7 @@ pub fn configure(
     let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())?;
     *self_handle.lock().unwrap() = Some(runtime_handle.port_handle().clone());
 
-    asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), trace)?;
+    asyn_record::register_port(port_name, runtime_handle.port_handle().clone())?;
 
     // See the module doc's `PortRuntimeHandle` gap note: both runtimes must
     // outlive this function.

@@ -31,7 +31,6 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
@@ -79,10 +78,10 @@ fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, String> {
 }
 
 /// Every PMAC iocsh command, sharing one controller registry.
-pub fn pmac_commands(holder: &Arc<MotorHolder>, trace: Arc<TraceManager>) -> Vec<CommandDef> {
+pub fn pmac_commands(holder: &Arc<MotorHolder>) -> Vec<CommandDef> {
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     vec![
-        pmac_asyn_ip_configure_command(trace),
+        pmac_asyn_ip_configure_command(),
         pmac_create_controller_command(&registry),
         pmac_create_axis_command(&registry, holder),
         pmac_create_axes_command(&registry, holder),

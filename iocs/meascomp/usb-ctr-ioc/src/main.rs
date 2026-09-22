@@ -48,11 +48,6 @@ async fn main() -> CaResult<()> {
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
-    // The asyn record takes its trace masks and exception list from the
-    // registry entry, so the entry must carry the trace manager the port
-    // runs on: create_port_runtime binds it to PortServices::global().
-    let trace = PortServices::global().trace().clone();
-
     // Runtime kept alive by being captured in the startup command closure
     let runtime: Arc<Mutex<Option<CtrRuntime>>> = Arc::new(Mutex::new(None));
     // Hand-off slot from USBCTRConfig to the scalerRecord bind at iocInit.
@@ -101,7 +96,6 @@ async fn main() -> CaResult<()> {
 
     // USBCTRConfig command
     {
-        let trace_c = trace.clone();
         let rt = runtime.clone();
         let scaler_slot = pending_scaler.clone();
         app = app.register_startup_command(CommandDef::new(
@@ -143,12 +137,8 @@ async fn main() -> CaResult<()> {
                 ));
 
                 let port_handle = ctr_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle)
+                    .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(ctr_rt);
                 Ok(CommandOutcome::Continue)

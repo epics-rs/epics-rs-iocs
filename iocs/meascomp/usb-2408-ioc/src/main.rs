@@ -36,10 +36,6 @@ async fn main() -> CaResult<()> {
     // here, so the two meascomp IOCs never share a request or save file.
     epics_rs::base::runtime::env::set_default("USB_2408_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    // The asyn record takes its trace masks and exception list from the
-    // registry entry, so the entry must carry the trace manager the port
-    // runs on: create_port_runtime binds it to PortServices::global().
-    let trace = PortServices::global().trace().clone();
     let runtime: Arc<Mutex<Option<MultiFunctionRuntime>>> = Arc::new(Mutex::new(None));
 
     let mut app = IocApplication::new();
@@ -66,7 +62,6 @@ async fn main() -> CaResult<()> {
 
     // MultiFunctionConfig command
     {
-        let trace_c = trace.clone();
         let rt = runtime.clone();
         app = app.register_startup_command(CommandDef::new(
             "MultiFunctionConfig",
@@ -110,12 +105,8 @@ async fn main() -> CaResult<()> {
                 let mf_rt = create_usb_2408(&port_name, &unique_id, max_in, max_out)?;
 
                 let port_handle = mf_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle)
+                    .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(mf_rt);
                 Ok(CommandOutcome::Continue)

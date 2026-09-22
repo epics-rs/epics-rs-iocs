@@ -22,7 +22,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     {
         let mgr = ioc.mgr().clone();
-        let trace = ioc.trace().clone();
         let rt = runtime.clone();
         ioc.register_startup_command(CommandDef::new(
             "NDDriverStdArraysConfig",
@@ -75,12 +74,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 let nd_rt = create_nd_std_arrays(&port_name, max_buffers, max_memory)
                     .map_err(|e| format!("failed to create NDDriverStdArrays: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    nd_rt.port_handle().clone(),
-                    trace.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&port_name, nd_rt.port_handle().clone())
+                    .map_err(|e| e.to_string())?;
 
                 // The single address-0 NDArray output doubles as the driver
                 // context for downstream plugin wiring.

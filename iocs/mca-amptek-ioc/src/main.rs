@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -59,7 +58,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("MCA_AMPTEK_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = IocApplication::new();
@@ -73,7 +71,6 @@ async fn main() -> CaResult<()> {
     // drvAmptekConfigure(portName, interface, addressInfo, directMode)
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "drvAmptekConfigure",
             vec![
@@ -110,7 +107,6 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime_handle.port_handle().clone(),
-                    trace.clone(),
                 )
                 .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 ports

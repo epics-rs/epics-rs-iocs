@@ -20,7 +20,7 @@ pub fn register(ioc: &mut AdIoc) {
     }
 
     let runtime: Arc<Mutex<Option<AhxxxRuntime>>> = Arc::new(Mutex::new(None));
-    let cmd = ahxxx_configure_command(ioc.mgr().clone(), ioc.trace().clone(), runtime.clone());
+    let cmd = ahxxx_configure_command(ioc.mgr().clone(), runtime.clone());
     ioc.register_startup_command(cmd);
 
     // Keep the runtime (read thread, callback thread, port actor) alive.
