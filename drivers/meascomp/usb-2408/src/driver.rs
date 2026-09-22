@@ -74,12 +74,16 @@ impl MultiFunctionDriver {
         max_input_points: usize,
         max_output_points: usize,
     ) -> AsynResult<Self> {
+        // ASYN_CANBLOCK, as C declares it (drvMultiFunction.cpp:821): every
+        // write does USB I/O behind the device mutex the poller holds for a
+        // whole sweep, so records must complete asynchronously instead of
+        // blocking the thread that processes them.
         let mut base = PortDriverBase::new(
             port_name,
             MAX_SIGNALS,
             PortFlags {
                 multi_device: true,
-                can_block: false,
+                can_block: true,
                 destructible: true,
             },
         );

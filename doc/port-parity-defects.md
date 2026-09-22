@@ -775,7 +775,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** libuldaq rejects the write (ERR_ALREADY_ACTIVE, `AoDevice.cpp:282-283`), so the device is unaffected, but the record shows no alarm and its VAL no longer matches the DAC.
 - **Class:** ref-faithful. **Live:** confirmed — `Ao1=40000` during a continuous run → "uldaq error 16: A background process is already in progress", record NO_ALARM.
 
-## PP-82 [MED] USB-2408 port declared non-blocking; C declares ASYN_CANBLOCK — OPEN
+## PP-82 [MED] USB-2408 port declared non-blocking; C declares ASYN_CANBLOCK — FIXED
 - **Rust:** `driver.rs:48-52` `can_block: false`; writes do USB I/O and take the device mutex the poller holds for its whole sweep (`poller.rs:93-173`).
 - **C:** `drvMultiFunction.cpp:821` `ASYN_MULTIDEVICE | ASYN_CANBLOCK` (USBCTR deliberately omits it, `drvUSBCTR.cpp:259-260`).
 - **Impact:** a CA put or scan thread blocks for a poll sweep (tens of ms; ≈300 ms once PP-79 sets 60 S/s), and blocking USB I/O runs on a tokio worker.
