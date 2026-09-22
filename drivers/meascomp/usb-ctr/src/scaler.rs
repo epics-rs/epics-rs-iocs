@@ -32,12 +32,39 @@ impl ScalerState {
     }
 }
 
+/// C `setScalerPresets` (drvUSBCTR.cpp:1040-1083), run on every arm before
+/// the scan starts: each non-zero preset becomes its counter's MAX_LIMIT,
+/// and counter 0's output-compare pair switches its output at PR1. That
+/// output gates counters 1-7, so the time preset stops them in hardware,
+/// not a poll later.
+fn load_presets(
+    device: &DaqDevice,
+    state: &ScalerState,
+    num_counters: usize,
+) -> Result<(), String> {
+    for i in 0..num_counters {
+        if state.presets[i] > 0 {
+            device
+                .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
+                .map_err(|e| format!("counter_load MAX_LIMIT({i}) error: {e}"))?;
+        }
+    }
+    device
+        .counter_load(0, CRT_OUTPUT_VAL0, 0)
+        .map_err(|e| format!("counter_load OUTPUT_VAL0 error: {e}"))?;
+    device
+        .counter_load(0, CRT_OUTPUT_VAL1, state.presets[0])
+        .map_err(|e| format!("counter_load OUTPUT_VAL1 error: {e}"))?;
+    Ok(())
+}
+
 /// Configure counters and start the continuous counter scan for scaler mode.
 pub fn start_scaler(
     device: &DaqDevice,
     state: &mut ScalerState,
     num_counters: usize,
 ) -> Result<(), String> {
+    load_presets(device, state, num_counters)?;
     let num_counters = num_counters as i32;
 
     // Configure each counter for counting mode
@@ -68,15 +95,6 @@ pub fn start_scaler(
                 },
             )
             .map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
-    }
-
-    // Set presets as max limits
-    for i in 0..num_counters as usize {
-        if state.presets[i] > 0 {
-            device
-                .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
-                .map_err(|e| format!("counter_load MAX_LIMIT({i}) error: {e}"))?;
-        }
     }
 
     // Start continuous counter scan

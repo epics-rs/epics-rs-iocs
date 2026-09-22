@@ -535,7 +535,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 
 ## usb-ctr — MCS / MCA / scaler
 
-## PP-44 [HIGH] Scaler arm never loads counter-0 output-compare registers — OPEN
+## PP-44 [HIGH] Scaler arm never loads counter-0 output-compare registers — FIXED
 - **Rust:** `usb-ctr/src/scaler.rs:69-76` loads only `CRT_MAX_LIMIT` for presets > 0; no `CRT_OUTPUT_VAL0/VAL1` in the scaler path (only MCS, `mcs.rs:186-187`).
 - **C:** `drvUSBCTR.cpp:1061-1081` `setScalerPresets` (called from `scalerArm_`, `:1174`) loads `CRT_OUTPUT_VAL0=0`, `CRT_OUTPUT_VAL1=PR1` on counter 0 every arm.
 - **Impact:** C0O (documented gate for counters 1-7) never switches at PR1; after any MCS start VAL1 stays 0xFFFFFFFF. The preset is enforced only in software one poll late, so S2..S8 over-count.
