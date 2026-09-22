@@ -148,6 +148,14 @@ record(ao, "$(P)MCS:Dwell") {
     field(PINI, "YES")
 }
 
+# The dwell the clock actually runs, written back when a scan starts.
+record(ai, "$(P)MCS:Dwell_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_DWELL_TIME")
+    field(PREC, "6")
+    field(SCAN, "I/O Intr")
+}
+
 record(longout, "$(P)MCS:NuseAll") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_NUM_CHANNELS")

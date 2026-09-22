@@ -303,6 +303,9 @@ impl PortDriver for CtrDriver {
                 }
                 self.base
                     .params
+                    .set_float64(self.params.mca_dwell_time, 0, st.mcs.dwell_time)?;
+                self.base
+                    .params
                     .set_int32(self.params.mca_acquiring, 0, 1)?;
             }
         } else if reason == self.params.mca_stop_acquire {

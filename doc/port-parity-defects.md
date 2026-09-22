@@ -613,11 +613,12 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Impact:** spectrum NORD = NuseAll mid-run (C: acquired points); AbsTimeWF NORD the reverse.
 - **Class:** ref-faithful. **Live:** not distinguishable after a completed run (both 100).
 
-## PP-57 [LOW] MCS actual dwell never written back; `Dwell_RBV` missing — OPEN (regression of PP-42 LOW, fix never merged)
+## PP-57 [LOW] MCS actual dwell never written back; `Dwell_RBV` missing — FIXED (regression of PP-42 LOW, fix never merged)
 - **Rust:** the in/out `rate` from `ulDaqInScan` (`mcs.rs:189-198`) is only logged; no `MCS:Dwell_RBV` record.
 - **C:** `drvUSBCTR.cpp:711` `setDoubleParam(mcaDwellTime_, 1./rate)`; `measCompMCS.template:122-127` Dwell_RBV.
 - **Impact:** the clock-quantized dwell is never shown.
 - **Class:** unimpl. **Live:** confirmed PV absent.
+- **Also fixed with it:** `start_mcs` replaced a dwell ≤ 0 with a 1 kHz rate; C passes `1/dwell` and lets libuldaq reject it, so the reported dwell is always the rate actually used.
 
 ## usb-ctr — pulse generators, counters, DIO, init
 

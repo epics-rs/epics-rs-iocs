@@ -189,12 +189,9 @@ pub fn start_mcs(
     let total_samples = state.num_counters_enabled * max_pts;
     state.scan_buffer.resize(total_samples, 0.0);
 
-    // Rate = 1/dwell
-    let mut rate = if dwell_time > 0.0 {
-        1.0 / dwell_time
-    } else {
-        1000.0
-    };
+    // C passes 1/dwell as is; a zero or negative dwell is libuldaq's to
+    // reject, not a cue to run at some other rate.
+    let mut rate = 1.0 / dwell_time;
 
     let mut options = scan_options(dwell_time, ch_advance_source != 0);
     if ext_trigger {
@@ -211,16 +208,18 @@ pub fn start_mcs(
     let _ = device.counter_load(0, CRT_OUTPUT_VAL0, 0);
     let _ = device.counter_load(0, CRT_OUTPUT_VAL1, 0xFFFFFFFF);
 
-    device
-        .daq_in_scan(
-            &chan_descs,
-            max_pts as i32,
-            &mut rate,
-            options,
-            flags,
-            &mut state.scan_buffer,
-        )
-        .map_err(|e| format!("daq_in_scan error: {e}"))?;
+    let started = device.daq_in_scan(
+        &chan_descs,
+        max_pts as i32,
+        &mut rate,
+        options,
+        flags,
+        &mut state.scan_buffer,
+    );
+    // The clock divides the dwell down to what it can do; C writes that
+    // actual dwell back to MCA_DWELL_TIME whether or not the scan started.
+    state.dwell_time = 1.0 / rate;
+    started.map_err(|e| format!("daq_in_scan error: {e}"))?;
 
     state.running = true;
     state.acquiring = true;
