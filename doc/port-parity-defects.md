@@ -1060,6 +1060,15 @@ the generator once, `MCS:Prescale` and `PollSleepMS` write once), MCS
 follows the actual dwell (2 ch x 200 pts, DwellActual 0.03462, TimeWF step
 0.03462). Workspace clippy clean, 2278 tests pass.
 
+The generator one-shot that takes ~3x its nominal time (2048 pts x 1 ms ->
+6.4 s) is the board, not the port: a standalone C program making the same
+`ulAOutScan` + `ulAOutScanStatus` calls goes idle at 2.21 s alone, at 6.38 s
+when the poller's `ulDIn` + 2x `ulCIn` + 8x `ulAIn` loop runs beside it with
+the AI data rate at the 60 Hz the Ai Rate records push (18.3 ms per `ulAIn`),
+and at 2.43 s with the same loop at the 1 kHz default (2.3 ms per `ulAIn`);
+the channel count does not matter (1 ch: 6.37 s). C's `pollerThread` reads the
+same way, so drvMultiFunction stretches its own scans identically.
+
 PP-98 (the drivers' missing asynPrint lines) is new; fixed in `c45603e`,
 with PP-99 (`7ef4286`) found while porting its trigger-mode line. PP-100
 (the missing ASYN_TRACE_ERROR lines) is fixed in `a378283`.
