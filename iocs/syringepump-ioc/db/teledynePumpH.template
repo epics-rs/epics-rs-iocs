@@ -160,7 +160,7 @@ record(seq, "$(s):$(ta):$(ss):Scanner") {
 ######################################################################
 
 record(stringin, "$(s):$(ta):$(ss):Vol") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetRead")
    field(INP, "@asyn($(PORT),0) GetVol")
    field(FLNK, "$(s):$(ta):$(ss):VolPARSE")
 
@@ -191,7 +191,7 @@ record(ai, "$(s):$(ta):$(ss):VolFormat")
 ######################################################################
 
 record(stringin, "$(s):$(ta):$(ss):Pressure") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetRead")
    field(INP,  "@asyn($(PORT),0) GetPress")
    field(FLNK, "$(s):$(ta):$(ss):PressurePARSE")
 }
@@ -219,7 +219,7 @@ record(ai, "$(s):$(ta):$(ss):PressureFormat")
 #Subroutine call to format Pressure SP readback
 ######################################################################
 record(stringin,"$(s):$(ta):$(ss):PressSet_RBV") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetSetPress")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):PressSetPARSE")
@@ -247,7 +247,7 @@ record(ai, "$(s):$(ta):$(ss):PressSetFormat")
 #Subroutine call to format Flow SP readback
 ####################################################################
 record(stringin,"$(s):$(ta):$(ss):Flow") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetFlow")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):FlowPARSE")
@@ -275,7 +275,7 @@ record(ai, "$(s):$(ta):$(ss):FlowFormat")
 #Subroutine call to format MaxFlow_RBV readback
 ####################################################################
 record(stringin,"$(s):$(ta):$(ss):MaxFlow_RBV") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetMFlow")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):MaxFlow_RBVPARSE")
@@ -304,20 +304,20 @@ record(ai, "$(s):$(ta):$(ss):MaxFlow_RBVFormat")
 
 ####################################################################
 record(stringin, "$(s):$(ta):$(ss):Status") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetStatus")
 }
 
 
 
 record(stringin, "$(s):$(ta):$(ss):Units") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetUnit")
     field(SCAN, "1 second")
 }
 
 record(stringin, "$(s):$(ta):$(ss):Mode") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetMode")
     field(SCAN, "1 second")
 }
@@ -325,7 +325,7 @@ record(stringin, "$(s):$(ta):$(ss):Mode") {
 
 
 record(stringin, "$(s):$(ta):$(ss):ID") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetID")
     field(SCAN, "1 second")
 }
@@ -338,14 +338,14 @@ record(stringin, "$(s):$(ta):$(ss):ID") {
 # directly; writing this record processes CmdReply via FLNK, which
 # re-reads the cached reply.
 record(stringout, "$(s):$(ta):$(ss):Command") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetWrite")
    field(OUT, "@asyn($(PORT),0) SendCmd")
    field(FLNK, "$(s):$(ta):$(ss):CmdReply")
 
 }
 
 record(waveform, "$(s):$(ta):$(ss):CmdReply") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetRead")
    field(INP,  "@asyn($(PORT),0) SendCmd")
    field(FTVL, "CHAR")
    field(NELM, "80")

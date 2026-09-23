@@ -40,20 +40,20 @@
 
 record(stringin, "$(dev):version1M") {
   field(DESC, "VersionString1")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(INP, "@asyn($(Link),0) QueryVer")
 }
 
 record(stringin, "$(dev):version2M") {
   field(DESC, "VersionString1")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Version2")
 }
 
 record(waveform, "$(dev):welcome") {
   field(DESC, "Grab Welcome text")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(INP, "@asyn($(Link),0) GrabWelcomeText")
   field(FTVL, "CHAR")
   field(NELM, "100")
@@ -161,7 +161,7 @@ record(mbbi, "$(dev):chan1StatM") {
 
 record(stringout, "$(dev):chanStatusM") {
   field(DESC, "Channel Status Monitor")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetWrite")
   field(OUT, "@asyn($(Link),0) QueryChanStatus")
 }
 
@@ -206,7 +206,7 @@ record(mbbi, "$(dev):chan4StatM") {
 
 record(stringout, "$(dev):linModeM") {
   field(DESC, "Channel Linearization Mode")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetWrite")
   field(OUT, "@asyn($(Link),0) QueryLinMode")
 }
 
@@ -288,7 +288,7 @@ record(mbbi, "$(dev):chan4LinModeM") {
 
 record(stringout, "$(dev):statusM") {
   field(DESC, "Channel Linearization Mode")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetWrite")
   field(OUT, "@asyn($(Link),0) QueryStatus")
 }
 
@@ -600,7 +600,7 @@ record(longin, "$(dev):measDataMonitor") {
 
 record(waveform, "$(dev):measDataM") {
   field(DESC, "Grab Welcome text")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(INP, "@asyn($(Link),0) GrabWelcomeText")
   field(FTVL, "CHAR")
   field(NELM, "250")
@@ -610,14 +610,14 @@ record(waveform, "$(dev):measDataM") {
 
 record(stringout, "$(dev):chan1InfoM") {
   field(DESC, "Channel #1 Info")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetWrite")
   field(OUT, "@asyn($(Link),0) QueryChan1Info")
   field(FLNK, "$(dev):chan2InfoM")
 }
 
 record(stringin, "$(dev):chan1NAM") {
   field(DESC, "Chan #1 Name")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan1Nam")
 }
@@ -652,28 +652,28 @@ record(longin, "$(dev):chan1RNG") {
 
 record(stringin, "$(dev):chan1UNT") {
   field(DESC, "Chan #1 Unit of Meas Range")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan1Unt")
 }
 
 record(stringout, "$(dev):chan2InfoM") {
   field(DESC, "Channel #2 Info")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetWrite")
   field(OUT, "@asyn($(Link),0) QueryChan2Info")
   field(FLNK, "$(dev):chan3InfoM")
 }
 
 record(stringout, "$(dev):chan3InfoM") {
   field(DESC, "Channel #3 Info")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetWrite")
   field(OUT, "@asyn($(Link),0) QueryChan3Info")
   field(FLNK, "$(dev):chan4InfoM")
 }
 
 record(stringout, "$(dev):chan4InfoM") {
   field(DESC, "Channel #4 Info")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetWrite")
   field(OUT, "@asyn($(Link),0) QueryChan4Info")
 }
 
@@ -700,21 +700,21 @@ record(longin, "$(dev):chan4ANO") {
 
 record(stringin, "$(dev):chan4NAM") {
   field(DESC, "Chan #4 Name")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan4Nam")
 }
 
 record(stringin, "$(dev):chan3NAM") {
   field(DESC, "Chan #3 Name")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan3Nam")
 }
 
 record(stringin, "$(dev):chan2NAM") {
   field(DESC, "Chan #2 Name")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan2Nam")
 }
@@ -784,21 +784,21 @@ record(longin, "$(dev):chan2RNG") {
 
 record(stringin, "$(dev):chan4UNT") {
   field(DESC, "Chan #4 Unit of Meas Range")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan4Unt")
 }
 
 record(stringin, "$(dev):chan3UNT") {
   field(DESC, "Chan #3 Unit of Meas Range")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan3Unt")
 }
 
 record(stringin, "$(dev):chan2UNT") {
   field(DESC, "Chan #2 Unit of Meas Range")
-  field(DTYP, "asynOctet")
+  field(DTYP, "asynOctetRead")
   field(SCAN, "I/O Intr")
   field(INP, "@asyn($(Link),0) Chan2Unt")
 }
