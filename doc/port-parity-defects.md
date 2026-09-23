@@ -898,7 +898,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **C:** `drvUSBCTR.cpp` 26 sites, 23 of them built on Linux (`:481-1514`: each uldaq call's error line, the three closing "ERROR writing" lines `:1250,1312,1364`, the array refusals `:1425,1449,1476`, the poller's `cbDIn` `:1514`); `drvMultiFunction.cpp` `reportError`'s two ERROR forms (`:1306-1318`) behind 34 call sites, and 19 direct sites, of which `:1232,1245` (board-family dispatch) and `:1373,2816` (Windows-enum mapping the port's records do not use) do not apply. `stopWaveGen`/`stopWaveDig` return the scan stop's status to `writeInt32` (`:1735`, `:1878-1882`); the poller discards it and prints a failing call only when the previous cycle succeeded, except `ulTIn` every cycle (`:2616-2846`).
 - **Impact:** `asynSetTraceMask` ERROR (on by default) showed no driver failure at all; a refused scan start, a failed write or a dead USB link was visible only in `RUST_LOG` output, never in C's words.
 - **Class:** unimpl. **Live:** static.
-- **Fixed:** `a378283`. Live on 0.30.1 with the default mask: 2408 trigger mode 2 → `mapTriggerType unsupported cbwTriggerType=2`, `writeInt32 Error: Setting trigger mode`, closing line status=-1, WRITE/INVALID; WaveDigNumPoints 5000 → C's line, no alarm; WaveDig dwell 1e-6 → `startWaveDig Error: Calling AInScan, err=22`, DwellActual −9999; no enabled channels → `startWaveGen: ERROR no enabled channels`; Ao1 during generation → C's refusal line and no closing line; IntNumPoints 3000 → `defineWaveform: ERROR numPoints=3000 …` with the int32 and float64 closing lines; array reads at addr 3 / 9 → `readFloat32Array: ERROR: addr=3 max=1`, `readFloat64Array: ERROR: addr=9 max=7`. CTR MCS start while the scaler counts → C's refusal and closing line; MCS dwell 1e-9 → `startMCS error calling ulDaqInScan, … status=22`, no alarm as C; trigger value 3 → `unsupported trigger value=3`; `readInt32Array: got illegal command 17`. Not exercised: poller errors (need a USB fault), pulse-generator and scaler call failures, the `writeFloat32Array` refusals (the UserWF put never reaches the driver on 0.30.1, see the epics-rs list below). The Rust fails a write whose `defineWaveform` refused (since PP-93) and one whose TC open-detect write failed; C discards both statuses, so there the Rust prints the closing ERROR line where C prints the TRACEIO_DRIVER one -- kept, by user decision, as `upstream-c-defects.md` 231.
+- **Fixed:** `a378283`. Live on 0.30.1 with the default mask: 2408 trigger mode 2 → `mapTriggerType unsupported cbwTriggerType=2`, `writeInt32 Error: Setting trigger mode`, closing line status=-1, WRITE/INVALID; WaveDigNumPoints 5000 → C's line, no alarm; WaveDig dwell 1e-6 → `startWaveDig Error: Calling AInScan, err=22`, DwellActual −9999; no enabled channels → `startWaveGen: ERROR no enabled channels`; Ao1 during generation → C's refusal line and no closing line; IntNumPoints 3000 → `defineWaveform: ERROR numPoints=3000 …` with the int32 and float64 closing lines; array reads at addr 3 / 9 → `readFloat32Array: ERROR: addr=3 max=1`, `readFloat64Array: ERROR: addr=9 max=7`. CTR MCS start while the scaler counts → C's refusal and closing line; MCS dwell 1e-9 → `startMCS error calling ulDaqInScan, … status=22`, no alarm as C; trigger value 3 → `unsupported trigger value=3`; `readInt32Array: got illegal command 17`. Not exercised: poller errors (need a USB fault), pulse-generator and scaler call failures. The two `writeFloat32Array` refusals were unreachable until epics-rs #116; with it they print `writeFloat32Array: ERROR: addr=5 max=1, nElements=2 max=2048` and `ERROR: unknown function=73`. The Rust fails a write whose `defineWaveform` refused (since PP-93) and one whose TC open-detect write failed; C discards both statuses, so there the Rust prints the closing ERROR line where C prints the TRACEIO_DRIVER one -- kept, by user decision, as `upstream-c-defects.md` 231.
 
 ## Live hardware verification (2026-09-22)
 
@@ -1044,13 +1044,19 @@ binaries:
   (`services.rs:44-47`); services built on a shared trace detach it from the
   global exception list (quadem's octet commands did; fixed in `eeb8b30`).
 
-Found against 0.30.1, not filed yet:
+Found against 0.30.1, filed and merged as epics-rs PR #116 (`47a1152d`),
+also untagged:
 - A waveform record with DTYP `asyn*ArrayOut` and its link in INP, the form
-  C's measComp db uses for `WaveGen<n>UserWF`, runs as an input: asyn-rs
-  takes an INP link as output only for `asynOctetWrite`/`asynOctetWriteBinary`
-  (`adapter.rs:3204-3209`). A put of 0.5, 0.25, 0.125 to `WaveGen1UserWF`
-  reads back 2048 zeros and `writeFloat32Array` is never called, so no user
-  waveform can be loaded. Still present on merged main (`68c38aea`).
+  C's measComp db uses for `WaveGen<n>UserWF`, ran as an input: asyn-rs took
+  an INP link as output only for `asynOctetWrite`/`asynOctetWriteBinary`. A
+  put of 0.5, 0.25, 0.125 to `WaveGen1UserWF` read back 2048 zeros and
+  `writeFloat32Array` was never called, so no user waveform could be loaded.
+  `dtyp_is_output` now carries C's rule (every `asynXxxArrayWfOut` dset binds
+  `&pwf->inp` with `isOutput=1`) and such a record is write-only, as C
+  registers no readback for it. Verified on the board: the same put lands in
+  the driver buffer as 0.5, 0.25, 0.125 with the rest 0, an 8-point
+  user-defined waveform plays to CurrentPoint 8, and both array refusals
+  print.
 
 Re-verified on 2026-09-23 against merged main (both IOCs built with a path
 patch on `~/codes/epics-rs`): every PP-100 line above prints once and
