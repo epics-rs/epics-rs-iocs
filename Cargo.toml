@@ -262,14 +262,28 @@ members = [
 # `register_asyn_device_support` registers the asyn shell commands on
 # `PortManager::global()`.
 #
+# 0.30.2 carries five more fixes this port filed. Its one break is
+# `DeviceSupportContext`, which gains a `record_type` the factory gate
+# reads: ten test contexts in yokogawa-gm10/-mw100 name their record
+# ("ai", and "bo" for the two poll triggers). Behavioral: one output write on a non-blocking port reaches the
+# driver once instead of twice, `asynSetTrace*` writes the named port's own
+# trace, `PortServices::new` builds its own trace instead of rebinding the
+# one it is passed, a waveform with DTYP `asyn*ArrayOut` and its link in INP
+# writes (C's `asynXxxArrayWfOut` shape, which `WaveGen<n>UserWF` uses), and
+# the universal factory refuses a (record type, DTYP) pair no `device()`
+# line declares, as a DTYP put does in C. That last one drops records this
+# workspace had bound only because the factory took anything: DTYP
+# `asynOctet` where C declares `asynOctetRead`/`asynOctetWrite`, and an ai
+# reading `asynOctetRead`.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.30.1"
-asyn-rs = "0.30.1"
-ad-core-rs = "0.30.1"
-ad-plugins-rs = "0.30.1"
+epics-rs = "0.30.2"
+asyn-rs = "0.30.2"
+ad-core-rs = "0.30.2"
+ad-plugins-rs = "0.30.2"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.30.1", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.30.2", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.30.1"
+mca-rs = "0.30.2"
