@@ -885,7 +885,7 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **C:** 22 `asynPrint` sites: `drvUSBCTR.cpp:492,658,748,968,988,1220,1385,1407,1419` (TRACE_FLOW) and `:1246,1308,1360` (TRACEIO_DRIVER); `drvMultiFunction.cpp:1476,1694,1853,1896` (TRACE_FLOW) and `:1304,2203,2320,2419,2672,2709` (TRACEIO_DRIVER), `:1304` being `reportError`'s Info line behind 32 success paths. `drvUSBCTR.cpp:658` is Windows-only and `drvMultiFunction.cpp:1476` is the pulse generator the USB-2408 lacks.
 - **Impact:** `asynSetTraceMask <port> -1 DRIVER|FLOW` shows only epics-rs's own lines; the written values, scan starts and poll readings C traces never appear.
 - **Class:** unimpl. **Live:** confirmed on epics-rs 0.30.1 — mask 0x9 on USBCTR_1 (port and addr 0), an MCS Dwell write printed no line.
-- **Fixed:** `c45603e`. Live with mask 0x19 on both ports: each C line appears in C's wording (pulse start, write lines, erase, `readMCS`/`readScaler` getStatus, both `readInt32Array` lines, scaler read; on the 2408 the Info lines of AOut, data rate, input mode/type, TC type, open detect, trigger count, DOut/DBitOut, AOutScan/ALoadQueue/AInScan, stop lines, generator/digitizer status, `readWaveDig`, `Calling TIn`). Each CTR write line appears twice: that is epics-rs #112, which the trace now shows directly.
+- **Fixed:** `c45603e`. Live with mask 0x19 on both ports: each C line appears in C's wording (pulse start, write lines, erase, `readMCS`/`readScaler` getStatus, both `readInt32Array` lines, scaler read; on the 2408 the Info lines of AOut, data rate, input mode/type, TC type, open detect, trigger count, DOut/DBitOut, AOutScan/ALoadQueue/AInScan, stop lines, generator/digitizer status, `readWaveDig`, `Calling TIn`). Each CTR write line appeared twice on 0.30.1: that is epics-rs #112, which the trace showed directly; on merged main each appears once.
 
 ## PP-99 [LOW] USB-2408 stores a TRIGGER_MODE that C refuses — FIXED
 - **Rust:** `driver.rs` `write_int32` stored any TRIGGER_MODE value.
@@ -1025,8 +1025,10 @@ write on the now CANBLOCK 2408 in WRITE/INVALID. The workspace moves in
 binds every main's asyn commands to `PortManager::global()`, `491d9ba`
 returns the autosave sets to after iocInit, and `b74017e` re-applies PP-82.
 
-Found against 0.30.1, open in epics-rs (filed as #112, #113, #114 in that
-order):
+Found against 0.30.1, filed as #112, #113, #114 and merged in that order as
+epics-rs PR #115 (`68c38aea`), which carries no release tag yet -- this
+workspace builds against the 0.30.1 release, so #112 is still present in its
+binaries:
 - On a non-blocking asyn port every output write reaches the driver twice.
   `write_begin` completes it with `submit_blocking` and returns `Ok(None)`
   (asyn-rs `adapter.rs:2653-2658`); epics-base-rs reads `Ok(None)` as "no
@@ -1048,7 +1050,15 @@ Found against 0.30.1, not filed yet:
   takes an INP link as output only for `asynOctetWrite`/`asynOctetWriteBinary`
   (`adapter.rs:3204-3209`). A put of 0.5, 0.25, 0.125 to `WaveGen1UserWF`
   reads back 2048 zeros and `writeFloat32Array` is never called, so no user
-  waveform can be loaded.
+  waveform can be loaded. Still present on merged main (`68c38aea`).
+
+Re-verified on 2026-09-23 against merged main (both IOCs built with a path
+patch on `~/codes/epics-rs`): every PP-100 line above prints once and
+unchanged; one put now reaches the driver once (`PulseGen1Period` restarts
+the generator once, `MCS:Prescale` and `PollSleepMS` write once), MCS
+100 x 10 ms completes in 1.005 s elapsed, and the digitizer's time axis
+follows the actual dwell (2 ch x 200 pts, DwellActual 0.03462, TimeWF step
+0.03462). Workspace clippy clean, 2278 tests pass.
 
 PP-98 (the drivers' missing asynPrint lines) is new; fixed in `c45603e`,
 with PP-99 (`7ef4286`) found while porting its trigger-mode line. PP-100
