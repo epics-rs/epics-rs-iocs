@@ -907,6 +907,13 @@ defect regardless of C; **ref-faithful** = adopt C's posture;
 - **Class:** ref-indep. **Live:** confirmed against a stub pump on 127.0.0.1 answering the H-series ack: pre-fix 90 frames, every one a poll, no `REFILL=` or `DIGITAL=`; post-fix `SetRefillRate 12` put `6R009REFILL=120.0000` with its checksum on the wire and `SetDigitalOut 2` put `6R008DIGITAL=HLHHHHHH`.
 - **Fixed:** `ea31c61` — each calc drives a `SetRefillRateSend` ao / `SetDigitalSend` longout that carries the link, the `PressSend`/`MaxFlowSend` idiom already in this template; the scaling and the selector pass through unchanged. Adds those two PVs. Found by the DTYP/link sweep over the workspace's 183 db files, which turned up no other `calcout` with an `@asyn` link.
 
+## PP-102 [MED] 33 octet records carry a DTYP asyn never declares — FIXED
+- **Rust:** `iocs/syringepump-ioc/db/teledynePumpH.template` (11), `teledynePumpD.template` (3) and `iocs/microepsilon-ioc/db/xxCapaNCDT6200.template` (19) set `DTYP, "asynOctet"` on stringin, stringout and waveform records.
+- **C:** asyn's `.dbd` declares `asynOctetRead`, `asynOctetWrite`, `asynOctetCmdResponse`, `asynOctetWriteRead` and `asynOctetWriteBinary` per record type and no bare `asynOctet`, so a DTYP put of it is `S_db_badChoice` at db load.
+- **Impact:** none until epics-rs 0.30.2, whose universal factory refuses a pair no `device()` line declares (epics-rs #117): from that release the 33 records get no device support, so every octet readback and command in those two IOCs stops.
+- **Class:** contract. **Live:** the syringepump H IOC against a stub pump on 0.30.2 — `Status` reads `RUNNING` through `asynOctetRead` (NO_ALARM) and the writes still reach the wire. The microepsilon IOC cannot be verified here: its device (10.6.28.17) is absent, `CapaNCDT6200ConfigInit` fails to create port L0, and both the old and the new template log the same 68 "no device support" plus 103 `recGblRecordError` lines, `asynInt32` records included.
+- **Fixed:** `75a7c35` — reads on stringin and waveform, writes on stringout. Found by the (record type, DTYP) sweep over the workspace's 1995 asyn-linked records; after it, the only undeclared pairs left are `mca`/`asynMCA` and the vac `digitel`/`vs` records, each served by this workspace's own device support rather than the universal factory.
+
 ## Live hardware verification (2026-09-22)
 
 IOCs: `usb-ctr-ioc` (CA 5064) and `usb-2408-ioc` (CA 5074), release build of
@@ -1033,9 +1040,8 @@ binds every main's asyn commands to `PortManager::global()`, `491d9ba`
 returns the autosave sets to after iocInit, and `b74017e` re-applies PP-82.
 
 Found against 0.30.1, filed as #112, #113, #114 and merged in that order as
-epics-rs PR #115 (`68c38aea`), which carries no release tag yet -- this
-workspace builds against the 0.30.1 release, so #112 is still present in its
-binaries:
+epics-rs PR #115 (`68c38aea`), released in 0.30.2 together with #116 and
+#117; this workspace moved to it in `c6665af`:
 - On a non-blocking asyn port every output write reaches the driver twice.
   `write_begin` completes it with `submit_blocking` and returns `Ok(None)`
   (asyn-rs `adapter.rs:2653-2658`); epics-base-rs reads `Ok(None)` as "no
@@ -1052,7 +1058,7 @@ binaries:
   global exception list (quadem's octet commands did; fixed in `eeb8b30`).
 
 Found against 0.30.1, filed and merged as epics-rs PR #116 (`47a1152d`),
-also untagged:
+released in 0.30.2:
 - A waveform record with DTYP `asyn*ArrayOut` and its link in INP, the form
   C's measComp db uses for `WaveGen<n>UserWF`, ran as an input: asyn-rs took
   an INP link as output only for `asynOctetWrite`/`asynOctetWriteBinary`. A
@@ -1085,3 +1091,11 @@ same way, so drvMultiFunction stretches its own scans identically.
 PP-98 (the drivers' missing asynPrint lines) is new; fixed in `c45603e`,
 with PP-99 (`7ef4286`) found while porting its trigger-mode line. PP-100
 (the missing ASYN_TRACE_ERROR lines) is fixed in `a378283`.
+
+The last epics-rs item this port filed is #117, the universal factory's
+record-type gate, which came out of PP-101: the factory bound a `calcout`
+that C's asyn never declares, so the record loaded and wrote nothing.
+Released in 0.30.2. Re-verified on the boards against that release: each
+CTR write reaches the driver once, `WaveGen1UserWF` lands 0.5, 0.25, 0.125
+in the driver buffer, both `writeFloat32Array` refusals and every PP-100
+line print unchanged, and a 100-point MCS run completes in 1.18 s.
