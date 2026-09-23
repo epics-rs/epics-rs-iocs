@@ -407,14 +407,23 @@ record(ao,"$(s):$(ta):$(ss):SetRefillRate") {
 }
 
 
+# The scaling stays in the calc; the device write lives on the ao below.
+# EPICS asyn declares no device support for calcout, so an @asyn link here
+# binds nothing and the rate never reached the pump.
 record(calcout, "$(s):$(ta):$(ss):SetRefillRateCalc") {
   field(INPA, "$(s):$(ta):$(ss):SetRefillRate CP")
   field(CALC, "A*10")
   field(DOPT, "Use CALC")
-  field(OUT, "@asyn($(PORT),0) SetRefillRate")
-  field(DTYP, "asynFloat64")
+  field(OUT, "$(s):$(ta):$(ss):SetRefillRateSend.VAL PP")
   info(archive, "Monitor, 00:00:01, VAL")
 
+}
+
+
+record(ao,"$(s):$(ta):$(ss):SetRefillRateSend") {
+    field(DTYP, "asynFloat64")
+    field(OUT, "@asyn($(PORT),0) SetRefillRate")
+    field(PREC, "4")
 }
 
 
@@ -437,11 +446,18 @@ record(calcout, "$(s):$(ta):$(ss):SetDigitalCalc1") {
    field(DESC, "Digital Calc 1")
    field(INPA, "$(s):$(ta):$(ss):SetDigitalOut CP")
    field(CALC, "A")
-   field(DTYP, "asynInt32")
-   field(OUT, "@asyn($(PORT),0) SetDigital")
+   field(OUT, "$(s):$(ta):$(ss):SetDigitalSend.VAL PP")
    field(PINI, "NO")
    info(archive, "Monitor, 00:00:01, VAL")
 
+}
+
+
+# The selector the driver maps to one of the four DIGITAL= choices is the
+# mbbo's state index, which the calc above passes through.
+record(longout, "$(s):$(ta):$(ss):SetDigitalSend") {
+   field(DTYP, "asynInt32")
+   field(OUT, "@asyn($(PORT),0) SetDigital")
 }
 
 
