@@ -3,13 +3,11 @@
 //! Usage:
 //!   cargo run -p delaygen-ioc -- iocs/delaygen-ioc/st.cmd
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -40,8 +38,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("DELAYGEN", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
-
     let mut app = IocApplication::new();
 
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
@@ -56,7 +52,7 @@ async fn main() -> CaResult<()> {
 
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
     // drvAsynIPPortConfigure / asynOctetSetInputEos / asynOctetSetOutputEos.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager.clone());
 
     // asyn-rs 0.22.1's `register_asyn_commands` registers asynSetOption /
@@ -160,7 +156,6 @@ async fn main() -> CaResult<()> {
 
     // DG645Config(myport,ioport,ioaddr) -- C drvAsynDG645(myport,ioport,ioaddr)
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "DG645Config",
             vec![
@@ -203,7 +198,6 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -215,7 +209,6 @@ async fn main() -> CaResult<()> {
     // ColbyConfig(myport,ioport,addr,units,iface) -- C
     // drvAsynColby(myport,ioport,addr,units,iface)
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "ColbyConfig",
             vec![
@@ -274,7 +267,6 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -286,7 +278,6 @@ async fn main() -> CaResult<()> {
     // CoherentSdgConfig(myport,ioport,ioaddr) -- C
     // drvAsynCoherentSDG(myport,ioport,ioaddr)
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "CoherentSdgConfig",
             vec![
@@ -330,7 +321,6 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
                 )
                 .map_err(|e| e.to_string())?;
 

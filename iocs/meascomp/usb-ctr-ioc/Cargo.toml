@@ -6,6 +6,8 @@ publish = false
 
 [dependencies]
 usb-ctr = { path = "../../../drivers/meascomp/usb-ctr" }
+mca = { path = "../../../drivers/mca" }
+mca-rs = { workspace = true }
 epics-rs = { workspace = true, features = ["asyn", "scaler", "bridge"] }
 asyn-rs = { workspace = true, features = ["epics"] }
 tokio = { version = "1", features = ["full"] }

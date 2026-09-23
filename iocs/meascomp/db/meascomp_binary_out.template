@@ -1,6 +1,18 @@
+# PINI drives the bit at boot; PHAS 2 makes that happen after the direction
+# records have processed.
 record(bo, "$(P)$(R)") {
+    field(PINI, "$(PINI=YES)")
+    field(PHAS, "2")
     field(DTYP, "asynUInt32Digital")
     field(OUT,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_OUTPUT")
     field(ZNAM, "Low")
     field(ONAM, "High")
+}
+
+record(bi, "$(P)$(R)_RBV") {
+    field(DTYP, "asynUInt32Digital")
+    field(INP,  "@asynMask($(PORT),$(ADDR),$(MASK))DIGITAL_INPUT")
+    field(ZNAM, "Low")
+    field(ONAM, "High")
+    field(SCAN, "I/O Intr")
 }

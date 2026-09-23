@@ -43,3 +43,44 @@ impl DaqDevice {
         error::check(unsafe { ulDConfigBit(self.handle(), port, bit, direction) })
     }
 }
+
+/// The bits a DIGITAL_OUTPUT write drives, with their levels.
+///
+/// C `writeUInt32Digital` writes a bit only if it is both in the record's
+/// `mask` and an output in `direction` (1 = output): a bit configured as an
+/// input is skipped, not driven -- libuldaq would reject it with
+/// `ERR_WRONG_DIG_CONFIG`, and on an open-collector port driving it would
+/// clamp whatever signal is wired to it.
+pub fn output_bits(
+    value: u32,
+    mask: u32,
+    direction: u32,
+    num_bits: usize,
+) -> impl Iterator<Item = (i32, bool)> {
+    (0..num_bits)
+        .filter(move |bit| mask & direction & (1 << bit) != 0)
+        .map(move |bit| (bit as i32, value & (1 << bit) != 0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_bits_are_never_driven() {
+        // Bits 0-3 In, 4-7 Out: a whole-port write touches only 4-7.
+        let bits: Vec<_> = output_bits(0xA5, 0xFF, 0xF0, 8).collect();
+        assert_eq!(bits, vec![(4, false), (5, true), (6, false), (7, true)]);
+    }
+
+    #[test]
+    fn only_masked_output_bits_are_driven() {
+        let bits: Vec<_> = output_bits(0xFF, 0x02, 0xFF, 8).collect();
+        assert_eq!(bits, vec![(1, true)]);
+    }
+
+    #[test]
+    fn a_port_with_no_outputs_drives_nothing() {
+        assert_eq!(output_bits(0xFF, 0xFF, 0x00, 8).count(), 0);
+    }
+}

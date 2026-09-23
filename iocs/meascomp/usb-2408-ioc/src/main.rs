@@ -5,7 +5,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -31,8 +30,10 @@ async fn main() -> CaResult<()> {
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
+    // This IOC's own directory: its auto_settings.req and autosave/ live
+    // here, so the two meascomp IOCs never share a request or save file.
+    epics_rs::base::runtime::env::set_default("USB_2408_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     let runtime: Arc<Mutex<Option<MultiFunctionRuntime>>> = Arc::new(Mutex::new(None));
 
     let mut app = IocApplication::new();
@@ -43,6 +44,8 @@ async fn main() -> CaResult<()> {
     // registry with the stdRecords.dbd manifest); the db files this IOC
     // loads use it, as a C IOC links the owning module's .dbd.
     app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    // Universal asyn device support, and with it asyn.dbd's shell commands
+    // (asynReport, asynSetTraceMask, ...) on PortManager::global().
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     let autosave_config = Arc::new(Mutex::new(
@@ -52,7 +55,6 @@ async fn main() -> CaResult<()> {
 
     // MultiFunctionConfig command
     {
-        let trace_c = trace.clone();
         let rt = runtime.clone();
         app = app.register_startup_command(CommandDef::new(
             "MultiFunctionConfig",
@@ -96,12 +98,8 @@ async fn main() -> CaResult<()> {
                 let mf_rt = create_usb_2408(&port_name, &unique_id, max_in, max_out)?;
 
                 let port_handle = mf_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle)
+                    .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(mf_rt);
                 Ok(CommandOutcome::Continue)

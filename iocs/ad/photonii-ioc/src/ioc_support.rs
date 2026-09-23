@@ -24,7 +24,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     {
         let mgr = ioc.mgr().clone();
-        let trace = ioc.trace().clone();
         let rt_slot = runtime.clone();
         ioc.register_startup_command(CommandDef::new(
             "PhotonIIConfig",
@@ -82,12 +81,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 let rt = create_photonii_detector(&port_name, cmd.handle.clone(), max_memory)
                     .map_err(|e| format!("failed to create the PhotonII detector: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    rt.port_handle().clone(),
-                    trace.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&port_name, rt.port_handle().clone())
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     rt.pool().clone(),

@@ -1,15 +1,15 @@
 # Per-channel waveform generator records
 # Macros: P (prefix), R (record name), PORT (asyn port), ADDR (channel)
 
-record(mbbo, "$(P)$(R)WaveType") {
+record(mbbo, "$(P)$(R)Type") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_WAVE_TYPE")
-    field(ZRST, "User")      field(ZRVL, "0")
-    field(ONST, "Sin")       field(ONVL, "1")
-    field(TWST, "Square")    field(TWVL, "2")
-    field(THST, "Sawtooth")  field(THVL, "3")
-    field(FRST, "Pulse")     field(FRVL, "4")
-    field(FVST, "Random")    field(FVVL, "5")
+    field(ZRST, "User-defined")  field(ZRVL, "0")
+    field(ONST, "Sin wave")      field(ONVL, "1")
+    field(TWST, "Square wave")   field(TWVL, "2")
+    field(THST, "Sawtooth")      field(THVL, "3")
+    field(FRST, "Pulse")         field(FRVL, "4")
+    field(FVST, "Random")        field(FVVL, "5")
     field(VAL,  "1")
     field(PINI, "YES")
 }
@@ -19,8 +19,8 @@ record(bo, "$(P)$(R)Enable") {
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_ENABLE")
     field(VAL,  "1")
     field(PINI, "YES")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(ZNAM, "Disable")
+    field(ONAM, "Enable")
     field(VAL,  "1")
     field(PINI, "YES")
 }
@@ -49,8 +49,19 @@ record(ao, "$(P)$(R)PulseWidth") {
     field(PINI, "YES")
 }
 
-# User-defined waveform in volts, used when WaveType is "User". A waveform
-# shorter than WaveGenNumPoints is repeated to fill the scan.
+# The internal waveform the driver computed for this channel, pushed on every
+# change of its shape.
+record(waveform, "$(P)$(R)InternalWF") {
+    field(DTYP, "asynFloat32ArrayIn")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_INT_WF")
+    field(FTVL, "FLOAT")
+    field(NELM, "$(WGEN_POINTS=2048)")
+    field(SCAN, "I/O Intr")
+}
+
+# User-defined waveform in volts, used when Type is "User-defined", scaled by
+# Amplitude and shifted by Offset. The scan plays WaveGenUserNumPoints of it;
+# points never written stay 0 V.
 record(waveform, "$(P)$(R)UserWF") {
     field(DTYP, "asynFloat32ArrayOut")
     field(INP,  "@asyn($(PORT),$(ADDR),1.0)WAVEGEN_USER_WF")

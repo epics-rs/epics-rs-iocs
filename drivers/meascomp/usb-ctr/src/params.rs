@@ -1,13 +1,42 @@
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
+use mca::interface::McaReason;
 
 /// 8 counters + 1 digital I/O channel in MCS mode.
 pub const MAX_MCS_COUNTERS: usize = 9;
+/// Counters on the largest board (USB-CTR08); the actual number comes from
+/// [`CtrModel::num_counters`].
 pub const MAX_COUNTERS: usize = 8;
 pub const NUM_TIMERS: usize = 4;
 pub const NUM_IO_BITS: usize = 8;
 pub const DIGITAL_IO_COUNTER: usize = MAX_MCS_COUNTERS - 1;
+
+/// The boards drvUSBCTR drives, with C's MODEL values (drvUSBCTR.cpp:364-372).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CtrModel {
+    Ctr08 = 0,
+    Ctr04 = 1,
+}
+
+impl CtrModel {
+    pub fn from_product_name(name: &str) -> Option<Self> {
+        match name {
+            "USB-CTR08" => Some(Self::Ctr08),
+            "USB-CTR04" => Some(Self::Ctr04),
+            _ => None,
+        }
+    }
+
+    /// C `numCounters_`: the counters the board has. Every per-counter loop
+    /// is bounded by this; libuldaq rejects counter 4..7 on a CTR04.
+    pub fn num_counters(self) -> usize {
+        match self {
+            Self::Ctr08 => 8,
+            Self::Ctr04 => 4,
+        }
+    }
+}
 
 /// Parameter indices for the USB-CTR driver.
 #[derive(Clone, Copy)]
@@ -15,6 +44,7 @@ pub struct CtrParams {
     // Board info
     pub model_name: usize,
     pub model_number: usize,
+    pub model: usize,
     pub firmware_version: usize,
     pub unique_id: usize,
     pub ul_version: usize,
@@ -64,14 +94,17 @@ pub struct CtrParams {
     pub mca_acquiring: usize,
     pub mca_elapsed_real: usize,
     pub mca_elapsed_live: usize,
+    pub mca_elapsed_counts: usize,
     pub mca_prescale: usize,
 }
 
 impl CtrParams {
     pub fn create(base: &mut PortDriverBase) -> AsynResult<Self> {
+        let mca = McaReason::create_params(base)?;
         Ok(Self {
             model_name: base.create_param("MODEL_NAME", ParamType::Octet)?,
             model_number: base.create_param("MODEL_NUMBER", ParamType::Int32)?,
+            model: base.create_param("MODEL", ParamType::Int32)?,
             firmware_version: base.create_param("FIRMWARE_VERSION", ParamType::Octet)?,
             unique_id: base.create_param("UNIQUE_ID", ParamType::Octet)?,
             ul_version: base.create_param("UL_VERSION", ParamType::Octet)?,
@@ -105,18 +138,47 @@ impl CtrParams {
             mcs_prescale_counter: base.create_param("MCS_PRESCALE_COUNTER", ParamType::Int32)?,
             mcs_point0_action: base.create_param("MCS_POINT0_ACTION", ParamType::Int32)?,
 
-            mca_start_acquire: base.create_param("MCA_START_ACQUIRE", ParamType::Int32)?,
-            mca_stop_acquire: base.create_param("MCA_STOP_ACQUIRE", ParamType::Int32)?,
-            mca_erase: base.create_param("MCA_ERASE", ParamType::Int32)?,
-            mca_data: base.create_param("MCA_DATA", ParamType::Int32Array)?,
-            mca_num_channels: base.create_param("MCA_NUM_CHANNELS", ParamType::Int32)?,
-            mca_dwell_time: base.create_param("MCA_DWELL_TIME", ParamType::Float64)?,
-            mca_ch_advance_source: base.create_param("MCA_CH_ADVANCE_SOURCE", ParamType::Int32)?,
-            mca_preset_real: base.create_param("MCA_PRESET_REAL_TIME", ParamType::Float64)?,
-            mca_acquiring: base.create_param("MCA_ACQUIRING", ParamType::Int32)?,
-            mca_elapsed_real: base.create_param("MCA_ELAPSED_REAL_TIME", ParamType::Float64)?,
-            mca_elapsed_live: base.create_param("MCA_ELAPSED_LIVE_TIME", ParamType::Float64)?,
-            mca_prescale: base.create_param("MCA_PRESCALE", ParamType::Int32)?,
+            // All 21 drvMca.h parameters under their drvMca.h names, as C
+            // creates them (drvUSBCTR.cpp:331-351): an mca record's
+            // devMcaAsyn resolves every one of them at init.
+            mca_start_acquire: mca[McaReason::StartAcquire as usize],
+            mca_stop_acquire: mca[McaReason::StopAcquire as usize],
+            mca_erase: mca[McaReason::Erase as usize],
+            mca_data: mca[McaReason::Data as usize],
+            mca_num_channels: mca[McaReason::NumChannels as usize],
+            mca_dwell_time: mca[McaReason::DwellTime as usize],
+            mca_ch_advance_source: mca[McaReason::ChannelAdvanceSource as usize],
+            mca_preset_real: mca[McaReason::PresetRealTime as usize],
+            mca_acquiring: mca[McaReason::Acquiring as usize],
+            mca_elapsed_real: mca[McaReason::ElapsedRealTime as usize],
+            mca_elapsed_live: mca[McaReason::ElapsedLiveTime as usize],
+            mca_elapsed_counts: mca[McaReason::ElapsedCounts as usize],
+            mca_prescale: mca[McaReason::Prescale as usize],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_board_has_its_own_counter_count() {
+        assert_eq!(
+            CtrModel::from_product_name("USB-CTR08"),
+            Some(CtrModel::Ctr08)
+        );
+        assert_eq!(
+            CtrModel::from_product_name("USB-CTR04"),
+            Some(CtrModel::Ctr04)
+        );
+        assert_eq!(CtrModel::Ctr08.num_counters(), 8);
+        assert_eq!(CtrModel::Ctr04.num_counters(), 4);
+        assert_eq!(CtrModel::Ctr04 as i32, 1);
+    }
+
+    #[test]
+    fn another_board_is_not_a_usb_ctr() {
+        assert_eq!(CtrModel::from_product_name("USB-2408-2AO"), None);
     }
 }

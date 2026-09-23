@@ -49,7 +49,9 @@ record(ao, "$(P)PollSleepMS") {
     field(PINI, "YES")
 }
 
-# Newest driver-reported failure, as C reportError() publishes it.
+# Newest driver-reported failure. An epics-rs addition: C creates
+# LAST_ERROR_MESSAGE but never writes it. The record that failed also
+# carries the WRITE alarm, as in C.
 record(waveform, "$(P)LastErrorMessage") {
     field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0,1.0)LAST_ERROR_MESSAGE")

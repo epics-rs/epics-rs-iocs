@@ -4,7 +4,10 @@ record(longin, "$(P)$(R)Counts") {
     field(SCAN, "I/O Intr")
 }
 
+# PINI with VAL 1 clears the counter at boot, as upstream does.
 record(bo, "$(P)$(R)Reset") {
+    field(PINI, "YES")
+    field(VAL,  "1")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)COUNTER_RESET")
     field(ZNAM, "Done")

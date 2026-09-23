@@ -13,7 +13,6 @@ use epics_rs::ad_core::ioc::{GenericDriverContext, PluginManager};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
 };
@@ -107,14 +106,16 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
 }
 
 /// The four startup verbs a quadEM `st.cmd` uses before its `drv*Configure`
-/// call: create the octet port, then frame it.
-pub fn octet_port_commands(trace: Arc<TraceManager>) -> Vec<CommandDef> {
+/// call: create the octet port, then frame it. The ports are bound to the
+/// process services every driver port runs on, as C's one `pasynBase`;
+/// `PortServices::new` would also re-point the shared trace's exception sink.
+pub fn octet_port_commands() -> Vec<CommandDef> {
     vec![
         epics_rs::asyn::iocsh::drv_asyn_ip_port_configure_command(
-            epics_rs::asyn::services::PortServices::new(trace.clone()),
+            epics_rs::asyn::services::PortServices::global(),
         ),
         epics_rs::asyn::iocsh::drv_asyn_serial_port_configure_command(
-            epics_rs::asyn::services::PortServices::new(trace),
+            epics_rs::asyn::services::PortServices::global(),
         ),
         eos_command("asynOctetSetInputEos", true),
         eos_command("asynOctetSetOutputEos", false),
@@ -130,13 +131,12 @@ pub fn octet_port_commands(trace: Arc<TraceManager>) -> Vec<CommandDef> {
 /// `NDArrayAddr`.
 pub fn register_quadem_port(
     mgr: &Arc<PluginManager>,
-    trace: &Arc<TraceManager>,
     port_name: &str,
     handle: PortHandle,
     pool: Arc<NDArrayPool>,
     outputs: &[Arc<parking_lot::Mutex<NDArrayOutput>>],
 ) -> epics_rs::asyn::error::AsynResult<()> {
-    epics_rs::asyn::asyn_record::register_port(port_name, handle, trace.clone())?;
+    epics_rs::asyn::asyn_record::register_port(port_name, handle)?;
 
     mgr.set_driver(Arc::new(GenericDriverContext::new(
         pool,
@@ -158,7 +158,6 @@ pub fn register_quadem_port(
 /// from one driver, so one command serves the AH401 and AH501 IOCs.
 pub fn ahxxx_configure_command(
     mgr: Arc<PluginManager>,
-    trace: Arc<TraceManager>,
     runtime: Arc<Mutex<Option<AhxxxRuntime>>>,
 ) -> CommandDef {
     CommandDef::new(
@@ -221,7 +220,6 @@ pub fn ahxxx_configure_command(
 
             register_quadem_port(
                 &mgr,
-                &trace,
                 &port_name,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
@@ -243,7 +241,6 @@ pub fn ahxxx_configure_command(
 /// precedes this verb.
 pub fn nsls_em_configure_command(
     mgr: Arc<PluginManager>,
-    trace: Arc<TraceManager>,
     runtime: Arc<Mutex<Option<NslsEmRuntime>>>,
 ) -> CommandDef {
     CommandDef::new(
@@ -304,7 +301,6 @@ pub fn nsls_em_configure_command(
 
             register_quadem_port(
                 &mgr,
-                &trace,
                 &port_name,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
@@ -325,7 +321,6 @@ pub fn nsls_em_configure_command(
 /// and bounds the Rust `NDArrayPool`.
 pub fn fx4_configure_command(
     mgr: Arc<PluginManager>,
-    trace: Arc<TraceManager>,
     runtime: Arc<Mutex<Option<Fx4Runtime>>>,
 ) -> CommandDef {
     CommandDef::new(
@@ -372,7 +367,6 @@ pub fn fx4_configure_command(
 
             register_quadem_port(
                 &mgr,
-                &trace,
                 &port_name,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
@@ -392,7 +386,6 @@ pub fn fx4_configure_command(
 /// is unbounded) and bounds the Rust pool.
 pub fn pcr4_configure_command(
     mgr: Arc<PluginManager>,
-    trace: Arc<TraceManager>,
     runtime: Arc<Mutex<Option<Pcr4Runtime>>>,
 ) -> CommandDef {
     CommandDef::new(
@@ -439,7 +432,6 @@ pub fn pcr4_configure_command(
 
             register_quadem_port(
                 &mgr,
-                &trace,
                 &port_name,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
@@ -461,7 +453,6 @@ pub fn pcr4_configure_command(
 /// argument has no C++ analogue and bounds the Rust `NDArrayPool`.
 pub fn t4u_em_configure_command(
     mgr: Arc<PluginManager>,
-    trace: Arc<TraceManager>,
     runtime: Arc<Mutex<Option<T4uRuntime>>>,
 ) -> CommandDef {
     CommandDef::new(
@@ -519,7 +510,6 @@ pub fn t4u_em_configure_command(
 
             register_quadem_port(
                 &mgr,
-                &trace,
                 &port_name,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
@@ -537,7 +527,6 @@ pub fn t4u_em_configure_command(
 /// basePortNum, cfgFileName)`.
 pub fn t4u_direct_em_configure_command(
     mgr: Arc<PluginManager>,
-    trace: Arc<TraceManager>,
     runtime: Arc<Mutex<Option<T4uRuntime>>>,
 ) -> CommandDef {
     CommandDef::new(
@@ -605,7 +594,6 @@ pub fn t4u_direct_em_configure_command(
 
             register_quadem_port(
                 &mgr,
-                &trace,
                 &port_name,
                 rt.port_handle().clone(),
                 rt.pool.clone(),

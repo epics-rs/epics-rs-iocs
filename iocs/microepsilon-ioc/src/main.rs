@@ -6,14 +6,12 @@
 //! Usage:
 //!   cargo run -p microepsilon-ioc -- st.cmd
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -39,8 +37,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("MICROEPSILON", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
-
     let mut app = IocApplication::new();
 
     let (asyn_name, asyn_factory) = asyn_record::asyn_record_factory();
@@ -62,7 +58,7 @@ async fn main() -> CaResult<()> {
     // `microepsilon::connect::connect_octet` (the `.proto`'s fixed
     // InTerminator/OutTerminator), not via iocsh -- see
     // `motor-port-eos-ownership`'s "driver-programmatic EOS" case.
-    let port_manager = Arc::new(PortManager::new());
+    let port_manager = PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // CapaNCDT6200ConfigInit(cfgPort, ioPort, ioAddr) -- no upstream C
@@ -74,7 +70,6 @@ async fn main() -> CaResult<()> {
     // `drvAsynSerialPortConfigure`. Mirrors `love-ioc`'s
     // `LoveInit(lovPort, serPort, serAddr)` shape.
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "CapaNCDT6200ConfigInit",
             vec![
@@ -115,12 +110,8 @@ async fn main() -> CaResult<()> {
                 let (runtime_handle, _actor_jh) =
                     create_port_runtime(driver, RuntimeConfig::default())
                         .map_err(|e| format!("CapaNCDT6200ConfigInit: {e}"))?;
-                asyn_record::register_port(
-                    &cfg_port,
-                    runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                asyn_record::register_port(&cfg_port, runtime_handle.port_handle().clone())
+                    .map_err(|e| e.to_string())?;
                 // See drivers/microepsilon::data_driver's module doc
                 // (`PortRuntimeHandle` gap note): dropping the last handle
                 // to a port runtime closes its shutdown channel and the
@@ -144,7 +135,6 @@ async fn main() -> CaResult<()> {
     // and its internal `_RBK` transport port, and retains both runtimes
     // itself.
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "capaNCDT6200Configure",
             vec![
@@ -176,7 +166,7 @@ async fn main() -> CaResult<()> {
                     _ => return Err("IPport required".into()),
                 };
 
-                data_configure(&port_name, &ip_address, &ip_port, trace_c.clone())
+                data_configure(&port_name, &ip_address, &ip_port)
                     .map_err(|e| format!("capaNCDT6200Configure: {e}"))?;
 
                 Ok(CommandOutcome::Continue)

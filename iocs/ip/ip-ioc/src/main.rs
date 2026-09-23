@@ -19,7 +19,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -64,13 +63,8 @@ fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, Strin
     Ok(Duration::from_secs_f64(seconds))
 }
 
-fn register(
-    ports: &Ports,
-    name: &str,
-    trace: &Arc<TraceManager>,
-    port: IpPortRuntime,
-) -> Result<(), String> {
-    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), trace.clone())
+fn register(ports: &Ports, name: &str, port: IpPortRuntime) -> Result<(), String> {
+    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone())
         .map_err(|e| e.to_string())?;
     ports.lock().expect("port list poisoned").push(port);
     Ok(())
@@ -88,7 +82,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("IP", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = IocApplication::new();
@@ -105,7 +98,6 @@ async fn main() -> CaResult<()> {
     // MPCConfig(port, octetPort, address, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "MPCConfig",
             vec![
@@ -136,7 +128,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 1.0)?;
                 let port = create_mpc(&name, &octet, address, poll)
                     .map_err(|e| format!("MPCConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(&ports, &name, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -145,7 +137,6 @@ async fn main() -> CaResult<()> {
     // TPG261Config(port, octetPort, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "TPG261Config",
             vec![
@@ -169,7 +160,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 2.0)?;
                 let port = create_tpg261(&name, &octet, poll)
                     .map_err(|e| format!("TPG261Config failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(&ports, &name, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -178,7 +169,6 @@ async fn main() -> CaResult<()> {
     // TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "TelevacConfig",
             vec![
@@ -217,7 +207,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 4, 1.0)?;
                 let port = create_televac(&name, &octet, stations, relays, poll)
                     .map_err(|e| format!("TelevacConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(&ports, &name, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -226,7 +216,6 @@ async fn main() -> CaResult<()> {
     // MKSConfig(port, octetPort, numGauges, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "MKSConfig",
             vec![
@@ -258,7 +247,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 1.0)?;
                 let port = create_mks(&name, &octet, gauges, poll)
                     .map_err(|e| format!("MKSConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(&ports, &name, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -267,7 +256,6 @@ async fn main() -> CaResult<()> {
     // ND261Config(port, octetPort, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "ND261Config",
             vec![
@@ -291,7 +279,7 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 2, 1.0)?;
                 let port = create_nd261(&name, &octet, poll)
                     .map_err(|e| format!("ND261Config failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(&ports, &name, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -300,7 +288,6 @@ async fn main() -> CaResult<()> {
     // EurothermConfig(port, octetPort, groupAddress)
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "EurothermConfig",
             vec![
@@ -327,7 +314,7 @@ async fn main() -> CaResult<()> {
                     .map_err(|_| format!("EurothermConfig: groupAddress {group} is not 0..9"))?;
                 let port = create_eurotherm(&name, &octet, group)
                     .map_err(|e| format!("EurothermConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(&ports, &name, port)?;
                 Ok(CommandOutcome::Continue)
             },
         ));

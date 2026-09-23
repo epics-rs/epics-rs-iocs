@@ -5,7 +5,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -32,6 +31,9 @@ async fn main() -> CaResult<()> {
         "MEASCOMP",
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
+    // This IOC's own directory: its auto_settings.req and autosave/ live
+    // here, so the two meascomp IOCs never share a request or save file.
+    epics_rs::base::runtime::env::set_default("USB_CTR_IOC", env!("CARGO_MANIFEST_DIR"));
     // scaler-rs ships scaler.db; st.cmd loads it from $(SCALER)/db the
     // way upstream's USBCTR st.cmd loads it from the scaler module. The
     // crate's const names the db dir itself; SCALER names the crate dir
@@ -44,8 +46,6 @@ async fn main() -> CaResult<()> {
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
-    let trace = Arc::new(TraceManager::new());
-
     // Runtime kept alive by being captured in the startup command closure
     let runtime: Arc<Mutex<Option<CtrRuntime>>> = Arc::new(Mutex::new(None));
     // Hand-off slot from USBCTRConfig to the scalerRecord bind at iocInit.
@@ -57,6 +57,10 @@ async fn main() -> CaResult<()> {
     // Register record types
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
+
+    // The optional mca-record form of the MCS spectra (meascomp_mca.template).
+    let (mca_name, mca_factory) = mca_rs::mca_record_factory();
+    app = app.register_record_type(mca_name, move || mca_factory());
 
     let (scaler_name, scaler_factory) = epics_rs::scaler::scaler_record_factory();
     app = app.register_record_type(scaler_name, move || scaler_factory());
@@ -72,7 +76,8 @@ async fn main() -> CaResult<()> {
     // Contributing the menu here makes that assignment resolve.
     epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
 
-    // Universal asyn device support
+    // Universal asyn device support, and with it asyn.dbd's shell commands
+    // (asynReport, asynSetTraceMask, ...) on PortManager::global().
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Autosave
@@ -83,7 +88,6 @@ async fn main() -> CaResult<()> {
 
     // USBCTRConfig command
     {
-        let trace_c = trace.clone();
         let rt = runtime.clone();
         let scaler_slot = pending_scaler.clone();
         app = app.register_startup_command(CommandDef::new(
@@ -122,15 +126,12 @@ async fn main() -> CaResult<()> {
                 *scaler_slot.lock().unwrap() = Some(CtrScalerDriver::new(
                     ctr_rt.device.clone(),
                     ctr_rt.state.clone(),
+                    ctr_rt.port_handle().clone(),
                 ));
 
                 let port_handle = ctr_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    trace_c.clone(),
-                )
-                .map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle)
+                    .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(ctr_rt);
                 Ok(CommandOutcome::Continue)
@@ -153,6 +154,16 @@ async fn main() -> CaResult<()> {
             ) as Box<dyn DeviceSupport>)
         });
     }
+
+    // Binds every mca record with DTYP "asynMCA" to the port its INP names,
+    // as upstream's devMcaAsyn does.
+    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+        if ctx.dtyp != mca::interface::ASYN_MCA_DTYP {
+            return None;
+        }
+        let dev = mca::dev_mca_asyn::connect(ctx.inp)?;
+        Some(Box::new(dev) as Box<dyn DeviceSupport>)
+    });
 
     app.startup_script(&script)
         .run(epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc)

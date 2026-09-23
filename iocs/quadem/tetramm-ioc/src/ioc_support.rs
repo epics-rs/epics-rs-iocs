@@ -18,7 +18,6 @@ fn tetramm_configure_command(
     runtime: Arc<std::sync::Mutex<Option<TetrAmmRuntime>>>,
 ) -> CommandDef {
     let mgr = ioc.mgr().clone();
-    let trace = ioc.trace().clone();
     CommandDef::new(
         "drvTetrAMMConfigure",
         vec![
@@ -65,7 +64,6 @@ fn tetramm_configure_command(
 
             register_quadem_port(
                 &mgr,
-                &trace,
                 &port_name,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
@@ -83,7 +81,7 @@ fn tetramm_configure_command(
 pub fn register(ioc: &mut AdIoc) {
     epics_rs::base::runtime::env::set_default("QUADEM", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
 
-    for cmd in octet_port_commands(ioc.trace().clone()) {
+    for cmd in octet_port_commands() {
         ioc.register_startup_command(cmd);
     }
 

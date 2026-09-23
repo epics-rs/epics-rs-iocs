@@ -1,7 +1,50 @@
+# In volts: LINR=LINEAR scales EGUL..EGUF onto the driver's DAC bounds
+# (0..65535 on the USB-2408-2AO), as upstream measCompAnalogOut.template does
+# with USB2408.substitutions' +/-10 V limits.
 record(ao, "$(P)$(R)") {
+    field(PINI, "$(PINI=YES)")
+    # PHAS 2: the Range record processes first at iocInit.
+    field(PHAS, "2")
+    field(VAL,  "$(VAL=0)")
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_VALUE")
-    field(PREC, "4")
+    field(LINR, "LINEAR")
+    field(EGUL, "$(EGUL=-10.)")
+    field(DRVL, "$(DRVL=-10.)")
+    field(LOPR, "$(LOPR=-10.)")
+    field(EGUF, "$(EGUF=10.)")
+    field(DRVH, "$(DRVH=10.)")
+    field(HOPR, "$(HOPR=10.)")
+    field(EGU,  "V")
+    field(PREC, "$(PREC=4)")
+    field(FLNK, "$(P)$(R)Return.PROC  PP MS")
+}
+
+###################################################################
+# Pulse: with Pulse set, every write to $(P)$(R) is followed by    #
+# Return's value, so the output pulses to it and comes back.       #
+###################################################################
+record(ao, "$(P)$(R)Return") {
+    field(DTYP, "asynInt32")
+    field(DISV, "0")
+    field(SDIS, "$(P)$(R)Pulse.VAL  NPP NMS")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_OUT_VALUE")
+    field(OMSL, "closed_loop")
+    field(LINR, "LINEAR")
+    field(EGUL, "$(EGUL=-10.)")
+    field(DRVL, "$(DRVL=-10.)")
+    field(LOPR, "$(LOPR=-10.)")
+    field(EGUF, "$(EGUF=10.)")
+    field(DRVH, "$(DRVH=10.)")
+    field(HOPR, "$(HOPR=10.)")
+    field(EGU,  "V")
+    field(PREC, "$(PREC=4)")
+    field(VAL,  "$(VAL=0)")
+}
+
+record(bo, "$(P)$(R)Pulse") {
+    field(ZNAM, "Normal")
+    field(ONAM, "Pulse")
 }
 
 record(mbbo, "$(P)$(R)Range") {
@@ -39,7 +82,7 @@ record(bo, "$(P)$(R)SyncWrite") {
 #  Tweak the output up or down by a fixed step                    #
 ###################################################################
 record(ao, "$(P)$(R)TweakVal") {
-    field(PREC, "$(PREC=0)")
+    field(PREC, "$(PREC=4)")
 }
 
 record(calcout, "$(P)$(R)TweakUp") {
@@ -47,7 +90,7 @@ record(calcout, "$(P)$(R)TweakUp") {
     field(INPA, "$(P)$(R).VAL  NPP MS")
     field(INPB, "$(P)$(R)TweakVal.VAL  NPP MS")
     field(OUT,  "$(P)$(R).VAL  PP MS")
-    field(PREC, "$(PREC=0)")
+    field(PREC, "$(PREC=4)")
 }
 
 record(calcout, "$(P)$(R)TweakDown") {
@@ -55,5 +98,5 @@ record(calcout, "$(P)$(R)TweakDown") {
     field(INPA, "$(P)$(R).VAL  NPP MS")
     field(INPB, "$(P)$(R)TweakVal.VAL  NPP MS")
     field(OUT,  "$(P)$(R).VAL  PP MS")
-    field(PREC, "$(PREC=0)")
+    field(PREC, "$(PREC=4)")
 }

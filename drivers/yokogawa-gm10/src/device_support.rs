@@ -1040,6 +1040,7 @@ mod tests {
         let registry = registry_with("gm10dev", connect_default_fixture());
         let f = factory(registry);
         let ctx = DeviceSupportContext {
+            record_type: "ai",
             dtyp: "Some Other Device",
             inp: "gm10dev VAL:1",
             out: "",
@@ -1052,6 +1053,7 @@ mod tests {
         let registry = registry_with("gm10dev", connect_default_fixture());
         let f = factory(registry);
         let ctx = DeviceSupportContext {
+            record_type: "ai",
             dtyp: DTYP,
             inp: "gm10dev VAL:1",
             out: "",
@@ -1070,6 +1072,7 @@ mod tests {
         let registry = registry_with("gm10dev", connect_default_fixture());
         let f = factory(registry);
         let ctx = DeviceSupportContext {
+            record_type: "ai",
             dtyp: DTYP,
             inp: "@gm10dev VAL:1",
             out: "",
@@ -1086,6 +1089,7 @@ mod tests {
         let registry = registry_with("gm10dev", connect_default_fixture());
         let f = factory(registry);
         let ctx = DeviceSupportContext {
+            record_type: "ai",
             dtyp: DTYP,
             inp: "gm10dev VAL:1",
             out: "",
@@ -1127,6 +1131,7 @@ mod tests {
         let registry = registry_with("gm10dev", instrument);
         let f = factory(registry);
         let ctx = DeviceSupportContext {
+            record_type: "bo",
             dtyp: DTYP,
             inp: "",
             out: "gm10dev CHAN_TRIG",

@@ -17,7 +17,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     {
         let mgr = ioc.mgr().clone();
-        let trace = ioc.trace().clone();
         let rt = runtime.clone();
         ioc.register_startup_command(CommandDef::new(
             "ADTimePixConfig",
@@ -67,7 +66,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime.port_handle().clone(),
-                    trace.clone(),
                 ).map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

@@ -11,9 +11,6 @@
 //! Usage:
 //!   cargo run -p pmac-ioc -- st.cmd
 
-use std::sync::Arc;
-
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -40,15 +37,14 @@ async fn main() -> CaResult<()> {
 
     // Standard asyn iocsh commands — the serial/IP port configure verbs and the
     // EOS setters a raw-ASCII PMAC link needs.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // PMAC iocsh commands (including pmacAsynIPConfigure, which builds an IP
     // port with the PMAC ethernet framing interpose installed) + motor device
     // support.
-    let trace = Arc::new(TraceManager::new());
     let holder = MotorHolder::new();
-    for command in pmac_commands(&holder, trace) {
+    for command in pmac_commands(&holder) {
         app = app.register_startup_command(command);
     }
     app = app.register_dynamic_device_support(holder.device_support_factory());

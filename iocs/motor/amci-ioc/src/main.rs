@@ -9,9 +9,6 @@
 //! Usage:
 //!   cargo run -p amci-ioc -- st.cmd
 
-use std::sync::Arc;
-
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -41,13 +38,12 @@ async fn main() -> CaResult<()> {
 
     // Standard asyn iocsh commands — provides `drvAsynIPPortConfigure`, the
     // underlying octet port a Modbus link runs over.
-    let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
+    let port_manager = epics_rs::asyn::manager::PortManager::global();
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // Modbus iocsh commands: modbusInterposeConfig, drvModbusAsynConfigure.
-    let trace = Arc::new(TraceManager::new());
     let handle = epics_rs::base::runtime::task::runtime_handle();
-    app = modbus_rs::ioc::register_modbus_commands(app, handle, trace);
+    app = modbus_rs::ioc::register_modbus_commands(app, handle);
 
     // AMCI iocsh commands + motor device support.
     let holder = MotorHolder::new();

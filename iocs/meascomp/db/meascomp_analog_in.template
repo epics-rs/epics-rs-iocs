@@ -1,8 +1,17 @@
+# The mean of every poll's reading over SCAN, in volts: raw ADC counts scaled
+# by LINR over the driver's ADC bounds onto EGUL..EGUF, which must match the
+# channel's Range (upstream measCompAnalogIn.template).
 record(ai, "$(P)$(R)") {
-    field(DTYP, "asynFloat64")
-    field(INP,  "@asyn($(PORT),$(ADDR),1.0)VOLTAGE_IN_VALUE")
-    field(PREC, "6")
-    field(SCAN, "I/O Intr")
+    field(SCAN, "$(SCAN=1 second)")
+    field(DTYP, "asynInt32Average")
+    field(INP,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_VALUE")
+    field(LINR, "LINEAR")
+    field(EGUF, "$(EGUF=10.)")
+    field(EGUL, "$(EGUL=-10.)")
+    field(HOPR, "$(HOPR=10.)")
+    field(LOPR, "$(LOPR=-10.)")
+    field(EGU,  "V")
+    field(PREC, "$(PREC=4)")
 }
 
 record(mbbo, "$(P)$(R)Range") {
@@ -24,5 +33,13 @@ record(mbbo, "$(P)$(R)Type") {
     field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_TYPE")
     field(ZRST, "Volts")     field(ZRVL, "0")
     field(ONST, "TC deg.")   field(ONVL, "1")
+    field(PINI, "YES")
+}
+
+# ADC data rate in samples/s; 60 rejects 60 Hz pickup.
+record(ao, "$(P)$(R)Rate") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),1.0)ANALOG_IN_RATE")
+    field(VAL,  "$(RATE=60)")
     field(PINI, "YES")
 }

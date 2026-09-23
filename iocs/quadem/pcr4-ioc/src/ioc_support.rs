@@ -13,12 +13,12 @@ use quadem::iocsh::{octet_port_commands, pcr4_configure_command};
 pub fn register(ioc: &mut AdIoc) {
     epics_rs::base::runtime::env::set_default("QUADEM", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
 
-    for cmd in octet_port_commands(ioc.trace().clone()) {
+    for cmd in octet_port_commands() {
         ioc.register_startup_command(cmd);
     }
 
     let runtime: Arc<Mutex<Option<Pcr4Runtime>>> = Arc::new(Mutex::new(None));
-    let cmd = pcr4_configure_command(ioc.mgr().clone(), ioc.trace().clone(), runtime.clone());
+    let cmd = pcr4_configure_command(ioc.mgr().clone(), runtime.clone());
     ioc.register_startup_command(cmd);
 
     // Keep the runtime (read thread, callback thread, port actor) alive.

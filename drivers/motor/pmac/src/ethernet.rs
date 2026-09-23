@@ -47,15 +47,12 @@
 //! byte-identical on LE and additionally correct on a big-endian host, where
 //! the C would put the control character in the wrong byte.
 
-use std::sync::Arc;
-
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::eos::EosInterpose;
 use epics_rs::asyn::interpose::{EomReason, OctetInterpose, OctetNext, OctetReadResult};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -398,7 +395,7 @@ impl OctetInterpose for PmacIpInterpose {
 /// (ACK) and OEOS `\r` on its own asyn user), so a startup script that uses
 /// this command must still `asynOctetSetInputEos(port, 0, "\006")` and
 /// `asynOctetSetOutputEos(port, 0, "\r")` — the crate's `st.cmd` does.
-pub fn pmac_asyn_ip_configure_command(trace: Arc<TraceManager>) -> CommandDef {
+pub fn pmac_asyn_ip_configure_command() -> CommandDef {
     CommandDef::new(
         "pmacAsynIPConfigure",
         vec![arg_str_req("portName"), arg_str_req("hostInfo")],
@@ -421,12 +418,8 @@ pub fn pmac_asyn_ip_configure_command(trace: Arc<TraceManager>) -> CommandDef {
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default())
                 .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
-            epics_rs::asyn::asyn_record::register_port(
-                &port,
-                handle.port_handle().clone(),
-                trace.clone(),
-            )
-            .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
+            epics_rs::asyn::asyn_record::register_port(&port, handle.port_handle().clone())
+                .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
             drop(handle);
 
             ctx.println(&format!(

@@ -57,8 +57,17 @@ dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_in.template",  "P=$(PREFIX),R=Bi8,
 dbLoadRecords("$(MEASCOMP)/db/meascomp_long_in.template",  "P=$(PREFIX),R=Li,PORT=$(PORT),ADDR=0,MASK=0xFF")
 dbLoadRecords("$(MEASCOMP)/db/meascomp_long_out.template", "P=$(PREFIX),R=Lo,PORT=$(PORT),ADDR=0,MASK=0xFF")
 
-# No direction records: the USB-2408 AUXPORT reports DPIOT_NONCONFIG,
-# so its 8 bits have a fixed direction and ulDConfigBit is rejected.
+# Digital I/O bit directions (0=input, 1=output). The AUXPORT is
+# open-collector with no direction control: "In" releases the bit and the
+# driver then never drives it, "Out" makes Bo/Lo able to pull it low.
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd1,PORT=$(PORT),ADDR=0,MASK=0x01,VAL=0")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd2,PORT=$(PORT),ADDR=0,MASK=0x02,VAL=0")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd3,PORT=$(PORT),ADDR=0,MASK=0x04,VAL=0")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd4,PORT=$(PORT),ADDR=0,MASK=0x08,VAL=0")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd5,PORT=$(PORT),ADDR=0,MASK=0x10,VAL=1")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd6,PORT=$(PORT),ADDR=0,MASK=0x20,VAL=1")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd7,PORT=$(PORT),ADDR=0,MASK=0x40,VAL=1")
+dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_dir.template", "P=$(PREFIX),R=Bd8,PORT=$(PORT),ADDR=0,MASK=0x80,VAL=1")
 
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo1,PORT=$(PORT),ADDR=0,MASK=0x01")
 dbLoadRecords("$(MEASCOMP)/db/meascomp_binary_out.template", "P=$(PREFIX),R=Bo2,PORT=$(PORT),ADDR=0,MASK=0x02")
@@ -88,8 +97,8 @@ dbLoadRecords("$(MEASCOMP)/db/meascomp_wave_gen_n.template", "P=$(PREFIX),R=Wave
 
 # Autosave: request files live next to this script, saved state under
 # ./autosave. set_pass1_restoreFile is a no-op until the first save has run.
-set_requestfile_path("$(MEASCOMP)")
-set_savefile_path("$(MEASCOMP)/autosave")
+set_requestfile_path("$(USB_2408_IOC)")
+set_savefile_path("$(USB_2408_IOC)/autosave")
 set_pass1_restoreFile("auto_settings.sav", "P=$(PREFIX)")
 
 iocInit()

@@ -1181,10 +1181,9 @@ Edit `iocs/meascomp/usb-ctr-ioc/st.cmd` to set your device serial number:
 epicsEnvSet("UNIQUE_ID", "0214D582")
 ```
 
-An empty `UNIQUE_ID` connects to the first available device, which is
-**not safe when multiple MCC devices are plugged in** — both this IOC
-and `usb-2408-ioc` would grab the same `descriptors[0]`. Always set
-`UNIQUE_ID` explicitly in multi-device setups.
+`UNIQUE_ID` must match a connected board exactly; an empty or unknown
+ID fails `USBCTRConfig`, as upstream `measCompDiscover` does, so an IOC
+never binds to whichever board happens to enumerate first.
 
 To list all connected MCC devices and their UNIQUE_IDs:
 
@@ -1264,10 +1263,10 @@ caput USB2408:Ai1Type 1          # Switch to TC mode
 caput USB2408:Ti1TCType 1        # J-type thermocouple
 caget USB2408:Ti1
 
-# Set analog output 1 to mid-scale
-caput USB2408:Ao1 32768
+# Set analog output 1 to 2.5 V (the record is in volts, +/-10 V)
+caput USB2408:Ao1 2.5
 
-# Start waveform digitizer (8 channels, 1000 points)
+# Start waveform digitizer (1 channel, the default, 1000 points)
 caput USB2408:WaveDigNumPoints 1000
 caput USB2408:WaveDigDwell 0.001
 caput USB2408:WaveDigRun 1

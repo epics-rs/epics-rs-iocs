@@ -13,7 +13,7 @@ record(busy, "$(P)WaveGenRun") {
 
 # Readback of the frequency in use; set it through UserFrequency or
 # IntFrequency below, whichever matches the selected wave type.
-record(ai, "$(P)WaveGenFreq") {
+record(ai, "$(P)WaveGenFrequency") {
     field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_FREQ")
     field(PREC, "3")
@@ -73,10 +73,14 @@ record(ao, "$(P)WaveGenUserDwell") {
     field(FLNK, "$(P)WaveGenCalcUserFrequency")
 }
 
+# The dwell/frequency calcs write only a usable result: a zero input (a
+# record not yet initialised, whatever the iocInit order) must never reach
+# the driver as a zero dwell.
 record(calcout, "$(P)WaveGenCalcUserFrequency") {
     field(INPA, "$(P)WaveGenUserDwell  NPP MS")
     field(INPB, "$(P)WaveGenUserNumPoints  NPP MS")
     field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OOPT, "When Non-zero")
     field(OUT,  "$(P)WaveGenUserFrequency.VAL  NPP MS")
 }
 
@@ -87,8 +91,9 @@ record(ao, "$(P)WaveGenUserFrequency") {
 
 record(calcout, "$(P)WaveGenCalcUserDwell") {
     field(INPA, "$(P)WaveGenUserFrequency  NPP MS")
-    field(INPB, "$(P)WaveGenUserNumPoints  NPP MS")
+    field(INPB, "$(P)WaveGenUserNumPoints  CP MS")
     field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OOPT, "When Non-zero")
     field(OUT,  "$(P)WaveGenUserDwell.VAL  PP MS")
 }
 
@@ -105,6 +110,7 @@ record(calcout, "$(P)WaveGenCalcIntFrequency") {
     field(INPA, "$(P)WaveGenIntDwell  NPP MS")
     field(INPB, "$(P)WaveGenIntNumPoints  NPP MS")
     field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OOPT, "When Non-zero")
     field(OUT,  "$(P)WaveGenIntFrequency.VAL  NPP MS")
 }
 
@@ -115,23 +121,27 @@ record(ao, "$(P)WaveGenIntFrequency") {
 
 record(calcout, "$(P)WaveGenCalcIntDwell") {
     field(INPA, "$(P)WaveGenIntFrequency  NPP MS")
-    field(INPB, "$(P)WaveGenIntNumPoints  NPP MS")
+    field(INPB, "$(P)WaveGenIntNumPoints  CP MS")
     field(CALC, "(A>0&&B>0)?1/(A*B):0")
+    field(OOPT, "When Non-zero")
     field(OUT,  "$(P)WaveGenIntDwell.VAL  PP MS")
 }
 
+# Time bases of the user and internal waveforms: from their Dwell when it is
+# written, and the one in use again from the dwell the generator runs at when
+# a scan starts.
 record(waveform, "$(P)WaveGenUserTimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_USER_TIME_WF")
     field(FTVL, "FLOAT")
-    field(NELM, "$(WGEN_POINTS=2048)")
+    field(NELM, "$(WGEN_POINTS=2048)")    field(SCAN, "I/O Intr")
 }
 
 record(waveform, "$(P)WaveGenIntTimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)WAVEGEN_INT_TIME_WF")
     field(FTVL, "FLOAT")
-    field(NELM, "$(WGEN_POINTS=2048)")
+    field(NELM, "$(WGEN_POINTS=2048)")    field(SCAN, "I/O Intr")
 }
 
 record(longin, "$(P)WaveGenCurrentPoint") {
@@ -143,20 +153,23 @@ record(longin, "$(P)WaveGenCurrentPoint") {
 record(bo, "$(P)WaveGenExtTrigger") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_TRIGGER")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(PINI, "YES")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
 }
 
 record(bo, "$(P)WaveGenExtClock") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_EXT_CLOCK")
-    field(ZNAM, "Off")
-    field(ONAM, "On")
+    field(PINI, "YES")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
 }
 
 record(bo, "$(P)WaveGenContinuous") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)WAVEGEN_CONTINUOUS")
+    field(PINI, "YES")
     field(ZNAM, "One-shot")
     field(ONAM, "Continuous")
 }

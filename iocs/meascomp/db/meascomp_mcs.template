@@ -1,19 +1,20 @@
 # MCS (Multi-Channel Scaler) control records
 # Macros: P (prefix), PORT (asyn port)
+#
+# The record fields are upstream measCompMCS.template's. What upstream's
+# USBCTR_SNL.st does -- read the spectra on DoReadAll, and on the hardware's
+# 1 -> 0 transition read them and only then release Acquiring -- is done by
+# the DoReadAll / AcquireDone / FinishAcquire records below.
 
-record(bo, "$(P)MCS:StartAll") {
-    field(DTYP, "asynInt32")
-    field(OUT,  "@asyn($(PORT),0,1.0)MCA_START_ACQUIRE")
-    field(ZNAM, "Done")
-    field(ONAM, "Start")
-    field(FLNK, "$(P)MCS:SetAcquiring")
-}
-
-record(bo, "$(P)MCS:StopAll") {
-    field(DTYP, "asynInt32")
-    field(OUT,  "@asyn($(PORT),0,1.0)MCA_STOP_ACQUIRE")
-    field(ZNAM, "Done")
-    field(ONAM, "Stop")
+# Upstream's SNL program sets this when it has connected; here the database
+# itself does that job, so it is connected from the start.
+record(bi, "$(P)MCS:SNL_Connected") {
+    field(ZNAM, "Not connected")
+    field(ZSV,  "MAJOR")
+    field(ONAM, "Connected")
+    field(OSV,  "NO_ALARM")
+    field(VAL,  "1")
+    field(PINI, "YES")
 }
 
 record(bo, "$(P)MCS:EraseAll") {
@@ -21,6 +22,84 @@ record(bo, "$(P)MCS:EraseAll") {
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_ERASE")
     field(ZNAM, "Done")
     field(ONAM, "Erase")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:ReadAllOnce")
+}
+
+record(bo, "$(P)MCS:EraseStart") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_ERASE")
+    field(ZNAM, "Done")
+    field(ONAM, "Erase")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:StartAll.PROC")
+}
+
+# Raise Acquiring, issue the start, then read back what the start did. A
+# start that does not leave the hardware acquiring -- a run that already has
+# all its points, or one refused while the scaler counts -- finishes at once.
+# Upstream's SNL program sees the driver's MCA_ACQUIRING 1 -> 0 pulse for the
+# complete run, but a pulse inside one write reaches an epics-rs I/O Intr
+# record only as its final value, so the database reads the state instead.
+record(bo, "$(P)MCS:StartAll") {
+    field(ZNAM, "Done")
+    field(ONAM, "Start")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:StartSeq")
+}
+
+record(seq, "$(P)MCS:StartSeq") {
+    field(SELM, "All")
+    field(DOL1, "1")  field(LNK1, "$(P)MCS:SetAcquiring.PROC  PP")
+    field(DOL2, "1")  field(LNK2, "$(P)MCS:DoStartAll.PROC  PP")
+    field(DOL3, "1")  field(LNK3, "$(P)MCS:StartCheck.PROC  PP")
+}
+
+record(bi, "$(P)MCS:StartCheck") {
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_ACQUIRING")
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+    field(FLNK, "$(P)MCS:StartCheckDone")
+}
+
+record(calcout, "$(P)MCS:StartCheckDone") {
+    field(INPA, "$(P)MCS:StartCheck  NPP NMS")
+    field(CALC, "A")
+    field(OOPT, "When Zero")
+    field(OUT,  "$(P)MCS:FinishAcquire.PROC  PP")
+}
+
+record(bo, "$(P)MCS:DoStartAll") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_START_ACQUIRE")
+    field(ZNAM, "Done")
+    field(ONAM, "Start")
+    field(VAL,  "1")
+}
+
+record(bo, "$(P)MCS:SetAcquiring") {
+    field(OUT,  "$(P)MCS:Acquiring PP MS")
+    field(ZNAM, "Done")
+    field(ONAM, "Set")
+    field(VAL,  "1")
+    field(FLNK, "$(P)MCS:SetClientWait.PROC")
+}
+
+# What a client waits on: set with StartAll, cleared only after the spectra
+# have been re-read, so `caput -c $(P)MCS:EraseStart 1` returns with the data
+# already in the spectrum records.
+record(busy, "$(P)MCS:Acquiring") {
+    field(ZNAM, "Done")
+    field(ONAM, "Acquiring")
+}
+
+record(bo, "$(P)MCS:StopAll") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_STOP_ACQUIRE")
+    field(ZNAM, "Done")
+    field(ONAM, "Stop")
+    field(VAL,  "1")
 }
 
 # What the driver is doing right now.
@@ -33,52 +112,39 @@ record(bi, "$(P)MCS:HardwareAcquiring") {
     field(FLNK, "$(P)MCS:AcquireDone")
 }
 
-# What a client waits on. Set when acquisition starts and cleared only after
-# the spectra have been re-read, so `caput -c $(P)MCS:EraseStart 1` returns
-# with the data already in the waveform records. Upstream gets this ordering
-# from USBCTR_SNL.st; the same fan-out done in the database needs no
-# sequencer.
-record(busy, "$(P)MCS:Acquiring") {
-    field(ZNAM, "Done")
-    field(ONAM, "Acquiring")
-}
-
 # Fires once on the hardware's 1 -> 0 transition.
 record(calcout, "$(P)MCS:AcquireDone") {
     field(INPA, "$(P)MCS:HardwareAcquiring  NPP NMS")
     field(CALC, "A")
     field(OOPT, "Transition To Zero")
-    field(OUT,  "$(P)MCS:DoReadAll  PP")
+    field(OUT,  "$(P)MCS:FinishAcquire.PROC  PP")
 }
 
-record(bo, "$(P)MCS:SetAcquiring") {
-    field(ZNAM, "Done")
-    field(ONAM, "Acquiring")
-    field(OUT,  "$(P)MCS:Acquiring  PP")
-}
-
-# Erase, mark acquiring, start -- in that order.
-record(seq, "$(P)MCS:EraseStart") {
+# Read every spectrum, then release Acquiring -- in that order, as the SNL
+# program's HardwareAcquiring handler does. Nothing else clears Acquiring.
+record(seq, "$(P)MCS:FinishAcquire") {
     field(SELM, "All")
-    field(DOL1, "1")  field(LNK1, "$(P)MCS:EraseAll  PP")
-    field(DOL2, "1")  field(LNK2, "$(P)MCS:SetAcquiring  PP")
-    field(DOL3, "1")  field(LNK3, "$(P)MCS:StartAll  PP")
+    field(DOL1, "1")  field(LNK1, "$(P)MCS:ReadAllOnce.PROC  PP")
+    field(DOL2, "0")  field(LNK2, "$(P)MCS:Acquiring  PP")
 }
 
-# Re-read every spectrum plus the time bases, then release Acquiring.
-record(bo, "$(P)MCS:DoReadAll") {
-    field(ZNAM, "Done")
-    field(ONAM, "Read")
-    field(FLNK, "$(P)MCS:ReadFanout")
-}
-
+# Refreshes the spectra once a second while acquiring.
 record(bo, "$(P)MCS:ReadAll") {
+    field(SCAN, "1 second")
+    field(DISV, "0")
+    field(SDIS, "$(P)MCS:Acquiring NPP NMS")
     field(ZNAM, "Done")
     field(ONAM, "Read")
-    field(FLNK, "$(P)MCS:ReadFanout")
+    field(FLNK, "$(P)MCS:ReadAllOnce")
 }
 
 record(bo, "$(P)MCS:ReadAllOnce") {
+    field(VAL,  "1")
+    field(OUT,  "$(P)MCS:DoReadAll.VAL PP MS")
+}
+
+# Reads the spectra and the absolute time base; it never touches Acquiring.
+record(bo, "$(P)MCS:DoReadAll") {
     field(ZNAM, "Done")
     field(ONAM, "Read")
     field(FLNK, "$(P)MCS:ReadFanout")
@@ -95,22 +161,24 @@ record(fanout, "$(P)MCS:ReadFanout") {
     field(LNK6, "$(P)MCS:mca7  PP")
     field(LNK7, "$(P)MCS:mca8  PP")
     field(LNK8, "$(P)MCS:mca9  PP")
-    field(LNK9, "$(P)MCS:TimeWF  PP")
-    field(LNKA, "$(P)MCS:AbsTimeWF  PP")
-    field(FLNK, "$(P)MCS:ClearAcquiring")
+    field(LNK9, "$(P)MCS:AbsTimeWF  PP")
+    field(FLNK, "$(P)MCS:ClearReadAll")
 }
 
-record(bo, "$(P)MCS:ClearAcquiring") {
+record(bo, "$(P)MCS:ClearReadAll") {
     field(VAL,  "0")
-    field(OUT,  "$(P)MCS:Acquiring  PP")
+    field(OUT,  "$(P)MCS:DoReadAll.VAL  NPP")
 }
 
-# Time bases, read on demand through the fan-out above.
+# Time bases. The relative one is pushed by the driver whenever Dwell is
+# written (C computeMCSTimes), and again with the dwell the clock runs at when
+# a scan starts; the absolute one is read with the spectra.
 record(waveform, "$(P)MCS:TimeWF") {
     field(DTYP, "asynFloat32ArrayIn")
     field(INP,  "@asyn($(PORT),0,1.0)MCS_TIME_WF")
     field(FTVL, "FLOAT")
     field(NELM, "$(MAX_POINTS=2048)")
+    field(SCAN, "I/O Intr")
 }
 
 record(waveform, "$(P)MCS:AbsTimeWF") {
@@ -120,19 +188,23 @@ record(waveform, "$(P)MCS:AbsTimeWF") {
     field(NELM, "$(MAX_POINTS=2048)")
 }
 
-# A client that needs to be released only after it has consumed the data sets
+# A client that must be released only after it has consumed the data sets
 # EnableClientWait; ClientWait is then raised with Acquiring and the client
 # clears it when done.
 record(bo, "$(P)MCS:EnableClientWait") {
+    field(PINI, "YES")
     field(ZNAM, "Disable")
     field(ONAM, "Enable")
 }
 
 record(bo, "$(P)MCS:SetClientWait") {
-    field(VAL,  "1")
-    field(SDIS, "$(P)MCS:EnableClientWait  NPP NMS")
     field(DISV, "0")
-    field(OUT,  "$(P)MCS:ClientWait  PP")
+    field(SDIS, "$(P)MCS:EnableClientWait NPP NMS")
+    field(OMSL, "closed_loop")
+    field(DOL,  "1")
+    field(OUT,  "$(P)MCS:ClientWait PP MS")
+    field(ONAM, "SetClientWait")
+    field(ZNAM, "Done")
 }
 
 record(busy, "$(P)MCS:ClientWait") {
@@ -143,9 +215,17 @@ record(busy, "$(P)MCS:ClientWait") {
 record(ao, "$(P)MCS:Dwell") {
     field(DTYP, "asynFloat64")
     field(OUT,  "@asyn($(PORT),0,1.0)MCA_DWELL_TIME")
-    field(PREC, "6")
-    field(VAL,  "0.001")
+    field(PREC, "4")
+    field(VAL,  "0.1")
     field(PINI, "YES")
+}
+
+# The dwell the clock actually runs, written back when a scan starts.
+record(ai, "$(P)MCS:Dwell_RBV") {
+    field(DTYP, "asynFloat64")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_DWELL_TIME")
+    field(PREC, "4")
+    field(SCAN, "I/O Intr")
 }
 
 record(longout, "$(P)MCS:NuseAll") {
@@ -154,6 +234,15 @@ record(longout, "$(P)MCS:NuseAll") {
     field(VAL,  "$(MAX_POINTS=2048)")
     field(DRVL, "1")
     field(DRVH, "$(MAX_POINTS=2048)")
+    field(PINI, "YES")
+}
+
+record(mbbi, "$(P)MCS:Model") {
+    field(DESC, "Model")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),0,1.0)MODEL")
+    field(ZRVL, "0")  field(ZRST, "USB-CTR08")
+    field(ONVL, "1")  field(ONST, "USB-CTR04")
     field(PINI, "YES")
 }
 
@@ -170,17 +259,21 @@ record(longout, "$(P)MCS:Prescale") {
     field(PINI, "YES")
 }
 
-record(bo, "$(P)MCS:TrigMode") {
+# The MCS always runs triggered. For an untriggered scan leave the trigger
+# input unconnected and choose "Low level", which is always satisfied.
+record(mbbo, "$(P)MCS:TrigMode") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)TRIGGER_MODE")
-    field(ZNAM, "Internal")
-    field(ONAM, "External")
+    field(ZRVL, "0")  field(ZRST, "Rising edge")
+    field(ONVL, "1")  field(ONST, "Falling edge")
+    field(TWVL, "6")  field(TWST, "High level")
+    field(THVL, "7")  field(THST, "Low level")
     field(PINI, "YES")
 }
 
 record(ao, "$(P)MCS:PresetReal") {
     field(DTYP, "asynFloat64")
-    field(OUT,  "@asyn($(PORT),0,1.0)MCA_PRESET_REAL_TIME")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_PRESET_REAL")
     field(PREC, "3")
     field(VAL,  "0")
     field(PINI, "YES")
@@ -188,7 +281,7 @@ record(ao, "$(P)MCS:PresetReal") {
 
 record(ai, "$(P)MCS:ElapsedReal") {
     field(DTYP, "asynFloat64")
-    field(INP,  "@asyn($(PORT),0,1.0)MCA_ELAPSED_REAL_TIME")
+    field(INP,  "@asyn($(PORT),0,1.0)MCA_ELAPSED_REAL")
     field(PREC, "3")
     field(SCAN, "I/O Intr")
 }
@@ -199,11 +292,35 @@ record(longin, "$(P)MCS:CurrentChannel") {
     field(SCAN, "I/O Intr")
 }
 
-record(mbbo, "$(P)MCS:ChannelAdvance") {
+# Counter that divides an external channel advance by Prescale.
+record(mbbo, "$(P)MCS:PrescaleCounter") {
     field(DTYP, "asynInt32")
-    field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADVANCE_SOURCE")
-    field(ZRST, "Internal")  field(ZRVL, "0")
-    field(ONST, "External")  field(ONVL, "1")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCS_PRESCALE_COUNTER")
+    field(ZRVL, "0")  field(ZRST, "CTR0")
+    field(ONVL, "1")  field(ONST, "CTR1")
+    field(TWVL, "2")  field(TWST, "CTR2")
+    field(THVL, "3")  field(THST, "CTR3")
+    field(FRVL, "4")  field(FRST, "CTR4")
+    field(FVVL, "5")  field(FVST, "CTR5")
+    field(SXVL, "6")  field(SXST, "CTR6")
+    field(SVVL, "7")  field(SVST, "CTR7")
+    field(PINI, "YES")
+}
+
+record(mbbo, "$(P)MCS:Point0Action") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCS_POINT0_ACTION")
+    field(ZRVL, "0")  field(ZRST, "Clear")
+    field(ONVL, "1")  field(ONST, "No clear")
+    field(TWVL, "2")  field(TWST, "Skip")
+    field(PINI, "YES")
+}
+
+record(bo, "$(P)MCS:ChannelAdvance") {
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),0,1.0)MCA_CH_ADV_SOURCE")
+    field(ZNAM, "Internal")
+    field(ONAM, "External")
     field(PINI, "YES")
 }
 
@@ -269,4 +386,9 @@ record(bo, "$(P)MCS:MCSDIOEnable") {
     field(ZNAM, "No")  field(ONAM, "Yes")  field(VAL, "1")
     field(OUT,  "$(P)MCS:MCSCounterEnable.B8 PP")
     field(PINI, "YES")
+}
+
+# asyn record for debugging
+record(asyn, "$(P)MCS:Asyn") {
+    field(PORT, "$(PORT)")
 }
