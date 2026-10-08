@@ -1,0 +1,8 @@
+# epics-rs 0.31.0 pins 1.99.0 and every consumer inherits the floor:
+# `ad-plugins-rs` pulls `rust-hdf5` 0.7.2, whose zstd backend calls
+# `std::hint::cold_path` (stable since 1.98). Kept equal to the
+# upstream pin rather than to the floor so a lint this workspace sees
+# is the lint epics-rs CI saw.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

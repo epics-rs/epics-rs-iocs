@@ -153,17 +153,13 @@ async fn acquire_one_image(
     ));
 
     let end_ts = EpicsTimestamp::now();
-    let array = NDArray {
-        unique_id: image_counter,
-        timestamp: end_ts,
-        time_stamp: start_time.as_f64(),
-        data_size: decoded.data.total_bytes(),
-        pool_id: 0,
-        dims: decoded.dims,
-        data: decoded.data,
-        attributes,
-        codec: None,
-    };
+    let mut array = NDArray::with_data(decoded.dims, decoded.data);
+    array.unique_id = image_counter;
+    // Field by field, not `update_time_stamps`: the epicsTS is the read's end
+    // and `time_stamp` the read's start, as C left them.
+    array.timestamp = end_ts;
+    array.time_stamp = start_time.as_f64();
+    array.attributes = attributes;
 
     let _ = ctx
         .handle

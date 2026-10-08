@@ -261,17 +261,10 @@ async fn publish_frame(
         source_impl: None,
     });
 
-    let array = NDArray {
-        unique_id,
-        timestamp: ts,
-        time_stamp: ts.as_f64(),
-        dims,
-        data_size: data.total_bytes(),
-        pool_id: 0,
-        data,
-        attributes,
-        codec: None,
-    };
+    let mut array = NDArray::with_data(dims, data);
+    array.unique_id = unique_id;
+    array.update_time_stamps(ts);
+    array.attributes = attributes;
 
     set_params(
         ctx,

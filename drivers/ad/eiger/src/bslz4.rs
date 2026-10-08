@@ -238,18 +238,8 @@ mod tests {
     /// exactly what the C stream path feeds `bshuf_decompress_lz4`.
     fn roundtrip_via_ad_plugins(values: Vec<u16>) {
         let n = values.len();
-        let src = NDArray {
-            unique_id: 0,
-            timestamp: Default::default(),
-            time_stamp: 0.0,
-            dims: vec![NDDimension::new(n)],
-            data_size: n * 2,
-            pool_id: 0,
-            data: NDDataBuffer::U16(values.clone()),
-            attributes: Default::default(),
-            codec: None,
-        };
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let src = NDArray::with_data(vec![NDDimension::new(n)], NDDataBuffer::U16(values.clone()));
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).expect("compress_bslz4");
         let payload = compressed.data.as_u8_slice();
 
         let decoded = decode_blocks(payload, n, 2, 0).expect("decode");
@@ -292,22 +282,14 @@ mod tests {
         // check our decoder and theirs produce the same pixels from it.
         let values: Vec<u32> = (0..5000u32).map(|i| i * 3).collect();
         let n = values.len();
-        let src = NDArray {
-            unique_id: 0,
-            timestamp: Default::default(),
-            time_stamp: 0.0,
-            dims: vec![NDDimension::new(n)],
-            data_size: n * 4,
-            pool_id: 0,
-            data: NDDataBuffer::U32(values.clone()),
-            attributes: Default::default(),
-            codec: None,
-        };
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let src = NDArray::with_data(vec![NDDimension::new(n)], NDDataBuffer::U32(values.clone()));
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).expect("compress_bslz4");
         let ours = decode_blocks(compressed.data.as_u8_slice(), n, 4, 0).unwrap();
 
         let theirs = ad_plugins_rs::codec::decompress_bslz4(&compressed).unwrap();
-        let NDDataBuffer::U32(theirs) = theirs.data else {
+        // Borrowed, not moved out: `NDArray` has a `Drop` that returns its
+        // buffer to the pool, so a field cannot leave it.
+        let NDDataBuffer::U32(theirs) = &theirs.data else {
             panic!("expected U32");
         };
         let ours: Vec<u32> = ours
@@ -317,32 +299,24 @@ mod tests {
             .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(ours, values);
-        assert_eq!(theirs, values);
+        assert_eq!(theirs, &values);
     }
 
     #[test]
     fn header_is_parsed_and_cross_checked() {
         let values: Vec<u16> = (0..2000).collect();
         let n = values.len();
-        let src = NDArray {
-            unique_id: 0,
-            timestamp: Default::default(),
-            time_stamp: 0.0,
-            dims: vec![NDDimension::new(n)],
-            data_size: n * 2,
-            pool_id: 0,
-            data: NDDataBuffer::U16(values.clone()),
-            attributes: Default::default(),
-            codec: Some(Codec {
-                name: CodecName::BSLZ4,
-                compressed_size: 0,
-                level: 0,
-                shuffle: 0,
-                compressor: 0,
-                original_data_type: NDDataType::UInt16,
-            }),
-        };
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let mut src =
+            NDArray::with_data(vec![NDDimension::new(n)], NDDataBuffer::U16(values.clone()));
+        src.codec = Some(Codec {
+            name: CodecName::BSLZ4,
+            compressed_size: 0,
+            level: 0,
+            shuffle: 0,
+            compressor: 0,
+            original_data_type: NDDataType::UInt16,
+        });
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).expect("compress_bslz4");
 
         // Re-frame with the 12-byte header the detector prepends.
         let mut framed = Vec::new();
@@ -374,18 +348,8 @@ mod tests {
     fn zero_block_size_in_header_means_default() {
         let values: Vec<u16> = (0..3000).collect();
         let n = values.len();
-        let src = NDArray {
-            unique_id: 0,
-            timestamp: Default::default(),
-            time_stamp: 0.0,
-            dims: vec![NDDimension::new(n)],
-            data_size: n * 2,
-            pool_id: 0,
-            data: NDDataBuffer::U16(values.clone()),
-            attributes: Default::default(),
-            codec: None,
-        };
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let src = NDArray::with_data(vec![NDDimension::new(n)], NDDataBuffer::U16(values.clone()));
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).expect("compress_bslz4");
 
         let mut framed = Vec::new();
         framed.extend_from_slice(&((n * 2) as u64).to_be_bytes());

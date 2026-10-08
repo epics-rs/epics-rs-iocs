@@ -498,17 +498,9 @@ async fn process_color_frame(
         ];
 
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let array = NDArray {
-            unique_id: array_counter,
-            timestamp: ts,
-            time_stamp: ts.as_f64(),
-            dims,
-            data_size: data.total_bytes(),
-            pool_id: 0,
-            data,
-            attributes: NDAttributeList::new(),
-            codec: None,
-        };
+        let mut array = NDArray::with_data(dims, data);
+        array.unique_id = array_counter;
+        array.update_time_stamps(ts);
 
         publish_array(
             &ctx.color_handle,
@@ -555,17 +547,9 @@ async fn process_depth_frame(
     let dims = vec![NDDimension::new(w), NDDimension::new(h)];
 
     let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-    let array = NDArray {
-        unique_id: array_counter,
-        timestamp: ts,
-        time_stamp: ts.as_f64(),
-        dims,
-        data_size: data.total_bytes(),
-        pool_id: 0,
-        data,
-        attributes: NDAttributeList::new(),
-        codec: None,
-    };
+    let mut array = NDArray::with_data(dims, data);
+    array.unique_id = array_counter;
+    array.update_time_stamps(ts);
 
     publish_array(
         &ctx.depth_handle,
@@ -603,21 +587,16 @@ async fn process_pointcloud(
             .collect();
 
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let array = NDArray {
-            unique_id: array_counter,
-            timestamp: ts,
-            time_stamp: ts.as_f64(),
-            dims: vec![
+        let mut array = NDArray::with_data(
+            vec![
                 NDDimension::new(3),
                 NDDimension::new(w),
                 NDDimension::new(h),
             ],
-            data_size: data.len() * std::mem::size_of::<f32>(),
-            pool_id: 0,
-            data: NDDataBuffer::F32(data),
-            attributes: NDAttributeList::new(),
-            codec: None,
-        };
+            NDDataBuffer::F32(data),
+        );
+        array.unique_id = array_counter;
+        array.update_time_stamps(ts);
 
         publish_array(
             &ctx.color_handle,

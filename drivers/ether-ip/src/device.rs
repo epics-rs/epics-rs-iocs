@@ -827,21 +827,21 @@ fn read_waveform(raw: &[u8], element: usize, record: &dyn Record) -> Result<Epic
             for i in 0..nelm {
                 v.push(cip::get_double(raw, element + i).ok_or(())?);
             }
-            Ok(EpicsValue::DoubleArray(v))
+            Ok(EpicsValue::DoubleArray(v.into()))
         }
         Some(CipType::Sint) => {
             let mut v = Vec::with_capacity(nelm);
             for i in 0..nelm {
                 v.push(cip::get_usint(raw, element + i).ok_or(())?);
             }
-            Ok(EpicsValue::CharArray(v))
+            Ok(EpicsValue::CharArray(v.into()))
         }
         Some(_) => {
             let mut v = Vec::with_capacity(nelm);
             for i in 0..nelm {
                 v.push(cip::get_dint(raw, element + i).ok_or(())?);
             }
-            Ok(EpicsValue::LongArray(v))
+            Ok(EpicsValue::LongArray(v.into()))
         }
         None => Err(()),
     }
