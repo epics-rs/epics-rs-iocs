@@ -1,0 +1,20 @@
+[package]
+name = "ad-pylon"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# The C++ shim is one native library; `links` keeps cargo from letting a
+# second crate link it.
+links = "pylonshim"
+
+[dependencies]
+ad-genicam = { path = "../genicam" }
+epics-rs = { workspace = true, features = ["asyn", "ad"] }
+# Named as crates by the ported sources, the way `eiger` names
+# `ad_plugins_rs`; both are the same code the umbrella re-exports.
+asyn-rs = { workspace = true }
+ad-core-rs = { workspace = true }
+parking_lot = "0.12"
+
+[build-dependencies]
+cc = "1"

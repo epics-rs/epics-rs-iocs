@@ -354,19 +354,17 @@ async fn publish_frame(
 
     let ts = EpicsTimestamp::now();
     let data_type = data.data_type();
-    let array = NDArray {
-        unique_id: array_counter,
-        timestamp: ts,
-        // C stamped every frame of an acquisition with the acquisition's start
-        // time, not the frame's; keep that, it is the exposure start.
-        time_stamp: start_ts.as_f64(),
-        dims: vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
-        data_size: data.total_bytes(),
-        pool_id: 0,
+    let mut array = NDArray::with_data(
+        vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
         data,
-        attributes: Default::default(),
-        codec: None,
-    };
+    );
+    array.unique_id = array_counter;
+    // The pair is set field by field rather than through `update_time_stamps`
+    // because the two halves have different sources here: C stamped every
+    // frame of an acquisition with the acquisition's start time, not the
+    // frame's, and `time_stamp` keeps that — it is the exposure start.
+    array.timestamp = ts;
+    array.time_stamp = start_ts.as_f64();
 
     set_params(
         ctx,

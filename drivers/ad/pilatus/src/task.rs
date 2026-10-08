@@ -643,17 +643,11 @@ fn build_array(
             NDAttrValue::String(d),
         ));
     }
-    NDArray {
-        unique_id,
-        timestamp: ts,
-        time_stamp: ts.as_f64(),
-        dims: vec![NDDimension::new(nx), NDDimension::new(ny)],
-        data_size: buffer.total_bytes(),
-        pool_id: 0,
-        data: buffer,
-        attributes,
-        codec: None,
-    }
+    let mut array = NDArray::with_data(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer);
+    array.unique_id = unique_id;
+    array.update_time_stamps(ts);
+    array.attributes = attributes;
+    array
 }
 
 async fn max_size(ctx: &mut Ctx) -> (usize, usize) {

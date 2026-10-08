@@ -447,7 +447,7 @@ mod tests {
             vec![NDDimension::new(pixels.len())],
             NDDataBuffer::U32(pixels.to_vec()),
         );
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).expect("compress_bslz4");
         let mut blob = Vec::new();
         blob.extend_from_slice(&((pixels.len() * 4) as u64).to_be_bytes());
         blob.extend_from_slice(&((bslz4::default_block_size(4) * 4) as u32).to_be_bytes());

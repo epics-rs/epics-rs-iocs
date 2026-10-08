@@ -817,7 +817,7 @@ impl SimEngine {
 mod tests {
     use super::*;
 
-    fn pool() -> NDArrayPool {
+    fn pool() -> std::sync::Arc<NDArrayPool> {
         NDArrayPool::new(0)
     }
 

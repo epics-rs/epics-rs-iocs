@@ -50,7 +50,7 @@ use epics_rs::base::server::device_support::{
 };
 use epics_rs::base::server::recgbl::alarm_status::{COMM_ALARM, READ_ALARM, WRITE_ALARM};
 use epics_rs::base::server::record::{ProcessContext, Record, ScanType};
-use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::{EpicsValue, SharedArray};
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
 
 use crate::item::Action;
@@ -580,7 +580,7 @@ impl OpcuaDevice {
             // lsi/lso clamp the string to SIZV themselves and set LEN from it.
             Op::LongString => {
                 let v = value::read_string(data, choices).map_err(err)?;
-                put(record, "VAL", EpicsValue::CharArray(v.into_bytes()))?;
+                put(record, "VAL", EpicsValue::CharArray(v.into_bytes().into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Array => {
@@ -1172,11 +1172,11 @@ fn outgoing_array(record: &mut dyn Record, incoming: &Variant) -> value::Result<
     }
 }
 
-fn clamp<T>(mut v: Vec<T>, nelm: usize) -> Vec<T> {
+fn clamp<T>(mut v: Vec<T>, nelm: usize) -> SharedArray<T> {
     if nelm > 0 && v.len() > nelm {
         v.truncate(nelm);
     }
-    v
+    v.into()
 }
 
 // -------------------------------------------------------------------- the factory

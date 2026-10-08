@@ -238,7 +238,7 @@ fn lsi_takes_a_long_string_and_sets_len() {
 
     assert_eq!(
         field(&record, "VAL"),
-        EpicsValue::CharArray(b"a long string".to_vec())
+        EpicsValue::CharArray(b"a long string".to_vec().into())
     );
     assert_eq!(field(&record, "LEN"), EpicsValue::ULong(14));
 }
@@ -592,7 +592,7 @@ fn a_waveform_takes_the_array_in_its_own_element_type() {
 
     assert_eq!(
         field(&record, "VAL"),
-        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0])
+        EpicsValue::DoubleArray(vec![1.0, 2.0, 3.0].into())
     );
     assert_eq!(field(&record, "NORD"), EpicsValue::ULong(3));
 }
@@ -611,7 +611,10 @@ fn an_array_longer_than_nelm_is_clamped() {
         Variant::from(vec![1i32, 2, 3, 4]),
     );
 
-    assert_eq!(field(&record, "VAL"), EpicsValue::LongArray(vec![1, 2]));
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::LongArray(vec![1, 2].into())
+    );
 }
 
 #[test]
@@ -630,7 +633,7 @@ fn a_char_waveform_holds_a_string_node_as_its_bytes() {
 
     assert_eq!(
         field(&record, "VAL"),
-        EpicsValue::CharArray(b"text".to_vec())
+        EpicsValue::CharArray(b"text".to_vec().into())
     );
 }
 
@@ -643,7 +646,7 @@ fn an_aao_sends_its_first_nord_elements() {
         .put_field("FTVL", EpicsValue::Short(DbFieldType::Long as i16))
         .unwrap();
     record
-        .put_field("VAL", EpicsValue::LongArray(vec![7, 8]))
+        .put_field("VAL", EpicsValue::LongArray(vec![7, 8].into()))
         .unwrap();
     let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
     let leaf = leaf(&registry);

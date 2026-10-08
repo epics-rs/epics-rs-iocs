@@ -19,6 +19,8 @@ members = [
     "drivers/ad/psl",
     "drivers/ad/pixirad",
     "drivers/ad/bruker",
+    "drivers/ad/genicam",
+    "drivers/ad/pylon",
     "drivers/motor/amci",
     "drivers/motor/common",
     "drivers/motor/micronix",
@@ -86,6 +88,7 @@ members = [
     "iocs/ad/psl-ioc",
     "iocs/ad/pixirad-ioc",
     "iocs/ad/bruker-ioc",
+    "iocs/ad/pylon-ioc",
     "iocs/ether-ip/ether-ip-ioc",
     "iocs/ur-robot/ur-robot-ioc",
     "iocs/ip/ip-ioc",
@@ -276,14 +279,49 @@ members = [
 # `asynOctet` where C declares `asynOctetRead`/`asynOctetWrite`, and an ai
 # reading `asynOctetRead`.
 #
+# 0.31.0 is the widest bump yet -- a toolchain floor plus three break
+# families, 60 lines across 22 crates here. The floor comes first:
+# epics-rs pins 1.99.0 because `ad-plugins-rs` pulls rust-hdf5 0.7.2,
+# whose zstd backend calls `std::hint::cold_path` (stable in 1.98), so
+# rust-toolchain.toml and both CI pins move with it. 1.99 then drags in
+# two of its own: `Atomic*::fetch_update` lost its two-ordering form, so
+# merlin's `images_remaining` call becomes `try_update`, and clippy now
+# rejects the bare `#[must_use]` that async-trait 0.1.89 generates, which
+# moves drivers/opcua's own pin to 0.1.92. Family one: every array variant
+# of `EpicsValue`, and of pva's `NdArrayBuffer`/`TypedScalarArray`, holds
+# a `SharedArray<T>`/`PvArray<T>` rather than a `Vec<T>`. Read and slice
+# sites compile unchanged through `Deref`, so only construction moves --
+# and it moves at whatever already owns the conversion, which is why
+# drivers/opcua's `clamp` and drivers/mca's `read_spectrum` changed return
+# type once instead of their ten and one call sites changing each;
+# ether-ip and the opcua/pva-driver tests take `.into()` per literal.
+# Family two: `NDArrayPool::new` returns `Arc<Self>`, built with
+# `Arc::new_cyclic` because an array now holds a `Weak` back-pointer to
+# its pool; six pool fields and simdetector's `pool()` retype. Family
+# three is that back-pointer's consequence: `pool_id` is a method over a
+# private `pool` field and `NDArray` has a `Drop` that recycles the
+# buffer through it, so from outside ad-core-rs a struct literal cannot be
+# written and a field cannot be moved out. Sixteen literals in bruker,
+# eiger, psl, pixirad, merlin, pilatus, url, photonii, pva-driver and
+# d435i become `NDArray::with_data(dims, data)` plus
+# `update_time_stamps(ts)`, which also deletes each site's hand-multiplied
+# `data_size` and its duplicated timestamp pair; three keep the pair field
+# by field, with a comment, because their two halves come from different
+# clocks. eiger borrows `theirs.data` instead of moving it, and its six
+# codec calls unwrap the `Result<NDArray, CodecFailure>` the public
+# entry points now return. `NDPluginProcess::process_array` taking
+# `&Arc<NDArray>`, `NDGatherConfigure` gaining `maxPorts`, and the
+# kebab-cased example IOC binaries reach no caller here.
+#
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.30.2"
-asyn-rs = "0.30.2"
-ad-core-rs = "0.30.2"
-ad-plugins-rs = "0.30.2"
+epics-rs = "0.31.0"
+asyn-rs = "0.31.0"
+ad-core-rs = "0.31.0"
+ad-plugins-rs = "0.31.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.30.2", package = "epics-modbus-rs" }
-# mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
-# epics-rs "mca" feature exists yet, so drivers/mca depends on this
-# standalone published crate directly.
-mca-rs = "0.30.2"
+modbus-rs = { version = "0.31.0", package = "epics-modbus-rs" }
+# mcaRecord + soft device support (epics-modules/mca's mcaRecord.c).
+# 0.31.0 does add an epics-rs "mca" feature, but it is `pub use mca_rs as
+# mca` over this same published crate, so drivers/mca keeps the direct
+# dependency and the version keeps being pinned in one place.
+mca-rs = "0.31.0"

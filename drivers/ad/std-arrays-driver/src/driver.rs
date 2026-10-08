@@ -554,7 +554,7 @@ pub fn create_nd_std_arrays(
     _max_buffers: i32,
     max_memory: usize,
 ) -> AsynResult<NdStdArraysRuntime> {
-    let pool = Arc::new(NDArrayPool::new(max_memory));
+    let pool = NDArrayPool::new(max_memory);
     let queued_counter = Arc::new(QueuedArrayCounter::new());
     let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
 
@@ -600,7 +600,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let pool = Arc::new(NDArrayPool::new(0));
+            let pool = NDArrayPool::new(0);
             let queued_counter = Arc::new(QueuedArrayCounter::new());
             let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
             let det =
