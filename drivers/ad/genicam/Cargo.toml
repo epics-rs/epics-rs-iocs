@@ -1,0 +1,14 @@
+[package]
+name = "ad-genicam"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+epics-rs = { workspace = true, features = ["asyn", "ad"] }
+# The feature table and the driver both name asyn parameter types directly
+# (`asyn_rs::param::ParamType`), which the umbrella re-export reaches but the
+# sources spell as the crate, as `eiger` does with `ad_plugins_rs`.
+asyn-rs = { workspace = true }
+ad-core-rs = { workspace = true }
+parking_lot = "0.12"

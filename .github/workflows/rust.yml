@@ -20,17 +20,21 @@ env:
   #   * libuldaq (measComp Linux SDK): uldaq-sys and everything that links
   #     it — meascomp, usb-2408, usb-ctr, and the two IOC binaries.
   #   * librealsense2 (Intel RealSense SDK): d435i and its IOC binary.
+  #   * pylon (Basler pylon camera SDK): ad-pylon and its IOC binary. The
+  #     GenICam half is pure Rust, so ad-genicam stays in.
   # `--exclude` takes package names (not paths).
   LINK_EXCLUDES: >-
     --exclude uldaq-sys --exclude meascomp
     --exclude usb-2408 --exclude usb-ctr
     --exclude usb-2408-ioc --exclude usb-ctr-ioc
     --exclude d435i --exclude d435i-ioc
-  # clippy/check never invokes the linker, so the uldaq crates lint fine:
-  # their build script degrades gracefully (emits `-luldaq` for a link that
-  # never happens). Only realsense-sys's build script hard-fails without
-  # librealsense2 (pkg-config probe panics), so just the d435i pair is
-  # dropped from the lint gate.
+    --exclude ad-pylon --exclude ad-pylon-ioc
+  # clippy/check never invokes the linker, so the uldaq and pylon crates
+  # lint fine: their build scripts degrade gracefully (they emit link flags
+  # for a link that never happens, or warn and emit nothing). Only
+  # realsense-sys's build script hard-fails without librealsense2
+  # (pkg-config probe panics), so just the d435i pair is dropped from the
+  # lint gate.
   CLIPPY_EXCLUDES: >-
     --exclude d435i --exclude d435i-ioc
 

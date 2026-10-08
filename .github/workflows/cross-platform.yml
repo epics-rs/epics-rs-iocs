@@ -7,8 +7,8 @@ name: Cross-platform build
 # and tests* everywhere; `rust.yml` proves it's *clean* on the canonical
 # target.
 #
-# The vendor-SDK crates (measComp/libuldaq, RealSense/librealsense2) are
-# excluded on every platform — those libraries are not on a stock runner,
+# The vendor-SDK crates (measComp/libuldaq, RealSense/librealsense2,
+# Basler/pylon) are excluded on every platform — those libraries are not on a stock runner,
 # and libuldaq is Linux-only besides. Same set as `rust.yml`'s
 # LINK_EXCLUDES.
 #
@@ -39,6 +39,7 @@ env:
     --exclude usb-2408 --exclude usb-ctr
     --exclude usb-2408-ioc --exclude usb-ctr-ioc
     --exclude d435i --exclude d435i-ioc
+    --exclude ad-pylon --exclude ad-pylon-ioc
 
 jobs:
   build:

@@ -60,6 +60,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ad-genicam"
+version = "0.1.0"
+dependencies = [
+ "ad-core-rs",
+ "asyn-rs",
+ "epics-rs",
+ "parking_lot",
+]
+
+[[package]]
 name = "ad-mar345"
 version = "0.1.0"
 dependencies = [
@@ -128,6 +138,30 @@ dependencies = [
  "epics-rs",
  "log",
  "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "ad-pylon"
+version = "0.1.0"
+dependencies = [
+ "ad-core-rs",
+ "ad-genicam",
+ "asyn-rs",
+ "cc",
+ "epics-rs",
+ "parking_lot",
+]
+
+[[package]]
+name = "ad-pylon-ioc"
+version = "0.1.0"
+dependencies = [
+ "ad-core-rs",
+ "ad-plugins-rs",
+ "ad-pylon",
+ "asyn-rs",
+ "epics-rs",
  "tokio",
 ]
 

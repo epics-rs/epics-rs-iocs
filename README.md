@@ -52,11 +52,11 @@ epics-rs-iocs/
 │   │                           #   micronix, motorsim, newport, npoint, oms-asyn, oriel,
 │   │                           #   parker, phytron, pi, pi-gcs2, pijena, pmac, smaract,
 │   │                           #   smartmotor, thorlabs   (all bind the standard motor record)
-│   ├── ad/                     # 17 areaDetector drivers
-│   │                           #   bruker, csimdetector, eiger, mar345, marccd, merlin,
-│   │                           #   mythen, photonii, pilatus, pixirad, psl, pva-driver,
-│   │                           #   simdetector, specs-analyser, std-arrays-driver,
-│   │                           #   timepix3, url
+│   ├── ad/                     # 19 areaDetector drivers
+│   │                           #   bruker, csimdetector, eiger, genicam, mar345, marccd,
+│   │                           #   merlin, mythen, photonii, pilatus, pixirad, psl,
+│   │                           #   pva-driver, pylon, simdetector, specs-analyser,
+│   │                           #   std-arrays-driver, timepix3, url
 │   ├── meascomp/               # Measurement Computing (MCC) family
 │   │   ├── uldaq-sys/          #   Raw FFI bindings to libuldaq
 │   │   ├── meascomp/           #   Safe wrapper (DaqDevice, DIO, counter, timer, AI/AO)
@@ -113,6 +113,12 @@ installed:
   [libuldaq](https://github.com/mccdaq/uldaq). `clippy`/`check` pass
   without it, but building test or IOC binaries fails at link
   (`-luldaq`).
+- **ad-pylon / ad-pylon-ioc** need the
+  [Basler pylon SDK](https://www.baslerweb.com/en/software/pylon/) under
+  `PYLON_ROOT` (default `/opt/pylon`). `clippy`/`check` pass without it —
+  the build script warns and emits no link flags — but building the test or
+  IOC binary then fails at link. `ad-genicam`, the base driver it plugs
+  into, is pure Rust and needs nothing.
 
 On a machine without the SDKs, scope checks to the crates you touched,
 e.g. `cargo clippy -p motor-newport -p xps-ioc --all-targets -- -D warnings`.
@@ -276,6 +282,23 @@ st.cmd wires three `NDStdArrays` outputs to three distinct named asyn ports the 
 Build/run: `cargo run -p eiger-ioc --release -- iocs/ad/eiger-ioc/st.cmd`
 
 ---
+
+### genicam — `drivers/ad/genicam` (base driver, no IOC of its own)
+
+The areaDetector GenICam base driver. It owns the vendor-independent half:
+the generic feature records (`AcquirePeriod`, `FrameRate`,
+`TriggerSource`/`TriggerOverlap`/`TriggerSoftware`, `ExposureMode`,
+`ExposureAuto`, `GainAuto`, `PixelFormat`), the per-model feature set built
+from a camera's own GenICam XML, and unpacking of the packed 12-bit pixel
+formats. Capture control and node access are left to a vendor SDK behind
+two traits, `GenICamBackend` and `GenICamNode`, so it ships no IOC binary —
+a concrete camera driver depends on it, as `ad-pylon` does.
+
+- **Ports from:** `ADGenICam` (`ADGenICamApp/src/ADGenICam.cpp`,
+  `ADGenICamFeature.cpp`) — https://github.com/areaDetector/ADGenICam
+- `drivers/ad/genicam/src/`: `driver.rs` (the `ADGenICam` PortDriver and its
+  `GCParams`), `feature.rs` (feature set, node typing, value conversion),
+  `unpack.rs` (`Mono12p`/`Mono12Packed` into a `u16` buffer).
 
 ### mar345 — MAR 345 online image-plate detector
 
@@ -476,6 +499,43 @@ hardware.
     (overrun) monitor updates.
 - Uses `epics-pva-rs` as its pvAccess client; a `tokio::select!` races the
   driver's command channel against the PVA client's connect/monitor bridge.
+
+### pylon — `drivers/ad/pylon`, `iocs/ad/pylon-ioc`
+
+Basler cameras over the pylon SDK, as the GenICam backend under
+`ad-genicam`: `PylonBackend` drives the grab loop and feature nodes through
+a small C++ shim (`shim/pylon_shim.cpp`), because pylon's API is C++ only.
+
+- **Ports from:** `ADPylon` (`pylonApp/src/pylonCamera.cpp`) —
+  https://github.com/areaDetector/ADPylon
+- **Needs:** the Basler pylon SDK — see
+  [Vendor SDKs](#vendor-sdks-and-workspace-wide-checks).
+- **Build/run:** `cargo run -p ad-pylon-ioc --release -- iocs/ad/pylon-ioc/st.cmd`
+- **iocsh:** `ADPylonConfig(portName, cameraId, maxMemory, priority,
+  stackSize)`, where `cameraId` is either a camera serial number or a
+  zero-based index, and `genicamShowFeature(portName, featureName)`.
+- **Records:** `st_base.cmd` loads `db/pylon.template`, which includes
+  `ADGenICam.template` and, through it, ad-core-rs's `ADBase.template`.
+  `pylon.template` adds the pylon-specific layer:
+  - `TimeStampMode`/`_RBV`, `UniqueIdMode`/`_RBV` (bo/bi) — take the
+    NDArray timestamp and unique id from the camera's chunk data or from
+    the driver.
+  - `ConvertPixelFormat`/`_RBV`, `ConvertBitAlign`/`_RBV`,
+    `ConvertShiftBits`/`_RBV` — pylon's image-format converter.
+  - `GC_StatBufferReceived_RBV`, `GC_StatBufferFailed_RBV`,
+    `GC_StatBufferUnderrun_RBV`, `GC_StatPacketReceived_RBV`,
+    `GC_StatPacketFailed_RBV`, `GC_StatPacketRequested_RBV`,
+    `GC_StatPacketResent_RBV` (longin) — the stream grabber's counters.
+- **Per-model database:** each camera's own `st.cmd` loads its generated
+  feature database after `st_base.cmd` — `db/Basler-a2A1920-51gmBAS.template`
+  is the one committed here, 4247 lines. `scripts/add_camera.sh <camera-ip>`
+  regenerates that pair for a new model: it reads the camera's GenICam XML
+  over GigE (reading camera memory needs no control access, so an acquiring
+  IOC may hold it), writes `xml/<model>.xml` and `db/<model>.template`, and
+  prints the `dbLoadRecords` line to add. Both outputs are committed, so a
+  boot needs neither the camera's XML nor Python.
+- `tests/camemu.rs` runs the driver against pylon's camera emulator
+  (`PYLON_CAMEMU`), so it needs the SDK like the IOC binary does.
 
 ### simdetector — `drivers/ad/simdetector`, `iocs/ad/simdetector-ioc`
 
