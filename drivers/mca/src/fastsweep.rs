@@ -342,14 +342,14 @@ impl FastSweepDriver {
 
         let data_req = DrvUserRequest::new(data_drv_info, 0).with_iface(InterfaceType::Int32Array);
         let data_info = input.handle.drv_user_create_blocking(&data_req)?;
-        let (data_sub, data_rx) =
-            input
-                .handle
-                .interrupts()
-                .register_interrupt_user(InterruptFilter {
-                    reason: Some(data_info.reason),
-                    ..Default::default()
-                });
+        let (data_sub, data_rx) = input.handle.interrupts().register_interrupt_user(
+            InterruptFilter {
+                reason: Some(data_info.reason),
+                ..Default::default()
+            },
+            // Only the first `maxSignals` elements are read.
+            max_signals * std::mem::size_of::<i32>(),
+        );
 
         // Best-effort: C falls back to `numAverage_ = 1` rather than
         // failing the driver when no interval source is configured
@@ -363,15 +363,13 @@ impl FastSweepDriver {
                 if let Ok(seed) = input.handle.read_float64_blocking(interval_info.reason, 0) {
                     shared.state.lock().unwrap().callback_interval = seed;
                 }
-                Some(
-                    input
-                        .handle
-                        .interrupts()
-                        .register_interrupt_user(InterruptFilter {
-                            reason: Some(interval_info.reason),
-                            ..Default::default()
-                        }),
-                )
+                Some(input.handle.interrupts().register_interrupt_user(
+                    InterruptFilter {
+                        reason: Some(interval_info.reason),
+                        ..Default::default()
+                    },
+                    0,
+                ))
             } else {
                 None
             };
