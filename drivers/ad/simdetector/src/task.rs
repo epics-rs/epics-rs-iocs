@@ -13,7 +13,6 @@ use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
-use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
 use crate::image::{Layout, SimEngine};
 use crate::params::SimParams;
@@ -301,7 +300,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
         image.unique_id = image_counter;
         // `updateTimeStamps` only stamps the NDArray; C's simDetector never
         // writes the NDTimeStamp / NDEpicsTSSec parameters.
-        image.timestamp = EpicsTimestamp::now();
+        image.update_time_stamps_now();
 
         if array_callbacks {
             ctx.publisher.publish(Arc::new(image)).await;
