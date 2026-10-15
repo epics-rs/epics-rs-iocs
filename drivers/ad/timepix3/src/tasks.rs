@@ -602,7 +602,11 @@ fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
         updates.push(ParamSetValue::new(
             p.chip_temperature,
             0,
-            ParamValue::Octet(serval::json_to_string(&Value::Array(temps)).into_bytes().into()),
+            ParamValue::Octet(
+                serval::json_to_string(&Value::Array(temps))
+                    .into_bytes()
+                    .into(),
+            ),
         ));
     }
 }

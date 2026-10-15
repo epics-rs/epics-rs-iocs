@@ -1109,9 +1109,9 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), String> {
         EpicsValue::ShortArray(_) => {
             EpicsValue::ShortArray(clamp(value::read_array::<i16>(data).map_err(err)?, nelm).into())
         }
-        EpicsValue::UShortArray(_) => {
-            EpicsValue::UShortArray(clamp(value::read_array::<u16>(data).map_err(err)?, nelm).into())
-        }
+        EpicsValue::UShortArray(_) => EpicsValue::UShortArray(
+            clamp(value::read_array::<u16>(data).map_err(err)?, nelm).into(),
+        ),
         EpicsValue::LongArray(_) => {
             EpicsValue::LongArray(clamp(value::read_array::<i32>(data).map_err(err)?, nelm).into())
         }
@@ -1121,15 +1121,15 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), String> {
         EpicsValue::Int64Array(_) => {
             EpicsValue::Int64Array(clamp(value::read_array::<i64>(data).map_err(err)?, nelm).into())
         }
-        EpicsValue::UInt64Array(_) => {
-            EpicsValue::UInt64Array(clamp(value::read_array::<u64>(data).map_err(err)?, nelm).into())
-        }
+        EpicsValue::UInt64Array(_) => EpicsValue::UInt64Array(
+            clamp(value::read_array::<u64>(data).map_err(err)?, nelm).into(),
+        ),
         EpicsValue::FloatArray(_) => {
             EpicsValue::FloatArray(clamp(value::read_array::<f32>(data).map_err(err)?, nelm).into())
         }
-        EpicsValue::DoubleArray(_) => {
-            EpicsValue::DoubleArray(clamp(value::read_array::<f64>(data).map_err(err)?, nelm).into())
-        }
+        EpicsValue::DoubleArray(_) => EpicsValue::DoubleArray(
+            clamp(value::read_array::<f64>(data).map_err(err)?, nelm).into(),
+        ),
         EpicsValue::StringArray(_) => EpicsValue::StringArray(
             clamp(value::read_string_array(data).map_err(err)?, nelm)
                 .into_iter()

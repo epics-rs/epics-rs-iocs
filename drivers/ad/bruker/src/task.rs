@@ -287,7 +287,11 @@ async fn publish_frame(
         vec![ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet(format!("Reading from File {}", exposure.file_name).into_bytes().into()),
+            ParamValue::Octet(
+                format!("Reading from File {}", exposure.file_name)
+                    .into_bytes()
+                    .into(),
+            ),
         )],
     )
     .await;
@@ -309,17 +313,13 @@ async fn publish_frame(
     // buffer. The array is the size of the frame that was actually read.
     let ts = EpicsTimestamp::now();
     let data_size = image.data.len() * 4;
-    let array = NDArray {
-        unique_id,
-        timestamp: ts,
-        time_stamp: ts.as_f64(),
-        dims: vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
-        data_size,
-        pool_id: 0,
-        data: NDDataBuffer::U32(image.data),
-        attributes: epics_rs::ad_core::attributes::NDAttributeList::new(),
-        codec: None,
-    };
+    let mut array = NDArray::with_data(
+        vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
+        NDDataBuffer::U32(image.data),
+    );
+    array.unique_id = unique_id;
+    array.timestamp = ts;
+    array.time_stamp = ts.as_f64();
 
     set_params(
         ctx,

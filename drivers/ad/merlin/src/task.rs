@@ -124,7 +124,9 @@ async fn data_loop(ctx: AcquisitionContext) {
                         vec![ParamSetValue::new(
                             ctx.ad_params.status_message,
                             0,
-                            ParamValue::Octet("Error in Labview data channel response".as_bytes().into()),
+                            ParamValue::Octet(
+                                "Error in Labview data channel response".as_bytes().into(),
+                            ),
                         )],
                     )
                     .await;
@@ -292,20 +294,17 @@ async fn publish_image(
         }
     };
 
-    let array = NDArray {
-        unique_id: array_counter,
-        timestamp: start,
-        time_stamp: start.as_f64(),
-        dims: vec![
+    let mut array = NDArray::with_data(
+        vec![
             NDDimension::new(header.x_size),
             NDDimension::new(header.y_size),
         ],
-        data_size: data.total_bytes(),
-        pool_id: 0,
         data,
-        attributes: build_attributes(&header.attrs, acquisition_header),
-        codec: None,
-    };
+    );
+    array.unique_id = array_counter;
+    array.timestamp = start;
+    array.time_stamp = start.as_f64();
+    array.attributes = build_attributes(&header.attrs, acquisition_header);
     publish(ctx, array).await;
 }
 
@@ -371,17 +370,14 @@ async fn publish_profiles(
     let NDDataBuffer::U32(_) = &profiles.image else {
         unreachable!("decode_profiles always returns U32")
     };
-    let array = NDArray {
-        unique_id: array_counter,
-        timestamp: start,
-        time_stamp: start.as_f64(),
-        dims: vec![NDDimension::new(stride), NDDimension::new(2)],
-        data_size: profiles.image.total_bytes(),
-        pool_id: 0,
-        data: profiles.image,
-        attributes: build_attributes(&header.attrs, acquisition_header),
-        codec: None,
-    };
+    let mut array = NDArray::with_data(
+        vec![NDDimension::new(stride), NDDimension::new(2)],
+        profiles.image,
+    );
+    array.unique_id = array_counter;
+    array.timestamp = start;
+    array.time_stamp = start.as_f64();
+    array.attributes = build_attributes(&header.attrs, acquisition_header);
     publish(ctx, array).await;
 }
 

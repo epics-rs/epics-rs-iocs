@@ -329,18 +329,13 @@ pub fn decode_nt_nd_array(value: &PvField) -> Result<NDArray, ConvertError> {
     let (dts_sec, dts_nsec) = read_time_t(s, "dataTimeStamp")?;
     let time_stamp = (dts_sec as f64 + dts_nsec as f64 * 1e-9) - EPICS_EPOCH_OFFSET as f64;
 
-    let data_size = data.len() * data.data_type().element_size();
-    Ok(NDArray {
-        unique_id,
-        timestamp,
-        time_stamp,
-        dims,
-        data,
-        attributes,
-        codec,
-        pool_id: 0,
-        data_size,
-    })
+    let mut array = NDArray::with_data(dims, data);
+    array.unique_id = unique_id;
+    array.timestamp = timestamp;
+    array.time_stamp = time_stamp;
+    array.attributes = attributes;
+    array.codec = codec;
+    Ok(array)
 }
 
 #[cfg(test)]
@@ -432,8 +427,14 @@ mod tests {
             (NdArrayBuffer::UInt(vec![1, 2].into()), NDDataType::UInt32),
             (NdArrayBuffer::Long(vec![-1, 2].into()), NDDataType::Int64),
             (NdArrayBuffer::ULong(vec![1, 2].into()), NDDataType::UInt64),
-            (NdArrayBuffer::Float(vec![1.5, 2.5].into()), NDDataType::Float32),
-            (NdArrayBuffer::Double(vec![1.5, 2.5].into()), NDDataType::Float64),
+            (
+                NdArrayBuffer::Float(vec![1.5, 2.5].into()),
+                NDDataType::Float32,
+            ),
+            (
+                NdArrayBuffer::Double(vec![1.5, 2.5].into()),
+                NDDataType::Float64,
+            ),
         ];
         for (buf, expected) in cases {
             let nt = base_nt(
@@ -479,7 +480,10 @@ mod tests {
             NDDataBuffer::U8(v) => assert_eq!(v.as_slice(), &[0xAA, 0xBB, 0xCC, 0xDD]),
             other => panic!("expected raw U8 buffer, got {other:?}"),
         }
-        let codec = arr.codec.expect("codec must be Some for compressed array");
+        let codec = arr
+            .codec
+            .as_ref()
+            .expect("codec must be Some for compressed array");
         assert_eq!(codec.name, CodecName::LZ4);
         assert_eq!(codec.compressed_size, 4);
         assert_eq!(codec.original_data_type, NDDataType::UInt16);

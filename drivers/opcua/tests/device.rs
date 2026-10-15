@@ -611,7 +611,10 @@ fn an_array_longer_than_nelm_is_clamped() {
         Variant::from(vec![1i32, 2, 3, 4]),
     );
 
-    assert_eq!(field(&record, "VAL"), EpicsValue::LongArray(vec![1, 2].into()));
+    assert_eq!(
+        field(&record, "VAL"),
+        EpicsValue::LongArray(vec![1, 2].into())
+    );
 }
 
 #[test]
