@@ -19,10 +19,10 @@ fn int_arg(args: &[ArgValue], i: usize) -> Option<i64> {
     }
 }
 
-fn string_arg(args: &[ArgValue], i: usize) -> Option<String> {
+fn string_arg(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
-        _ => None,
+        Some(ArgValue::String(s)) => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 
@@ -63,8 +63,8 @@ async fn main() -> CaResult<()> {
         ],
         "drvEtherIP_define_PLC name ip_addr slot",
         |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = string_arg(args, 0).ok_or("name required")?;
-            let ip = string_arg(args, 1).ok_or("ip_addr required")?;
+            let name = string_arg(args, 0)?.ok_or("name required")?;
+            let ip = string_arg(args, 1)?.ok_or("ip_addr required")?;
             let slot = int_arg(args, 2).ok_or("slot required")?;
             if !(0..=255).contains(&slot) {
                 return Err(format!("slot {slot} out of range 0..255"));

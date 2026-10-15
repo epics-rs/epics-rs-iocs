@@ -43,20 +43,23 @@ use opcua::subscription::SubscriptionConfig;
 /// and `SubscriptionConfig` accept.
 const OPTION_SLOTS: usize = 6;
 
-fn string(args: &[ArgValue], i: usize) -> Option<String> {
+fn string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.to_str()?.to_owned()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 
 fn required(args: &[ArgValue], i: usize, name: &str) -> Result<String, String> {
-    string(args, i).ok_or_else(|| format!("argument '{name}' is required"))
+    string(args, i)?.ok_or_else(|| format!("argument '{name}' is required"))
 }
 
 /// The `key=value` tail of a command, from argument `from` on.
 fn options(args: &[ArgValue], from: usize) -> Result<Vec<(String, String)>, String> {
-    let tokens: Vec<String> = (from..args.len()).filter_map(|i| string(args, i)).collect();
+    let mut tokens = Vec::new();
+    for i in from..args.len() {
+        tokens.extend(string(args, i)?);
+    }
     ioc::parse_options(tokens.iter().map(String::as_str))
 }
 
@@ -179,7 +182,7 @@ fn commands(
         {
             let registry = registry.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let pattern = string(args, 0).unwrap_or_else(|| "*".to_string());
+                let pattern = string(args, 0)?.unwrap_or_else(|| "*".to_string());
                 let level = match args.get(1) {
                     Some(ArgValue::Int(v)) => *v as i32,
                     _ => 0,
@@ -252,7 +255,7 @@ fn commands(
             let registry = registry.clone();
             let connector = connector.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let session = string(args, 0).unwrap_or_else(|| "*".to_string());
+                let session = string(args, 0)?.unwrap_or_else(|| "*".to_string());
                 print!(
                     "{}",
                     ioc::show_security(&registry, &connector.security(), &session)
@@ -305,7 +308,8 @@ fn commands(
             let connector = connector.clone();
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let root = required(args, 0, "PKI / server certs location")?;
-                if (1..4).any(|i| string(args, i).is_some()) {
+                if (1..4).any(|i| matches!(args.get(i), Some(ArgValue::String(s)) if !s.is_empty()))
+                {
                     return Err("opcuaSetupPKI: this port's client (async-opcua) derives \
                          trusted/, rejected/ and issuers/ from one PKI root; the four-argument \
                          form, which names each location separately, has no equivalent. Use \
@@ -335,7 +339,7 @@ fn commands(
                     .security()
                     .pki_root
                     .unwrap_or_else(|| opcua::client::DEFAULT_PKI_DIR.to_string());
-                match string(args, 0) {
+                match string(args, 0)? {
                     Some(location) => eprintln!(
                         "opcuaSaveRejected: '{location}' ignored — this port's client saves \
                          rejected server certificates under '{pki}/rejected', which it fixes."
