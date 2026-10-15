@@ -108,7 +108,7 @@ impl CSimDetector {
             port_base,
             nd,
             sim,
-            pool: Arc::new(NDArrayPool::new(max_memory)),
+            pool: NDArrayPool::new(max_memory),
             queued_counter: Arc::new(QueuedArrayCounter::new()),
             last_array: shared.last_array,
             acquiring: shared.acquiring,

@@ -830,9 +830,7 @@ impl QuadEmBase {
             port_base.set_float64_param(params.double_data, addr as i32, 0.0)?;
         }
 
-        let pool = Arc::new(epics_rs::ad_core::ndarray_pool::NDArrayPool::new(
-            max_memory,
-        ));
+        let pool = epics_rs::ad_core::ndarray_pool::NDArrayPool::new(max_memory);
 
         let outputs = (0..=QE_MAX_DATA)
             .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))

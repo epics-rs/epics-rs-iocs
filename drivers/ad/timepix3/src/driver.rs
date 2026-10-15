@@ -751,7 +751,7 @@ fn new_multi_addr_base(port_name: &str, max_memory: usize) -> AsynResult<ADDrive
     Ok(ADDriverBase {
         port_base,
         params,
-        pool: Arc::new(NDArrayPool::new(max_memory)),
+        pool: NDArrayPool::new(max_memory),
         array_output: NDArrayOutput::new(),
         queued_counter: Arc::new(QueuedArrayCounter::new()),
         last_array: None,
