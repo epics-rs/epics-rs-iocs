@@ -9,7 +9,6 @@ use std::time::Duration;
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -39,8 +38,6 @@ async fn main() -> CaResult<()> {
     };
 
     epics_rs::base::runtime::env::set_default("DELAYGEN", env!("CARGO_MANIFEST_DIR"));
-
-    let trace = Arc::new(TraceManager::new());
 
     let mut app = IocApplication::new();
 
@@ -146,7 +143,11 @@ async fn main() -> CaResult<()> {
                     }
                 };
 
-                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
+                if let Err(e) = mgr_c.register_port_with_config(
+                    driver,
+                    RuntimeConfig::default(),
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
                     return Ok(CommandOutcome::Continue);
                 }
@@ -160,7 +161,6 @@ async fn main() -> CaResult<()> {
 
     // DG645Config(myport,ioport,ioaddr) -- C drvAsynDG645(myport,ioport,ioaddr)
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "DG645Config",
             vec![
@@ -178,7 +178,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "DG645Config myport ioport ioaddr",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let my_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("myport required".into()),
@@ -203,7 +203,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -215,7 +215,6 @@ async fn main() -> CaResult<()> {
     // ColbyConfig(myport,ioport,addr,units,iface) -- C
     // drvAsynColby(myport,ioport,addr,units,iface)
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "ColbyConfig",
             vec![
@@ -241,7 +240,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "ColbyConfig myport ioport addr units iface",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let my_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("myport required".into()),
@@ -274,7 +273,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
 
@@ -286,7 +285,6 @@ async fn main() -> CaResult<()> {
     // CoherentSdgConfig(myport,ioport,ioaddr) -- C
     // drvAsynCoherentSDG(myport,ioport,ioaddr)
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "CoherentSdgConfig",
             vec![
@@ -304,7 +302,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "CoherentSdgConfig myport ioport ioaddr",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let my_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("myport required".into()),
@@ -330,7 +328,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
 

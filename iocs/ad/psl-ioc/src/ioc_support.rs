@@ -19,7 +19,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
     let runtime: Arc<std::sync::Mutex<Option<PslRuntime>>> = Arc::new(std::sync::Mutex::new(None));
 
     let mgr = ioc.mgr().clone();
-    let trace = ioc.trace().clone();
     let rt_slot = runtime.clone();
     ioc.register_startup_command(CommandDef::new(
         "PSLConfig",
@@ -50,7 +49,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             },
         ],
         "PSLConfig portName serverPort [maxBuffers] [maxMemory] [priority] [stackSize]",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = match &args[0] {
                 ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
@@ -80,7 +79,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             epics_rs::asyn::asyn_record::register_port(
                 &port_name,
                 rt.port_handle().clone(),
-                trace.clone(),
+                ctx.db().scan_control().interrupt_gate(),
             )
             .map_err(|e| e.to_string())?;
 

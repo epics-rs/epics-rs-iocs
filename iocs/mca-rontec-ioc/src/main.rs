@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -55,7 +54,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("MCA_RONTEC_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = IocApplication::new();
@@ -88,7 +86,6 @@ async fn main() -> CaResult<()> {
     // RontecConfig(portName,serialPort,serialPortAddress) -- C
     // RontecConfig (`drvMcaRontec.c:165`).
     {
-        let trace_c = trace.clone();
         let ports_c = ports.clone();
         app = app.register_startup_command(CommandDef::new(
             "RontecConfig",
@@ -107,7 +104,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "RontecConfig portName serialPort serialPortAddress",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match args.first() {
                     Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
@@ -130,7 +127,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
                 ports_c

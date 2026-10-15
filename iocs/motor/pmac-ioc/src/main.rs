@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -46,9 +45,8 @@ async fn main() -> CaResult<()> {
     // PMAC iocsh commands (including pmacAsynIPConfigure, which builds an IP
     // port with the PMAC ethernet framing interpose installed) + motor device
     // support.
-    let trace = Arc::new(TraceManager::new());
     let holder = MotorHolder::new();
-    for command in pmac_commands(&holder, trace) {
+    for command in pmac_commands(&holder) {
         app = app.register_startup_command(command);
     }
     app = app.register_dynamic_device_support(holder.device_support_factory());

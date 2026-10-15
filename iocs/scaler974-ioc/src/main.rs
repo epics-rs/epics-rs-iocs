@@ -148,7 +148,11 @@ async fn main() -> CaResult<()> {
                 // had no registry fallback) but is now a duplicate that the
                 // registry rejects with "port already registered", failing
                 // this command's very first invocation.
-                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
+                if let Err(e) = mgr_c.register_port_with_config(
+                    driver,
+                    RuntimeConfig::default(),
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
                     return Ok(CommandOutcome::Continue);
                 }

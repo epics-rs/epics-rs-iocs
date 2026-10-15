@@ -5,7 +5,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -44,8 +43,6 @@ async fn main() -> CaResult<()> {
         scaler_dir.to_str().expect("cargo paths are UTF-8"),
     );
 
-    let trace = Arc::new(TraceManager::new());
-
     // Runtime kept alive by being captured in the startup command closure
     let runtime: Arc<Mutex<Option<CtrRuntime>>> = Arc::new(Mutex::new(None));
     // Hand-off slot from USBCTRConfig to the scalerRecord bind at iocInit.
@@ -83,7 +80,6 @@ async fn main() -> CaResult<()> {
 
     // USBCTRConfig command
     {
-        let trace_c = trace.clone();
         let rt = runtime.clone();
         let scaler_slot = pending_scaler.clone();
         app = app.register_startup_command(CommandDef::new(
@@ -103,7 +99,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "USBCTRConfig portName uniqueID [maxTimePoints]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
@@ -128,7 +124,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     port_handle,
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
 

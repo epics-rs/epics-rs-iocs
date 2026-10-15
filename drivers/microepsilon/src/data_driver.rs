@@ -129,8 +129,8 @@ use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::AlarmSeverity;
 
@@ -615,7 +615,7 @@ pub fn configure(
     port_name: &str,
     ip_address: &str,
     ip_port: &str,
-    trace: Arc<TraceManager>,
+    owner: &Arc<InterruptGate>,
 ) -> AsynResult<()> {
     if port_name.is_empty() || ip_address.is_empty() {
         return Err(AsynError::Status {
@@ -640,7 +640,7 @@ pub fn configure(
     let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())?;
     *self_handle.lock().unwrap() = Some(runtime_handle.port_handle().clone());
 
-    asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), trace)?;
+    asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), owner)?;
 
     // See the module doc's `PortRuntimeHandle` gap note: both runtimes must
     // outlive this function.

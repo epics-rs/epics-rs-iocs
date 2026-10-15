@@ -21,7 +21,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     {
         let mgr = ioc.mgr().clone();
-        let trace = ioc.trace().clone();
         let c_rt = color_runtime.clone();
         let d_rt = depth_runtime.clone();
         ioc.register_startup_command(CommandDef::new(
@@ -34,7 +33,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 ArgDesc { name: "maxMemory", arg_type: ArgType::Int },
             ],
             "d435iConfig portName [serial] [maxSizeX] [maxSizeY] [maxMemory]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
@@ -58,8 +57,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 let c_port_handle = color_rt.port_handle().clone();
                 let d_port_handle = depth_rt.port_handle().clone();
 
-                epics_rs::asyn::asyn_record::register_port(&port_name, c_port_handle, trace.clone()).map_err(|e| e.to_string())?;
-                epics_rs::asyn::asyn_record::register_port(&depth_port_name, d_port_handle, trace.clone()).map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&port_name, c_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(&depth_port_name, d_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
 
                 // Register color port as the primary driver context (pool + fan-out).
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

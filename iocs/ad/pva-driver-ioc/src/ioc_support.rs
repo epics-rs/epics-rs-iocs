@@ -25,7 +25,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     {
         let mgr = ioc.mgr().clone();
-        let trace = ioc.trace().clone();
         let rt_slot = runtime.clone();
         ioc.register_startup_command(CommandDef::new(
             "pvaDriverConfig",
@@ -56,7 +55,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 },
             ],
             "pvaDriverConfig portName pvName [maxBuffers] [maxMemory] [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
@@ -78,8 +77,12 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     .map_err(|e| format!("failed to create pvAccess detector: {e}"))?;
 
                 let port_handle = det_runtime.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(&port_name, port_handle, trace.clone())
-                    .map_err(|e| e.to_string())?;
+                epics_rs::asyn::asyn_record::register_port(
+                    &port_name,
+                    port_handle,
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     det_runtime.pool().clone(),

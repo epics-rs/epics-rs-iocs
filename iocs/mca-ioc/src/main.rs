@@ -23,7 +23,6 @@ use std::time::Duration;
 
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -73,7 +72,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("MCA_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = IocApplication::new();
@@ -87,7 +85,6 @@ async fn main() -> CaResult<()> {
     // DemoSourceConfig(portName, maxSignals, period)
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "DemoSourceConfig",
             vec![
@@ -105,7 +102,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "DemoSourceConfig portName maxSignals period - start the demo signal source",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = arg_string(args, 0)?.ok_or("portName required")?;
                 let max_signals = arg_int(args, 1).ok_or("maxSignals required")? as usize;
                 let period = arg_double(args, 2).ok_or("period required")?;
@@ -116,7 +113,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime_handle.port_handle().clone(),
-                    trace.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| format!("DemoSourceConfig: {e}"))?;
                 ports
@@ -132,7 +129,6 @@ async fn main() -> CaResult<()> {
     // -- C `initFastSweep` (`drvFastSweep.cpp:57`).
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "initFastSweep",
             vec![
@@ -162,7 +158,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "initFastSweep portName inputName maxSignals maxPoints [dataString] [intervalString]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = arg_string(args, 0)?.ok_or("portName required")?;
                 let input_name = arg_string(args, 1)?.ok_or("inputName required")?;
                 let max_signals = arg_int(args, 2).ok_or("maxSignals required")? as usize;
@@ -186,7 +182,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime_handle.port_handle().clone(),
-                    trace.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| format!("initFastSweep: {e}"))?;
                 ports

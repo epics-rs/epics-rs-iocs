@@ -22,7 +22,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
     {
         let mgr = ioc.mgr().clone();
-        let trace = ioc.trace().clone();
         let rt_slot = runtime.clone();
         ioc.register_startup_command(CommandDef::new(
             "mar345Config",
@@ -54,7 +53,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             ],
             "mar345Config portName serverPort [maxBuffers] [maxMemory] \
              [priority] [stackSize]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
@@ -80,7 +79,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     det.port_handle().clone(),
-                    trace.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
 

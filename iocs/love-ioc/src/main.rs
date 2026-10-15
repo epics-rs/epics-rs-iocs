@@ -10,7 +10,6 @@ use std::time::Duration;
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -34,8 +33,6 @@ async fn main() -> CaResult<()> {
     };
 
     epics_rs::base::runtime::env::set_default("LOVE", env!("CARGO_MANIFEST_DIR"));
-
-    let trace = Arc::new(TraceManager::new());
 
     let mut app = IocApplication::new();
 
@@ -122,7 +119,11 @@ async fn main() -> CaResult<()> {
                 // had no registry fallback) but is now a duplicate that the
                 // registry rejects with "port already registered", failing
                 // this command's very first invocation.
-                if let Err(e) = mgr_c.register_port_with_config(driver, RuntimeConfig::default()) {
+                if let Err(e) = mgr_c.register_port_with_config(
+                    driver,
+                    RuntimeConfig::default(),
+                    ctx.db().scan_control().interrupt_gate(),
+                ) {
                     ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
                     return Ok(CommandOutcome::Continue);
                 }
@@ -136,7 +137,6 @@ async fn main() -> CaResult<()> {
 
     // LoveInit(lovPort,serPort,serAddr) -- C drvLoveInit(lovPort,serPort,serAddr)
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "LoveInit",
             vec![
@@ -154,7 +154,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "LoveInit lovPort serPort serAddr",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let lov_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("lovPort required".into()),
@@ -183,7 +183,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &lov_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
 

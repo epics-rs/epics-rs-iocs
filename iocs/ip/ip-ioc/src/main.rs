@@ -19,8 +19,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -67,10 +67,10 @@ fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, Strin
 fn register(
     ports: &Ports,
     name: &str,
-    trace: &Arc<TraceManager>,
+    owner: &Arc<InterruptGate>,
     port: IpPortRuntime,
 ) -> Result<(), String> {
-    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), trace.clone())
+    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), owner)
         .map_err(|e| e.to_string())?;
     ports.lock().expect("port list poisoned").push(port);
     Ok(())
@@ -88,7 +88,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("IP", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = IocApplication::new();
@@ -105,7 +104,6 @@ async fn main() -> CaResult<()> {
     // MPCConfig(port, octetPort, address, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "MPCConfig",
             vec![
@@ -127,7 +125,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "MPCConfig portName octetPort address [pollPeriod] - MPC/Digitel ion-pump controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let address = int_arg(args, 2)?;
@@ -136,7 +134,12 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 1.0)?;
                 let port = create_mpc(&name, &octet, address, poll)
                     .map_err(|e| format!("MPCConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(
+                    &ports,
+                    &name,
+                    ctx.db().scan_control().interrupt_gate(),
+                    port,
+                )?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -145,7 +148,6 @@ async fn main() -> CaResult<()> {
     // TPG261Config(port, octetPort, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "TPG261Config",
             vec![
@@ -163,13 +165,18 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "TPG261Config portName octetPort [pollPeriod] - Pfeiffer TPG261/TPG262 gauge controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let poll = poll_arg(args, 2, 2.0)?;
                 let port = create_tpg261(&name, &octet, poll)
                     .map_err(|e| format!("TPG261Config failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(
+                    &ports,
+                    &name,
+                    ctx.db().scan_control().interrupt_gate(),
+                    port,
+                )?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -178,7 +185,6 @@ async fn main() -> CaResult<()> {
     // TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "TelevacConfig",
             vec![
@@ -205,7 +211,7 @@ async fn main() -> CaResult<()> {
             ],
             "TelevacConfig portName octetPort numStations numRelays [pollPeriod] - \
              Televac vacuum gauge controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let stations = int_arg(args, 2)?;
@@ -217,7 +223,12 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 4, 1.0)?;
                 let port = create_televac(&name, &octet, stations, relays, poll)
                     .map_err(|e| format!("TelevacConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(
+                    &ports,
+                    &name,
+                    ctx.db().scan_control().interrupt_gate(),
+                    port,
+                )?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -226,7 +237,6 @@ async fn main() -> CaResult<()> {
     // MKSConfig(port, octetPort, numGauges, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "MKSConfig",
             vec![
@@ -249,7 +259,7 @@ async fn main() -> CaResult<()> {
             ],
             "MKSConfig portName octetPort numGauges [pollPeriod] - MKS/HPS SensaVac 937 \
              gauge controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let gauges = int_arg(args, 2)?;
@@ -258,7 +268,12 @@ async fn main() -> CaResult<()> {
                 let poll = poll_arg(args, 3, 1.0)?;
                 let port = create_mks(&name, &octet, gauges, poll)
                     .map_err(|e| format!("MKSConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(
+                    &ports,
+                    &name,
+                    ctx.db().scan_control().interrupt_gate(),
+                    port,
+                )?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -267,7 +282,6 @@ async fn main() -> CaResult<()> {
     // ND261Config(port, octetPort, [pollPeriod])
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "ND261Config",
             vec![
@@ -285,13 +299,18 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "ND261Config portName octetPort [pollPeriod] - Heidenhain ND261 display unit",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let poll = poll_arg(args, 2, 1.0)?;
                 let port = create_nd261(&name, &octet, poll)
                     .map_err(|e| format!("ND261Config failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(
+                    &ports,
+                    &name,
+                    ctx.db().scan_control().interrupt_gate(),
+                    port,
+                )?;
                 Ok(CommandOutcome::Continue)
             },
         ));
@@ -300,7 +319,6 @@ async fn main() -> CaResult<()> {
     // EurothermConfig(port, octetPort, groupAddress)
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "EurothermConfig",
             vec![
@@ -319,7 +337,7 @@ async fn main() -> CaResult<()> {
             ],
             "EurothermConfig portName octetPort groupAddress - Eurotherm 800/2000 \
              temperature controller (the asyn address is the local address)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let group = int_arg(args, 2)?;
@@ -327,7 +345,12 @@ async fn main() -> CaResult<()> {
                     .map_err(|_| format!("EurothermConfig: groupAddress {group} is not 0..9"))?;
                 let port = create_eurotherm(&name, &octet, group)
                     .map_err(|e| format!("EurothermConfig failed: {e}"))?;
-                register(&ports, &name, &trace, port)?;
+                register(
+                    &ports,
+                    &name,
+                    ctx.db().scan_control().interrupt_gate(),
+                    port,
+                )?;
                 Ok(CommandOutcome::Continue)
             },
         ));

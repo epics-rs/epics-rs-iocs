@@ -13,7 +13,6 @@ use epics_rs::asyn::asyn_record;
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -38,8 +37,6 @@ async fn main() -> CaResult<()> {
     };
 
     epics_rs::base::runtime::env::set_default("MICROEPSILON", env!("CARGO_MANIFEST_DIR"));
-
-    let trace = Arc::new(TraceManager::new());
 
     let mut app = IocApplication::new();
 
@@ -74,7 +71,6 @@ async fn main() -> CaResult<()> {
     // `drvAsynSerialPortConfigure`. Mirrors `love-ioc`'s
     // `LoveInit(lovPort, serPort, serAddr)` shape.
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "CapaNCDT6200ConfigInit",
             vec![
@@ -92,7 +88,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "CapaNCDT6200ConfigInit cfgPort ioPort ioAddr",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let cfg_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("cfgPort required".into()),
@@ -118,7 +114,7 @@ async fn main() -> CaResult<()> {
                 asyn_record::register_port(
                     &cfg_port,
                     runtime_handle.port_handle().clone(),
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
                 // See drivers/microepsilon::data_driver's module doc
@@ -144,7 +140,6 @@ async fn main() -> CaResult<()> {
     // and its internal `_RBK` transport port, and retains both runtimes
     // itself.
     {
-        let trace_c = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "capaNCDT6200Configure",
             vec![
@@ -162,7 +157,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "capaNCDT6200Configure portName IPaddress IPport",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
@@ -176,8 +171,13 @@ async fn main() -> CaResult<()> {
                     _ => return Err("IPport required".into()),
                 };
 
-                data_configure(&port_name, &ip_address, &ip_port, trace_c.clone())
-                    .map_err(|e| format!("capaNCDT6200Configure: {e}"))?;
+                data_configure(
+                    &port_name,
+                    &ip_address,
+                    &ip_port,
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| format!("capaNCDT6200Configure: {e}"))?;
 
                 Ok(CommandOutcome::Continue)
             },

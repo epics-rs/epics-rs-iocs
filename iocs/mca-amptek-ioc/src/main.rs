@@ -19,7 +19,6 @@ use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
@@ -59,7 +58,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("MCA_AMPTEK_IOC", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     let ports: Ports = Arc::new(Mutex::new(Vec::new()));
 
     let mut app = IocApplication::new();
@@ -73,7 +71,6 @@ async fn main() -> CaResult<()> {
     // drvAmptekConfigure(portName, interface, addressInfo, directMode)
     {
         let ports = ports.clone();
-        let trace = trace.clone();
         app = app.register_startup_command(CommandDef::new(
             "drvAmptekConfigure",
             vec![
@@ -96,7 +93,7 @@ async fn main() -> CaResult<()> {
             ],
             "drvAmptekConfigure portName interface addressInfo [directMode] - \
              create an Amptek DP5 asyn port (interface must be 0, Ethernet)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = arg_string(args, 0)?.ok_or("portName required")?;
                 let interface = arg_int(args, 1).ok_or("interface required")? as i32;
                 let address_info = arg_string(args, 2)?.ok_or("addressInfo required")?;
@@ -110,7 +107,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime_handle.port_handle().clone(),
-                    trace.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 ports

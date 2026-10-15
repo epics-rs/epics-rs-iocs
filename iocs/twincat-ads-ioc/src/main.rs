@@ -16,7 +16,6 @@
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -49,7 +48,6 @@ async fn main() -> CaResult<()> {
 
     epics_rs::base::runtime::env::set_default("TWINCAT_ADS", env!("CARGO_MANIFEST_DIR"));
 
-    let trace = Arc::new(TraceManager::new());
     // One IOC can serve several PLCs; each port's runtime is kept alive here.
     let runtimes: Arc<Mutex<Vec<AdsRuntime>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -85,7 +83,6 @@ async fn main() -> CaResult<()> {
 
     // adsAsynPortDriverConfigure
     {
-        let trace_c = trace.clone();
         let rts = runtimes.clone();
         app = app.register_startup_command(CommandDef::new(
             "adsAsynPortDriverConfigure",
@@ -138,7 +135,7 @@ async fn main() -> CaResult<()> {
             "adsAsynPortDriverConfigure portName ipAddr amsNetId [amsPort] \
              [paramTableSize] [priority] [disableAutoConnect] [defaultSampleTimeMS] \
              [maxDelayTimeMS] [adsTimeoutMS] [defaultTimeSource]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = arg_string(args, 0)?.ok_or("portName required")?;
                 let ip_addr = arg_string(args, 1)?.ok_or("ipAddr required")?;
                 let ams_text = arg_string(args, 2)?.ok_or("amsNetId required")?;
@@ -177,7 +174,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime.port_handle().clone(),
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
                 rts.lock().unwrap().push(runtime);

@@ -5,7 +5,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::trace::TraceManager;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -32,7 +31,6 @@ async fn main() -> CaResult<()> {
         concat!(env!("CARGO_MANIFEST_DIR"), "/.."),
     );
 
-    let trace = Arc::new(TraceManager::new());
     let runtime: Arc<Mutex<Option<MultiFunctionRuntime>>> = Arc::new(Mutex::new(None));
 
     let mut app = IocApplication::new();
@@ -52,7 +50,6 @@ async fn main() -> CaResult<()> {
 
     // MultiFunctionConfig command
     {
-        let trace_c = trace.clone();
         let rt = runtime.clone();
         app = app.register_startup_command(CommandDef::new(
             "MultiFunctionConfig",
@@ -75,7 +72,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "MultiFunctionConfig portName uniqueID [maxInputPoints] [maxOutputPoints]",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
@@ -99,7 +96,7 @@ async fn main() -> CaResult<()> {
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     port_handle,
-                    trace_c.clone(),
+                    ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
 
