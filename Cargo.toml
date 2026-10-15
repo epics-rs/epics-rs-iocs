@@ -251,13 +251,31 @@ members = [
 # can load an attributes file at all.
 #
 # Cargo.lock pins the exact patch release.
-epics-rs = "0.30.0"
-asyn-rs = "0.30.0"
-ad-core-rs = "0.30.0"
-ad-plugins-rs = "0.30.0"
+epics-rs = "0.32.0"
+asyn-rs = "0.32.0"
+ad-core-rs = "0.32.0"
+ad-plugins-rs = "0.32.0"
 # Modbus TCP/RTU/ASCII driver (drvModbusAsyn port).
-modbus-rs = { version = "0.30.0", package = "epics-modbus-rs" }
+modbus-rs = { version = "0.32.0", package = "epics-modbus-rs" }
 # mcaRecord + soft device support (epics-modules/mca's mcaRecord.c). No
 # epics-rs "mca" feature exists yet, so drivers/mca depends on this
 # standalone published crate directly.
-mca-rs = "0.30.0"
+mca-rs = "0.32.0"
+
+# Local check of epics-rs release/v0.32.0 before it is on crates.io.
+[patch.crates-io]
+ad-core-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/ad-core-rs" }
+ad-plugins-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/ad-plugins-rs" }
+asyn-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/asyn-rs" }
+epics-base-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-base-rs" }
+epics-bridge-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-bridge-rs" }
+epics-ca-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-ca-rs" }
+epics-libcom-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-libcom-rs" }
+epics-macros-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-macros-rs" }
+epics-modbus-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/modbus-rs" }
+epics-pva-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-pva-rs" }
+epics-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-rs" }
+epics-rtems-boot = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-rtems-boot" }
+mca-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/mca-rs" }
+motor-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/motor-rs" }
+scaler-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/scaler-rs" }
