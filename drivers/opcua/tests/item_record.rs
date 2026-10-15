@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use epics_rs::base::server::device_support::DeviceSupport;
+use epics_rs::base::server::device_support::{DeviceAlarm, DeviceSupport};
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::server::records::longout::LongoutRecord;
 use epics_rs::base::types::EpicsValue;
@@ -265,7 +265,14 @@ fn a_connection_loss_is_a_comm_alarm_and_leaves_the_record_undefined() {
     process(&mut device, &mut record);
 
     // COMM_ALARM, INVALID_ALARM.
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(record.value_is_undefined());
 }
 
@@ -281,7 +288,14 @@ fn a_read_failure_is_a_read_alarm() {
     process(&mut device, &mut record);
 
     // READ_ALARM, INVALID_ALARM.
-    assert_eq!(device.last_alarm(), Some((1, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(record.value_is_undefined());
 }
 
@@ -297,7 +311,14 @@ fn a_write_failure_is_a_write_alarm() {
     process(&mut device, &mut record);
 
     // WRITE_ALARM, INVALID_ALARM.
-    assert_eq!(device.last_alarm(), Some((2, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 2,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(record.value_is_undefined());
 }
 
@@ -310,7 +331,14 @@ fn a_session_that_is_down_is_a_comm_alarm() {
     // No reason, and the session never came up.
     process(&mut device, &mut record);
 
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
 }
 
 // ------------------------------------------------------------------- the status

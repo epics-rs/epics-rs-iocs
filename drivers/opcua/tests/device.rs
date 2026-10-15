@@ -12,7 +12,7 @@ use async_opcua::types::{StatusCode, Variant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use epics_rs::base::server::device_support::DeviceSupport;
+use epics_rs::base::server::device_support::{DeviceAlarm, DeviceSupport};
 use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType};
 use epics_rs::base::server::records::ai::AiRecord;
 use epics_rs::base::server::records::ao::AoRecord;
@@ -152,7 +152,7 @@ fn longin_takes_the_value_into_val() {
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(-7));
     assert_eq!(
         device.last_timestamp(),
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+        Some((SystemTime::UNIX_EPOCH + Duration::from_secs(1)).into())
     );
     assert_eq!(device.last_alarm(), None);
 }
@@ -184,7 +184,14 @@ fn a_value_out_of_the_records_range_raises_read_invalid() {
     );
 
     // READ_ALARM, INVALID — and the record keeps the value it had.
-    assert_eq!(device.last_alarm(), Some((1, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(1));
 }
 
@@ -670,7 +677,14 @@ fn an_output_record_takes_the_type_of_the_value_the_node_last_sent() {
     outgoing(&mut device, &mut record);
 
     // 300 does not fit a Byte: the write is refused, WRITE_ALARM / INVALID.
-    assert_eq!(device.last_alarm(), Some((2, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 2,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert_eq!(leaf.lock().outgoing, None);
 
     record.put_field("VAL", EpicsValue::Long(200)).unwrap();
@@ -690,7 +704,14 @@ fn a_record_on_a_session_that_is_down_raises_a_comm_alarm() {
     outgoing(&mut device, &mut record);
 
     // COMM_ALARM, INVALID — and nothing is queued for the server.
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert!(!leaf.lock().dirty);
 }
 
@@ -702,7 +723,14 @@ fn an_input_record_on_a_session_that_is_down_raises_a_comm_alarm() {
 
     device.read(&mut record).expect("the read stage runs");
 
-    assert_eq!(device.last_alarm(), Some((9, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 9,
+            sevr: 3,
+            msg: ""
+        })
+    );
 }
 
 #[test]
@@ -754,9 +782,30 @@ fn each_failure_reason_raises_its_own_alarm() {
     leaf.lock().state = ConnectionStatus::Up;
 
     for (reason, alarm) in [
-        (ProcessReason::ReadFailure, (1, 3)),
-        (ProcessReason::WriteFailure, (2, 3)),
-        (ProcessReason::ConnectionLoss, (9, 3)),
+        (
+            ProcessReason::ReadFailure,
+            DeviceAlarm {
+                stat: 1,
+                sevr: 3,
+                msg: "",
+            },
+        ),
+        (
+            ProcessReason::WriteFailure,
+            DeviceAlarm {
+                stat: 2,
+                sevr: 3,
+                msg: "",
+            },
+        ),
+        (
+            ProcessReason::ConnectionLoss,
+            DeviceAlarm {
+                stat: 9,
+                sevr: 3,
+                msg: "",
+            },
+        ),
     ] {
         leaf.lock().queue.push(Update::new(
             reason,
@@ -799,7 +848,14 @@ fn a_bad_status_code_carries_no_value() {
 
     device.read(&mut record).expect("the update is delivered");
 
-    assert_eq!(device.last_alarm(), Some((1, 3)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 3,
+            msg: ""
+        })
+    );
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(1));
 }
 
@@ -822,7 +878,14 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
 
     device.read(&mut record).expect("the update is delivered");
 
-    assert_eq!(device.last_alarm(), Some((1, 1)));
+    assert_eq!(
+        device.last_alarm(),
+        Some(DeviceAlarm {
+            stat: 1,
+            sevr: 1,
+            msg: ""
+        })
+    );
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(9));
 }
 

@@ -46,11 +46,11 @@ use async_opcua::types::Variant;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
 };
 use epics_rs::base::server::recgbl::alarm_status::{COMM_ALARM, READ_ALARM, WRITE_ALARM};
 use epics_rs::base::server::record::{ProcessContext, Record, ScanType};
-use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::{EpicsValue, WallTime};
 use epics_rs::ca::server::ioc_app::DeviceSupportContext;
 
 use crate::item::Action;
@@ -910,12 +910,17 @@ impl DeviceSupport for OpcuaDevice {
         self.send(record)
     }
 
-    fn last_alarm(&self) -> Option<(u16, u16)> {
-        self.alarm
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        let (stat, sevr) = self.alarm?;
+        Some(DeviceAlarm {
+            stat,
+            sevr,
+            msg: "",
+        })
     }
 
-    fn last_timestamp(&self) -> Option<SystemTime> {
-        self.timestamp
+    fn last_timestamp(&self) -> Option<WallTime> {
+        self.timestamp.map(WallTime::from)
     }
 }
 

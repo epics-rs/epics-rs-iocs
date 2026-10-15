@@ -15,7 +15,7 @@ use std::sync::Arc;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status;
@@ -453,8 +453,13 @@ impl DeviceSupport for EtherIpDevice {
         self.is_output
     }
 
-    fn last_alarm(&self) -> Option<(u16, u16)> {
-        self.alarm
+    fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
+        let (stat, sevr) = self.alarm?;
+        Some(DeviceAlarm {
+            stat,
+            sevr,
+            msg: "",
+        })
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
