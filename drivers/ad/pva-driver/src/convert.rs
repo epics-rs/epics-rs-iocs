@@ -413,7 +413,7 @@ mod tests {
         // The single highest-risk-of-inversion detail: wire `timeStamp` ->
         // `NDArray::timestamp` (EpicsTimestamp), wire `dataTimeStamp` ->
         // `NDArray::time_stamp` (f64) — not the other way around.
-        let nt = base_nt(NdArrayBuffer::UByte(vec![0]), vec![]);
+        let nt = base_nt(NdArrayBuffer::UByte(vec![0].into()), vec![]);
         let arr = decode(&nt);
 
         assert_eq!(arr.timestamp.sec, 2_000);
@@ -424,16 +424,16 @@ mod tests {
     #[test]
     fn decodes_all_ten_numeric_value_variants() {
         let cases: Vec<(NdArrayBuffer, NDDataType)> = vec![
-            (NdArrayBuffer::Byte(vec![-1, 2]), NDDataType::Int8),
-            (NdArrayBuffer::UByte(vec![1, 2]), NDDataType::UInt8),
-            (NdArrayBuffer::Short(vec![-1, 2]), NDDataType::Int16),
-            (NdArrayBuffer::UShort(vec![1, 2]), NDDataType::UInt16),
-            (NdArrayBuffer::Int(vec![-1, 2]), NDDataType::Int32),
-            (NdArrayBuffer::UInt(vec![1, 2]), NDDataType::UInt32),
-            (NdArrayBuffer::Long(vec![-1, 2]), NDDataType::Int64),
-            (NdArrayBuffer::ULong(vec![1, 2]), NDDataType::UInt64),
-            (NdArrayBuffer::Float(vec![1.5, 2.5]), NDDataType::Float32),
-            (NdArrayBuffer::Double(vec![1.5, 2.5]), NDDataType::Float64),
+            (NdArrayBuffer::Byte(vec![-1, 2].into()), NDDataType::Int8),
+            (NdArrayBuffer::UByte(vec![1, 2].into()), NDDataType::UInt8),
+            (NdArrayBuffer::Short(vec![-1, 2].into()), NDDataType::Int16),
+            (NdArrayBuffer::UShort(vec![1, 2].into()), NDDataType::UInt16),
+            (NdArrayBuffer::Int(vec![-1, 2].into()), NDDataType::Int32),
+            (NdArrayBuffer::UInt(vec![1, 2].into()), NDDataType::UInt32),
+            (NdArrayBuffer::Long(vec![-1, 2].into()), NDDataType::Int64),
+            (NdArrayBuffer::ULong(vec![1, 2].into()), NDDataType::UInt64),
+            (NdArrayBuffer::Float(vec![1.5, 2.5].into()), NDDataType::Float32),
+            (NdArrayBuffer::Double(vec![1.5, 2.5].into()), NDDataType::Float64),
         ];
         for (buf, expected) in cases {
             let nt = base_nt(
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn rejects_boolean_value_variant() {
-        let nt = base_nt(NdArrayBuffer::Boolean(vec![true, false]), vec![]);
+        let nt = base_nt(NdArrayBuffer::Boolean(vec![true, false].into()), vec![]);
         let value = nt_nd_array_value(&nt);
         let err = decode_nt_nd_array(&value).unwrap_err();
         assert!(matches!(err, ConvertError::UnsupportedValueType(_)));
@@ -461,7 +461,7 @@ mod tests {
         use epics_rs::pva::pvdata::VariantValue;
 
         let mut nt = base_nt(
-            NdArrayBuffer::UByte(vec![0xAA, 0xBB, 0xCC, 0xDD]),
+            NdArrayBuffer::UByte(vec![0xAA, 0xBB, 0xCC, 0xDD].into()),
             vec![WireDimension {
                 size: 2,
                 ..Default::default()
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn rejects_unrecognized_codec_name() {
-        let mut nt = base_nt(NdArrayBuffer::UByte(vec![1]), vec![]);
+        let mut nt = base_nt(NdArrayBuffer::UByte(vec![1].into()), vec![]);
         nt.codec = NdCodec {
             name: "made-up-codec".into(),
             parameters: Some(epics_rs::pva::pvdata::VariantValue::scalar(
@@ -508,7 +508,7 @@ mod tests {
         // reimplemented here) is keyed off a "ColorMode" NDAttribute. RGB1 =
         // color-interleaved: dim[0]=color, dim[1]=x, dim[2]=y.
         let mut nt = base_nt(
-            NdArrayBuffer::UByte(vec![0; 3 * 4 * 5]),
+            NdArrayBuffer::UByte(vec![0; 3 * 4 * 5].into()),
             vec![
                 WireDimension {
                     size: 3,
@@ -549,7 +549,7 @@ mod tests {
         // color_dim at its 0-default (same as x_dim), so `NDArraySizeZ`
         // (`dims[info.color.dim].size`) reads the X size, not 0.
         let nt = base_nt(
-            NdArrayBuffer::UByte(vec![0; 6]),
+            NdArrayBuffer::UByte(vec![0; 6].into()),
             vec![
                 WireDimension {
                     size: 3,
@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn boolean_valued_attribute_is_silently_dropped() {
-        let mut nt = base_nt(NdArrayBuffer::UByte(vec![0]), vec![]);
+        let mut nt = base_nt(NdArrayBuffer::UByte(vec![0].into()), vec![]);
         nt.attribute = vec![
             WireAttribute::scalar("Kept", ScalarValue::Int(7)),
             WireAttribute::scalar("DroppedBool", ScalarValue::Boolean(true)),
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn null_valued_attribute_becomes_undefined_typed() {
-        let mut nt = base_nt(NdArrayBuffer::UByte(vec![0]), vec![]);
+        let mut nt = base_nt(NdArrayBuffer::UByte(vec![0].into()), vec![]);
         nt.attribute = vec![WireAttribute {
             name: "NullAttr".into(),
             ..Default::default()
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn attribute_source_type_maps_to_ndattr_source() {
-        let mut nt = base_nt(NdArrayBuffer::UByte(vec![0]), vec![]);
+        let mut nt = base_nt(NdArrayBuffer::UByte(vec![0].into()), vec![]);
         nt.attribute = vec![WireAttribute {
             name: "ParamAttr".into(),
             source_type: 1,
@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn rejects_unselected_value_union() {
-        let nt = base_nt(NdArrayBuffer::UByte(vec![0]), vec![]);
+        let nt = base_nt(NdArrayBuffer::UByte(vec![0].into()), vec![]);
         let mut value = nt_nd_array_value(&nt);
         if let PvField::Structure(s) = &mut value
             && let Some(v) = s.get_field_mut("value")

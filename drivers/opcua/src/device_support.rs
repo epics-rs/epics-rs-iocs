@@ -580,7 +580,7 @@ impl OpcuaDevice {
             // lsi/lso clamp the string to SIZV themselves and set LEN from it.
             Op::LongString => {
                 let v = value::read_string(data, choices).map_err(err)?;
-                put(record, "VAL", EpicsValue::CharArray(v.into_bytes()))?;
+                put(record, "VAL", EpicsValue::CharArray(v.into_bytes().into()))?;
                 Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
             }
             Op::Array => {
@@ -1104,31 +1104,31 @@ fn store_array(data: &Variant, record: &mut dyn Record) -> Result<(), String> {
                 }
                 _ => value::read_array_u8(data).map_err(err)?,
             };
-            EpicsValue::CharArray(clamp(bytes, nelm))
+            EpicsValue::CharArray(clamp(bytes, nelm).into())
         }
         EpicsValue::ShortArray(_) => {
-            EpicsValue::ShortArray(clamp(value::read_array::<i16>(data).map_err(err)?, nelm))
+            EpicsValue::ShortArray(clamp(value::read_array::<i16>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::UShortArray(_) => {
-            EpicsValue::UShortArray(clamp(value::read_array::<u16>(data).map_err(err)?, nelm))
+            EpicsValue::UShortArray(clamp(value::read_array::<u16>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::LongArray(_) => {
-            EpicsValue::LongArray(clamp(value::read_array::<i32>(data).map_err(err)?, nelm))
+            EpicsValue::LongArray(clamp(value::read_array::<i32>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::ULongArray(_) => {
-            EpicsValue::ULongArray(clamp(value::read_array::<u32>(data).map_err(err)?, nelm))
+            EpicsValue::ULongArray(clamp(value::read_array::<u32>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::Int64Array(_) => {
-            EpicsValue::Int64Array(clamp(value::read_array::<i64>(data).map_err(err)?, nelm))
+            EpicsValue::Int64Array(clamp(value::read_array::<i64>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::UInt64Array(_) => {
-            EpicsValue::UInt64Array(clamp(value::read_array::<u64>(data).map_err(err)?, nelm))
+            EpicsValue::UInt64Array(clamp(value::read_array::<u64>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::FloatArray(_) => {
-            EpicsValue::FloatArray(clamp(value::read_array::<f32>(data).map_err(err)?, nelm))
+            EpicsValue::FloatArray(clamp(value::read_array::<f32>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::DoubleArray(_) => {
-            EpicsValue::DoubleArray(clamp(value::read_array::<f64>(data).map_err(err)?, nelm))
+            EpicsValue::DoubleArray(clamp(value::read_array::<f64>(data).map_err(err)?, nelm).into())
         }
         EpicsValue::StringArray(_) => EpicsValue::StringArray(
             clamp(value::read_string_array(data).map_err(err)?, nelm)

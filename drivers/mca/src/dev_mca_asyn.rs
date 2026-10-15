@@ -32,7 +32,7 @@
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_rs::base::server::record::Record;
-use epics_rs::base::types::EpicsValue;
+use epics_rs::base::types::{EpicsValue, SharedArray};
 
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
@@ -186,7 +186,7 @@ impl DevMcaAsyn {
 
     /// C `asynCallback`'s `mcaData` branch (`devMcaAsyn.c:340-348`):
     /// `pasynInt32Array->read(..., pPvt->data, pmca->nuse, &pPvt->nread)`.
-    fn read_spectrum(&self, max_elements: usize) -> AsynResult<Vec<i32>> {
+    fn read_spectrum(&self, max_elements: usize) -> AsynResult<SharedArray<i32>> {
         let user = AsynUser::new(self.reasons[McaReason::Data as usize]).with_addr(self.addr);
         let result = self
             .handle
