@@ -31,7 +31,7 @@
 //! `drivers/microepsilon/src/data_driver.rs`'s `park_on` discussion).
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
-use epics_rs::base::server::record::Record;
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset, Record, register_device_row};
 use epics_rs::base::types::{EpicsValue, SharedArray};
 
 use epics_rs::asyn::adapter::parse_asyn_link;
@@ -41,6 +41,7 @@ use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
 use mca_rs::record::{McaCommand, McaRecord, McaStatus};
 
@@ -305,5 +306,28 @@ pub fn connect(inp: &str) -> Option<DevMcaAsyn> {
         handle: entry.handle,
         addr: link.addr,
         reasons: [0; McaReason::COUNT],
+    })
+}
+
+/// `mcaSupport.dbd`'s `device(mca,INST_IO,devMcaAsyn,"asynMCA")`; the dset
+/// (`devMcaAsyn.c:89-97`) fills init_record, send_msg and read_array.
+pub static DEV_MCA_ASYN: DevSup = DevSup {
+    name: "devMcaAsyn",
+    choice: ASYN_MCA_DTYP,
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(6, &[2, 4, 5], false),
+};
+
+/// Bind every `DTYP "asynMCA"` mca record to the port its INP names, and
+/// put `asynMCA` in the mca DTYP menu: a dynamic support adds no menu row,
+/// and mca has none of its own, so without the row `DTYP` reads empty.
+pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
+    register_device_row("mca", &DEV_MCA_ASYN);
+    app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+        if ctx.dtyp != ASYN_MCA_DTYP {
+            return None;
+        }
+        let dev = connect(ctx.inp)?;
+        Some(Box::new(dev) as Box<dyn DeviceSupport>)
     })
 }
