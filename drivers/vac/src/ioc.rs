@@ -69,6 +69,7 @@ mod tests {
     fn factory_dispatches_vacsen_dtyp() {
         let f = device_support_factory();
         let ctx = DeviceSupportContext {
+            record_type: "vs",
             dtyp: vac_sen::DTYP,
             inp: "@asyn(TV1 0)5",
             out: "",
@@ -81,6 +82,7 @@ mod tests {
     fn factory_dispatches_digitel_dtyp() {
         let f = device_support_factory();
         let ctx = DeviceSupportContext {
+            record_type: "digitel",
             dtyp: digitel_pump::DTYP,
             inp: "@asyn(DIGITEL_1 0)0",
             out: "",
@@ -93,6 +95,7 @@ mod tests {
     fn factory_rejects_unknown_dtyp() {
         let f = device_support_factory();
         let ctx = DeviceSupportContext {
+            record_type: "vs",
             dtyp: "asyn Something",
             inp: "@asyn(TV1 0)5",
             out: "",
@@ -104,6 +107,7 @@ mod tests {
     fn factory_rejects_unparseable_link() {
         let f = device_support_factory();
         let ctx = DeviceSupportContext {
+            record_type: "vs",
             dtyp: vac_sen::DTYP,
             inp: "not-an-asyn-link",
             out: "",
