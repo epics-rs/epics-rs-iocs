@@ -564,7 +564,7 @@ impl AmptekDriver {
         self.base.set_string_param(
             self.amptek[AmptekReason::Model as usize],
             0,
-            dpp_type.name().to_string(),
+            dpp_type.name(),
         )?;
         self.base.set_int32_param(
             self.amptek[AmptekReason::SerialNumber as usize],

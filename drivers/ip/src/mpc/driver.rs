@@ -251,9 +251,7 @@ impl PortDriver for MpcDriver {
         self.supply(addr)?;
         let text = std::str::from_utf8(value)
             .map_err(|_| asyn_error("MPC: command strings must be ASCII"))?;
-        self.base
-            .params
-            .set_string(reason, addr, text.to_string())?;
+        self.base.params.set_string(reason, addr, text)?;
 
         if reason == p.tsp_timed {
             self.send(cmd::TSP_TIMED, text)?;

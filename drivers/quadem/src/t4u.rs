@@ -334,8 +334,7 @@ impl T4uDriver {
             .set_int32_param(p.model, 0, QeModel::SydorEm as i32)?;
         base.port_base
             .set_int32_param(p.values_per_read, 0, DEFAULT_VALUES_PER_READ)?;
-        base.port_base
-            .set_string_param(p.firmware, 0, FIRMWARE.to_string())?;
+        base.port_base.set_string_param(p.firmware, 0, FIRMWARE)?;
         base.port_base
             .set_float64_param(p.temperature, 0, TEMPERATURE)?;
         base.port_base.set_int32_param(p.geometry, 0, GEOMETRY)?;
