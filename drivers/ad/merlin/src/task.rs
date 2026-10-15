@@ -148,7 +148,7 @@ async fn data_loop(ctx: AcquisitionContext) {
                 .unwrap_or(0)
                 + 1;
             array_counter += 1;
-            let _ = ctx.shared.images_remaining.fetch_update(
+            let _ = ctx.shared.images_remaining.try_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,
                 |n| if n > 0 { Some(n - 1) } else { None },
