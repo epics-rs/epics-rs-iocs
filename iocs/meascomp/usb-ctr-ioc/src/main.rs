@@ -12,6 +12,15 @@ use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
 use usb_ctr::{CtrRuntime, CtrScalerDriver, create_usb_ctr};
 
+/// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
+static SCALER_DEVICES: &[epics_rs::base::server::record::DevSup] =
+    &[epics_rs::base::server::record::DevSup {
+        name: "devScalerAsyn",
+        choice: "Asyn Scaler",
+        link_type: epics_rs::base::server::record::DbLinkType::InstIo,
+        dset: epics_rs::base::server::record::Dset::new(7, &[2, 4, 5, 6], false),
+    }];
+
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
     // The drivers report every uldaq failure through `log`; without a
@@ -67,7 +76,7 @@ async fn main() -> CaResult<()> {
     // The scaler device support binds dynamically by DTYP at iocInit, so the
     // name is in no device menu when scaler.db's DTYP field is applied.
     // Contributing the menu here makes that assignment resolve.
-    epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
+    epics_rs::base::server::record::register_device_menu(scaler_name, SCALER_DEVICES);
 
     // Universal asyn device support
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);

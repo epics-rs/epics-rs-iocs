@@ -24,6 +24,15 @@ use scaler974::driver::Scaler974Driver;
 /// macro is dead code, see `driver`'s module doc).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// `scalerSupport.dbd`'s `device(scaler,INST_IO,devScalerAsyn,"Asyn Scaler")`.
+static SCALER_DEVICES: &[epics_rs::base::server::record::DevSup] =
+    &[epics_rs::base::server::record::DevSup {
+        name: "devScalerAsyn",
+        choice: "Asyn Scaler",
+        link_type: epics_rs::base::server::record::DbLinkType::InstIo,
+        dset: epics_rs::base::server::record::Dset::new(7, &[2, 4, 5, 6], false),
+    }];
+
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -66,7 +75,7 @@ async fn main() -> CaResult<()> {
     // script runs, so the put resolves against the record type's live device
     // menu instead of failing S_db_noRSET. (asyn contributes its own menus via
     // register_asyn_device_support; the dynamic scaler support has no such hook.)
-    epics_rs::base::server::record::register_device_menu(scaler_name, &["Asyn Scaler"]);
+    epics_rs::base::server::record::register_device_menu(scaler_name, SCALER_DEVICES);
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
