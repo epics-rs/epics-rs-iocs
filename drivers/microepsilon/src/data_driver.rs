@@ -630,7 +630,7 @@ pub fn configure(
     let mut rbk_driver = DrvAsynIPPort::new(&rbk_port_name, &host)?;
     // `drvAsynIPPortConfigure(link->portName, link->hostInfo, priority, 1, 1)`
     // (`capaNCDT6200Sup.c:476`): noAutoConnect=1.
-    rbk_driver.base_mut().set_auto_connect(false);
+    rbk_driver.base_mut().init_auto_connect(false);
     // noProcessEos=1: no `push_interpose` call -- no EOS interpose installed.
     let (rbk_runtime, _rbk_actor_jh) = create_port_runtime(rbk_driver, RuntimeConfig::default())?;
     let rbk_port_handle = rbk_runtime.port_handle().clone();

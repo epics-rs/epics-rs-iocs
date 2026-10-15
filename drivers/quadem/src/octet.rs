@@ -173,7 +173,7 @@ pub fn create_ip_port(
 ) -> AsynResult<(OctetIo, PortRuntimeHandle)> {
     let mut driver = epics_rs::asyn::drivers::ip_port::DrvAsynIPPort::new(port_name, host_info)?;
     if no_auto_connect {
-        driver.base_mut().auto_connect = false;
+        driver.base_mut().init_auto_connect(false);
     }
     if process_eos {
         driver.install_interpose(Box::new(
