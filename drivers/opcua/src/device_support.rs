@@ -869,7 +869,7 @@ impl DeviceSupport for OpcuaDevice {
     }
 
     fn set_process_context(&mut self, ctx: &ProcessContext) {
-        self.udf = ctx.udf;
+        self.udf = ctx.udf != 0;
     }
 
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {
