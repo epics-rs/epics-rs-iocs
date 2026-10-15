@@ -245,7 +245,7 @@ fn lsi_takes_a_long_string_and_sets_len() {
 
     assert_eq!(
         field(&record, "VAL"),
-        EpicsValue::CharArray(b"a long string".to_vec().into())
+        EpicsValue::CharArray(b"a long string\0".to_vec().into())
     );
     assert_eq!(field(&record, "LEN"), EpicsValue::ULong(14));
 }
