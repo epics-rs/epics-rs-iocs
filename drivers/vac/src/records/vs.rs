@@ -623,10 +623,9 @@ mod tests {
     /// check with `udf == false`. `CommonFields::default()` starts at the
     /// dbCommon `UDF = 1`.
     fn common() -> CommonFields {
-        CommonFields {
-            udf: 0,
-            ..CommonFields::default()
-        }
+        let mut common = CommonFields::default();
+        common.udf = 0;
+        common
     }
 
     #[test]

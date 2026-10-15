@@ -908,10 +908,9 @@ mod tests {
     use super::*;
 
     fn common() -> CommonFields {
-        CommonFields {
-            udf: 0,
-            ..CommonFields::default()
-        }
+        let mut common = CommonFields::default();
+        common.udf = 0;
+        common
     }
 
     #[test]
