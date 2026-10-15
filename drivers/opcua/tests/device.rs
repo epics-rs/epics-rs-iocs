@@ -379,6 +379,8 @@ fn mbbo_direct_reads_back_val_and_its_bits_from_the_shifted_raw() {
     // recomputes it; the record's own readback keeps the two fields apart.
     assert_eq!(field(&record, "RVAL"), EpicsValue::ULong(0x50));
     assert_eq!(field(&record, "VAL"), EpicsValue::Long(5));
+    // The bits follow VAL at the record's monitor() (mbboDirectRecord.c:240).
+    record.monitor_value_changed();
     assert_eq!(field(&record, "B0"), EpicsValue::UChar(1));
     assert_eq!(field(&record, "B1"), EpicsValue::UChar(0));
     assert_eq!(field(&record, "B2"), EpicsValue::UChar(1));
