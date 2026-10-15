@@ -16,7 +16,8 @@ use epics_rs::base::server::iocsh::registry::*;
 use motor_common::MotorHolder;
 use motor_common::connect::connect_ip;
 use motor_common::iocsh::{
-    arg_int_opt, arg_str_opt, arg_str_req, opt_double, opt_string, poll_intervals, req_string,
+    arg_double_opt, arg_int_opt, arg_str_opt, arg_str_req, opt_double, opt_string, poll_intervals,
+    req_string,
 };
 
 use crate::mdriveplus::ImsMDrivePlusAxis;
@@ -36,7 +37,7 @@ pub fn ims_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
             arg_str_opt("deviceName"),
             arg_int_opt("movingPollMs"),
             arg_int_opt("idlePollMs"),
-            arg_int_opt("timeoutMs"),
+            arg_double_opt("timeoutMs"),
         ],
         "ImsMDrivePlusCreateController(motorPort, ioPort, [deviceName], [movingPollMs], \
          [idlePollMs], [timeoutMs]) - Create an IMS MDrivePlus controller (DTYP motorPort) \
