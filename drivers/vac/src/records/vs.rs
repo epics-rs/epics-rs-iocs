@@ -5,7 +5,8 @@ use std::any::Any;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, FieldMetadataOverride, ProcessOutcome, Record,
+    AlarmSeverity, CommonFields, DeclaredFields, FieldDesc, FieldIx, FieldMetadataOverride,
+    ProcessOutcome, Record, declared_set,
 };
 use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue};
 
@@ -530,11 +531,19 @@ impl Record for VsRecord {
     /// transitioned, even if its value did not change (`monitor()`'s
     /// `|| (alrm_chg_flg)` clauses). The `*S` setting fields are not in that
     /// list — their posts are gated on `chgc` / their own shadow.
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &[
-            "VAL", "PRES", "IG1R", "IG2R", "DGSR", "FLTR", "SP1", "SP2", "SP3", "SP4", "SP5",
-            "SP6", "SP1R", "SP2R", "SP3R", "SP4R", "LPRS", "CGAP", "LCAP", "CGBP", "LCBP",
-        ]
+    fn alarm_cycle_monitored_fields(&self) -> DeclaredFields {
+        // `ALL_FIELDS` is built at run time, so the set resolves on first use.
+        static MONITORED: std::sync::LazyLock<[FieldIx; 21]> = std::sync::LazyLock::new(|| {
+            declared_set(
+                ALL_FIELDS.as_slice(),
+                [
+                    "VAL", "PRES", "IG1R", "IG2R", "DGSR", "FLTR", "SP1", "SP2", "SP3", "SP4",
+                    "SP5", "SP6", "SP1R", "SP2R", "SP3R", "SP4R", "LPRS", "CGAP", "LCAP", "CGBP",
+                    "LCBP",
+                ],
+            )
+        });
+        &*MONITORED
     }
 
     fn check_alarms(&mut self, common: &mut CommonFields) {

@@ -5,7 +5,8 @@ use std::any::Any;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::{
-    AlarmSeverity, CommonFields, FieldDesc, FieldMetadataOverride, ProcessOutcome, Record,
+    AlarmSeverity, CommonFields, DeclaredFields, FieldDesc, FieldIx, FieldMetadataOverride,
+    ProcessOutcome, Record, declared_set,
 };
 use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue, PvString};
 
@@ -819,13 +820,20 @@ impl Record for DigitelRecord {
     /// C posts every readback with the cycle's alarm mask when the alarm
     /// transitioned, even if the value did not change (`monitor()`'s
     /// `|| alrm_chg_flg` clauses).
-    fn alarm_cycle_monitored_fields(&self) -> &'static [&'static str] {
-        &[
-            "VAL", "LVAL", "MODR", "BAKR", "COOL", "BKIN", "SET1", "SET2", "SET3", "SET4", "ACCW",
-            "ACCI", "PTYP", "SP1R", "S1HR", "S1MR", "S1VR", "SP2R", "S2HR", "S2MR", "S2VR", "SP3R",
-            "S3HR", "S3MR", "S3VR", "S3BR", "S3TR", "SP4R", "S4HR", "S4MR", "S4VR", "TONL", "CRNT",
-            "VOLT", "ERR",
-        ]
+    fn alarm_cycle_monitored_fields(&self) -> DeclaredFields {
+        // `ALL_FIELDS` is built at run time, so the set resolves on first use.
+        static MONITORED: std::sync::LazyLock<[FieldIx; 35]> = std::sync::LazyLock::new(|| {
+            declared_set(
+                ALL_FIELDS.as_slice(),
+                [
+                    "VAL", "LVAL", "MODR", "BAKR", "COOL", "BKIN", "SET1", "SET2", "SET3", "SET4",
+                    "ACCW", "ACCI", "PTYP", "SP1R", "S1HR", "S1MR", "S1VR", "SP2R", "S2HR", "S2MR",
+                    "S2VR", "SP3R", "S3HR", "S3MR", "S3VR", "S3BR", "S3TR", "SP4R", "S4HR", "S4MR",
+                    "S4VR", "TONL", "CRNT", "VOLT", "ERR",
+                ],
+            )
+        });
+        &*MONITORED
     }
 
     fn check_alarms(&mut self, common: &mut CommonFields) {
