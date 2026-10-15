@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use epics_rs::base::server::db_loader::{DbLoadConfig, DbRecordDef, parse_db_file};
+use epics_rs::base::types::RecordName;
 
 /// Every parameter `MythenParams::create` makes (drivers/ad/mythen/src/driver.rs).
 const CREATED: &[&str] = &[
@@ -58,10 +59,9 @@ fn load() -> Vec<DbRecordDef> {
 #[test]
 fn the_template_loads() {
     let defs = load();
-    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     // One record from the Mythen set, one from the included ADBase.template.
-    assert!(names.contains(&"dp_mythen1K:cam1:BitDepth"));
-    assert!(names.contains(&"dp_mythen1K:cam1:Acquire"));
+    assert!(defs.iter().any(|d| d.name == "dp_mythen1K:cam1:BitDepth"));
+    assert!(defs.iter().any(|d| d.name == "dp_mythen1K:cam1:Acquire"));
 }
 
 /// `dbLoadRecords` merges a re-declared record into the existing instance only
@@ -69,7 +69,7 @@ fn the_template_loads() {
 /// to drop the "Continuous" choice must stay an mbbo.
 #[test]
 fn redeclared_records_keep_their_type() {
-    let mut types: HashMap<String, String> = HashMap::new();
+    let mut types: HashMap<RecordName, String> = HashMap::new();
     for def in load() {
         match types.get(&def.name) {
             Some(first) => assert_eq!(
@@ -82,7 +82,7 @@ fn redeclared_records_keep_their_type() {
             }
         }
     }
-    assert!(types.contains_key("dp_mythen1K:cam1:ImageMode"));
+    assert!(types.contains_key(&RecordName::from("dp_mythen1K:cam1:ImageMode")));
 }
 
 #[test]
