@@ -24,13 +24,11 @@ use std::time::Duration;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::base::error::CaResult;
-use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
+use epics_rs::ca::server::ioc_app::IocApplication;
 
 use mca::dev_mca_asyn;
 use mca::fastsweep::FastSweepDriver;
-use mca::interface::ASYN_MCA_DTYP;
 
 mod demo_source;
 
@@ -194,18 +192,7 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // Binds every mca record with DTYP "asynMCA" to the asyn port its own
-    // INP link (`@asyn(portName,addr)`) names -- unlike scalerRecord
-    // (scaler974-ioc), mcaRecord's INP is now mirrored into
-    // DeviceSupportContext (epics-base-rs 0.24.0), so no single-instance
-    // registry workaround is needed here.
-    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != ASYN_MCA_DTYP {
-            return None;
-        }
-        let dev = dev_mca_asyn::connect(ctx.inp)?;
-        Some(Box::new(dev) as Box<dyn DeviceSupport>)
-    });
+    app = dev_mca_asyn::register_dev_mca_asyn(app);
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
