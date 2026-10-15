@@ -239,7 +239,7 @@ mod tests {
     fn roundtrip_via_ad_plugins(values: Vec<u16>) {
         let n = values.len();
         let src = NDArray::with_data(vec![NDDimension::new(n)], NDDataBuffer::U16(values.clone()));
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
         let payload = compressed.data.as_u8_slice();
 
         let decoded = decode_blocks(payload, n, 2, 0).expect("decode");
@@ -283,7 +283,7 @@ mod tests {
         let values: Vec<u32> = (0..5000u32).map(|i| i * 3).collect();
         let n = values.len();
         let src = NDArray::with_data(vec![NDDimension::new(n)], NDDataBuffer::U32(values.clone()));
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
         let ours = decode_blocks(compressed.data.as_u8_slice(), n, 4, 0).unwrap();
 
         let theirs = ad_plugins_rs::codec::decompress_bslz4(&compressed).unwrap();
@@ -314,7 +314,7 @@ mod tests {
             compressor: 0,
             original_data_type: NDDataType::UInt16,
         });
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
 
         // Re-frame with the 12-byte header the detector prepends.
         let mut framed = Vec::new();
@@ -347,7 +347,7 @@ mod tests {
         let values: Vec<u16> = (0..3000).collect();
         let n = values.len();
         let src = NDArray::with_data(vec![NDDimension::new(n)], NDDataBuffer::U16(values.clone()));
-        let compressed = ad_plugins_rs::codec::compress_bslz4(&src);
+        let compressed = ad_plugins_rs::codec::compress_bslz4(&src).unwrap();
 
         let mut framed = Vec::new();
         framed.extend_from_slice(&((n * 2) as u64).to_be_bytes());
