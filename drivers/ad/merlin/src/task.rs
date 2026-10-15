@@ -88,7 +88,7 @@ async fn status_loop(handle: PortHandle, ad: ADBaseParams, init_param: usize) {
                     vec![ParamSetValue::new(
                         ad.status_message,
                         0,
-                        ParamValue::Octet("Waiting for acquire command".into()),
+                        ParamValue::Octet("Waiting for acquire command".as_bytes().into()),
                     )],
                 )
                 .await;
@@ -124,7 +124,7 @@ async fn data_loop(ctx: AcquisitionContext) {
                         vec![ParamSetValue::new(
                             ctx.ad_params.status_message,
                             0,
-                            ParamValue::Octet("Error in Labview data channel response".into()),
+                            ParamValue::Octet("Error in Labview data channel response".as_bytes().into()),
                         )],
                     )
                     .await;
@@ -284,7 +284,7 @@ async fn publish_image(
                     vec![ParamSetValue::new(
                         ctx.ad_params.status_message,
                         0,
-                        ParamValue::Octet("Error: unsupported frame".into()),
+                        ParamValue::Octet("Error: unsupported frame".as_bytes().into()),
                     )],
                 )
                 .await;

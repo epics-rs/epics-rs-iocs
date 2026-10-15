@@ -240,7 +240,7 @@ impl PortDriver for CtrDriver {
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg.into_bytes()),
+                ParamValue::Octet(msg.into_bytes().into()),
             );
         }
         self.base.call_param_callbacks(addr)?;
@@ -362,7 +362,7 @@ impl PortDriver for CtrDriver {
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg.into_bytes()),
+                ParamValue::Octet(msg.into_bytes().into()),
             );
         }
         self.base.call_param_callbacks(addr)?;
@@ -420,7 +420,7 @@ impl PortDriver for CtrDriver {
             let _ = self.base.params.set_value(
                 self.params.last_error_message,
                 0,
-                ParamValue::Octet(msg.into_bytes()),
+                ParamValue::Octet(msg.into_bytes().into()),
             );
         }
         self.base.call_param_callbacks(addr)?;

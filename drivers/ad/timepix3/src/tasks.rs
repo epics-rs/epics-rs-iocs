@@ -208,7 +208,7 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
         ParamSetValue::new(
             p.det_type,
             0,
-            ParamValue::Octet(det_type.clone().into_bytes()),
+            ParamValue::Octet(det_type.clone().into_bytes().into()),
         ),
         ParamSetValue::new(
             ctx.ad.status,
@@ -228,7 +228,7 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
         updates.push(ParamSetValue::new(
             ctx.ad.base.model,
             0,
-            ParamValue::Octet(det_type.into_bytes()),
+            ParamValue::Octet(det_type.into_bytes().into()),
         ));
     }
     if let Ok(dashboard) = &reply {
@@ -291,7 +291,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
             updates.push(ParamSetValue::new(
                 reason,
                 0,
-                ParamValue::Octet(serval::json_to_string(v).into_bytes()),
+                ParamValue::Octet(serval::json_to_string(v).into_bytes().into()),
             ));
         }
     };
@@ -473,7 +473,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
             updates.push(ParamSetValue::new(
                 p.layout,
                 addr,
-                ParamValue::Octet(serval::json_to_string(c).into_bytes()),
+                ParamValue::Octet(serval::json_to_string(c).into_bytes().into()),
             ));
         }
         if let Some(&(vdd, avdd)) = rails.get(chip) {
@@ -590,7 +590,7 @@ fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
             updates.push(ParamSetValue::new(
                 reason,
                 0,
-                ParamValue::Octet(value.into_bytes()),
+                ParamValue::Octet(value.into_bytes().into()),
             ));
         }
     }
@@ -602,7 +602,7 @@ fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
         updates.push(ParamSetValue::new(
             p.chip_temperature,
             0,
-            ParamValue::Octet(serval::json_to_string(&Value::Array(temps)).into_bytes()),
+            ParamValue::Octet(serval::json_to_string(&Value::Array(temps)).into_bytes().into()),
         ));
     }
 }
@@ -635,7 +635,7 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
                         updates.push(ParamSetValue::new(
                             p.status,
                             0,
-                            ParamValue::Octet(v.as_bytes().to_vec()),
+                            ParamValue::Octet(v.as_bytes().into()),
                         ));
                     }
                     for (ptr, reason) in [
@@ -664,7 +664,7 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
                         updates.push(ParamSetValue::new(
                             p.start_time,
                             0,
-                            ParamValue::Octet(v.as_bytes().to_vec()),
+                            ParamValue::Octet(v.as_bytes().into()),
                         ));
                     }
                     ctx.set(0, updates).await;

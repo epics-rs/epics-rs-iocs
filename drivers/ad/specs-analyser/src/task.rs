@@ -109,7 +109,7 @@ impl Worker {
         self.batch.push(ParamSetValue::new(
             reason,
             0,
-            ParamValue::Octet(value.into()),
+            ParamValue::Octet(Vec::from(value.into()).into()),
         ));
     }
 

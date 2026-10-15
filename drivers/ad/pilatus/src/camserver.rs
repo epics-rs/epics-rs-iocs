@@ -117,7 +117,7 @@ impl Ctx {
         self.batch.updates.push(ParamSetValue::new(
             reason,
             0,
-            ParamValue::Octet(value.into()),
+            ParamValue::Octet(Vec::from(value.into()).into()),
         ));
     }
 

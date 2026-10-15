@@ -423,22 +423,22 @@ fn poll_once(
         ParamSetValue::new(
             params.program_state,
             0,
-            ParamValue::Octet(program_state.into_bytes()),
+            ParamValue::Octet(program_state.into_bytes().into()),
         ),
         ParamSetValue::new(
             params.robot_mode,
             0,
-            ParamValue::Octet(robot_mode.clone().into_bytes()),
+            ParamValue::Octet(robot_mode.clone().into_bytes().into()),
         ),
         ParamSetValue::new(
             params.loaded_program,
             0,
-            ParamValue::Octet(loaded_program.into_bytes()),
+            ParamValue::Octet(loaded_program.into_bytes().into()),
         ),
         ParamSetValue::new(
             params.safety_status,
             0,
-            ParamValue::Octet(safety_status.into_bytes()),
+            ParamValue::Octet(safety_status.into_bytes().into()),
         ),
         ParamSetValue::new(
             params.is_program_saved,

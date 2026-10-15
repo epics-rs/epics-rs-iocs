@@ -300,7 +300,7 @@ impl DeviceWorker for TpgWorker {
                     Ok(id) => shared.push(ParamSetValue::new(
                         p.gauge_id,
                         addr,
-                        ParamValue::Octet(id.into_bytes()),
+                        ParamValue::Octet(id.into_bytes().into()),
                     )),
                     Err(e) => log::error!("TPG261: gauge {gauge} id: {e}"),
                 }

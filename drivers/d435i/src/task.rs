@@ -45,7 +45,7 @@ async fn write_string(handle: &PortHandle, reason: usize, addr: i32, value: Stri
             vec![ParamSetValue::new(
                 reason,
                 addr,
-                ParamValue::Octet(value.into_bytes()),
+                ParamValue::Octet(value.into_bytes().into()),
             )],
         )
         .await;
@@ -759,7 +759,7 @@ async fn try_connect_pipeline(
                 ParamSetValue::new(
                     ctx.color_ad.status_message,
                     0,
-                    ParamValue::Octet("Connecting to camera...".into()),
+                    ParamValue::Octet("Connecting to camera...".as_bytes().into()),
                 ),
                 ParamSetValue::new(ctx.rs_params.rs_connected, 0, ParamValue::Int32(0)),
             ],
@@ -884,7 +884,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     ParamSetValue::new(
                         ctx.color_ad.status_message,
                         0,
-                        ParamValue::Octet("Acquiring data".into()),
+                        ParamValue::Octet("Acquiring data".as_bytes().into()),
                     ),
                 ],
             )

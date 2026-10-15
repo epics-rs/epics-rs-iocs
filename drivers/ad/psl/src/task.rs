@@ -66,7 +66,7 @@ async fn task_loop(mut ctx: AcquisitionContext) {
                 ParamSetValue::new(
                     ctx.ad_params.status_message,
                     0,
-                    ParamValue::Octet("Waiting for acquire command".into()),
+                    ParamValue::Octet("Waiting for acquire command".as_bytes().into()),
                 ),
             ],
         )
@@ -96,7 +96,7 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
             ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet("Waiting for the detector".into()),
+                ParamValue::Octet("Waiting for the detector".as_bytes().into()),
             ),
         ],
     )
@@ -347,14 +347,14 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
         Some(Abort::Stopped) => updates.push(ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet("Acquisition aborted".into()),
+            ParamValue::Octet("Acquisition aborted".as_bytes().into()),
         )),
         Some(Abort::Error(message)) => {
             log::error!("psl: {message}");
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet(message.clone().into_bytes()),
+                ParamValue::Octet(message.clone().into_bytes().into()),
             ));
         }
     }

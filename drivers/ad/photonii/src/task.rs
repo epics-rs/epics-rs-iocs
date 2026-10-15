@@ -83,7 +83,7 @@ async fn task_loop(mut ctx: AcquisitionContext) {
                 ParamSetValue::new(
                     ctx.ad_params.status_message,
                     0,
-                    ParamValue::Octet("Waiting for acquire command".into()),
+                    ParamValue::Octet("Waiting for acquire command".as_bytes().into()),
                 ),
             ],
         )
@@ -155,7 +155,7 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
             ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet("Starting exposure".into()),
+                ParamValue::Octet("Starting exposure".as_bytes().into()),
             ),
         ],
     )
@@ -195,7 +195,7 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
         vec![ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet("Waiting for Acquisition".into()),
+            ParamValue::Octet("Waiting for Acquisition".as_bytes().into()),
         )],
     )
     .await;
@@ -315,12 +315,12 @@ async fn publish_frame(
             ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,
-                ParamValue::Octet(format!("Reading from File {file_name}").into_bytes()),
+                ParamValue::Octet(format!("Reading from File {file_name}").into_bytes().into()),
             ),
             ParamSetValue::new(
                 ctx.ad_params.base.full_file_name,
                 0,
-                ParamValue::Octet(file_name.as_bytes().to_vec()),
+                ParamValue::Octet(file_name.as_bytes().into()),
             ),
         ],
     )
@@ -450,7 +450,7 @@ async fn finish(ctx: &AcquisitionContext, sync: &SyncIOHandle, abort: Option<Abo
         updates.push(ParamSetValue::new(
             ctx.ad_params.status_message,
             0,
-            ParamValue::Octet(m.into_bytes()),
+            ParamValue::Octet(m.into_bytes().into()),
         ));
     }
     set_params(ctx, updates).await;

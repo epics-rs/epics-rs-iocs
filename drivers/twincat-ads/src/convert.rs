@@ -184,7 +184,7 @@ pub fn decode_array(
             ParamType::Int8Array => Ok(ParamValue::Int8Array(
                 data.iter().map(|&b| b as i8).collect(),
             )),
-            ParamType::Octet => Ok(ParamValue::Octet(decode_plc_string(data))),
+            ParamType::Octet => Ok(ParamValue::Octet(decode_plc_string(data).into())),
             _ => Err(unsupported()),
         };
     }
@@ -491,7 +491,7 @@ mod tests {
         // The PLC sends the whole fixed-size slot; the tail is stale data.
         let raw = b"Hello\0\xff\xfe garbage";
         match decode_array(AdsType::String, raw, ParamType::Octet).unwrap() {
-            ParamValue::Octet(s) => assert_eq!(s, b"Hello"),
+            ParamValue::Octet(s) => assert_eq!(&s[..], b"Hello"),
             other => panic!("{other:?}"),
         }
     }
