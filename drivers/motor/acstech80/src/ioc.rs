@@ -64,7 +64,7 @@ pub fn spiiplus_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 return Err("SPiiPlusConfig: card must be >= 0".into());
             }
             let asyn_port = req_string(args, 1, "asynPort")?;
-            let mode = match opt_string(args, 2) {
+            let mode = match opt_string(args, 2)? {
                 Some(s) => CommandMode::parse(&s),
                 None => CommandMode::Buffer,
             };

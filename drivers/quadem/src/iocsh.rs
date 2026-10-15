@@ -78,11 +78,11 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
         format!("{name} portName addr eos"),
         move |args: &[ArgValue], ctx: &CommandContext| {
             let port = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let eos = match args.get(2) {
-                Some(ArgValue::String(s)) => raw_from_escaped(s),
+                Some(ArgValue::String(s)) => raw_from_escaped(s.to_str()?),
                 _ => Vec::new(),
             };
             let Some(entry) = epics_rs::asyn::asyn_record::get_port(&port) else {
@@ -188,11 +188,11 @@ pub fn ahxxx_configure_command(
         "drvAHxxxConfigure portName QEPortName ringBufferSize modelName [maxMemory]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let qe_port_name = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("QEPortName required".into()),
             };
             // C++ passes ringBufferSize straight to drvQuadEM, which
@@ -202,7 +202,7 @@ pub fn ahxxx_configure_command(
                 _ => 0,
             };
             let model_name = match args.get(3) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("modelName required".into()),
             };
             let max_memory = match args.get(4) {
@@ -273,11 +273,11 @@ pub fn nsls_em_configure_command(
         "drvNSLS_EMConfigure portName broadcastAddress moduleID ringBufferSize [maxMemory]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let broadcast_address = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("broadcastAddress required".into()),
             };
             let module_id = match args.get(2) {
@@ -351,11 +351,11 @@ pub fn fx4_configure_command(
         "drvFX4Configure portName FX4_IP ringBufferSize [maxMemory]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let fx4_ip = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("FX4_IP required".into()),
             };
             let ring_buffer_size = match args.get(2) {
@@ -418,11 +418,11 @@ pub fn pcr4_configure_command(
         "drvPCR4Configure portName QEPortName ringBufferSize [maxMemory]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let qe_port_name = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("QEPortName required".into()),
             };
             let ring_buffer_size = match args.get(2) {
@@ -491,11 +491,11 @@ pub fn t4u_em_configure_command(
         "drvT4U_EMConfigure portName qtHostAddress ringBufferSize basePortNum [maxMemory]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let qt_host_address = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("qtHostAddress required".into()),
             };
             let ring_buffer_size = match args.get(2) {
@@ -572,11 +572,11 @@ pub fn t4u_direct_em_configure_command(
          [maxMemory]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match args.first() {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let t4u_address = match args.get(1) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("T4UAddress required".into()),
             };
             let ring_buffer_size = match args.get(2) {
@@ -585,7 +585,7 @@ pub fn t4u_direct_em_configure_command(
             };
             let base_port_num = port_number(args.get(3), "basePortNum")?;
             let cfg_file_name = match args.get(4) {
-                Some(ArgValue::String(s)) => s.clone(),
+                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("cfgFileName required".into()),
             };
             let max_memory = match args.get(5) {

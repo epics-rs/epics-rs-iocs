@@ -52,7 +52,7 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             "simDetectorConfig portName [maxSizeX] [maxSizeY] [dataType] [maxBuffers] [maxMemory]",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let size_x = match args.get(1) {

@@ -21,7 +21,7 @@ fn int_arg(args: &[ArgValue], i: usize) -> Option<i64> {
 
 fn string_arg(args: &[ArgValue], i: usize) -> Option<String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) => Some(s.clone()),
+        Some(ArgValue::String(s)) => Some(s.to_str()?.to_owned()),
         _ => None,
     }
 }

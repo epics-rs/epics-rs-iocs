@@ -52,11 +52,11 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
         "PSLConfig portName serverPort [maxBuffers] [maxMemory] [priority] [stackSize]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match &args[0] {
-                ArgValue::String(s) if !s.is_empty() => s.clone(),
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let server_port = match &args[1] {
-                ArgValue::String(s) if !s.is_empty() => s.clone(),
+                ArgValue::String(s) if !s.is_empty() => s.to_str()?.to_owned(),
                 _ => return Err("serverPort required".into()),
             };
             // 0 means "unlimited" in the C startup scripts.

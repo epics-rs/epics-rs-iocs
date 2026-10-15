@@ -105,11 +105,11 @@ async fn main() -> CaResult<()> {
             "USBCTRConfig portName uniqueID [maxTimePoints]",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let unique_id = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("uniqueID required".into()),
                 };
                 let max_points = match args.get(2) {

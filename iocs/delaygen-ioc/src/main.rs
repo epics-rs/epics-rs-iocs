@@ -123,11 +123,11 @@ async fn main() -> CaResult<()> {
              - create a serial octet port",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match args.first() {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let tty = match args.get(1) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("ttyName required".into()),
                 };
                 let no_auto_connect = matches!(args.get(3), Some(ArgValue::Int(n)) if *n != 0);
@@ -180,11 +180,11 @@ async fn main() -> CaResult<()> {
             "DG645Config myport ioport ioaddr",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let my_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("myport required".into()),
                 };
                 let io_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("ioport required".into()),
                 };
                 let io_addr = match &args[2] {
@@ -243,11 +243,11 @@ async fn main() -> CaResult<()> {
             "ColbyConfig myport ioport addr units iface",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let my_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("myport required".into()),
                 };
                 let io_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("ioport required".into()),
                 };
                 let io_addr = match &args[2] {
@@ -255,7 +255,7 @@ async fn main() -> CaResult<()> {
                     _ => return Err("addr required".into()),
                 };
                 let units = match &args[3] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("units required".into()),
                 };
                 let iface = match &args[4] {
@@ -306,11 +306,11 @@ async fn main() -> CaResult<()> {
             "CoherentSdgConfig myport ioport ioaddr",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let my_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("myport required".into()),
                 };
                 let io_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("ioport required".into()),
                 };
                 let io_addr = match &args[2] {

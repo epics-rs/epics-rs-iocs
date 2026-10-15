@@ -52,11 +52,11 @@ async fn main() -> CaResult<()> {
         "gm10Init netDevice address",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let net_device = match &args[0] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("netDevice required".into()),
             };
             let address = match &args[1] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("address required".into()),
             };
 

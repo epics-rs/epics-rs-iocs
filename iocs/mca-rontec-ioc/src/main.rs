@@ -109,11 +109,11 @@ async fn main() -> CaResult<()> {
             "RontecConfig portName serialPort serialPortAddress",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port_name = match args.first() {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let serial_port = match args.get(1) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("serialPort required".into()),
                 };
                 let serial_addr = match args.get(2) {

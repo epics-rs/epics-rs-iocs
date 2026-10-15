@@ -61,17 +61,17 @@ pub fn arg_double_opt(name: &'static str) -> ArgDesc {
 /// Read a required string arg.
 pub fn req_string(args: &[ArgValue], i: usize, name: &str) -> Result<String, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) => Ok(s.clone()),
+        Some(ArgValue::String(s)) => Ok(s.to_str()?.to_owned()),
         _ => Err(format!("{name} must be a string")),
     }
 }
 
 /// Read an optional string arg: `Some` for a non-empty string, else `None`
 /// (absent or `Missing`).
-pub fn opt_string(args: &[ArgValue], i: usize) -> Option<String> {
+pub fn opt_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 

@@ -695,8 +695,8 @@ impl NewportHolder {
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let motor_port = req_string(args, 0, "motorPort")?;
                 let tcl_file = req_string(args, 1, "tclFile")?;
-                let task_name = opt_string(args, 2).unwrap_or_else(|| "0".to_string());
-                let parameters = opt_string(args, 3).unwrap_or_else(|| "0".to_string());
+                let task_name = opt_string(args, 2)?.unwrap_or_else(|| "0".to_string());
+                let parameters = opt_string(args, 3)?.unwrap_or_else(|| "0".to_string());
 
                 let controller = {
                     let controllers = holder
@@ -852,7 +852,7 @@ impl NewportHolder {
                 let motor_port = req_string(args, 0, "motorPort")?;
                 let group = req_string(args, 1, "group")?;
                 let csv_file = req_string(args, 2, "csvFile")?;
-                let move_mode = parse_move_mode(opt_string(args, 3))?;
+                let move_mode = parse_move_mode(opt_string(args, 3)?)?;
 
                 let controller = holder.xps_controller(&motor_port, "XPSDefineProfileFromFile")?;
                 let csv = std::fs::read_to_string(&csv_file).map_err(|e| {
@@ -913,9 +913,10 @@ impl NewportHolder {
                 let motor_port = req_string(args, 0, "motorPort")?;
                 let file_name = req_string(args, 1, "fileName")?;
                 let host = req_string(args, 2, "host")?;
-                let ftp_user = opt_string(args, 3).unwrap_or_else(|| XPS_FTP_USER.to_string());
-                let ftp_pass = opt_string(args, 4).unwrap_or_else(|| XPS_FTP_PASSWORD.to_string());
-                let ftp_dir = opt_string(args, 5).unwrap_or_else(|| XPS_TRAJECTORY_DIR.to_string());
+                let ftp_user = opt_string(args, 3)?.unwrap_or_else(|| XPS_FTP_USER.to_string());
+                let ftp_pass = opt_string(args, 4)?.unwrap_or_else(|| XPS_FTP_PASSWORD.to_string());
+                let ftp_dir =
+                    opt_string(args, 5)?.unwrap_or_else(|| XPS_TRAJECTORY_DIR.to_string());
 
                 let controller = holder.xps_controller(&motor_port, "XPSBuildProfile")?;
 
@@ -1833,17 +1834,17 @@ fn parse_move_mode(arg: Option<String>) -> Result<MoveMode, String> {
 
 fn req_string(args: &[ArgValue], i: usize, name: &str) -> Result<String, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) => Ok(s.clone()),
+        Some(ArgValue::String(s)) => Ok(s.to_str()?.to_owned()),
         _ => Err(format!("{name} must be a string")),
     }
 }
 
 /// Read an optional string arg: `Some` if a non-empty string was given, else
 /// `None` (absent or `Missing`).
-fn opt_string(args: &[ArgValue], i: usize) -> Option<String> {
+fn opt_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 

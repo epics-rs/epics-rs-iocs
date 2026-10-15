@@ -37,7 +37,7 @@ type Ports = Arc<Mutex<Vec<IpPortRuntime>>>;
 
 fn string_arg(args: &[ArgValue], i: usize) -> Result<String, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) => Ok(s.clone()),
+        Some(ArgValue::String(s)) => Ok(s.to_str()?.to_owned()),
         _ => Err(format!("argument {i} must be a string")),
     }
 }

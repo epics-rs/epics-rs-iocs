@@ -33,10 +33,10 @@ use mca_amptek::driver::AmptekDriver;
 /// (mirrors `mca-ioc`'s `Ports`; see its `main.rs`).
 type Ports = Arc<Mutex<Vec<PortRuntimeHandle>>>;
 
-fn arg_string(args: &[ArgValue], i: usize) -> Option<String> {
+fn arg_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 
@@ -97,9 +97,9 @@ async fn main() -> CaResult<()> {
             "drvAmptekConfigure portName interface addressInfo [directMode] - \
              create an Amptek DP5 asyn port (interface must be 0, Ethernet)",
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let port_name = arg_string(args, 0).ok_or("portName required")?;
+                let port_name = arg_string(args, 0)?.ok_or("portName required")?;
                 let interface = arg_int(args, 1).ok_or("interface required")? as i32;
-                let address_info = arg_string(args, 2).ok_or("addressInfo required")?;
+                let address_info = arg_string(args, 2)?.ok_or("addressInfo required")?;
                 let direct_mode = arg_int(args, 3).unwrap_or(0) != 0;
 
                 let driver = AmptekDriver::new(&port_name, interface, &address_info, direct_mode)

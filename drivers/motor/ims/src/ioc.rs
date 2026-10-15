@@ -44,7 +44,7 @@ pub fn ims_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
         move |args: &[ArgValue], ctx: &CommandContext| {
             let motor_port = req_string(args, 0, "motorPort")?;
             let io_port = req_string(args, 1, "ioPort")?;
-            let device_name = opt_string(args, 2).unwrap_or_default();
+            let device_name = opt_string(args, 2)?.unwrap_or_default();
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
 

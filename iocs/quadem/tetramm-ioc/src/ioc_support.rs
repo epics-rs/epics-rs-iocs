@@ -42,11 +42,11 @@ fn tetramm_configure_command(
         "drvTetrAMMConfigure portName QEPortName [ringBufferSize] [maxMemory]",
         move |args: &[ArgValue], _ctx: &CommandContext| {
             let port_name = match &args[0] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
             let qe_port_name = match &args[1] {
-                ArgValue::String(s) => s.clone(),
+                ArgValue::String(s) => s.to_str()?.to_owned(),
                 _ => return Err("QEPortName required".into()),
             };
             // C++ passes ringBufferSize straight to drvQuadEM, which

@@ -94,11 +94,11 @@ async fn main() -> CaResult<()> {
             "CapaNCDT6200ConfigInit cfgPort ioPort ioAddr",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let cfg_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("cfgPort required".into()),
                 };
                 let io_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("ioPort required".into()),
                 };
                 let io_addr = match &args[2] {
@@ -164,15 +164,15 @@ async fn main() -> CaResult<()> {
             "capaNCDT6200Configure portName IPaddress IPport",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let ip_address = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("IPaddress required".into()),
                 };
                 let ip_port = match &args[2] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("IPport required".into()),
                 };
 

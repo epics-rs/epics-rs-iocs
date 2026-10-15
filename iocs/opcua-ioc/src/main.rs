@@ -45,7 +45,7 @@ const OPTION_SLOTS: usize = 6;
 
 fn string(args: &[ArgValue], i: usize) -> Option<String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.to_str()?.to_owned()),
         _ => None,
     }
 }

@@ -88,11 +88,11 @@ async fn main() -> CaResult<()> {
              - create a serial octet port",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port = match args.first() {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let tty = match args.get(1) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.clone(),
+                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
                     _ => return Err("ttyName required".into()),
                 };
                 let no_auto_connect = matches!(args.get(3), Some(ArgValue::Int(n)) if *n != 0);
@@ -156,11 +156,11 @@ async fn main() -> CaResult<()> {
             "LoveInit lovPort serPort serAddr",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let lov_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("lovPort required".into()),
                 };
                 let ser_port = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("serPort required".into()),
                 };
                 let ser_addr = match &args[2] {
@@ -213,7 +213,7 @@ async fn main() -> CaResult<()> {
             "LoveConfig lovPort addr model",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let lov_port = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("lovPort required".into()),
                 };
                 let addr = match &args[1] {
@@ -221,7 +221,7 @@ async fn main() -> CaResult<()> {
                     _ => return Err("addr required".into()),
                 };
                 let model_str = match &args[2] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("model required".into()),
                 };
 

@@ -45,11 +45,11 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             "ADTimePixConfig portName serverURL [maxMemory]",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let port_name = match &args[0] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("portName required".into()),
                 };
                 let server_url = match &args[1] {
-                    ArgValue::String(s) => s.clone(),
+                    ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("serverURL required".into()),
                 };
                 let max_memory = match args.get(2) {

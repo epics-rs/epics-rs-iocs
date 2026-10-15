@@ -23,10 +23,10 @@ use epics_rs::ca::server::ioc_app::IocApplication;
 
 use twincat_ads::{AdsConfig, AdsRuntime, AmsNetId, TimeBase, create_ads_port};
 
-fn arg_string(args: &[ArgValue], i: usize) -> Option<String> {
+fn arg_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 
@@ -74,7 +74,7 @@ async fn main() -> CaResult<()> {
             }],
             "adsSetLocalAddress localAmsNetId",
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let text = arg_string(args, 0).ok_or("localAmsNetId required")?;
+                let text = arg_string(args, 0)?.ok_or("localAmsNetId required")?;
                 let net_id =
                     AmsNetId::from_str(&text).map_err(|e| format!("localAmsNetId: {e}"))?;
                 twincat_ads::set_local_address(net_id);
@@ -139,9 +139,9 @@ async fn main() -> CaResult<()> {
              [paramTableSize] [priority] [disableAutoConnect] [defaultSampleTimeMS] \
              [maxDelayTimeMS] [adsTimeoutMS] [defaultTimeSource]",
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let port_name = arg_string(args, 0).ok_or("portName required")?;
-                let ip_addr = arg_string(args, 1).ok_or("ipAddr required")?;
-                let ams_text = arg_string(args, 2).ok_or("amsNetId required")?;
+                let port_name = arg_string(args, 0)?.ok_or("portName required")?;
+                let ip_addr = arg_string(args, 1)?.ok_or("ipAddr required")?;
+                let ams_text = arg_string(args, 2)?.ok_or("amsNetId required")?;
                 let remote_net_id =
                     AmsNetId::from_str(&ams_text).map_err(|e| format!("amsNetId: {e}"))?;
                 let ams_port = arg_int(args, 3).unwrap_or(851) as u16;
@@ -196,7 +196,7 @@ async fn main() -> CaResult<()> {
             }],
             "adsPollInfo [name]",
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                twincat_ads::poll_info(&arg_string(args, 0).unwrap_or_default());
+                twincat_ads::poll_info(&arg_string(args, 0)?.unwrap_or_default());
                 Ok(CommandOutcome::Continue)
             },
         ));

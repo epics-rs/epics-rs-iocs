@@ -79,7 +79,7 @@ pub fn acsmotion_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 return Err("AcsMotionConfig: numAxes must be > 0".into());
             }
             let num_axes = num_axes as usize;
-            let virtual_list = opt_string(args, 3).unwrap_or_default();
+            let virtual_list = opt_string(args, 3)?.unwrap_or_default();
             let homing_method = opt_int(args, 4, HOME_LIMIT_INDEX as i64, "homingMethod")? as i32;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 5, 6)?;
 

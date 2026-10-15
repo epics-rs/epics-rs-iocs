@@ -39,10 +39,10 @@ mod demo_source;
 /// (mirrors `ur-robot-ioc`'s `Ports`; see its `main.rs`).
 type Ports = Arc<Mutex<Vec<PortRuntimeHandle>>>;
 
-fn arg_string(args: &[ArgValue], i: usize) -> Option<String> {
+fn arg_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Some(s.clone()),
-        _ => None,
+        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
+        _ => Ok(None),
     }
 }
 
@@ -106,7 +106,7 @@ async fn main() -> CaResult<()> {
             ],
             "DemoSourceConfig portName maxSignals period - start the demo signal source",
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let port_name = arg_string(args, 0).ok_or("portName required")?;
+                let port_name = arg_string(args, 0)?.ok_or("portName required")?;
                 let max_signals = arg_int(args, 1).ok_or("maxSignals required")? as usize;
                 let period = arg_double(args, 2).ok_or("period required")?;
 
@@ -163,12 +163,12 @@ async fn main() -> CaResult<()> {
             ],
             "initFastSweep portName inputName maxSignals maxPoints [dataString] [intervalString]",
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let port_name = arg_string(args, 0).ok_or("portName required")?;
-                let input_name = arg_string(args, 1).ok_or("inputName required")?;
+                let port_name = arg_string(args, 0)?.ok_or("portName required")?;
+                let input_name = arg_string(args, 1)?.ok_or("inputName required")?;
                 let max_signals = arg_int(args, 2).ok_or("maxSignals required")? as usize;
                 let max_points = arg_int(args, 3).ok_or("maxPoints required")? as usize;
-                let data_string = arg_string(args, 4).unwrap_or_default();
-                let interval_string = arg_string(args, 5).unwrap_or_default();
+                let data_string = arg_string(args, 4)?.unwrap_or_default();
+                let interval_string = arg_string(args, 5)?.unwrap_or_default();
 
                 let (driver, subscriptions) = FastSweepDriver::connect(
                     &port_name,
