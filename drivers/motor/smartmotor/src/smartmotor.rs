@@ -3,8 +3,8 @@
 //! Ported from `motorSmartMotor/smartMotorApp/src/drvSmartMotor.cc` +
 //! `devSmartMotor.cc`. A SmartMotor is an integrated servo + drive; commands
 //! use the Animatics language (`P=`, `D=`, `V=`, `A=`, `G`, `S`, `RP`, `RBt`,
-//! …) and are terminated by a newline (the driver owns output framing; the
-//! startup script sets only the input EOS `\r`). Set commands produce no reply;
+//! …) and are terminated by the port output EOS `\n`; replies by input EOS
+//! `\r` (`SmartMotorConfig` sets both, as C `motor_init`). Set commands produce no reply;
 //! status is read back with `R*` query commands.
 //!
 //! ## Single-motor mode only
@@ -20,11 +20,10 @@
 //!   by switching the port input EOS between `\n` (echo) and `\r` (response) on
 //!   every transaction.
 //!
-//! The asyn-rs [`SyncIOHandle`] reads to the port's fixed input EOS and exposes
-//! no per-read EOS override, so the daisy-chain framing cannot be reproduced
-//! faithfully. [`SmartMotorController::new`] therefore detects echo mode and
-//! returns an error rather than driving it incorrectly. Supporting daisy chain
-//! needs an input-EOS control API on `SyncIOHandle` (upstream `epics-rs`).
+//! [`SmartMotorController::new`] detects echo mode and returns an error rather
+//! than driving it incorrectly. Supporting daisy chain means switching the
+//! input EOS per transaction through `PortHandle::set_input_eos_blocking`, as
+//! C does; that is not ported.
 //!
 //! ## Units
 //!
@@ -52,9 +51,6 @@ use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 20;
-
-/// Command terminator; the driver owns output framing (C output EOS `\n`).
-const TERMINATOR: &[u8] = b"\n";
 
 /// Minimum acceleration the controller accepts (C forces `A >= 2`).
 const MIN_ACCEL: i32 = 2;
@@ -101,7 +97,7 @@ impl SmartMotorController {
         if reply.starts_with("RBe") || reply.contains('\n') {
             return Err(smartmotor_err(
                 "SmartMotor: controller is in daisy-chain echo mode, which is \
-                 unsupported (needs per-read input-EOS control on SyncIOHandle)",
+                 unsupported (needs per-transaction input-EOS switching)",
             ));
         }
         if reply != "0" && reply != "1" {
@@ -112,23 +108,16 @@ impl SmartMotorController {
         Ok(ctrl)
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command with no reply (moves and set commands; the SmartMotor does
     /// not echo or answer these in single-motor mode).
     fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Send a query command and return its `\r`-terminated reply (trimmed).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
@@ -337,12 +326,6 @@ impl AsynMotor for SmartMotorAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn framed_appends_newline() {
-        assert_eq!(SmartMotorController::framed("P=100"), b"P=100\n");
-        assert_eq!(SmartMotorController::framed("G"), b"G\n");
-    }
 
     #[test]
     fn accel_clamps_to_minimum() {
