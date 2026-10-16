@@ -45,6 +45,12 @@ impl ChangeResolution for CorvusAxis {
     }
 }
 
+impl ChangeResolution for HydraAxis {
+    fn change_resolution(&mut self, new_resolution: f64) {
+        HydraAxis::change_resolution(self, new_resolution);
+    }
+}
+
 type ResolutionAxes = HashMap<String, Vec<Arc<Mutex<dyn ChangeResolution>>>>;
 
 /// The axes of every controller port, as C's `findAsynPortDriver` +
@@ -163,6 +169,16 @@ pub fn corvus_create_controller_command() -> CommandDef {
     )
 }
 
+/// Build the `SMChydraChangeResolution(portName, axisNo, newResolution)`
+/// command.
+pub fn hydra_change_resolution_command() -> CommandDef {
+    change_resolution_command(
+        "SMChydraChangeResolution",
+        "SMC hydra port name",
+        "SMChydraDriver.cpp",
+    )
+}
+
 /// Build the `SMChydraCreateController(portName, SMChydraPortName, numAxes,
 /// movingPollPeriod, idlePollPeriod)` command, periods in ms.
 pub fn hydra_create_controller_command() -> CommandDef {
@@ -199,8 +215,9 @@ pub fn hydra_create_controller_command() -> CommandDef {
             let controller = Arc::new(Mutex::new(HydraController::new(handle)));
 
             for index in 0..num_axes as usize {
-                let ax = HydraAxis::new(controller.clone(), index);
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                let ax = Arc::new(Mutex::new(HydraAxis::new(controller.clone(), index)));
+                register_resolution_axis(&port_name, ax.clone());
+                let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 install(
                     ctx,
                     asyn_user(&port_name, index as i32),
