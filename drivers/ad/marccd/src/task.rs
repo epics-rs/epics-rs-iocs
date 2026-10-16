@@ -658,7 +658,7 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
             TraceMask::ERROR,
             "marCCD:collectSeries: error, frame type must be Normal",
         );
-        finish_series(l, tiff_timeout, false, auto_increment, file_number);
+        finish_series(l, tiff_timeout, use_shutter, auto_increment, file_number);
         return;
     }
 
@@ -912,6 +912,58 @@ mod tests {
             frame.attributes.get("Period").unwrap().value,
             NDAttrValue::Float64(2.5)
         );
+        std::mem::forget(det);
+    }
+
+    /// marCCD.cpp:1131-1140 computes useShutter before the frame-type check,
+    /// and its `goto done` closes the shutter (:1235).
+    #[test]
+    fn a_series_refused_for_its_frame_type_closes_the_shutter() {
+        use crate::driver::tests::sent_count;
+        use epics_rs::ad_core::driver::ShutterMode;
+        use std::time::Duration;
+
+        let name = "MARCCD_SERIES_FRAME";
+        let log = fake_server(name, |c| {
+            if c.starts_with("get_mode") {
+                "1"
+            } else if c.starts_with("get_size") {
+                "4,4"
+            } else if c.starts_with("get_bin") {
+                "1,1"
+            } else if c.starts_with("get_") {
+                "0"
+            } else {
+                ""
+            }
+        });
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad) = (det.port_handle().clone(), det.ad_params);
+        // An acquire the task reads before it first waits leaves the start
+        // event set behind it, and a second series runs.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h
+            .get_string_param_blocking(ad.status_message, 0, 256)
+            .unwrap()
+            != b"Waiting for acquire command"
+        {
+            assert!(Instant::now() < deadline, "the task never waited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        h.write_int32_blocking(ad.image_mode, 0, ImageMode::SeriesTimed as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.frame_type, 0, FrameType::Raw as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.shutter_mode, 0, ShutterMode::DetectorOnly as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.read_int32_blocking(ad.acquire, 0).unwrap() != 0 {
+            assert!(Instant::now() < deadline, "the series never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(sent_count(&log, "shutter,0"), 1);
         std::mem::forget(det);
     }
 }

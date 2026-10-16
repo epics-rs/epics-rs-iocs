@@ -478,7 +478,7 @@ pub(crate) mod tests {
     }
 
     /// How many times `command` reached the server.
-    fn sent_count(log: &Mutex<Vec<String>>, command: &str) -> usize {
+    pub(crate) fn sent_count(log: &Mutex<Vec<String>>, command: &str) -> usize {
         log.lock().iter().map(|c| c.matches(command).count()).sum()
     }
 
