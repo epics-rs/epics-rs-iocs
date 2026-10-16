@@ -70,3 +70,13 @@ fn a_photon_energy_write_reports_done_when_the_put_fails() {
         b"Photon Energy set"
     );
 }
+
+/// eigerDetector never writes `pasynUser->errorMessage`, so a write whose
+/// REST exchange fails reaches the record as its status alone.
+#[test]
+fn a_failed_rest_exchange_hands_the_record_no_message() {
+    let mut driver = offline_driver("EIGER_WS_MESSAGE");
+    let mut user = AsynUser::new(driver.ad.params.acquire);
+    let e = driver.write_int32(&mut user, 1).unwrap_err();
+    assert_eq!(e.message(), "");
+}

@@ -92,7 +92,7 @@ impl EigerDriver {
     pub fn reconnect(&mut self) -> AsynResult<()> {
         // A detector that comes back speaking another API keeps the parameter
         // set this port was created with; only an IOC restart rebuilds it.
-        self.ops.rest.probe().map_err(rest_err)?;
+        self.ops.rest.probe().map_err(|e| self.rest_failure(e))?;
         self.init_params()
     }
 
@@ -294,28 +294,40 @@ impl EigerDriver {
     }
 
     fn put_int(&mut self, index: usize, value: i32) -> AsynResult<()> {
-        let updates = self.ops.put_int(index, value).map_err(rest_err)?;
+        let updates = self
+            .ops
+            .put_int(index, value)
+            .map_err(|e| self.rest_failure(e))?;
         self.apply(updates)
     }
 
     fn put_bool(&mut self, index: usize, value: bool) -> AsynResult<()> {
-        let updates = self.ops.put_bool(index, value).map_err(rest_err)?;
+        let updates = self
+            .ops
+            .put_bool(index, value)
+            .map_err(|e| self.rest_failure(e))?;
         self.apply(updates)
     }
 
     fn put_f64(&mut self, index: usize, value: f64) -> AsynResult<()> {
         let current = self.ad.port_base.get_float64_param(index, 0).unwrap_or(0.0);
-        let updates = self.ops.put_f64(index, value, current).map_err(rest_err)?;
+        let updates = self
+            .ops
+            .put_f64(index, value, current)
+            .map_err(|e| self.rest_failure(e))?;
         self.apply(updates)
     }
 
     fn put_str(&mut self, index: usize, value: &str) -> AsynResult<()> {
-        let updates = self.ops.put_str(index, value).map_err(rest_err)?;
+        let updates = self
+            .ops
+            .put_str(index, value)
+            .map_err(|e| self.rest_failure(e))?;
         self.apply(updates)
     }
 
     fn fetch(&mut self, index: usize) -> AsynResult<()> {
-        let updates = self.ops.fetch(index).map_err(rest_err)?;
+        let updates = self.ops.fetch(index).map_err(|e| self.rest_failure(e))?;
         self.apply(updates)
     }
 
@@ -328,6 +340,19 @@ impl EigerDriver {
             0,
             env!("CARGO_PKG_VERSION"),
         )
+    }
+
+    /// A failed REST exchange: its text goes to the port's error trace, as
+    /// eigerParam's `ERR_ARGS` lines do, and the record gets the status
+    /// alone, since eigerDetector never writes `pasynUser->errorMessage`.
+    fn rest_failure(&self, e: RestError) -> AsynError {
+        self.ad
+            .port_base
+            .trace_print(TraceMask::ERROR, format_args!("{e}"));
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        }
     }
 
     fn status_message(&mut self, msg: &str) -> AsynResult<()> {
@@ -352,7 +377,10 @@ impl EigerDriver {
         }
 
         if self.api == ApiVersion::V1_6_0 {
-            self.ops.rest.status_update().map_err(rest_err)?;
+            self.ops
+                .rest
+                .status_update()
+                .map_err(|e| self.rest_failure(e))?;
         }
 
         let mut indices = vec![
@@ -559,10 +587,6 @@ impl EigerDriver {
             self.ad.write_octet(user, data).map(drop)
         }
     }
-}
-
-fn rest_err(e: RestError) -> AsynError {
-    asyn_err(e.to_string())
 }
 
 /// An asyn error carrying a driver-level message.
