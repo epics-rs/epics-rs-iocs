@@ -653,7 +653,7 @@ impl PortDriver for EigerDriver {
                 TraceMask::ERROR,
                 format_args!(
                     "eigerDetector::writeInt32: error status={} function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             );
             return Err(e);
@@ -678,7 +678,7 @@ impl PortDriver for EigerDriver {
                 line!(),
                 format_args!(
                     "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => {
@@ -708,7 +708,7 @@ impl PortDriver for EigerDriver {
                 line!(),
                 format_args!(
                     "eigerDetector:writeOctet: status={}, function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => {
