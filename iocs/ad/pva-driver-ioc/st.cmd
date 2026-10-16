@@ -34,17 +34,20 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 
 dbLoadRecords("$(PVADRIVERIOC)/db/pva.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
-# Load the NDStdArrays image-output plugin and the rest of the standard
-# plugin chain via the framework's commonPlugins.cmd. Unlike upstream's own
-# st.cmd, this does NOT also call NDStdArraysConfigure("Image1",...) itself
-# first: this framework's commonPlugins.cmd already creates the Image1/
-# IMAGE1 NDStdArrays plugin (record prefix "image1:"), and duplicating it
-# here would collide on that same record prefix. TYPE/FTVL/NELEMENTS below
-# select the upstream st.cmd's active (64-bit float) NDStdArrays.template line.
-epicsEnvSet("TYPE",      "Float64")
-epicsEnvSet("FTVL",      "DOUBLE")
-epicsEnvSet("NELEMENTS", "12000000")
+# Create a standard arrays plugin, set it to get data from the pvaDriver.
+NDStdArraysConfigure("Image1", 3, 0, "$(PORT)", 0)
 
+# This creates a waveform large enough for 2000x2000x3 (e.g. RGB color) arrays.
+# This waveform only allows transporting 8-bit images
+#dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int8,FTVL=UCHAR,NELEMENTS=12000000")
+# This waveform only allows transporting 16-bit images
+#dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=12000000")
+# This waveform allows transporting 32-bit images
+#dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int32,FTVL=LONG,NELEMENTS=12000000")
+# This waveform allows transporting 64-bit float images
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Float64,FTVL=DOUBLE,NELEMENTS=12000000")
+
+# Load all other plugins using commonPlugins.cmd
 < $(ADCORE)/ioc/commonPlugins.cmd
 
 # Upstream also calls asynSetTraceMask/asynSetTraceInfoMask here. Omitted:
