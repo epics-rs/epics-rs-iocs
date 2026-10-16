@@ -4,8 +4,8 @@
 //! model-1-style `asynMotorController`/`asynMotorAxis` pair, configured with a
 //! separate controller + per-axis create command). Communication is over a
 //! `drvAsynSerialPort` (FTDI USB serial); commands and replies are `\n`
-//! terminated (the startup script sets the input EOS; the driver owns output
-//! framing).
+//! terminated by the port EOS, which the startup script sets both ways as C's
+//! `smaractscu.iocsh` does.
 //!
 //! ## Protocol
 //!
@@ -58,9 +58,6 @@ use motor_common::util::{atof, atoi};
 
 /// Response buffer size.
 const READ_BUF: usize = 64;
-
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\n";
 
 /// Hold-target-forever time (ms) — used in closed-loop mode.
 const HOLD_FOREVER: u32 = 60000;
@@ -194,16 +191,9 @@ impl ScuController {
         Self { handle }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and read back its reply (every SCU command replies).
     fn transact(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
