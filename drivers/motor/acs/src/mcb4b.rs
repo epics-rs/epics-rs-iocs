@@ -17,7 +17,7 @@
 //! asynOctetSetOutputEos("$(PORT)", -1, "\r")
 //! ```
 //!
-//! So this port sends **bare** command bytes via [`SyncIOHandle::write_octet`]
+//! So this port sends **bare** command bytes via [`SyncIOHandle::write_read`]
 //! and lets the asyn-rs `EosInterpose` layer append the configured `\r`; the
 //! startup script must set both EOS. The driver must NOT append `\r` itself —
 //! that would double it on the wire. (Contrast `motor-mclennan`, where the C
@@ -89,8 +89,8 @@ impl Mcb4bController {
     /// queries and set commands (whose reply is discarded) to keep the stream
     /// synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C writeReadController: pasynOctetSyncIO->writeRead.
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
     }
