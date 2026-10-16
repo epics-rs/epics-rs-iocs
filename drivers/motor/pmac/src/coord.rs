@@ -349,7 +349,6 @@ impl AsynMotor for PmacCsAxis {
             direction,
             slip_stall: flags.following_error,
             problem: flags.problem,
-            has_encoder: true,
             ..MotorStatus::default()
         })
     }
