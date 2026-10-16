@@ -54,13 +54,10 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi, atol};
 
+use crate::exchange::Exchange;
+
 /// Reply read buffer size (C `BUFFER_SIZE`).
 const READ_BUF: usize = 128;
-
-fn trim_line(raw: &[u8]) -> String {
-    let s = String::from_utf8_lossy(raw);
-    s.trim_end_matches(['\r', '\n', '\0']).to_string()
-}
 
 /// Port EOS set at connect (C `ASCII_EOS_STR`, drvEnsembleAsyn.cc:935-936).
 pub const INPUT_EOS: &[u8] = b"\n";
@@ -71,6 +68,7 @@ const PRECISION: usize = 6;
 
 /// Reply status characters (C `ASCII_*_CHAR`).
 const ACK: u8 = b'%';
+const FAULT: u8 = b'#';
 
 /// Axis status word bits (C `Axis_Status.Bits`, little-endian layout).
 const AXIS_ENABLED: u32 = 1 << 0;
@@ -118,28 +116,31 @@ fn fmt(v: f64) -> String {
 /// axes behind a mutex so command/reply pairs stay atomic (C
 /// `sendReceiveMutex`).
 pub struct EnsembleController {
-    handle: SyncIOHandle,
+    io: Exchange,
 }
 
 impl EnsembleController {
-    /// Wrap a connected octet handle.
-    pub fn new(handle: SyncIOHandle) -> Self {
-        Self { handle }
+    /// Wrap a connected octet handle; `serial_port` and `motor_port` are
+    /// the asyn users C prints the exchange errors on.
+    pub fn new(handle: SyncIOHandle, serial_port: &str, motor_port: &str) -> Self {
+        Self {
+            io: Exchange::new(
+                handle,
+                "drvEnsembleAsyn",
+                READ_BUF,
+                Some(FAULT),
+                serial_port,
+                motor_port,
+            ),
+        }
     }
 
     fn read_line(&self) -> AsynResult<String> {
-        Ok(trim_line(&self.handle.read_octet(0, READ_BUF)?))
+        self.io.read_line()
     }
 
-    /// Write a command and read one reply line.
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        // C sendAndReceive: pasynOctetSyncIO->writeRead; plain reads follow
-        // only for the value line after a bare ACK.
-        Ok(trim_line(&self.handle.write_read(
-            0,
-            cmd.as_bytes(),
-            READ_BUF,
-        )?))
+        self.io.write_read(cmd)
     }
 
     /// Send a command that returns only an ACK. Errors on NAK/fault/timeout/empty.

@@ -63,7 +63,11 @@ pub fn ensemble_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 ensemble::OUTPUT_EOS,
                 EosRefusal::Ignored,
             )?;
-            let controller = Arc::new(Mutex::new(EnsembleController::new(handle)));
+            let controller = Arc::new(Mutex::new(EnsembleController::new(
+                handle,
+                &asyn_port,
+                &card.to_string(),
+            )));
             {
                 let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
                 ctrl.ping()

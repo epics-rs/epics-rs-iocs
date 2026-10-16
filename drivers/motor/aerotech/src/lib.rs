@@ -5,6 +5,7 @@
 
 pub mod a3200;
 pub mod ensemble;
+mod exchange;
 pub mod ioc;
 
 pub use a3200::{A3200_MAX_AXES, A3200Axis, A3200Controller};
