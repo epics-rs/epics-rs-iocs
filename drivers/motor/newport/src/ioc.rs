@@ -22,12 +22,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
@@ -1024,75 +1024,82 @@ impl NewportHolder {
                     "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} pulses={num_pulses} over elements {start_pulses}..{end_pulses} (running on background thread)",
                     plan.group, plan.file_name
                 );
-                thread::spawn(move || {
-                    for (positioner, target) in &plan.start_moves {
-                        let moved = match plan.move_mode {
-                            MoveMode::Absolute => {
-                                exec_sock.group_move_absolute(positioner, *target)
+                // C's XPSProfile thread (XPSController.cpp:206-209).
+                spawn_dedicated_thread(
+                    "XPSProfile".into(),
+                    ThreadPriority::Low,
+                    StackSizeClass::Medium,
+                    move || {
+                        for (positioner, target) in &plan.start_moves {
+                            let moved = match plan.move_mode {
+                                MoveMode::Absolute => {
+                                    exec_sock.group_move_absolute(positioner, *target)
+                                }
+                                MoveMode::Relative => {
+                                    exec_sock.group_move_relative(positioner, *target)
+                                }
+                            };
+                            if let Err(e) = moved {
+                                eprintln!(
+                                    "XPSExecuteProfile: move to start for {positioner} failed: {e}"
+                                );
+                                return;
                             }
-                            MoveMode::Relative => {
-                                exec_sock.group_move_relative(positioner, *target)
+                        }
+
+                        // Configure gathering + the per-pulse sampling event
+                        // (C executeProfile order: reset, configure, pulse window,
+                        // trigger, action, start).
+                        let event_id = match Self::xps_start_gathering(
+                            &exec_sock,
+                            &plan,
+                            pulse_start,
+                            pulse_end,
+                            pulse_period,
+                        ) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("XPSExecuteProfile: {e}");
+                                return;
                             }
                         };
-                        if let Err(e) = moved {
-                            eprintln!(
-                                "XPSExecuteProfile: move to start for {positioner} failed: {e}"
-                            );
-                            return;
+
+                        let run = exec_sock.multiple_axes_pvt_execution(
+                            &plan.group,
+                            &plan.file_name,
+                            executions,
+                        );
+
+                        // Tear down the event and stop gathering even on a failed
+                        // or aborted run (C removes the event and stops gathering
+                        // unconditionally after MultipleAxesPVTExecution).
+                        if let Err(e) = exec_sock.event_extended_remove(event_id) {
+                            eprintln!("XPSExecuteProfile: EventExtendedRemove failed: {e}");
                         }
-                    }
-
-                    // Configure gathering + the per-pulse sampling event
-                    // (C executeProfile order: reset, configure, pulse window,
-                    // trigger, action, start).
-                    let event_id = match Self::xps_start_gathering(
-                        &exec_sock,
-                        &plan,
-                        pulse_start,
-                        pulse_end,
-                        pulse_period,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            eprintln!("XPSExecuteProfile: {e}");
-                            return;
+                        match exec_sock.gathering_stop() {
+                            // -30: gathering never started (aborted before one
+                            // element completed); C tolerates it.
+                            Ok(()) | Err(XpsError::Api(-30)) => {}
+                            Err(e) => eprintln!("XPSExecuteProfile: GatheringStop failed: {e}"),
                         }
-                    };
 
-                    let run = exec_sock.multiple_axes_pvt_execution(
-                        &plan.group,
-                        &plan.file_name,
-                        executions,
-                    );
-
-                    // Tear down the event and stop gathering even on a failed
-                    // or aborted run (C removes the event and stops gathering
-                    // unconditionally after MultipleAxesPVTExecution).
-                    if let Err(e) = exec_sock.event_extended_remove(event_id) {
-                        eprintln!("XPSExecuteProfile: EventExtendedRemove failed: {e}");
-                    }
-                    match exec_sock.gathering_stop() {
-                        // -30: gathering never started (aborted before one
-                        // element completed); C tolerates it.
-                        Ok(()) | Err(XpsError::Api(-30)) => {}
-                        Err(e) => eprintln!("XPSExecuteProfile: GatheringStop failed: {e}"),
-                    }
-
-                    match run {
-                        Ok(()) => println!(
-                            "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
-                            plan.file_name
-                        ),
-                        // -27: the trajectory was aborted (C reports it as such).
-                        Err(XpsError::Api(-27)) => {
-                            eprintln!("XPSExecuteProfile: MultipleAxesPVTExecution aborted")
+                        match run {
+                            Ok(()) => println!(
+                                "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
+                                plan.file_name
+                            ),
+                            // -27: the trajectory was aborted (C reports it as such).
+                            Err(XpsError::Api(-27)) => {
+                                eprintln!("XPSExecuteProfile: MultipleAxesPVTExecution aborted")
+                            }
+                            Err(e) => eprintln!(
+                                "XPSExecuteProfile: execution of '{}' failed: {e}",
+                                plan.file_name
+                            ),
                         }
-                        Err(e) => eprintln!(
-                            "XPSExecuteProfile: execution of '{}' failed: {e}",
-                            plan.file_name
-                        ),
-                    }
-                });
+                    },
+                )
+                .map_err(|e| format!("XPSExecuteProfile: cannot create XPSProfile thread: {e}"))?;
                 Ok(CommandOutcome::Continue)
             },
         )
