@@ -18,12 +18,9 @@
 //!
 //! ## Units
 //!
-//! As in the Ensemble port, the C `stepSize = 1 / CountsPerUnit` scaling cancels
-//! at the asyn-rs [`AsynMotor`] (dial-frame EGU) boundary and is dropped: the
-//! driver works in the controller's user units, and the record's `MRES` must be
-//! `stepSize` (raw counts are integers). Command values
-//! are formatted at a fixed `PRECISION` (the C derived a per-axis digit count
-//! from `stepSize`, which this port does not carry).
+//! As C, `stepSize = 1 / CountsPerUnit` scales every outgoing record step
+//! value into the A3200's user units and divides every readback, and values
+//! are formatted to `maxDigits` places derived from it.
 //!
 //! ## Fault handling (owner model)
 //!
@@ -74,9 +71,6 @@ const READ_BUF: usize = 256;
 pub const INPUT_EOS: &[u8] = b"\n";
 pub const OUTPUT_EOS: &[u8] = b"\n";
 
-/// Decimal places used when formatting outgoing numeric values.
-const PRECISION: usize = 6;
-
 /// Reply status characters (C `ASCII_ACK_CHAR` / `ASCII_FAULT_CHAR`).
 const ACK: u8 = b'%';
 const FAULT: u8 = b'#';
@@ -113,9 +107,19 @@ fn a3200_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Format a numeric command value at the fixed precision.
-fn fmt(v: f64) -> String {
-    format!("{v:.PRECISION$}")
+/// C `%.*f` with the axis `maxDigits`.
+fn fmt(v: f64, digits: usize) -> String {
+    format!("{v:.digits$}")
+}
+
+/// C's `stepSize` from a `CountsPerUnit` reply, 1 when it was refused.
+fn step_size(counts_per_unit: AsynResult<String>) -> f64 {
+    counts_per_unit.map_or(1.0, |s| 1.0 / atof(&s))
+}
+
+/// C `maxDigits`: two places past the step's, at least one.
+fn max_digits(step_size: f64) -> usize {
+    ((-step_size.abs().log10()) as i32 + 2).max(1) as usize
 }
 
 /// An A3200 controller endpoint owning the asyn octet handle plus the motion
@@ -239,6 +243,10 @@ pub struct A3200Axis {
     reverse_direc: bool,
     /// `EndOfTravelLimitSetup` word (limit-switch active levels).
     swconfig: u32,
+    /// C `fabs(stepSize)`: user units per record step.
+    step: f64,
+    /// C `maxDigits`.
+    digits: usize,
     /// Latched fault code awaiting acknowledgement (owner: move sets, poll
     /// refreshes, enable clears).
     last_fault: i32,
@@ -254,12 +262,13 @@ impl A3200Axis {
     /// Construct the named axis and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
     pub fn new(controller: Arc<Mutex<A3200Controller>>, axis_name: String) -> AsynResult<Self> {
-        let (has_encoder, home_direction, reverse_direc, swconfig) = {
+        let (has_encoder, step_size, home_direction, reverse_direc, swconfig) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
                 .get_param("PositionFeedbackType", &axis_name)
                 .map(|s| atoi(&s) > 0)
                 .unwrap_or(false);
+            let step_size = step_size(ctrl.get_param("CountsPerUnit", &axis_name));
             let home_direction = ctrl
                 .get_param("HomeSetup", &axis_name)
                 .map(|s| atol(&s) as u32 & 0x1)
@@ -273,7 +282,13 @@ impl A3200Axis {
                 .map(|s| atoi(&s) != 0)
                 .unwrap_or(false);
             ctrl.command(&format!("RAMP MODE RATE {axis_name}"))?;
-            (has_encoder, home_direction, reverse_direc, swconfig)
+            (
+                has_encoder,
+                step_size,
+                home_direction,
+                reverse_direc,
+                swconfig,
+            )
         };
 
         Ok(Self {
@@ -283,6 +298,8 @@ impl A3200Axis {
             home_direction,
             reverse_direc,
             swconfig,
+            step: step_size.abs(),
+            digits: max_digits(step_size),
             last_fault: 0,
             problem: false,
             current_cmd_pos: 0.0,
@@ -292,6 +309,11 @@ impl A3200Axis {
 
     fn lock(&self) -> MutexGuard<'_, A3200Controller> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A record step value in user units, formatted as C's `%.*f`.
+    fn units(&self, v: f64) -> String {
+        fmt(v * self.step, self.digits)
     }
 
     /// Issue the move command sequence. Returns `Ok(None)` on ACK, `Ok(Some(code))`
@@ -319,16 +341,24 @@ impl A3200Axis {
         }
         if accel > 0.0 {
             let cmd = if linear {
-                format!("RAMP RATE {}", fmt(accel))
+                format!("RAMP RATE {}", self.units(accel))
             } else {
-                format!("RAMP RATE {name} {}", fmt(accel))
+                format!("RAMP RATE {name} {}", self.units(accel))
             };
             ctrl.command(&cmd)?;
         }
         let cmd = if linear {
-            format!("LINEAR {name} {} F{}", fmt(position), fmt(max_v))
+            format!(
+                "LINEAR {name} {} F{}",
+                self.units(position),
+                self.units(max_v)
+            )
         } else {
-            format!("{mode} {name} {} {}", fmt(position), fmt(max_v))
+            format!(
+                "{mode} {name} {} {}",
+                self.units(position),
+                self.units(max_v)
+            )
         };
         let reply = ctrl.write_read(&cmd)?;
         match reply.as_bytes().first() {
@@ -407,9 +437,12 @@ impl AsynMotor for A3200Axis {
         self.last_direction = velocity > 0.0;
         let name = self.axis_name.clone();
         let ctrl = self.lock();
-        ctrl.command(&format!("AbortDecelRate.{name} = {}", fmt(acceleration)))?;
-        ctrl.command(&format!("RAMP RATE {name} {}", fmt(acceleration)))?;
-        ctrl.command(&format!("FREERUN {name} {}", fmt(velocity)))?;
+        ctrl.command(&format!(
+            "AbortDecelRate.{name} = {}",
+            self.units(acceleration)
+        ))?;
+        ctrl.command(&format!("RAMP RATE {name} {}", self.units(acceleration)))?;
+        ctrl.command(&format!("FREERUN {name} {}", self.units(velocity)))?;
         Ok(())
     }
 
@@ -435,10 +468,13 @@ impl AsynMotor for A3200Axis {
         let name = self.axis_name.clone();
         let ctrl = self.lock();
         if velocity > 0.0 {
-            ctrl.command(&format!("HomeSpeed.{name} = {}", fmt(velocity)))?;
+            ctrl.command(&format!("HomeSpeed.{name} = {}", self.units(velocity)))?;
         }
         if acceleration > 0.0 {
-            ctrl.command(&format!("HomeRampRate.{name} = {}", fmt(acceleration)))?;
+            ctrl.command(&format!(
+                "HomeRampRate.{name} = {}",
+                self.units(acceleration)
+            ))?;
         }
         ctrl.command(&format!("HomeSetup.{name} = {hparam}"))?;
         ctrl.command(&format!("HOME {name}"))?;
@@ -458,7 +494,7 @@ impl AsynMotor for A3200Axis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let name = self.axis_name.clone();
         self.lock()
-            .command(&format!("POSOFFSET SET {name} {}", fmt(position)))
+            .command(&format!("POSOFFSET SET {name} {}", self.units(position)))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, closed_loop: bool) -> AsynResult<()> {
@@ -523,7 +559,7 @@ impl AsynMotor for A3200Axis {
         let cmd_pos = it.next().map(atof).unwrap_or(0.0);
         let act_vel = it.next().map(atof).unwrap_or(0.0);
 
-        self.current_cmd_pos = cmd_pos;
+        self.current_cmd_pos = cmd_pos / self.step;
         // Latch the newest non-zero fault; never clear it here (owner: enable).
         if axis_fault != 0 && axis_fault != self.last_fault {
             self.last_fault = axis_fault;
@@ -549,9 +585,9 @@ impl AsynMotor for A3200Axis {
         };
 
         Ok(MotorStatus {
-            position: cmd_pos,
-            encoder_position: enc_pos,
-            velocity: act_vel,
+            position: cmd_pos / self.step,
+            encoder_position: enc_pos / self.step,
+            velocity: act_vel / self.step,
             done: !move_active,
             moving: move_active,
             high_limit,
@@ -574,9 +610,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fmt_uses_fixed_precision() {
-        assert_eq!(fmt(1.5), "1.500000");
-        assert_eq!(fmt(-100.0), "-100.000000");
+    fn max_digits_follows_the_step() {
+        assert_eq!(max_digits(0.0004), 5);
+        assert_eq!(fmt(1.5, 5), "1.50000");
+        assert_eq!(step_size(Err(a3200_err("refused"))), 1.0);
     }
 
     #[test]
