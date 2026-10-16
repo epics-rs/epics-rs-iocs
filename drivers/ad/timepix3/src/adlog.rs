@@ -12,6 +12,11 @@ const LOG_HTTP_WARNING: &str = "void ADTimePix::logHttpWarning(const char*, cons
 pub const REFRESH_PIXEL_CONFIG: &str = "asynStatus ADTimePix::refreshPixelConfigFromServal()";
 pub const WRITE_BPC_FILE: &str = "asynStatus ADTimePix::writeBPCfile(char**, int*)";
 pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
+pub const WRITE_INT32: &str = "virtual asynStatus ADTimePix::writeInt32(asynUser*, epicsInt32)";
+pub const WRITE_FLOAT64: &str =
+    "virtual asynStatus ADTimePix::writeFloat64(asynUser*, epicsFloat64)";
+pub const WRITE_OCTET: &str =
+    "virtual asynStatus ADTimePix::writeOctet(asynUser*, const char*, size_t, size_t*)";
 
 /// `ERR`/`ERR_ARGS`, at `ASYN_TRACE_ERROR`.
 pub fn err(func: &str, msg: &str) -> String {

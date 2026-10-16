@@ -1003,7 +1003,26 @@ impl PortDriver for TimePix3Driver {
         // the readbacks (and, for ADAcquire, the latched Acquire=1) are never
         // refreshed after a failed write and the operator sees the detector as
         // acquiring when it is not.
-        self.ad.port_base.call_param_callbacks(addr)?;
+        let _ = self.ad.port_base.call_param_callbacks(addr);
+        match &result {
+            Err(e) => self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                &adlog::err(
+                    adlog::WRITE_INT32,
+                    &format!(
+                        "ERROR status={} function={reason}, value={value}",
+                        e.status() as i32
+                    ),
+                ),
+            ),
+            Ok(()) => self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                &adlog::log(
+                    adlog::WRITE_INT32,
+                    &format!("function={reason} value={value}"),
+                ),
+            ),
+        }
         result
     }
 
@@ -1034,7 +1053,26 @@ impl PortDriver for TimePix3Driver {
             Ok(())
         };
 
-        self.ad.port_base.call_param_callbacks(addr)?;
+        let _ = self.ad.port_base.call_param_callbacks(addr);
+        match &result {
+            Err(e) => self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                &adlog::err(
+                    adlog::WRITE_FLOAT64,
+                    &format!(
+                        "ERROR status = {}, function ={reason}, value = {value:.6}",
+                        e.status() as i32
+                    ),
+                ),
+            ),
+            Ok(()) => self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                &adlog::log(
+                    adlog::WRITE_FLOAT64,
+                    &format!("function={reason} value={value:.6}"),
+                ),
+            ),
+        }
         result
     }
 
@@ -1069,6 +1107,17 @@ impl PortDriver for TimePix3Driver {
         // parameter library and discards it — the record never shows the
         // failure. The status is left to the return value here.
         self.ad.port_base.call_param_callbacks(addr)?;
+        let name = self.ad.port_base.params.param_name(reason).unwrap_or("");
+        // C prints the value as the `char *` it was handed: up to the NUL.
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let value = String::from_utf8_lossy(&data[..end]);
+        self.ad.port_base.trace_print(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                adlog::WRITE_OCTET,
+                &format!("function={reason}, paramName={name}, value={value}"),
+            ),
+        );
         Ok(data.len())
     }
 
