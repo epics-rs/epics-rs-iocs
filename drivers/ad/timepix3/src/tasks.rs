@@ -232,8 +232,6 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
     serval_ok && det_ok
 }
 
-/// The first disk in `Server.DiskSpace`, which is empty until raw file writing
-/// is configured (C getDashboard, serval_http.cpp:388).
 /// C `updateStatusFromConnection` (serval_http.cpp:148-164).
 fn connection_status(
     ctx: &Arc<Ctx>,
@@ -285,6 +283,8 @@ fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetV
     }
 }
 
+/// The first disk in `Server.DiskSpace`, which is empty until raw file writing
+/// is configured (C getDashboard, serval_http.cpp:388).
 fn disk_space(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let p = ctx.p;
     let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") else {
