@@ -1,13 +1,12 @@
-# PI C-630: one motor record per daisy-chained axis. DTYP is
-# PIC630_$(CARD)_$(AXIS) (the per-axis key registered by PIC630Config; wire
-# address is $(AXIS)+1, i.e. 1-9). Load this template once per axis with a
-# distinct AXIS/M.
+# PI C-630: one motor record per daisy-chained axis, DTYP "PI C630" with OUT
+# #C$(C) S$(S); the wire address is $(S)+1, i.e. 1-9.
 #
 # The C-630 works in raw controller counts (MA/MR/TP are integer counts, no
 # separate EGU scaling in the driver), so MRES = 1 and EGU = counts.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PIC630_$(CARD)_$(AXIS)")
+    field(DTYP, "PI C630")
+    field(OUT,  "#C$(C) S$(S=0) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000.0)")
     field(ACCL, "$(ACCL=0.2)")

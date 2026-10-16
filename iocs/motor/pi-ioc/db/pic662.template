@@ -1,6 +1,5 @@
-# PI E-662: one motor record for the controller's single axis. DTYP is
-# PIC662_$(CARD)_0 (the fixed axis-0 key registered by PIC662Config — the
-# E-662 is a single-axis piezo controller).
+# PI E-662: one motor record for the controller's single axis, DTYP "PIC662"
+# with OUT #C$(C) S0.
 #
 # The record works in raw counts (the driver scales to/from micrometres by the
 # fixed drive resolution 0.001 at the wire), so MRES = 1 and EGU = counts. The
@@ -8,7 +7,8 @@
 # relative moves reach the controller.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PIC662_$(CARD)_0")
+    field(DTYP, "PIC662")
+    field(OUT,  "#C$(C) S$(S=0) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000.0)")
     field(ACCL, "$(ACCL=0.2)")
