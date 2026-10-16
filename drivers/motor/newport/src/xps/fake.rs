@@ -1,0 +1,98 @@
+//! A scripted XPS for unit tests: every call succeeds with a canned reply,
+//! the call named in `fail` returns -3, and every command is logged.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::registry::claim_port;
+use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
+
+use super::rpc::{SocketMode, XpsSocket};
+
+pub type Fail = Arc<Mutex<&'static str>>;
+pub type Log = Arc<Mutex<Vec<String>>>;
+
+struct FakeXps {
+    base: PortDriverBase,
+    reply: Option<String>,
+    fail: Fail,
+    log: Log,
+}
+
+impl PortDriver for FakeXps {
+    fn base(&self) -> &PortDriverBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.base
+    }
+    fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        let cmd = String::from_utf8_lossy(data);
+        let name = cmd.split('(').next().unwrap_or("").trim();
+        self.log.lock().unwrap().push(cmd.trim().to_string());
+        let values = match name {
+            _ if name == *self.fail.lock().unwrap() => "-3",
+            "GroupStatusGet" => "0,12",
+            "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
+            "GroupPositionCurrentGet" => "0,1.5",
+            "GroupPositionSetpointGet" => "0,1.25",
+            "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
+            _ => "0,0",
+        };
+        self.reply = Some(format!("{values},EndOfAPI"));
+        Ok(data.len())
+    }
+    fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        let reply = self.reply.take().ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: "no reply".into(),
+        })?;
+        buf[..reply.len()].copy_from_slice(reply.as_bytes());
+        Ok(reply.len())
+    }
+}
+
+/// One fake XPS on asyn port `port`.
+pub struct FakeLine {
+    port: String,
+    rt: PortRuntimeHandle,
+    pub fail: Fail,
+    pub log: Log,
+}
+
+impl FakeLine {
+    pub fn new(port: &str, fail: &'static str) -> Self {
+        let fail = Arc::new(Mutex::new(fail));
+        let log = Log::default();
+        let line = FakeXps {
+            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            reply: None,
+            fail: fail.clone(),
+            log: log.clone(),
+        };
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
+                .unwrap();
+        Self {
+            port: port.into(),
+            rt,
+            fail,
+            log,
+        }
+    }
+
+    pub fn socket(&self, mode: SocketMode) -> XpsSocket {
+        let io =
+            SyncIOHandle::from_handle(self.rt.port_handle().clone(), 0, Duration::from_secs(1));
+        XpsSocket::new(io, &self.port, mode)
+    }
+
+    /// The commands sent since the last call.
+    pub fn take_log(&self) -> Vec<String> {
+        self.log.lock().unwrap().drain(..).collect()
+    }
+}

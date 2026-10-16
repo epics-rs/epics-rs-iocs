@@ -12,6 +12,8 @@ pub mod axis;
 pub mod commands;
 pub mod controller;
 pub mod corrector;
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod ftp;
 pub mod gathering;
 pub mod pco;

@@ -1015,7 +1015,8 @@ impl NewportHolder {
     /// Moves the group to the trajectory start, configures gathering (each
     /// trajectory pulse samples every registered positioner's
     /// `SetpointPosition`+`CurrentPosition` via a `GatheringOneData` event),
-    /// then runs the built PVT profile with `MultipleAxesPVTExecution`. The
+    /// then runs the built PVT profile with `MultipleAxesPVTExecution` and
+    /// moves each axis to the profile's end (C `runProfile` flyback). The
     /// moves and the execution block until the motion finishes, so everything
     /// runs on a background thread over a dedicated socket (`execPort`, a
     /// `drvAsynIPPort` to the XPS) — the shared poll socket keeps polling
@@ -1069,20 +1070,6 @@ impl NewportHolder {
                 let start_pulses = opt_int(args, 3, 1, "startPulses")?;
                 let end_pulses = opt_int(args, 4, num_elements, "endPulses")?;
                 let num_pulses = opt_int(args, 5, num_elements, "numPulses")?;
-                let window = profile::pulse_output_window(
-                    &plan.times,
-                    start_pulses as i32,
-                    end_pulses as i32,
-                    num_pulses as i32,
-                );
-                let (pulse_start, pulse_end, pulse_period) = match window {
-                    Ok(w) => w,
-                    Err(e) => {
-                        xps_profile_failed(&motor_port, "runProfile", &e.to_string());
-                        return Ok(CommandOutcome::Continue);
-                    }
-                };
-
                 // A dedicated blocking socket so the seconds-to-minutes-long
                 // execution never contends with the shared poll socket.
                 let handle = connect_ip(&exec_port, XPS_PVT_EXEC_TIMEOUT)?;
@@ -1102,9 +1089,7 @@ impl NewportHolder {
                             &exec_sock,
                             &plan,
                             executions,
-                            pulse_start,
-                            pulse_end,
-                            pulse_period,
+                            (start_pulses as i32, end_pulses as i32, num_pulses as i32),
                         ) {
                             None => println!(
                                 "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
@@ -1121,31 +1106,45 @@ impl NewportHolder {
     }
 
     /// Run a built trajectory: move to the start, configure gathering, execute,
-    /// then remove the event and stop gathering (C `runProfile`,
-    /// XPSController.cpp:862-1145). Returns C's message for the last failed
-    /// step, which C prints once at the end.
+    /// remove the event, stop gathering and fly back to the end (C
+    /// `runProfile`, XPSController.cpp:862-1145). `pulses` is
+    /// `(startPulses, endPulses, numPulses)`. Returns C's message for the last
+    /// failed step, which C prints once at the end.
     fn xps_run_profile(
         sock: &XpsSocket,
         plan: &ExecutionPlan,
         executions: i32,
-        pulse_start: i32,
-        pulse_end: i32,
-        pulse_period: f64,
+        pulses: (i32, i32, i32),
     ) -> Option<String> {
-        for (positioner, target) in &plan.start_moves {
-            let moved = match plan.move_mode {
+        // C ignores both moves' status.
+        Self::xps_profile_moves(sock, plan.move_mode, &plan.start_moves);
+        let message = Self::xps_execute_gathered(sock, plan, executions, pulses);
+        Self::xps_profile_moves(sock, plan.move_mode, &plan.end_moves);
+        message
+    }
+
+    /// Move each axis in turn; a move on the blocking socket returns when the
+    /// motion is done, as C's `waitMotors` waits after it.
+    fn xps_profile_moves(sock: &XpsSocket, mode: MoveMode, moves: &[(String, f64)]) {
+        for (positioner, target) in moves {
+            let _ = match mode {
                 MoveMode::Absolute => sock.group_move_absolute(positioner, *target),
                 MoveMode::Relative => sock.group_move_relative(positioner, *target),
             };
-            if let Err(e) = moved {
-                return Some(format!("move to start for {positioner} failed: {e}"));
-            }
         }
-        let event_id =
-            match Self::xps_start_gathering(sock, plan, pulse_start, pulse_end, pulse_period) {
-                Ok(id) => id,
-                Err(message) => return Some(message),
-            };
+    }
+
+    /// The part of C `runProfile` between the start move and `done:`.
+    fn xps_execute_gathered(
+        sock: &XpsSocket,
+        plan: &ExecutionPlan,
+        executions: i32,
+        pulses: (i32, i32, i32),
+    ) -> Option<String> {
+        let event_id = match Self::xps_start_gathering(sock, plan, pulses) {
+            Ok(id) => id,
+            Err(message) => return Some(message),
+        };
 
         let mut message =
             match sock.multiple_axes_pvt_execution(&plan.group, &plan.file_name, executions) {
@@ -1186,9 +1185,7 @@ impl NewportHolder {
     fn xps_start_gathering(
         sock: &XpsSocket,
         plan: &ExecutionPlan,
-        pulse_start: i32,
-        pulse_end: i32,
-        pulse_period: f64,
+        (start_pulses, end_pulses, num_pulses): (i32, i32, i32),
     ) -> Result<i32, String> {
         sock.gathering_reset()
             .map_err(|e| format!("Error performing GatheringReset, status={}", e.code()))?;
@@ -1209,8 +1206,15 @@ impl NewportHolder {
                 e.code()
             )
         })?;
-        sock.multiple_axes_pvt_pulse_output_set(&plan.group, pulse_start, pulse_end, pulse_period)
-            .map_err(|e| format!("MultipleAxesPVTPulseOutputSet failed: {e}"))?;
+        let (pulse_start, pulse_end, pulse_period) =
+            profile::pulse_output_window(&plan.times, start_pulses, end_pulses, num_pulses)?;
+        // C ignores its status.
+        let _ = sock.multiple_axes_pvt_pulse_output_set(
+            &plan.group,
+            pulse_start,
+            pulse_end,
+            pulse_period,
+        );
         let triggers = vec![
             "Always".to_string(),
             format!("{}.PVT.TrajectoryPulse", plan.group),
@@ -2084,4 +2088,67 @@ fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
         TraceMask::ERROR,
         format_args!("XPSController:{function}: {message}"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xps::fake::FakeLine;
+
+    fn plan() -> ExecutionPlan {
+        ExecutionPlan {
+            file_name: "traj.trj".into(),
+            group: "G1".into(),
+            start_moves: vec![("G1.P1".into(), -0.25)],
+            end_moves: vec![("G1.P1".into(), 3.0)],
+            move_mode: MoveMode::Absolute,
+            times: vec![0.5, 0.5, 1.0],
+            gathering_positioners: vec!["G1.P1".into()],
+        }
+    }
+
+    fn run(line: &FakeLine, fail: &'static str) -> (Option<String>, Vec<String>) {
+        *line.fail.lock().unwrap() = fail;
+        let message =
+            NewportHolder::xps_run_profile(&line.socket(SocketMode::Query), &plan(), 1, (1, 2, 2));
+        (message, line.take_log())
+    }
+
+    /// C `runProfile` (XPSController.cpp:905-1135): the start move, the pulse
+    /// output and the flyback are unchecked, a failed gathering step skips
+    /// to `done:` and the flyback, and the last failed step's message wins.
+    #[test]
+    fn run_profile_flies_back_and_keeps_the_last_message() {
+        let line = FakeLine::new("xps_run_profile", "");
+        let (message, log) = run(&line, "");
+        assert_eq!(message, None);
+        assert_eq!(log.first().unwrap(), "GroupMoveAbsolute (G1.P1,-0.25)");
+        assert_eq!(log.last().unwrap(), "GroupMoveAbsolute (G1.P1,3)");
+
+        for ignored in ["GroupMoveAbsolute", "MultipleAxesPVTPulseOutputSet"] {
+            let (message, log) = run(&line, ignored);
+            assert_eq!(message, None, "{ignored}");
+            assert!(
+                log.iter()
+                    .any(|c| c.starts_with("MultipleAxesPVTExecution "))
+            );
+        }
+
+        let (message, log) = run(&line, "GatheringReset");
+        assert_eq!(
+            message.as_deref(),
+            Some("Error performing GatheringReset, status=-3")
+        );
+        assert!(
+            !log.iter()
+                .any(|c| c.starts_with("MultipleAxesPVTExecution "))
+        );
+        assert_eq!(log.last().unwrap(), "GroupMoveAbsolute (G1.P1,3)");
+
+        let (message, _) = run(&line, "EventExtendedRemove");
+        assert_eq!(
+            message.as_deref(),
+            Some("Error performing ExtendedEventRemove, status=-3")
+        );
+    }
 }

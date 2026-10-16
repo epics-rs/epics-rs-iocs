@@ -32,6 +32,9 @@ struct BuiltTrajectory {
     /// `(positioner, target)`, already resolved to absolute or relative units
     /// per the profile's move mode.
     start_moves: Vec<(String, f64)>,
+    /// Per-axis flyback after the run, resolved the same way: the last point
+    /// (absolute) or back one post-ramp distance (relative).
+    end_moves: Vec<(String, f64)>,
     move_mode: MoveMode,
 }
 
@@ -42,6 +45,7 @@ pub struct ExecutionPlan {
     pub file_name: String,
     pub group: String,
     pub start_moves: Vec<(String, f64)>,
+    pub end_moves: Vec<(String, f64)>,
     pub move_mode: MoveMode,
     /// The profile's per-point times, for the pulse-output window
     /// (C `profileTimes_`).
@@ -329,7 +333,9 @@ impl XpsController {
             .profile
             .as_ref()
             .ok_or("no profile defined (call XPSDefineProfileFromFile first)")?;
-        if built.pre_distance.len() != profile.axes.len() {
+        if built.pre_distance.len() != profile.axes.len()
+            || built.post_distance.len() != profile.axes.len()
+        {
             return Err("built trajectory does not match the defined profile".into());
         }
         let group = profile.group.clone();
@@ -340,6 +346,7 @@ impl XpsController {
             .map_err(|e| verify_message(e.code()))?;
 
         let mut start_moves = Vec::with_capacity(profile.axes.len());
+        let mut end_moves = Vec::with_capacity(profile.axes.len());
         for (j, ax) in profile.axes.iter().enumerate() {
             let (min_pos, max_pos, _max_vel, _max_accel) = self
                 .poll
@@ -378,12 +385,18 @@ impl XpsController {
                 MoveMode::Relative => -built.pre_distance[j],
             };
             start_moves.push((ax.positioner.clone(), target));
+            let end = match move_mode {
+                MoveMode::Absolute => ax.positions[ax.positions.len() - 1],
+                MoveMode::Relative => -built.post_distance[j],
+            };
+            end_moves.push((ax.positioner.clone(), end));
         }
 
         self.built_trajectory = Some(BuiltTrajectory {
             file_name: file_name.to_string(),
             group,
             start_moves,
+            end_moves,
             move_mode,
         });
         Ok(())
@@ -400,6 +413,7 @@ impl XpsController {
             file_name: built.file_name.clone(),
             group: built.group.clone(),
             start_moves: built.start_moves.clone(),
+            end_moves: built.end_moves.clone(),
             move_mode: built.move_mode,
             times: profile.times.clone(),
             gathering_positioners: self.registered_positioners(),

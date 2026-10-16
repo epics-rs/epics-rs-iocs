@@ -1001,58 +1001,10 @@ fn referencing_distance(distance: f64, hardware_status: i32) -> f64 {
 mod tests {
     use super::*;
 
-    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-    use epics_rs::asyn::registry::claim_port;
-    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-    use epics_rs::asyn::sync_io::SyncIOHandle;
-
+    use crate::xps::fake::{Fail, FakeLine, Log};
     use crate::xps::rpc::SocketMode;
 
-    /// An XPS that answers every call, and `fail` with error -3.
-    struct FakeXps {
-        base: PortDriverBase,
-        reply: Option<String>,
-        fail: Arc<Mutex<&'static str>>,
-        /// Every command, in order.
-        log: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl PortDriver for FakeXps {
-        fn base(&self) -> &PortDriverBase {
-            &self.base
-        }
-        fn base_mut(&mut self) -> &mut PortDriverBase {
-            &mut self.base
-        }
-        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-            let cmd = String::from_utf8_lossy(data);
-            let name = cmd.split('(').next().unwrap_or("").trim();
-            self.log.lock().unwrap().push(cmd.trim().to_string());
-            let values = match name {
-                _ if name == *self.fail.lock().unwrap() => "-3",
-                "GroupStatusGet" => "0,12",
-                "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
-                "GroupPositionCurrentGet" => "0,1.5",
-                "GroupPositionSetpointGet" => "0,1.25",
-                "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
-                _ => "0,0",
-            };
-            self.reply = Some(format!("{values},EndOfAPI"));
-            Ok(data.len())
-        }
-        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-            let reply = self.reply.take().ok_or_else(|| AsynError::Status {
-                status: AsynStatus::Timeout,
-                message: "no reply".into(),
-            })?;
-            buf[..reply.len()].copy_from_slice(reply.as_bytes());
-            Ok(reply.len())
-        }
-    }
-
-    type Log = Arc<Mutex<Vec<String>>>;
-
-    fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Arc<Mutex<&'static str>>, Log) {
+    fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Fail, Log) {
         let (mut axes, fail, log) = fake_axes(port, fail, false, &["G1.P1"]);
         (axes.remove(0), fail, log)
     }
@@ -1063,25 +1015,11 @@ mod tests {
         fail: &'static str,
         enable_set_position: bool,
         positioners: &[&str],
-    ) -> (Vec<XpsAxis>, Arc<Mutex<&'static str>>, Log) {
-        let fail = Arc::new(Mutex::new(fail));
-        let log = Log::default();
-        let line = FakeXps {
-            base: PortDriverBase::new(port, 1, PortFlags::default()),
-            reply: None,
-            fail: fail.clone(),
-            log: log.clone(),
-        };
-        let (rt, _jh) =
-            create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
-                .unwrap();
-        let socket = |mode| {
-            let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-            XpsSocket::new(io, port, mode)
-        };
+    ) -> (Vec<XpsAxis>, Fail, Log) {
+        let line = FakeLine::new(port, fail);
         let controller = Arc::new(Mutex::new(
             XpsController::new(
-                socket(SocketMode::Query),
+                line.socket(SocketMode::Query),
                 enable_set_position,
                 Duration::ZERO,
             )
@@ -1093,7 +1031,7 @@ mod tests {
             .map(|(n, p)| {
                 XpsAxis::new(
                     controller.clone(),
-                    socket(SocketMode::Fire),
+                    line.socket(SocketMode::Fire),
                     "MOTOR_T",
                     n as i32,
                     p,
@@ -1101,7 +1039,7 @@ mod tests {
                 )
             })
             .collect();
-        (axes, fail, log)
+        (axes, line.fail.clone(), line.log.clone())
     }
 
     /// C `XPSAxis::poll` (`done:`, XPSAxis.cpp:755-758): a failed call raises
