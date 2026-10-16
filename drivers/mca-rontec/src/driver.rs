@@ -546,6 +546,18 @@ impl PortDriver for RontecDriver {
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         Ok(self.read_spectrum(buf))
     }
+
+    /// C `int32ArrayWrite` (`drvMcaRontec.c:480-498`): the device memory
+    /// cannot be written, so nothing is stored and no callback runs.
+    fn write_int32_array(&mut self, user: &AsynUser, _data: &[i32]) -> AsynResult<()> {
+        user.print(
+            TraceMask::ERROR,
+            file!(),
+            line!(),
+            format_args!("drvMcaRontec::int32ArrayWrite, write to Rontec not implemented"),
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -920,6 +932,23 @@ mod tests {
             rig.trace()
         );
         assert_eq!(rig.writes.lock().unwrap()[1], b"$SS 0,1,1,4");
+    }
+
+    #[test]
+    fn an_array_write_only_prints_not_implemented() {
+        let rig = Rig::new("arraywrite", rontec_reply);
+        rig.submit(
+            RequestOp::Int32ArrayWrite {
+                data: vec![1, 2, 3],
+            },
+            McaReason::Data,
+        )
+        .expect("C returns asynSuccess");
+        assert!(
+            rig.trace()
+                .contains("drvMcaRontec::int32ArrayWrite, write to Rontec not implemented\n")
+        );
+        assert!(rig.writes.lock().unwrap().is_empty());
     }
 
     #[test]
