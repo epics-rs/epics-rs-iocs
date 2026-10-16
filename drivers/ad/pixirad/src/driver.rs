@@ -379,6 +379,9 @@ impl PortDriver for PixiradDetector {
             }
         } else if reason == q.auto_calibrate && value != 0 {
             status = self.do_auto_calibrate();
+        } else if reason < q.system_reset {
+            // FIRST_PIXIRAD_PARAM is PixiradSystemReset (pixirad.cpp:238).
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -680,6 +683,27 @@ mod tests {
             shared,
         )
         .expect("C builds the driver whatever the box answers")
+    }
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        let mut det = detector("PIXI_BASE_WRITE", None);
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
     }
 
     #[test]
