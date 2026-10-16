@@ -24,7 +24,8 @@
 //! the same raw-steps round trip the real-axis driver does with `scale_`, and it
 //! cancels at the record boundary for the same reason (see [`crate::axis`]).
 //! This port speaks the PLC's EGU directly, so `pmacSetCoordStepsPerUnit` /
-//! `pmacSetDefaultCoordSteps` are not provided and the records take `MRES = 1`.
+//! `pmacSetDefaultCoordSteps` are not provided. The records still take
+//! `MRES = stepSize` (1e-4): raw counts are integers, so `MRES` is the step.
 //!
 //! ## Not supported by the hardware path
 //!
