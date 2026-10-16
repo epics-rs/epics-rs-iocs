@@ -20,8 +20,7 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # OEMCreateController(portName, OEMPortName, numAxes, movingPollPeriod, idlePollPeriod).
 OEMCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000)
 
-# One motor record per axis (OUT @asyn($(CTRL),axis)). The driver reports
-# positions in controller counts, so MRES = 1.
+# One motor record per axis (OUT @asyn($(CTRL),axis)) and its OEM_RESOLUTION.
 dbLoadRecords("$(PARKER_IOC)/db/oem.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
