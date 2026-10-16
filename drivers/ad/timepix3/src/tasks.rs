@@ -7,7 +7,6 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -71,7 +70,7 @@ impl Ctx {
     fn trace(&self, mask: TraceMask, line: &str) {
         self.handle
             .trace()
-            .output_device(self.handle.port_name(), Some(0), 0, mask, line);
+            .output(self.handle.port_name(), mask, line);
     }
 
     async fn set_int(&self, reason: usize, addr: i32, value: i32) {
@@ -1304,7 +1303,7 @@ async fn publish_image(
     }
     // C prints and drops a refused alloc before it counts
     // (serval_stream.cpp:177-183, :808-814).
-    let Ok(mut array) = ctx.pool.alloc_with(
+    let Ok(mut array) = ctx.pool.wrap(
         vec![NDDimension::new(width), NDDimension::new(height)],
         NDDataBuffer::U32(pixels),
     ) else {
@@ -1319,25 +1318,12 @@ async fn publish_image(
         + 1;
     ctx.set_int(ctx.ad.base.array_counter, 0, counter).await;
 
-    let mut attributes = epics_rs::ad_core::attributes::NDAttributeList::new();
-    attributes.add(epics_rs::ad_core::attributes::NDAttribute::new_static(
-        "ColorMode",
-        "Color Mode",
-        epics_rs::ad_core::attributes::NDAttrSource::Driver,
-        epics_rs::ad_core::attributes::NDAttrValue::Int32(NDColorMode::Mono as i32),
-    ));
-
     array.unique_id = frame_number;
-    // C reads the clock for timeStamp, then takes the port's moved stamp as
-    // epicsTS (serval_stream.cpp:1270-1273, updateTimeStamp).
-    array.time_stamp = EpicsTimestamp::now().as_f64();
-    array.timestamp = ctx
-        .handle
-        .update_time_stamp()
-        .await
-        .unwrap_or_else(|_| SystemTime::now())
-        .into();
-    array.attributes = attributes;
+    array.timestamp = EpicsTimestamp::now();
+    array.time_stamp = array.timestamp.as_f64();
+    // C hands the frame the getAttributes set and no ColorMode attribute
+    // (serval_stream.cpp:292, :943); C ignores the status.
+    let _ = ctx.pool.owner().get_attributes(&mut array).await;
 
     ArrayPublisher::new(ctx.output.clone()).publish(array).await;
 }
@@ -1612,29 +1598,40 @@ mod tests {
         std::mem::forget(runtime);
     }
 
-    /// serval_stream.cpp:177-183 allocates the frame with a NULL pData, so a
-    /// frame over the pool's maxMemory is refused before it is counted.
+    /// C runs `getAttributes` on both image streams' frames and adds no
+    /// ColorMode attribute (serval_stream.cpp:292, :943).
     #[tokio::test]
-    async fn a_frame_over_the_pool_limit_is_refused() {
+    async fn an_image_carries_the_attributes_file_set() {
+        use epics_rs::ad_core::attributes::NDAttrValue;
         use epics_rs::ad_core::plugin::channel::ndarray_channel;
         use epics_rs::asyn::runtime::config::RuntimeConfig;
         use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::user::AsynUser;
 
         let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
         let shared = Arc::new(Shared::new());
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
-        let driver =
-            crate::driver::TimePix3Driver::new("TPXPOOL", http.clone(), shared.clone(), 0, cmd_tx)
+        let mut driver =
+            crate::driver::TimePix3Driver::new("TPXATTR", http.clone(), shared.clone(), 0, cmd_tx)
                 .unwrap();
-        let (p, ad) = (driver.p, driver.ad.params);
+        let (p, ad, pool) = (driver.p, driver.ad.params, driver.ad.pool.clone());
+        // ADTimePix::writeOctet never chains to ADDriver::writeOctet, so the
+        // set is loaded through the base the way asynNDArrayDriver would.
+        driver
+            .ad
+            .write_octet(
+                &AsynUser::new(ad.base.attributes_file),
+                br#"<Attributes><Attribute name="Exposure" type="PARAM" source="ACQ_TIME" datatype="DOUBLE"/></Attributes>"#,
+            )
+            .unwrap();
         let (runtime, _) = create_port_runtime(
-            &epics_rs::asyn::registry::claim_port("TPXPOOL").unwrap(),
+            &epics_rs::asyn::registry::claim_port("TPXATTR").unwrap(),
             driver,
             RuntimeConfig::default(),
         )
         .unwrap();
         let mut output = NDArrayOutput::new();
-        let (tx, mut rx) = ndarray_channel("TPXPOOL_SINK", 4);
+        let (tx, mut rx) = ndarray_channel("TPXATTR_SINK", 4);
         output.add(tx);
         let ctx = Arc::new(Ctx {
             handle: runtime.port_handle().clone(),
@@ -1643,23 +1640,39 @@ mod tests {
             p,
             ad,
             output: Arc::new(parking_lot::Mutex::new(output)),
-            pool: DriverPool::standalone(4),
+            pool,
         });
         ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+        ctx.set(
+            0,
+            vec![ParamSetValue::new(
+                ad.acquire_time,
+                0,
+                ParamValue::Float64(0.25),
+            )],
+        )
+        .await;
 
-        publish_image(&ctx, 1, 2, 1, vec![1, 2], "refused\n").await;
-        assert_eq!(
-            ctx.handle
-                .read_int32(ad.base.array_counter, 0)
+        for kind in [StreamKind::PrvImg, StreamKind::Img] {
+            let frame = Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number: 1,
+                time_at_frame: 0.0,
+                pixels: vec![1, 2],
+            });
+            handle_frame(&ctx, kind, frame).await;
+            let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
-                .unwrap(),
-            0
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), rx.recv())
-                .await
-                .is_err()
-        );
+                .expect("no array")
+                .unwrap();
+            assert_eq!(
+                array.attributes.get("Exposure").map(|a| &a.value),
+                Some(&NDAttrValue::Float64(0.25))
+            );
+            assert_eq!(array.attributes.len(), 1);
+        }
         std::mem::forget(runtime);
     }
 }
