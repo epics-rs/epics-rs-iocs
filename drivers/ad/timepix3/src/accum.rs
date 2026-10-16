@@ -6,23 +6,31 @@
 //! pixel array, the other a 1-D bin array — so both use this one accumulator
 //! and the geometry lives in the caller.
 
-use std::collections::VecDeque;
+use crate::window::{Configuration, RollingSumStatus, RollingWindowSum};
 
 /// C clamps `imgFramesToSum_` / `prvHstFramesToSum_` into this range
 /// (ADTimePix.cpp:604).
 pub const MIN_FRAMES_TO_SUM: usize = 1;
 pub const MAX_FRAMES_TO_SUM: usize = 100_000;
+/// C `DEFAULT_RETENTION_LIMIT_MB` (ADTimePix.h:987).
+pub const DEFAULT_RETENTION_LIMIT_MB: usize = 512;
 
 /// What one frame produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
     /// The running sum after this frame — always fresh.
     pub running: Vec<u64>,
-    /// The sum of the buffered frames, present only on the frames where the
-    /// update interval elapses (C `should_update_sum`, serval_stream.cpp:805).
+    /// The window sum, present only on the frames where the update interval
+    /// elapses and the window took the frame (C `should_update_sum`,
+    /// serval_stream.cpp:1180-1182).
     pub sum_n: Option<Vec<u64>>,
-    /// How many frames the `sum_n` covers.
+    /// The frames the window holds (C `FramesSummed`).
     pub frames_summed: usize,
+    /// The window's new configuration, when this frame's geometry, the
+    /// requested frames or the budget changed it.
+    pub window_config: Option<Configuration>,
+    /// The window's verdict on this frame; `None` when it is unconfigured.
+    pub window_push: Option<RollingSumStatus>,
     /// Counts in *this* frame.
     pub frame_counts: u64,
     /// Set when this frame's geometry differed from the previous one and the
@@ -67,8 +75,11 @@ pub fn clamp_average_to_u32(sum: u64, divisor: u64) -> (u32, bool) {
 pub struct Accumulator {
     len: usize,
     running: Vec<u64>,
-    buffer: VecDeque<Vec<u32>>,
+    /// The last frame, held apart from the window, which may retain none.
+    current: Vec<u32>,
+    window: RollingWindowSum,
     frames_to_sum: usize,
+    retention_limit_mb: usize,
     update_interval: usize,
     since_update: usize,
     frame_count: u64,
@@ -89,9 +100,11 @@ impl Accumulator {
         Self {
             len: 0,
             running: Vec::new(),
-            buffer: VecDeque::new(),
-            // C's defaults (ADTimePix.cpp:1495).
+            current: Vec::new(),
+            window: RollingWindowSum::default(),
+            // C's defaults (ADTimePix.cpp:1495, :1978).
             frames_to_sum: 10,
+            retention_limit_mb: DEFAULT_RETENTION_LIMIT_MB,
             update_interval: 1,
             since_update: 0,
             frame_count: 0,
@@ -132,29 +145,47 @@ impl Accumulator {
         &self.running
     }
 
-    /// The sum of the buffered frames (C `imgWindowSum_.sum()` /
-    /// `prvHstWindowSum_.sum()`).
+    /// The window sum (C `imgWindowSum_.sum()` / `prvHstWindowSum_.sum()`).
     pub fn window_sum(&self) -> Vec<u64> {
-        let mut sum = vec![0u64; self.len];
-        for f in &self.buffer {
-            for (s, &v) in sum.iter_mut().zip(f) {
-                *s = s.saturating_add(u64::from(v));
-            }
-        }
-        sum
+        self.window.sum().to_vec()
+    }
+
+    pub fn window(&self) -> &RollingWindowSum {
+        &self.window
     }
 
     pub fn frames_to_sum(&self) -> usize {
         self.frames_to_sum
     }
 
-    pub fn set_frames_to_sum(&mut self, n: i32) {
+    /// C reconfigures a window that has a geometry at once
+    /// (ADTimePix.cpp:755-858); the configuration is returned for posting.
+    pub fn set_frames_to_sum(&mut self, n: i32) -> Option<Configuration> {
         self.frames_to_sum = usize::try_from(n)
             .unwrap_or(MIN_FRAMES_TO_SUM)
             .clamp(MIN_FRAMES_TO_SUM, MAX_FRAMES_TO_SUM);
-        while self.buffer.len() > self.frames_to_sum {
-            self.buffer.pop_front();
-        }
+        self.reconfigure()
+    }
+
+    pub fn set_retention_limit_mb(&mut self, mb: i32) -> Option<Configuration> {
+        self.retention_limit_mb = usize::try_from(mb).unwrap_or(1).max(1);
+        self.reconfigure()
+    }
+
+    pub fn retention_limit_mb(&self) -> usize {
+        self.retention_limit_mb
+    }
+
+    fn budget_bytes(&self) -> usize {
+        self.retention_limit_mb * 1024 * 1024
+    }
+
+    fn reconfigure(&mut self) -> Option<Configuration> {
+        let elements = self.window.element_count();
+        (elements > 0).then(|| {
+            self.window
+                .configure(elements, self.frames_to_sum, self.budget_bytes())
+        })
     }
 
     /// An interval below 1 would make `since_update >= interval` true on every
@@ -172,17 +203,18 @@ impl Accumulator {
     }
 
     pub fn buffered_frames(&self) -> usize {
-        self.buffer.len()
+        self.window.frame_count()
     }
 
     /// The last frame, as delivered.
     pub fn current_frame(&self) -> Option<&[u32]> {
-        self.buffer.back().map(Vec::as_slice)
+        (!self.current.is_empty()).then_some(self.current.as_slice())
     }
 
     pub fn reset(&mut self) {
         self.running.clear();
-        self.buffer.clear();
+        self.current.clear();
+        self.window.reset();
         self.len = 0;
         self.since_update = 0;
         self.frame_count = 0;
@@ -203,7 +235,7 @@ impl Accumulator {
         if frame.len() != self.len {
             // A geometry change invalidates every accumulated frame.
             self.running = vec![0; frame.len()];
-            self.buffer.clear();
+            self.window.clear();
             self.len = frame.len();
             self.frame_count = 0;
             self.total_counts = 0;
@@ -219,26 +251,36 @@ impl Accumulator {
         }
         self.total_counts = self.total_counts.saturating_add(frame_counts);
         self.frame_count += 1;
+        self.current.clear();
+        self.current.extend_from_slice(frame);
 
-        self.buffer.push_back(frame.to_vec());
-        while self.buffer.len() > self.frames_to_sum {
-            self.buffer.pop_front();
-        }
+        // serval_stream.cpp:1132-1164, histogram_io.cpp:607-632.
+        let budget = self.budget_bytes();
+        let window_config = (self.window.element_count() != self.len
+            || self.window.requested_frames() != self.frames_to_sum
+            || self.window.budget_bytes() != budget)
+            .then(|| self.window.configure(self.len, self.frames_to_sum, budget));
+        let window_push = window_config
+            .is_none_or(|c| c.status == RollingSumStatus::Ok)
+            .then(|| self.window.push(frame));
 
         self.since_update += 1;
-        let (sum_n, frames_summed) = if self.since_update >= self.update_interval {
-            self.since_update = 0;
-            (Some(self.window_sum()), self.buffer.len())
-        } else {
-            (None, 0)
-        };
+        let sum_n = (window_push == Some(RollingSumStatus::Ok)
+            && self.since_update >= self.update_interval
+            && self.window.frame_count() > 0)
+            .then(|| {
+                self.since_update = 0;
+                self.window_sum()
+            });
 
         Update {
             running: self.running.clone(),
             sum_n,
-            frames_summed,
+            frames_summed: self.window.frame_count(),
             frame_counts,
             reset,
+            window_config,
+            window_push,
         }
     }
 }
@@ -324,6 +366,34 @@ mod tests {
         let u = a.add(&[10]);
         // Frames 5 and 10 (4 was trimmed).
         assert_eq!(u.sum_n, Some(vec![15]));
+    }
+
+    /// The window holds what the retention budget allows beside its sum
+    /// (rolling_window_sum.cpp:44-121); the last frame is kept regardless.
+    #[test]
+    fn the_retention_budget_caps_the_sum_of_n() {
+        let mut a = Accumulator::new();
+        // 64 Ki elements in 1 MiB: a 512 KiB sum and two 256 KiB frames.
+        a.set_retention_limit_mb(1);
+        let frame = |v| vec![v; 65536];
+        a.add(&frame(1));
+        a.add(&frame(2));
+        let u = a.add(&frame(4));
+        let c = a.window();
+        assert_eq!((c.effective_frames(), u.frames_summed), (2, 2));
+        assert_eq!(u.sum_n.as_deref().map(|s| s[0]), Some(6));
+        assert_eq!(u.running[0], 7);
+
+        // A budget below one frame leaves no window and no sum of N.
+        let mut a = Accumulator::new();
+        a.set_retention_limit_mb(1);
+        let u = a.add(&vec![1; 131072]);
+        assert_eq!(
+            u.window_config.map(|c| c.status),
+            Some(RollingSumStatus::BudgetTooSmall)
+        );
+        assert_eq!((u.window_push, u.sum_n, u.frames_summed), (None, None, 0));
+        assert_eq!(a.current_frame().map(<[u32]>::len), Some(131072));
     }
 
     #[test]
