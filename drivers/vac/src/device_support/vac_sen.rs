@@ -5,10 +5,11 @@ use std::time::Duration;
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
 };
-use epics_rs::base::server::record::Record;
+use epics_rs::base::server::record::{Record, ScanType};
 
 use super::PortIo;
 use crate::protocol::vac_sen::{
@@ -27,6 +28,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct VacSen {
     link: AsynLink,
+    /// C `pr->name`, for the init refusal lines.
+    name: String,
     io: Option<PortIo>,
     cfg: Option<Config>,
     /// C `pPvt->errCount`, persisted across process cycles.
@@ -39,6 +42,7 @@ impl VacSen {
     pub fn new(link: AsynLink) -> Self {
         Self {
             link,
+            name: String::new(),
             io: None,
             cfg: None,
             err_count: 0,
@@ -63,6 +67,10 @@ impl DeviceSupport for VacSen {
         DTYP
     }
 
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_owned();
+    }
+
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let rec = record
             .as_any_mut()
@@ -75,20 +83,24 @@ impl DeviceSupport for VacSen {
         // Every C failure below is a `goto bad` — errlogPrintf "record
         // disabled", `pr->pact = 1`, no alarm (`devVacSen.c:306-314`). The
         // TYPE/downcast checks above stay `Err`; they have no C arm.
+        // C's `bad:` prints its own line after whichever refusal led there; a
+        // failed `connectDevice` prints nothing else.
+        let bad = |name: &str| {
+            errlog_vprintf(format_args!(
+                "devVacSen::init {name} Problem initializing - record disabled.\n"
+            ));
+            Ok(DeviceInitOutcome::dead())
+        };
         let cfg = match configure(dev, self.link.addr, &self.link.drv_info) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("devVacSen::init {e}");
-                return Ok(DeviceInitOutcome::dead());
+                errlog_vprintf(format_args!("devVacSen::init {} {e}\n", self.name));
+                return bad(&self.name);
             }
         };
 
         let Some(port) = get_port(&self.link.port_name) else {
-            eprintln!(
-                "devVacSen::init can't connect to serial port {}",
-                self.link.port_name
-            );
-            return Ok(DeviceInitOutcome::dead());
+            return bad(&self.name);
         };
         self.io = Some(PortIo {
             handle: port.handle,

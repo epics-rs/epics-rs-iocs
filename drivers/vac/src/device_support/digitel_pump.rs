@@ -6,10 +6,11 @@ use std::time::Duration;
 use epics_rs::asyn::adapter::AsynLink;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
 };
-use epics_rs::base::server::record::Record;
+use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::PvString;
 
 use super::PortIo;
@@ -33,6 +34,8 @@ const YES: u16 = 1;
 
 pub struct DigitelPump {
     link: AsynLink,
+    /// C `pr->name`, for the init refusal lines.
+    name: String,
     io: Option<PortIo>,
     cfg: Option<Config>,
     /// C `pPvt->errCount`, persisted across process cycles. The Digitels are
@@ -46,6 +49,7 @@ impl DigitelPump {
     pub fn new(link: AsynLink) -> Self {
         Self {
             link,
+            name: String::new(),
             io: None,
             cfg: None,
             err_count: 0,
@@ -70,6 +74,10 @@ impl DeviceSupport for DigitelPump {
         DTYP
     }
 
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_owned();
+    }
+
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let rec = record
             .as_any_mut()
@@ -86,15 +94,16 @@ impl DeviceSupport for DigitelPump {
         let cfg = match configure(dev, self.link.addr, &self.link.drv_info) {
             Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("devDigitelPump::init {e}");
+                errlog_vprintf(format_args!("devDigitelPump::init {} {e}\n", self.name));
                 return Ok(DeviceInitOutcome::dead());
             }
         };
 
         let Some(port) = get_port(&self.link.port_name) else {
-            eprintln!(
-                "devDigitelPump::init can't connect to serial port {}",
-                self.link.port_name
+            // A plain `printf`, carrying `connectDevice`'s errorMessage.
+            let port = &self.link.port_name;
+            println!(
+                "can't connect to serial port {port} asynManager:connectDevice port {port} not found"
             );
             return Ok(DeviceInitOutcome::dead());
         };

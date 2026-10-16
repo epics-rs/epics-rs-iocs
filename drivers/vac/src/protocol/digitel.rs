@@ -130,7 +130,8 @@ pub fn configure(dev: DevType, address: i32, user_param: &str) -> Result<Config,
             }
             let limit = if dev == DevType::Mpc { 2 } else { 4 };
             if !(1..=limit).contains(&station) {
-                return Err(format!("{dev:?} station out of range {station}"));
+                let model = if dev == DevType::Mpc { "MPC" } else { "QPC" };
+                return Err(format!("{model} station out of range {station}"));
             }
             cfg.prefix = format!("~ {address:02X}").into_bytes();
             cfg.pump_no = station;
