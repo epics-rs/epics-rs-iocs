@@ -9,15 +9,9 @@
 //!
 //! ## Units
 //!
-//! The C driver carries a `stepSize = 1 / CountsPerUnit` and multiplies every
-//! outgoing position/velocity/acceleration by it (and divides every readback),
-//! bridging the motor record's raw-step frame to the Ensemble's user-unit
-//! frame. At the asyn-rs `AsynMotor` boundary (dial-frame EGU) that scaling
-//! cancels, so it is dropped: the driver works in the controller's user units
-//! natively, and the record's `MRES` must be `stepSize` (raw counts are
-//! integers). Command values are formatted to `PRECISION`
-//! decimal places (the C derived a per-axis digit count from `stepSize`; with
-//! `stepSize` dropped a fixed precision is used).
+//! As C, `stepSize = 1 / CountsPerUnit` scales every outgoing record step
+//! value into the Ensemble's user units and divides every readback, and
+//! values are formatted to `maxDigits` places derived from it.
 //!
 //! ## Not modeled (documented)
 //!
@@ -25,8 +19,6 @@
 //!   return `MOTOR_AXIS_ERROR` in C too — unimplemented there.)
 //! - Encoder-ratio / resolution / limit / PID setters (the C `motorAxisSetDouble`
 //!   cases all just log "Ensemble does not support ..." — no-ops here.)
-//! - The `CountsPerUnit` re-read on every enable (C did it only to refresh
-//!   `stepSize`, which this port does not use).
 //! - The async notification / forced-fast-poll machinery: replaced by periodic
 //!   polling.
 //!
@@ -63,9 +55,6 @@ const READ_BUF: usize = 128;
 pub const INPUT_EOS: &[u8] = b"\n";
 pub const OUTPUT_EOS: &[u8] = b"\n";
 
-/// Decimal places used when formatting outgoing numeric values.
-const PRECISION: usize = 6;
-
 /// Reply status characters (C `ASCII_*_CHAR`).
 const ACK: u8 = b'%';
 const FAULT: u8 = b'#';
@@ -86,6 +75,7 @@ const CW_EOT_SW_STATE: u32 = 1 << 2;
 /// Ensemble parameter IDs (C `EnsembleParameterId.h`; the `(0 << 24)` high byte
 /// is always zero for these).
 const PARAM_REVERSE_MOTION_DIRECTION: i32 = 1;
+const PARAM_COUNTS_PER_UNIT: i32 = 2;
 const PARAM_POSITION_FEEDBACK_TYPE: i32 = 47;
 const PARAM_END_OF_TRAVEL_LIMIT_SETUP: i32 = 61;
 const PARAM_ABORT_DECEL_RATE: i32 = 73;
@@ -107,9 +97,19 @@ fn ens_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Format a numeric command value at the fixed precision.
-fn fmt(v: f64) -> String {
-    format!("{v:.PRECISION$}")
+/// C `%.*f` with the axis `maxDigits`.
+fn fmt(v: f64, digits: usize) -> String {
+    format!("{v:.digits$}")
+}
+
+/// C's `stepSize` from a `CountsPerUnit` reply, 1 when it was refused.
+fn step_size(counts_per_unit: AsynResult<String>) -> f64 {
+    counts_per_unit.map_or(1.0, |s| 1.0 / atof(&s))
+}
+
+/// C `maxDigits`: two places past the step's, at least one.
+fn max_digits(step_size: f64) -> usize {
+    ((-step_size.abs().log10()) as i32 + 2).max(1) as usize
 }
 
 /// An Ensemble controller endpoint owning the asyn octet handle, shared by its
@@ -212,18 +212,23 @@ pub struct EnsembleAxis {
     reverse_direc: bool,
     /// `EndOfTravelLimitSetup` word (limit-switch active levels).
     swconfig: u32,
+    /// C `fabs(stepSize)`: user units per record step.
+    step: f64,
+    /// C `maxDigits`.
+    digits: usize,
 }
 
 impl EnsembleAxis {
     /// Construct axis `axis` and probe its feedback type, home/limit setup and
     /// reverse-direction parameters, then set `RAMP MODE RATE`.
     pub fn new(controller: Arc<Mutex<EnsembleController>>, axis: i32) -> AsynResult<Self> {
-        let (has_encoder, home_direction, reverse_direc, swconfig) = {
+        let (has_encoder, step_size, home_direction, reverse_direc, swconfig) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let has_encoder = ctrl
                 .get_param(axis, PARAM_POSITION_FEEDBACK_TYPE)
                 .map(|s| atoi(&s) > 0)
                 .unwrap_or(false);
+            let step_size = step_size(ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT));
             let home_direction = ctrl
                 .get_param(axis, PARAM_HOME_SETUP)
                 .map(|s| atol(&s) as u32)
@@ -237,7 +242,13 @@ impl EnsembleAxis {
                 .map(|s| atoi(&s) != 0)
                 .unwrap_or(false);
             ctrl.command(&format!("RAMP MODE @{axis} RATE"))?;
-            (has_encoder, home_direction, reverse_direc, swconfig)
+            (
+                has_encoder,
+                step_size,
+                home_direction,
+                reverse_direc,
+                swconfig,
+            )
         };
 
         Ok(Self {
@@ -247,11 +258,18 @@ impl EnsembleAxis {
             home_direction,
             reverse_direc,
             swconfig,
+            step: step_size.abs(),
+            digits: max_digits(step_size),
         })
     }
 
     fn lock(&self) -> MutexGuard<'_, EnsembleController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A record step value in user units, formatted as C's `%.*f`.
+    fn units(&self, v: f64) -> String {
+        fmt(v * self.step, self.digits)
     }
 
     fn do_move(&mut self, position: f64, relative: bool, max_v: f64, accel: f64) -> AsynResult<()> {
@@ -261,9 +279,13 @@ impl EnsembleAxis {
             let ctrl = self.lock();
             ctrl.command(mode)?;
             if accel > 0.0 {
-                ctrl.command(&format!("RAMP RATE {}", fmt(accel)))?;
+                ctrl.command(&format!("RAMP RATE {}", self.units(accel)))?;
             }
-            ctrl.command(&format!("LINEAR @{axis} {} F{}", fmt(position), fmt(max_v)))?;
+            ctrl.command(&format!(
+                "LINEAR @{axis} {} F{}",
+                self.units(position),
+                self.units(max_v)
+            ))?;
         }
         Ok(())
     }
@@ -309,10 +331,10 @@ impl AsynMotor for EnsembleAxis {
         let ctrl = self.lock();
         ctrl.command(&format!(
             "SETPARM @{axis}, {PARAM_ABORT_DECEL_RATE}, {}",
-            fmt(acceleration)
+            self.units(acceleration)
         ))?;
-        ctrl.command(&format!("RAMP RATE @{axis} {}", fmt(acceleration)))?;
-        ctrl.command(&format!("FREERUN @{axis} {}", fmt(velocity)))?;
+        ctrl.command(&format!("RAMP RATE @{axis} {}", self.units(acceleration)))?;
+        ctrl.command(&format!("FREERUN @{axis} {}", self.units(velocity)))?;
         Ok(())
     }
 
@@ -338,7 +360,7 @@ impl AsynMotor for EnsembleAxis {
         if velocity > 0.0 {
             ctrl.command(&format!(
                 "SETPARM @{axis}, {PARAM_HOME_SPEED}, {}",
-                fmt(velocity)
+                self.units(velocity)
             ))?;
         }
         if acceleration > 0.0 {
@@ -346,7 +368,7 @@ impl AsynMotor for EnsembleAxis {
             // send it to honour the intent.
             ctrl.command(&format!(
                 "SETPARM @{axis}, {PARAM_HOME_RAMP_RATE}, {}",
-                fmt(acceleration)
+                self.units(acceleration)
             ))?;
         }
         ctrl.command(&format!("SETPARM @{axis}, {PARAM_HOME_SETUP}, {hparam}"))?;
@@ -365,13 +387,17 @@ impl AsynMotor for EnsembleAxis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let axis = self.axis;
         self.lock()
-            .command(&format!("POSOFFSET SET @{axis}, {}", fmt(position)))
+            .command(&format!("POSOFFSET SET @{axis}, {}", self.units(position)))
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, closed_loop: bool) -> AsynResult<()> {
         let axis = self.axis;
-        let ctrl = self.lock();
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         if closed_loop {
+            // C refreshes stepSize on every enable (not maxDigits).
+            if let Ok(s) = ctrl.get_param(axis, PARAM_COUNTS_PER_UNIT) {
+                self.step = (1.0 / atof(&s)).abs();
+            }
             // Acknowledge any pending fault, then enable.
             let fault = ctrl
                 .query(&format!("AXISFAULT @{axis}"))
@@ -426,9 +452,9 @@ impl AsynMotor for EnsembleAxis {
         };
 
         Ok(MotorStatus {
-            position: cmd_pos,
-            encoder_position: enc_pos,
-            velocity: act_vel,
+            position: cmd_pos / self.step,
+            encoder_position: enc_pos / self.step,
+            velocity: act_vel / self.step,
             done,
             moving: move_active,
             high_limit,
@@ -451,9 +477,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fmt_uses_fixed_precision() {
-        assert_eq!(fmt(1.5), "1.500000");
-        assert_eq!(fmt(-100.0), "-100.000000");
+    fn max_digits_follows_the_step() {
+        assert_eq!(max_digits(1.0), 2);
+        assert_eq!(max_digits(0.001), 5);
+        assert_eq!(max_digits(1e-4), 6);
+        assert_eq!(max_digits(1000.0), 1);
+        assert_eq!(fmt(1.5, 2), "1.50");
+    }
+
+    #[test]
+    fn step_size_is_one_for_a_refused_counts_per_unit() {
+        assert_eq!(step_size(Ok("1000".into())), 0.001);
+        assert_eq!(step_size(Err(ens_err("refused"))), 1.0);
     }
 
     #[test]
