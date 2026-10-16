@@ -352,4 +352,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::mem::forget(rt);
     }
+
+    /// C keeps the last image in pArrays[0] until the next alloc
+    /// (URLDriver.cpp:132-134), published or not.
+    #[test]
+    fn the_last_image_stays_charged_after_the_acquisition() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("url-last-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("frame.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&png)
+            .unwrap();
+
+        let rt = create_url_detector(&claim_port("URL_LAST").unwrap(), 1 << 20).unwrap();
+        let (h, ad) = (rt.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    rt.url_params.url_name,
+                    0,
+                    ParamValue::Octet(format!("file://{}", png.display()).into_bytes().into()),
+                ),
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(0)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Single as i32),
+                ),
+            ],
+        )
+        .unwrap();
+
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() != 1
+            || h.read_int32_blocking(ad.status, 0).unwrap() != ADStatus::Idle as i32
+        {
+            assert!(Instant::now() < deadline, "no image");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = rt.pool();
+        assert_eq!(pool.num_alloc_buffers() - pool.num_free_buffers(), 1);
+        std::mem::forget(rt);
+    }
 }
