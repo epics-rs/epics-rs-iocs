@@ -121,7 +121,7 @@ impl PortDriver for IoDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_int32(reason, addr, value)?;
+            self.base.set_int32_param(reason, addr, value)?;
 
             let channel = u8::try_from(addr)
                 .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
@@ -166,7 +166,7 @@ impl PortDriver for IoDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_float64(reason, addr, value)?;
+            self.base.set_float64_param(reason, addr, value)?;
 
             let channel = u8::try_from(addr)
                 .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;

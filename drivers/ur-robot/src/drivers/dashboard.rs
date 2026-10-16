@@ -240,7 +240,7 @@ impl PortDriver for DashboardDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_int32(reason, user.addr, value)?;
+            self.base.set_int32_param(reason, user.addr, value)?;
 
             if p.is_command(reason) && value == 0 {
                 return Ok(());

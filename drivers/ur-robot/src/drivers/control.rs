@@ -472,8 +472,8 @@ impl ControlDriver {
         });
         drop(inner);
 
-        self.base.params.set_int32(p.custom_script_error, 0, 0)?;
-        self.base.params.set_int32(p.custom_script_running, 0, 1)?;
+        self.base.set_int32_param(p.custom_script_error, 0, 0)?;
+        self.base.set_int32_param(p.custom_script_running, 0, 1)?;
         Ok(())
     }
 }
@@ -493,7 +493,7 @@ impl PortDriver for ControlDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_float64(reason, addr, value)?;
+            self.base.set_float64_param(reason, addr, value)?;
 
             // Only the four per-axis parameters take one address per joint; a
             // scalar parameter written at addr 1..5 is a miswired record, not a
@@ -599,7 +599,7 @@ impl PortDriver for ControlDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_int32(reason, user.addr, value)?;
+            self.base.set_int32_param(reason, user.addr, value)?;
 
             if p.is_command(reason) && value == 0 {
                 return Ok(());
@@ -623,7 +623,7 @@ impl PortDriver for ControlDriver {
                 let body = match body {
                     Ok(body) => body,
                     Err(e) => {
-                        self.base.params.set_int32(p.custom_script_error, 0, 1)?;
+                        self.base.set_int32_param(p.custom_script_error, 0, 1)?;
                         return Err(e);
                     }
                 };
@@ -788,7 +788,7 @@ impl PortDriver for ControlDriver {
                     value: ParamValue::Int32(value),
                 } = u
                 {
-                    self.base.params.set_int32(reason, addr, value)?;
+                    self.base.set_int32_param(reason, addr, value)?;
                 }
             }
             result.map_err(|e| asyn_error(format!("RTDE control command failed: {e}")))
@@ -809,8 +809,7 @@ impl PortDriver for ControlDriver {
                 .trim_end_matches('\0')
                 .to_string();
             self.base
-                .params
-                .set_string(reason, user.addr, text.clone())?;
+                .set_string_param(reason, user.addr, text.clone())?;
 
             // A missing file prints and succeeds, as C's writeOctet does
             // (rtde_control_driver.cpp:611-619).
@@ -818,10 +817,10 @@ impl PortDriver for ControlDriver {
                 if std::path::Path::new(&text).exists() {
                     spdlog::debug(format_args!("Successfully read URScript file: {text}"));
                     self.inner.lock().custom_script_path = text;
-                    self.base.params.set_int32(p.custom_script_error, 0, 0)?;
+                    self.base.set_int32_param(p.custom_script_error, 0, 0)?;
                 } else {
                     spdlog::error(format_args!("Failed to read URScript file: {text}"));
-                    self.base.params.set_int32(p.custom_script_error, 0, 1)?;
+                    self.base.set_int32_param(p.custom_script_error, 0, 1)?;
                 }
                 return Ok(data.len());
             }

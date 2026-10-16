@@ -251,7 +251,7 @@ impl PortDriver for GripperDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_int32(reason, user.addr, value)?;
+            self.base.set_int32_param(reason, user.addr, value)?;
 
             if p.is_command(reason) && value == 0 {
                 return Ok(());
@@ -391,10 +391,10 @@ impl PortDriver for GripperDriver {
             drop(gripper);
 
             if let Some(v) = calibrated {
-                self.base.params.set_int32(p.is_calibrated, 0, v)?;
+                self.base.set_int32_param(p.is_calibrated, 0, v)?;
             }
             if let Some(param) = refused {
-                self.base.params.set_int32(param, 0, 0)?;
+                self.base.set_int32_param(param, 0, 0)?;
             }
             result.map_err(|e| {
                 spdlog::error(format_args!("{e}"));
@@ -411,7 +411,7 @@ impl PortDriver for GripperDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_float64(reason, user.addr, value)?;
+            self.base.set_float64_param(reason, user.addr, value)?;
 
             // SET_SPEED / SET_FORCE configure the RobotiqGripper object, which
             // outlives every (re)connect — nothing goes on the wire until the
