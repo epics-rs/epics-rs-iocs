@@ -59,6 +59,7 @@ impl CtrDriver {
 
         // Set defaults
         base.set_float64_param(params.poll_sleep_ms, 0, 50.0)?;
+        base.set_int32_param(params.pulse_run, 0, 0)?;
         base.set_int32_param(params.mcs_max_points, 0, max_time_points as i32)?;
         base.set_int32_param(params.mca_num_channels, 0, max_time_points as i32)?;
 
@@ -135,7 +136,7 @@ impl CtrDriver {
     /// C `USBCTR::eraseMCS`: the buffers, the point and every address's
     /// elapsed times and counts.
     fn erase_mcs(&mut self) -> AsynResult<()> {
-        let num_points = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
+        let num_points = self.int(self.params.mca_num_channels, 0);
         mcs::erase_mcs(
             &mut self.state.lock().unwrap().mcs,
             num_points.max(0) as usize,
@@ -152,6 +153,22 @@ impl CtrDriver {
             self.base.call_param_callbacks(i)?;
         }
         Ok(())
+    }
+
+    /// C `getIntegerParam`, whose status every caller ignores: an unset
+    /// value reads as the 0 an untouched local would hold here.
+    fn int(&self, reason: usize, addr: i32) -> i32 {
+        self.base.get_int32_param(reason, addr).unwrap_or(0)
+    }
+
+    /// C `getDoubleParam`; see [`Self::int`].
+    fn float(&self, reason: usize, addr: i32) -> f64 {
+        self.base.get_float64_param(reason, addr).unwrap_or(0.0)
+    }
+
+    /// C `getUIntDigitalParam`; see [`Self::int`].
+    fn uint(&self, reason: usize, addr: i32) -> u32 {
+        self.base.get_uint32_param(reason, addr).unwrap_or(0)
     }
 
     /// C `pulseGenRunning_[addr]`.
@@ -206,17 +223,11 @@ impl CtrDriver {
 
     fn pulse_request(&self, addr: i32) -> AsynResult<PulseRequest> {
         Ok(PulseRequest {
-            period: self
-                .base
-                .get_float64_param(self.params.pulse_period, addr)?,
-            duty_cycle: self
-                .base
-                .get_float64_param(self.params.pulse_duty_cycle, addr)?,
-            delay: self.base.get_float64_param(self.params.pulse_delay, addr)?,
-            count: self.base.get_int32_param(self.params.pulse_count, addr)? as u64,
-            idle_state: self
-                .base
-                .get_int32_param(self.params.pulse_idle_state, addr)?,
+            period: self.float(self.params.pulse_period, addr),
+            duty_cycle: self.float(self.params.pulse_duty_cycle, addr),
+            delay: self.float(self.params.pulse_delay, addr),
+            count: self.int(self.params.pulse_count, addr) as u64,
+            idle_state: self.int(self.params.pulse_idle_state, addr),
         })
     }
 }
@@ -288,10 +299,8 @@ impl PortDriver for CtrDriver {
                 let st = self.state.lock().unwrap();
                 (st.scaler.running, st.mcs.running)
             };
-            let num_channels = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
-            let current_point = self
-                .base
-                .get_int32_param(self.params.mcs_current_point, 0)?;
+            let num_channels = self.int(self.params.mca_num_channels, 0);
+            let current_point = self.int(self.params.mcs_current_point, 0);
             if scaler_running {
                 status = -1;
             } else if mcs_running {
@@ -307,20 +316,12 @@ impl PortDriver for CtrDriver {
                 let num_channels = num_channels.max(0) as usize;
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
-                let dwell = self.base.get_float64_param(self.params.mca_dwell_time, 0)?;
-                let ch_adv = self
-                    .base
-                    .get_int32_param(self.params.mca_ch_advance_source, 0)?;
-                let prescale = self.base.get_int32_param(self.params.mca_prescale, 0)?;
-                let enable = self
-                    .base
-                    .get_uint32_param(self.params.mcs_counter_enable, 0)?;
-                st.mcs.preset_real_time = self
-                    .base
-                    .get_float64_param(self.params.mca_preset_real, 0)?;
-                let point0_action = self
-                    .base
-                    .get_int32_param(self.params.mcs_point0_action, 0)?;
+                let dwell = self.float(self.params.mca_dwell_time, 0);
+                let ch_adv = self.int(self.params.mca_ch_advance_source, 0);
+                let prescale = self.int(self.params.mca_prescale, 0);
+                let enable = self.uint(self.params.mcs_counter_enable, 0);
+                st.mcs.preset_real_time = self.float(self.params.mca_preset_real, 0);
+                let point0_action = self.int(self.params.mcs_point0_action, 0);
                 // C `writeInt32` ignores `startMCS`'s status; it prints its own.
                 let num_counters = st.num_counters;
                 let actual_dwell = mcs::start_mcs(
@@ -333,9 +334,7 @@ impl PortDriver for CtrDriver {
                         counter_enable: enable,
                         ch_advance_source: ch_adv,
                         prescale,
-                        prescale_counter: self
-                            .base
-                            .get_int32_param(self.params.mcs_prescale_counter, 0)?,
+                        prescale_counter: self.int(self.params.mcs_prescale_counter, 0),
                         point0_action,
                     },
                     &trace,
@@ -428,11 +427,7 @@ impl PortDriver for CtrDriver {
             trace::asyn_status(-1)?;
         }
         let counter = user.addr as usize;
-        let num_channels = self
-            .base
-            .get_int32_param(self.params.mca_num_channels, 0)
-            .unwrap_or(0)
-            .max(0) as usize;
+        let num_channels = self.int(self.params.mca_num_channels, 0).max(0) as usize;
         let st = self.state.lock().unwrap();
         let Some(src) = st.mcs.mcs_buffers.get(counter) else {
             return Ok(0);
@@ -473,11 +468,7 @@ impl PortDriver for CtrDriver {
         // computeMCSTimes' doCallbacksFloat32Array(.., numTimePoints, ..)
         // does -- a full-length time base against a short spectrum is
         // unplottable.
-        let num_channels = self
-            .base
-            .get_int32_param(self.params.mca_num_channels, 0)
-            .unwrap_or(0)
-            .max(0) as usize;
+        let num_channels = self.int(self.params.mca_num_channels, 0).max(0) as usize;
         let st = self.state.lock().unwrap();
         let n = buf.len().min(st.mcs.time_buffer.len()).min(num_channels);
         buf[..n].copy_from_slice(&st.mcs.time_buffer[..n]);
@@ -499,11 +490,7 @@ impl PortDriver for CtrDriver {
             );
             trace::asyn_status(-1)?;
         }
-        let num_channels = self
-            .base
-            .get_int32_param(self.params.mca_num_channels, 0)
-            .unwrap_or(0)
-            .max(0) as usize;
+        let num_channels = self.int(self.params.mca_num_channels, 0).max(0) as usize;
         let st = self.state.lock().unwrap();
         let n = buf
             .len()
@@ -523,7 +510,7 @@ impl PortDriver for CtrDriver {
             // C readMCS reads the preset on every pass.
             self.state.lock().unwrap().mcs.preset_real_time = value;
         } else if reason == self.params.mca_dwell_time {
-            let num_points = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
+            let num_points = self.int(self.params.mca_num_channels, 0);
             let mut st = self.state.lock().unwrap();
             let times = mcs::compute_times(&mut st.mcs, num_points.max(0) as usize, value);
             self.base
@@ -576,9 +563,7 @@ impl PortDriver for CtrDriver {
 
         if reason == self.params.digital_output {
             // C writes only the masked bits configured as outputs.
-            let direction = self
-                .base
-                .get_uint32_param(self.params.digital_direction, 0)?;
+            let direction = self.uint(self.params.digital_direction, 0);
             let dev = self.device.lock().unwrap();
             for bit in 0..NUM_IO_BITS {
                 if mask & direction & (1 << bit) != 0 {
@@ -613,9 +598,7 @@ impl PortDriver for CtrDriver {
         } else {
             0
         };
-        let direction = self
-            .base
-            .get_uint32_param(self.params.digital_direction, 0)?;
+        let direction = self.uint(self.params.digital_direction, 0);
 
         self.base.call_param_callbacks(addr)?;
         let port = &self.base.port_name;
