@@ -9,7 +9,7 @@
 //!   "Spec" = ControlNet Spec. version 2.0, Errata 1
 //!   "ENET" = AB Publication 1756-RM005A-EN-E
 
-use epics_rs::base::types::c_cast::f64_to_i32;
+use epics_rs::base::types::c_cast::{f64_to_i32, f64_to_u32};
 use std::fmt;
 
 /// A tag value is transported as an abbreviated type code followed by raw data.
@@ -760,8 +760,8 @@ pub fn get_udint(raw: &[u8], element: usize) -> Option<u32> {
         CipType::Bool | CipType::Sint => raw.get(at).map(|&v| v as u32),
         CipType::Int | CipType::Uint => rd_u16(raw, at).map(|v| v as u32),
         CipType::Dint | CipType::Bits => rd_u32(raw, at),
-        CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as u32),
-        CipType::Lreal => rd_u64(raw, at).map(|v| f64::from_bits(v) as u32),
+        CipType::Real => rd_u32(raw, at).map(|v| f64_to_u32(f32::from_bits(v) as f64)),
+        CipType::Lreal => rd_u64(raw, at).map(|v| f64_to_u32(f64::from_bits(v))),
         _ => {
             crate::eip_printf!(1, "EIP get_CIP_UDINT: unknown type 0x{:04X}\n", t.code());
             None

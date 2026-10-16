@@ -450,6 +450,20 @@ fn get_dint_converts_as_get_cip_dint() {
     assert_eq!(get_dint(&raw(CipType::Lint, &5i64.to_le_bytes()), 0), None);
 }
 
+/// `get_CIP_UDINT` (ether_ip.c:1331-1338) casts floats as x86 C does: the
+/// 64-bit convert, low 32 bits.
+#[test]
+fn get_udint_casts_floats_as_get_cip_udint() {
+    assert_eq!(
+        get_udint(&raw(CipType::Real, &(-1.0f32).to_le_bytes()), 0),
+        Some(u32::MAX)
+    );
+    assert_eq!(
+        get_udint(&raw(CipType::Lreal, &5e9f64.to_le_bytes()), 0),
+        Some(705_032_704)
+    );
+}
+
 #[test]
 fn decode_bool_stays_unsigned() {
     let b = raw(CipType::Bool, &[0xFF]);
