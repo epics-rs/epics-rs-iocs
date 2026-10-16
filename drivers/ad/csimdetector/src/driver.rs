@@ -12,12 +12,12 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::ndarray_driver::{
     ArrayOwner, NDArrayDriverBase, handle_write_int32,
 };
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
@@ -27,6 +27,12 @@ use epics_rs::ad_core::runtime as rt;
 use crate::params::CSimParams;
 use crate::task::{CSimTaskContext, start_sim_task};
 use crate::types::{MAX_SIGNALS, Signal};
+
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "ADCSimDetector:writeInt32 error, ",
+    done: "ADCSimDetector:writeInt32: ",
+    list: OwnList::Addressed,
+};
 
 /// `DRIVER_VERSION.DRIVER_REVISION.DRIVER_MODIFICATION` (ADCSimDetector.h:22-24).
 pub const DRIVER_VERSION: &str = "2.5.0";
@@ -134,43 +140,24 @@ impl PortDriver for CSimDetector {
     /// `ADCSimDetector::writeInt32` (ADCSimDetector.cpp:354-385).
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
-
-        // C keeps this status unless asynNDArrayDriver::writeInt32 replaces it.
-        let mut status = self.port_base.set_int32_param(reason, addr, value);
-        if reason == self.nd.acquire {
-            self.set_acquire(value);
-        } else if self.sim.belongs_to_base(reason) {
-            let template = self.owner.array(0);
-            status = handle_write_int32(
-                &mut self.port_base,
-                &self.nd,
-                &self.pool,
-                template.as_deref(),
-                user,
-                value,
-            );
-        }
-
-        let _ = self.port_base.call_param_callbacks(addr);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "ADCSimDetector:writeInt32 error, status={} function={reason}, value={value}",
-                    e.c_status_code()
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("ADCSimDetector:writeInt32: function={reason}, value={value}"),
-            ),
-        }
-        status
+        INT32_TAIL.write_int32(self, user, value, |det, user, status| {
+            if reason == det.nd.acquire {
+                det.set_acquire(value);
+                status
+            } else if det.sim.belongs_to_base(reason) {
+                let template = det.owner.array(0);
+                handle_write_int32(
+                    &mut det.port_base,
+                    &det.nd,
+                    &det.pool,
+                    template.as_deref(),
+                    user,
+                    value,
+                )
+            } else {
+                status
+            }
+        })
     }
 
     // `writeFloat64` is not overridden by `ADCSimDetector`, and neither
@@ -278,6 +265,7 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::ndarray::NDDimension;
     use epics_rs::asyn::error::AsynError;
+    use epics_rs::asyn::trace::TraceMask;
 
     struct Fixture {
         det: CSimDetector,
