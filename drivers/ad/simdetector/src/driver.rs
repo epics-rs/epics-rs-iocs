@@ -104,24 +104,6 @@ impl SimDetector {
             stop_tx,
         })
     }
-
-    /// `simDetector::setShutter` (simDetector.cpp:490-502).
-    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
-        let mode = self
-            .ad
-            .port_base
-            .get_int32_param(self.ad.params.shutter_mode, 0)
-            .unwrap_or(0);
-        match shutter_op(mode, open) {
-            ShutterOp::DetectorStatus(v) => {
-                self.ad
-                    .port_base
-                    .set_int32_param(self.ad.params.shutter_status, 0, v)?;
-            }
-            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => self.ad.set_shutter(open)?,
-        }
-        Ok(())
-    }
 }
 
 impl PortDriver for SimDetector {
@@ -202,12 +184,7 @@ impl PortDriver for SimDetector {
         } else if sim.int32_write_dirties_image(reason, &p) {
             status = self.ad.port_base.set_int32_param(sim.reset_image, 0, 1);
         } else if !sim.owns(reason) {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            status = if reason == p.shutter_control {
-                self.set_shutter(value != 0)
-            } else {
-                self.ad.write_int32_pool(reason, value).map(drop)
-            };
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -281,6 +258,24 @@ impl ADDriver for SimDetector {
 
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
+    }
+
+    /// `simDetector::setShutter` (simDetector.cpp:490-502).
+    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+        let mode = self
+            .ad
+            .port_base
+            .get_int32_param(self.ad.params.shutter_mode, 0)
+            .unwrap_or(0);
+        match shutter_op(mode, open) {
+            ShutterOp::DetectorStatus(v) => {
+                self.ad
+                    .port_base
+                    .set_int32_param(self.ad.params.shutter_status, 0, v)?;
+            }
+            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => self.ad.set_shutter(open)?,
+        }
+        Ok(())
     }
 }
 
@@ -413,6 +408,49 @@ mod tests {
     /// simDetector inherits `asynNDArrayDriver::writeOctet`, so an
     /// `NDAttributesFile` write loads the set and a `FilePath` write runs
     /// `checkPath`.
+    /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
+    /// an ASYN_TRACEIO_DRIVER line (ADDriver.cpp:111-113,
+    /// asynNDArrayDriver.cpp:703-705).
+    #[test]
+    fn a_base_class_write_runs_both_base_class_write_int32s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "SIM_BASE_TRACE";
+        let det = {
+            let (start_tx, _) = rt::command_channel::<Signal>(1);
+            let (stop_tx, _) = rt::command_channel::<Signal>(1);
+            SimDetector::new(name, 64, 48, NDDataType::UInt8, 0, start_tx, stop_tx).unwrap()
+        };
+        let p = det.ad.params.base;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for driver in ["asynNDArrayDriver", "ADDriver"] {
+            assert!(
+                text.contains(&format!(
+                    "{driver}:writeInt32: function={}",
+                    p.pool_poll_stats
+                )),
+                "{driver}: {text:?}"
+            );
+        }
+        std::mem::forget(runtime);
+    }
+
     #[test]
     fn octet_writes_reach_the_asyn_nd_array_driver_branches() {
         let mut f = Fixture::new();
