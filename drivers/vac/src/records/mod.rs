@@ -98,7 +98,7 @@ pub(crate) fn set_sevr(
     epics_rs::base::server::recgbl::rec_gbl_set_sevr(common, stat, sevr)
 }
 
-/// `menu(menuAlarmSevr)` index → [`AlarmSeverity`]. A record's `HHSV`/`LLSV`/
+/// `menu(menuAlarmSevr)` index → [`AlarmSeverity`](epics_rs::base::server::record::AlarmSeverity). A record's `HHSV`/`LLSV`/
 /// `HSV`/`LSV` are dbCommon-typed menu fields, so they arrive as raw indices.
 pub(crate) fn severity_of(index: u16) -> epics_rs::base::server::record::AlarmSeverity {
     use epics_rs::base::server::record::AlarmSeverity;
