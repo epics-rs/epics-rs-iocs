@@ -15,8 +15,6 @@ epicsEnvSet("CARD",   "0")
 epicsEnvSet("PORT",   "serial1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 epicsEnvSet("ADDR",   "0")
-# Second multi-drop address on the same bus for the C-663 example below.
-epicsEnvSet("ADDR663","1")
 
 # ---- asyn octet port ----
 drvAsynSerialPortConfigure("$(PORT)", "$(TTY)", 0, 0, 0)
@@ -45,20 +43,19 @@ PIC862Config($(CARD), "$(PORT)", $(ADDR), 100, 1000)
 # controller counts, so MRES = 1.
 dbLoadRecords("$(PI_IOC)/db/pic862.template", "P=$(P),M=c862,CARD=$(CARD)")
 
-# ---- PI C-663 controller (same multi-drop bus, different address) ----
-# The C-663 is a C-862 clone: identical framing (CR out, LF+ETX in — already
-# set on this port above) and the same \x01{addr}VE select-at-connect exchange,
-# so it shares the serial port and is addressed by ADDR663.
-# PIC663Setup(maxCards, [scanRate]) is accepted for startup-script parity; the
-# asyn-rs port allocates per PIC663Config call.
-PIC663Setup(8, 10)
-
-# PIC663Config(card, asynPort, addr, [movingPollMs], [idlePollMs]) - addr is
-# the multi-drop bus address (0-15), selected once at connect time via
-# \x01{addr}VE.
-PIC663Config($(CARD), "$(PORT)", $(ADDR663), 100, 1000)
-
-dbLoadRecords("$(PI_IOC)/db/pic663.template", "P=$(P),M=c663,CARD=$(CARD)")
+# ---- PI C-663 controller (separate port) ----
+# The C-663 is a C-862 clone (CR out, LF+ETX in, \x01{addr}VE at connect).
+# Both drivers select their bus address only at connect, so a C-663 on the
+# C-862's port would receive every later C-862 command; it needs its own port.
+# Uncomment for real hardware.
+#drvAsynSerialPortConfigure("serial663", "/dev/ttyUSB6", 0, 0, 0)
+#asynSetOption("serial663", -1, "baud", "9600")
+#asynOctetSetOutputEos("serial663", 0, "\r")
+#asynOctetSetInputEos("serial663", 0, "\n\x03")
+#PIC663Setup(8, 10)
+# PIC663Config(card, asynPort, addr, [movingPollMs], [idlePollMs])
+#PIC663Config(0, "serial663", 0, 100, 1000)
+#dbLoadRecords("$(PI_IOC)/db/pic663.template", "P=$(P),M=c663,CARD=0")
 
 # ---- PI C-630 stepper chain (separate port — different protocol/framing) ----
 # The C-630 is NOT a C-862 clone: it uses a per-command 1-digit axis address
