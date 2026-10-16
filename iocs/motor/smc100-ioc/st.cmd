@@ -24,12 +24,9 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# NOTE (hardware path): the SMC100 driver appends the CR/LF command
-# terminator itself, so no output EOS is required. Input-response framing
-# relies on the serial read returning a complete reply; asyn-rs exposes no
-# `asynOctetSetInputEos` iocsh command yet, so the input terminator cannot be
-# set here. Verify response framing against real hardware / a serial
-# simulator before production use.
+# Replies end in CR/LF (C st.cmd.SMC100). The driver appends the CR/LF
+# command terminator itself, so only the input EOS is set.
+asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- SMC100 controller ----
 # SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs])
