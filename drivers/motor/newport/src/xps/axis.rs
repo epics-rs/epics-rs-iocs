@@ -172,9 +172,25 @@ impl XpsAxis {
     /// Read the group status over the poll socket, holding the controller lock
     /// only for the single exchange (used by the move-to-home step sequence,
     /// which must release the lock between RPCs and sleeps).
-    fn locked_group_status(&self) -> XpsResult<i32> {
+    /// C `GroupStatusGet(pollSocket_, groupName_, &groupStatus)` with its
+    /// status ignored: a failed call leaves `group_status` as it was.
+    fn refresh_group_status(&self, group_status: &mut i32) {
         let ctrl = self.lock_controller();
-        ctrl.poll_socket().group_status_get(&self.group_name)
+        if let Ok(status) = ctrl.poll_socket().group_status_get(&self.group_name) {
+            *group_status = status;
+        }
+    }
+
+    /// `PositionerHardwareStatusGet` into an out-parameter, as
+    /// [`Self::refresh_group_status`].
+    fn refresh_hardware_status(&self, hardware_status: &mut i32) {
+        let ctrl = self.lock_controller();
+        if let Ok(status) = ctrl
+            .poll_socket()
+            .positioner_hardware_status_get(&self.positioner_name)
+        {
+            *hardware_status = status;
+        }
     }
 
     /// Shared move preamble (C `XPSAxis::move`, before the `GroupMove*` call):
@@ -755,10 +771,13 @@ impl AsynMotor for XpsAxis {
         }
         let mut distance = position * self.step_size;
 
+        // C ignores the status of every call here but GroupInitialize and the
+        // ones it prints for; a failed read leaves C's out-parameter unchanged.
+        let mut group_status = 0;
         // A Ready group (10..=18) refuses the sequence; kill it (move socket).
-        let group_status = self.locked_group_status()?;
+        self.refresh_group_status(&mut group_status);
         if (10..=18).contains(&group_status) {
-            self.move_sock.group_kill(&self.group_name)?;
+            let _ = self.move_sock.group_kill(&self.group_name);
         }
         thread::sleep(XPS_REFERENCING_SETTLE);
         let initialized = {
@@ -769,13 +788,13 @@ impl AsynMotor for XpsAxis {
             return Err(self.move_to_home_failed("error calling GroupInitialize", false));
         }
         thread::sleep(XPS_REFERENCING_SETTLE);
-        self.move_sock.group_referencing_start(&self.group_name)?;
+        let _ = self.move_sock.group_referencing_start(&self.group_name);
         thread::sleep(XPS_REFERENCING_SETTLE);
-        self.move_sock.group_referencing_stop(&self.group_name)?;
+        let _ = self.move_sock.group_referencing_stop(&self.group_name);
         thread::sleep(XPS_REFERENCING_SETTLE);
 
         // Must now be in referencing mode (status 11).
-        let group_status = self.locked_group_status()?;
+        self.refresh_group_status(&mut group_status);
         if group_status != XPS_STATUS_HOMING_DONE {
             return Err(
                 self.move_to_home_failed("error putting axis into referencing mode.", false)
@@ -833,24 +852,21 @@ impl AsynMotor for XpsAxis {
         thread::sleep(XPS_REFERENCING_POLL);
 
         // Must be moving (status 44) to begin the switch-crossing wait.
-        let group_status = self.locked_group_status()?;
+        self.refresh_group_status(&mut group_status);
         if group_status != 44 {
             return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
         }
         // Wait until the hardware status flips (crossed the switch), aborting
         // if the move stops for any other reason. Bounded (see DEVIATION above).
+        let mut hardware_status = 0;
         let mut polls = 0;
         loop {
             thread::sleep(XPS_REFERENCING_POLL);
-            let hw = {
-                let ctrl = self.lock_controller();
-                ctrl.poll_socket()
-                    .positioner_hardware_status_get(&self.positioner_name)?
-            };
-            if hw != initial_hw {
+            self.refresh_hardware_status(&mut hardware_status);
+            if hardware_status != initial_hw {
                 break;
             }
-            let group_status = self.locked_group_status()?;
+            self.refresh_group_status(&mut group_status);
             if group_status != 44 {
                 // Move finished for some other reason.
                 return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
@@ -984,6 +1000,8 @@ mod tests {
         base: PortDriverBase,
         reply: Option<String>,
         fail: Arc<Mutex<&'static str>>,
+        /// Every call name, in order.
+        log: Arc<Mutex<Vec<String>>>,
     }
 
     impl PortDriver for FakeXps {
@@ -996,6 +1014,7 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data);
             let name = cmd.split('(').next().unwrap_or("").trim();
+            self.log.lock().unwrap().push(name.to_string());
             let values = match name {
                 _ if name == *self.fail.lock().unwrap() => "-3",
                 "GroupStatusGet" => "0,12",
@@ -1017,12 +1036,16 @@ mod tests {
         }
     }
 
-    fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Arc<Mutex<&'static str>>) {
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Arc<Mutex<&'static str>>, Log) {
         let fail = Arc::new(Mutex::new(fail));
+        let log = Log::default();
         let line = FakeXps {
             base: PortDriverBase::new(port, 1, PortFlags::default()),
             reply: None,
             fail: fail.clone(),
+            log: log.clone(),
         };
         let (rt, _jh) =
             create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
@@ -1041,14 +1064,14 @@ mod tests {
             "G1.P1",
             1.0,
         );
-        (axis, fail)
+        (axis, fail, log)
     }
 
     /// C `XPSAxis::poll` (`done:`, XPSAxis.cpp:755-758): a failed call raises
     /// only COMM_ERR, keeps what this poll already wrote and every older value.
     #[test]
     fn a_failed_poll_raises_only_comms_error() {
-        let (mut axis, fail) = fake_axis("xps_poll_fail", "");
+        let (mut axis, fail, _) = fake_axis("xps_poll_fail", "");
         let user = AsynUser::new(0);
 
         *fail.lock().unwrap() = "PositionerErrorGet";
@@ -1075,8 +1098,40 @@ mod tests {
             ("xps_new_sgamma", "PositionerSGammaParametersGet"),
             ("xps_new_pid", "PositionerCorrectorTypeGet"),
         ] {
-            let (axis, _) = fake_axis(port, call);
+            let (axis, _, _) = fake_axis(port, call);
             assert_eq!(axis.positioner_name, "G1.P1", "{call}");
+        }
+    }
+
+    /// C doMoveToHome ignores GroupKill and GroupReferencingStart/Stop
+    /// (XPSAxis.cpp:1633-1652); the status-11 check is what refuses.
+    #[test]
+    fn move_to_home_ignores_the_calls_c_ignores() {
+        for (port, call) in [
+            ("xps_mth_kill", "GroupKill"),
+            ("xps_mth_refstart", "GroupReferencingStart"),
+            ("xps_mth_status", "GroupStatusGet"),
+        ] {
+            let (mut axis, fail, log) = fake_axis(port, "");
+            let user = AsynUser::new(0);
+            *fail.lock().unwrap() = call;
+            log.lock().unwrap().clear();
+            assert!(axis.move_to_home(&user, 1.0, 0.0, 1.0, 1.0).is_err());
+            let log = log.lock().unwrap();
+            for sent in [
+                "GroupInitialize",
+                "GroupReferencingStart",
+                "GroupReferencingStop",
+            ] {
+                assert!(
+                    log.iter().any(|c| c == sent),
+                    "{call}: {sent} not sent in {log:?}"
+                );
+            }
+            assert!(
+                !log.iter().any(|c| c == "PositionerHardwareStatusGet"),
+                "{call}: status 12 is not referencing mode"
+            );
         }
     }
 
@@ -1084,7 +1139,7 @@ mod tests {
     /// a failed PositionerUserTravelLimitsGet.
     #[test]
     fn poll_status_string_fails_and_travel_limits_do_not() {
-        let (mut axis, fail) = fake_axis("xps_poll_string", "");
+        let (mut axis, fail, _) = fake_axis("xps_poll_string", "");
         let user = AsynUser::new(0);
 
         *fail.lock().unwrap() = "GroupStatusStringGet";
