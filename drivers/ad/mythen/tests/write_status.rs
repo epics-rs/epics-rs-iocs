@@ -167,3 +167,41 @@ fn a_base_class_int32_write_reaches_the_ndarray_pool() {
     driver.write_int32(&mut user, 1).unwrap();
     assert_eq!(driver.ad.pool.num_free_buffers(), 2);
 }
+
+/// ADDriver::writeFloat64 is asynPortDriver's (mythen.cpp:1210), whose
+/// IO_DRIVER line precedes mythen's.
+#[test]
+fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+    use epics_rs::asyn::trace::{TraceFile, TraceMask};
+    use epics_rs::asyn::user::UserTrace;
+    let port = "MYTHEN_WS_F64";
+    let (mut driver, _received) = driver(port);
+    let manager = epics_rs::asyn::services::PortServices::global()
+        .trace()
+        .clone();
+    let path = std::env::temp_dir().join(format!("mythen-trace-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+    let delay = driver.ad.params.shutter_open_delay;
+    let mut user = AsynUser::new(delay).with_addr(0);
+    user.trace = Some(UserTrace {
+        manager,
+        port: port.into(),
+    });
+    driver.write_float64(&mut user, 2.0).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let base = format!(
+        "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+    );
+    let own = format!("mythen:writeFloat64: function={delay}, value=2");
+    let at = |line: &str| {
+        text.find(line)
+            .unwrap_or_else(|| panic!("{line}: {text:?}"))
+    };
+    assert!(at(&base) < at(&own));
+}

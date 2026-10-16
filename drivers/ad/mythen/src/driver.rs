@@ -487,6 +487,9 @@ impl PortDriver for MythenDriver {
                 }
                 Err(e) => Err(e),
             });
+        } else if reason < self.p.setting {
+            // ADDriver::writeFloat64 is asynPortDriver's (mythen.cpp:1210).
+            status.set(self.ad.port_base.write_float64_param(user, value));
         }
 
         status.or(self.refresh_settings());
