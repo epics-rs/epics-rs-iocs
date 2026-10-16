@@ -55,10 +55,16 @@ pub fn anf2_create_controller_command() -> CommandDef {
             // and a negative C value both leave permanently un-satisfied.
             let num_axes = req_int(args, 3, "Number of axes")?.clamp(0, MAX_AXES as i64) as usize;
 
-            let controller = Anf2Controller::new(&in_port, &out_port, num_axes)
-                .map_err(|e| format!("ANF2CreateController: {e}"))?;
-
             register_port(ctx, &port_name, num_axes as i32)?;
+            let (controller, out_status) = Anf2Controller::new(&in_port, &out_port, num_axes);
+            if out_status.is_err() {
+                MotorTrace::new(port_name.clone(), 0).print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "ANF2Controller::ANF2Controller: cannot connect to ANF2 controller\n"
+                    ),
+                );
+            }
             anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -122,8 +128,7 @@ pub fn anf2_create_axis_command() -> CommandDef {
             let base_speed = req_int(args, 3, "Base speed")?.clamp(1, 1_000_000) as i32;
             let homing_timeout = req_int(args, 4, "Homing timeout")?.clamp(0, 300) as i32;
 
-            let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout)
-                .map_err(|e| format!("ANF2CreateAxis: {e}"))?;
+            let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout);
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
             install(
                 ctx,

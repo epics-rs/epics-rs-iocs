@@ -82,18 +82,20 @@ pub struct Anf2Controller {
 impl Anf2Controller {
     /// Connect the In/Out Modbus ports previously created by
     /// `drvModbusAsynConfigure` (C constructor's `pasynInt32SyncIO`/
-    /// `pasynInt32ArraySyncIO` connect loop).
-    pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> Result<Self, String> {
-        let (in_regs, in_status) = ModbusRegs::connect(in_port, TIMEOUT);
+    /// `pasynInt32ArraySyncIO` connect loop). C keeps the controller either
+    /// way; the status of the last output connect, the only one C checks, is
+    /// returned, and is success when the loop has no axis to run.
+    pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> (Self, AsynResult<()>) {
+        let (in_regs, _) = ModbusRegs::connect(in_port, TIMEOUT);
         let (out_regs, out_status) = ModbusRegs::connect(out_port, TIMEOUT);
-        in_status.and(out_status).map_err(|e| e.to_string())?;
-        Ok(Self {
+        let ctrl = Self {
             in_port: in_port.to_string(),
             in_regs,
             out_regs,
             num_axes,
             axes_created: 0,
-        })
+        };
+        (ctrl, if num_axes == 0 { Ok(()) } else { out_status })
     }
 
     fn read16(&self, axis_no: i32, reg: i32) -> AsynResult<i32> {
@@ -140,14 +142,15 @@ pub struct Anf2Axis {
 
 impl Anf2Axis {
     /// C `ANF2Axis::ANF2Axis`: send the configuration array, decode the
-    /// has-encoder bits, and zero the position. Performs blocking I/O.
+    /// has-encoder bits, and zero the position. Performs blocking I/O. C
+    /// ignores every status here, so the axis is always built and counted.
     pub fn new(
         controller: Arc<Mutex<Anf2Controller>>,
         axis_no: i32,
         config: i32,
         base_speed: i32,
         homing_timeout: i32,
-    ) -> AsynResult<Self> {
+    ) -> Self {
         let in_port = controller
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -179,7 +182,7 @@ impl Anf2Axis {
         conf_reg[CONFIGURATION] = config;
         conf_reg[BASE_SPEED] = base_speed;
         conf_reg[HOME_TIMEOUT] = homing_timeout << 16;
-        ax.lock().write_array(ax.axis_no, &conf_reg)?;
+        let _ = ax.lock().write_array(ax.axis_no, &conf_reg);
 
         sleep(Duration::from_millis(50));
 
@@ -187,11 +190,11 @@ impl Anf2Axis {
         // feedback configured (config bits 24/25).
         ax.has_encoder = (config & 0x0100_0000) != 0 || (config & 0x0200_0000) != 0;
 
-        ax.set_position(&AsynUser::new(0), 0.0)?;
+        let _ = ax.set_position(&AsynUser::new(0), 0.0);
 
         ax.lock().axes_created += 1;
 
-        Ok(ax)
+        ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Anf2Controller> {
@@ -481,6 +484,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn axes_of_missing_ports_are_built_and_counted() {
+        let (ctrl, out_status) = Anf2Controller::new("anf2MissingIn", "anf2MissingOut", 1);
+        assert!(out_status.is_err());
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let axis = Anf2Axis::new(ctrl.clone(), 0, 0x0100_0000, 1, 0);
+        assert!(axis.has_encoder);
+        assert_eq!(ctrl.lock().unwrap().axes_created, 1);
+    }
+
+    #[test]
     fn send_accel_and_velocity_clamps_and_packs() {
         let mut reg = ZERO5;
         Anf2Axis::send_accel_and_velocity(&mut reg, 500_000.0, 2_000_000.0);
@@ -512,8 +525,8 @@ mod tests {
     fn an_axis_forces_its_read_at_its_register_block() {
         let (reason, taken) = crate::regs::fake::publish("anf2ForceReadIn");
         crate::regs::fake::publish("anf2ForceReadOut");
-        let ctrl = Anf2Controller::new("anf2ForceReadIn", "anf2ForceReadOut", 1).unwrap();
-        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 2, 0, 1, 0).unwrap();
+        let ctrl = Anf2Controller::new("anf2ForceReadIn", "anf2ForceReadOut", 1).0;
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 2, 0, 1, 0);
         ax.poll(&AsynUser::new(0)).unwrap();
         assert_eq!(*taken.lock().unwrap(), [(reason, 2 * AXIS_REG_OFFSET)]);
     }
