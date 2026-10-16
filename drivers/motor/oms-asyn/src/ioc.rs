@@ -8,6 +8,7 @@ use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
@@ -34,6 +35,8 @@ pub fn oms_commands() -> Vec<CommandDef> {
 /// idlePollPeriod, initString)`. As C's constructor, a failure past the
 /// port's creation is printed and leaves the port without axes.
 fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> CommandDef {
+    // The constructors' minFwMinor.
+    let min_fw_minor = if controller_type == "MAXnet" { 30 } else { 0 };
     CommandDef::new(
         cmd_name,
         vec![
@@ -57,39 +60,50 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             let who = format!("{controller_type}Config");
 
             register_port(ctx, &port_name, num_axes)?;
+            // On each early return C still runs startPoller on the half-built
+            // controller and crashes (a C bug); the port keeps no axes here.
             let Some(handle) = connect_with_default_eos(&serial_port, TIMEOUT, &who) else {
                 println!(
-                    "{who}: can't connect to port {serial_port}: port {serial_port} not found"
+                    "{who}: can't connect to port {serial_port}: asynManager:connectDevice port \
+                     {serial_port} not found"
                 );
                 return Ok(CommandOutcome::Continue);
             };
             let controller = OmsController::new(handle, &serial_port, controller_type);
-            if let Err(e) = controller.firmware_version() {
-                println!("{who}: unable to talk to controller at {serial_port}: {e}");
-                return Ok(CommandOutcome::Continue);
+            let (fw_major, fw_minor) = match controller.firmware_version() {
+                Ok(version) => version,
+                Err(e) => {
+                    println!(
+                        "{who}: unable to talk to controller at {serial_port}: {}",
+                        e.message_display()
+                    );
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if fw_minor < min_fw_minor {
+                println!(
+                    "{}",
+                    unsupported_firmware(controller_type, fw_major, fw_minor)
+                );
             }
             controller.init(&init_string);
 
             // omsBaseController::Init: the axes are the fields of `AA RP;`.
-            let total_axes = match controller.axis_count() {
-                Ok(n) => n,
-                Err(e) => {
-                    println!("{who}: unable to talk to controller at {serial_port}: {e}");
-                    return Ok(CommandOutcome::Continue);
-                }
-            };
+            let total_axes = controller.axis_count();
+            // Init leaves errorMessage untouched, so C prints it empty.
             if num_axes as usize > OMS_MAX_AXES {
-                eprintln!(
-                    "omsBaseController:Init: number of axes={num_axes} exceeds allowed maximum"
-                );
-                println!("{who}: unable to talk to controller at {serial_port}");
+                errlog_vprintf(format_args!(
+                    "omsBaseController:Init: number of axes={num_axes} exceeds allowed maximum\n"
+                ));
+                println!("{who}: unable to talk to controller at {serial_port}: ");
                 return Ok(CommandOutcome::Continue);
             }
             if total_axes > num_axes.max(0) as usize {
-                eprintln!(
-                    "omsBaseController:Init: actual number of axes={total_axes} > MIN(numAxes={num_axes}, OMS_MAX_AXES)"
-                );
-                println!("{who}: unable to talk to controller at {serial_port}");
+                errlog_vprintf(format_args!(
+                    "omsBaseController:Init: actual number of axes={total_axes} > \
+                     MIN(numAxes={num_axes}, OMS_MAX_AXES)\n"
+                ));
+                println!("{who}: unable to talk to controller at {serial_port}: ");
                 return Ok(CommandOutcome::Continue);
             }
 
@@ -108,6 +122,20 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             }
             Ok(CommandOutcome::Continue)
         },
+    )
+}
+
+/// The constructors' unsupported-firmware line; only MXA's names the minimum
+/// from its fields.
+fn unsupported_firmware(controller_type: &str, major: i32, minor: i32) -> String {
+    let mandatory = if controller_type == "MAXnet" {
+        "1.30"
+    } else {
+        "1.0"
+    };
+    format!(
+        "This Controllers Firmware Version {major}.{minor} is not supported, version \
+         {mandatory} or higher is mandatory"
     )
 }
 
