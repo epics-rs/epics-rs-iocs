@@ -31,8 +31,8 @@ use epics_rs::base::server::record::DevSup;
 use epics_rs::motor::trace::MotorTrace;
 use motor_common::connect::{EosConnectError, EosRefusal, connect_serial, connect_with_eos};
 use motor_common::iocsh::{
-    arg_double_opt, arg_double_req, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int,
-    opt_string, poll_intervals, req_double, req_string,
+    arg_double_opt, arg_double_req, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double,
+    opt_int, opt_string, poll_intervals, req_double, req_string,
 };
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
@@ -701,6 +701,62 @@ pub fn xps_tcl_script_execute_command() -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// C `tclCall.cc` `getsocket`: the XPS `tclcall` runs on, fixed in C's
+/// source, and its `TIMEOUT`.
+const TCLCALL_IP: &str = "164.54.160.124";
+const TCLCALL_PORT: i32 = 5001;
+const TCLCALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// `tclcall(tclName, taskName, args)` (tclCall.cc): run a TCL script on
+/// the XPS at [`TCLCALL_IP`] over a socket of its own.
+pub fn tclcall_command() -> CommandDef {
+    CommandDef::new(
+        "tclcall",
+        vec![
+            arg_str_opt("tcl name"),
+            arg_str_opt("Task name"),
+            arg_str_opt("Function args"),
+        ],
+        "tclcall(tclName, taskName, args)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            // printf's "%s" of a missing iocsh string argument.
+            let text = |i: usize| match args.get(i) {
+                Some(ArgValue::String(s)) => s.to_str().map(str::to_owned),
+                _ => Ok("(null)".to_owned()),
+            };
+            println!("XPS ip = {TCLCALL_IP}");
+            let socket = connect_to_server(ctx, TCLCALL_IP, TCLCALL_PORT).map(|handle| {
+                let port = handle.port_name().to_owned();
+                XpsSocket::new(handle, &port, SocketMode::Query, TCLCALL_TIMEOUT)
+            });
+            if socket.is_none() {
+                println!(" Error TCP_ConnectToServer");
+            }
+            tclcall(socket.as_ref(), &text(0)?, &text(1)?, &text(2)?);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// C `tclcall` after `getsocket`; returns its status.
+fn tclcall(socket: Option<&XpsSocket>, name: &str, task_name: &str, args: &str) -> i32 {
+    let status = match socket {
+        Some(socket) => socket
+            .tcl_script_execute(name, task_name, args)
+            .map_or_else(|e| e.code(), |()| 0),
+        None => {
+            // SendAndReceive on socket -1 (asynOctetSocket.cpp:137-140).
+            println!("SendAndReceive: invalid SocketIndex -1");
+            -22
+        }
+    };
+    println!("TCL Call Status {status}");
+    if status < 0 {
+        println!("Error Name called {name}, Task Name {task_name}, Args {args}");
+    }
+    status
 }
 
 /// Create the `XPSPositionCompare` iocsh command.
@@ -1888,5 +1944,18 @@ mod tests {
             message.as_deref(),
             Some("Error performing ExtendedEventRemove, status=-3")
         );
+    }
+
+    /// C `tclcall`: the controller's code is the status, and a missing
+    /// socket is SendAndReceive's -22.
+    #[test]
+    fn tclcall_returns_the_script_status() {
+        let line = FakeLine::new("xps_tclcall", "");
+        let socket = line.socket(SocketMode::Query);
+        assert_eq!(tclcall(Some(&socket), "a.tcl", "t", "1"), 0);
+        assert_eq!(line.take_log(), ["TCLScriptExecute (a.tcl,t,1)"]);
+        *line.fail.lock().unwrap() = "TCLScriptExecute";
+        assert_eq!(tclcall(Some(&socket), "a.tcl", "t", "1"), -3);
+        assert_eq!(tclcall(None, "a.tcl", "t", "1"), -22);
     }
 }
