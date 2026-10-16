@@ -7,6 +7,12 @@ use epics_rs::asyn::trace::TraceMask;
 
 use crate::trace::SelfTrace;
 
+/// C drvUSBCTR's timer limits.
+const MIN_FREQUENCY: f64 = 0.023;
+const MAX_FREQUENCY: f64 = 48e6;
+const MIN_DELAY: f64 = 0.0;
+const MAX_DELAY: f64 = 67.11;
+
 /// One timer's `PULSE_GEN_*` parameters.
 pub struct PulseRequest {
     pub period: f64,
@@ -32,10 +38,17 @@ pub fn start(
         count,
         idle_state,
     } = *request;
+    // C clamps every request into the timer's range before starting it.
     let mut timing = PulseTiming {
-        frequency: if period > 0.0 { 1.0 / period } else { 1000.0 },
-        duty_cycle,
-        initial_delay: delay,
+        frequency: (1.0 / period).clamp(MIN_FREQUENCY, MAX_FREQUENCY),
+        duty_cycle: if duty_cycle <= 0.0 {
+            0.0001
+        } else if duty_cycle >= 1.0 {
+            0.9999
+        } else {
+            duty_cycle
+        },
+        initial_delay: delay.clamp(MIN_DELAY, MAX_DELAY),
     };
     let idle = if idle_state != 0 {
         TMRIS_HIGH
@@ -54,11 +67,7 @@ pub fn start(
         return Err(e);
     }
 
-    let actual_period = if timing.frequency > 0.0 {
-        1.0 / timing.frequency
-    } else {
-        period
-    };
+    let actual_period = 1.0 / timing.frequency;
 
     trace.print(
         TraceMask::FLOW,
