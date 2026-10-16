@@ -1,4 +1,4 @@
-//! Octet-port connect helper for the `LoveInit` iocsh command. The
+//! Octet-port connect helper for the `drvLoveInit` iocsh command. The
 //! underlying asyn port is created first by `drvAsynSerialPortConfigure` or
 //! `drvAsynIPPortConfigure`; this looks it up by name, applies the fixed
 //! input/output EOS (C `setDefaultEos`, `drvLove.c:640-660`, called

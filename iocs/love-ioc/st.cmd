@@ -6,7 +6,7 @@
 #
 # Mirrors upstream epics-modules/love's iocs/loveExIOC st.cmd.linux: one
 # serial port shared by every controller address on the RS-485 bus, one
-# LoveInit call per port, and one LoveConfig call per address to set that
+# drvLoveInit call per port, and one drvLoveConfig call per address to set that
 # address's model (1600 or 16A) before any records bind to it.
 #
 # Unlike the delaygen drivers, EOS is NOT set here: drvLoveInit itself
@@ -30,15 +30,15 @@ asynSetOption(S0, 0, "clocal",  "Y")
 asynSetOption(S0, 0, "crtscts", "N")
 
 # ---- Love driver + per-address model configuration ----
-# LoveInit(lovPort,serPort,serAddr)
-LoveInit("L0", "S0", 0)
+# drvLoveInit(lovPort,serPort,serAddr)
+drvLoveInit("L0", "S0", 0)
 
-# LoveConfig(lovPort,addr,model) -- "1600" or "16A", one call per controller
+# drvLoveConfig(lovPort,addr,model) -- "1600" or "16A", one call per controller
 # address actually wired to the RS-485 bus.
-LoveConfig("L0", 1, "1600")
-LoveConfig("L0", 2, "1600")
-LoveConfig("L0", 3, "1600")
-LoveConfig("L0", 4, "16A")
+drvLoveConfig("L0", 1, "1600")
+drvLoveConfig("L0", 2, "1600")
+drvLoveConfig("L0", 3, "1600")
+drvLoveConfig("L0", 4, "16A")
 
 # ---- records: one pair per controller address ----
 dbLoadRecords("$(LOVE)/db/LoveController.template", "P=love:,Q=Love1:,PORT=L0,ADDR=0x01")

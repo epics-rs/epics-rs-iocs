@@ -132,10 +132,10 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // LoveInit(lovPort,serPort,serAddr) -- C drvLoveInit(lovPort,serPort,serAddr)
+    // C drvLoveInit(lovPort,serPort,serAddr)
     {
         app = app.register_startup_command(CommandDef::new(
-            "LoveInit",
+            "drvLoveInit",
             vec![
                 ArgDesc {
                     name: "lovPort",
@@ -150,7 +150,7 @@ async fn main() -> CaResult<()> {
                     arg_type: ArgType::Int,
                 },
             ],
-            "LoveInit lovPort serPort serAddr",
+            "drvLoveInit lovPort serPort serAddr",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let lov_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
@@ -167,7 +167,7 @@ async fn main() -> CaResult<()> {
 
                 let handle =
                     connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT, INPUT_EOS, OUTPUT_EOS)
-                        .map_err(|e| format!("LoveInit: {e}"))?;
+                        .map_err(|e| format!("drvLoveInit: {e}"))?;
                 // C `setDefaultEos` (drvLove.c:647-657).
                 ctx.println(&format!(
                     "drvLove::setDefaultEos Input EOS set to \\0{}",
@@ -180,12 +180,12 @@ async fn main() -> CaResult<()> {
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
                 let driver = LoveDriver::new(&lov_port, handle, models.clone())
-                    .map_err(|e| format!("LoveInit: failed to initialize {lov_port}: {e}"))?;
+                    .map_err(|e| format!("drvLoveInit: failed to initialize {lov_port}: {e}"))?;
                 love::registry::register(&lov_port, models);
 
                 let (runtime_handle, _actor_jh) =
                     create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("LoveInit: {e}"))?;
+                        .map_err(|e| format!("drvLoveInit: {e}"))?;
                 epics_rs::asyn::asyn_record::register_port(
                     &lov_port,
                     runtime_handle.port_handle().clone(),
@@ -198,10 +198,10 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // LoveConfig(lovPort,addr,model) -- C drvLoveConfig(lovPort,addr,model)
+    // C drvLoveConfig(lovPort,addr,model)
     {
         app = app.register_startup_command(CommandDef::new(
-            "LoveConfig",
+            "drvLoveConfig",
             vec![
                 ArgDesc {
                     name: "lovPort",
@@ -216,7 +216,7 @@ async fn main() -> CaResult<()> {
                     arg_type: ArgType::String,
                 },
             ],
-            "LoveConfig lovPort addr model",
+            "drvLoveConfig lovPort addr model",
             move |args: &[ArgValue], _ctx: &CommandContext| {
                 let lov_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
@@ -232,11 +232,11 @@ async fn main() -> CaResult<()> {
                 };
 
                 let table = love::registry::lookup(&lov_port)
-                    .ok_or_else(|| format!("LoveConfig::failure to locate port {lov_port}"))?;
+                    .ok_or_else(|| format!("drvLoveConfig::failure to locate port {lov_port}"))?;
                 let model = Model::parse(&model_str)
-                    .ok_or_else(|| format!("LoveConfig::unsupported model \"{model_str}\""))?;
+                    .ok_or_else(|| format!("drvLoveConfig::unsupported model \"{model_str}\""))?;
                 if !(1..=K_INSTRMAX as i32).contains(&addr) {
-                    return Err(format!("LoveConfig: addr {addr} out of range"));
+                    return Err(format!("drvLoveConfig: addr {addr} out of range"));
                 }
                 table.lock().unwrap()[(addr - 1) as usize] = model;
 

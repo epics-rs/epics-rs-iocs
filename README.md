@@ -1009,7 +1009,7 @@ Records, by db file (all under `$(P)` prefix):
 
 `drivers/love` is an asyn port driver for Love 1600/16A PID controllers on
 a shared RS-485 multi-drop line, using the checksummed ASCII frame format
-and per-address model configuration (`LoveInit` for the port, `LoveConfig`
+and per-address model configuration (`drvLoveInit` for the port, `drvLoveConfig`
 per bus address) that the C driver uses. EOS (ACK `0x06` in / ETX `0x03`
 out) is hardcoded by the driver itself, not the startup script.
 
