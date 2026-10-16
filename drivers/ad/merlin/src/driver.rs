@@ -19,6 +19,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
@@ -569,6 +570,23 @@ impl PortDriver for MerlinDetector {
         };
 
         self.ad.port_base.call_param_callbacks(0)?;
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "merlinDetector:writeInt32: error, status={}, reason={reason} value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("merlinDetector:writeInt32: reason={reason}, value={value}"),
+            ),
+        }
         status
     }
 
@@ -604,10 +622,27 @@ impl PortDriver for MerlinDetector {
             Ok(())
         };
 
-        if status.is_err() {
-            self.ad
-                .port_base
-                .set_float64_param(reason, user.addr, old)?;
+        match &status {
+            Err(e) => {
+                self.ad
+                    .port_base
+                    .set_float64_param(reason, user.addr, old)?;
+                user.print(
+                    TraceMask::ERROR,
+                    file!(),
+                    line!(),
+                    format_args!(
+                        "merlinDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                        e.status() as i32
+                    ),
+                );
+            }
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}"),
+            ),
         }
         self.ad.port_base.call_param_callbacks(0)?;
         status
