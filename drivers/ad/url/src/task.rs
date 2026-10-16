@@ -172,7 +172,11 @@ async fn acquire_one_image(
     ));
 
     let end_ts = EpicsTimestamp::now();
-    let mut array = ctx.pool.wrap(decoded.dims, decoded.data);
+    // C dereferences a refused alloc unchecked (URLDriver.cpp:133); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.wrap(decoded.dims, decoded.data) else {
+        return Ok(());
+    };
     array.unique_id = image_counter;
     array.timestamp = end_ts;
     array.time_stamp = start_time.as_f64();
