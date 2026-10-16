@@ -521,13 +521,9 @@ async fn read_f64(ctx: &AcquisitionContext, reason: usize) -> f64 {
 
 async fn read_string(ctx: &AcquisitionContext, reason: usize) -> String {
     ctx.handle
-        .read_octet(reason, 0, MAX_FILENAME_LEN)
+        .get_string_param(reason, 0, MAX_FILENAME_LEN)
         .await
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .trim_end_matches('\0')
-                .to_string()
-        })
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
 }
 

@@ -182,10 +182,12 @@ impl Fixture {
     }
 
     fn string(&self, reason: usize) -> String {
-        let bytes = self.sync.read_octet(reason, 256).expect("string parameter");
-        String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .to_string()
+        let bytes = self
+            .detector
+            .port_handle()
+            .get_string_param_blocking(reason, 0, 256)
+            .expect("string parameter");
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// The next array the plugin is handed, or nothing within `timeout`.
