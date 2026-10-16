@@ -91,13 +91,14 @@ mod tests {
     fn a_port_refusing_both_eos_still_connects() {
         let name = "SP_NOEOS";
         let driver = NoEos(PortDriverBase::new(name, 1, PortFlags::default()));
-        let (rt, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
-        epics_rs::asyn::asyn_record::register_port(
-            name,
-            rt.port_handle().clone(),
-            &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
-        )
-        .unwrap();
+        let claim = epics_rs::asyn::registry::claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(
+                rt.port_handle().clone(),
+                &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
+            )
+            .unwrap();
         assert!(connect_octet(name, 0, Duration::from_secs(1)).is_ok());
     }
 }
