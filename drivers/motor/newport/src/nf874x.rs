@@ -325,6 +325,11 @@ impl AsynMotor for Nf874xAxis {
         self.send(&[format!("{} DH {position:.6}", self.name)])
     }
 
+    /// The same `DH` as [`Self::set_position`], as C's `setEncoderPosition`.
+    fn set_encoder_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.send(&[format!("{} DH {position:.6}", self.name)])
+    }
+
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         self.closed_loop(enable)
     }
