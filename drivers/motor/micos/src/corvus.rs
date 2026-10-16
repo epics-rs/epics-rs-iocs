@@ -331,7 +331,6 @@ impl AsynMotor for CorvusAxis {
             velocity: 0.0,
             done: !moving,
             moving,
-            direction: true,
             has_encoder: true,
             high_limit,
             low_limit,
