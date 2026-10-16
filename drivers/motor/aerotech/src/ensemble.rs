@@ -15,7 +15,7 @@
 //! frame. At the asyn-rs `AsynMotor` boundary (dial-frame EGU) that scaling
 //! cancels, so it is dropped: the driver works in the controller's user units
 //! natively, and the record's `MRES` must be `stepSize` (raw counts are
-//! integers). Command values are formatted to [`PRECISION`]
+//! integers). Command values are formatted to `PRECISION`
 //! decimal places (the C derived a per-axis digit count from `stepSize`; with
 //! `stepSize` dropped a fixed precision is used).
 //!
