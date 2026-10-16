@@ -2,9 +2,8 @@
 //!
 //! Ported from `motorAcsMotion/acsMotionApp/src/SPiiPlusDriver.cpp` +
 //! `SPiiPlusCommDriver.cpp` (the model-3 `asynMotorController`/`asynMotorAxis`
-//! driver). Commands are ACSPL+ text terminated by CR (`\r`); the driver owns
-//! output framing and the startup script sets only the input EOS (`\r`), as in
-//! the C module's `ACS_Motion.iocsh` (`asynOctetSetInputEos ... "\r"`). A reply
+//! driver). Commands are ACSPL+ text terminated by CR (`\r`); the port EOS is
+//! `\r` both ways, set at connect (see [`INPUT_EOS`]). A reply
 //! whose first character is `?` is a controller error (`?<errno>`), matching the
 //! C `writeReadAck`/`writeReadDouble` check `inString[0] == '?'`. Axes are
 //! addressed by 0-based index on the wire.
@@ -64,8 +63,10 @@ use motor_common::util::{atof, atoi};
 /// Response buffer size (C `MAX_CONTROLLER_STRING_SIZE` is 256).
 const READ_BUF: usize = 256;
 
-/// Command terminator (C port EOS `\r`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect: C sets it in ACS_Motion.iocsh:28-29 and
+/// SPiiPlusCommDriver.cpp:425-426 restores it after every binary poll.
+pub const INPUT_EOS: &[u8] = b"\r";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Motor-status (`MST`) bit masks (C `SPiiPlusDriver::poll`).
 const MST_ENABLED: i32 = 1 << 0;
@@ -193,13 +194,6 @@ impl SpiiPlusController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and return its reply (trimmed of CR/LF/NUL/`:` prompt and
     /// spaces). A reply whose first character is `?` is a controller error
     /// (`?<errno>`), returned as an [`AsynError`] (C `writeReadAck`). A
@@ -207,7 +201,7 @@ impl SpiiPlusController {
     /// trimming); a query replies with the value.
     fn command(&self, cmd: &str) -> AsynResult<String> {
         // C SPiiPlusComm::writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string();
         if text.starts_with('?') {
