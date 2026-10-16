@@ -43,7 +43,21 @@ dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,
 # Plugin chain
 < $(ADSIMDETECTOR)/simDetectorPlugins.cmd
 
-# iocInit is called automatically by IocApplication after this script completes.
+# Create a standard arrays plugin, set it to get data from FFT plugin.
+NDStdArraysConfigure("Image2", 3, 0, "FFT1", 0)
+
+# This waveform allows transporting 64-bit images, so it can handle any detector data type at the expense of more memory and bandwidth
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image2:,PORT=Image2,ADDR=0,TIMEOUT=1,NDARRAY_PORT=FFT1,TYPE=Float64,FTVL=DOUBLE,NELEMENTS=12000000")
+
+set_requestfile_path("$(ADSIMDETECTOR)/db")
+
+asynSetTraceIOMask("$(PORT)",0,2)
+
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
+
 #
 # Example interactive commands:
 #   dbl                                  # List all PVs
