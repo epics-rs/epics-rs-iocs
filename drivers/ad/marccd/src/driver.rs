@@ -143,8 +143,7 @@ impl PortDriver for MarccdDriver {
         } else if function == params.base.write_file {
             self.send(Cmd::WriteFile);
         } else if function < p.first() {
-            // Base-class parameter: pool controls plus plain stores.
-            status = self.ad.write_int32_pool(function, value).map(|_| ());
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -205,6 +204,12 @@ impl ADDriver for MarccdDriver {
 
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
+    }
+
+    /// `marCCD::setShutter` talks to marServer, so it runs on the worker.
+    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+        self.send(Cmd::SetShutter(open));
+        Ok(())
     }
 }
 
@@ -408,6 +413,30 @@ mod tests {
         }
         let sent = log.lock().clone();
         (det, sent)
+    }
+
+    /// ADDriver.cpp:96-98 calls the virtual setShutter, which marCCD
+    /// overrides to drive a detector shutter through marServer (:723-729).
+    #[test]
+    fn shutter_control_reaches_marccds_set_shutter() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        let name = "MARCCD_SHUTTER";
+        let log = fake_server(name, |c| if c.starts_with("get_") { "0" } else { "" });
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad) = (det.port_handle(), det.ad_params);
+        h.write_int32_blocking(ad.shutter_mode, 0, ShutterMode::DetectorOnly as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.shutter_control, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !log.lock().iter().any(|c| c.starts_with("shutter,1")) {
+            assert!(Instant::now() < deadline, "shutter,1 never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while h.read_int32_blocking(ad.shutter_status, 0).unwrap() != 1 {
+            assert!(Instant::now() < deadline, "ADShutterStatus stayed closed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

@@ -69,6 +69,9 @@ pub enum Cmd {
     WriteFile,
     /// C's `marCCDStability` branch: `set_stability,<v>` then `getConfig`.
     SetStability(f64),
+    /// `ADDriver::writeInt32`'s `ADShutterControl` call of the virtual
+    /// `marCCD::setShutter` (ADDriver.cpp:96-98, marCCD.cpp:712-750).
+    SetShutter(bool),
 }
 
 /// Everything a worker thread needs to reach the driver.
@@ -609,6 +612,7 @@ async fn cmd_loop(w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
                 srv.write_server(&cmd_set_stability(value)).await;
                 srv.get_config().await;
             }
+            Cmd::SetShutter(open) => w.server.lock().await.set_shutter(open).await,
         }
     }
 }
