@@ -3,7 +3,8 @@
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
 //! `drvAsynSerialPortConfigure`), the IMS iocsh commands
 //! (`ImsMDrivePlusCreateController` and the model-1 `IM483PLSetup` /
-//! `IM483PLConfig`), the motor record type, and the CA + PVA (QSRV) server.
+//! `IM483PLConfig`, `IM483SMSetup` / `IM483SMConfig`), the motor record type,
+//! and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p ims-ioc -- st.cmd
@@ -14,7 +15,8 @@ use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_ims::ioc::{
-    im483pl_config_command, im483pl_setup_command, ims_create_controller_command,
+    im483pl_config_command, im483pl_setup_command, im483sm_config_command, im483sm_setup_command,
+    ims_create_controller_command,
 };
 
 #[epics_rs::base::epics_main]
@@ -45,6 +47,8 @@ async fn main() -> CaResult<()> {
     // ImsRegister.cc's model-1 commands and their DTYPs.
     app = app.register_startup_command(im483pl_setup_command());
     app = app.register_startup_command(im483pl_config_command());
+    app = app.register_startup_command(im483sm_setup_command());
+    app = app.register_startup_command(im483sm_config_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

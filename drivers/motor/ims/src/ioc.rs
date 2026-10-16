@@ -22,7 +22,10 @@ use motor_common::iocsh::{
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::{asyn_user, install, model1_device, register_port};
 
-use crate::drv_im483::{DrvIm483Axis, IM483PL_NUM_CARDS, Im483Controller, im483pl_probe};
+use crate::drv_im483::{
+    DrvIm483Axis, IM483PL_NUM_CARDS, IM483SM_NUM_CARDS, Im483Controller, im483pl_probe,
+    im483sm_probe,
+};
 use crate::mdriveplus::{DRIVER_NAME, INPUT_EOS, ImsMDrivePlusAxis, OUTPUT_EOS};
 
 /// C `IMS_TIMEOUT` (ImsMDrivePlusMotorAxis.h:17).
@@ -127,6 +130,49 @@ pub fn im483pl_config_command() -> CommandDef {
                 )));
                 IM483PL.install(ctx, card, signal as i32, motor)?;
             }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devIM483SM,"IM483SM")` (devImsMotor.dbd).
+static DEV_IM483SM: DevSup = model1_device("devIM483SM", "IM483SM");
+
+static IM483SM: Model1 = Model1::new(&DEV_IM483SM, IM483SM_NUM_CARDS, SCAN_RATE);
+
+/// `IM483SMSetup(num_cards, scan_rate)`.
+pub fn im483sm_setup_command() -> CommandDef {
+    IM483SM.setup_command("IM483SMSetup")
+}
+
+/// `IM483SMConfig(card, name)`: one axis per card, probed at once as for
+/// [`im483pl_config_command`].
+pub fn im483sm_config_command() -> CommandDef {
+    CommandDef::new(
+        "IM483SMConfig",
+        config_args(),
+        "IM483SMConfig(card, name)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !IM483SM.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                COMM_TIMEOUT,
+                b"\r\n",
+                b"\r",
+                EosRefusal::Ignored,
+            )?;
+            let controller = Im483Controller::new(handle);
+            if !im483sm_probe(&controller) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let controller = Arc::new(Mutex::new(controller));
+            let motor: Arc<Mutex<dyn AsynMotor>> =
+                Arc::new(Mutex::new(DrvIm483Axis::im483sm(controller)));
+            IM483SM.install(ctx, card, 0, motor)?;
             Ok(CommandOutcome::Continue)
         },
     )

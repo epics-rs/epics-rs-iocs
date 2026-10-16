@@ -1,10 +1,14 @@
-//! The model-1 IM483 drivers (`drvIM483PL.cc` + `devIM483PL.cc`): records
-//! reach axis `signal` of `card` through `DTYP "IM483PL"`.
+//! The model-1 IM483 drivers (`drvIM483PL.cc` + `devIM483PL.cc`,
+//! `drvIM483SM.cc` + `devIM483SM.cc`): records reach axis `signal` of `card`
+//! through `DTYP "IM483PL"` or `"IM483SM"`.
 //!
 //! The party-line IM483PL prefixes every command with the axis name and a
-//! space. Each command is answered by one line, which is read and dropped.
+//! space; the single-axis IM483SM sends it bare. Each command is answered by
+//! one line, which is read and dropped.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::sleep;
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
@@ -19,6 +23,9 @@ pub const IM483PL_NUM_CARDS: i32 = 8;
 pub const IM483PL_MAX_AXES: usize = 8;
 /// `IM483PL_axis[]`.
 const IM483PL_AXIS: [&str; IM483PL_MAX_AXES] = ["A", "B", "C", "D", "E", "F", "G", "H"];
+
+/// `IM483SM_NUM_CARDS`.
+pub const IM483SM_NUM_CARDS: i32 = 8;
 
 /// `BUFF_SIZE`.
 const BUFF_SIZE: usize = 50;
@@ -63,6 +70,29 @@ pub fn im483pl_probe(ctrl: &Im483Controller) -> usize {
         .count()
 }
 
+/// `motor_init`'s probe of an IM483SM, three tries: reset with ETX, wait a
+/// second, send a space and read the sign-on. True when it answered; the
+/// rest of the sign-on, up to `BUFF_SIZE` characters, is read and dropped,
+/// as C keeps it only for `dbior`.
+pub fn im483sm_probe(ctrl: &Im483Controller) -> bool {
+    (0..3).any(|_| {
+        let _ = ctrl.handle.write_octet(0, b"\x03");
+        sleep(Duration::from_secs(1));
+        let first = ctrl.ask(" ");
+        if first.is_empty() {
+            return false;
+        }
+        let mut read = first.len();
+        while read < BUFF_SIZE {
+            match ctrl.handle.read_octet(0, BUFF_SIZE) {
+                Ok(line) if !line.is_empty() => read += line.len(),
+                _ => break,
+            }
+        }
+        true
+    })
+}
+
 /// One axis of a model-1 IM483 card.
 pub struct DrvIm483Axis {
     controller: Arc<Mutex<Im483Controller>>,
@@ -84,6 +114,16 @@ impl DrvIm483Axis {
                 has_encoder: true,
                 ..MotorStatus::default()
             },
+            position: 0,
+        }
+    }
+
+    /// The one axis of an IM483SM, which C takes to have no encoder.
+    pub fn im483sm(controller: Arc<Mutex<Im483Controller>>) -> Self {
+        Self {
+            controller,
+            prefix: String::new(),
+            status: MotorStatus::default(),
             position: 0,
         }
     }
