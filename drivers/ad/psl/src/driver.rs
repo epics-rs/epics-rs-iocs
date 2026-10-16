@@ -341,7 +341,6 @@ impl PslDetector {
             self.ad
                 .port_base
                 .set_string_param(self.ad.params.base.file_path, 0, path)?;
-            self.check_path()?;
         }
 
         if self.supports("RecordName") {
@@ -888,5 +887,62 @@ mod tests {
         assert_eq!(det.get_i32(p.file_path_exists), 1);
         let _ = det.write_octet(&mut AsynUser::new(p.file_path), b"");
         assert_eq!(det.get_i32(p.file_path_exists), 1);
+    }
+
+    /// A PSLViewer that answers every command with `reply`.
+    struct FakeServer {
+        base: PortDriverBase,
+        reply: Vec<u8>,
+    }
+
+    impl PortDriver for FakeServer {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let n = self.reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.reply[..n]);
+            Ok(n)
+        }
+    }
+
+    /// getConfig stores GetRecordPath's answer as it came, without
+    /// `checkPath` (PSL.cpp:453-459).
+    #[test]
+    fn get_config_stores_the_record_path_unchecked() {
+        let name = "PSL_RECORD_PATH";
+        let dir = std::env::temp_dir().display().to_string();
+        let dir = dir.trim_end_matches('/').to_string();
+        let ip = format!("{name}_IP");
+        let mut base = PortDriverBase::new(&ip, 1, Default::default());
+        base.init_connected(true);
+        let server = FakeServer {
+            base,
+            reply: dir.clone().into_bytes(),
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(&ip).unwrap(), server, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PslDetector::new(name, PslServer::new(handle), 1 << 20, shared, tx).unwrap();
+        det.state.valid_options = ["RecordPath".to_string()].into();
+        let p = det.ad.params.base;
+        det.get_config().unwrap();
+        let stored =
+            String::from_utf8_lossy(det.ad.port_base.get_string_param(p.file_path, 0).unwrap())
+                .into_owned();
+        assert_eq!(stored, dir);
+        assert_eq!(det.get_i32(p.file_path_exists), 0);
     }
 }
