@@ -122,9 +122,7 @@ impl SimDetector {
                     .port_base
                     .set_int32_param(self.ad.params.shutter_status, 0, v);
             }
-            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => {
-                let _ = self.ad.set_shutter(open);
-            }
+            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => self.ad.set_shutter(open),
         }
     }
 }

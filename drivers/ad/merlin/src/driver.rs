@@ -567,7 +567,8 @@ impl PortDriver for MerlinDetector {
         } else if reason < self.params.first() {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
             if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0)
+                self.ad.set_shutter(value != 0);
+                Ok(())
             } else {
                 self.ad.write_int32_pool(reason, value).map(|_| ())
             }
