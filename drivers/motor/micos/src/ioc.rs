@@ -107,14 +107,20 @@ pub fn hydra_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_ip(&hydra_port, HYDRA_TIMEOUT)?;
-            let controller = Arc::new(Mutex::new(HydraController::new(handle)));
-
             register_port(ctx, &port_name, num_axes as i32)?;
 
+            let (handle, _) = connect_controller(
+                &hydra_port,
+                HYDRA_TIMEOUT,
+                &port_name,
+                format_args!(
+                    "SMChydraController::SMChydraController: cannot connect to SMC hydra controller"
+                ),
+            );
+            let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+
             for index in 0..num_axes as usize {
-                let ax = HydraAxis::new(controller.clone(), index)
-                    .map_err(|e| format!("SMChydraCreateController: axis {index}: {e}"))?;
+                let ax = HydraAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 install(
                     ctx,

@@ -112,18 +112,20 @@ pub struct HydraAxis {
 }
 
 impl HydraAxis {
-    /// Construct axis `axis_no` (0-based) and read its motor form.
-    pub fn new(controller: Arc<Mutex<HydraController>>, axis_no: usize) -> AsynResult<Self> {
+    /// Construct axis `axis_no` (0-based) and read its motor form. C ignores
+    /// the query's status (SMChydraAxis.cpp:15-17), so a controller that does
+    /// not answer leaves the form at `atoi("")`, 0.
+    pub fn new(controller: Arc<Mutex<HydraController>>, axis_no: usize) -> Self {
         let addr = axis_no + 1;
         let motor_form = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            atoi(&ctrl.query(&format!("{addr} getmotor"))?)
+            atoi(&ctrl.query(&format!("{addr} getmotor")).unwrap_or_default())
         };
-        Ok(Self {
+        Self {
             controller,
             axis_no,
             motor_form,
-        })
+        }
     }
 
     fn addr(&self) -> usize {
@@ -315,6 +317,13 @@ impl AsynMotor for HydraAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_axis_of_an_unanswering_controller_is_still_built() {
+        let (handle, _) = SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO);
+        let controller = Arc::new(Mutex::new(HydraController::new(handle)));
+        assert_eq!(HydraAxis::new(controller, 0).motor_form, 0);
+    }
 
     #[test]
     fn status_bits() {
