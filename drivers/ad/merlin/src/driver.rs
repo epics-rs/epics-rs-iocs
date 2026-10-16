@@ -769,10 +769,15 @@ mod tests {
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::sync_io::SyncIOHandle;
 
     /// A detector whose command socket never connects: the writes under test
     /// must not need the device.
     fn detector(name: &str) -> MerlinDetector {
+        detector_sized(name, 1 << 20)
+    }
+
+    fn detector_sized(name: &str, max_memory: usize) -> MerlinDetector {
         let ip = format!("{name}_CMD");
         let driver = DrvAsynIPPort::new(&ip, "127.0.0.1:1").unwrap();
         let (runtime, _) =
@@ -786,7 +791,7 @@ mod tests {
             512,
             512,
             DetectorType::MerlinQuad,
-            1 << 20,
+            max_memory,
             Arc::new(SharedState::new()),
         )
         .unwrap()
@@ -840,6 +845,67 @@ mod tests {
         assert_eq!(
             det.ad.port_base.get_float64_param(threshold, 0).unwrap(),
             0.0
+        );
+    }
+
+    /// The last frame of a Single acquisition under a software trigger;
+    /// returns ADAcquire and SoftwareTrigger after it.
+    fn last_software_triggered_frame(name: &str, max_memory: usize) -> (i32, i32) {
+        let mut det = detector_sized(name, max_memory);
+        let (ad_params, params, init_param) = (det.ad.params, det.params, det.init_param);
+        let pool = det.ad.pool.clone();
+        let shared = det.shared.clone();
+        let base = &mut det.ad.port_base;
+        base.set_int32_param(ad_params.acquire, 0, 1).unwrap();
+        base.set_int32_param(
+            ad_params.trigger_mode,
+            0,
+            TriggerMode::SoftwareTrigger as i32,
+        )
+        .unwrap();
+        base.set_int32_param(params.software_trigger, 0, 1).unwrap();
+        shared.images_remaining.store(1, Ordering::Release);
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle().clone();
+        let ctx = AcquisitionContext {
+            data: MpxConnection::new(handle.clone(), MPX_MAXLINE),
+            handle: handle.clone(),
+            output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()))),
+            pool,
+            ad_params,
+            params,
+            init_param,
+            det_type: DetectorType::MerlinQuad,
+            shared,
+        };
+        let mut body = crate::protocol::tests::quad_header(768, 1);
+        body.resize(768 + 256 * 256 * 2, 0);
+        epics_rs::ad_core::runtime::run_thread(move || async move {
+            let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, default_timeout());
+            crate::task::handle_frame(&ctx, &sync, &body, &mut String::new()).await;
+        })
+        .join()
+        .unwrap();
+        let acquire = handle.read_int32_blocking(ad_params.acquire, 0).unwrap();
+        let trigger = handle
+            .read_int32_blocking(params.software_trigger, 0)
+            .unwrap();
+        std::mem::forget(runtime);
+        (acquire, trigger)
+    }
+
+    /// merlinDetector.cpp:209/:242: a frame the pool refuses `continue`s past
+    /// the software-trigger reset and the completion (:290-305).
+    #[test]
+    fn a_refused_last_frame_leaves_the_acquisition_running() {
+        assert_eq!(
+            last_software_triggered_frame("MERLIN_LAST_OK", 1 << 20),
+            (0, 0)
+        );
+        assert_eq!(
+            last_software_triggered_frame("MERLIN_LAST_REFUSED", 1000),
+            (1, 1)
         );
     }
 }

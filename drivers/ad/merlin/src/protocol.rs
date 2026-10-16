@@ -365,7 +365,7 @@ pub fn parse_mq_header(body: &[u8]) -> Result<MqHeader, MpxError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // --- command codec ---------------------------------------------------
@@ -512,7 +512,7 @@ mod tests {
     /// A Merlin Quad MQ1 header: 1 chip, 256x256, U16, with the optional
     /// field block and one DAC block. Padded to `offset` bytes so the binary
     /// payload starts exactly where the header says it does.
-    fn quad_header(offset: usize, dacs_present: i32) -> Vec<u8> {
+    pub(crate) fn quad_header(offset: usize, dacs_present: i32) -> Vec<u8> {
         let mut text = String::new();
         text.push_str("MQ1,");
         text.push_str("000001,"); // frame number

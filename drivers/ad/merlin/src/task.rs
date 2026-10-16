@@ -137,94 +137,111 @@ async fn data_loop(ctx: AcquisitionContext) {
             }
         };
 
-        let start = EpicsTimestamp::now();
-        let header = protocol::data_header(&body);
+        handle_frame(&ctx, &sync, &body, &mut acquisition_header).await;
+    }
+}
 
-        // The acquisition header is not an image, so it advances no counter.
-        let mut array_counter = sync
-            .read_int32(ctx.ad_params.base.array_counter)
-            .unwrap_or(0);
-        if header != DataHeader::Acquisition {
-            let images = sync
-                .read_int32(ctx.ad_params.num_images_counter)
-                .unwrap_or(0)
-                + 1;
-            array_counter += 1;
-            let _ =
-                ctx.shared
-                    .images_remaining
-                    .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                        if n > 0 { Some(n - 1) } else { None }
-                    });
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
+/// One frame of C `merlinTask` (merlinDetector.cpp:142-305). A data frame
+/// that yields no NDArray ends the pass there, as C's `continue` does, so it
+/// neither clears the software trigger nor completes the acquisition.
+pub(crate) async fn handle_frame(
+    ctx: &AcquisitionContext,
+    sync: &SyncIOHandle,
+    body: &[u8],
+    acquisition_header: &mut String,
+) {
+    let start = EpicsTimestamp::now();
+    let header = protocol::data_header(body);
+
+    // The acquisition header is not an image, so it advances no counter.
+    let mut array_counter = sync
+        .read_int32(ctx.ad_params.base.array_counter)
+        .unwrap_or(0);
+    if header != DataHeader::Acquisition {
+        let images = sync
+            .read_int32(ctx.ad_params.num_images_counter)
+            .unwrap_or(0)
+            + 1;
+        array_counter += 1;
+        let _ = ctx
+            .shared
+            .images_remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                if n > 0 { Some(n - 1) } else { None }
+            });
+        let _ = ctx
+            .handle
+            .set_params_and_notify(
+                0,
+                vec![ParamSetValue::new(
+                    ctx.ad_params.num_images_counter,
                     0,
-                    vec![ParamSetValue::new(
-                        ctx.ad_params.num_images_counter,
-                        0,
-                        ParamValue::Int32(images),
-                    )],
-                )
-                .await;
-        }
+                    ParamValue::Int32(images),
+                )],
+            )
+            .await;
+    }
 
-        let array_callbacks = sync
-            .read_int32(ctx.ad_params.base.array_callbacks)
-            .unwrap_or(1)
-            != 0;
+    let array_callbacks = sync
+        .read_int32(ctx.ad_params.base.array_callbacks)
+        .unwrap_or(1)
+        != 0;
 
-        if array_callbacks {
-            match header {
-                DataHeader::Acquisition => {
-                    let text = String::from_utf8_lossy(&body);
-                    let end = text.len().min(MPX_ACQUISITION_HEADER_LEN);
-                    acquisition_header = text[..end].to_string();
-                }
-                DataHeader::QuadData => {
-                    publish_image(&ctx, &body, array_counter, start, &acquisition_header).await;
-                }
-                DataHeader::Profile => {
-                    publish_profiles(&ctx, &body, array_counter, start, &acquisition_header).await;
-                }
-                DataHeader::Unknown => {
-                    trace(&ctx.handle, "Unknown header type 3");
-                }
+    if array_callbacks {
+        let published = match header {
+            DataHeader::Acquisition => {
+                let text = String::from_utf8_lossy(body);
+                let end = text.len().min(MPX_ACQUISITION_HEADER_LEN);
+                *acquisition_header = text[..end].to_string();
+                true
             }
+            DataHeader::QuadData => {
+                publish_image(ctx, body, array_counter, start, acquisition_header).await
+            }
+            DataHeader::Profile => {
+                publish_profiles(ctx, body, array_counter, start, acquisition_header).await
+            }
+            DataHeader::Unknown => {
+                trace(&ctx.handle, "Unknown header type 3");
+                true
+            }
+        };
+        if !published {
+            return;
         }
+    }
 
-        // A software trigger is one-shot: clear it once its frame arrives.
-        let trigger = sync.read_int32(ctx.ad_params.trigger_mode).unwrap_or(0);
-        if trigger == TriggerMode::SoftwareTrigger as i32 {
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
+    // A software trigger is one-shot: clear it once its frame arrives.
+    let trigger = sync.read_int32(ctx.ad_params.trigger_mode).unwrap_or(0);
+    if trigger == TriggerMode::SoftwareTrigger as i32 {
+        let _ = ctx
+            .handle
+            .set_params_and_notify(
+                0,
+                vec![ParamSetValue::new(
+                    ctx.params.software_trigger,
                     0,
-                    vec![ParamSetValue::new(
-                        ctx.params.software_trigger,
+                    ParamValue::Int32(0),
+                )],
+            )
+            .await;
+    }
+
+    if ctx.shared.images_remaining.load(Ordering::Acquire) == 0 {
+        let _ = ctx
+            .handle
+            .set_params_and_notify(
+                0,
+                vec![
+                    ParamSetValue::new(ctx.ad_params.acquire, 0, ParamValue::Int32(0)),
+                    ParamSetValue::new(
+                        ctx.ad_params.status,
                         0,
-                        ParamValue::Int32(0),
-                    )],
-                )
-                .await;
-        }
-
-        if ctx.shared.images_remaining.load(Ordering::Acquire) == 0 {
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
-                    0,
-                    vec![
-                        ParamSetValue::new(ctx.ad_params.acquire, 0, ParamValue::Int32(0)),
-                        ParamSetValue::new(
-                            ctx.ad_params.status,
-                            0,
-                            ParamValue::Int32(ADStatus::Idle as i32),
-                        ),
-                    ],
-                )
-                .await;
-        }
+                        ParamValue::Int32(ADStatus::Idle as i32),
+                    ),
+                ],
+            )
+            .await;
     }
 }
 
@@ -270,16 +287,17 @@ fn build_attributes(parsed: &[(String, NDAttrValue)], acquisition_header: &str) 
     attrs
 }
 
+/// False when no NDArray went out (C's `pImage == NULL`).
 async fn publish_image(
     ctx: &AcquisitionContext,
     body: &[u8],
     array_counter: i32,
     start: EpicsTimestamp,
     acquisition_header: &str,
-) {
+) -> bool {
     let header = match protocol::parse_mq_header(body) {
         Ok(h) => h,
-        Err(_) => return,
+        Err(_) => return false,
     };
     if !matches!(header.pixel_depth, 8 | 16 | 32) {
         trace(
@@ -287,7 +305,7 @@ async fn publish_image(
             &format!("Unsupported bit depth {}", header.pixel_depth),
         );
         set_status_message(ctx, "Error: Unsupported bit depth").await;
-        return;
+        return false;
     }
     let data = match image::decode_image(
         body,
@@ -300,7 +318,7 @@ async fn publish_image(
         Ok(d) => d,
         Err(_) => {
             set_status_message(ctx, "Error: unsupported frame").await;
-            return;
+            return false;
         }
     };
 
@@ -320,25 +338,27 @@ async fn publish_image(
             ),
         );
         set_status_message(ctx, "Error: run out of buffers in detector driver").await;
-        return;
+        return false;
     };
     array.unique_id = array_counter;
     array.timestamp = start;
     array.time_stamp = start.as_f64();
     array.attributes = build_attributes(&header.attrs, acquisition_header);
     publish(ctx, array).await;
+    true
 }
 
+/// False when no NDArray went out (C's `pImage == NULL`).
 async fn publish_profiles(
     ctx: &AcquisitionContext,
     body: &[u8],
     array_counter: i32,
     start: EpicsTimestamp,
     acquisition_header: &str,
-) {
+) -> bool {
     let header = match protocol::parse_mq_header(body) {
         Ok(h) => h,
-        Err(_) => return,
+        Err(_) => return false,
     };
     // The device echoes the PROFILES mask it acquired with; we can only lay
     // out a frame that carries both profiles and the sum.
@@ -351,7 +371,7 @@ async fn publish_profiles(
                 header.profile_select
             ),
         );
-        return;
+        return false;
     }
 
     let profiles = match image::decode_profiles(
@@ -362,7 +382,7 @@ async fn publish_profiles(
         ctx.det_type.swaps_pixels(),
     ) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let stride = header.x_size.max(header.y_size);
@@ -378,7 +398,7 @@ async fn publish_profiles(
         ctx.data
             .trace("merlinDetector:copyProfileToNDArray32: unable to allocate NDArray from pool");
         set_status_message(ctx, "Error: run out of buffers in detector driver").await;
-        return;
+        return false;
     };
 
     let _ = ctx
@@ -405,6 +425,7 @@ async fn publish_profiles(
     array.time_stamp = start.as_f64();
     array.attributes = build_attributes(&header.attrs, acquisition_header);
     publish(ctx, array).await;
+    true
 }
 
 /// Update the NDArray metadata parameters and hand the array to the plugins.
