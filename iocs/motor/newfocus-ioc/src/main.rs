@@ -1,8 +1,9 @@
-//! Newport New Focus PMNC 8750/8752 picomotor motor IOC.
+//! Newport New Focus picomotor motor IOC: PMNC 8750/8752 and 8742/8743-CL.
 //!
 //! Assembles: a TCP octet port (`drvAsynIPPortConfigure`), the New Focus
-//! PMNC controller (`PMNC87xxSetup`/`PMNC87xxConfig`), the motor record type, and
-//! the CA + PVA (QSRV) server.
+//! PMNC controller (`PMNC87xxSetup`/`PMNC87xxConfig`), the 874x controller
+//! (`nf874xCreateController`), the motor record type, and the CA + PVA (QSRV)
+//! server.
 //!
 //! Usage:
 //!   cargo run -p newfocus-ioc -- st.cmd
@@ -13,6 +14,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_newport::ioc::{pmnc87xx_config_command, pmnc87xx_setup_command};
+use motor_newport::ioc_nf874x::nf874x_create_controller_command;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -39,6 +41,7 @@ async fn main() -> CaResult<()> {
     // Newport iocsh commands + motor device support.
     app = app.register_startup_command(pmnc87xx_setup_command());
     app = app.register_startup_command(pmnc87xx_config_command());
+    app = app.register_startup_command(nf874x_create_controller_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

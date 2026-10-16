@@ -12,8 +12,8 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::connect_serial;
-use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
-use motor_common::model1::{Model1, SCAN_RATE};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
 use crate::pm304::{Pm304Axis, Pm304Controller};
@@ -43,12 +43,12 @@ pub fn pm304_config_command() -> CommandDef {
         ],
         "PM304Config(card, name, n_axes)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
+            let card = c_int(args, 0);
             if !PM304.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let mut n_axes = req_int(args, 2, "Number of axes")?;
+            let mut n_axes = c_int(args, 2);
             if n_axes == 0 {
                 n_axes = 1; // C: older startup files omit it.
             }

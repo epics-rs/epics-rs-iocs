@@ -1,9 +1,10 @@
-//! IMS MDrivePlus motor IOC.
+//! IMS motor IOC.
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
-//! `drvAsynSerialPortConfigure`), the IMS iocsh command
-//! (`ImsMDrivePlusCreateController`), the motor record type, and the CA + PVA
-//! (QSRV) server.
+//! `drvAsynSerialPortConfigure`), the IMS iocsh commands
+//! (`ImsMDrivePlusCreateController` and the model-1 `IM483PLSetup` /
+//! `IM483PLConfig`, `IM483SMSetup` / `IM483SMConfig`, `MDriveSetup` /
+//! `MDriveConfig`), the motor record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p ims-ioc -- st.cmd
@@ -13,7 +14,10 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_ims::ioc::ims_create_controller_command;
+use motor_ims::ioc::{
+    im483pl_config_command, im483pl_setup_command, im483sm_config_command, im483sm_setup_command,
+    ims_create_controller_command, mdrive_config_command, mdrive_setup_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -40,6 +44,13 @@ async fn main() -> CaResult<()> {
     // IMS config command creates the controller + its single axis on one motor
     // device support (DTYP = motorPort).
     app = app.register_startup_command(ims_create_controller_command());
+    // ImsRegister.cc's model-1 commands and their DTYPs.
+    app = app.register_startup_command(im483pl_setup_command());
+    app = app.register_startup_command(im483pl_config_command());
+    app = app.register_startup_command(im483sm_setup_command());
+    app = app.register_startup_command(im483sm_config_command());
+    app = app.register_startup_command(mdrive_setup_command());
+    app = app.register_startup_command(mdrive_config_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

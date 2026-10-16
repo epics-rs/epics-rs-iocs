@@ -1,0 +1,22 @@
+# drvMotorSim.c's model-2 simulator: one motor record per axis, signal S of
+# card C, as motorSimTest.db. Positions are raw steps: MRES 0.001 makes the
+# motorSimCreate limits (steps) ±22/42 mm.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "Motor Simulation")
+    field(OUT,  "#C$(C) S$(S) @motorSim")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1)")
+    field(VBAS, "0")
+    field(VMAX, "$(VMAX=1)")
+    field(HVEL, "$(HVEL=1)")
+    field(ACCL, "$(ACCL=1)")
+    field(BDST, "0.01")
+    field(BVEL, "0.1")
+    field(BACC, "0.1")
+    field(DHLM, "$(HLM=30)")
+    field(DLLM, "$(LLM=-30)")
+    field(MRES, "$(MRES=0.001)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=5)")
+}

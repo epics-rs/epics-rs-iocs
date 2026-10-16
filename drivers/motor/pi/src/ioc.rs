@@ -9,7 +9,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::{EosRefusal, connect_with_eos};
-use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
 use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
@@ -78,12 +78,12 @@ pub fn pic862_config_command() -> CommandDef {
         ],
         "PIC862Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIC862.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let addr = req_int(args, 2, "asyn address (GPIB)")?;
+            let addr = c_int(args, 2);
             if !(0..=15).contains(&addr) {
                 return Err("PIC862Config: addr must be 0-15".into());
             }
@@ -130,12 +130,12 @@ pub fn pic663_config_command() -> CommandDef {
         ],
         "PIC663Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIC663.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
             let asyn_port = req_string(args, 1, "asyn port name")?;
-            let addr = req_int(args, 2, "asyn address (GPIB)")?;
+            let addr = c_int(args, 2);
             if !(0..=15).contains(&addr) {
                 return Err("PIC663Config: addr must be 0-15".into());
             }
@@ -217,7 +217,7 @@ pub fn pic630_config_command() -> CommandDef {
         arg_defs,
         "PIC630Config(card, name, cur0, ..., cur8)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIC630.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
@@ -268,7 +268,7 @@ pub fn pic662_config_command() -> CommandDef {
         ],
         "PIC662Config(card, name)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIC662.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
@@ -315,7 +315,7 @@ pub fn pic844_config_command() -> CommandDef {
         ],
         "PIC844Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIC844.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
@@ -365,7 +365,7 @@ pub fn pic848_config_command() -> CommandDef {
         ],
         "PIC848Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIC848.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
@@ -422,7 +422,7 @@ pub fn pie516_config_command() -> CommandDef {
         ],
         "PIE516Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIE516.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
@@ -473,7 +473,7 @@ pub fn pie517_config_command() -> CommandDef {
         ],
         "PIE517Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIE517.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
@@ -524,7 +524,7 @@ pub fn pie710_config_command() -> CommandDef {
         ],
         "PIE710Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIE710.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
@@ -575,7 +575,7 @@ pub fn pie816_config_command() -> CommandDef {
         ],
         "PIE816Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "Card being configured")?;
+            let card = c_int(args, 0);
             if !PIE816.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }

@@ -1,8 +1,8 @@
 //! Simulated motor IOC.
 //!
 //! Assembles: the simulated motor controller (`motorSimCreateController` /
-//! `motorSimConfigAxis`), the motor record type, and the CA + PVA (QSRV)
-//! server. No hardware — the axes integrate their own trajectories, so this is
+//! `motorSimConfigAxis`, and drvMotorSim.c's `motorSimCreate`), the motor
+//! record type, and the CA + PVA (QSRV) server. No hardware — the axes integrate their own trajectories, so this is
 //! a self-contained motor-record test/demo target.
 //!
 //! Usage:
@@ -11,7 +11,7 @@
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_motorsim::ioc::MotorSimHolder;
+use motor_motorsim::ioc::{MotorSimHolder, motor_sim_create_command};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -37,6 +37,8 @@ async fn main() -> CaResult<()> {
     let holder = MotorSimHolder::new();
     app = app.register_startup_command(holder.create_controller_command());
     app = app.register_startup_command(holder.config_axis_command());
+    // motorSimCreate and its "Motor Simulation" DTYP (drvMotorSim.c).
+    app = app.register_startup_command(motor_sim_create_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

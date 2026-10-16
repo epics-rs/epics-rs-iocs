@@ -737,7 +737,7 @@ const TCLCALL_PORT: i32 = 5001;
 const TCLCALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// `tclcall(tclName, taskName, args)` (tclCall.cc): run a TCL script on
-/// the XPS at [`TCLCALL_IP`] over a socket of its own.
+/// the XPS at `TCLCALL_IP` over a socket of its own.
 pub fn tclcall_command() -> CommandDef {
     CommandDef::new(
         "tclcall",
@@ -1646,14 +1646,14 @@ fn model1_config_args() -> Vec<ArgDesc> {
 fn model1_config_command(
     name: &'static str,
     driver: &'static Model1,
-    build: fn(&CommandContext, i64, &str) -> Result<(), String>,
+    build: fn(&CommandContext, i32, &str) -> Result<(), String>,
 ) -> CommandDef {
     CommandDef::new(
         name,
         model1_config_args(),
         format!("{name}(card, name, addr)"),
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = c_int(args, 0) as i64;
+            let card = c_int(args, 0);
             if !driver.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }

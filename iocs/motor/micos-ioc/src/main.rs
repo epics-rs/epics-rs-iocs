@@ -1,10 +1,10 @@
-//! Micos motor IOC (SMC corvus, SMC hydra and SMC Taurus).
+//! Micos motor IOC (SMC corvus, SMC hydra, SMC Taurus and the model-1 MoCo).
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
 //! `drvAsynSerialPortConfigure`), the corvus/hydra/Taurus iocsh commands
 //! (`SMCcorvusCreateController`, `SMChydraCreateController`,
-//! `SMCTaurusCreateController`), the motor record type, and the CA + PVA (QSRV)
-//! server.
+//! `SMCTaurusCreateController`, and the MoCo's `MicosSetup` / `MicosConfig`),
+//! the motor record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p micos-ioc -- st.cmd           # SMC corvus
@@ -17,8 +17,8 @@ use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_micos::ioc::{
-    corvus_create_controller_command, hydra_create_controller_command,
-    taurus_create_controller_command,
+    corvus_create_controller_command, hydra_create_controller_command, micos_config_command,
+    micos_setup_command, taurus_create_controller_command,
 };
 
 #[epics_rs::base::epics_main]
@@ -47,6 +47,9 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(corvus_create_controller_command());
     app = app.register_startup_command(hydra_create_controller_command());
     app = app.register_startup_command(taurus_create_controller_command());
+    // MicosRegister.cc's model-1 commands and the "Micos MoCo" DTYP.
+    app = app.register_startup_command(micos_setup_command());
+    app = app.register_startup_command(micos_config_command());
     app = app.register_dynamic_device_support(
         &epics_rs::motor::devices::devices(),
         epics_rs::motor::devices::device_support_factory(),

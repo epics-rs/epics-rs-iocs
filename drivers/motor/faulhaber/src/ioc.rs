@@ -12,8 +12,8 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::connect_serial;
-use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
-use motor_common::model1::{Model1, SCAN_RATE};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
 use crate::faulhaber::{FaulhaberAxis, FaulhaberController};
@@ -47,11 +47,11 @@ pub fn mcdc2805_config_command() -> CommandDef {
         ],
         "MCDC2805Config(card, modules, name)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
+            let card = c_int(args, 0);
             if !MCDC2805.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
-            let num_motors = req_int(args, 1, "# modules on this serial port")?;
+            let num_motors = c_int(args, 1);
             if !(1..=8).contains(&num_motors) {
                 return Err("MCDC2805Config: numMotors must be 1..=8".into());
             }
