@@ -24,15 +24,15 @@ modbusInterposeConfig("$(ANF2)_IP", 0, 2000, 0)
 drvModbusAsynConfigure("$(ANF2)_In",  "$(ANF2)_IP", 0, 4,  0,    20, "INT16",       100, "ANF2_stepper")
 drvModbusAsynConfigure("$(ANF2)_Out", "$(ANF2)_IP", 0, 16, 1024, 20, "INT32_LE_BS", 0,   "ANF2_stepper")
 
-# ANF2CreateController(portName, inPort, outPort, numAxes)
+# ANF2CreateController(portName, ANF2InPortName, ANF2OutPortName, numAxes)
 ANF2CreateController("$(ANF2)", "$(ANF2)_In", "$(ANF2)_Out", 2)
 
-# ANF2CreateAxis(portName, axis, hexConfig, baseSpeed, homingTimeout, [movingPollMs], [idlePollMs])
-ANF2CreateAxis("$(ANF2)", 0, "0x86280000", 100, 0, 100, 1000)
-ANF2CreateAxis("$(ANF2)", 1, "0x86000000", 100, 0, 100, 1000)
+# ANF2CreateAxis(ANF2Name, axis, hexConfig, baseSpeed, homingTimeout)
+ANF2CreateAxis("$(ANF2)", 0, "0x86280000", 100, 0)
+ANF2CreateAxis("$(ANF2)", 1, "0x86000000", 100, 0)
 
-dbLoadRecords("$(AMCI_IOC)/db/anf2.template", "P=$(P),M=anf2:1,N=0,PORT=$(ANF2)")
-dbLoadRecords("$(AMCI_IOC)/db/anf2.template", "P=$(P),M=anf2:2,N=1,PORT=$(ANF2)")
+dbLoadRecords("$(AMCI_IOC)/db/anf2.template", "P=$(P),M=anf2:1,PORT=$(ANF2),ADDR=0")
+dbLoadRecords("$(AMCI_IOC)/db/anf2.template", "P=$(P),M=anf2:2,PORT=$(ANF2),ADDR=1")
 
 # ------------------------------------------------------------------
 # ANG1 controller: one asyn IP port, a Modbus link, and two Modbus
@@ -45,17 +45,17 @@ modbusInterposeConfig("$(ANG1)_IP", 0, 2000, 0)
 drvModbusAsynConfigure("$(ANG1)_In",  "$(ANG1)_IP", 0, 4, 0,    10, "INT16", 100, "ANG1_stepper")
 drvModbusAsynConfigure("$(ANG1)_Out", "$(ANG1)_IP", 0, 6, 1024, 10, "INT16", 0,   "ANG1_stepper")
 
-# ANG1CreateController(portName, inPort, outPort, numAxes, [movingPollMs], [idlePollMs])
+# ANG1CreateController(portName, ANG1InPortName, ANG1OutPortName, numAxes,
+#                      movingPollPeriod, idlePollPeriod), periods in ms
 ANG1CreateController("$(ANG1)", "$(ANG1)_In", "$(ANG1)_Out", 1, 100, 0)
 
-dbLoadRecords("$(AMCI_IOC)/db/ang1.template", "P=$(P),M=ang1:1,N=0,PORT=$(ANG1)")
+dbLoadRecords("$(AMCI_IOC)/db/ang1.template", "P=$(P),M=ang1:1,PORT=$(ANG1),ADDR=0")
 
 iocInit()
 
-# ANF2StartPoller(portName, movingPollPeriod, idlePollPeriod) - accepted for
-# startup-script parity with the C reference (which defers the poller until
-# after iocInit); a no-op in this port since polling already starts
-# automatically once records initialize.
+# ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod), periods in ms.
+# The rs axes already poll from iocInit at 100/1000 ms; this only checks the
+# port exists.
 ANF2StartPoller("$(ANF2)", 200, 1000)
 
 # Example:

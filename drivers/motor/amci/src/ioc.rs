@@ -1,16 +1,9 @@
 //! iocsh commands for the AMCI controllers.
 //!
 //! - **ANF2** (`ANF2CreateController` + `ANF2CreateAxis` + `ANF2StartPoller`):
-//!   three commands, mirroring C — the first connects the In/Out Modbus ports
-//!   and registers a shared controller keyed by *port name* (C looks the
-//!   controller back up by port name via `findAsynPortDriver`, so the
-//!   registry here is `String`-keyed rather than the `i64`-card keying
-//!   `smaract`'s two-step commands use); the second looks it up and installs
-//!   one axis (`DTYP` `{portName}_{axis}`). Poll intervals move to
-//!   `ANF2CreateAxis` — C's `ANF2CreateAxis` has none (they only exist on the
-//!   deferred `ANF2StartPoller`) — because `MotorHolder::install` needs them
-//!   at axis-install time; `ANF2StartPoller` is accepted for startup-script
-//!   parity but is a no-op — see its doc comment.
+//!   three commands, as C. The first connects the In/Out Modbus ports and
+//!   creates controller port `portName`; the second looks it up by port name
+//!   (C `findAsynPortDriver`) and adds one axis, `@asyn(portName,axis)`.
 //! - **ANG1** (`ANG1CreateController`): single command — connects the ports
 //!   and installs all `numAxes` axes immediately, matching the C constructor.
 
@@ -21,9 +14,10 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
+    DEFAULT_IDLE_POLL_MS, DEFAULT_MOVING_POLL_MS, arg_int_opt, arg_int_req, arg_str_req,
+    poll_intervals, req_int, req_string,
 };
-use motor_common::{MotorHolder, asyn_user};
+use motor_common::{PortDriver, asyn_user, install, register_port};
 
 use crate::anf2::{Anf2Axis, Anf2Controller, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1Controller};
@@ -41,176 +35,154 @@ pub fn anf2_create_controller_command() -> CommandDef {
     CommandDef::new(
         "ANF2CreateController",
         vec![
-            arg_str_req("portName"),
-            arg_str_req("inPort"),
-            arg_str_req("outPort"),
-            arg_int_req("numAxes"),
+            arg_str_req("Port name"),
+            arg_str_req("ANF2 In port name"),
+            arg_str_req("ANF2 Out port name"),
+            arg_int_req("Number of axes"),
         ],
-        "ANF2CreateController(portName, inPort, outPort, numAxes) - Create an AMCI \
-         ANF2 controller (Modbus In/Out ports created by drvModbusAsynConfigure); \
-         add axes with ANF2CreateAxis",
+        "ANF2CreateController(portName, ANF2InPortName, ANF2OutPortName, numAxes)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let port_name = req_string(args, 0, "portName")?;
-            let in_port = req_string(args, 1, "inPort")?;
-            let out_port = req_string(args, 2, "outPort")?;
+            let port_name = req_string(args, 0, "Port name")?;
+            let in_port = req_string(args, 1, "In port name")?;
+            let out_port = req_string(args, 2, "Out port name")?;
             // Stricter than C by design: C (ANF2Driver.cpp:88-97) clamps only
             // the upper bound and lets a negative/zero numAxes through. Clamp
             // the lower bound to 0 as well. This is a defensive narrowing, not
             // a behavioral divergence — the only runtime use of num_axes is the
             // `axes_created != num_axes` poll gate, which a zero-clamped value
             // and a negative C value both leave permanently un-satisfied.
-            let num_axes = req_int(args, 3, "numAxes")?.clamp(0, MAX_AXES as i64) as usize;
+            let num_axes = req_int(args, 3, "Number of axes")?.clamp(0, MAX_AXES as i64) as usize;
 
             let controller = Anf2Controller::new(&in_port, &out_port, num_axes)
                 .map_err(|e| format!("ANF2CreateController: {e}"))?;
 
+            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
             anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(port_name.clone(), Arc::new(Mutex::new(controller)));
-
-            println!(
-                "ANF2CreateController: portName={port_name} inPort={in_port} \
-                 outPort={out_port} numAxes={num_axes} (add axes with ANF2CreateAxis)"
-            );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build `ANF2CreateAxis(portName, axis, hexConfig, baseSpeed, homingTimeout,
-/// [movingPollMs], [idlePollMs])` bound to `holder`. C's `ANF2CreateAxis` has
-/// no poll-interval arguments (those live on `ANF2StartPoller`); they move
-/// here because `MotorHolder::install` needs them at axis-install time.
-pub fn anf2_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// C `strtoul(hexConfig, NULL, 16)`: leading blanks and an optional `0x`,
+/// then the longest run of hex digits, 0 when there is none; `None` where C's
+/// `errno` is set (overflow).
+fn strtoul_hex(text: &str) -> Option<u64> {
+    let text = text.trim_start();
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+    let end = text
+        .find(|c: char| !c.is_ascii_hexdigit())
+        .unwrap_or(text.len());
+    match &text[..end] {
+        "" => Some(0),
+        digits => u64::from_str_radix(digits, 16).ok(),
+    }
+}
+
+/// Build `ANF2CreateAxis(ANF2Name, axis, hexConfig, baseSpeed, homingTimeout)`,
+/// printing what C's does. C starts no poller until `ANF2StartPoller`; here the
+/// axis polls at the default periods from `iocInit`.
+pub fn anf2_create_axis_command() -> CommandDef {
     CommandDef::new(
         "ANF2CreateAxis",
         vec![
-            arg_str_req("portName"),
-            arg_int_req("axis"),
-            arg_str_req("hexConfig"),
-            arg_int_req("baseSpeed"),
-            arg_int_req("homingTimeout"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_str_req("Port name"),
+            arg_int_req("Axis number"),
+            arg_str_req("Hex config"),
+            arg_int_req("Base speed"),
+            arg_int_req("Homing timeout"),
         ],
-        "ANF2CreateAxis(portName, axis, hexConfig, baseSpeed, homingTimeout, \
-         [movingPollMs], [idlePollMs]) - Add axis `axis` (0-based, DTYP \
-         {portName}_{axis}) to a controller created by ANF2CreateController",
+        "ANF2CreateAxis(ANF2Name, axis, hexConfig, baseSpeed, homingTimeout)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port_name = req_string(args, 0, "portName")?;
-            let axis = req_int(args, 1, "axis")?;
-            if axis < 0 {
-                return Err("ANF2CreateAxis: axis must be >= 0".into());
-            }
-            let hex_config = req_string(args, 2, "hexConfig")?;
-            let hex_digits = hex_config
-                .strip_prefix("0x")
-                .or_else(|| hex_config.strip_prefix("0X"))
-                .unwrap_or(&hex_config);
-            // Stricter than C by design: C parses with strtoul(hexConfig,
-            // NULL, 16) and never checks errno, so a malformed string silently
-            // yields config = 0. Reject an unparseable hexConfig with an
-            // explicit error rather than programming a garbage axis with a
-            // zero configuration.
-            let config = u32::from_str_radix(hex_digits, 16)
-                .map_err(|_| format!("ANF2CreateAxis: invalid hexConfig={hex_config}"))?
-                as i32;
-            let base_speed = req_int(args, 3, "baseSpeed")?.clamp(1, 1_000_000) as i32;
-            let homing_timeout = req_int(args, 4, "homingTimeout")?.clamp(0, 300) as i32;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 5, 6)?;
-
-            let controller = anf2_registry()
+            let port_name = req_string(args, 0, "Port name")?;
+            let axis = req_int(args, 1, "Axis number")?;
+            let hex_config = req_string(args, 2, "Hex config")?;
+            let Some(controller) = anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&port_name)
                 .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "ANF2CreateAxis: no controller for portName={port_name} \
-                         (call ANF2CreateController first)"
-                    )
-                })?;
+            else {
+                println!("ANF2MotorDriver:ANF2CreateAxis: Error port {port_name} not found");
+                return Ok(CommandOutcome::Continue);
+            };
+            let Some(config) = strtoul_hex(&hex_config) else {
+                println!("ANF2MotorDriver:ANF2CreateAxis: Error invalid config={hex_config}");
+                return Ok(CommandOutcome::Continue);
+            };
+            println!("ANF2MotorDriver:ANF2CreateAxis: Config=0x{config:x}");
+            let config = config as i32;
+            let base_speed = req_int(args, 3, "Base speed")?.clamp(1, 1_000_000) as i32;
+            let homing_timeout = req_int(args, 4, "Homing timeout")?.clamp(0, 300) as i32;
 
             let ax = Anf2Axis::new(controller, axis as i32, config, base_speed, homing_timeout)
                 .map_err(|e| format!("ANF2CreateAxis: {e}"))?;
-            let dtyp_key = format!("{port_name}_{axis}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            holder.install(
+            install(
                 ctx,
                 asyn_user(&port_name, axis as i32),
-                dtyp_key,
                 motor,
-                moving_poll_ms,
-                idle_poll_ms,
-            );
-
-            println!(
-                "ANF2CreateAxis: portName={port_name} axis={axis} config=0x{config:x} \
-                 baseSpeed={base_speed} homingTimeout={homing_timeout} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={port_name}_{axis})"
-            );
+                DEFAULT_MOVING_POLL_MS,
+                DEFAULT_IDLE_POLL_MS,
+            )?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build `ANF2StartPoller(portName, movingPollPeriod, idlePollPeriod)`.
-/// Accepted for startup-script parity (the C example scripts call this after
-/// `iocInit`) but a no-op here: this port's poll loop already starts idle at
-/// axis-install time and only begins actually polling once the record's
-/// device support runs `init()` post-`iocInit` (the generic mechanism every
-/// vendor driver in this workspace relies on) — exactly the timing
-/// `ANF2StartPoller` exists to achieve in C. Still validates the port exists,
-/// matching C's "port not found" error.
+/// Build `ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)`. The
+/// axes already poll from `iocInit` at the default periods, so only the port
+/// lookup and its error line are C's.
 pub fn anf2_start_poller_command() -> CommandDef {
     CommandDef::new(
         "ANF2StartPoller",
         vec![
-            arg_str_req("portName"),
-            arg_int_req("movingPollPeriod"),
-            arg_int_req("idlePollPeriod"),
+            arg_str_req("Port name"),
+            arg_int_req("Moving poll period (ms)"),
+            arg_int_req("Idle poll period (ms)"),
         ],
-        "ANF2StartPoller(portName, movingPollPeriod, idlePollPeriod) - Accepted for \
-         startup-script parity; a no-op here (polling already starts automatically \
-         after iocInit)",
+        "ANF2StartPoller(ANF2Name, movingPollPeriod, idlePollPeriod)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let port_name = req_string(args, 0, "portName")?;
-            anf2_registry()
+            let port_name = req_string(args, 0, "Port name")?;
+            if !anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(&port_name)
-                .ok_or_else(|| format!("ANF2StartPoller: port {port_name} not found"))?;
+                .contains_key(&port_name)
+            {
+                println!("ANF2MotorDriver:ANF2StartPoller: Error port {port_name} not found");
+            }
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build `ANG1CreateController(portName, inPort, outPort, numAxes,
-/// movingPollMs, idlePollMs)` bound to `holder`. Matches the C constructor:
+/// Build `ANG1CreateController(portName, ANG1InPortName, ANG1OutPortName,
+/// numAxes, movingPollPeriod, idlePollPeriod)`. Matches the C constructor:
 /// connects the ports and installs all `numAxes` axes immediately (no
 /// separate create-axis command).
-pub fn ang1_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+pub fn ang1_create_controller_command() -> CommandDef {
     CommandDef::new(
         "ANG1CreateController",
         vec![
-            arg_str_req("portName"),
-            arg_str_req("inPort"),
-            arg_str_req("outPort"),
-            arg_int_req("numAxes"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_str_req("Port name"),
+            arg_str_req("ANG1 In port name"),
+            arg_str_req("ANG1 Out port name"),
+            arg_int_req("Number of axes"),
+            arg_int_opt("Moving poll period (ms)"),
+            arg_int_opt("Idle poll period (ms)"),
         ],
-        "ANG1CreateController(portName, inPort, outPort, numAxes, [movingPollMs], \
-         [idlePollMs]) - Create an AMCI ANG1 controller (Modbus In/Out ports \
-         created by drvModbusAsynConfigure) with numAxes axes (DTYP {portName}_{axis})",
+        "ANG1CreateController(portName, ANG1InPortName, ANG1OutPortName, numAxes, \
+         movingPollPeriod, idlePollPeriod)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let port_name = req_string(args, 0, "portName")?;
-            let in_port = req_string(args, 1, "inPort")?;
-            let out_port = req_string(args, 2, "outPort")?;
-            let num_axes = req_int(args, 3, "numAxes")?;
+            let port_name = req_string(args, 0, "Port name")?;
+            let in_port = req_string(args, 1, "In port name")?;
+            let out_port = req_string(args, 2, "Out port name")?;
+            let num_axes = req_int(args, 3, "Number of axes")?;
             // Stricter than C by design: C's axis loop (ANG1Driver.cpp:94)
             // simply doesn't execute for numAxes<=0, silently creating a
             // zero-axis controller with no error. A zero-axis controller is a
@@ -226,29 +198,35 @@ pub fn ang1_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 .map_err(|e| format!("ANG1CreateController: {e}"))?;
             let controller = Arc::new(Mutex::new(controller));
 
+            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
             for axis in 0..num_axes {
                 // Infallible, matching C: axis construction ignores the
                 // initial setPosition status and never aborts this command.
                 let ax = Ang1Axis::new(controller.clone(), axis as i32);
-                let dtyp_key = format!("{port_name}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(
+                install(
                     ctx,
                     asyn_user(&port_name, axis as i32),
-                    dtyp_key,
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
-                );
+                )?;
             }
 
-            println!(
-                "ANG1CreateController: portName={port_name} inPort={in_port} \
-                 outPort={out_port} numAxes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP={port_name}_{{0..{}}})",
-                (num_axes - 1).max(0)
-            );
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strtoul_hex;
+
+    #[test]
+    fn hex_config_reads_as_strtoul() {
+        assert_eq!(strtoul_hex("0x86280000"), Some(0x8628_0000));
+        assert_eq!(strtoul_hex(" 86zz"), Some(0x86));
+        assert_eq!(strtoul_hex("zz"), Some(0));
+        assert_eq!(strtoul_hex("0x1ffffffffffffffff"), None);
+    }
 }

@@ -18,7 +18,6 @@ use motor_amci::ioc::{
     anf2_create_axis_command, anf2_create_controller_command, anf2_start_poller_command,
     ang1_create_controller_command,
 };
-use motor_common::MotorHolder;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -48,12 +47,14 @@ async fn main() -> CaResult<()> {
     app = modbus_rs::ioc::register_modbus_commands(app, handle);
 
     // AMCI iocsh commands + motor device support.
-    let holder = MotorHolder::new();
     app = app.register_startup_command(anf2_create_controller_command());
-    app = app.register_startup_command(anf2_create_axis_command(&holder));
+    app = app.register_startup_command(anf2_create_axis_command());
     app = app.register_startup_command(anf2_start_poller_command());
-    app = app.register_startup_command(ang1_create_controller_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(ang1_create_controller_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
