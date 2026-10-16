@@ -563,12 +563,7 @@ impl PortDriver for MerlinDetector {
             self.try_set(MPXCMD_PROFILES, &value.to_string());
             Ok(())
         } else if reason < self.params.first() {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0)
-            } else {
-                self.ad.write_int32_pool(reason, value).map(|_| ())
-            }
+            ADDriver::ad_write_int32(self, user, value)
         } else {
             Ok(())
         };
@@ -815,6 +810,38 @@ mod tests {
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
         );
+    }
+
+    /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
+    /// an ASYN_TRACEIO_DRIVER line (ADDriver.cpp:111-113,
+    /// asynNDArrayDriver.cpp:703-705).
+    #[test]
+    fn a_base_class_write_runs_both_base_class_write_int32s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "MERLIN_BASE_TRACE";
+        let det = detector(name);
+        let p = det.ad.params.base;
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for driver in ["asynNDArrayDriver", "ADDriver"] {
+            assert!(
+                text.contains(&format!("{driver}:writeInt32: function={}", p.pool_poll_stats)),
+                "{driver}: {text:?}"
+            );
+        }
+        std::mem::forget(runtime);
     }
 
     #[test]
