@@ -8,7 +8,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray::NDArray;
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
@@ -27,6 +27,7 @@ pub(crate) struct AcquisitionContext {
     pub acq_rx: rt::CommandReceiver<AcqCommand>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
+    pub pool: Arc<NDArrayPool>,
     pub queued: Arc<QueuedArrayCounter>,
     pub ad: ADBaseParams,
     pub url: URLParams,
@@ -171,7 +172,7 @@ async fn acquire_one_image(
     ));
 
     let end_ts = EpicsTimestamp::now();
-    let mut array = NDArray::with_data(decoded.dims, decoded.data);
+    let mut array = ctx.pool.wrap(decoded.dims, decoded.data);
     array.unique_id = image_counter;
     array.timestamp = end_ts;
     array.time_stamp = start_time.as_f64();
