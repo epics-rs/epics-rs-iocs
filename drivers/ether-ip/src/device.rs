@@ -526,12 +526,7 @@ impl DeviceSupport for EtherIpDevice {
             || {
                 get_period(&name, self.scan)
                     .filter(|p| *p > 0.0)
-                    .or_else(|| {
-                        match driver::DEFAULT_RATE_MS.load(std::sync::atomic::Ordering::Relaxed) {
-                            0 => None,
-                            ms => Some(ms as f64 / 1000.0),
-                        }
-                    })
+                    .or_else(|| Some(driver::default_rate()).filter(|p| *p > 0.0))
                     .unwrap_or_else(|| {
                         errlog_vprintf(format_args!(
                             "devEtherIP ({name}): cannot decode SCAN field, no scan flag given\n"

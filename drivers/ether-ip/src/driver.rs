@@ -6,7 +6,7 @@
 //! MultiRequest, sends it, and fans the results back out to the tags.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -40,8 +40,17 @@ const EPICS_EPOCH_OFFSET: f64 = 631_152_000.0;
 pub static TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_TIMEOUT_MS);
 /// `EIP_buffer_limit`.
 pub static BUFFER_LIMIT: AtomicU32 = AtomicU32::new(encap::DEFAULT_BUFFER_LIMIT as u32);
-/// `drvEtherIP_default_rate` (seconds), scaled by 1000 to stay in an atomic.
-pub static DEFAULT_RATE_MS: AtomicU32 = AtomicU32::new(0);
+/// `drvEtherIP_default_rate` (seconds), as f64 bits.
+static DEFAULT_RATE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// `drvEtherIP_default_rate`.
+pub fn default_rate() -> f64 {
+    f64::from_bits(DEFAULT_RATE_BITS.load(Ordering::Relaxed))
+}
+
+pub fn set_default_rate(secs: f64) {
+    DEFAULT_RATE_BITS.store(secs.to_bits(), Ordering::Relaxed);
+}
 
 fn timeout() -> Duration {
     Duration::from_millis(TIMEOUT_MS.load(Ordering::Relaxed) as u64)
