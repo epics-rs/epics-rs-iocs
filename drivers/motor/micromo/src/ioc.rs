@@ -16,11 +16,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::connect::connect_serial;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller};
 
@@ -141,7 +141,7 @@ pub fn mvp2001_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
             holder.install(
                 ctx,
-                (&card.to_string(), axis_no as i32),
+                asyn_user(&card.to_string(), axis_no as i32),
                 dtyp_key,
                 motor,
                 moving_poll_ms,

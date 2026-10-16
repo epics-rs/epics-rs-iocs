@@ -13,11 +13,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::connect::connect_ip;
 use motor_common::iocsh::{
     arg_int_opt, arg_str_opt, arg_str_req, opt_double, opt_string, poll_intervals, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::mdriveplus::ImsMDrivePlusAxis;
 
@@ -55,7 +55,7 @@ pub fn ims_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             holder.install(
                 ctx,
-                (&motor_port, 0),
+                asyn_user(&motor_port, 0),
                 motor_port.clone(),
                 motor,
                 moving_poll_ms,

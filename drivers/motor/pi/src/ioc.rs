@@ -6,11 +6,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, TraceUser};
 
 use crate::c630::{PIC630_NUM_AXIS, PIC630Axis, PIC630Controller};
 use crate::c662::{PIC662Axis, PIC662Controller};
@@ -119,7 +119,7 @@ pub fn pic862_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             holder.install(
                 ctx,
-                (&card.to_string(), 0),
+                TraceUser::Model1,
                 dtyp_key,
                 motor,
                 moving_poll_ms,
@@ -202,7 +202,7 @@ pub fn pic663_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             holder.install(
                 ctx,
-                (&card.to_string(), 0),
+                TraceUser::Model1,
                 dtyp_key,
                 motor,
                 moving_poll_ms,
@@ -318,7 +318,7 @@ pub fn pic630_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 holder.install(
                     ctx,
-                    (&card.to_string(), signal as i32),
+                    TraceUser::Model1,
                     dtyp_key,
                     motor,
                     moving_poll_ms,
@@ -393,7 +393,7 @@ pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             holder.install(
                 ctx,
-                (&card.to_string(), 0),
+                TraceUser::Model1,
                 dtyp_key,
                 motor,
                 moving_poll_ms,
@@ -475,7 +475,7 @@ pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 holder.install(
                     ctx,
-                    (&card.to_string(), signal as i32),
+                    TraceUser::Model1,
                     dtyp_key,
                     motor,
                     moving_poll_ms,
@@ -566,7 +566,7 @@ pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 holder.install(
                     ctx,
-                    (&card.to_string(), signal as i32),
+                    TraceUser::Model1,
                     dtyp_key,
                     motor,
                     moving_poll_ms,
@@ -653,7 +653,7 @@ pub fn pie516_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 holder.install(
                     ctx,
-                    (&card.to_string(), axis as i32),
+                    TraceUser::Model1,
                     dtyp_key,
                     motor,
                     moving_poll_ms,
@@ -737,7 +737,7 @@ pub fn pie517_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 holder.install(
                     ctx,
-                    (&card.to_string(), axis as i32),
+                    TraceUser::Model1,
                     dtyp_key,
                     motor,
                     moving_poll_ms,
@@ -822,7 +822,7 @@ pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 holder.install(
                     ctx,
-                    (&card.to_string(), axis as i32),
+                    TraceUser::Model1,
                     dtyp_key,
                     motor,
                     moving_poll_ms,
@@ -907,7 +907,7 @@ pub fn pie816_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
                 holder.install(
                     ctx,
-                    (&card.to_string(), axis as i32),
+                    TraceUser::Model1,
                     dtyp_key,
                     motor,
                     moving_poll_ms,

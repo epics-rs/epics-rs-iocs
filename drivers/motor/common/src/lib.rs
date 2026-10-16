@@ -35,6 +35,15 @@ use epics_rs::base::server::iocsh::registry::CommandContext;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
+pub use epics_rs::motor::trace::TraceUser;
+
+/// The trace user of an axis a C asyn driver serves: its port and address.
+pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
+    TraceUser::Asyn {
+        port: port.into(),
+        addr,
+    }
+}
 
 /// Holds every motor device support created by a vendor's `*CreateController`
 /// commands and the poll-loop command senders, keyed for the record layer to
@@ -60,12 +69,12 @@ impl MotorHolder {
     /// Wire one motor into a record + poll loop: build the device support and
     /// poll loop for `motor`, spawn the poll loop (starts idle), and store the
     /// device support under `dtyp_key` for later `dbLoadRecords` binding.
-    /// `(port, addr)` are the controller port and axis its trace lines print
-    /// on, C's `pasynUser` for the axis.
+    /// `user` is the asyn user its trace lines print on: [`asyn_user`] for a
+    /// C asyn driver, [`TraceUser::Model1`] for a model-1 one.
     pub fn install(
         &self,
         ctx: &CommandContext,
-        (port, addr): (&str, i32),
+        user: TraceUser,
         dtyp_key: String,
         motor: Arc<Mutex<dyn AsynMotor>>,
         moving_poll_ms: u64,
@@ -77,8 +86,7 @@ impl MotorHolder {
             poll_loop,
             poll_cmd_tx,
         } = MotorBuilder::new(motor)
-            .port(port)
-            .addr(addr)
+            .trace_user(user)
             .moving_poll_interval(Duration::from_millis(moving_poll_ms))
             .idle_poll_interval(Duration::from_millis(idle_poll_ms))
             .build();

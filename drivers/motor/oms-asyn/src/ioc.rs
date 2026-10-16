@@ -23,11 +23,11 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, poll_intervals,
     req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::oms::{OmsAxis, OmsController};
 
@@ -157,7 +157,7 @@ fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> Co
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
             holder.install(
                 ctx,
-                (&name, axis as i32),
+                asyn_user(&name, axis as i32),
                 dtyp_key.clone(),
                 motor,
                 moving_poll_ms,

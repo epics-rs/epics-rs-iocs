@@ -32,6 +32,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
+use epics_rs::motor::trace::TraceUser;
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -153,6 +154,14 @@ pub struct NewportHolder {
     hxp_controllers: Mutex<HashMap<String, HxpRegistration>>,
 }
 
+/// The trace user of an axis a C asyn driver serves: its port and address.
+fn asyn_user(port: &str, addr: i32) -> TraceUser {
+    TraceUser::Asyn {
+        port: port.into(),
+        addr,
+    }
+}
+
 impl NewportHolder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -180,11 +189,13 @@ impl NewportHolder {
     /// Shared wiring for every `*CreateController` command: build the motor
     /// record + poll loop for `motor`, spawn the poll loop (starts idle), and
     /// store the device support under `dtyp_key` for later `dbLoadRecords`
-    /// binding.
+    /// binding. `user` is the asyn user its trace lines print on:
+    /// [`asyn_user`] for a C asyn driver, [`TraceUser::Model1`] for a model-1
+    /// one (ESP300, MM3000, PM500, PMNC).
     fn install(
         &self,
         ctx: &CommandContext,
-        (port, addr): (&str, i32),
+        user: TraceUser,
         dtyp_key: String,
         motor: Arc<Mutex<dyn AsynMotor>>,
         moving_poll_ms: u64,
@@ -196,8 +207,7 @@ impl NewportHolder {
             poll_loop,
             poll_cmd_tx,
         } = MotorBuilder::new(motor)
-            .port(port)
-            .addr(addr)
+            .trace_user(user)
             .moving_poll_interval(Duration::from_millis(moving_poll_ms))
             .idle_poll_interval(Duration::from_millis(idle_poll_ms))
             .build();
@@ -260,7 +270,7 @@ impl NewportHolder {
 
                 holder.install(
                     ctx,
-                    (&motor_port, 0),
+                    asyn_user(&motor_port, 0),
                     dtyp_key.clone(),
                     motor,
                     moving_poll_ms,
@@ -314,7 +324,7 @@ impl NewportHolder {
 
                 holder.install(
                     ctx,
-                    (&motor_port, 0),
+                    asyn_user(&motor_port, 0),
                     dtyp_key.clone(),
                     motor,
                     moving_poll_ms,
@@ -376,7 +386,7 @@ impl NewportHolder {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                     holder.install(
                         ctx,
-                        (&motor_port, axis_index as i32),
+                        asyn_user(&motor_port, axis_index as i32),
                         dtyp_key,
                         motor,
                         moving_poll_ms,
@@ -527,7 +537,7 @@ impl NewportHolder {
 
                 holder.install(
                     ctx,
-                    (&motor_port, axis),
+                    asyn_user(&motor_port, axis),
                     dtyp_key.clone(),
                     motor,
                     moving_poll_ms,
@@ -689,7 +699,7 @@ impl NewportHolder {
 
                 holder.install(
                     ctx,
-                    (&motor_port, axis),
+                    asyn_user(&motor_port, axis),
                     dtyp_key.clone(),
                     motor,
                     moving_poll_ms,
@@ -1301,7 +1311,7 @@ impl NewportHolder {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     holder.install(
                         ctx,
-                        (&motor_port, axis_no as i32),
+                        asyn_user(&motor_port, axis_no as i32),
                         dtyp_key,
                         motor,
                         moving_poll_ms,
@@ -1566,7 +1576,7 @@ impl NewportHolder {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     holder.install(
                         ctx,
-                        (&motor_port, (axis - 1) as i32),
+                        TraceUser::Model1,
                         dtyp_key,
                         motor,
                         moving_poll_ms,
@@ -1624,7 +1634,7 @@ impl NewportHolder {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     holder.install(
                         ctx,
-                        (&motor_port, (axis - 1) as i32),
+                        TraceUser::Model1,
                         dtyp_key,
                         motor,
                         moving_poll_ms,
@@ -1691,7 +1701,7 @@ impl NewportHolder {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     holder.install(
                         ctx,
-                        (&motor_port, (axis - 1) as i32),
+                        asyn_user(&motor_port, (axis - 1) as i32),
                         dtyp_key,
                         motor,
                         moving_poll_ms,
@@ -1750,7 +1760,7 @@ impl NewportHolder {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     holder.install(
                         ctx,
-                        (&motor_port, index as i32),
+                        TraceUser::Model1,
                         dtyp_key,
                         motor,
                         moving_poll_ms,
@@ -1812,7 +1822,7 @@ impl NewportHolder {
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     holder.install(
                         ctx,
-                        (&motor_port, index as i32),
+                        TraceUser::Model1,
                         dtyp_key,
                         motor,
                         moving_poll_ms,

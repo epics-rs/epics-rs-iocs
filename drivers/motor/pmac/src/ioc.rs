@@ -34,11 +34,11 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::axis::PmacAxis;
 use crate::controller::{DeferredMode, PMAC_TIMEOUT, PmacController};
@@ -217,7 +217,7 @@ fn create_axis(
         Arc::new(Mutex::new(PmacAxis::new(reg.controller.clone(), axis)));
     holder.install(
         ctx,
-        (name, axis),
+        asyn_user(name, axis),
         format!("PMAC_{name}_{axis}"),
         motor,
         reg.moving_poll_ms,
@@ -504,7 +504,7 @@ fn pmac_asyn_coord_create_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(cs_axis));
                 holder.install(
                     ctx,
-                    (&cs_name, axis as i32),
+                    asyn_user(&cs_name, axis as i32),
                     format!("PMACCS_{cs_name}_{axis}"),
                     motor,
                     moving_poll_ms,
