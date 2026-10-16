@@ -119,8 +119,7 @@ pub fn pmac_err(message: impl Into<String>) -> AsynError {
 /// command left the record believing it had been accepted. Here a `<BELL>` reply
 /// is an error.
 pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<String> {
-    handle.write_octet(0, command.as_bytes())?;
-    let raw = handle.read_octet(0, PMAC_MAXBUF)?;
+    let raw = handle.write_read(0, command.as_bytes(), PMAC_MAXBUF)?;
     if raw.first() == Some(&BELL) {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(|c: char| c.is_control() || c == '\0');
