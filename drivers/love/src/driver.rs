@@ -333,7 +333,7 @@ impl LoveDriver {
     /// does this). `models` is the shared per-address model table (see the
     /// `registry` module doc) -- the caller constructs it, passes a clone
     /// here, and registers another clone under `port_name` for a later
-    /// `LoveConfig` call to find.
+    /// `drvLoveConfig` call to find.
     pub fn new(port_name: &str, handle: SyncIOHandle, models: ModelTable) -> AsynResult<Self> {
         let base = PortDriverBase::new(
             port_name,

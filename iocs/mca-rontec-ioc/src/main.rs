@@ -34,7 +34,7 @@ use mca_rontec::driver::RontecDriver;
 /// Every asyn port `RontecConfig` creates, kept alive for the life of the
 /// process. Dropping a `PortRuntimeHandle` closes its actor's shutdown
 /// channel and ends the actor thread even though a `PortHandle` clone
-/// survives in `asyn_record` -- love-ioc's `LoveInit`/syringepump-ioc/
+/// survives in `asyn_record` -- love-ioc's `drvLoveInit`/syringepump-ioc/
 /// delaygen-ioc all drop theirs at the end of their command closure and hit
 /// this (flagged, unfixed there); this IOC follows mca-ioc's own `Ports`
 /// pattern instead since it is new code, not a preserved defect.

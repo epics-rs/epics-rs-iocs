@@ -103,8 +103,8 @@
 //!   hand-rolled `*Init`/`*Config` iocsh command in this workspace that
 //!   calls `create_port_runtime` directly**: `iocs/syringepump-ioc/src/main.rs`'s
 //!   `TeledyneDInit`/`TeledyneHInit`, `iocs/love-ioc/src/main.rs`'s
-//!   `LoveInit`, and `iocs/delaygen-ioc/src/main.rs`'s `DG645Config`/
-//!   `ColbyConfig`/`CoherentSdgConfig` (6 call sites total, `rg -n
+//!   `drvLoveInit`, and `iocs/delaygen-ioc/src/main.rs`'s `drvAsynDG645`/
+//!   `drvAsynColby`/`drvAsynCoherentSDG` (6 call sites total, `rg -n
 //!   "create_port_runtime" iocs/` grepped exhaustively) all drop their local
 //!   `runtime_handle` at the end of the closure without retaining it
 //!   anywhere. Distinct from (not exhibiting this defect): asyn-rs 0.22.1's

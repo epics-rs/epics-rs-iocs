@@ -156,10 +156,10 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // DG645Config(myport,ioport,ioaddr) -- C drvAsynDG645(myport,ioport,ioaddr)
+    // C drvAsynDG645(myport,ioport,ioaddr)
     {
         app = app.register_startup_command(CommandDef::new(
-            "DG645Config",
+            "drvAsynDG645",
             vec![
                 ArgDesc {
                     name: "myport",
@@ -174,7 +174,7 @@ async fn main() -> CaResult<()> {
                     arg_type: ArgType::Int,
                 },
             ],
-            "DG645Config myport ioport ioaddr",
+            "drvAsynDG645 myport ioport ioaddr",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let my_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
@@ -190,13 +190,13 @@ async fn main() -> CaResult<()> {
                 };
 
                 let handle = connect_octet(&io_port, io_addr, COMMAND_TIMEOUT)
-                    .map_err(|e| format!("DG645Config: {e}"))?;
+                    .map_err(|e| format!("drvAsynDG645: {e}"))?;
                 let driver = Dg645Driver::new(&my_port, handle)
-                    .map_err(|e| format!("DG645Config: failed to initialize {my_port}: {e}"))?;
+                    .map_err(|e| format!("drvAsynDG645: failed to initialize {my_port}: {e}"))?;
 
                 let (runtime_handle, _actor_jh) =
                     create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("DG645Config: {e}"))?;
+                        .map_err(|e| format!("drvAsynDG645: {e}"))?;
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
@@ -209,11 +209,10 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // ColbyConfig(myport,ioport,addr,units,iface) -- C
-    // drvAsynColby(myport,ioport,addr,units,iface)
+    // C drvAsynColby(myport,ioport,addr,units,iface)
     {
         app = app.register_startup_command(CommandDef::new(
-            "ColbyConfig",
+            "drvAsynColby",
             vec![
                 ArgDesc {
                     name: "myport",
@@ -236,7 +235,7 @@ async fn main() -> CaResult<()> {
                     arg_type: ArgType::Int,
                 },
             ],
-            "ColbyConfig myport ioport addr units iface",
+            "drvAsynColby myport ioport addr units iface",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let my_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
@@ -260,13 +259,13 @@ async fn main() -> CaResult<()> {
                 };
 
                 let handle = connect_octet(&io_port, io_addr, COMMAND_TIMEOUT)
-                    .map_err(|e| format!("ColbyConfig: {e}"))?;
+                    .map_err(|e| format!("drvAsynColby: {e}"))?;
                 let driver = ColbyDriver::new(&my_port, handle, &units, iface)
-                    .map_err(|e| format!("ColbyConfig: failed to initialize {my_port}: {e}"))?;
+                    .map_err(|e| format!("drvAsynColby: failed to initialize {my_port}: {e}"))?;
 
                 let (runtime_handle, _actor_jh) =
                     create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("ColbyConfig: {e}"))?;
+                        .map_err(|e| format!("drvAsynColby: {e}"))?;
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),
@@ -279,11 +278,10 @@ async fn main() -> CaResult<()> {
         ));
     }
 
-    // CoherentSdgConfig(myport,ioport,ioaddr) -- C
-    // drvAsynCoherentSDG(myport,ioport,ioaddr)
+    // C drvAsynCoherentSDG(myport,ioport,ioaddr)
     {
         app = app.register_startup_command(CommandDef::new(
-            "CoherentSdgConfig",
+            "drvAsynCoherentSDG",
             vec![
                 ArgDesc {
                     name: "myport",
@@ -298,7 +296,7 @@ async fn main() -> CaResult<()> {
                     arg_type: ArgType::Int,
                 },
             ],
-            "CoherentSdgConfig myport ioport ioaddr",
+            "drvAsynCoherentSDG myport ioport ioaddr",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let my_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
@@ -314,14 +312,14 @@ async fn main() -> CaResult<()> {
                 };
 
                 let handle = connect_octet(&io_port, io_addr, COHERENT_SDG_COMMAND_TIMEOUT)
-                    .map_err(|e| format!("CoherentSdgConfig: {e}"))?;
+                    .map_err(|e| format!("drvAsynCoherentSDG: {e}"))?;
                 let driver = CoherentSdgDriver::new(&my_port, handle).map_err(|e| {
-                    format!("CoherentSdgConfig: failed to initialize {my_port}: {e}")
+                    format!("drvAsynCoherentSDG: failed to initialize {my_port}: {e}")
                 })?;
 
                 let (runtime_handle, _actor_jh) =
                     create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("CoherentSdgConfig: {e}"))?;
+                        .map_err(|e| format!("drvAsynCoherentSDG: {e}"))?;
                 epics_rs::asyn::asyn_record::register_port(
                     &my_port,
                     runtime_handle.port_handle().clone(),

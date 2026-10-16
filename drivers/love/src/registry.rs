@@ -1,5 +1,5 @@
-//! Per-address model table, shared between `LoveInit` (which creates the
-//! port and its [`LoveDriver`](crate::driver::LoveDriver)) and `LoveConfig`
+//! Per-address model table, shared between `drvLoveInit` (which creates the
+//! port and its [`LoveDriver`](crate::driver::LoveDriver)) and `drvLoveConfig`
 //! (a *separate* iocsh command, called afterwards, that must reach back into
 //! the already-running driver instance and set the model for one address).
 //!
@@ -12,8 +12,8 @@
 //! PortDriver>>`, no `Any` downcast, no custom-command extension point in
 //! the actor's request enum). This module is the Rust substitute: a
 //! name-keyed registry of `Arc<Mutex<[Model; K_INSTRMAX]>>` tables,
-//! constructed by `LoveInit` *before* `create_port_runtime`, with one clone
-//! held by the driver and another registered here for `LoveConfig` to find.
+//! constructed by `drvLoveInit` *before* `create_port_runtime`, with one clone
+//! held by the driver and another registered here for `drvLoveConfig` to find.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -54,7 +54,7 @@ fn registry() -> &'static Mutex<HashMap<String, ModelTable>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register `table` under `port_name`, called once by `LoveInit`.
+/// Register `table` under `port_name`, called once by `drvLoveInit`.
 pub fn register(port_name: &str, table: ModelTable) {
     registry()
         .lock()
@@ -62,8 +62,8 @@ pub fn register(port_name: &str, table: ModelTable) {
         .insert(port_name.to_string(), table);
 }
 
-/// Look up the model table for an already-`LoveInit`-ed port, called by
-/// `LoveConfig`. C: the `pports` linked-list walk in `drvLoveConfig` that
+/// Look up the model table for an already-`drvLoveInit`-ed port, called by
+/// `drvLoveConfig`. C: the `pports` linked-list walk in `drvLoveConfig` that
 /// fails with `"drvLoveConfig::failure to locate port %s\n"` when no match
 /// is found.
 pub fn lookup(port_name: &str) -> Option<ModelTable> {

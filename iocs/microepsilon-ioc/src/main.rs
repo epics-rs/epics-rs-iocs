@@ -69,7 +69,7 @@ async fn main() -> CaResult<()> {
     // xxCapaNCDT6200.template record binds to), wrapping a raw octet port
     // created separately via `drvAsynIPPortConfigure`/
     // `drvAsynSerialPortConfigure`. Mirrors `love-ioc`'s
-    // `LoveInit(lovPort, serPort, serAddr)` shape.
+    // `drvLoveInit(lovPort, serPort, serAddr)` shape.
     {
         app = app.register_startup_command(CommandDef::new(
             "CapaNCDT6200ConfigInit",
@@ -121,9 +121,9 @@ async fn main() -> CaResult<()> {
                 // (`PortRuntimeHandle` gap note): dropping the last handle
                 // to a port runtime closes its shutdown channel and the
                 // actor thread exits. Unlike syringepump-ioc's
-                // `TeledyneDInit`/`TeledyneHInit`, love-ioc's `LoveInit`, and
-                // delaygen-ioc's `DG645Config`/`ColbyConfig`/
-                // `CoherentSdgConfig` (all of which drop their local
+                // `TeledyneDInit`/`TeledyneHInit`, love-ioc's `drvLoveInit`, and
+                // delaygen-ioc's `drvAsynDG645`/`drvAsynColby`/
+                // `drvAsynCoherentSDG` (all of which drop their local
                 // `runtime_handle` at the end of the closure without
                 // retaining it anywhere), this port's runtime is retained
                 // explicitly here.
