@@ -1389,9 +1389,22 @@ impl PortDriver for TimePix3Driver {
             let snapshot = self.shared.acquisition.snapshot();
             let active = self.shared.acquisition.monitoring();
             let needs_stop = active || snapshot.resources != 0 || snapshot.phase == Phase::Stopping;
+            println!(
+                "ACQUIRE CHANGE: ADAcquire={value} (active={}), current ADStatus={}",
+                i32::from(active),
+                self.int(self.ad.params.status, 0)
+            );
+            let flow = |d: &mut Self, msg: &str| {
+                d.ad.port_base.trace_print(
+                    TraceMask::FLOW,
+                    format_args!("{}", adlog::log(adlog::WRITE_INT32, msg)),
+                )
+            };
             if value != 0 && !active {
+                flow(self, "Entering acquire start");
                 self.acquire_start()
             } else if value == 0 && needs_stop {
+                flow(self, "Entering acquire stop");
                 self.acquire_stop()
             } else {
                 Ok(())
@@ -2385,6 +2398,45 @@ mod tests {
                 .unwrap_or_else(|| panic!("{line}: {text:?}"))
         };
         assert!(at(&base) < at(&own));
+        std::mem::forget(runtime);
+    }
+
+    /// An Acquire write says which transition it enters (ADTimePix.cpp:519-526).
+    #[test]
+    fn an_acquire_write_traces_the_transition() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_ACQ_FLOW";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let acquire = det.ad.params.acquire;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::FLOW);
+        let _ = h.write_int32_blocking(acquire, 0, 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let line = adlog::log(adlog::WRITE_INT32, "Entering acquire start");
+        assert!(text.contains(&line), "{text:?}");
         std::mem::forget(runtime);
     }
 
