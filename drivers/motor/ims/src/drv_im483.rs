@@ -15,7 +15,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -112,9 +112,9 @@ pub struct DrvIm483Axis {
     /// `motor_info->position`.
     position: i32,
     /// The record's PREM and POST for the move it sends next.
-    strings: Option<(Vec<u8>, Vec<u8>)>,
+    strings: Option<(Vec<u8>, Option<PostMessage>)>,
     /// The move in flight's POST, `nodeptr->postmsgptr`.
-    post: Option<Vec<u8>>,
+    post: Option<PostMessage>,
 }
 
 impl DrvIm483Axis {
@@ -179,7 +179,7 @@ impl DrvIm483Axis {
     /// its POST, or none, becomes the one `poll` sends.
     fn send_move(&mut self, commands: &[String]) -> AsynResult<()> {
         let (prem, post) = self.strings.take().unwrap_or_default();
-        self.post = (!post.is_empty()).then_some(post);
+        self.post = post;
         let Some((last, rest)) = commands.split_last() else {
             return Ok(());
         };
@@ -279,8 +279,13 @@ impl AsynMotor for DrvIm483Axis {
         Ok(())
     }
 
-    fn set_move_strings(&mut self, _user: &AsynUser, prem: &[u8], post: &[u8]) -> AsynResult<()> {
-        self.strings = Some((prem.to_vec(), post.to_vec()));
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings = Some((prem.to_vec(), post));
         Ok(())
     }
 
@@ -327,14 +332,16 @@ impl AsynMotor for DrvIm483Axis {
         status.encoder_position = encoder.map_or(0.0, |e| atof(from(&e, 5)).trunc());
         status.problem = false;
         let status = status.clone();
-        // The move's POST once it is done or a limit stops it in its
-        // direction (drvIM483PL.cc:357-366). C sends it without reading its
-        // reply, which the next `^` then reads as its own and every later
-        // query is a line behind; the reply is read here.
+        // The move's POST, as the field holds it now, once the move is done
+        // or a limit stops it in its direction (drvIM483PL.cc:357-366); an
+        // emptied one is not sent (`send_mess`'s empty-message exit). C sends
+        // it without reading its reply, which the next `^` then reads as its
+        // own and every later query is a line behind; the reply is read here.
         let ls_active =
             (status.high_limit && status.direction) || (status.low_limit && !status.direction);
         if (status.done || ls_active)
-            && let Some(post) = self.post.take()
+            && let Some(post) = self.post.take().map(|p| p.get())
+            && !post.is_empty()
         {
             let mut line = self.name.as_bytes().to_vec();
             line.extend_from_slice(&post);
@@ -472,13 +479,13 @@ mod tests {
     #[test]
     fn prem_leads_the_move_message() {
         let mut pl = Rig::new("im483_prem_pl", true);
-        pl.axis.set_move_strings(&pl.user, b"MO", b"").unwrap();
+        pl.axis.set_move_strings(&pl.user, b"MO", None).unwrap();
         pl.move_to(10.0);
         assert_eq!(pl.sent(), ["A V2.00;", "A I1.00;", "AMO; R10.00"]);
         pl.move_to(11.0);
         assert_eq!(pl.sent(), ["A V2.00;", "A I1.00;", "A R11.00"]);
         let mut sm = Rig::new("im483_prem_sm", false);
-        sm.axis.set_move_strings(&sm.user, b"MO", b"").unwrap();
+        sm.axis.set_move_strings(&sm.user, b"MO", None).unwrap();
         sm.move_to(10.0);
         assert_eq!(sm.sent(), ["V2.00;", "I1.00;", "MO;R10.00"]);
     }
@@ -487,7 +494,9 @@ mod tests {
     #[test]
     fn post_follows_the_move_once_done() {
         let mut pl = Rig::new("im483_post_pl", true);
-        pl.axis.set_move_strings(&pl.user, b"", b" MF").unwrap();
+        pl.axis
+            .set_move_strings(&pl.user, b"", Some(post(b" MF")))
+            .unwrap();
         pl.move_to(10.0);
         pl.sent();
         pl.moving.store(true, Ordering::SeqCst);
@@ -501,7 +510,9 @@ mod tests {
     #[test]
     fn post_follows_a_move_a_limit_stops() {
         let mut pl = Rig::new("im483_post_ls", true);
-        pl.axis.set_move_strings(&pl.user, b"", b" MF").unwrap();
+        pl.axis
+            .set_move_strings(&pl.user, b"", Some(post(b" MF")))
+            .unwrap();
         pl.move_to(10.0);
         pl.sent();
         pl.moving.store(true, Ordering::SeqCst);
@@ -509,11 +520,45 @@ mod tests {
         assert_eq!(pl.poll_extra(), ["A MF"]);
     }
 
+    /// The POST field is read when the move is done (`postmsgptr =
+    /// &mr->post`): a put during the move is what goes out, and an emptied
+    /// one sends nothing.
+    #[test]
+    fn post_is_read_when_the_move_is_done() {
+        let mut pl = Rig::new("im483_post_late", true);
+        let field = post(b" MF");
+        pl.axis
+            .set_move_strings(&pl.user, b"", Some(field.clone()))
+            .unwrap();
+        pl.move_to(10.0);
+        pl.sent();
+        field.set(b" XY");
+        assert_eq!(pl.poll_extra(), ["A XY"]);
+
+        pl.axis
+            .set_move_strings(&pl.user, b"", Some(field.clone()))
+            .unwrap();
+        pl.move_to(11.0);
+        pl.sent();
+        field.set(b"");
+        assert!(pl.poll_extra().is_empty());
+        field.set(b" MF");
+        assert!(pl.poll_extra().is_empty(), "sent once, or not at all");
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let field = PostMessage::default();
+        field.set(text);
+        field
+    }
+
     /// A later move without POST replaces the motion C would post for.
     #[test]
     fn a_move_without_post_drops_the_last_ones() {
         let mut pl = Rig::new("im483_post_drop", true);
-        pl.axis.set_move_strings(&pl.user, b"", b" MF").unwrap();
+        pl.axis
+            .set_move_strings(&pl.user, b"", Some(post(b" MF")))
+            .unwrap();
         pl.move_to(10.0);
         pl.move_to(11.0);
         pl.sent();
