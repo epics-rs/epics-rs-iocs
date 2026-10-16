@@ -4,7 +4,6 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use epics_rs::ad_core::ioc::GenericDriverContext;
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::plugin::wiring::upstream_key;
 
 use ad_csimdetector::{CSimDetectorRuntime, MAX_SIGNALS, create_c_sim_detector};
 
@@ -113,11 +112,10 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     mgr.wiring(),
                 )));
                 // Addresses 1..=MAX_SIGNALS carry the per-signal 1-D arrays.
-                // `register_output` keys on `upstream_key(name, 0)`, i.e. the
-                // bare name, so the already-suffixed key is passed through.
                 for addr in 1..=MAX_SIGNALS {
-                    mgr.wiring().register_output(
-                        &upstream_key(&port_name, addr as i32),
+                    mgr.wiring().register_output_at(
+                        &port_name,
+                        addr as i32,
                         sim_rt.array_output(addr).clone(),
                     );
                 }
