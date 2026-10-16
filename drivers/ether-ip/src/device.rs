@@ -170,25 +170,14 @@ pub fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String>
     let mask;
     let last_element;
     if bits > 0 && special & spco::BIT == 0 {
-        // A binary record with no explicit bit number: the tag is a BOOL array,
-        // which Logix packs into UDINTs. The requested element is a *bit*
-        // index, so it folds into a UDINT index plus a mask.
-        //
-        // UPSTREAM FIX: the C (`devEtherIP.c:1094`) uses `mask = 255` for the
-        // no-index case regardless of `bits`. That is only meaningful for a
-        // single bit -- get_bits then reads "any of the low 8 bits set", the
-        // 0/0xFF BOOL encoding -- and `get_bits` carries a matching
-        // `if (bits == 1)` special case. For NOBT > 1 the mask is shifted left
-        // each iteration, so bit 1 is selected by 0x1FE: it aliases eight bits
-        // at once and cannot represent "bit i" at all. There is exactly one
-        // mask that can: 1. Setting it here makes `get_bits`/`put_bits` a
-        // single uniform rule with no `bits == 1` boundary case.
+        // A binary record with no explicit bit number: an indexed tag is a
+        // BOOL array, which Logix packs into UDINTs, so the bit index folds
+        // into a UDINT index plus a mask; an unindexed one is a plain BOOL,
+        // masked 255 whatever NOBT is (devEtherIP.c:1086-1100).
         mask = if special & spco::INDEX_INCLUDED != 0 {
             1u32 << (element & 0x1F)
-        } else if bits == 1 {
-            0xFF
         } else {
-            1
+            255
         };
         last_element = (element + bits - 1) >> 5;
         element >>= 5;
@@ -1140,15 +1129,11 @@ mod tests {
         assert_eq!(l.elements, 2);
     }
 
-    /// UPSTREAM FIX (`devEtherIP.c:1094`): the C sets mask 255 for an
-    /// un-indexed binary link regardless of NOBT. For a bi that is the intended
-    /// "any low byte bit set" BOOL test; for NOBT > 1 it makes bit 1 select
-    /// 0x1FE, which aliases eight bits. The only mask that can address bit i by
-    /// shifting is 1.
+    /// devEtherIP.c:1094: 255 for an unindexed binary link, NOBT or not.
     #[test]
     fn unindexed_binary_link_mask() {
         assert_eq!(parse_link("@plc1 aBool", 1, 1).unwrap().mask, 0xFF);
-        assert_eq!(parse_link("@plc1 aWord", 1, 4).unwrap().mask, 1); // C: 255
+        assert_eq!(parse_link("@plc1 aWord", 1, 4).unwrap().mask, 0xFF);
     }
 
     #[test]
