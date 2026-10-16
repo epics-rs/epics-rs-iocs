@@ -136,9 +136,8 @@ impl PortDriver for CSimDetector {
         let reason = user.reason;
         let addr = user.addr;
 
-        self.port_base.set_int32_param(reason, addr, value)?;
-
-        let mut status: AsynResult<()> = Ok(());
+        // C keeps this status unless asynNDArrayDriver::writeInt32 replaces it.
+        let mut status = self.port_base.set_int32_param(reason, addr, value);
         if reason == self.nd.acquire {
             self.set_acquire(value);
         } else if self.sim.belongs_to_base(reason) {
@@ -397,6 +396,19 @@ mod tests {
         assert_eq!(f.get_i32(f.det.nd.acquire_busy, 0), 1);
         assert!(f.start_rx.try_recv().is_ok());
         assert!(f.stop_rx.try_recv().is_err());
+    }
+
+    /// ADCSimDetector.cpp:364-367: setIntegerParam's asynParamInvalidList is
+    /// the write's status, and setAcquire still runs.
+    #[test]
+    fn a_refused_acquire_set_still_starts_and_fails_the_write() {
+        let mut f = Fixture::new();
+        let mut user = AsynUser::new(f.det.nd.acquire).with_addr(MAX_ADDR as i32);
+        assert!(matches!(
+            f.det.write_int32(&mut user, 1),
+            Err(AsynError::ParamInvalidList(_))
+        ));
+        assert!(f.start_rx.try_recv().is_ok());
     }
 
     #[test]
