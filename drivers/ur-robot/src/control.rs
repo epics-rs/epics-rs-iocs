@@ -40,6 +40,9 @@ const HANDSHAKE_POLL: Duration = Duration::from_millis(1);
 /// (`waitForProgramRunning`, 5 s).
 const PROGRAM_RUNNING_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_STATE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `RTDE_START_SYNCHRONIZATION_TIMEOUT` (5) under C++'s `duration > 5` on
+/// whole seconds, which gives up in the sixth second.
+const START_SYNCHRONIZATION_WAIT: Duration = Duration::from_secs(6);
 
 /// UR joint/tool limits the C++ range-checks commands against
 /// (rtde_control_interface.h:28).
@@ -176,6 +179,13 @@ impl ControlInterface {
 
         self.setup_recipes(&mut session)?;
         session.send_start()?;
+        // C++ polls isStarted() for RTDE_START_SYNCHRONIZATION_TIMEOUT whole
+        // seconds; nothing reads the socket meanwhile, so the start reply is
+        // the package send_start consumed or nothing.
+        if !session.is_started() {
+            std::thread::sleep(START_SYNCHRONIZATION_WAIT);
+            return Err(UrError::SyncStartTimeout);
+        }
 
         let writer = session.writer()?;
         let stream = StateStream::spawn(session, Iface::Control);
@@ -248,12 +258,14 @@ impl ControlInterface {
         .map(|s| s.to_string())
         .collect();
 
-        let registers_supported = match self.version.major {
+        // setupRecipes asks for the version again rather than using versions_.
+        let version = session.controller_version()?;
+        let registers_supported = match version.major {
             3 => {
                 if self.use_upper_range_registers {
-                    self.version.minor >= 9
+                    version.minor >= 9
                 } else {
-                    self.version.minor >= 4
+                    version.minor >= 4
                 }
             }
             // Same gate defect as in the receive interface: upstream writes the
@@ -263,7 +275,7 @@ impl ControlInterface {
             // interface would appear to hang.
             m if m >= 5 => {
                 if self.use_upper_range_registers {
-                    self.version.minor >= 3
+                    version.minor >= 3
                 } else {
                     true
                 }
@@ -274,8 +286,8 @@ impl ControlInterface {
             return Err(UrError::Protocol(format!(
                 "PolyScope {}.{} does not provide the {} range of RTDE output registers, \
                  which the control interface needs",
-                self.version.major,
-                self.version.minor,
+                version.major,
+                version.minor,
                 if self.use_upper_range_registers {
                     "upper"
                 } else {
@@ -386,15 +398,8 @@ impl ControlInterface {
 
         debug_assert_eq!(recipes.len(), recipe::COUNT as usize);
 
-        for (i, names) in recipes.iter().enumerate() {
-            let assigned = session.send_input_setup(names)?;
-            let expected = (i + 1) as u8;
-            if assigned != expected {
-                return Err(UrError::Protocol(format!(
-                    "controller assigned recipe id {assigned} to input recipe {expected}; \
-                     the control interface addresses recipes positionally"
-                )));
-            }
+        for names in &recipes {
+            session.send_input_setup(names)?;
         }
         Ok(())
     }

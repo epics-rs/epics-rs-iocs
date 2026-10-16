@@ -157,11 +157,14 @@ impl ReceiveInterface {
         let mut session = Session::new(&self.hostname, DEFAULT_TIMEOUT);
         session.connect()?;
         session.negotiate_protocol_version()?;
+        // C++ asks twice, once for the frequency and again in setupRecipes, and
+        // each answer is whichever package comes next (see Session::exchange).
+        let frequency = default_frequency(session.controller_version()?);
         let version = session.controller_version()?;
         self.version = version;
 
         let variables = output_variables(version, self.use_upper_range_registers);
-        session.send_output_setup(&variables, default_frequency(version))?;
+        session.send_output_setup(&variables, frequency)?;
         session.send_start()?;
 
         let stream = StateStream::spawn(session, Iface::Receive);

@@ -136,15 +136,8 @@ impl IoInterface {
             recipes.push(vec![cmd.clone(), self.in_double_reg(reg)]);
         }
 
-        for (i, names) in recipes.iter().enumerate() {
-            let assigned = self.session.send_input_setup(names)?;
-            let expected = (i + 1) as u8;
-            if assigned != expected {
-                return Err(UrError::Protocol(format!(
-                    "controller assigned recipe id {assigned} to input recipe {expected} \
-                     ({names:?}); the interface addresses recipes positionally"
-                )));
-            }
+        for names in &recipes {
+            self.session.send_input_setup(names)?;
         }
         Ok(())
     }

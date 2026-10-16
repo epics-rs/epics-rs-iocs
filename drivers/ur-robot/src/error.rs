@@ -41,6 +41,11 @@ pub enum UrError {
     )]
     InputRegistersInUse,
 
+    /// `RTDEControlInterface` saw no start reply before
+    /// `RTDE_START_SYNCHRONIZATION_TIMEOUT`.
+    #[error("Failed to start RTDE data synchronization, before timeout")]
+    SyncStartTimeout,
+
     #[error("timed out after {0:?}: {1}")]
     Timeout(std::time::Duration, String),
 
