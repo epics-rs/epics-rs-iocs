@@ -30,16 +30,21 @@
 //! the `block_in_place` panic older versions had (see
 //! `drivers/microepsilon/src/data_driver.rs`'s `park_on` discussion).
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
-use epics_rs::base::server::record::{DbLinkType, DevSup, Dset, Record, register_device_row};
+use epics_rs::base::server::record::{
+    DbLinkType, DevSup, Dset, Record, ScanType, register_device_row,
+};
 use epics_rs::base::types::{EpicsValue, SharedArray};
 
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult};
-use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest};
+use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::services::PortServices;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
@@ -47,8 +52,20 @@ use mca_rs::record::{McaCommand, McaRecord, McaStatus, commands};
 
 use crate::interface::{ASYN_MCA_DTYP, McaReason};
 
-/// `mcaAsynPvt` (`devMcaAsyn.c:38-56`).
+/// One mca record's devMcaAsyn state.
 pub struct DevMcaAsyn {
+    /// The record's INP, parsed in [`DeviceSupport::init`] as C
+    /// `init_record` does.
+    inp: String,
+    /// `pmca->name`, for `init_record`'s messages.
+    name: String,
+    /// `None` until `init` connects, and for good after it fails: C leaves
+    /// that record in PACT (`devMcaAsyn.c:208-210`), so it never processes.
+    port: Option<McaPort>,
+}
+
+/// `mcaAsynPvt` (`devMcaAsyn.c:38-56`) of a connected record.
+struct McaPort {
     handle: PortHandle,
     /// `pasynUser->addr`, fixed for this record's lifetime by its own INP
     /// link (`connectDevice(pasynUser, port, signal)`, `devMcaAsyn.c:170`).
@@ -68,7 +85,29 @@ pub struct DevMcaAsyn {
     data: SharedArray<i32>,
 }
 
+/// C `asynPrint(pasynUser, ASYN_TRACE_ERROR, ...)` for a user on `port`
+/// (`None`: a user no port accepted).
+fn trace_error(port: Option<&str>, addr: i32, reason: usize, args: std::fmt::Arguments<'_>) {
+    PortServices::global().trace().print(
+        port,
+        port.map(|_| addr),
+        reason as i32,
+        TraceMask::ERROR,
+        args,
+    );
+}
+
 impl DevMcaAsyn {
+    /// The device support for a record whose INP is `inp`; nothing is
+    /// connected before [`DeviceSupport::init`].
+    pub fn new(inp: &str) -> Self {
+        DevMcaAsyn {
+            inp: inp.to_owned(),
+            name: String::new(),
+            port: None,
+        }
+    }
+
     fn mca(record: &mut dyn Record) -> CaResult<&mut McaRecord> {
         record
             .as_any_mut()
@@ -80,6 +119,68 @@ impl DevMcaAsyn {
             })
     }
 
+    /// C `init_record`'s `parseLink`, `connectDevice` and the 21
+    /// `findDrvInfo` calls (`devMcaAsyn.c:121-204`), with C's messages. Any
+    /// failure is C's `goto bad`.
+    fn connect(&self) -> Option<McaPort> {
+        let link = match parse_asyn_link(&self.inp) {
+            Ok(link) => link,
+            Err(e) => {
+                errlog_vprintf(format_args!(
+                    "devMcaAsyn::init_record {} bad link {e}\n",
+                    self.name
+                ));
+                return None;
+            }
+        };
+        let Some(entry) = get_port(&link.port_name) else {
+            trace_error(
+                None,
+                link.addr,
+                0,
+                format_args!(
+                    "devMcaAsyn::init_record, {} connectDevice failed to {}",
+                    self.name, link.port_name
+                ),
+            );
+            return None;
+        };
+        let mut port = McaPort {
+            handle: entry.handle,
+            addr: link.addr,
+            reasons: [0; McaReason::COUNT],
+            status: McaStatus::default(),
+            data: SharedArray::default(),
+        };
+        // `pasynUser->reason` as the previous create left it.
+        let mut reason = 0;
+        for command in McaReason::ALL {
+            let req = DrvUserRequest::new(command.drv_info(), port.addr);
+            match port.handle.drv_user_create_blocking(&req) {
+                Ok(info) => {
+                    reason = info.reason;
+                    port.reasons[command as usize] = info.reason;
+                }
+                Err(_) => {
+                    trace_error(
+                        Some(&link.port_name),
+                        port.addr,
+                        reason,
+                        format_args!(
+                            "devMcaAsyn::findDrvInfo, {} drvUserCreate failed for {}",
+                            self.name,
+                            command.drv_info()
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(port)
+    }
+}
+
+impl McaPort {
     fn write_i32(&self, reason: McaReason, value: i32) -> AsynResult<()> {
         self.handle
             .write_int32_blocking(self.reasons[reason as usize], self.addr, value)
@@ -195,15 +296,12 @@ impl DeviceSupport for DevMcaAsyn {
         ASYN_MCA_DTYP
     }
 
-    /// C `init_record` (`devMcaAsyn.c:100-230`): resolve all 21 drvInfo
-    /// strings via `asynDrvUser->create()`, in `McaReason::ALL` order
-    /// (`findDrvInfo`, `devMcaAsyn.c:184-204`). The link parse and port
-    /// lookup that precede this in C (`parseLink`/`connectDevice`,
-    /// `devMcaAsyn.c:141-168`) already happened in
-    /// [`connect`], which built `self.handle`/
-    /// `self.addr` before this device support was ever registered -- unlike
-    /// C, a bad link or unknown port cannot reach `init` at all (see
-    /// `connect`'s doc).
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_owned();
+    }
+
+    /// C `init_record` (`devMcaAsyn.c:100-230`): `DevMcaAsyn::connect`;
+    /// on failure the record is dead, no alarm (C `goto bad`, `pact=1`).
     ///
     /// Also reproduces the record-level `init_record`'s OWN second half
     /// (`mcaRecord.c:463-487`, "Initialize hardware to agree with the
@@ -214,23 +312,9 @@ impl DeviceSupport for DevMcaAsyn {
     /// it. Without this, a driver never learns a setup field's db-loaded
     /// value (e.g. `NUSE`) until a client explicitly rewrites it after boot.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        for reason in McaReason::ALL {
-            let req = DrvUserRequest::new(reason.drv_info(), self.addr);
-            // C `findDrvInfo` failure is a `goto bad` — pact=1, no alarm
-            // (`devMcaAsyn.c:184-209`).
-            let info: DrvUserInfo = match self.handle.drv_user_create_blocking(&req) {
-                Ok(info) => info,
-                Err(e) => {
-                    eprintln!(
-                        "devMcaAsyn::init_record drvInfo '{}': {e}",
-                        reason.drv_info()
-                    );
-                    return Ok(DeviceInitOutcome::dead());
-                }
-            };
-            self.reasons[reason as usize] = info.reason;
-        }
-
+        let Some(port) = self.connect() else {
+            return Ok(DeviceInitOutcome::dead());
+        };
         let mca = Self::mca(record)?;
         for command in [
             McaCommand::ChannelAdvanceSource(mca.chas as i32),
@@ -248,8 +332,9 @@ impl DeviceSupport for DevMcaAsyn {
         ] {
             // C discards every one of these send_msg statuses
             // (`mcaRecord.c:464-487`).
-            let _ = self.send_command(command);
+            let _ = port.send_command(command);
         }
+        self.port = Some(port);
         Ok(DeviceInitOutcome::ok())
     }
 
@@ -263,18 +348,21 @@ impl DeviceSupport for DevMcaAsyn {
     /// C's `asynCallback` ignores every driver status (`devMcaAsyn.c:355-391`),
     /// so a failing driver neither alarms the record nor cuts the cycle short.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        let Some(port) = self.port.as_mut() else {
+            return Ok(DeviceReadOutcome::ok());
+        };
         let mca = Self::mca(record)?;
 
         for command in mca.take_device_requests() {
-            let _ = self.send_command(command);
+            let _ = port.send_command(command);
         }
 
-        self.read_status();
-        let must_read_spectrum = mca.apply_status(self.status);
+        port.read_status();
+        let must_read_spectrum = mca.apply_status(port.status);
 
         if must_read_spectrum {
-            self.read_spectrum(mca.nuse.max(0) as usize);
-            mca.land_spectrum_read(EpicsValue::LongArray(self.data.clone()))?;
+            port.read_spectrum(mca.nuse.max(0) as usize);
+            mca.land_spectrum_read(EpicsValue::LongArray(port.data.clone()))?;
         }
 
         Ok(DeviceReadOutcome::ok())
@@ -293,33 +381,13 @@ impl DeviceSupport for DevMcaAsyn {
         command: &str,
         _args: &[EpicsValue],
     ) -> CaResult<Vec<&'static str>> {
-        if command == commands::STOP_ACQUIRE {
-            let _ = self.send_command(McaCommand::StopAcquire);
+        if let Some(port) = &self.port
+            && command == commands::STOP_ACQUIRE
+        {
+            let _ = port.send_command(McaCommand::StopAcquire);
         }
         Ok(Vec::new())
     }
-}
-
-/// C `init_record`'s link/port half (`devMcaAsyn.c:141-181`):
-/// `parseLink` -> `pasynManager->connectDevice` -> `findInterface` (Int32,
-/// Float64, Int32Array, DrvUser -- all required). Returns `None` on any
-/// failure, which the `register_dynamic_device_support` factory calling
-/// this turns into "no device support for this record" -- the closest
-/// analogue available to C's `pmca->pact=1` permanent-disable, since a
-/// dynamic-device-support factory has no record-alarm side channel of its
-/// own. The 21 `findDrvInfo` calls that follow in C are deferred to
-/// [`DeviceSupport::init`], which can return a proper `CaResult` `Err`
-/// instead of silently disabling the record.
-pub fn connect(inp: &str) -> Option<DevMcaAsyn> {
-    let link = parse_asyn_link(inp).ok()?;
-    let entry = get_port(&link.port_name)?;
-    Some(DevMcaAsyn {
-        handle: entry.handle,
-        addr: link.addr,
-        reasons: [0; McaReason::COUNT],
-        status: McaStatus::default(),
-        data: SharedArray::default(),
-    })
 }
 
 /// `mcaSupport.dbd`'s `device(mca,INST_IO,devMcaAsyn,"asynMCA")`; the dset
@@ -331,7 +399,7 @@ pub static DEV_MCA_ASYN: DevSup = DevSup {
     dset: Dset::new(6, &[2, 4, 5], false),
 };
 
-/// Bind every `DTYP "asynMCA"` mca record to the port its INP names, and
+/// Give every `DTYP "asynMCA"` mca record devMcaAsyn, and
 /// put `asynMCA` in the mca DTYP menu: a dynamic support adds no menu row,
 /// and mca has none of its own, so without the row `DTYP` reads empty.
 pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
@@ -340,8 +408,7 @@ pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
         if ctx.dtyp != ASYN_MCA_DTYP {
             return None;
         }
-        let dev = connect(ctx.inp)?;
-        Some(Box::new(dev) as Box<dyn DeviceSupport>)
+        Some(Box::new(DevMcaAsyn::new(ctx.inp)) as Box<dyn DeviceSupport>)
     })
 }
 
@@ -349,9 +416,11 @@ pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use epics_rs::asyn::asyn_record::register_port;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
     use epics_rs::base::server::record::Record;
 
     use super::*;
@@ -385,6 +454,31 @@ mod tests {
         }
     }
 
+    fn init_dev(inp: &str) -> (DevMcaAsyn, McaRecord, DeviceInitOutcome) {
+        let mut dev = DevMcaAsyn::new(inp);
+        dev.set_record_info("mcaTest:mca1", ScanType::Passive);
+        let mut rec = McaRecord {
+            nmax: 8,
+            nuse: 8,
+            ..Default::default()
+        };
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        let outcome = dev.init(&mut rec).unwrap();
+        (dev, rec, outcome)
+    }
+
+    /// C `init_record`'s `goto bad` on a bad link or an unknown port
+    /// (`devMcaAsyn.c:123-136`): the record is dead, with no alarm.
+    #[test]
+    fn a_bad_link_or_unknown_port_leaves_the_record_dead() {
+        for inp in ["", "@asyn(MCATESTNOSUCHPORT)"] {
+            let (dev, _, outcome) = init_dev(inp);
+            assert!(matches!(outcome, DeviceInitOutcome::Dead { alarm: None }));
+            assert!(dev.port.is_none());
+        }
+    }
+
     struct Fixture {
         _runtime: PortRuntimeHandle,
         dev: DevMcaAsyn,
@@ -411,21 +505,14 @@ mod tests {
             num_channels: reasons[McaReason::NumChannels as usize],
         };
         let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
-        let mut dev = DevMcaAsyn {
-            handle: runtime.port_handle().clone(),
-            addr: 0,
-            reasons: [0; McaReason::COUNT],
-            status: McaStatus::default(),
-            data: SharedArray::default(),
-        };
-        let mut rec = McaRecord {
-            nmax: 8,
-            nuse: 8,
-            ..Default::default()
-        };
-        rec.init_record(0).unwrap();
-        rec.init_record(1).unwrap();
-        dev.init(&mut rec).unwrap();
+        register_port(
+            name,
+            runtime.port_handle().clone(),
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let (dev, rec, outcome) = init_dev(&format!("@asyn({name})"));
+        assert!(matches!(outcome, DeviceInitOutcome::Live));
         writes.lock().unwrap().clear();
         Fixture {
             _runtime: runtime,
