@@ -209,3 +209,49 @@ fn an_unplaceable_eig_name_is_traced_with_no_message() {
         "{text}"
     );
 }
+
+/// A failed put prints the parameter layer's ERR_ARGS chain
+/// (eigerParam.cpp:423-445, :807-808) and nothing of eigerDetector's own.
+#[test]
+fn a_failed_put_prints_only_the_parameter_chain() {
+    use std::sync::Arc;
+
+    use epics_rs::asyn::port::PortDriver;
+    use epics_rs::asyn::services::PortServices;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::asyn::user::AsynUser;
+
+    let port = "EIGER_PUT_CHAIN";
+    let rest = RestApi::new("127.0.0.1", dead_port());
+    let (signals, _receivers) = tasks::signals();
+    let cfg = EigerConfig {
+        port_name: port.to_string(),
+        api: ApiVersion::V1_6_0,
+        model: Model::Eiger1,
+        max_size_x: 0,
+        max_size_y: 0,
+        max_memory: 0,
+    };
+    let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");
+    let manager = PortServices::global().trace().clone();
+    let log = std::env::temp_dir().join(format!("eiger-put-chain-{}.log", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    let mut user = AsynUser::new(driver.p.trigger_mode);
+    assert!(driver.write_int32(&mut user, 0).is_err());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.splitn(3, ' ').nth(2).unwrap_or(l))
+        .filter(|l| !l.is_empty() && !l.starts_with('['))
+        .collect();
+    assert!(
+        lines.iter().all(|l| l.starts_with("Param[")
+            || l.starts_with("eigerDetector::writeInt32: error status=")),
+        "{text}"
+    );
+}
