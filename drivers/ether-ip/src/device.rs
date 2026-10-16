@@ -1119,7 +1119,6 @@ const OUTPUT_TYPES: &[&str] = &[
 mod tests {
     use super::*;
 
-    /// `drvEtherIP_init` then `drvEtherIP_define_PLC`, as a st.cmd does.
     /// devEtherIP.c mbbo_write / check_mbbo_callback: a staged write leaves
     /// the record PACT, and the next transfer ends it without the readback
     /// that would put the PLC's value back into VAL.
@@ -1173,6 +1172,7 @@ mod tests {
         ));
     }
 
+    /// `drvEtherIP_init` then `drvEtherIP_define_PLC`, as a st.cmd does.
     fn define_plc(name: &str, ip_addr: &str, slot: u8) {
         if !driver::initialized() {
             driver::init();
