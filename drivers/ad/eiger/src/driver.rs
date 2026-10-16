@@ -28,6 +28,12 @@ pub struct EigerDriver {
     signals: Signals,
 }
 
+/// asyn address of the Monitor interface's NDArray callbacks (C
+/// `MONITOR_ASYN_ADDRESS`).
+pub const MONITOR_ASYN_ADDRESS: usize = 10;
+/// C `MAX_ASYN_ADDRESS`, the port's maxAddr.
+pub const MAX_ASYN_ADDRESS: usize = MONITOR_ASYN_ADDRESS + 1;
+
 /// Everything [`EigerDriver::new`] needs that is not read from the detector.
 pub struct EigerConfig {
     pub port_name: String,
@@ -50,7 +56,7 @@ impl EigerDriver {
         } = cfg;
         let mut ad = ADDriverBase::new(
             &port_name,
-            1,
+            MAX_ASYN_ADDRESS,
             max_size_x,
             max_size_y,
             max_memory,

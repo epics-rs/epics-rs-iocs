@@ -9,7 +9,7 @@ use std::net::TcpListener;
 
 use epics_rs::ad_core::driver::ADStatus;
 
-use eiger::driver::{EigerConfig, EigerDriver};
+use eiger::driver::{EigerConfig, EigerDriver, MAX_ASYN_ADDRESS, MONITOR_ASYN_ADDRESS};
 use eiger::params::Model;
 use eiger::rest::{ApiVersion, RestApi};
 use eiger::tasks;
@@ -83,4 +83,31 @@ fn the_configure_command_fails_when_the_detector_does_not_answer() {
         result,
         Err(ConfigError::Rest("unable to parse response json"))
     ));
+}
+
+#[test]
+fn the_port_has_cs_eleven_addresses() {
+    let rest = RestApi::new("127.0.0.1", dead_port());
+    let (signals, _receivers) = tasks::signals();
+    let cfg = EigerConfig {
+        port_name: "EIGER_MAX_ADDR".to_string(),
+        api: ApiVersion::V1_6_0,
+        model: Model::Eiger1,
+        max_size_x: 0,
+        max_size_y: 0,
+        max_memory: 0,
+    };
+    let driver = EigerDriver::new(cfg, rest, signals).expect("driver");
+
+    // ADDriver(portName, MAX_ASYN_ADDRESS, ...), eigerDetector.cpp:190.
+    let base = &driver.ad.port_base;
+    let counter = driver.ad.params.base.array_counter;
+    assert!(
+        base.get_int32_param(counter, MONITOR_ASYN_ADDRESS as i32)
+            .is_ok()
+    );
+    assert!(
+        base.get_int32_param(counter, MAX_ASYN_ADDRESS as i32)
+            .is_err()
+    );
 }
