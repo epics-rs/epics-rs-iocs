@@ -507,8 +507,17 @@ impl DeviceSupport for EtherIpDevice {
             return self.readback(record);
         }
 
-        // Driver statistics do not touch the tag's value at all.
+        // Driver statistics do not touch the tag's value, but C reads them
+        // inside `lock_data` (devEtherIP.c:1642), so a tag without data fails
+        // them like any read: READ_ALARM and status 0, which converts RVAL.
         if self.link.as_ref().is_some_and(Link::is_statistic) {
+            let has_data = self.bound().is_some_and(|(tag, link)| {
+                tag.data.lock().has_value() && *tag.elements.lock() > link.element
+            });
+            if !has_data {
+                self.read_alarm();
+                return Ok(DeviceReadOutcome::ok());
+            }
             return match self.statistic() {
                 Some(v) => {
                     self.no_alarm();
@@ -1119,6 +1128,19 @@ mod tests {
         dev.read(&mut record).unwrap();
         let alarm = dev.last_alarm().unwrap();
         assert_eq!(alarm.stat, alarm_status::WRITE_ALARM);
+    }
+
+    /// devEtherIP.c:1642: statistics are read under lock_data, so a tag
+    /// without data fails them.
+    #[test]
+    fn a_statistic_without_tag_data_raises_read_alarm() {
+        use epics_rs::base::server::records::ai::AiRecord;
+        driver::define_plc("statnodata", "127.0.0.1", 0);
+        let mut record = AiRecord::default();
+        let mut dev = EtherIpDevice::new("@statnodata REAL PLC_ERRORS", false);
+        dev.init(&mut record).unwrap();
+        dev.read(&mut record).unwrap();
+        assert_eq!(dev.last_alarm().unwrap().stat, alarm_status::READ_ALARM);
     }
 
     // -- link parsing --------------------------------------------------------
