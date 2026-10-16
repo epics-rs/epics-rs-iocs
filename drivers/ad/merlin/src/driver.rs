@@ -837,7 +837,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         for driver in ["asynNDArrayDriver", "ADDriver"] {
             assert!(
-                text.contains(&format!("{driver}:writeInt32: function={}", p.pool_poll_stats)),
+                text.contains(&format!(
+                    "{driver}:writeInt32: function={}",
+                    p.pool_poll_stats
+                )),
                 "{driver}: {text:?}"
             );
         }

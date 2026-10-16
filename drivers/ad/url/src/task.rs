@@ -294,13 +294,8 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 .await
                 .unwrap_or(0)
                 + 1;
-            let image_result = acquire_one_image(
-                &ctx,
-                start_time,
-                image_counter,
-                num_images_counter,
-            )
-            .await;
+            let image_result =
+                acquire_one_image(&ctx, start_time, image_counter, num_images_counter).await;
 
             set_shutter_via_handle(&ctx.handle, &ctx.ad, false).await;
             let _ = ctx.handle.call_param_callbacks(0).await;

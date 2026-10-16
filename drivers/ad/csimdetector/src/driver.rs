@@ -511,7 +511,9 @@ mod tests {
                 NDDataType::Float64,
             )
             .unwrap();
-        f.det.owner.store_array(0, Some(image.share().array().clone()));
+        f.det
+            .owner
+            .store_array(0, Some(image.share().array().clone()));
         f.det
             .port_base
             .set_int32_param(f.det.nd.pool_num_pre_alloc_buffers, 0, 2)
