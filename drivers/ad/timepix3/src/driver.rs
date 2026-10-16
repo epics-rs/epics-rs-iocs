@@ -1379,7 +1379,7 @@ impl TimePix3Driver {
         }
         // acquire.cpp:416.
         self.shared.rates.lock().prv_img.restart();
-        self.sync_stream_endpoints();
+        self.sync_stream_endpoints()?;
 
         if self.cmd_tx.try_send(Command::AcquisitionStarted).is_err() {
             return Err("Failed to create measurement monitor thread");
@@ -1392,15 +1392,28 @@ impl TimePix3Driver {
     }
 
     /// C `syncTcpStreamEndpoints` (acquire.cpp:201-223): the workers stream
-    /// from the enabled channels' Base PVs as they stand at the start.
-    fn sync_stream_endpoints(&mut self) {
+    /// from the enabled channels' Base PVs as they stand at the start. Img
+    /// needs ImgAccumulationEnable, PrvHst needs Format 4 and
+    /// PrvHstAccumulationEnable too (acquire.cpp:461-475, :478-500).
+    fn sync_stream_endpoints(&mut self) -> Result<(), &'static str> {
         let p = self.p;
         let enabled = |this: &Self, write: usize, base: usize| {
             (this.int(write, 0) != 0).then(|| this.text(base, 0))
         };
         let prv_img = enabled(self, p.write_prv_img, p.prv_img_base);
-        let img = enabled(self, p.write_img, p.img_base);
-        let prv_hst = enabled(self, p.write_prv_hst, p.prv_hst_base);
+        let img = enabled(self, p.write_img, p.img_base)
+            .filter(|_| self.int(p.img_accumulation_enable, 0) != 0);
+        let prv_hst = enabled(self, p.write_prv_hst, p.prv_hst_base).filter(|path| {
+            path.starts_with("tcp://")
+                && self.int(p.prv_hst_format, 0) == 4
+                && self.int(p.prv_hst_accumulation_enable, 0) != 0
+        });
+        if prv_hst
+            .as_deref()
+            .is_some_and(|path| crate::stream::parse_tcp_path(path).is_none())
+        {
+            return Err("Histogram TCP path is invalid");
+        }
         let mut checked = vec![];
         if prv_img.is_some() {
             checked.push(p.prv_img_base);
@@ -1417,6 +1430,7 @@ impl TimePix3Driver {
             }
         }
         self.shared.set_stream_paths(prv_img, img, prv_hst);
+        Ok(())
     }
 
     /// C `acquireStop` (acquire.cpp:696-698).
@@ -3022,6 +3036,54 @@ mod tests {
             Some("tcp://listen@localhost:8089")
         );
         assert_eq!(paths.img, None);
+    }
+
+    /// C starts the Img worker only with ImgAccumulationEnable set and the
+    /// PrvHst worker only for a tcp:// jsonhisto (Format 4) channel with
+    /// PrvHstAccumulationEnable set, and fails a start whose histogram path
+    /// does not parse (acquire.cpp:461-500).
+    #[test]
+    fn a_start_gates_the_img_and_prv_hst_workers() {
+        let start = |name: &str, img_acc: i32, format: i32, hst_acc: i32, hst: &str| {
+            let shared = Arc::new(Shared::new());
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let mut det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&fake_serval("/server/destination"))),
+                shared.clone(),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            let p = det.p;
+            for (reason, v) in [
+                (p.write_img, 1),
+                (p.img_accumulation_enable, img_acc),
+                (p.write_prv_hst, 1),
+                (p.prv_hst_format, format),
+                (p.prv_hst_accumulation_enable, hst_acc),
+            ] {
+                det.ad.port_base.set_int32_param(reason, 0, v).unwrap();
+            }
+            det.set_text(p.img_base, "tcp://localhost:8088").unwrap();
+            det.set_text(p.prv_hst_base, hst).unwrap();
+            let started = det
+                .write_int32(&mut AsynUser::new(det.ad.params.acquire), 1)
+                .is_ok();
+            let paths = shared.stream_paths();
+            (started, paths.img.is_some(), paths.prv_hst.is_some())
+        };
+        let tcp = "tcp://localhost:8451";
+        assert_eq!(start("TPX_GATE_ALL", 1, 4, 1, tcp), (true, true, true));
+        assert_eq!(start("TPX_GATE_IMG", 0, 4, 1, tcp), (true, false, true));
+        assert_eq!(start("TPX_GATE_FMT", 1, 3, 1, tcp), (true, true, false));
+        assert_eq!(start("TPX_GATE_HST", 1, 4, 0, tcp), (true, true, false));
+        assert_eq!(
+            start("TPX_GATE_FILE", 1, 4, 1, "file:///tmp"),
+            (true, true, false)
+        );
+        let (started, ..) = start("TPX_GATE_BAD", 1, 4, 1, "tcp://localhost");
+        assert!(!started);
     }
 
     /// A stop zeroes the stream rates and the Img accumulation
