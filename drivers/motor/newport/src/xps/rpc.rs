@@ -294,10 +294,9 @@ impl XpsSocket {
                 .handle
                 .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
             {
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    ..
-                }) => return Ok(()),
+                // write_read wraps its failure in the step that failed, so
+                // the timeout is read through `status()`.
+                Err(e) if e.status() == AsynStatus::Timeout => return Ok(()),
                 Err(e) => {
                     // C prints only for asynError (asynOctetSocket.cpp:197).
                     if e.status() == AsynStatus::Error {
@@ -457,6 +456,59 @@ mod tests {
         // exp 20 >= 13 → scientific.
         assert_eq!(format_g(1e20, 13), "1e+20");
         assert_eq!(format_g(1.25, 13), "1.25");
+    }
+
+    /// An XPS that takes every command and never answers.
+    struct Silent(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for Silent {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "no reply".into(),
+            })
+        }
+    }
+
+    /// C `SendAndReceive` with a negative timeout: a move whose reply has
+    /// not come back yet is sent, not failed.
+    #[test]
+    fn a_fire_command_with_no_reply_yet_succeeds() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = "xps_fire_silent";
+        let (rt, _jh) = create_port_runtime(
+            &claim_port(port).unwrap(),
+            Silent(PortDriverBase::new(port, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let sock = XpsSocket::new(io, port, SocketMode::Fire);
+        sock.group_move_absolute("G1.P1", 1.0).unwrap();
     }
 
     #[test]
