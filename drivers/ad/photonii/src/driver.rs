@@ -159,10 +159,11 @@ impl PortDriver for PhotonIIDetector {
             .port_base
             .set_int32_param(reason, user.addr, value)?;
 
+        let mut status = Ok(());
         if reason == self.ad.params.acquire {
             self.set_acquire(value, was_acquiring)?;
         } else if reason == self.params.shutter {
-            self.ad.set_shutter(value != 0)?;
+            status = self.ad.set_shutter(value != 0);
         } else if reason == self.params.dr_sum_enable {
             self.command(&protocol::set_dr_summation(value))?;
         } else if reason == self.ad.params.trigger_mode {
@@ -181,8 +182,25 @@ impl PortDriver for PhotonIIDetector {
             self.command(&protocol::set_num_subframes(value))?;
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "PhotonII::writeInt32: error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("PhotonII::writeInt32: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -196,6 +214,12 @@ impl PortDriver for PhotonIIDetector {
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}"),
+        );
         Ok(())
     }
 
