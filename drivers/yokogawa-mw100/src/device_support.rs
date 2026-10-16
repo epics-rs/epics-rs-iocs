@@ -25,6 +25,7 @@
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::sync::mpsc::{self, Receiver, Sender};
 use epics_rs::base::server::database::WriteDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
@@ -566,6 +567,9 @@ pub struct MwDevice {
     link_text: String,
     is_io_intr: bool,
     resolved: Option<Resolved>,
+    record_type: &'static str,
+    /// Senders of the dummy IOSCANPVT an invalid input record scans on.
+    dummy_scan: Vec<Sender<()>>,
 }
 
 impl MwDevice {
@@ -575,6 +579,8 @@ impl MwDevice {
             link_text,
             is_io_intr: false,
             resolved: None,
+            record_type: "",
+            dummy_scan: Vec::new(),
         }
     }
 }
@@ -589,6 +595,7 @@ impl DeviceSupport for MwDevice {
     // and get_ioint_info hands out a dummy IOSCANPVT. `resolved == None` is
     // that flag; `Err` would print and alarm.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        self.record_type = record.record_type();
         self.resolved = resolve_link(&self.registry, &self.link_text, record);
         let Some(Resolved { op, .. }) = self.resolved else {
             // C's status 1 converts nothing (boRecord.c:159, mbboRecord.c:143).
@@ -609,8 +616,21 @@ impl DeviceSupport for MwDevice {
         self.is_io_intr = matches!(scan, ScanType::IoIntr);
     }
 
-    fn io_intr_receiver(&mut self) -> Option<epics_rs::base::runtime::sync::mpsc::Receiver<()>> {
-        let resolved = self.resolved.as_ref()?;
+    fn io_intr_receiver(&mut self) -> Option<Receiver<()>> {
+        let Some(resolved) = self.resolved.as_ref() else {
+            // The input dsets hand an invalid record `dummy_ioscanpvt`, which
+            // nothing requests (devMW100_ai.c:171-172); ao/bo/mbbo have no
+            // get_ioint_info at all.
+            if !matches!(
+                self.record_type,
+                "ai" | "bi" | "longin" | "mbbi" | "stringin"
+            ) {
+                return None;
+            }
+            let (tx, rx) = mpsc::channel(1);
+            self.dummy_scan.push(tx);
+            return Some(rx);
+        };
         let category = operation_interrupt_category(resolved.op, &resolved.instrument)?;
         Some(resolved.instrument.register_interrupt(category))
     }
@@ -1310,7 +1330,11 @@ mod tests {
                 device.init(&mut record),
                 Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched))
             ));
-            assert!(device.io_intr_receiver().is_none());
+            assert_eq!(
+                device.io_intr_receiver().is_some(),
+                record_type == "ai",
+                "{record_type}: dummy IOSCANPVT only for an input dset"
+            );
             let outcome = device.read(&mut record).unwrap();
             assert!(!outcome.did_compute());
             device.write(&mut record).unwrap();
