@@ -57,8 +57,9 @@ use motor_common::util::{atof, atoi, nint};
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
 
-/// Command terminator (C `ACS_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect (C `ACS_EOS`, drvSPiiPlus.cc:690-691).
+pub const INPUT_EOS: &[u8] = b"\r";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Motor-status (`MST`) bit masks (C `MOTOR_STATUS`).
 const MST_ENABLED: i32 = 0x01;
@@ -182,20 +183,13 @@ impl SpiiPlusController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and return its reply (trimmed). Every command produces an
     /// acknowledgment or value, so this is used for both queries and set
     /// commands (whose reply is discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
         // C send_mess/send_recv_mess flush the input before every write;
         // write_read is that flush, write and read as one exchange.
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }

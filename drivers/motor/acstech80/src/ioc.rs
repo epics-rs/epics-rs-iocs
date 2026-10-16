@@ -14,13 +14,13 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
+use motor_common::connect::connect_with_eos;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_string, poll_intervals, req_int,
     req_string,
 };
 
-use crate::spiiplus::{CommandMode, SpiiPlusAxis, SpiiPlusController};
+use crate::spiiplus::{CommandMode, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
 
 /// Serial command timeout (C `TIMEOUT` 2 s).
 const SPIIPLUS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -70,7 +70,7 @@ pub fn spiiplus_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             };
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, SPIIPLUS_TIMEOUT)?;
+            let handle = connect_with_eos(&asyn_port, SPIIPLUS_TIMEOUT, INPUT_EOS, OUTPUT_EOS)?;
             let controller = SpiiPlusController::new(handle, mode)
                 .map_err(|e| format!("SPiiPlusConfig: {e}"))?;
             let ident = controller.ident().to_string();
