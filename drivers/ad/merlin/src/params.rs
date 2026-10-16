@@ -62,4 +62,9 @@ impl MerlinParams {
             select_gui: base.create_param("SELECTGUI", ParamType::Octet)?,
         })
     }
+
+    /// C `FIRST_merlin_PARAM` — a reason below this belongs to the base class.
+    pub fn first(&self) -> usize {
+        self.thresholds[0]
+    }
 }

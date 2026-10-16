@@ -554,6 +554,13 @@ impl PortDriver for MerlinDetector {
             self.get_threshold()?;
         } else if reason == self.params.profile_control {
             self.try_set(MPXCMD_PROFILES, &value.to_string());
+        } else if reason < self.params.first() {
+            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
+            if reason == self.ad.params.shutter_control {
+                self.ad.set_shutter(value != 0)?;
+            } else {
+                self.ad.write_int32_pool(reason, value)?;
+            }
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
@@ -693,4 +700,54 @@ pub fn create_merlin_detector(
         data_task,
         status_task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+
+    /// A detector whose command socket never connects: the writes under test
+    /// must not need the device.
+    fn detector(name: &str) -> MerlinDetector {
+        let ip = format!("{name}_CMD");
+        let driver = DrvAsynIPPort::new(&ip, "127.0.0.1:1").unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(&ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        MerlinDetector::new(
+            name,
+            MpxConnection::new(handle, MPX_MAXLINE),
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+            Arc::new(SharedState::new()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let mut det = detector("MERLIN_BASE_WRITE");
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        let mut user = AsynUser::new(p.shutter_control);
+        det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
 }
