@@ -19,7 +19,7 @@ fn f64s(data: &NDDataBuffer) -> Vec<f64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acquisition_publishes_the_2d_array_and_all_eight_signals() {
     let rt = create_c_sim_detector(
-        "CSIM_E2E",
+        &epics_rs::asyn::registry::claim_port("CSIM_E2E").unwrap(),
         NUM_TIME_POINTS as i32,
         NDDataType::Float64,
         0,
@@ -99,7 +99,7 @@ async fn acquisition_publishes_the_2d_array_and_all_eight_signals() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_acquire_time_limit_stops_the_acquisition_by_itself() {
     let rt = create_c_sim_detector(
-        "CSIM_E2E_STOP",
+        &epics_rs::asyn::registry::claim_port("CSIM_E2E_STOP").unwrap(),
         NUM_TIME_POINTS as i32,
         NDDataType::Float64,
         0,
