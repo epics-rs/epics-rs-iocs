@@ -1,8 +1,9 @@
 //! The persistent acquisition worker: `SpecsAnalyser::specsAnalyserTask`
-//! (`specsAnalyser.cpp:268-706`). Runs on its own runtime
-//! (`rt::run_thread_named`) because `ArrayPublisher::publish` is async; its
-//! exchanges run on the driver ([`SpecsAnalyserDriver::with_wire`]), the
-//! same owner as `write_int32`'s.
+//! (`specsAnalyser.cpp:268-706`). It holds the driver as C holds
+//! `this->lock()`, releasing it only where C unlocks, so its exchanges and
+//! parameter steps run on the driver ([`SpecsAnalyserDriver::with_wire`]).
+//! It runs on its own runtime (`rt::run_thread_named`) because
+//! `ArrayPublisher::publish` is async.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,9 +16,9 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
-use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
 
 use crate::codec;
 use crate::driver::SpecsAnalyserDriver;
@@ -37,13 +38,18 @@ pub struct Worker {
     pub stop: Arc<Event>,
     pub output: ArrayPublisher,
     pub pool: DriverPool,
-    /// Pending parameter writes, flushed at each C `callParamCallbacks()`.
-    /// Always constructed empty.
-    pub batch: Vec<ParamSetValue>,
+}
+
+/// The running task, on its own thread: a hold is tied to the thread that
+/// took it.
+struct Task {
+    w: Worker,
+    /// C `this->lock()`; `None` once the port is gone.
+    hold: Option<DriverHold<SpecsAnalyserDriver>>,
     /// C's `status` local, carried across outer-loop passes — used only to
     /// decide whether the wait branch may overwrite `ADStatusMessage`/
-    /// `ADStatus` (`specsAnalyser.cpp:307-313`). Always constructed `true`.
-    pub last_status_ok: bool,
+    /// `ADStatus` (`specsAnalyser.cpp:307-313`).
+    last_status_ok: bool,
 }
 
 /// Current time as an f64 epoch second count (C `secPastEpoch + nsec/1e9`).
@@ -70,89 +76,87 @@ struct Prepared {
     energy_channels: i32,
 }
 
-impl Worker {
+impl Task {
     // -----------------------------------------------------------------------
     // Parameter library (C `setIntegerParam`/`setDoubleParam`/`getIntegerParam`/
     // `getDoubleParam`/`callParamCallbacks`).
     // -----------------------------------------------------------------------
 
-    fn set_i32(&mut self, reason: usize, value: i32) {
-        self.batch
-            .push(ParamSetValue::new(reason, 0, ParamValue::Int32(value)));
-    }
-
-    fn set_f64(&mut self, reason: usize, value: f64) {
-        self.batch
-            .push(ParamSetValue::new(reason, 0, ParamValue::Float64(value)));
-    }
-
-    fn set_str(&mut self, reason: usize, value: impl Into<Vec<u8>>) {
-        self.batch.push(ParamSetValue::new(
-            reason,
-            0,
-            ParamValue::Octet(Into::<Vec<u8>>::into(value).into()),
-        ));
-    }
-
-    fn set_f64_array(&mut self, reason: usize, value: Vec<f64>) {
-        self.batch.push(ParamSetValue::new(
-            reason,
-            0,
-            ParamValue::Float64Array(value.into()),
-        ));
-    }
-
-    async fn callbacks(&mut self) {
-        let updates = std::mem::take(&mut self.batch);
-        let _ = self.self_handle.set_params_and_notify(0, updates).await;
-    }
-
-    async fn flush(&mut self) {
-        if !self.batch.is_empty() {
-            self.callbacks().await;
-        }
-    }
-
-    async fn get_i32(&mut self, reason: usize) -> i32 {
-        self.flush().await;
-        self.self_handle.read_int32(reason, 0).await.unwrap_or(0)
-    }
-
-    async fn get_f64(&mut self, reason: usize) -> f64 {
-        self.flush().await;
-        self.self_handle
-            .read_float64(reason, 0)
-            .await
-            .unwrap_or(0.0)
-    }
-
-    // -----------------------------------------------------------------------
-    // Exchanges — run on the driver, so `SPECSMsgCounter_`/`SPECSConnected_`
-    // have one owner for both the write path and this task.
-    // -----------------------------------------------------------------------
-
-    /// `f` on the driver, after this task's pending sets.
-    async fn driver<R: Send + 'static>(
+    /// `f` on the driver, inside the hold. A failed step drops the hold:
+    /// the port is gone.
+    fn driver<R: Send + 'static>(
         &mut self,
         f: impl FnOnce(&mut SpecsAnalyserDriver) -> R + Send + 'static,
     ) -> Result<R, WireError> {
-        self.flush().await;
-        self.self_handle.with_driver(f).await.map_err(WireError::Io)
+        let result = match self.hold.as_mut() {
+            Some(hold) => hold.run(f),
+            None => Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "specsAnalyserTask holds no driver".into(),
+            }),
+        };
+        if result.is_err() {
+            self.hold = None;
+        }
+        result.map_err(WireError::Io)
     }
 
-    async fn wire<R: Send + 'static>(
+    /// C `this->unlock()` … `this->lock()` around `wait`.
+    fn unlocked<R>(&mut self, wait: impl FnOnce() -> R) -> R {
+        match self.hold.as_mut() {
+            Some(hold) => hold.unlocked(wait),
+            None => wait(),
+        }
+    }
+
+    fn set(&mut self, reason: usize, value: ParamValue) {
+        let _ = self.driver(move |d| {
+            let _ = d.ad.port_base.set_param_value(reason, 0, value);
+        });
+    }
+
+    fn set_i32(&mut self, reason: usize, value: i32) {
+        self.set(reason, ParamValue::Int32(value));
+    }
+
+    fn set_f64(&mut self, reason: usize, value: f64) {
+        self.set(reason, ParamValue::Float64(value));
+    }
+
+    fn set_str(&mut self, reason: usize, value: impl Into<Vec<u8>>) {
+        self.set(reason, ParamValue::Octet(value.into().into()));
+    }
+
+    fn set_f64_array(&mut self, reason: usize, value: Vec<f64>) {
+        self.set(reason, ParamValue::Float64Array(value.into()));
+    }
+
+    fn callbacks(&mut self) {
+        let _ = self.driver(|d| {
+            let _ = d.ad.port_base.call_param_callbacks(0);
+        });
+    }
+
+    fn get_i32(&mut self, reason: usize) -> i32 {
+        self.driver(move |d| d.ad.port_base.get_int32_param(reason, 0).unwrap_or(0))
+            .unwrap_or(0)
+    }
+
+    fn get_f64(&mut self, reason: usize) -> f64 {
+        self.driver(move |d| d.ad.port_base.get_float64_param(reason, 0).unwrap_or(0.0))
+            .unwrap_or(0.0)
+    }
+
+    fn wire<R: Send + 'static>(
         &mut self,
         f: impl FnOnce(&mut WireLink) -> Result<R, WireError> + Send + 'static,
     ) -> Result<R, WireError> {
-        self.driver(move |d| d.with_wire(f)).await?
+        self.driver(move |d| d.with_wire(f))?
     }
 
-    async fn command_response(
-        &mut self,
-        command: &str,
-    ) -> Result<HashMap<String, String>, WireError> {
+    fn command_response(&mut self, command: &str) -> Result<HashMap<String, String>, WireError> {
         let command = command.to_string();
-        self.wire(move |link| link.command_response(&command)).await
+        self.wire(move |link| link.command_response(&command))
     }
 
     // -----------------------------------------------------------------------
@@ -165,45 +169,43 @@ impl Worker {
     /// failed (C's `status != asynSuccess` branch, `specsAnalyser.cpp:436-440`)
     /// — the caller then simply loops back to the wait branch, exactly as C's
     /// `while(1)` falls through with `ADAcquire` already 0.
-    async fn wait_and_prepare(&mut self) -> Option<Prepared> {
-        self.set_i32(self.p.pause_acq, 0);
+    fn wait_and_prepare(&mut self) -> Option<Prepared> {
+        self.set_i32(self.w.p.pause_acq, 0);
         if self.last_status_ok {
-            self.set_str(self.ad.status_message, "Waiting for the acquire command");
-            let adstatus = self.get_i32(self.ad.status).await;
+            self.set_str(self.w.ad.status_message, "Waiting for the acquire command");
+            let adstatus = self.get_i32(self.w.ad.status);
             if adstatus != ADStatus::Aborted as i32 && adstatus != ADStatus::Error as i32 {
-                self.set_i32(self.ad.status, ADStatus::Idle as i32);
+                self.set_i32(self.w.ad.status, ADStatus::Idle as i32);
             }
         }
-        self.set_i32(self.ad.num_exposures_counter, 0);
-        self.set_i32(self.ad.num_images_counter, 0);
-        self.callbacks().await;
+        self.set_i32(self.w.ad.num_exposures_counter, 0);
+        self.set_i32(self.w.ad.num_images_counter, 0);
+        self.callbacks();
 
-        self.start.wait();
+        let start = self.w.start.clone();
+        self.unlocked(|| start.wait());
 
-        let acquire = self.get_i32(self.ad.acquire).await;
-        self.set_i32(self.p.pause_acq, 0);
-        let iterations = self.get_i32(self.ad.num_exposures).await;
+        let acquire = self.get_i32(self.w.ad.acquire);
+        self.set_i32(self.w.p.pause_acq, 0);
+        let iterations = self.get_i32(self.w.ad.num_exposures);
 
         let mut ok = true;
         let mut non_energy_channels = 0;
-        match self
-            .wire(|link| link.get_analyser_parameter_int("NumNonEnergyChannels"))
-            .await
-        {
+        match self.wire(|link| link.get_analyser_parameter_int("NumNonEnergyChannels")) {
             Ok(v) => {
                 non_energy_channels = v;
-                self.set_i32(self.p.non_energy_channels, v);
+                self.set_i32(self.w.p.non_energy_channels, v);
             }
             Err(_) => ok = false,
         }
 
         let run_mode = if ok {
             // C discards `sendSimpleCommand(SPECS_CMD_CLEAR)`'s own status.
-            let _ = self.command_response("ClearSpectrum").await;
-            let run_mode_val = self.get_i32(self.p.run_mode).await;
+            let _ = self.command_response("ClearSpectrum");
+            let run_mode_val = self.get_i32(self.w.p.run_mode);
             let run_mode = RunMode::from_i32(run_mode_val);
             if run_mode.is_some() {
-                ok = self.run_define().await;
+                ok = self.run_define();
             }
             run_mode
         } else {
@@ -215,10 +217,8 @@ impl Worker {
         // case — the C `default:` branch only skips Define, not Validate.
         let mut validated: Option<ValidateResult> = None;
         if ok {
-            let kinetic_energy = self.get_f64(self.p.kinetic_energy).await;
-            let validated_now = self
-                .driver(move |d| d.validate_spectrum(run_mode, kinetic_energy))
-                .await;
+            let kinetic_energy = self.get_f64(self.w.p.kinetic_energy);
+            let validated_now = self.driver(move |d| d.validate_spectrum(run_mode, kinetic_energy));
             match validated_now.and_then(|r| r) {
                 Ok(result) => validated = Some(result),
                 Err(_) => ok = false,
@@ -228,16 +228,16 @@ impl Worker {
         let mut energy_channels = 0;
         if ok {
             let result = validated.expect("ok implies validated is Some");
-            self.set_f64(self.p.start_energy, result.start_energy);
-            self.set_f64(self.p.end_energy, result.end_energy);
-            self.set_f64(self.p.step_width, result.step_width);
-            self.set_i32(self.p.samples_iteration, result.samples);
-            self.set_f64(self.ad.acquire_time, result.dwell_time);
-            self.set_f64(self.p.pass_energy, result.pass_energy);
-            self.set_i32(self.p.lens_mode, result.lens_mode);
-            self.set_i32(self.p.scan_range, result.scan_range);
+            self.set_f64(self.w.p.start_energy, result.start_energy);
+            self.set_f64(self.w.p.end_energy, result.end_energy);
+            self.set_f64(self.w.p.step_width, result.step_width);
+            self.set_i32(self.w.p.samples_iteration, result.samples);
+            self.set_f64(self.w.ad.acquire_time, result.dwell_time);
+            self.set_f64(self.w.p.pass_energy, result.pass_energy);
+            self.set_i32(self.w.p.lens_mode, result.lens_mode);
+            self.set_i32(self.w.p.scan_range, result.scan_range);
             energy_channels = result.samples;
-            self.set_i32(self.p.samples, energy_channels * iterations);
+            self.set_i32(self.w.p.samples, energy_channels * iterations);
 
             if run_mode == Some(RunMode::Sfat) {
                 // The number of channels is (end-start)/width + 1
@@ -248,22 +248,22 @@ impl Worker {
                         .floor() as i32
                         + 1;
                 }
-                self.set_i32(self.p.samples_iteration, energy_channels);
-                self.set_i32(self.p.samples, energy_channels * iterations);
+                self.set_i32(self.w.p.samples_iteration, energy_channels);
+                self.set_i32(self.w.p.samples, energy_channels * iterations);
             }
 
             let nbytes = (energy_channels.max(0) as i64) * (non_energy_channels.max(0) as i64) * 8;
-            self.set_i32(self.ad.base.array_size_x, energy_channels);
-            self.set_i32(self.ad.base.array_size_y, non_energy_channels);
-            self.set_i32(self.ad.base.array_size, nbytes as i32);
-            self.callbacks().await;
+            self.set_i32(self.w.ad.base.array_size_x, energy_channels);
+            self.set_i32(self.w.ad.base.array_size_y, non_energy_channels);
+            self.set_i32(self.w.ad.base.array_size, nbytes as i32);
+            self.callbacks();
         }
 
         self.last_status_ok = ok;
         if !ok {
-            self.set_i32(self.ad.acquire, 0);
-            self.set_i32(self.ad.status, ADStatus::Error as i32);
-            self.callbacks().await;
+            self.set_i32(self.w.ad.acquire, 0);
+            self.set_i32(self.w.ad.status, ADStatus::Error as i32);
+            self.callbacks();
             return None;
         }
 
@@ -277,8 +277,8 @@ impl Worker {
 
     /// The `DefineSpectrum*` command for the current run mode
     /// (`specsAnalyser.cpp:344-366`), as `writeInt32` sends it.
-    async fn run_define(&mut self) -> bool {
-        matches!(self.driver(|d| d.dispatch_define().is_ok()).await, Ok(true))
+    fn run_define(&mut self) -> bool {
+        matches!(self.driver(|d| d.dispatch_define().is_ok()), Ok(true))
     }
 
     /// The acquisition body (`specsAnalyser.cpp:441-704`).
@@ -294,37 +294,34 @@ impl Worker {
         let mut image = vec![0.0f64; nx * ny];
         let mut spectrum = vec![0.0f64; nx];
 
-        self.set_i32(self.p.percent_complete_iteration, 0);
-        self.set_i32(self.p.current_sample_iteration, 0);
-        self.set_i32(self.p.percent_complete, 0);
-        self.set_i32(self.p.current_sample, 0);
+        self.set_i32(self.w.p.percent_complete_iteration, 0);
+        self.set_i32(self.w.p.current_sample_iteration, 0);
+        self.set_i32(self.w.p.percent_complete, 0);
+        self.set_i32(self.w.p.current_sample, 0);
 
         let acq_start_epoch = now_epoch_f64();
         let acq_start_instant = Instant::now();
 
-        let acquire_time = self.get_f64(self.ad.acquire_time).await;
-        let acquire_period = self.get_f64(self.ad.acquire_period).await;
-        let num_images = self.get_i32(self.ad.num_images).await;
-        let image_mode = self.get_i32(self.ad.image_mode).await;
-        let safe_state = self.get_i32(self.p.safe_state).await;
+        let acquire_time = self.get_f64(self.w.ad.acquire_time);
+        let acquire_period = self.get_f64(self.w.ad.acquire_period);
+        let num_images = self.get_i32(self.w.ad.num_images);
+        let image_mode = self.get_i32(self.w.ad.image_mode);
+        let safe_state = self.get_i32(self.w.p.safe_state);
 
-        self.set_i32(self.ad.status, ADStatus::Initializing as i32);
-        self.set_str(self.ad.status_message, "Executing pre-scan...");
+        self.set_i32(self.w.ad.status, ADStatus::Initializing as i32);
+        self.set_str(self.w.ad.status_message, "Executing pre-scan...");
 
         let mut ok = true;
         let mut iteration = 0i32;
         let mut last_data: HashMap<String, String> = HashMap::new();
         while iteration < iterations && acquire == 1 {
-            let _ = self.command_response("ClearSpectrum").await;
-            let _ = self
-                .command_response(&codec::start_command(safe_state != 0))
-                .await;
+            let _ = self.command_response("ClearSpectrum");
+            let _ = self.command_response(&codec::start_command(safe_state != 0));
 
             let mut current_data_point: i32 = 0;
             let mut num_data_points: i32;
             last_data = self
                 .command_response("GetAcquisitionStatus")
-                .await
                 .unwrap_or_default();
 
             loop {
@@ -344,13 +341,13 @@ impl Worker {
                     break;
                 }
 
-                rt::sleep(secs(UPDATE_RATE)).await;
+                self.unlocked(|| std::thread::sleep(secs(UPDATE_RATE)));
 
                 // sendSimpleCommand always replaces the whole map
                 // (specsAnalyser.cpp:1335-1337), even on a device-level
                 // ERROR reply or an I/O failure — never merges into stale
                 // data from a prior poll.
-                match self.command_response("GetAcquisitionStatus").await {
+                match self.command_response("GetAcquisitionStatus") {
                     Ok(data) => {
                         ok = true;
                         last_data = data;
@@ -382,21 +379,22 @@ impl Worker {
 
                 if num_data_points > current_data_point {
                     if current_data_point == 0 {
-                        self.set_i32(self.ad.status, ADStatus::Acquire as i32);
-                        self.set_str(self.ad.status_message, "Acquiring data...");
+                        self.set_i32(self.w.ad.status, ADStatus::Acquire as i32);
+                        self.set_str(self.w.ad.status_message, "Acquiring data...");
 
-                        let data_delay_max = self.get_f64(self.p.data_delay_max).await;
+                        let data_delay_max = self.get_f64(self.w.p.data_delay_max);
                         let period = acquire_time.min(data_delay_max);
-                        rt::sleep(secs(period)).await;
-                        if let Ok(range) = self.wire(|link| link.read_ordinate_range()).await {
-                            self.set_str(self.p.non_energy_units, range.unit);
+                        // C sleeps here holding the lock (specsAnalyser.cpp:525).
+                        std::thread::sleep(secs(period));
+                        if let Ok(range) = self.wire(|link| link.read_ordinate_range()) {
+                            self.set_str(self.w.p.non_energy_units, range.unit);
                             if let Some(min) = range.min {
-                                self.set_f64(self.p.non_energy_min, min);
+                                self.set_f64(self.w.p.non_energy_min, min);
                             }
                             if let Some(max) = range.max {
-                                self.set_f64(self.p.non_energy_max, max);
+                                self.set_f64(self.w.p.non_energy_max, max);
                             }
-                            self.callbacks().await;
+                            self.callbacks();
                         }
                     }
 
@@ -410,29 +408,28 @@ impl Worker {
                     let (from, to) = (current_data_point, read_end_data_point - 1);
                     let values = self
                         .wire(move |link| link.read_acquisition_data(from, to))
-                        .await
                         .unwrap_or_default();
 
                     if (values.len() as i32)
                         < (read_end_data_point - current_data_point) * non_energy_channels
                     {
-                        let _ = self.command_response("Abort").await;
+                        let _ = self.command_response("Abort");
                         ok = false;
-                        self.set_i32(self.ad.acquire, 0);
-                        self.set_i32(self.ad.status, ADStatus::Error as i32);
-                        self.set_str(self.ad.status_message, "SPECS Receive Error, see log");
+                        self.set_i32(self.w.ad.acquire, 0);
+                        self.set_i32(self.w.ad.status, ADStatus::Error as i32);
+                        self.set_str(self.w.ad.status_message, "SPECS Receive Error, see log");
                         continue;
                     }
 
                     let mut index = 0usize;
                     for y in 0..non_energy_channels.max(0) {
                         if num_data_points > energy_channels {
-                            let _ = self.command_response("Abort").await;
+                            let _ = self.command_response("Abort");
                             ok = false;
-                            self.set_i32(self.ad.acquire, 0);
-                            self.set_i32(self.ad.status, ADStatus::Error as i32);
+                            self.set_i32(self.w.ad.acquire, 0);
+                            self.set_i32(self.w.ad.status, ADStatus::Error as i32);
                             self.set_str(
-                                self.ad.status_message,
+                                self.w.ad.status_message,
                                 "SPECS Controller Error(B), see log",
                             );
                             break;
@@ -458,30 +455,30 @@ impl Worker {
 
                     if iteration == 0 {
                         self.set_f64_array(
-                            self.p.acq_spectrum,
+                            self.w.p.acq_spectrum,
                             spectrum[..current_data_point.max(0) as usize].to_vec(),
                         );
                     } else {
-                        self.set_f64_array(self.p.acq_spectrum, spectrum.clone());
+                        self.set_f64_array(self.w.p.acq_spectrum, spectrum.clone());
                     }
-                    self.set_f64_array(self.p.acq_image, image.clone());
+                    self.set_f64_array(self.w.p.acq_image, image.clone());
 
                     let pct_iter = if energy_channels > 0 {
                         (current_data_point * 100) / energy_channels
                     } else {
                         0
                     };
-                    self.set_i32(self.p.percent_complete_iteration, pct_iter);
+                    self.set_i32(self.w.p.percent_complete_iteration, pct_iter);
                     let total = iterations * energy_channels;
                     let pct_total = if total > 0 {
                         ((current_data_point + iteration * energy_channels) * 100) / total
                     } else {
                         0
                     };
-                    self.set_i32(self.p.percent_complete, pct_total);
-                    self.set_i32(self.p.current_sample_iteration, current_data_point);
+                    self.set_i32(self.w.p.percent_complete, pct_total);
+                    self.set_i32(self.w.p.current_sample_iteration, current_data_point);
                     self.set_i32(
-                        self.p.current_sample,
+                        self.w.p.current_sample,
                         current_data_point + iteration * energy_channels,
                     );
 
@@ -489,47 +486,49 @@ impl Worker {
                     // here (distinct from the `acquireTime` captured once
                     // before the iteration loop) so a client changing it
                     // mid-scan is reflected in the estimate immediately.
-                    let current_acquire_time = self.get_f64(self.ad.acquire_time).await;
+                    let current_acquire_time = self.get_f64(self.w.ad.acquire_time);
                     let remaining_iter =
                         ((energy_channels - current_data_point) as f64) * current_acquire_time;
-                    self.set_f64(self.p.remaining_time_iteration, remaining_iter);
+                    self.set_f64(self.w.p.remaining_time_iteration, remaining_iter);
                     let remaining_total = ((energy_channels - current_data_point
                         + (iterations - (iteration + 1)) * energy_channels)
                         as f64)
                         * current_acquire_time;
-                    self.set_f64(self.p.remaining_time, remaining_total);
+                    self.set_f64(self.w.p.remaining_time, remaining_total);
 
-                    self.callbacks().await;
+                    self.callbacks();
                 }
 
-                acquire = self.get_i32(self.ad.acquire).await;
+                acquire = self.get_i32(self.w.ad.acquire);
             }
 
             if last_data.get("ControllerState").map(String::as_str) == Some("error") {
                 ok = false;
-                self.set_i32(self.ad.acquire, 0);
-                self.set_i32(self.ad.status, ADStatus::Error as i32);
+                self.set_i32(self.w.ad.acquire, 0);
+                self.set_i32(self.w.ad.status, ADStatus::Error as i32);
                 match last_data.get("Message").filter(|m| !m.is_empty()) {
-                    Some(msg) => self.set_str(self.ad.status_message, msg.clone()),
-                    None => self.set_str(self.ad.status_message, "SPECS Controller Error, see log"),
+                    Some(msg) => self.set_str(self.w.ad.status_message, msg.clone()),
+                    None => {
+                        self.set_str(self.w.ad.status_message, "SPECS Controller Error, see log")
+                    }
                 }
             }
 
-            acquire = self.get_i32(self.ad.acquire).await;
+            acquire = self.get_i32(self.w.ad.acquire);
             iteration += 1;
         }
         let _ = &last_data;
 
-        let array_counter = self.get_i32(self.ad.base.array_counter).await + 1;
-        let num_images_counter = self.get_i32(self.ad.num_images_counter).await + 1;
-        self.set_i32(self.ad.base.array_counter, array_counter);
-        self.set_i32(self.ad.num_images_counter, num_images_counter);
+        let array_counter = self.get_i32(self.w.ad.base.array_counter) + 1;
+        let num_images_counter = self.get_i32(self.w.ad.num_images_counter) + 1;
+        self.set_i32(self.w.ad.base.array_counter, array_counter);
+        self.set_i32(self.w.ad.num_images_counter, num_images_counter);
 
-        let array_callbacks = self.get_i32(self.ad.base.array_callbacks).await;
+        let array_callbacks = self.get_i32(self.w.ad.base.array_callbacks);
         // C dereferences a refused alloc unchecked (specsAnalyser.cpp:454, :493);
         // here the frame is dropped after the pool's limit line.
         if array_callbacks != 0
-            && let Ok(mut array) = self.pool.alloc_with(
+            && let Ok(mut array) = self.w.pool.alloc_with(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
                 NDDataBuffer::F64(image),
             )
@@ -537,25 +536,31 @@ impl Worker {
             array.unique_id = array_counter;
             array.time_stamp = acq_start_epoch;
             array.timestamp = EpicsTimestamp::now();
-            self.output.publish(array).await;
+            // C unlock() … lock() around doCallbacksGenericPointer
+            // (specsAnalyser.cpp:664-667); the publish awaits, so the hold is
+            // dropped and retaken rather than lent to a closure.
+            drop(self.hold.take());
+            self.w.output.publish(array).await;
+            self.hold = self.w.self_handle.hold_driver_blocking().ok();
         }
 
         self.last_status_ok = ok;
         if ok {
             if image_mode == 0 /* Single */ || (image_mode == 1 /* Multiple */ && num_images_counter >= num_images)
             {
-                self.set_i32(self.ad.acquire, 0);
+                self.set_i32(self.w.ad.acquire, 0);
             }
-            self.callbacks().await;
-            acquire = self.get_i32(self.ad.acquire).await;
+            self.callbacks();
+            acquire = self.get_i32(self.w.ad.acquire);
 
             if acquire != 0 {
                 let elapsed = acq_start_instant.elapsed().as_secs_f64();
                 let delay = acquire_period - elapsed;
                 if delay >= 0.0 {
-                    self.set_i32(self.ad.status, ADStatus::Waiting as i32);
-                    self.callbacks().await;
-                    self.stop.wait_timeout(secs(delay));
+                    self.set_i32(self.w.ad.status, ADStatus::Waiting as i32);
+                    self.callbacks();
+                    let stop = self.w.stop.clone();
+                    self.unlocked(|| stop.wait_timeout(secs(delay)));
                 }
             }
         }
@@ -566,12 +571,12 @@ impl Worker {
     /// pass; otherwise (e.g. `ImageMode::Continuous`, which never resets
     /// `ADAcquire` between batches) it falls straight through to rerun the
     /// acquisition body against the previous pass's `Prepared` state.
-    pub async fn run(mut self) {
+    async fn run(mut self) {
         let mut prepared: Option<Prepared> = None;
-        loop {
-            let acquire = self.get_i32(self.ad.acquire).await;
+        while self.hold.is_some() {
+            let acquire = self.get_i32(self.w.ad.acquire);
             if acquire == 0 {
-                prepared = self.wait_and_prepare().await;
+                prepared = self.wait_and_prepare();
                 if prepared.is_none() {
                     continue;
                 }
@@ -595,5 +600,14 @@ impl Worker {
 /// Spawn the acquisition worker thread (C `epicsThreadCreate(...,
 /// specsAnalyserTaskC, ...)`).
 pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("specsAnalyserTask", move || w.run())
+    rt::run_thread_named("specsAnalyserTask", move || async move {
+        let hold = w.self_handle.hold_driver_blocking().ok();
+        Task {
+            w,
+            hold,
+            last_status_ok: true,
+        }
+        .run()
+        .await
+    })
 }

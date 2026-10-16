@@ -752,8 +752,6 @@ pub fn create_specs_analyser_detector(
         stop,
         output: ArrayPublisher::new(array_output.clone()),
         pool: pool.clone(),
-        batch: Vec::new(),
-        last_status_ok: true,
     };
     let tasks = vec![start_task(worker)];
 

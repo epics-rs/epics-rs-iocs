@@ -38,16 +38,25 @@ fn healthy(command: &str) -> String {
     }
 }
 
-/// Commands starting with a prefix get `ERROR <code> refused`, or no reply at
-/// all for code 0.
-type Rules = Vec<(&'static str, u32)>;
+/// How the server answers a command starting with a rule's prefix.
+#[derive(Clone, Copy)]
+enum Act {
+    /// `ERROR <code> refused`.
+    Refuse(u32),
+    /// No reply.
+    Mute,
+    /// The healthy reply, this many milliseconds late.
+    Slow(u64),
+}
+
+type Rules = Vec<(&'static str, Act)>;
 
 /// A detector on a fake server that answers by the rules last armed; `heard`
-/// gets each request's counter.
+/// gets each request's counter and command.
 struct Fake {
     runtime: SpecsAnalyserRuntime,
     arm: mpsc::Sender<Rules>,
-    heard: mpsc::Receiver<u32>,
+    heard: mpsc::Receiver<(u32, String)>,
 }
 
 impl Fake {
@@ -60,7 +69,7 @@ impl Fake {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let (arm, armed) = mpsc::channel::<Rules>();
-        arm.send(refuse.iter().map(|&p| (p, code)).collect())
+        arm.send(refuse.iter().map(|&p| (p, Act::Refuse(code))).collect())
             .unwrap();
         let (tell, heard) = mpsc::channel();
         std::thread::spawn(move || {
@@ -77,10 +86,14 @@ impl Fake {
                 let (counter, command) = line.trim_start_matches('?').split_at(4);
                 let command = command.trim().to_string();
                 let counter: u32 = counter.parse().unwrap();
-                let _ = tell.send(counter);
+                let _ = tell.send((counter, command.clone()));
                 let reply = match rules.iter().find(|(p, _)| command.starts_with(p)) {
-                    Some((_, 0)) => continue,
-                    Some((_, code)) => format!("ERROR {code} refused"),
+                    Some((_, Act::Mute)) => continue,
+                    Some((_, Act::Refuse(code))) => format!("ERROR {code} refused"),
+                    Some((_, Act::Slow(ms))) => {
+                        std::thread::sleep(std::time::Duration::from_millis(*ms));
+                        healthy(&command)
+                    }
                     None => healthy(&command),
                 };
                 // One write, so one read takes the whole reply.
@@ -127,10 +140,15 @@ impl Fake {
     }
 
     fn refuse(&self, code: u32, commands: &[&'static str]) {
-        self.answer(&commands.iter().map(|&p| (p, code)).collect::<Rules>());
+        self.answer(
+            &commands
+                .iter()
+                .map(|&p| (p, Act::Refuse(code)))
+                .collect::<Rules>(),
+        );
     }
 
-    fn answer(&self, rules: &[(&'static str, u32)]) {
+    fn answer(&self, rules: &[(&'static str, Act)]) {
         self.arm.send(rules.to_vec()).unwrap();
     }
 
@@ -176,7 +194,10 @@ impl Fake {
 
     /// The counter of the last request the server has seen.
     fn last_heard(&self) -> u32 {
-        self.heard.try_iter().last().unwrap_or(0)
+        self.heard
+            .try_iter()
+            .last()
+            .map_or(0, |(counter, _)| counter)
     }
 
     fn write_int32(&self, reason: usize, value: i32) -> Result<(), AsynStatus> {
@@ -219,8 +240,11 @@ fn a_refused_spectrum_parameter_read_fails_the_connect() {
 fn connect_returns_the_or_of_the_step_statuses() {
     let fake = Fake::start_refusing("SPECS_WS_CONNOR", 3, &["Connect"]);
     fake.answer(&[
-        ("GetSpectrumParameterInfo ParameterName:\"LensMode\"", 0),
-        ("GetSpectrumParameterInfo", 7),
+        (
+            "GetSpectrumParameterInfo ParameterName:\"LensMode\"",
+            Act::Mute,
+        ),
+        ("GetSpectrumParameterInfo", Act::Refuse(7)),
     ]);
     let connect = fake.runtime.specs_params.connect;
     assert_eq!(fake.write_int32(connect, 1), Err(AsynStatus::Error));
@@ -369,7 +393,11 @@ fn the_acquisition_task_posts_the_message_counter() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut last = before;
     loop {
-        last = fake.heard.try_iter().last().unwrap_or(last);
+        last = fake
+            .heard
+            .try_iter()
+            .last()
+            .map_or(last, |(counter, _)| counter);
         if last > before && fake.msg_counter() == last as i32 {
             break;
         }
@@ -380,4 +408,37 @@ fn the_acquisition_task_posts_the_message_counter() {
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+}
+
+/// The task holds the driver lock from its start wait to its first poll
+/// sleep (C this->lock(), specsAnalyser.cpp:323-501), so a write issued
+/// while ValidateSpectrum is out lands after the iteration's
+/// GetAcquisitionStatus.
+#[test]
+fn a_write_waits_for_the_task_sequence() {
+    let fake = Fake::start("SPECS_WS_HOLD");
+    fake.answer(&[("ValidateSpectrum", Act::Slow(300))]);
+    let turns = fake.reason("TURNS");
+    let ad = &fake.runtime.ad_params;
+    fake.write_int32(ad.num_exposures, 1).unwrap();
+    fake.write_int32(ad.acquire, 1).unwrap();
+    let mut heard = Vec::new();
+    while !heard.iter().any(|c: &String| c == "ValidateSpectrum") {
+        let (_, command) = fake
+            .heard
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the task never validated");
+        heard.push(command);
+    }
+    fake.write_int32(turns, 9).unwrap();
+    heard.extend(fake.heard.try_iter().map(|(_, command)| command));
+    let set = heard
+        .iter()
+        .position(|c| c.starts_with("SetAnalyzerParameterValue"))
+        .expect("the write was sent");
+    let status = heard
+        .iter()
+        .position(|c| c == "GetAcquisitionStatus")
+        .unwrap_or(heard.len());
+    assert!(status < set, "{heard:?}");
 }
