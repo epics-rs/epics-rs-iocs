@@ -17,11 +17,14 @@ pub enum DppType {
     Mca8000D,
     Tb5,
     Dp5X,
+    /// A `DEVICE_ID` outside the enum. C compares the raw id, so such a
+    /// device matches none of the per-type gates; only its name falls back
+    /// to `"DP5"`.
+    Unknown(u8),
 }
 
 impl DppType {
-    /// `CDP5Status::GetDeviceNameFromVal` (`DP5Status.cpp:653-682`): any
-    /// value not in `0..=5` names as `"DP5"`, matching C's `default` arm.
+    /// `RAW[39]` as `Process_Status` stores it in `DEVICE_ID`.
     pub fn from_device_id(device_id: u8) -> Self {
         match device_id {
             0 => DppType::Dp5,
@@ -30,14 +33,15 @@ impl DppType {
             3 => DppType::Mca8000D,
             4 => DppType::Tb5,
             5 => DppType::Dp5X,
-            _ => DppType::Dp5,
+            other => DppType::Unknown(other),
         }
     }
 
-    /// `CDP5Status::GetDeviceNameFromVal` (`DP5Status.cpp:653-682`).
+    /// `CDP5Status::GetDeviceNameFromVal` (`DP5Status.cpp:653-682`): the
+    /// `default` arm names an unknown id `"DP5"`.
     pub fn name(self) -> &'static str {
         match self {
-            DppType::Dp5 => "DP5",
+            DppType::Dp5 | DppType::Unknown(_) => "DP5",
             DppType::Px5 => "PX5",
             DppType::Dp5G => "DP5G",
             DppType::Mca8000D => "MCA8000D",
@@ -74,7 +78,7 @@ pub fn byte_version_to_string(v: u8) -> String {
 /// (`DP5Status.h`) / `drvAmptek.cpp`'s param names.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Dp5Status {
-    pub device_id: u8,
+    /// `DEVICE_ID`.
     pub dpp_type: DppType,
     pub fast_count: f64,
     pub slow_count: f64,
@@ -118,8 +122,7 @@ pub fn process_status(raw: &[u8]) -> Dp5Status {
         raw.len()
     );
 
-    let device_id = raw[39];
-    let dpp_type = DppType::from_device_id(device_id);
+    let dpp_type = DppType::from_device_id(raw[39]);
     let fast_count = long_word_to_double(0, raw);
     let slow_count = long_word_to_double(4, raw);
     let accumulation_time = f64::from(raw[12]) * 0.001
@@ -157,7 +160,6 @@ pub fn process_status(raw: &[u8]) -> Dp5Status {
         && dpp_eco < 0xFF;
 
     Dp5Status {
-        device_id,
         dpp_type,
         fast_count,
         slow_count,
@@ -192,7 +194,6 @@ mod tests {
     #[test]
     fn zeroed_block_decodes_to_zeroed_status() {
         let s = process_status(&raw_fixture());
-        assert_eq!(s.device_id, 0);
         assert_eq!(s.dpp_type, DppType::Dp5);
         assert_eq!(s.fast_count, 0.0);
         assert_eq!(s.slow_count, 0.0);
@@ -291,6 +292,20 @@ mod tests {
         assert_eq!(DppType::from_device_id(4).name(), "TB5");
         assert_eq!(DppType::from_device_id(5).name(), "DP5-X");
         assert_eq!(DppType::from_device_id(200).name(), "DP5");
+    }
+
+    /// An unknown id is not `dppDP5` for the gates (`DP5Status.cpp:132`).
+    #[test]
+    fn unknown_device_id_is_not_dp5() {
+        let mut raw = raw_fixture();
+        raw[39] = 200;
+        raw[24] = 0x70; // firmware/build >= 0x686
+        raw[49] = 0x01; // DPP_ECO < 0xFF
+        let s = process_status(&raw);
+        assert_eq!(s.dpp_type, DppType::Unknown(200));
+        assert!(!s.is_dp5_rev_dx_gains);
+        raw[39] = 0;
+        assert!(process_status(&raw).is_dp5_rev_dx_gains);
     }
 
     #[test]

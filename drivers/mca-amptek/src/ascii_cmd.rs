@@ -432,6 +432,17 @@ mod tests {
         }
     }
 
+    /// An unknown `DEVICE_ID` fails every `== dppDP5` gate
+    /// (`AsciiCmdUtilities.cpp:234-244`), unlike a DP5.
+    #[test]
+    fn create_full_readback_cmd_unknown_device_is_not_dp5() {
+        let cmd = create_full_readback_cmd(false, DppType::Unknown(9), false, 0);
+        assert!(!cmd.contains("BOOT=?;"));
+        assert!(!cmd.contains("GATE=?;"));
+        assert!(cmd.contains("CON1=?;"));
+        assert!(cmd.contains("CON2=?;"));
+    }
+
     #[test]
     fn create_full_readback_cmd_mca8000d_delegates() {
         assert_eq!(
