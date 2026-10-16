@@ -325,11 +325,11 @@ impl QuadEmDevice for AhxxxDriver {
                     break;
                 }
             }
-            let _ = self.base_set_acquire(0);
+            self.base_set_acquire(0);
             return status;
         }
 
-        let _ = self.base_set_acquire(1);
+        self.base_set_acquire(1);
 
         let num_acquire = proto::naq_value(acquire_mode, num_average);
         let model = self.model;

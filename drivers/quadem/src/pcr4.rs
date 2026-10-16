@@ -350,11 +350,11 @@ impl QuadEmDevice for Pcr4Driver {
                 }
             }
 
-            let _ = self.base_set_acquire(0);
+            self.base_set_acquire(0);
             return status;
         }
 
-        let _ = self.base_set_acquire(1);
+        self.base_set_acquire(1);
         // Pushing the settings also flushes any stale input.
         let _ = self.set_acquire_params();
 

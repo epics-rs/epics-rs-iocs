@@ -219,10 +219,10 @@ impl QuadEmDevice for TetrAmmDriver {
                     }
                 }
             }
-            let _ = self.base_set_acquire(0);
+            self.base_set_acquire(0);
             status
         } else {
-            let _ = self.base_set_acquire(1);
+            self.base_set_acquire(1);
             // C++ calls setAcquireParams() here: it is needed before NAQ and
             // also flushes any stale input.
             let _ = self.set_acquire_params();

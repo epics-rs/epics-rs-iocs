@@ -411,7 +411,7 @@ impl T4uDriver {
         // asked, so the port is always "acquiring" and the read threads never
         // wait on acquireStartEvent_.
         this.shared.set_acquiring(true);
-        this.base_set_acquire(1)?;
+        this.base_set_acquire(1);
         Ok(this)
     }
 
