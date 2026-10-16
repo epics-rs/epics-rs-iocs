@@ -785,9 +785,22 @@ impl SessionWorker {
         for config in &subscriptions {
             let (tx, rx) = mpsc::unbounded_channel();
             let id = match connection.create_subscription(config, tx).await {
-                Ok(id) => id,
+                Ok(id) => {
+                    if config.debug > 0 {
+                        errlog_vprintf(format_args!(
+                            "OPC UA subscription {} on session {} created (Good)\n",
+                            config.name, self.handle.name
+                        ));
+                    }
+                    id
+                }
                 Err(status) => {
-                    log::error!("subscription {}: create failed: {status}", config.name);
+                    errlog_vprintf(format_args!(
+                        "OPC UA subscription {}: createSubscription on session {} failed ({})\n",
+                        config.name,
+                        self.handle.name,
+                        status_name(status)
+                    ));
                     continue;
                 }
             };
@@ -805,41 +818,44 @@ impl SessionWorker {
                 .map(|item| monitored_item_request(&item.lock()))
                 .collect();
             if !requests.is_empty() {
-                match connection.create_monitored_items(id, requests).await {
-                    Ok(statuses) => {
-                        for (item, status) in monitored.iter().zip(statuses) {
-                            if status.is_bad() {
-                                let item = item.lock();
-                                log::error!(
-                                    "subscription {}: monitoring {} failed: {status}",
-                                    config.name,
-                                    item.node_id
-                                );
-                            }
-                        }
+                // C creates the items one call each, so a failed batch is every
+                // item failing with its status.
+                let statuses = match connection.create_monitored_items(id, requests).await {
+                    Ok(statuses) => statuses,
+                    Err(status) => vec![status; monitored.len()],
+                };
+                for (item, status) in monitored.iter().zip(&statuses) {
+                    if status.is_bad() {
+                        let item = item.lock();
+                        eprintln!(
+                            "OPC UA record {} monitored item {} failed with error {}",
+                            addressing_record(&item),
+                            item.wire_node_id(),
+                            status_name(*status)
+                        );
                     }
-                    Err(status) => log::error!(
-                        "subscription {}: creating monitored items failed: {status}",
-                        config.name
-                    ),
+                }
+                if config.debug > 0 {
+                    let last = statuses.last().copied().unwrap_or(StatusCode::Good);
+                    println!(
+                        "Subscription {}@{}: created {} monitored items ({})",
+                        config.name,
+                        self.handle.name,
+                        monitored.len(),
+                        status_name(last)
+                    );
                 }
             }
 
             // One dispatcher task per subscription: every value the server pushes
             // goes to the item its client handle names.
             let items = items.clone();
-            let name = config.name.clone();
             tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(notification) = rx.recv().await {
-                    match items.get(notification.client_handle as usize) {
-                        Some(item) => item
-                            .lock()
-                            .set_incoming_data(notification.value, ProcessReason::IncomingData),
-                        None => log::error!(
-                            "subscription {name}: a value arrived for the unknown item handle {}",
-                            notification.client_handle
-                        ),
+                    if let Some(item) = items.get(notification.client_handle as usize) {
+                        item.lock()
+                            .set_incoming_data(notification.value, ProcessReason::IncomingData);
                     }
                 }
             });
@@ -918,6 +934,20 @@ fn monitored_item_request(item: &Item) -> MonitoredItemCreateRequest {
 }
 
 /// Which failures mean the session is gone rather than the request being bad.
+/// The record whose link addresses the item's node (C `recConnector`).
+fn addressing_record(item: &Item) -> String {
+    item.leaves
+        .iter()
+        .find_map(|leaf| {
+            let leaf = leaf.lock();
+            leaf.link
+                .item_record()
+                .is_none()
+                .then(|| leaf.record.clone())
+        })
+        .unwrap_or_default()
+}
+
 /// C `UA_StatusCode_name`: the code's name without the info bits.
 pub(crate) fn status_name(status: StatusCode) -> &'static str {
     status.sub_code().name()
