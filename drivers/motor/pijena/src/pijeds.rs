@@ -9,8 +9,9 @@
 //!
 //! ## Wire protocol
 //!
-//! Commands are `\r`-terminated (C `EDS_OUT_EOS`); replies are framed by an ETX
-//! (0x11) input EOS (C `EDS_IN_ETX`), optionally led by an STX (0x13). Each
+//! Commands are `\r`-terminated by the port's output EOS (C `EDS_OUT_EOS`);
+//! replies are framed by an ETX (0x11) input EOS (C `EDS_IN_ETX`), optionally
+//! led by an STX (0x13). `PIJEDSConfig` sets both, as C `motor_init` does. Each
 //! command names the axis in place of `#`:
 //!
 //! - `set,<axis>,<pos>`   — move to absolute position (µm), write-only
@@ -53,9 +54,6 @@ use motor_common::util::{atof, atoi};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 128;
-
-/// Command terminator (C `EDS_OUT_EOS`).
-const TERMINATOR: &[u8] = b"\r";
 
 /// Position resolution significant digits (C `EDS_MAX_RES`); the `set`/`sr`
 /// value is formatted with this many decimals.
@@ -145,24 +143,17 @@ impl PiJedsController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a write-only set command (`set`/`sr`/`cl`); the E-516 returns no
     /// reply to these forms.
     fn write_cmd(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Send a query command and return its reply, stripped of framing control
     /// bytes (STX/ETX) and surrounding whitespace.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c.is_control() || c.is_whitespace())
