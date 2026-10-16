@@ -69,8 +69,9 @@ pub struct Link {
     /// First bit of interest, for the (multi-)bit records.
     pub mask: u32,
     pub special: u32,
-    /// Explicit `S <period>`; None means "take the record's SCAN".
-    pub period: Option<f64>,
+    /// The scan period: the `S` flag's, else the record's SCAN, else the
+    /// default rate.
+    pub period: f64,
     /// How many elements the driver must fetch for this record.
     pub elements: usize,
 }
@@ -84,87 +85,127 @@ impl Link {
     }
 }
 
-/// Parse `@PLC tag[element] flags...`.
+/// C `special_options`, matched in this order as a prefix of the rest of the
+/// link: `S ` and `B ` need the space, every other flag matches any token it
+/// begins.
+const SPECIAL_OPTIONS: [(&str, u32); 13] = [
+    ("E", spco::READ_SINGLE_ELEMENT),
+    ("S ", spco::SCAN_PERIOD),
+    ("B ", spco::BIT),
+    ("FORCE", spco::FORCE),
+    ("PLC_ERRORS", spco::PLC_ERRORS),
+    ("PLC_TASK_SLOW", spco::PLC_TASK_SLOW),
+    ("LIST_ERRORS", spco::LIST_ERRORS),
+    ("LIST_TICKS", spco::LIST_TICKS),
+    ("LIST_SCAN_TIME", spco::LIST_SCAN_TIME),
+    ("LIST_MIN_SCAN_TIME", spco::LIST_MIN_SCAN_TIME),
+    ("LIST_MAX_SCAN_TIME", spco::LIST_MAX_SCAN_TIME),
+    ("TAG_TRANSFER_TIME", spco::TAG_TRANSFER_TIME),
+    ("LIST_TIME", spco::LIST_TIME),
+];
+
+/// C `find_token`: skip spaces, then the token runs to the next space.
+fn find_token(text: &str, from: usize) -> Option<(usize, usize)> {
+    let start = from + text[from..].len() - text[from..].trim_start_matches(' ').len();
+    if start >= text.len() {
+        return None;
+    }
+    let end = text[start..].find(' ').map_or(text.len(), |n| start + n);
+    Some((start, end))
+}
+
+/// C `analyze_link` on `@PLC tag[element] flags...`, failing with the text C
+/// prints after `devEtherIP (<record>): `.
 ///
 /// `count` is the number of array elements the record wants (1, or NELM for a
 /// waveform); `bits` is >0 for the (multi-)bit records and is then the number
-/// of bits (NOBT, or 1 for bi/bo).
-pub fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String> {
+/// of bits (NOBT, or 1 for bi/bo). C resolves the period and finds the PLC
+/// between its parsing steps, so a link that fails later still printed those
+/// steps' lines first: `period_of` runs when no positive `S` period was
+/// given, `find_plc` once the tag is split.
+pub fn analyze_link<P>(
+    text: &str,
+    count: usize,
+    bits: usize,
+    period_of: impl FnOnce() -> f64,
+    find_plc: impl FnOnce(&str) -> Option<P>,
+) -> Result<(Link, P), String> {
     let text = text.strip_prefix('@').unwrap_or(text);
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-
-    let plc_name = (*tokens.first().ok_or("missing PLC in link")?).to_string();
-    let tag_text = *tokens.get(1).ok_or("missing tag in link")?;
+    let (p, end) = find_token(text, 0).ok_or_else(|| format!("Missing PLC in link '{text}'"))?;
+    let plc_name = text[p..end].to_string();
+    let (p, mut end) =
+        find_token(text, end).ok_or_else(|| format!("Missing tag in link '{text}'"))?;
+    let tag_text = &text[p..end];
 
     let mut special = 0u32;
-    let mut period = None;
-    let mut bit = 0u32;
-
-    let mut i = 2;
-    while i < tokens.len() {
-        let t = tokens[i];
-        match t {
-            "E" => {
+    let mut period = 0.0f64;
+    let mut bit = 0usize;
+    let mut single_element = false;
+    while let Some((p, e)) = find_token(text, end) {
+        end = e;
+        let rest = &text[p..];
+        let Some(&(_, mask)) = SPECIAL_OPTIONS.iter().find(|(o, _)| rest.starts_with(o)) else {
+            return Err(format!("Invalid flag '{rest}' in link '{text}'"));
+        };
+        special |= mask;
+        match mask {
+            spco::READ_SINGLE_ELEMENT => {
                 if count != 1 {
-                    return Err(format!("array record cannot use the 'E' flag ('{text}')"));
+                    return Err(format!("Array record cannot use 'E' flag ('{text}')"));
                 }
-                special |= spco::READ_SINGLE_ELEMENT;
+                single_element = true;
             }
-            "S" => {
-                let v = tokens.get(i + 1).ok_or("'S' flag needs a scan period")?;
-                period = Some(
-                    v.parse::<f64>()
-                        .map_err(|_| format!("bad scan period '{v}' in link '{text}'"))?,
-                );
-                special |= spco::SCAN_PERIOD;
-                i += 1;
+            // strtod: no number leaves 0 and resumes the scan right after the
+            // flag, so the unparsed text comes back as the next token.
+            spco::SCAN_PERIOD => {
+                let (v, n) = strtod(&text[p + 2..]);
+                if v.is_infinite() {
+                    return Err(format!("Error in scan flag in link '{text}'"));
+                }
+                period = v;
+                end = p + 2 + n;
             }
-            "B" => {
-                let v = tokens.get(i + 1).ok_or("'B' flag needs a bit number")?;
-                bit = v
-                    .parse::<u32>()
-                    .map_err(|_| format!("bad bit number '{v}' in link '{text}'"))?;
-                special |= spco::BIT;
-                i += 1;
+            // C tests `period` here, not `bit` (devEtherIP.c:974), and an
+            // infinite period already failed above: a bit flag never fails.
+            spco::BIT => {
+                let (v, n) = strtod(&text[p + 2..]);
+                bit = v as usize;
+                end = p + 2 + n;
             }
-            "FORCE" => special |= spco::FORCE,
-            "PLC_ERRORS" => special |= spco::PLC_ERRORS,
-            "PLC_TASK_SLOW" => special |= spco::PLC_TASK_SLOW,
-            "LIST_ERRORS" => special |= spco::LIST_ERRORS,
-            "LIST_TICKS" => special |= spco::LIST_TICKS,
-            "LIST_SCAN_TIME" => special |= spco::LIST_SCAN_TIME,
-            "LIST_MIN_SCAN_TIME" => special |= spco::LIST_MIN_SCAN_TIME,
-            "LIST_MAX_SCAN_TIME" => special |= spco::LIST_MAX_SCAN_TIME,
-            "TAG_TRANSFER_TIME" => special |= spco::TAG_TRANSFER_TIME,
-            "LIST_TIME" => special |= spco::LIST_TIME,
-            other => return Err(format!("invalid flag '{other}' in link '{text}'")),
+            _ => {}
         }
-        i += 1;
+    }
+
+    // C keeps a NaN period (`period <= 0.0` is false); a NaN cannot schedule
+    // a scan list here, so it falls through like any non-positive one.
+    if period <= 0.0 || period.is_nan() {
+        period = period_of();
     }
 
     // Split "array_tag[el]" into "array_tag" + el, unless 'E' asked for the
     // element to stay in the tag path (so the PLC does the indexing).
-    let single_element = special & spco::READ_SINGLE_ELEMENT != 0;
     let mut string_tag = tag_text.to_string();
     let mut element = 0usize;
-
-    if !single_element && string_tag.ends_with(']') {
-        let open = string_tag
-            .rfind('[')
-            .ok_or_else(|| format!("malformed array tag in '{text}'"))?;
-        if open == 0 {
-            return Err(format!("malformed array tag in '{text}'"));
+    if tag_text.ends_with(']') && !single_element {
+        let malformed = || format!("malformed array tag in '{text}'");
+        let open = match tag_text[..tag_text.len() - 1].rfind('[') {
+            Some(open) if open > 0 => open,
+            _ => return Err(malformed()),
+        };
+        let (v, n) = strtol(&tag_text[open + 1..]);
+        if n == 0 || v == i64::MAX || v == i64::MIN {
+            return Err(malformed());
         }
-        let idx = &string_tag[open + 1..string_tag.len() - 1];
-        element = idx
-            .parse::<usize>()
-            .map_err(|_| format!("malformed array tag in '{text}'"))?;
+        // A negative index wraps as C's size_t does.
+        element = v as usize;
         special |= spco::INDEX_INCLUDED;
         string_tag.truncate(open);
     }
 
+    let plc = find_plc(&plc_name).ok_or_else(|| format!("unknown PLC '{plc_name}'"))?;
+
     if count > 1 && (bits > 0 || special & spco::BIT != 0) {
-        return Err(format!("cannot access bits for array records ('{text}')"));
+        return Err("cannot access bits for array records".to_string());
     }
 
     let mask;
@@ -179,24 +220,77 @@ pub fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String>
         } else {
             255
         };
-        last_element = (element + bits - 1) >> 5;
+        last_element = element.wrapping_add(bits - 1) >> 5;
         element >>= 5;
     } else {
         // No binary record, or an explicit bit number: the element is a real
-        // array index and the bit is selected by `B <bit>`.
+        // array index and the bit is selected by `B <bit>` (x86 `shl` takes
+        // the count mod 32).
         last_element = element;
-        mask = 1u32 << bit;
+        mask = 1u32.wrapping_shl(bit as u32);
     }
 
-    Ok(Link {
+    let link = Link {
         plc_name,
         string_tag,
         element,
         mask,
         special,
         period,
-        elements: last_element + count,
-    })
+        elements: last_element.wrapping_add(count),
+    };
+    Ok((link, plc))
+}
+
+/// C `strtod`: the value and how many bytes it took, `(0.0, 0)` when it
+/// takes nothing.
+fn strtod(text: &str) -> (f64, usize) {
+    let t = text.trim_start();
+    let skipped = text.len() - t.len();
+    (1..=t.len())
+        .rev()
+        .filter(|&n| t.is_char_boundary(n))
+        .find_map(|n| t[..n].parse::<f64>().ok().map(|v| (v, skipped + n)))
+        .unwrap_or((0.0, 0))
+}
+
+/// C `strtol(text, &end, 0)`: the value, saturated to `i64::MIN..=MAX` as
+/// `LONG_MIN`/`LONG_MAX`, and how many bytes it took (0 for none).
+fn strtol(text: &str) -> (i64, usize) {
+    let b = text.as_bytes();
+    let mut i = b.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    let negative = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let (radix, digits_at) = match (b.get(i), b.get(i + 1)) {
+        (Some(b'0'), Some(b'x' | b'X')) if b.get(i + 2).is_some_and(u8::is_ascii_hexdigit) => {
+            (16, i + 2)
+        }
+        (Some(b'0'), _) => (8, i),
+        _ => (10, i),
+    };
+    let n = b[digits_at..]
+        .iter()
+        .take_while(|c| (**c as char).is_digit(radix))
+        .count();
+    if n == 0 {
+        return (0, 0);
+    }
+    let digits = &text[digits_at..digits_at + n];
+    let v = i128::from_str_radix(digits, radix).unwrap_or(i128::MAX);
+    let v = if negative { -v } else { v };
+    (
+        v.clamp(i64::MIN.into(), i64::MAX.into()) as i64,
+        digits_at + n,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -376,8 +470,9 @@ fn get_period(name: &str, scan: ScanType) -> Option<f64> {
     let label = menu_scan().label_at(index)?;
     let period = label
         .contains("second")
-        .then(|| strtod_prefix(label))
-        .flatten()
+        .then(|| strtod(label))
+        .filter(|&(_, n)| n > 0)
+        .map(|(v, _)| v)
         .filter(|p| p.is_finite());
     crate::eip_printf!(
         8,
@@ -385,16 +480,6 @@ fn get_period(name: &str, scan: ScanType) -> Option<f64> {
         period.unwrap_or(-1.0)
     );
     period
-}
-
-/// The number `strtod` takes off the front of `text`, or None when it takes
-/// nothing.
-fn strtod_prefix(text: &str) -> Option<f64> {
-    let t = text.trim_start();
-    (1..=t.len())
-        .rev()
-        .filter(|&n| t.is_char_boundary(n))
-        .find_map(|n| t[..n].parse::<f64>().ok())
 }
 
 impl DeviceSupport for EtherIpDevice {
@@ -413,7 +498,7 @@ impl DeviceSupport for EtherIpDevice {
 
     // Every C init_record/analyze_link failure returns an `S_*` status after
     // an errlogPrintf, never touching pact (`devEtherIP.c:884-1007,1183-1205`)
-    // — the record scans on: the `Err` shape, kept by every `?` below.
+    // — the record scans on: the `Err` shape.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C's mbbi/mbbo(Direct) `init_record` zero SHFT (devEtherIP.c:1331,
         // 1355,1563,1597): the tag's NOBT bits are the raw value, unshifted.
@@ -424,46 +509,49 @@ impl DeviceSupport for EtherIpDevice {
             record.put_field("SHFT", EpicsValue::UShort(0))?;
         }
         let (bits, count) = record_shape(record);
-        let link = parse_link(&self.link_text, count, bits)
-            .map_err(|e| CaError::InvalidValue(format!("devEtherIP: {e}")))?;
+        let name = self.name.clone();
+        let fail = |msg: String| {
+            errlog_vprintf(format_args!("devEtherIP ({name}): {msg}\n"));
+            Err(CaError::InvalidValue(msg))
+        };
+        let (link, plc) = match analyze_link(
+            &self.link_text,
+            count,
+            bits,
+            // devEtherIP.c:1021-1035: a non-positive period at each step
+            // falls through to the next.
+            || {
+                get_period(&name, self.scan)
+                    .filter(|p| *p > 0.0)
+                    .or_else(|| {
+                        match driver::DEFAULT_RATE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+                            0 => None,
+                            ms => Some(ms as f64 / 1000.0),
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        errlog_vprintf(format_args!(
+                            "devEtherIP ({name}): cannot decode SCAN field, no scan flag given\n"
+                        ));
+                        errlog_vprintf(format_args!(
+                            "Device support will use the default of 1 secs, "
+                        ));
+                        errlog_vprintf(format_args!("please complete the record configuration\n"));
+                        1.0
+                    })
+            },
+            driver::find_plc,
+        ) {
+            Ok(found) => found,
+            Err(msg) => return fail(msg),
+        };
 
-        let plc = driver::find_plc(&link.plc_name).ok_or_else(|| {
-            CaError::InvalidValue(format!("devEtherIP: unknown PLC '{}'", link.plc_name))
-        })?;
-
-        // devEtherIP.c:1021-1035: a non-positive period at each step falls
-        // through to the next.
-        let positive = |p: &f64| *p > 0.0;
-        let period = link
-            .period
-            .filter(positive)
-            .or_else(|| get_period(&self.name, self.scan).filter(positive))
-            .or_else(
-                || match driver::DEFAULT_RATE_MS.load(std::sync::atomic::Ordering::Relaxed) {
-                    0 => None,
-                    ms => Some(ms as f64 / 1000.0),
-                },
-            )
-            .unwrap_or_else(|| {
-                errlog_vprintf(format_args!(
-                    "devEtherIP ({}): cannot decode SCAN field, no scan flag given\n",
-                    self.name
-                ));
-                errlog_vprintf(format_args!(
-                    "Device support will use the default of 1 secs, "
-                ));
-                errlog_vprintf(format_args!("please complete the record configuration\n"));
-                1.0
-            });
-
-        let tag = plc
-            .add_tag(period, &link.string_tag, link.elements)
-            .ok_or_else(|| {
-                CaError::InvalidValue(format!(
-                    "devEtherIP: cannot register tag '{}'",
-                    link.string_tag
-                ))
-            })?;
+        let Some(tag) = plc.add_tag(link.period, &link.string_tag, link.elements) else {
+            return fail(format!(
+                "cannot register tag '{}' with driver",
+                link.string_tag
+            ));
+        };
 
         // One I/O Intr pulse per new tag value. Depth 1: a pending pulse
         // already says "re-read", and the record reads the current value.
@@ -1145,6 +1233,81 @@ mod tests {
 
     // -- link parsing --------------------------------------------------------
 
+    /// `analyze_link` with every PLC known and no SCAN period.
+    fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String> {
+        analyze_link(text, count, bits, || 0.0, |_| Some(())).map(|(l, ())| l)
+    }
+
+    /// devEtherIP.c:884-1007: C's texts, and the steps that ran before a
+    /// late failure have printed.
+    #[test]
+    fn analyze_link_fails_in_cs_order_with_cs_texts() {
+        let err = |text, count, bits| {
+            let mut asked = false;
+            let e = analyze_link(
+                text,
+                count,
+                bits,
+                || {
+                    asked = true;
+                    0.0
+                },
+                |_| None::<()>,
+            )
+            .unwrap_err();
+            (e, asked)
+        };
+        assert_eq!(err("", 1, 0).0, "Missing PLC in link ''");
+        assert_eq!(err("@plc1", 1, 0).0, "Missing tag in link 'plc1'");
+        assert_eq!(
+            err("@plc1 Cnt NOPE x", 1, 0),
+            (
+                "Invalid flag 'NOPE x' in link 'plc1 Cnt NOPE x'".into(),
+                false
+            )
+        );
+        assert_eq!(
+            err("@plc1 A[1] E", 2, 0).0,
+            "Array record cannot use 'E' flag ('plc1 A[1] E')"
+        );
+        assert_eq!(
+            err("@plc1 Cnt S 1e999", 1, 0).0,
+            "Error in scan flag in link 'plc1 Cnt S 1e999'"
+        );
+        // The period was resolved before the tag failed.
+        assert_eq!(
+            err("@plc1 A[x]", 1, 0),
+            ("malformed array tag in 'plc1 A[x]'".into(), true)
+        );
+        assert_eq!(err("@plc1 A", 1, 0).0, "unknown PLC 'plc1'");
+        // The PLC is looked up before the bits check.
+        assert_eq!(err("@plc1 A", 10, 1).0, "unknown PLC 'plc1'");
+        assert_eq!(
+            parse_link("@plc1 A", 10, 1).unwrap_err(),
+            "cannot access bits for array records"
+        );
+    }
+
+    /// strtod/strtol/prefix matching as C reads them.
+    #[test]
+    fn analyze_link_reads_flags_and_index_as_c_does() {
+        // A bad period leaves 0 and its text becomes the next token.
+        assert_eq!(
+            parse_link("@plc1 Cnt S x", 1, 0).unwrap_err(),
+            "Invalid flag 'x' in link 'plc1 Cnt S x'"
+        );
+        // A bad bit never fails: bit 0, then the text is the next token.
+        assert_eq!(parse_link("@plc1 Cnt B FORCE", 1, 0).unwrap().mask, 1);
+        // Flags match as prefixes; 'S' without its space does not.
+        assert!(parse_link("@plc1 Cnt FORCED", 1, 0).unwrap().forced());
+        assert!(parse_link("@plc1 Cnt S", 1, 0).is_err());
+        // strtol base 0.
+        assert_eq!(parse_link("@plc1 A[0x10]", 1, 0).unwrap().element, 16);
+        assert_eq!(parse_link("@plc1 A[010]", 1, 0).unwrap().element, 8);
+        assert_eq!(parse_link("@plc1 A[3x]", 1, 0).unwrap().element, 3);
+        assert_eq!(parse_link("@plc1 Cnt S 0.5", 1, 0).unwrap().period, 0.5);
+    }
+
     #[test]
     fn plain_scalar_link() {
         let l = parse_link("@plc1 REALS", 1, 0).unwrap();
@@ -1152,7 +1315,7 @@ mod tests {
         assert_eq!(l.string_tag, "REALS");
         assert_eq!(l.element, 0);
         assert_eq!(l.elements, 1);
-        assert_eq!(l.period, None);
+        assert_eq!(l.period, 0.0);
         assert_eq!(l.special, 0);
     }
 
@@ -1184,7 +1347,7 @@ mod tests {
     #[test]
     fn scan_and_bit_flags_take_a_value() {
         let l = parse_link("@plc1 Cnt S 0.5 B 3", 1, 0).unwrap();
-        assert_eq!(l.period, Some(0.5));
+        assert_eq!(l.period, 0.5);
         assert_eq!(l.mask, 1 << 3);
         assert!(l.special & spco::BIT != 0);
         assert!(l.special & spco::SCAN_PERIOD != 0);
