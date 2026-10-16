@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -56,6 +57,7 @@ pub struct Ctx {
     pub p: TimePixParams,
     pub ad: ADDriverParams,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pub pool: Arc<NDArrayPool>,
 }
 
 impl Ctx {
@@ -999,7 +1001,18 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ],
             )
             .await;
-            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
+            publish_image(
+                ctx,
+                f.frame_number,
+                f.width,
+                f.height,
+                f.pixels,
+                &adlog::err(
+                    adlog::PROCESS_PRV_IMG_DATA_LINE,
+                    "Failed to allocate NDArray or NDArray has no data pointer",
+                ),
+            )
+            .await;
         }
         (StreamKind::Img, Frame::Image(f)) => {
             let p = ctx.p;
@@ -1045,7 +1058,18 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ADDR,
             )
             .await;
-            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
+            publish_image(
+                ctx,
+                f.frame_number,
+                f.width,
+                f.height,
+                f.pixels,
+                &adlog::err(
+                    adlog::PROCESS_IMG_DATA_LINE,
+                    "Failed to allocate NDArray or NDArray has no data pointer",
+                ),
+            )
+            .await;
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             let p = ctx.p;
@@ -1165,6 +1189,7 @@ async fn publish_image(
     width: usize,
     height: usize,
     pixels: Vec<u32>,
+    refused: &str,
 ) {
     if ctx
         .handle
@@ -1175,6 +1200,15 @@ async fn publish_image(
     {
         return;
     }
+    // C prints and drops a refused alloc before it counts
+    // (serval_stream.cpp:515-520, :1380-1385).
+    let Ok(mut array) = ctx.pool.wrap(
+        vec![NDDimension::new(width), NDDimension::new(height)],
+        NDDataBuffer::U32(pixels),
+    ) else {
+        ctx.trace(TraceMask::ERROR, refused);
+        return;
+    };
     let counter = ctx
         .handle
         .read_int32(ctx.ad.base.array_counter, 0)
@@ -1191,10 +1225,6 @@ async fn publish_image(
         epics_rs::ad_core::attributes::NDAttrValue::Int32(NDColorMode::Mono as i32),
     ));
 
-    let mut array = NDArray::with_data(
-        vec![NDDimension::new(width), NDDimension::new(height)],
-        NDDataBuffer::U32(pixels),
-    );
     array.unique_id = frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
@@ -1276,6 +1306,7 @@ mod tests {
             p,
             ad,
             output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+            pool: NDArrayPool::new(0),
         };
 
         let (_sub, mut rx) = handle.interrupts().register_interrupt_user(
@@ -1334,6 +1365,7 @@ mod tests {
             p,
             ad,
             output: Arc::new(parking_lot::Mutex::new(output)),
+            pool: NDArrayPool::new(0),
         });
         ctx.set_int(ad.base.array_callbacks, 0, 1).await;
 

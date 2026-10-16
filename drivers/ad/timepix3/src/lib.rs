@@ -83,6 +83,7 @@ pub fn create_timepix3_detector(
         p,
         ad: ad_params,
         output: output.clone(),
+        pool: pool.clone(),
     });
     let threads = tasks::start(ctx, cmd_rx);
 
