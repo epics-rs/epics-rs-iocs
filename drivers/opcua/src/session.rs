@@ -145,8 +145,10 @@ impl SessionConfig {
                     self.name
                 );
             }
-            match std::fs::metadata(cert) {
-                Ok(meta) if meta.len() > 0 => Identity::Certificate {
+            // `loadFile` reads the whole file; an unreadable one is the same
+            // failure as a missing one.
+            match std::fs::read(cert) {
+                Ok(bytes) if !bytes.is_empty() => Identity::Certificate {
                     certificate: cert.to_string(),
                     private_key: key.to_string(),
                 },

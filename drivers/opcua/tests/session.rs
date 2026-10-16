@@ -446,6 +446,14 @@ fn an_unusable_credentials_file_falls_back_to_the_anonymous_token() {
         identity_from("cert=/nonexistent/id.der\nkey=/tmp/id.pem\n"),
         Anonymous
     );
+    // A directory opens for metadata but cannot be read as a certificate.
+    assert_eq!(
+        identity_from(&format!(
+            "cert={}\nkey=/tmp/id.pem\n",
+            std::env::temp_dir().display()
+        )),
+        Anonymous
+    );
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     config.identity_file = Some("/nonexistent/creds".into());
     assert_eq!(config.setup_identity(), Anonymous);
