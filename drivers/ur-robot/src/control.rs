@@ -517,7 +517,7 @@ impl ControlInterface {
             // A script error (e.g. an unsolvable inverse kinematics) kills the
             // script, and then DONE never arrives.
             if !self.is_program_running()? {
-                log::error!("ur-robot: the RTDE control script stopped mid-command");
+                eprintln!("RTDEControlInterface: RTDE control script is not running!");
                 return self.refused(RefusalReason::NotRunning);
             }
             if self.is_stopped_by_safety()? {
@@ -539,7 +539,7 @@ impl ControlInterface {
             return self.refused(RefusalReason::NotRunning);
         }
         if !self.is_program_running()? {
-            log::error!("ur-robot: the RTDE control script is not running");
+            eprintln!("RTDEControlInterface: RTDE control script is not running!");
             return self.refused(RefusalReason::NotRunning);
         }
         if let Some(reason) = self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {
@@ -626,7 +626,6 @@ impl ControlInterface {
     /// `reuploadScript()` — kill whatever is running, then send the script again.
     pub fn reupload_script(&mut self) -> UrResult<()> {
         if self.is_program_running()? {
-            log::info!("ur-robot: a script was running on the controller, stopping it");
             self.stop_script()?;
             self.dashboard.stop()?;
             std::thread::sleep(Duration::from_millis(100));
