@@ -21,7 +21,7 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
@@ -202,9 +202,20 @@ impl ADDriver for Mar345Driver {
         &mut self.ad
     }
 
+    /// `mar345::setShutter` (mar345.cpp:372-397): only the detector branch
+    /// talks to marServer, so only it runs on the shutter thread; every other
+    /// mode is `ADDriver::setShutter` inside this write.
     fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
-        let _ = self.shutter.try_send(open);
-        Ok(())
+        let mode = self
+            .ad
+            .port_base
+            .get_int32_param(self.ad.params.shutter_mode, 0)
+            .unwrap_or(0);
+        if ShutterMode::from_i32(mode) == Some(ShutterMode::DetectorOnly) {
+            let _ = self.shutter.try_send(open);
+            return Ok(());
+        }
+        self.ad.set_shutter(open)
     }
 }
 
@@ -335,7 +346,6 @@ mod tests {
     /// overrides to drive a detector shutter through marServer (:372-388).
     #[test]
     fn shutter_control_reaches_mar345s_set_shutter() {
-        use epics_rs::ad_core::driver::ShutterMode;
         use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::base::runtime::interrupt_accept::InterruptGate;
@@ -385,6 +395,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         std::mem::forget(det);
+    }
+
+    /// A non-detector mode is ADDriver::setShutter inside the write
+    /// (ADDriver.cpp:43-47), with no shutter thread to reach.
+    #[test]
+    fn an_epics_shutter_is_set_inside_the_write() {
+        let mut d = driver("MAR345_EPICS_SHUTTER", 0);
+        let ad = d.ad.params;
+        d.ad.port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        d.ad_write_int32(&AsynUser::new(ad.shutter_control).with_addr(0), 1)
+            .unwrap();
+        assert_eq!(
+            d.ad.port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
