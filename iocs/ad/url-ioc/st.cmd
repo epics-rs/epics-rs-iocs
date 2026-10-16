@@ -31,17 +31,16 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 
 dbLoadRecords("$(ADURLIOC)/db/url.template", "P=$(PREFIX),R=cam1:,PORT=$(PORT),ADDR=0,TIMEOUT=1")
 
-# Load the NDStdArrays image-output plugin and the rest of the standard
-# plugin chain via the framework's commonPlugins.cmd. Unlike upstream's own
-# st.cmd, this does NOT also call NDStdArraysConfigure("Image1",...) itself
-# first: this framework's commonPlugins.cmd already creates the Image1/
-# IMAGE1 NDStdArrays plugin (record prefix "image1:"), and duplicating it
-# here would collide on that same record prefix. TYPE/FTVL/NELEMENTS below
-# select the upstream st.cmd's active (16-bit) NDStdArrays.template line.
-epicsEnvSet("TYPE",      "Int16")
-epicsEnvSet("FTVL",      "SHORT")
-epicsEnvSet("NELEMENTS", "12582912")
+# Create a standard arrays plugin.
+NDStdArraysConfigure("Image1", 3, 0, "$(PORT)", 0)
 
+# This creates a waveform large enough for 2048x2048x3 (e.g. RGB color) arrays.
+# This waveform only allows transporting 8-bit images
+#dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int8,FTVL=UCHAR,NELEMENTS=12582912")
+# This waveform allows transporting 16-bit images
+dbLoadRecords("$(ADCORE)/db/NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int16,FTVL=SHORT,NELEMENTS=12582912")
+
+# Load all other plugins using commonPlugins.cmd
 < $(ADCORE)/ioc/commonPlugins.cmd
 
 # Upstream also calls asynSetTraceIOMask/asynSetTraceMask here. Omitted:
