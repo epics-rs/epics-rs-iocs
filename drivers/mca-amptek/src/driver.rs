@@ -759,17 +759,15 @@ impl AmptekDriver {
     }
 
     /// `drvAmptek::sendSCAs` (`drvAmptek.cpp:479-508`). C's
-    /// `getIntegerParam(i, ...)` leaves `itemp` unchanged for a param never
-    /// set at addr `i`, and on this non-multidevice port only addr 0 is ever
-    /// set, so each unset field repeats the previous one. C's first `itemp`
-    /// is uninitialized; it starts at 0 here.
+    /// `getIntegerParam(i, ...)` zeroes `itemp` for a param never set at
+    /// addr `i` (`asynPortDriver.cpp:304`), and on this non-multidevice port
+    /// only addr 0 is ever set, so SCAs 2-8 send 0 / OFF.
     fn send_scas(&mut self) -> AsynResult<()> {
         let reasons = [
             self.amptek[AmptekReason::SCALowChannel as usize],
             self.amptek[AmptekReason::SCAHighChannel as usize],
             self.amptek[AmptekReason::SCAOutputLevel as usize],
         ];
-        let mut itemp = 0;
         let mut scas = [ScaFields {
             low_channel: 0,
             high_channel: 0,
@@ -777,10 +775,9 @@ impl AmptekDriver {
         }; MAX_SCAS];
         for (i, sca) in scas.iter_mut().enumerate() {
             let [low, high, level] = reasons.map(|reason| {
-                if let Ok(v) = self.base.get_int32_param_strict(reason, i as i32) {
-                    itemp = v;
-                }
-                itemp
+                self.base
+                    .get_int32_param_strict(reason, i as i32)
+                    .unwrap_or(0)
             });
             *sca = ScaFields {
                 low_channel: low,
@@ -1517,7 +1514,7 @@ mod tests {
     /// Every record ADDR lands on addr 0, and `sendSCAs` repeats the last
     /// value read for each param unset at addr 1..7 (`drvAmptek.cpp:479-508`).
     #[test]
-    fn sca_writes_use_addr_0_and_send_scas_carries_itemp() {
+    fn sca_writes_use_addr_0_and_send_scas_zeroes_undefined_params() {
         let status = [0u8; 64];
         let (mut driver, fake) = driver_with_fake(move |req| default_reply(req, &status));
         connect(&mut driver).unwrap();
@@ -1541,11 +1538,13 @@ mod tests {
             .filter(|r| (r[2], r[3]) == (0x20, 0x02))
             .map(|r| String::from_utf8_lossy(&r[6..r.len() - 2]).into_owned())
             .collect();
-        assert!(sent[0].starts_with("SCAI=1;SCAL=5;SCAH=5;SCAO=;SCAI=2;SCAL=5;"));
         assert!(
-            sent[1].starts_with("SCAI=1;SCAL=5;SCAH=5;SCAO=HIGH;SCAI=2;SCAL=1;SCAH=1;SCAO=HIGH;")
+            sent[0].starts_with("SCAI=1;SCAL=5;SCAH=0;SCAO=OFF;SCAI=2;SCAL=0;SCAH=0;SCAO=OFF;")
         );
-        assert!(sent[1].ends_with("SCAI=8;SCAL=1;SCAH=1;SCAO=HIGH;"));
+        assert!(
+            sent[1].starts_with("SCAI=1;SCAL=5;SCAH=0;SCAO=HIGH;SCAI=2;SCAL=0;SCAH=0;SCAO=OFF;")
+        );
+        assert!(sent[1].ends_with("SCAI=8;SCAL=0;SCAH=0;SCAO=OFF;"));
     }
 
     /// A failed `XMTPT_DISABLE_MCA_MCS` fails the read and keeps
