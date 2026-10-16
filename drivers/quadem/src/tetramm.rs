@@ -832,6 +832,7 @@ pub fn create_tetramm(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

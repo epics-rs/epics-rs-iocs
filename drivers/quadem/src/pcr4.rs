@@ -705,6 +705,7 @@ pub fn create_pcr4(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

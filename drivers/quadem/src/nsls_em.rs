@@ -687,6 +687,7 @@ pub fn create_nsls_em(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

@@ -26,11 +26,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
 use crate::trace::AsynPrint;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::error::{AsynError, AsynResult};
@@ -995,11 +995,12 @@ pub struct QuadEmBase {
     pub port_base: PortDriverBase,
     pub nd_params: NDArrayDriverParams,
     pub params: QuadEmParams,
-    pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
+    pub pool: Arc<NDArrayPool>,
     /// One output per asyn address: 0-10 single-value streams, 11 the full
     /// 2-D array.
     pub outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
-    pub queued: Arc<QueuedArrayCounter>,
+    /// Keeps the pool's owner alive; the pool holds it weakly.
+    pub owner: Arc<ArrayOwner>,
 }
 
 impl QuadEmBase {
@@ -1014,7 +1015,7 @@ impl QuadEmBase {
             },
         );
 
-        let (nd_params, queued) = NDArrayDriverParams::create(&mut port_base)?;
+        let (nd_params, owner) = NDArrayDriverParams::create(&mut port_base)?;
         let params = QuadEmParams::create(&mut port_base)?;
 
         port_base.set_int32_param(nd_params.array_callbacks, 0, 1)?;
@@ -1042,7 +1043,7 @@ impl QuadEmBase {
             port_base.set_float64_param(params.double_data, addr as i32, 0.0)?;
         }
 
-        let pool = epics_rs::ad_core::ndarray_pool::NDArrayPool::new(max_memory);
+        let pool = NDArrayPool::for_driver(max_memory, &owner);
 
         let outputs = (0..=QE_MAX_DATA)
             .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
@@ -1054,7 +1055,7 @@ impl QuadEmBase {
             params,
             pool,
             outputs,
-            queued,
+            owner,
         })
     }
 
@@ -1110,7 +1111,7 @@ impl QuadEmBase {
     }
 
     /// Attach a downstream plugin to one asyn address' NDArray stream.
-    pub fn connect_downstream(&self, addr: usize, mut sender: NDArraySender) {
+    pub fn connect_downstream(&self, addr: usize, sender: NDArraySender) {
         let Some(out) = self.outputs.get(addr) else {
             asyn_print!(
                 self.port_base,
@@ -1119,7 +1120,6 @@ impl QuadEmBase {
             );
             return;
         };
-        sender.set_queued_counter(self.queued.clone());
         out.lock().add(sender);
     }
 }
@@ -1135,6 +1135,7 @@ pub struct CallbackContext {
     pub params: QuadEmParams,
     pub nd_params: NDArrayDriverParams,
     pub outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
+    pub pool: Arc<NDArrayPool>,
     pub shared: Arc<QuadEmShared>,
     /// Index of `ADAcquire` on this port, written to stop a finished
     /// multiple/single acquisition.
@@ -1170,7 +1171,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     for s in &samples {
         flat.extend_from_slice(s);
     }
-    let mut all = NDArray::with_data(
+    let mut all = ctx.pool.wrap(
         vec![NDDimension::new(QE_MAX_DATA), NDDimension::new(num_read)],
         NDDataBuffer::F64(flat),
     );
@@ -1184,8 +1185,9 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     // Addresses 0-10: one [numRead] array per data item.
     for item in 0..QE_MAX_DATA {
         let column: Vec<f64> = samples.iter().map(|s| s[item]).collect();
-        let mut single =
-            NDArray::with_data(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column));
+        let mut single = ctx
+            .pool
+            .wrap(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column));
         single.unique_id = counter;
         single.timestamp = ts;
         single.time_stamp = time_stamp;
@@ -1568,7 +1570,7 @@ mod tests {
         let acquire = m.base.nd_params.acquire;
         m.qe_write_int32(acquire, 0, 1).unwrap();
         assert_eq!(acquire_busy(&m), 1);
-        m.base.queued.increment();
+        m.base.owner.queued().increment();
         m.qe_write_int32(acquire, 0, 0).unwrap();
         assert_eq!(acquire_busy(&m), 0);
     }
@@ -1579,12 +1581,12 @@ mod tests {
         let (acquire, wait) = (m.base.nd_params.acquire, m.base.nd_params.wait_for_plugins);
         m.base.port_base.set_int32_param(wait, 0, 1).unwrap();
         m.qe_write_int32(acquire, 0, 1).unwrap();
-        m.base.queued.increment();
+        m.base.owner.queued().increment();
         m.qe_write_int32(acquire, 0, 0).unwrap();
         assert_eq!(acquire_busy(&m), 1);
 
         m.qe_write_int32(acquire, 0, 1).unwrap();
-        m.base.queued.decrement();
+        m.base.owner.queued().decrement();
         m.qe_write_int32(acquire, 0, 0).unwrap();
         assert_eq!(acquire_busy(&m), 0);
     }

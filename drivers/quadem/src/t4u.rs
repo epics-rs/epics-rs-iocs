@@ -1412,6 +1412,7 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

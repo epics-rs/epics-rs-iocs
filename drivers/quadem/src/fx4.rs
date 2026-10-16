@@ -576,6 +576,7 @@ pub fn create_fx4(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

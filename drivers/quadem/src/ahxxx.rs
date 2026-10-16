@@ -822,6 +822,7 @@ pub fn create_ahxxx(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });
