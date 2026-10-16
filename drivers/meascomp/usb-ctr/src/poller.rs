@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
@@ -39,14 +40,15 @@ pub fn start_poller(
 #[derive(Default)]
 struct PollSnapshot {
     digital_input: Option<u64>,
-    // Normal counter polling (scaler/MCS not running)
+    /// rs-only: C never sets COUNTER_VALUE, so its Counts records stay dark.
     counters: [Option<i64>; MAX_COUNTERS],
-    // Scaler state
     scaler_done_snapshot: Option<[u64; MAX_COUNTERS]>,
     mcs: Option<McsPass>,
     num_counters: usize,
 }
 
+/// C `USBCTR::pollerThread`: DIn, then the running scaler or MCS, then every
+/// address's callbacks.
 fn poller_loop(
     handle: PortHandle,
     params: CtrParams,
@@ -56,9 +58,12 @@ fn poller_loop(
     let mut prev_digital_input: u64 = 0;
     let mut force_callback = true;
     let trace = state.lock().unwrap().trace.clone();
+    let mut start = Instant::now();
 
     loop {
-        let start = Instant::now();
+        // C's POLL_TIME_MS is the period from one pass's start to the next.
+        let poll_time = start.elapsed();
+        start = Instant::now();
 
         // ---- Phase 1: uldaq reads (device lock held) ----
         let snapshot = {
@@ -97,47 +102,44 @@ fn poller_loop(
             snap
         }; // device lock released here
 
-        // ---- Phase 2: write results (no device lock) ----
-
+        // ---- Phase 2: set params (no device lock), as setXxxParam does ----
+        let mut updates = vec![ParamSetValue::new(
+            params.poll_time_ms,
+            0,
+            ParamValue::Float64(poll_time.as_secs_f64() * 1000.0),
+        )];
         if let Some(data) = snapshot.digital_input {
             let changed = data ^ prev_digital_input;
             if force_callback || changed != 0 {
                 prev_digital_input = data;
                 force_callback = false;
-                let _ = handle.set_params_and_notify_blocking(
+                updates.push(ParamSetValue::uint32_digital(
+                    params.digital_input,
                     0,
-                    vec![ParamSetValue::uint32_digital(
-                        params.digital_input,
-                        0,
-                        data as u32,
-                        0xFFFF_FFFF,
-                        0,
-                    )],
-                );
+                    data as u32,
+                    0xFFFF_FFFF,
+                    0,
+                ));
             }
         }
         if let Some(counts) = snapshot.scaler_done_snapshot {
-            for (i, c) in counts.iter().enumerate() {
-                let _ = handle.write_int32_blocking(params.counter_value, i as i32, *c as i32);
-            }
-        } else if let Some(pass) = snapshot.mcs {
-            let updates = pass
-                .updates(&params, snapshot.num_counters)
-                .into_iter()
-                .map(|(reason, addr, value)| ParamSetValue::new(reason, addr, value))
-                .collect();
-            let _ = handle.set_params_and_notify_blocking(0, updates);
-        } else {
-            for (counter, value) in snapshot.counters.iter().enumerate() {
-                if let Some(v) = value {
-                    let _ = handle.write_int32_blocking(
-                        params.counter_value,
-                        counter as i32,
-                        *v as i32,
-                    );
-                }
-            }
+            updates.extend(counts.iter().enumerate().map(|(i, c)| {
+                ParamSetValue::new(params.counter_value, i as i32, ParamValue::Int32(*c as i32))
+            }));
         }
+        updates.extend(snapshot.counters.iter().enumerate().filter_map(|(i, v)| {
+            v.map(|v| {
+                ParamSetValue::new(params.counter_value, i as i32, ParamValue::Int32(v as i32))
+            })
+        }));
+        if let Some(pass) = snapshot.mcs {
+            updates.extend(
+                pass.updates(&params, snapshot.num_counters)
+                    .into_iter()
+                    .map(|(reason, addr, value)| ParamSetValue::new(reason, addr, value)),
+            );
+        }
+        let _ = handle.set_params_and_notify_blocking(0, updates);
 
         // Callbacks for all addresses
         for addr in 0..MAX_MCS_COUNTERS as i32 {
@@ -147,13 +149,9 @@ fn poller_loop(
             st.scaler.done.call_callbacks();
         }
 
-        let elapsed = start.elapsed();
-        let _ =
-            handle.write_float64_blocking(params.poll_time_ms, 0, elapsed.as_secs_f64() * 1000.0);
-
         let poll_ms = handle
             .read_float64_blocking(params.poll_sleep_ms, 0)
             .unwrap_or(50.0);
-        std::thread::sleep(Duration::from_millis(poll_ms as u64));
+        std::thread::sleep(Duration::from_secs_f64(poll_ms.max(0.0) / 1000.0));
     }
 }
