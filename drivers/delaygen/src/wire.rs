@@ -18,6 +18,20 @@ use crate::connect::OctetLink;
 /// `motor_common::connect`/`motor-mclennan`).
 const OCTET_REASON: usize = 0;
 
+/// C's `if( pport->init==0 ) return asynError;` at the top of every
+/// DG645 and Coherent SDG transfer: a port whose constructor gave up after
+/// `registerPort` stays registered and refuses all I/O.
+pub(crate) fn require_init(init: bool) -> AsynResult<()> {
+    if init {
+        Ok(())
+    } else {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        })
+    }
+}
+
 /// A failed C `pasynOctetSyncIO` transaction with the byte counts the C
 /// drivers' error lines print.
 #[derive(Debug)]

@@ -60,3 +60,37 @@ pub fn connect_octet(port_name: &str, addr: i32, timeout: Duration) -> Result<Oc
         addr,
     })
 }
+
+/// An [`OctetLink`] onto a published port `io` whose every octet transfer
+/// fails: a device that never answers.
+#[cfg(test)]
+pub(crate) fn mute_link(io: &str) -> OctetLink {
+    use epics_rs::asyn::asyn_record::claim_port;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    struct Mute(PortDriverBase);
+
+    impl PortDriver for Mute {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    let claim = claim_port(io).unwrap();
+    let (runtime, _actor) = create_port_runtime(
+        &claim,
+        Mute(PortDriverBase::new(io, 1, PortFlags::default())),
+        RuntimeConfig::default(),
+    )
+    .unwrap();
+    claim
+        .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+        .unwrap();
+    connect_octet(io, 0, Duration::from_millis(100)).unwrap()
+}

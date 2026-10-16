@@ -470,11 +470,13 @@ pub struct Dg645Driver {
     error: i32,
     check_errors: bool,
     status_code_reason: usize,
+    /// C `pport->init`: every transfer refuses until [`Self::initialize`]
+    /// has run all three steps.
+    init: bool,
 }
 
 impl Dg645Driver {
-    /// C `drvAsynDG645`: registers every tag, then runs the same
-    /// three-step init sequence (`*IDN?`, `LERR?`, `*CLS`).
+    /// C `drvAsynDG645` up to `registerPort`: every tag, no traffic yet.
     pub fn new(port_name: &str, handle: OctetLink) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
@@ -497,20 +499,31 @@ impl Dg645Driver {
             .find_param("STATUS_CODE")
             .expect("STATUS_CODE is registered above");
 
-        let mut driver = Self {
+        let driver = Self {
             base,
             handle,
             error: 0,
             check_errors: true,
             status_code_reason,
+            init: false,
         };
-
-        driver.write_read("*IDN?")?;
-        let lerr = driver.write_read("LERR?")?;
-        driver.error = atoi(&lerr);
-        driver.write_only("*CLS")?;
-
         Ok(driver)
+    }
+
+    /// The rest of C `drvAsynDG645` (drvAsynDG645.cpp:566-594): `*IDN?`,
+    /// `LERR?` and `*CLS`. A failed step is C's errlog phrase; the port
+    /// stays registered and uninitialised.
+    pub fn initialize(&mut self) -> Result<(), &'static str> {
+        self.write_read("*IDN?")
+            .map_err(|_| "failed to acquire identification")?;
+        let lerr = self
+            .write_read("LERR?")
+            .map_err(|_| "failed to acquire error status")?;
+        self.error = atoi(&lerr);
+        self.write_only("*CLS")
+            .map_err(|_| "failed to clear status")?;
+        self.init = true;
+        Ok(())
     }
 
     /// C `writeRead`: the transaction and its `asynPrint` lines, which C
@@ -634,6 +647,7 @@ impl PortDriver for Dg645Driver {
     }
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.conv {
             Conv::Sink => Ok(0),
@@ -655,6 +669,7 @@ impl PortDriver for Dg645Driver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
             WriteKind::Sink => Ok(()),
@@ -674,6 +689,7 @@ impl PortDriver for Dg645Driver {
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.conv {
             Conv::Sink => Ok(0.0),
@@ -690,6 +706,7 @@ impl PortDriver for Dg645Driver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
             WriteKind::Sink => Ok(()),
@@ -704,6 +721,7 @@ impl PortDriver for Dg645Driver {
     }
 
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         let text = match spec.conv {
             Conv::Sink => String::new(),
@@ -726,6 +744,7 @@ impl PortDriver for Dg645Driver {
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
             WriteKind::Sink => Ok(0),
@@ -872,5 +891,22 @@ mod tests {
         // doc/upstream-c-defects.md #34: upstream cvtErrorText spelled
         // this "ckecking".
         assert_eq!(status_text(0, false), "Status checking disabled");
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+    use crate::connect::mute_link;
+
+    /// C leaves `init == 0` when `*IDN?` fails, and every transfer refuses.
+    #[test]
+    fn a_failed_identification_leaves_every_transfer_refusing() {
+        let link = mute_link("DG645_MUTE_IO");
+        let mut dg = Dg645Driver::new("DG645_MUTE", link).unwrap();
+        assert_eq!(dg.initialize(), Err("failed to acquire identification"));
+
+        let reason = dg.base.find_param("STATUS_CODE").unwrap();
+        assert!(dg.read_int32(&AsynUser::new(reason)).is_err());
     }
 }
