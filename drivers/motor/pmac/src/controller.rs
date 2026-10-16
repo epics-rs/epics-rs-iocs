@@ -20,10 +20,9 @@
 //! `PMAC_C_FEEDRATE_LIMIT`, `PMAC_C_FEEDRATE_POLL`, `PMAC_C_FEEDRATE_PROBLEM`,
 //! `PMAC_C_COMMSERROR` and `PMAC_C_COORDINATE_SYS_GROUP` as asyn parameters on
 //! address 0, bound to records by `pmacController.template`. The asyn-rs motor
-//! boundary carries no controller-level parameter port, so the two *inputs*
-//! among them (feed-rate polling on/off and its limit) become configuration
-//! arguments of `pmacCreateController`, and the CS-group selection becomes the
-//! `pmacCsGroupSwitch` iocsh command. The *outputs* (global status, feed-rate
+//! boundary carries no controller-level parameter port, so the *inputs* among
+//! them (feed-rate polling on/off and its limit, the CS-group selection) keep
+//! their defaults: no feed-rate poll, limit 100, no group switch. The *outputs* (global status, feed-rate
 //! problem) keep their real effect: they raise the motor record's PROBLEM bit,
 //! exactly as they do in C through `pmacAxis::getAxisStatus`.
 
