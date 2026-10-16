@@ -97,6 +97,11 @@ impl DashboardClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_port(&mut self, port: u16) {
+        self.port = port;
+    }
+
     pub fn is_connected(&self) -> bool {
         self.io.is_some()
     }

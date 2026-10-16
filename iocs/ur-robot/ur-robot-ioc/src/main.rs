@@ -122,8 +122,12 @@ async fn main() -> CaResult<()> {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let port = create_dashboard(&claim, &ip, poll)
-                    .map_err(|e| format!("URDashboardConfig failed: {e}"))?;
+                let port = match create_dashboard(&claim, &ip, poll) {
+                    Ok(port) => port,
+                    // The constructor throws (dashboard_driver.cpp:73-75).
+                    Err(AsynError::Status { message, .. }) => return Ok(ctx.cxx_error(message)),
+                    Err(e) => return Err(format!("URDashboardConfig failed: {e}")),
+                };
                 register(
                     &ports,
                     claim,

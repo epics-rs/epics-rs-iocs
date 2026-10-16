@@ -137,6 +137,14 @@ pub struct DashboardDriver {
 
 impl DashboardDriver {
     pub fn new(port_name: &str, robot_ip: &str) -> AsynResult<Self> {
+        Self::with_client(
+            port_name,
+            robot_ip,
+            DashboardClient::new(robot_ip, DEFAULT_TIMEOUT),
+        )
+    }
+
+    fn with_client(port_name: &str, robot_ip: &str, client: DashboardClient) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
             1,
@@ -148,11 +156,12 @@ impl DashboardDriver {
         );
         let params = DashboardParams::create(&mut base)?;
 
-        let client = Arc::new(Mutex::new(DashboardClient::new(robot_ip, DEFAULT_TIMEOUT)));
+        let client = Arc::new(Mutex::new(client));
         let shared = DashboardHandle::new(robot_ip);
-        registry::register_dashboard(port_name, shared.clone()).map_err(asyn_error)?;
 
-        // The C++ constructor connects, then reads the three static strings.
+        // The C++ constructor connects, then reads the three static strings;
+        // any of those reads throws out of the constructor
+        // (dashboard_driver.cpp:73-75), e.g. getSerialNumber below PolyScope 5.6.
         {
             let mut c = client.lock();
             match c.connect() {
@@ -163,7 +172,8 @@ impl DashboardDriver {
                 Err(e) => spdlog::error(format_args!("{e}")),
             }
             if c.is_connected() {
-                let version = c.polyscope_version().unwrap_or_default();
+                let thrown = |e: crate::error::UrError| asyn_error(e.to_string());
+                let version = c.polyscope_version().map_err(thrown)?;
                 base.set_string_param(
                     params.polyscope_version,
                     0,
@@ -172,12 +182,10 @@ impl DashboardDriver {
                         version.major, version.minor, version.patch, version.build
                     ),
                 )?;
-                if let Ok(serial) = c.serial_number() {
-                    base.set_string_param(params.serial_number, 0, serial)?;
-                }
-                if let Ok(model) = c.robot_model() {
-                    base.set_string_param(params.robot_model, 0, model)?;
-                }
+                let serial = c.serial_number().map_err(thrown)?;
+                base.set_string_param(params.serial_number, 0, serial)?;
+                let model = c.robot_model().map_err(thrown)?;
+                base.set_string_param(params.robot_model, 0, model)?;
                 base.set_int32_param(params.is_connected, 0, 1)?;
                 shared.set(DashboardState {
                     connected: true,
@@ -186,6 +194,7 @@ impl DashboardDriver {
                 });
             }
         }
+        registry::register_dashboard(port_name, shared.clone()).map_err(asyn_error)?;
 
         Ok(Self {
             base,
@@ -479,6 +488,47 @@ fn poll_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::error::AsynError;
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+
+    /// Below PolyScope 5.6 the C++ constructor's getSerialNumber throws, so
+    /// URDashboardConfig reports that text and no dashboard is left behind
+    /// for a control or gripper port to find.
+    #[test]
+    fn a_pre_5_6_dashboard_fails_construction_with_the_serial_number_text() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut w = sock.try_clone().unwrap();
+            let mut r = StdBufReader::new(sock);
+            w.write_all(b"Connected: Universal Robots Dashboard Server\n")
+                .unwrap();
+            for _ in 0..2 {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                w.write_all(b"URSoftware 5.4.0.80651 (Mar 23 2019)\n")
+                    .unwrap();
+            }
+        });
+        let mut client = DashboardClient::new("127.0.0.1", DEFAULT_TIMEOUT);
+        client.set_port(port);
+
+        let Err(AsynError::Status { message, .. }) =
+            DashboardDriver::with_client("DASH_PRE56", "127.0.0.1", client)
+        else {
+            panic!("construction throws");
+        };
+        assert_eq!(
+            message,
+            "getSerialNumber() function is not supported on the dashboard server for \
+             PolyScope versions less than 5.6.0"
+        );
+        assert!(registry::dashboard("DASH_PRE56").is_none());
+        server.join().unwrap();
+    }
 
     /// The octet pair is the interesting negative: `POPUP` and `LOAD_URP`
     /// look like commands but their payload is the request, and they never
