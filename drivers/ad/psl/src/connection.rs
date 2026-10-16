@@ -58,6 +58,18 @@ impl From<AsynError> for ServerError {
     }
 }
 
+impl From<ServerError> for AsynError {
+    fn from(e: ServerError) -> Self {
+        match e {
+            ServerError::Timeout => AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "timeout".into(),
+            },
+            ServerError::Transport(e) => e,
+        }
+    }
+}
+
 impl ServerError {
     /// The asynStatus C's `writeReadServer` would have returned.
     pub fn status(&self) -> i32 {

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -30,7 +30,7 @@ use epics_rs::ad_core::plugin::channel::{
 };
 use epics_rs::ad_core::runtime as rt;
 
-use crate::connection::PslServer;
+use crate::connection::{PslServer, ServerResult};
 use crate::params::PslParams;
 use crate::protocol::{self, Choices};
 use crate::task::{AcquisitionContext, start_acquisition_task};
@@ -137,7 +137,9 @@ impl PslDetector {
         self.state.camera_names = self.get_choices("GetCamList")?;
         // The multi-camera configuration is not in GetCamList.
         self.state.camera_names.insert("multiconf".into());
-        self.open_camera(0)
+        // C's constructor ignores what openCamera returns (PSL.cpp:180).
+        let _ = self.open_camera(0);
+        Ok(())
     }
 
     /// Send one command and publish both sides of the exchange to the
@@ -146,11 +148,16 @@ impl PslDetector {
         Ok(self.command_status(command)?.0)
     }
 
-    /// [`Self::command`] with the asynStatus C's `writeReadServer` returned.
-    fn command_status(&mut self, command: &str) -> AsynResult<(String, i32)> {
+    /// [`Self::command`] for a caller that returns C's `writeReadServer` status.
+    fn send(&mut self, command: &str) -> AsynResult<()> {
+        self.command_status(command)?.1.map_err(AsynError::from)
+    }
+
+    /// [`Self::command`] with the outcome C's `writeReadServer` returned.
+    fn command_status(&mut self, command: &str) -> AsynResult<(String, ServerResult<()>)> {
         let (reply, status) = match self.server.command(command) {
-            Ok(reply) => (reply, 0),
-            Err(e) => (String::new(), e.status()),
+            Ok(reply) => (reply, Ok(())),
+            Err(e) => (String::new(), Err(e)),
         };
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
@@ -166,9 +173,10 @@ impl PslDetector {
     fn get_choices(&mut self, command: &str) -> AsynResult<Choices> {
         let multi = self.state.multi_camera();
         let (reply, status) = self.command_status(command)?;
-        if status != 0 {
+        if let Err(e) = &status {
             self.trace_error(&format!(
-                "PSL::getChoices error in write/read to server {status}"
+                "PSL::getChoices error in write/read to server {}",
+                e.status()
             ));
         }
         let choices = protocol::parse_choices(&reply, multi);
@@ -200,7 +208,8 @@ impl PslDetector {
         base.set_string_param(self.ad.params.base.model, 0, model)?;
         base.set_string_param(self.ad.params.base.manufacturer, 0, "PSL")?;
 
-        let reply = self.command("GetMaximumSize")?;
+        // C returns this exchange's status (PSL.cpp:230).
+        let (reply, status) = self.command_status("GetMaximumSize")?;
         let size = protocol::parse_ints(&reply);
         if size.len() >= 2 {
             let base = &mut self.ad.port_base;
@@ -212,9 +221,9 @@ impl PslDetector {
         self.state.record_formats = self.get_choices("GetOptionRange;RecordFormat")?;
         self.state.trigger_modes = self.get_choices("GetOptionRange;TriggerMode")?;
 
-        self.get_config()?;
+        let _ = self.get_config();
         self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        status.map_err(AsynError::from)
     }
 
     fn supports(&self, option: &str) -> bool {
@@ -241,7 +250,7 @@ impl PslDetector {
                 base.set_int32_param(self.ad.params.base.data_type, 0, data_type as u8 as i32)?;
                 base.set_int32_param(self.ad.params.base.color_mode, 0, color_mode as i32)?;
             }
-            Err(_) if status == 0 => {
+            Err(_) if status.is_ok() => {
                 self.trace_error(&format!("PSL:getConfig: unknown mode={reply}"));
             }
             Err(_) => {}
@@ -256,7 +265,7 @@ impl PslDetector {
                         .port_base
                         .set_int32_param(self.ad.params.trigger_mode, 0, index)?;
                 }
-                None if status == 0 => {
+                None if status.is_ok() => {
                     self.trace_error(&format!("PSL:getConfig: unknown trigger mode={mode}"));
                 }
                 None => {}
@@ -361,7 +370,7 @@ impl PslDetector {
                         .port_base
                         .set_int32_param(self.ad.params.base.file_format, 0, index)?;
                 }
-                None if status == 0 => {
+                None if status.is_ok() => {
                     self.trace_error(&format!(
                         "PSL:getConfig: error, unknown file format string = {format}"
                     ));
@@ -456,57 +465,71 @@ impl PortDriver for PslDetector {
             .port_base
             .set_int32_param(reason, user.addr, value)?;
 
+        // C keeps the server status only on the branches below that assign it
+        // (PSL.cpp:744-797); the others report success whatever the server said.
         let p = self.ad.params;
-        if reason == p.acquire {
+        let status = if reason == p.acquire {
             if value != 0 && !was_acquiring {
-                self.start_acquire()?;
+                let _ = self.start_acquire();
+                Ok(())
             } else if value == 0 && was_acquiring {
-                self.command("Stop")?;
+                let status = self.send("Stop");
                 self.shared.stop_requested.store(true, Ordering::Release);
+                status
+            } else {
+                Ok(())
             }
         } else if reason == p.bin_x || reason == p.bin_y {
             let bin_x = self.get_i32(p.bin_x);
             let bin_y = self.get_i32(p.bin_y);
-            self.command(&protocol::set_binning(bin_x, bin_y))?;
+            self.command(&protocol::set_binning(bin_x, bin_y)).map(drop)
         } else if reason == p.min_x || reason == p.min_y || reason == p.size_x || reason == p.size_y
         {
             let min_x = self.get_i32(p.min_x);
             let min_y = self.get_i32(p.min_y);
             let size_x = self.get_i32(p.size_x);
             let size_y = self.get_i32(p.size_y);
-            self.command(&protocol::set_sub_area(min_x, min_y, size_x, size_y))?;
+            self.send(&protocol::set_sub_area(min_x, min_y, size_x, size_y))
         } else if reason == p.reverse_x {
-            self.command(&protocol::set_fliplr(value))?;
+            self.command(&protocol::set_fliplr(value)).map(drop)
         } else if reason == p.reverse_y {
-            self.command(&protocol::set_flipud(value))?;
+            self.command(&protocol::set_flipud(value)).map(drop)
         } else if reason == p.trigger_mode {
-            if let Ok(mode) = protocol::choice_from_index(&self.state.trigger_modes, value) {
-                let command = protocol::set_trigger_mode(mode);
-                self.command(&command)?;
+            match protocol::choice_from_index(&self.state.trigger_modes, value) {
+                Ok(mode) => {
+                    let command = protocol::set_trigger_mode(mode);
+                    self.command(&command).map(drop)
+                }
+                Err(_) => Ok(()),
             }
         } else if reason == p.base.auto_save {
-            self.command(&protocol::set_auto_save(value))?;
+            self.send(&protocol::set_auto_save(value))
         } else if reason == p.base.file_format {
-            if let Ok(format) = protocol::choice_from_index(&self.state.record_formats, value) {
-                let command = protocol::set_record_format(format);
-                self.command(&command)?;
+            match protocol::choice_from_index(&self.state.record_formats, value) {
+                Ok(format) => {
+                    let command = protocol::set_record_format(format);
+                    self.send(&command)
+                }
+                Err(_) => Ok(()),
             }
         } else if reason == self.params.camera_name {
-            self.open_camera(value)?;
+            self.open_camera(value)
         } else if reason == p.base.file_number {
-            self.command(&protocol::set_record_number(value))?;
+            self.send(&protocol::set_record_number(value))
         } else if reason < self.params.camera_name {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
             if reason == p.shutter_control {
-                self.ad.set_shutter(value != 0)?;
+                self.ad.set_shutter(value != 0)
             } else {
-                self.ad.write_int32_pool(reason, value)?;
+                self.ad.write_int32_pool(reason, value).map(drop)
             }
-        }
+        } else {
+            Ok(())
+        };
 
-        self.get_config()?;
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.get_config();
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -516,17 +539,19 @@ impl PortDriver for PslDetector {
             .set_float64_param(reason, user.addr, value)?;
 
         let p = self.ad.params;
-        if reason == p.acquire_time {
-            self.command(&protocol::set_exposure(value))?;
+        let status = if reason == p.acquire_time {
+            self.send(&protocol::set_exposure(value))
         } else if reason == p.acquire_period {
-            self.command(&protocol::set_frame_time(value))?;
+            self.send(&protocol::set_frame_time(value))
         } else if reason == p.gain {
-            self.command(&protocol::set_chip_gain(value))?;
-        }
+            self.send(&protocol::set_chip_gain(value))
+        } else {
+            Ok(())
+        };
 
-        self.get_config()?;
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.get_config();
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        status
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, value: &[u8]) -> AsynResult<usize> {
@@ -539,20 +564,21 @@ impl PortDriver for PslDetector {
             .set_string_param(reason, user.addr, text.clone())?;
 
         let p = self.ad.params;
-        if reason == p.base.file_path {
-            self.command(&protocol::set_record_path(&text))?;
-            self.check_path()?;
+        let status = if reason == p.base.file_path {
+            let status = self.send(&protocol::set_record_path(&text));
+            let _ = self.check_path();
+            status
         } else if reason == p.base.file_name {
-            self.command(&protocol::set_record_name(&text))?;
+            self.send(&protocol::set_record_name(&text))
         } else if reason == self.params.tiff_comment {
-            self.command(&protocol::set_record_tag(&text))?;
+            self.send(&protocol::set_record_tag(&text))
         } else {
-            self.ad.write_octet(user, value)?;
-        }
+            self.ad.write_octet(user, value).map(drop)
+        };
 
-        self.get_config()?;
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(value.len())
+        let _ = self.get_config();
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        status.map(|()| value.len())
     }
 
     fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
@@ -698,5 +724,28 @@ mod tests {
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
         );
+    }
+
+    #[test]
+    fn writes_report_the_server_status_only_where_c_keeps_it() {
+        let mut det = detector("PSL_STATUS");
+        let p = det.ad.params;
+        // Kept by C: the dead server's failure is the write's status.
+        assert!(
+            det.write_int32(&mut AsynUser::new(p.base.file_number), 3)
+                .is_err()
+        );
+        assert!(
+            det.write_float64(&mut AsynUser::new(p.acquire_time), 0.5)
+                .is_err()
+        );
+        assert!(
+            det.write_octet(&mut AsynUser::new(p.base.file_name), b"scan")
+                .is_err()
+        );
+        // Dropped by C: SetBinning's status is never assigned.
+        det.write_int32(&mut AsynUser::new(p.bin_x), 2).unwrap();
+        // The parameter is stored either way.
+        assert_eq!(det.get_i32(p.base.file_number), 3);
     }
 }
