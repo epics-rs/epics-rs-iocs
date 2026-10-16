@@ -236,9 +236,10 @@ impl PortDriver for BrukerDetector {
                     det.trace_error(&format!(
                         "BISDetector:writeInt32: invalid binning={value}, must be 1,2,4 or 8"
                     ));
+                    // C sets no errorMessage (BISDetector.cpp:660-664).
                     return Err(AsynError::Status {
                         status: AsynStatus::Error,
-                        message: format!("binning {value} is not 1, 2, 4 or 8"),
+                        message: String::new(),
                     });
                 }
             } else if reason == q.start_scan {

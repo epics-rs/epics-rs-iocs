@@ -400,7 +400,12 @@ fn a_binning_write_does_not_depend_on_bis() {
 
     sync.write_int32(ad.bin_x, 2).expect("binning 2");
     assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
-    assert!(sync.write_int32(ad.bin_x, 3).is_err());
+    let e = sync.write_int32(ad.bin_x, 3).unwrap_err();
+    assert_eq!(
+        e.message(),
+        "",
+        "C sets no errorMessage for a refused binning"
+    );
 }
 
 /// BISDetector.cpp:668 hands base-class writes to ADDriver::writeInt32,
