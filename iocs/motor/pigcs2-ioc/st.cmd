@@ -10,7 +10,7 @@
 #============================================================
 
 epicsEnvSet("P",       "pi:")
-epicsEnvSet("CTRL",    "0")
+epicsEnvSet("CTRL",    "PI1")
 epicsEnvSet("PORT",    "piAsyn")
 epicsEnvSet("TTY",     "/dev/ttyUSB0")
 epicsEnvSet("NUMAXES", "1")
@@ -21,14 +21,14 @@ drvAsynSerialPortConfigure("$(PORT)", "$(TTY)", 0, 0, 0)
 asynSetOption("$(PORT)", -1, "baud", "115200")
 
 # ---- PI GCS2 controller ----
-# PIGCS2CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
+# PI_GCS2_CreateController(portName, asynPort, numAxes, priority, stackSize,
+#                          movingPollingRate, idlePollingRate), rates in ms.
 # Axes are auto-discovered via SAI? — the first numAxes of them (in
 # controller-reported order) are attached.
-PIGCS2CreateController("$(CTRL)", "$(PORT)", $(NUMAXES), 100, 1000)
+PI_GCS2_CreateController("$(CTRL)", "$(PORT)", $(NUMAXES), 0, 0, 100, 1000)
 
-# One motor record for axis 0. DTYP = PIGCS2_$(CTRL)_$(AXIS), where AXIS is
-# the GCS axis name (e.g. "1"), not a bare index.
-dbLoadRecords("$(PIGCS2_IOC)/db/pigcs2.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=1")
+# One motor record for axis 0 (the first discovered GCS axis).
+dbLoadRecords("$(PIGCS2_IOC)/db/pigcs2.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
 

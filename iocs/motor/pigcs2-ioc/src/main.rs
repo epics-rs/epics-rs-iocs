@@ -1,7 +1,7 @@
 //! PI GCS2 stage-controller IOC (motorPIGCS2).
 //!
 //! Assembles: a serial/TCP octet port (`drvAsynSerialPortConfigure` /
-//! `drvAsynIPPortConfigure`), the `PIGCS2CreateController` iocsh command, the
+//! `drvAsynIPPortConfigure`), the `PI_GCS2_CreateController` iocsh command, the
 //! motor record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
@@ -12,7 +12,6 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_common::MotorHolder;
 use motor_pi_gcs2::ioc::pigcs2_config_command;
 
 #[epics_rs::base::epics_main]
@@ -38,9 +37,11 @@ async fn main() -> CaResult<()> {
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // PI GCS2 iocsh command + motor device support.
-    let holder = MotorHolder::new();
-    app = app.register_startup_command(pigcs2_config_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(pigcs2_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

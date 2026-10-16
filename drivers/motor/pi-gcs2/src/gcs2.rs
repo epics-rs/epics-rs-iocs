@@ -5,7 +5,7 @@
 //! C-884/E-861/E-871/E-873 motor specialization) — the two classes the task
 //! scopes as "generic GCS2 stage-controller path". Commands are plain ASCII
 //! text terminated by `\n`; the driver owns output framing and
-//! `PIGCS2CreateController` sets input EOS `"\n"` and an empty output EOS, as
+//! `PI_GCS2_CreateController` sets input EOS `"\n"` and an empty output EOS, as
 //! the C `PIasynController` constructor does. Axes are addressed by the GCS *name
 //! string* returned by `SAI?` (e.g. `"1"`), not a bare index.
 //!
