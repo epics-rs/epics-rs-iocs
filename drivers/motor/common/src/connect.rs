@@ -6,9 +6,11 @@
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 /// asyn subaddress for a single-device octet port (0; GPIB would differ).
 const SERIAL_ADDR: i32 = 0;
@@ -38,6 +40,24 @@ pub fn connect_ip(ip_port: &str, timeout: Duration) -> Result<SyncIOHandle, Stri
         SERIAL_ADDR,
         timeout,
     ))
+}
+
+/// A model-3 `asynMotorController` constructor's
+/// `pasynOctetSyncIO->connect(octetPort, 0, &pasynUserController_, NULL)`:
+/// on a missing port it prints `report` on `pasynUserSelf` (the controller
+/// port `self_port`, address 0) and the controller keeps the user anyway,
+/// so every later transfer on it is refused rather than the create failing.
+pub fn connect_controller(
+    octet_port: &str,
+    timeout: Duration,
+    self_port: &str,
+    report: std::fmt::Arguments<'_>,
+) -> (SyncIOHandle, AsynResult<()>) {
+    let (handle, status) = SyncIOHandle::connect_port(octet_port, SERIAL_ADDR, timeout);
+    if status.is_err() {
+        MotorTrace::new(self_port, 0).print_self(TraceMask::ERROR, report);
+    }
+    (handle, status)
 }
 
 /// What a refused EOS set does to a controller's create, and the order the
@@ -179,6 +199,19 @@ mod tests {
         connect_with_eos(port, Duration::from_secs(1), b"\n", b"\r", refusal)
             .map(drop)
             .map_err(String::from)
+    }
+
+    #[test]
+    fn a_controller_keeps_a_user_of_a_missing_port() {
+        let (handle, status) = connect_controller(
+            "motorNoSuchPort",
+            Duration::from_secs(1),
+            "motorNoSuchCtl",
+            format_args!("cannot connect"),
+        );
+        assert!(status.is_err());
+        let e = handle.write_read(0, b"?", 16).unwrap_err();
+        assert_eq!(e.message(), "asynManager::queueLockPort not connected");
     }
 
     #[test]
