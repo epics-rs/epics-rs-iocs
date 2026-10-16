@@ -75,6 +75,16 @@ fn smartmotor_err(message: impl Into<String>) -> AsynError {
 /// Shared controller endpoint: owns the serial handle for a single SmartMotor.
 pub struct SmartMotorController {
     handle: SyncIOHandle,
+    comm_state: CommState,
+}
+
+/// Controller communication state (C `cntrl->status`): one failed `RBt` is
+/// retried silently, a second in a row is a comm error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
 }
 
 impl SmartMotorController {
@@ -83,7 +93,10 @@ impl SmartMotorController {
     /// the controller is in daisy-chain echo mode, which this port cannot frame
     /// (see the module docs) and is rejected. Performs blocking serial I/O.
     pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
-        let ctrl = Self { handle };
+        let ctrl = Self {
+            handle,
+            comm_state: CommState::Normal,
+        };
         let reply = ctrl.query("RBe")?;
         if reply.starts_with("RBe") || reply.contains('\n') {
             return Err(smartmotor_err(
@@ -251,10 +264,28 @@ impl AsynMotor for SmartMotorAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
 
-        // Trajectory-busy flag: RBt == 0 means the move is done.
-        let done = atoi(&ctrl.query("RBt")?) == 0;
+        // Trajectory-busy flag: RBt == 0 means the move is done. C
+        // drvSmartMotor.cc:239-263: an empty or failed RBt keeps the previous
+        // status once (RETRY); a second in a row raises COMM_ERR.
+        let rbt = ctrl.query("RBt").ok().filter(|r| !r.is_empty());
+        let Some(rbt) = rbt else {
+            let hard = ctrl.comm_state != CommState::Normal;
+            ctrl.comm_state = if hard {
+                CommState::CommErr
+            } else {
+                CommState::Retry
+            };
+            drop(ctrl);
+            if hard {
+                self.last_status.comms_error = true;
+                self.last_status.problem = true;
+            }
+            return Ok(self.last_status.clone());
+        };
+        ctrl.comm_state = CommState::Normal;
+        let done = atoi(&rbt) == 0;
 
         let position = nint(atof(&ctrl.query("RP")?));
 
