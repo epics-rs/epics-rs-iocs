@@ -1148,6 +1148,12 @@ impl PortDriver for TimePix3Driver {
         } else if reason == p.prv_hst_sum_update_interval {
             self.shared.hst.lock().set_update_interval(value);
             Ok(())
+        } else if reason == p.processed_img_output_type || reason == p.processed_hst_output_type {
+            // ADTimePix.cpp:593-597, :605-609.
+            if value != 0 && value != 1 {
+                self.ad.port_base.set_int32_param(reason, 0, 0)?;
+            }
+            Ok(())
         } else if reason == p.img_image_data_reset {
             if value == 1 {
                 self.shared.img.lock().reset();
@@ -1394,6 +1400,28 @@ impl PortDriver for TimePix3Driver {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// A processed-output type other than 0 or 1 reads back 0
+    /// (ADTimePix.cpp:593-597, :605-609).
+    #[test]
+    fn a_processed_output_type_outside_zero_and_one_reads_back_zero() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_OUTPUT_TYPE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for reason in [p.processed_img_output_type, p.processed_hst_output_type] {
+            det.write_int32(&mut AsynUser::new(reason), 1).unwrap();
+            assert_eq!(det.int(reason, 0), 1);
+            det.write_int32(&mut AsynUser::new(reason), 7).unwrap();
+            assert_eq!(det.int(reason, 0), 0);
+        }
+    }
 
     /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).
     #[test]
