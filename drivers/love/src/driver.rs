@@ -466,7 +466,7 @@ impl LoveDriver {
         AsynUser::new(OCTET_REASON)
             .with_addr(self.ser_addr)
             .with_timeout(self.timeout)
-            .locking_port(self.serial.queue_lock_port_timeout())
+            .locking_port(&self.serial)
     }
 
     fn trace_error(&self, msg: &str) {
