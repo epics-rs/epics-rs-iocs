@@ -37,10 +37,12 @@ fn healthy(command: &str) -> String {
 }
 
 /// A detector on a fake server that answers `ERROR <code> refused` to every
-/// command starting with one of the prefixes last passed to `refuse`.
+/// command starting with one of the prefixes last passed to `refuse`; `heard`
+/// gets each request's counter.
 struct Fake {
     runtime: SpecsAnalyserRuntime,
     arm: mpsc::Sender<(u32, Vec<&'static str>)>,
+    heard: mpsc::Receiver<u32>,
 }
 
 impl Fake {
@@ -54,6 +56,7 @@ impl Fake {
         let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let (arm, armed) = mpsc::channel::<(u32, Vec<&'static str>)>();
         arm.send((code, refuse.to_vec())).unwrap();
+        let (tell, heard) = mpsc::channel();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("connection");
             let mut refuse = (0, Vec::new());
@@ -73,6 +76,7 @@ impl Fake {
                     healthy(&command)
                 };
                 let counter: u32 = counter.parse().unwrap();
+                let _ = tell.send(counter);
                 // One write, so one read takes the whole reply.
                 let frame = format!("!{counter:04} {reply}");
                 if stream.write_all(frame.as_bytes()).is_err() {
@@ -94,7 +98,22 @@ impl Fake {
 
         let claim = claim_port(name).unwrap();
         let runtime = create_specs_analyser_detector(&claim, &ip, 0, 0).expect("detector");
-        Fake { runtime, arm }
+        let fake = Fake {
+            runtime,
+            arm,
+            heard,
+        };
+        // The task's first post would overwrite a test's ADStatusMessage, and
+        // an Acquire it reads before its wait is never started.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fake.status_message() != "Waiting for the acquire command" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the task never waited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fake
     }
 
     fn refuse(&self, code: u32, commands: &[&'static str]) {
@@ -107,6 +126,27 @@ impl Fake {
             .drv_user_create_blocking(&DrvUserRequest::new(name, 0))
             .unwrap()
             .reason
+    }
+
+    fn status_message(&self) -> String {
+        let bytes = self
+            .runtime
+            .port_handle()
+            .get_string_param_blocking(self.runtime.ad_params.status_message, 0, 256)
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn msg_counter(&self) -> i32 {
+        self.runtime
+            .port_handle()
+            .read_int32_blocking(self.runtime.specs_params.msg_counter, 0)
+            .unwrap()
+    }
+
+    /// The counter of the last request the server has seen.
+    fn last_heard(&self) -> u32 {
+        self.heard.try_iter().last().unwrap_or(0)
     }
 
     fn write_int32(&self, reason: usize, value: i32) -> Result<(), AsynStatus> {
@@ -188,4 +228,62 @@ fn an_undecodable_confirm_is_an_error() {
     let fake = Fake::start("SPECS_WS_ODD");
     let odd = fake.reason("ODD");
     assert_eq!(fake.write_int32(odd, 9), Err(AsynStatus::Error));
+}
+
+/// sendSimpleCommand puts an ERROR reply's code and message in
+/// ADStatusMessage (specsAnalyser.cpp:1324-1331); SetSafeState's status is
+/// ignored (:879).
+#[test]
+fn a_refused_safe_state_reports_the_code_and_message() {
+    let fake = Fake::start("SPECS_WS_SAFE");
+    fake.refuse(7, &["SetSafeState"]);
+    let safe = fake.runtime.specs_params.safe_state;
+    assert_eq!(fake.write_int32(safe, 1), Ok(()));
+    assert_eq!(fake.status_message(), "7: refused");
+}
+
+#[test]
+fn a_refused_validate_reports_the_code_and_message() {
+    let fake = Fake::start("SPECS_WS_VALMSG");
+    fake.refuse(7, &["ValidateSpectrum"]);
+    let validate = fake.runtime.specs_params.validate;
+    assert_eq!(fake.write_int32(validate, 1), Err(AsynStatus::Error));
+    assert_eq!(fake.status_message(), "7: refused");
+}
+
+/// asynWriteRead posts SPECSMsgCounter for every exchange
+/// (specsAnalyser.cpp:2056-2062).
+#[test]
+fn a_write_posts_the_message_counter() {
+    let fake = Fake::start("SPECS_WS_COUNT");
+    let define = fake.runtime.specs_params.define;
+    fake.write_int32(define, 1).unwrap();
+    let last = fake.last_heard();
+    assert!(last > 0);
+    assert_eq!(fake.msg_counter(), last as i32);
+}
+
+/// The acquisition task's exchanges post it too.
+#[test]
+fn the_acquisition_task_posts_the_message_counter() {
+    let fake = Fake::start("SPECS_WS_TASKCOUNT");
+    let before = fake.last_heard();
+    // Refusing the first command of an acquisition ends it at once.
+    fake.refuse(7, &["GetAnalyzerParameterValue"]);
+    let acquire = fake.runtime.ad_params.acquire;
+    fake.write_int32(acquire, 1).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last = before;
+    loop {
+        last = fake.heard.try_iter().last().unwrap_or(last);
+        if last > before && fake.msg_counter() == last as i32 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "counter {} after the task sent {last}",
+            fake.msg_counter()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }

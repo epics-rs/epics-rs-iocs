@@ -59,14 +59,13 @@ impl From<WireError> for AsynError {
 }
 
 impl WireError {
-    /// `SpecsAnalyser::sendSimpleCommand`'s `ADStatusMessage` on error
-    /// (`specsAnalyser.cpp:1329-1331`, `"{code}: {message}"`).
+    /// The error's text.
     pub fn status_message(&self) -> String {
         match self {
             WireError::NotConnected => "Not connected to SPECS".to_string(),
             WireError::Io(e) => format!("SPECS communication error: {e}"),
             WireError::Frame(e) => format!("SPECS protocol framing error: {e:?}"),
-            WireError::Device(info) => format!("{}: {}", info.code, info.message),
+            WireError::Device(info) => info.status_message(),
             WireError::Field(name) => format!("SPECS reply has no valid {name}"),
         }
     }
@@ -142,6 +141,17 @@ pub struct WireLink<'a> {
     pub addr: i32,
     pub wire_state: &'a Mutex<u32>,
     pub connected: &'a AtomicBool,
+    /// The params the exchanges set, for the caller to apply.
+    pub trail: ExchangeTrail,
+}
+
+/// What C's exchange path leaves in the parameter library:
+/// `asynWriteRead`'s `SPECSMsgCounter_` (`specsAnalyser.cpp:2056-2062`) and
+/// `sendSimpleCommand`'s `ADStatusMessage` on an ERROR reply (`:1324-1331`).
+#[derive(Debug, Default)]
+pub struct ExchangeTrail {
+    pub msg_counter: Option<u32>,
+    pub status_message: Option<String>,
 }
 
 impl WireLink<'_> {
@@ -151,21 +161,20 @@ impl WireLink<'_> {
             .with_timeout(secs(SOCKET_TIMEOUT))
     }
 
-    /// `SpecsAnalyser::commandResponse` + `SpecsAnalyser::asynWriteRead`
-    /// (`specsAnalyser.cpp:1897-2118`). Advances and returns the wire
-    /// message counter unconditionally before attempting the round trip,
-    /// matching upstream incrementing/publishing `SPECSMsgCounter_` before
-    /// `pasynOctetSyncIO->writeRead` regardless of its outcome.
+    /// `SpecsAnalyser::sendSimpleCommand` (`specsAnalyser.cpp:1313-1339`),
+    /// the path of every exchange: the counter advances before the
+    /// connected check, as in `asynWriteRead`.
     pub fn command_response(
         &mut self,
         command: &str,
     ) -> Result<HashMap<String, String>, WireError> {
-        if !self.connected.load(Ordering::SeqCst) {
-            return Err(WireError::NotConnected);
-        }
         let mut guard = self.wire_state.lock().unwrap();
         let counter = next_counter(*guard);
         *guard = counter;
+        self.trail.msg_counter = Some(counter);
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err(WireError::NotConnected);
+        }
         let request = codec::format_request(counter, command);
 
         let result = self
@@ -209,6 +218,7 @@ impl WireLink<'_> {
                 if info.code == "3" {
                     self.connected.store(false, Ordering::SeqCst);
                 }
+                self.trail.status_message = Some(info.status_message());
                 return Err(WireError::Device(info));
             }
         }

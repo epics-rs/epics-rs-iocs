@@ -40,7 +40,7 @@ use crate::codec::{DefineFatArgs, DefineFrrArgs};
 use crate::params::SpecsParams;
 use crate::task::{Worker, start_task};
 use crate::types::{Event, RunMode, SOCKET_TIMEOUT, secs};
-use crate::wire::{self, DiscoveredValue, WireLink};
+use crate::wire::{self, DiscoveredValue, ExchangeTrail, WireLink};
 
 fn enum_choices(values: &[String]) -> Arc<[EnumEntry]> {
     values
@@ -136,7 +136,10 @@ impl SpecsAnalyserDriver {
         })
     }
 
-    fn with_wire<F, R>(&self, f: F) -> R
+    /// Runs `f`'s exchanges, then sets what they left in the parameter
+    /// library. The port is held meanwhile, so the counter C posts before
+    /// each exchange is posted once, with the write's own callbacks.
+    fn with_wire<F, R>(&mut self, f: F) -> R
     where
         F: FnOnce(&mut WireLink) -> R + Send + 'static,
         R: Send + 'static,
@@ -145,17 +148,27 @@ impl SpecsAnalyserDriver {
         let addr = self.driver_addr;
         let wire_state = self.wire_state.clone();
         let connected = self.connected.clone();
-        std::thread::spawn(move || {
+        let (result, trail) = std::thread::spawn(move || {
             let mut link = WireLink {
                 driver_port: &driver_port,
                 addr,
                 wire_state: &wire_state,
                 connected: &connected,
+                trail: ExchangeTrail::default(),
             };
-            f(&mut link)
+            let result = f(&mut link);
+            (result, link.trail)
         })
         .join()
-        .expect("specs-analyser wire thread panicked")
+        .expect("specs-analyser wire thread panicked");
+        let base = &mut self.ad.port_base;
+        if let Some(counter) = trail.msg_counter {
+            let _ = base.set_int32_param(self.p.msg_counter, 0, counter as i32);
+        }
+        if let Some(message) = trail.status_message {
+            let _ = base.set_string_param(self.ad.params.status_message, 0, message);
+        }
+        result
     }
 
     /// C `SpecsAnalyser::makeConnection` + the always-run
@@ -460,7 +473,7 @@ impl SpecsAnalyserDriver {
     /// `SPECSNonEnergyChannels_` (`specsAnalyser.cpp:865-875`) and the
     /// dynamic `paramIndexes_` fallback (`specsAnalyser.cpp:886-902`); the
     /// caller reverts to the old value on `Err`.
-    fn set_confirm_int(&self, raw_name: String, value: i32) -> AsynResult<i32> {
+    fn set_confirm_int(&mut self, raw_name: String, value: i32) -> AsynResult<i32> {
         self.with_wire(move |link| {
             link.set_analyser_parameter_int(&raw_name, value)?;
             link.get_analyser_parameter_int(&raw_name)
@@ -468,7 +481,7 @@ impl SpecsAnalyserDriver {
         .map_err(AsynError::from)
     }
 
-    fn set_confirm_double(&self, raw_name: String, value: f64) -> AsynResult<f64> {
+    fn set_confirm_double(&mut self, raw_name: String, value: f64) -> AsynResult<f64> {
         self.with_wire(move |link| {
             link.set_analyser_parameter_double(&raw_name, value)?;
             link.get_analyser_parameter_double(&raw_name)

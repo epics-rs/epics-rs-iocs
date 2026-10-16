@@ -167,15 +167,18 @@ impl Worker {
         &mut self,
         command: &str,
     ) -> Result<HashMap<String, String>, WireError> {
-        if !self.connected.load(Ordering::SeqCst) {
-            return Err(WireError::NotConnected);
-        }
         let counter = {
             let mut guard = self.wire_state.lock().unwrap();
             let next = codec::next_counter(*guard);
             *guard = next;
             next
         };
+        // asynWriteRead posts the counter before the exchange.
+        self.set_i32(self.p.msg_counter, counter as i32);
+        self.callbacks().await;
+        if !self.connected.load(Ordering::SeqCst) {
+            return Err(WireError::NotConnected);
+        }
         let request = codec::format_request(counter, command);
 
         let result = self
@@ -221,6 +224,7 @@ impl Worker {
                     self.connected.store(false, Ordering::SeqCst);
                     self.set_i32(self.p.connected, 0);
                 }
+                self.set_str(self.ad.status_message, info.status_message());
                 return Err(WireError::Device(info));
             }
         }
