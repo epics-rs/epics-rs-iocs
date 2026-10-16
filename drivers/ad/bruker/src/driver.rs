@@ -276,12 +276,23 @@ impl PortDriver for BrukerDetector {
             status = self.ad.write_int32_pool(reason, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        if let Err(e) = &status {
-            self.trace_error(&format!(
-                "BISDetector:writeInt32: error, status={} function={reason}, value={value}",
-                e.status() as i32
-            ));
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "BISDetector:writeInt32: error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("BISDetector:writeInt32: function={reason}, value={value}"),
+            ),
         }
         status
     }
