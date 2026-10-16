@@ -235,6 +235,7 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
         ));
     }
     if let Ok(dashboard) = &reply {
+        serval_version(ctx, dashboard, &mut updates);
         disk_space(ctx, dashboard, &mut updates);
     }
     ctx.set(0, updates).await;
@@ -243,6 +244,31 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
 
 /// The first disk in `Server.DiskSpace`, which is empty until raw file writing
 /// is configured (C getDashboard, serval_http.cpp:388).
+/// C `updateServalVersionFromDashboard` (serval_http.cpp:133).
+fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
+    let Some(server) = dashboard.get("Server").filter(|s| s.is_object()) else {
+        return;
+    };
+    let mut octet = |reason: usize, v: &str| {
+        updates.push(ParamSetValue::new(
+            reason,
+            0,
+            ParamValue::Octet(v.as_bytes().to_vec().into()),
+        ));
+    };
+    if let Some(ver) = server.get("SoftwareVersion").map(serval::json_to_string)
+        && !ver.is_empty()
+    {
+        octet(ctx.ad.base.sdk_version, &ver);
+        octet(ctx.ad.base.manufacturer, "ASI");
+    }
+    if let Some(ts) = server.get("SoftwareTimestamp").map(serval::json_to_string)
+        && !ts.is_empty()
+    {
+        octet(ctx.p.fw_time_stamp, &ts);
+    }
+}
+
 fn disk_space(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let p = ctx.p;
     let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") else {
@@ -268,14 +294,17 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
 async fn refresh_detector(ctx: &Arc<Ctx>) {
     let p = ctx.p;
 
-    if let Ok(dashboard) = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL)
-        && let Some(disk) = dashboard.pointer("/Server/DiskSpace/0")
-    {
-        if let Some(v) = disk.get("FreeSpace").and_then(Value::as_i64) {
-            ctx.set_int64(p.free_space, 0, v).await;
-        }
-        if let Some(v) = disk.get("LowerLimit").and_then(Value::as_i64) {
-            ctx.set_int64(p.lower_limit, 0, v).await;
+    if let Ok(dashboard) = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL) {
+        let mut updates = Vec::new();
+        serval_version(ctx, &dashboard, &mut updates);
+        ctx.set(0, updates).await;
+        if let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") {
+            if let Some(v) = disk.get("FreeSpace").and_then(Value::as_i64) {
+                ctx.set_int64(p.free_space, 0, v).await;
+            }
+            if let Some(v) = disk.get("LowerLimit").and_then(Value::as_i64) {
+                ctx.set_int64(p.lower_limit, 0, v).await;
+            }
         }
     }
 
