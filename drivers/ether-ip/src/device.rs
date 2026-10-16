@@ -215,12 +215,13 @@ pub fn analyze_link<P>(
     if bits > 0 && special & spco::BIT == 0 {
         // A binary record with no explicit bit number: an indexed tag is a
         // BOOL array, which Logix packs into UDINTs, so the bit index folds
-        // into a UDINT index plus a mask; an unindexed one is a plain BOOL,
-        // masked 255 whatever NOBT is (devEtherIP.c:1086-1100).
+        // into a UDINT index plus a mask; an unindexed one reads from bit 0.
+        // C defect not copied: devEtherIP.c:1101 masks it 255, so bit 0 of a
+        // bi read as the OR of bits 0-7 and a bo wrote 255.
         mask = if special & spco::INDEX_INCLUDED != 0 {
             1u32 << (element & 0x1F)
         } else {
-            255
+            1
         };
         last_element = element.wrapping_add(bits - 1) >> 5;
         element >>= 5;
@@ -1519,11 +1520,15 @@ mod tests {
         assert_eq!(l.elements, 2);
     }
 
-    /// devEtherIP.c:1094: 255 for an unindexed binary link, NOBT or not.
+    /// An unindexed binary link reads from bit 0, as test.db's biDINT says;
+    /// C's mask of 255 made a bi on a DINT of 2 read 1.
     #[test]
-    fn unindexed_binary_link_mask() {
-        assert_eq!(parse_link("@plc1 aBool", 1, 1).unwrap().mask, 0xFF);
-        assert_eq!(parse_link("@plc1 aWord", 1, 4).unwrap().mask, 0xFF);
+    fn unindexed_binary_link_reads_from_bit_zero() {
+        let bi = parse_link("@plc1 aBool", 1, 1).unwrap();
+        let mbbi = parse_link("@plc1 aWord", 1, 4).unwrap();
+        let raw = bits_buf(&[0b0110]);
+        assert_eq!(get_bits(&raw, bi.element, bi.mask, 1), Some(0));
+        assert_eq!(get_bits(&raw, mbbi.element, mbbi.mask, 4), Some(0b0110));
     }
 
     #[test]
