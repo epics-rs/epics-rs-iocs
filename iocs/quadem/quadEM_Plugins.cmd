@@ -1,11 +1,10 @@
-# Port of quadEM iocBoot/quadEM_Plugins.cmd. The framework keeps
-# commonPlugins.cmd under $(ADCORE)/ioc, not $(ADCORE)/iocBoot.
+# Port of quadEM iocBoot/quadEM_Plugins.cmd.
 epicsEnvSet(NCHANS, $(TSPOINTS))
 epicsEnvSet(XSIZE,  $(RING_SIZE))
 epicsEnvSet(YSIZE,  11)
 epicsEnvSet(CBUFFS, 2000)
 
-< $(ADCORE)/ioc/commonPlugins.cmd
+< $(ADCORE)/iocBoot/commonPlugins.cmd
 # Create a standard arrays plugin
 # NELEMENTS must be $(RING_SIZE*11)
 NDStdArraysConfigure("Image1", 5, 0, "$(PORT)", 0, 0)
