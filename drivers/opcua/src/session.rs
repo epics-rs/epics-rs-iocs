@@ -947,7 +947,7 @@ impl SessionWorker {
                             config.name, self.handle.name
                         ));
                     }
-                    id
+                    Some(id)
                 }
                 Err(status) => {
                     errlog_vprintf(format_args!(
@@ -956,7 +956,7 @@ impl SessionWorker {
                         self.handle.name,
                         status_name(status)
                     ));
-                    continue;
+                    None
                 }
             };
 
@@ -975,15 +975,23 @@ impl SessionWorker {
             if !requests.is_empty() {
                 // C creates the items one call each, so a failed batch is every
                 // item failing with its status.
-                let results = match connection.create_monitored_items(id, requests).await {
-                    Ok(results) => results,
-                    Err(status) => vec![
+                // C goes on to add the items of a subscription the server refused;
+                // open62541 then fails each on the unknown subscription id.
+                let refused = |status| {
+                    vec![
                         MonitoredItemCreateResult {
                             status_code: status,
                             ..Default::default()
                         };
                         monitored.len()
-                    ],
+                    ]
+                };
+                let results = match id {
+                    Some(id) => connection
+                        .create_monitored_items(id, requests)
+                        .await
+                        .unwrap_or_else(refused),
+                    None => refused(StatusCode::BadSubscriptionIdInvalid),
                 };
                 for (item, result) in monitored.iter().zip(&results) {
                     let mut item = item.lock();
@@ -1026,6 +1034,9 @@ impl SessionWorker {
                 }
             }
 
+            if id.is_none() {
+                continue;
+            }
             // One dispatcher task per subscription: every value the server pushes
             // goes to the item its client handle names.
             let items = items.clone();

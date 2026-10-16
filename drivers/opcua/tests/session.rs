@@ -34,6 +34,8 @@ struct Behaviour {
     truncate_read: bool,
     /// The per-item status `CreateMonitoredItems` answers with.
     monitor_status: Option<StatusCode>,
+    /// `CreateSubscription` fails with this.
+    subscription_error: Option<StatusCode>,
 }
 
 #[derive(Default)]
@@ -158,6 +160,9 @@ impl UaConnection for Mock {
         sink: mpsc::UnboundedSender<Notification>,
     ) -> Result<u32, StatusCode> {
         self.calls.lock().subscriptions.push(config.clone());
+        if let Some(status) = self.behaviour.lock().subscription_error {
+            return Err(status);
+        }
         *self.sink.lock() = Some(sink);
         Ok(7)
     }
@@ -1017,6 +1022,30 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
         .clone();
     assert_eq!(filter.deadband_type, DeadbandType::Absolute as u32);
     assert_eq!(filter.deadband_value, 0.5);
+}
+
+/// C still runs `addMonitoredItems` for a subscription whose create failed, so
+/// each of its items is told the connection is lost.
+#[tokio::test]
+async fn a_refused_subscription_still_fails_its_items() {
+    let mock = Mock::arc();
+    mock.behave(|b| b.subscription_error = Some(StatusCode::BadTooManySubscriptions));
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0.clone()]);
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    handle.control(Control::Connect);
+    until(|| !mock.calls.lock().subscriptions.is_empty()).await;
+    until(|| item0.lock().state == ConnectionStatus::Down).await;
+
+    assert!(mock.calls.lock().monitored.is_empty());
+    let last = drain(&leaf0).pop().expect("the leaf has an update");
+    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
+    assert_eq!(last.status, StatusCode::BadSubscriptionIdInvalid);
 }
 
 /// `SubscriptionOpen62541::addMonitoredItems` files a connection loss for an
