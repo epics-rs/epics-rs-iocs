@@ -376,6 +376,8 @@ impl DataDriver {
                 alarm_status::NO_ALARM,
                 AlarmSeverity::NoAlarm as u16,
             )?;
+            // C calls every client on each push, changed value or not.
+            self.base.mark_param_changed(self.disp_reason, addr)?;
             self.base.call_param_callbacks(addr)?;
         }
         Ok(())
@@ -764,6 +766,27 @@ mod tests {
                 (AsynStatus::Error, alarm_status::NO_ALARM, 0)
             );
         }
+    }
+
+    #[test]
+    fn a_push_of_an_unchanged_value_still_reaches_the_records() {
+        let (mut driver, _keep_alive) = make_test_driver();
+        // A record only sees a push once iocInit has opened the gate.
+        driver.base.interrupts =
+            epics_rs::asyn::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        for _ in 0..2 {
+            driver.shared.lock().unwrap().pending_push = Some(PushUpdate {
+                values: [1.5; MAX_CHANNELS],
+                valid: true,
+            });
+            driver.apply_pending_push().unwrap();
+        }
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 2 * MAX_CHANNELS);
     }
 
     #[test]
