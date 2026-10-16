@@ -8,8 +8,9 @@
 //! input EOS on read. [`write_read`] therefore sends the bare command text
 //! and does not append anything.
 
-use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+
+use crate::connect::OctetLink;
 
 /// asyn reason used for every octet transaction against the underlying
 /// serial/IP port — that port has a single octet stream, so the reason
@@ -17,25 +18,73 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 /// `motor_common::connect`/`motor-mclennan`).
 const OCTET_REASON: usize = 0;
 
+/// A failed C `pasynOctetSyncIO` transaction with the byte counts the C
+/// drivers' error lines print.
+#[derive(Debug)]
+pub struct OctetFailure {
+    pub error: AsynError,
+    pub sent: usize,
+    pub received: usize,
+}
+
+impl OctetFailure {
+    /// The C `asynStatus` number the error lines print.
+    pub fn status(&self) -> i32 {
+        self.error.status() as i32
+    }
+}
+
+impl From<OctetFailure> for AsynError {
+    fn from(f: OctetFailure) -> Self {
+        f.error
+    }
+}
+
+/// Write `cmd`; a short write is `asynError`, as every C driver turns
+/// `nActual != nRequested` into one.
+fn write_all(link: &OctetLink, cmd: &str) -> Result<usize, OctetFailure> {
+    match link.sync.write_octet(OCTET_REASON, cmd.as_bytes()) {
+        Ok(n) if n == cmd.len() => Ok(n),
+        Ok(n) => Err(OctetFailure {
+            error: AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("wrote {n} of {} bytes", cmd.len()),
+            },
+            sent: n,
+            received: 0,
+        }),
+        Err(error) => Err(OctetFailure {
+            error,
+            sent: 0,
+            received: 0,
+        }),
+    }
+}
+
 /// Send `cmd` and return the reply with the port's configured input EOS
 /// already stripped (C `pasynOctetSyncIO->writeRead`, composed from the two
 /// primitives asyn-rs exposes).
-pub fn write_read(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-    let raw = handle.read_octet(OCTET_REASON, 4096)?;
-    Ok(String::from_utf8_lossy(&raw).into_owned())
+pub fn write_read(link: &OctetLink, cmd: &str) -> Result<String, OctetFailure> {
+    let sent = write_all(link, cmd)?;
+    match link.sync.read_octet(OCTET_REASON, 4096) {
+        Ok(raw) => Ok(String::from_utf8_lossy(&raw).into_owned()),
+        Err(error) => Err(OctetFailure {
+            received: error.partial_read().map_or(0, |p| p.nbytes_transferred()),
+            error,
+            sent,
+        }),
+    }
 }
 
 /// Send `cmd` without reading a reply (C `pasynOctetSyncIO->write`).
-pub fn write_only(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-    Ok(())
+pub fn write_only(link: &OctetLink, cmd: &str) -> Result<(), OctetFailure> {
+    write_all(link, cmd).map(drop)
 }
 
 /// Read a reply with no command sent first (used where a caller already
 /// wrote and only needs to drain an extra line, e.g. Colby's serial echo).
-pub fn read_only(handle: &SyncIOHandle) -> AsynResult<String> {
-    let raw = handle.read_octet(OCTET_REASON, 4096)?;
+pub fn read_only(link: &OctetLink) -> AsynResult<String> {
+    let raw = link.sync.read_octet(OCTET_REASON, 4096)?;
     Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 

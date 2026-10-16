@@ -43,10 +43,11 @@
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use crate::wire::{atof, atoi, write_only, write_read};
+use crate::connect::OctetLink;
+use crate::wire::{self, atof, atoi};
 
 /// C `commandTable[].readConv` — how a reply (or cached state) becomes the
 /// value returned to device support.
@@ -465,7 +466,7 @@ fn status_text(error: i32, check_errors: bool) -> &'static str {
 /// registers with `ASYN_CANBLOCK` only, no `ASYN_MULTIDEVICE`).
 pub struct Dg645Driver {
     base: PortDriverBase,
-    handle: SyncIOHandle,
+    handle: OctetLink,
     error: i32,
     check_errors: bool,
     status_code_reason: usize,
@@ -474,7 +475,7 @@ pub struct Dg645Driver {
 impl Dg645Driver {
     /// C `drvAsynDG645`: registers every tag, then runs the same
     /// three-step init sequence (`*IDN?`, `LERR?`, `*CLS`).
-    pub fn new(port_name: &str, handle: SyncIOHandle) -> AsynResult<Self> {
+    pub fn new(port_name: &str, handle: OctetLink) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
             1,
@@ -504,12 +505,48 @@ impl Dg645Driver {
             status_code_reason,
         };
 
-        write_read(&driver.handle, "*IDN?")?;
-        let lerr = write_read(&driver.handle, "LERR?")?;
+        driver.write_read("*IDN?")?;
+        let lerr = driver.write_read("LERR?")?;
         driver.error = atoi(&lerr);
-        write_only(&driver.handle, "*CLS")?;
+        driver.write_only("*CLS")?;
 
         Ok(driver)
+    }
+
+    /// C `writeRead`: the transaction and its `asynPrint` lines, which C
+    /// sends through `pasynUserTrace` on this driver's own port.
+    fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        let port = &self.base.port_name;
+        let result = wire::write_read(&self.handle, cmd);
+        if let Err(f) = &result {
+            self.base.trace_print(
+                TraceMask::ERROR,
+                &format!("{port} writeRead: error {} wrote \"{cmd}\"", f.status()),
+            );
+        }
+        let read = result.as_deref().unwrap_or("");
+        self.base.trace_print(
+            TraceMask::IO_FILTER,
+            &format!("{port} writeRead: wrote \"{cmd}\" read \"{read}\""),
+        );
+        Ok(result?)
+    }
+
+    /// C `writeOnly`; see [`Self::write_read`].
+    fn write_only(&self, cmd: &str) -> AsynResult<()> {
+        let port = &self.base.port_name;
+        let result = wire::write_only(&self.handle, cmd);
+        if let Err(f) = &result {
+            self.base.trace_print(
+                TraceMask::ERROR,
+                &format!("{port} writeOnly: error {} wrote \"{cmd}\"", f.status()),
+            );
+        }
+        self.base.trace_print(
+            TraceMask::IO_FILTER,
+            &format!("{port} writeOnly: wrote \"{cmd}\""),
+        );
+        Ok(result?)
     }
 
     fn spec(&self, reason: usize) -> AsynResult<&'static CommandSpec> {
@@ -523,7 +560,7 @@ impl Dg645Driver {
     /// actually changes, replicating C's explicit
     /// `if(old_error != pport->error) signalStatusUpdate(pport)` gate.
     fn check_error(&mut self) -> AsynResult<()> {
-        let reply = write_read(&self.handle, "LERR?")?;
+        let reply = self.write_read("LERR?")?;
         self.error = atoi(&reply);
         self.base
             .set_int32_param(self.status_code_reason, 0, self.error)?;
@@ -543,19 +580,19 @@ impl Dg645Driver {
 
     /// C `writeChannelRef`.
     fn write_channel_ref(&mut self, spec: &CommandSpec, new_chan: i32) -> AsynResult<()> {
-        let reply = write_read(&self.handle, spec.read_cmd)?;
+        let reply = self.write_read(spec.read_cmd)?;
         let (_old_chan, old_delay) = parse_chan_delay_pair(&reply);
         let wire = format_channel_ref_cmd(spec.write_cmd, new_chan, old_delay);
-        let status = write_only(&self.handle, &wire);
+        let status = self.write_only(&wire);
         self.after_write(status)
     }
 
     /// C `writeChannelDelay`.
     fn write_channel_delay(&mut self, spec: &CommandSpec, new_delay: f64) -> AsynResult<()> {
-        let reply = write_read(&self.handle, spec.read_cmd)?;
+        let reply = self.write_read(spec.read_cmd)?;
         let (chan, _old_delay) = parse_chan_delay_pair(&reply);
         let wire = format_channel_delay_cmd(spec.write_cmd, chan, new_delay);
-        let status = write_only(&self.handle, &wire);
+        let status = self.write_only(&wire);
         self.after_write(status)
     }
 
@@ -580,7 +617,7 @@ impl Dg645Driver {
             self.base.call_param_callbacks(0)?;
             Ok(())
         } else {
-            write_only(&self.handle, "*CLS")?;
+            self.write_only("*CLS")?;
             self.check_errors = true;
             self.check_error()
         }
@@ -606,11 +643,11 @@ impl PortDriver for Dg645Driver {
             // back `error`, regardless of check_errors.
             Conv::ErrorCode => Ok(self.error),
             Conv::StrInt => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(atoi(&reply))
             }
             Conv::ChanRef => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(parse_chan_delay_pair(&reply).0)
             }
             _ => Err(AsynError::InterfaceNotSupported(spec.tag.to_string())),
@@ -623,11 +660,11 @@ impl PortDriver for Dg645Driver {
             WriteKind::Sink => Ok(()),
             WriteKind::Int => {
                 let wire = format_int_cmd(spec.write_cmd, value);
-                let status = write_only(&self.handle, &wire);
+                let status = self.write_only(&wire);
                 self.after_write(status)
             }
             WriteKind::CommandOnly => {
-                let status = write_only(&self.handle, spec.write_cmd);
+                let status = self.write_only(spec.write_cmd);
                 self.after_write(status)
             }
             WriteKind::ChannelRef => self.write_channel_ref(spec, value),
@@ -641,11 +678,11 @@ impl PortDriver for Dg645Driver {
         match spec.conv {
             Conv::Sink => Ok(0.0),
             Conv::StrFloat => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(atof(&reply))
             }
             Conv::ChanDelay => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 Ok(parse_chan_delay_pair(&reply).1)
             }
             _ => Err(AsynError::InterfaceNotSupported(spec.tag.to_string())),
@@ -658,7 +695,7 @@ impl PortDriver for Dg645Driver {
             WriteKind::Sink => Ok(()),
             WriteKind::Float(fmt) => {
                 let wire = format_float_cmd(spec.write_cmd, fmt, value);
-                let status = write_only(&self.handle, &wire);
+                let status = self.write_only(&wire);
                 self.after_write(status)
             }
             WriteKind::ChannelDelay => self.write_channel_delay(spec, value),
@@ -671,13 +708,13 @@ impl PortDriver for Dg645Driver {
         let text = match spec.conv {
             Conv::Sink => String::new(),
             Conv::Ident => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 cvt_ident(&reply)
             }
             Conv::ErrorText => status_text(self.error, self.check_errors).to_string(),
-            Conv::CopyText => write_read(&self.handle, spec.read_cmd)?,
+            Conv::CopyText => self.write_read(spec.read_cmd)?,
             Conv::ChanDelay => {
-                let reply = write_read(&self.handle, spec.read_cmd)?;
+                let reply = self.write_read(spec.read_cmd)?;
                 chan_delay_text(&reply)
             }
             _ => return Err(AsynError::InterfaceNotSupported(spec.tag.to_string())),
@@ -699,7 +736,7 @@ impl PortDriver for Dg645Driver {
                 let n = data.iter().position(|&b| b == 0).unwrap_or(data.len());
                 let text = String::from_utf8_lossy(&data[..n]);
                 let wire = format_str_cmd(spec.write_cmd, &text);
-                let status = write_only(&self.handle, &wire);
+                let status = self.write_only(&wire);
                 self.after_write(status)?;
                 Ok(n)
             }

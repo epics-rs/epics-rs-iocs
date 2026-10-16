@@ -77,7 +77,9 @@
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
+
+use crate::connect::OctetLink;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::wire::{self, atof_f32, write_only, write_read};
@@ -152,8 +154,18 @@ fn split_net_reply(reply: &str) -> Vec<String> {
 }
 
 /// C `writeRead(pasynUser,outBuf,inpBuf,inputSize,iface)`.
-fn device_write_read(handle: &SyncIOHandle, iface: Iface, cmd: &str) -> AsynResult<String> {
-    let raw = write_read(handle, cmd)?;
+fn device_write_read(handle: &OctetLink, iface: Iface, cmd: &str) -> AsynResult<String> {
+    let raw = write_read(handle, cmd).inspect_err(|f| {
+        handle.print(
+            TraceMask::ERROR,
+            format_args!(
+                "writeRead: error sending {cmd},sent={},recv={},err={}",
+                f.sent,
+                f.received,
+                f.status()
+            ),
+        )
+    })?;
     Ok(if iface == Iface::Serial {
         strip_serial_echo(&raw, cmd)
     } else {
@@ -161,21 +173,30 @@ fn device_write_read(handle: &SyncIOHandle, iface: Iface, cmd: &str) -> AsynResu
     })
 }
 
-/// C `writeOnly(pasynUser,outBuf,iface)`. The serial-only drain read's
-/// result is discarded in the C source (not even assigned to a variable) —
-/// `let _ = ...` reproduces that verbatim.
-fn device_write_only(handle: &SyncIOHandle, iface: Iface, cmd: &str) -> AsynResult<()> {
-    write_only(handle, cmd)?;
+/// C `writeOnly(pasynUser,outBuf,iface)`. The serial-only drain read runs
+/// whatever the write returned, and C discards its result (not even
+/// assigned to a variable) — `let _ = ...` reproduces that verbatim.
+fn device_write_only(handle: &OctetLink, iface: Iface, cmd: &str) -> AsynResult<()> {
+    let result = write_only(handle, cmd).inspect_err(|f| {
+        handle.print(
+            TraceMask::ERROR,
+            format_args!(
+                "writeOnly: error sending {cmd},sent={},err={}",
+                f.sent,
+                f.status()
+            ),
+        )
+    });
     if iface == Iface::Serial {
         let _ = wire::read_only(handle);
     }
-    Ok(())
+    Ok(result?)
 }
 
 /// Colby Instruments PDL-100A port driver state (C `struct Port`).
 pub struct ColbyDriver {
     base: PortDriverBase,
-    handle: SyncIOHandle,
+    handle: OctetLink,
     iface: Iface,
     /// C `pport->units` — a free-form string from the iocsh `units` arg,
     /// normalized to literal `"ns"`/`"ps"` only by an addr-6 write. Scaling
@@ -191,7 +212,7 @@ impl ColbyDriver {
     /// C `drvAsynColby(myport,ioport,addr,units,iface)`: validates `iface`,
     /// then queries `*IDN?` once as an init-time connectivity check (the C
     /// driver aborts driver creation if this fails).
-    pub fn new(port_name: &str, handle: SyncIOHandle, units: &str, iface: i32) -> AsynResult<Self> {
+    pub fn new(port_name: &str, handle: OctetLink, units: &str, iface: i32) -> AsynResult<Self> {
         let iface = Iface::from_arg(iface).map_err(|message| AsynError::Status {
             status: AsynStatus::Error,
             message,

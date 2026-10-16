@@ -65,7 +65,9 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
+
+use crate::connect::OctetLink;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::wire::{atof, atoi, write_read};
@@ -278,16 +280,27 @@ fn ok_or_device_error(prefix: &str, reply: &str) -> AsynResult<()> {
 /// for both reads (`readParam`) and writes (`writeIntParam`/
 /// `writeFloatParam`/`writeCmdOnly`) alike. The 100 ms delay runs
 /// unconditionally, even when the I/O itself failed.
-fn device_write_read(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
+fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<String> {
     let result = write_read(handle, cmd);
+    if let Err(f) = &result {
+        handle.print(
+            TraceMask::ERROR,
+            format_args!("{port} writeRead: error {} wrote \"{cmd}\"", f.status()),
+        );
+    }
+    let read = result.as_deref().unwrap_or("");
+    handle.print(
+        TraceMask::IO_FILTER,
+        format_args!("{port} writeRead: wrote \"{cmd}\" read \"{read}\""),
+    );
     std::thread::sleep(WRITEREADDELAY);
-    result
+    Ok(result?)
 }
 
 /// Coherent SDG port driver state (C `struct Port`).
 pub struct CoherentSdgDriver {
     base: PortDriverBase,
-    handle: SyncIOHandle,
+    handle: OctetLink,
 }
 
 impl CoherentSdgDriver {
@@ -295,7 +308,7 @@ impl CoherentSdgDriver {
     /// as an init-time connectivity check (the C driver aborts driver
     /// creation if this fails, storing `"*COMM FAILED*"` — moot here since a
     /// failed `new()` never produces a driver instance to report through).
-    pub fn new(port_name: &str, handle: SyncIOHandle) -> AsynResult<Self> {
+    pub fn new(port_name: &str, handle: OctetLink) -> AsynResult<Self> {
         let base = PortDriverBase::new(
             port_name,
             13,
@@ -306,7 +319,7 @@ impl CoherentSdgDriver {
             },
         );
 
-        device_write_read(&handle, "status?")?;
+        device_write_read(port_name, &handle, "status?")?;
 
         Ok(Self { base, handle })
     }
@@ -337,7 +350,7 @@ impl PortDriver for CoherentSdgDriver {
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         match spec.read_conv {
             ReadConv::StrFloat => {
-                let reply = device_write_read(&self.handle, spec.read_cmd)?;
+                let reply = device_write_read(&self.base.port_name, &self.handle, spec.read_cmd)?;
                 Ok(atof(&reply))
             }
             _ => Err(AsynError::AddressOutOfRange(user.addr)),
@@ -349,7 +362,7 @@ impl PortDriver for CoherentSdgDriver {
         match spec.write {
             WriteKind::FloatFmt { prefix } => {
                 let cmd = format_float_write(prefix, value);
-                let reply = device_write_read(&self.handle, &cmd)?;
+                let reply = device_write_read(&self.base.port_name, &self.handle, &cmd)?;
                 ok_or_device_error(prefix, &reply)
             }
             _ => Err(AsynError::AddressOutOfRange(user.addr)),
@@ -360,11 +373,11 @@ impl PortDriver for CoherentSdgDriver {
         let spec = find_spec(user.addr).ok_or(AsynError::AddressOutOfRange(user.addr))?;
         let raw = match spec.read_conv {
             ReadConv::StrInt => {
-                let reply = device_write_read(&self.handle, spec.read_cmd)?;
+                let reply = device_write_read(&self.base.port_name, &self.handle, spec.read_cmd)?;
                 atoi(&reply) as u32
             }
             ReadConv::StrBin => {
-                let reply = device_write_read(&self.handle, spec.read_cmd)?;
+                let reply = device_write_read(&self.base.port_name, &self.handle, spec.read_cmd)?;
                 parse_str_bin(&reply)
             }
             ReadConv::Sink => 0,
@@ -383,11 +396,11 @@ impl PortDriver for CoherentSdgDriver {
         match spec.write {
             WriteKind::IntFmt { prefix, width } => {
                 let cmd = format_int_write(prefix, width, value);
-                let reply = device_write_read(&self.handle, &cmd)?;
+                let reply = device_write_read(&self.base.port_name, &self.handle, &cmd)?;
                 ok_or_device_error(prefix, &reply)
             }
             WriteKind::CmdOnly(cmd) => {
-                let reply = device_write_read(&self.handle, cmd)?;
+                let reply = device_write_read(&self.base.port_name, &self.handle, cmd)?;
                 ok_or_device_error(cmd, &reply)
             }
             WriteKind::Sink => Ok(()),
@@ -402,7 +415,7 @@ impl PortDriver for CoherentSdgDriver {
                 // The reply is still awaited (a connectivity check) even
                 // though its content is discarded -- see the module doc's
                 // cvtIdent quirk note.
-                let _ = device_write_read(&self.handle, spec.read_cmd)?;
+                let _ = device_write_read(&self.base.port_name, &self.handle, spec.read_cmd)?;
                 let text = "Coherent SDG";
                 let bytes = text.as_bytes();
                 let n = bytes.len().min(buf.len());
