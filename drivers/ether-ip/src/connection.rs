@@ -353,6 +353,164 @@ impl Connection {
         Ok(r.data(response.len()).to_vec())
     }
 
+    /// A routed request for a diagnostic, with C's `<who>: send failed` /
+    /// `No response` / `Transaction id mismatch` lines; None after printing.
+    fn diagnostic_request(&mut self, who: &str, msg: &[u8]) -> Option<Vec<u8>> {
+        match self.send_routed(msg) {
+            Ok(r) => Some(r),
+            Err(EipError::Send(_) | EipError::TooLarge { .. }) => {
+                crate::eip_printf!(1, "{who}: send failed\n");
+                None
+            }
+            Err(EipError::TransactionMismatch { got, want }) => {
+                crate::eip_printf!(
+                    1,
+                    "{who}: Transaction id mismatch, got {got} expected {want}\n"
+                );
+                None
+            }
+            Err(_) => {
+                crate::eip_printf!(1, "{who}: No response\n");
+                None
+            }
+        }
+    }
+
+    /// `EIP_describe_type`: print a structure type's template.
+    pub fn describe_type(&mut self, type_id: u16) -> bool {
+        const WHO: &str = "EIP_describe_type";
+        crate::eip_printf!(9, "EIP describe type 0x{type_id:04X}\n");
+        let instance = u32::from(type_id);
+        let words = cip::cia_path_words(instance, 0);
+
+        let mut msg = Vec::new();
+        msg.push(cip::service::GET_ATTRIBUTE_LIST);
+        msg.push(words as u8);
+        cip::encode_cia_path(&mut msg, CipClass::Template, instance, 0);
+        for v in [4u16, 4, 5, 2, 1] {
+            msg.extend_from_slice(&v.to_le_bytes());
+        }
+        let Some(response) = self.diagnostic_request(WHO, &msg) else {
+            return false;
+        };
+        let Some(r) = cip::MrResponse::parse(&response) else {
+            crate::eip_printf!(1, "{WHO}: No response\n");
+            return false;
+        };
+        if r.service & 0x7F != cip::service::GET_ATTRIBUTE_LIST {
+            crate::eip_printf!(
+                1,
+                "{WHO}: Got response 0x{:X}, not S_Get_Attribute_List\n",
+                r.service
+            );
+            return false;
+        }
+        if r.general_status != 0 {
+            crate::eip_printf!(
+                1,
+                "Error in S_Get_Instance_Attr_List response ({})\n",
+                cip::cip_error_text(r.general_status)
+            );
+            return false;
+        }
+        let data = r.data(response.len());
+        let attr_count = cip::rd_u16(data, 0).unwrap_or(0);
+        if attr_count != 4 {
+            crate::eip_printf!(
+                1,
+                "Expected 4 attributes from S_Get_Instance_Attr_List response, got {attr_count}\n"
+            );
+            return false;
+        }
+        let (mut handle, mut members, mut def_words, mut struct_size) = (0u16, 0u16, 0u32, 0u32);
+        let mut at = 2;
+        for _ in 0..attr_count {
+            let attr = cip::rd_u16(data, at).unwrap_or(0);
+            let status = cip::rd_u16(data, at + 2).unwrap_or(0);
+            at += 4;
+            if status != 0 {
+                crate::eip_printf!(
+                    1,
+                    "Status for S_Get_Instance_Attr_List attr. {attr} is 0x{status:04X}\n"
+                );
+                return false;
+            }
+            match attr {
+                1 => handle = cip::rd_u16(data, at).unwrap_or(0),
+                2 => members = cip::rd_u16(data, at).unwrap_or(0),
+                4 => def_words = cip::rd_u32(data, at).unwrap_or(0),
+                5 => struct_size = cip::rd_u32(data, at).unwrap_or(0),
+                _ => {
+                    crate::eip_printf!(1, "Unknown S_Get_Instance_Attr_List attr. {attr}\n");
+                    return false;
+                }
+            }
+            at += if attr <= 2 { 2 } else { 4 };
+        }
+        crate::eip_printf!(1, "Type ID            : 0x{handle:04X}\n");
+        crate::eip_printf!(1, "Struct member count: {members}\n");
+        crate::eip_printf!(1, "Template word size : {def_words}\n");
+        crate::eip_printf!(1, "Data byte count    : {struct_size}\n");
+
+        // Template bytes less the 23-byte header (Logix Data Access p.54).
+        let template_bytes = def_words.wrapping_mul(4).wrapping_sub(23);
+        let mut msg = Vec::new();
+        msg.push(cip::service::TEMPLATE_READ_DATA);
+        msg.push(words as u8);
+        cip::encode_cia_path(&mut msg, CipClass::Template, instance, 0);
+        msg.extend_from_slice(&0u32.to_le_bytes());
+        msg.extend_from_slice(&(template_bytes as u16).to_le_bytes());
+        let Some(response) = self.diagnostic_request(WHO, &msg) else {
+            return false;
+        };
+        let Some(r) = cip::MrResponse::parse(&response) else {
+            crate::eip_printf!(1, "{WHO}: No response\n");
+            return false;
+        };
+        if r.service & 0x7F != cip::service::TEMPLATE_READ_DATA {
+            crate::eip_printf!(
+                1,
+                "{WHO}: Got response 0x{:X}, not S_Template_ReadData\n",
+                r.service
+            );
+            return false;
+        }
+        if r.general_status != 0 {
+            crate::eip_printf!(1, "Error in S_Template_ReadData response\n");
+            return false;
+        }
+        let data = r.data(response.len());
+        let members: Vec<(u16, u16, u32)> = (0..usize::from(members))
+            .map(|i| {
+                let at = 8 * i;
+                (
+                    cip::rd_u16(data, at).unwrap_or(0),
+                    cip::rd_u16(data, at + 2).unwrap_or(0),
+                    cip::rd_u32(data, at + 4).unwrap_or(0),
+                )
+            })
+            .collect();
+        let mut strings = data
+            .get(8 * members.len()..)
+            .unwrap_or(&[])
+            .split(|&c| c == 0)
+            .map(String::from_utf8_lossy);
+        let name = strings.next().unwrap_or_default();
+        // The struct name ends at ';', the rest is undefined.
+        let name = name.split(';').next().unwrap_or_default();
+        crate::eip_printf!(1, "Structure name: '{name}'\n");
+        for (i, (info, t, offset)) in members.iter().enumerate() {
+            let member = strings.next().unwrap_or_default();
+            crate::eip_printf!(
+                1,
+                "{:2}) offset 0x{offset:08X} '{member}', {}\n",
+                i + 1,
+                cip::decode_type_and_info(*t, *info)
+            );
+        }
+        true
+    }
+
     fn read_identity(&mut self) -> Result<IdentityInfo> {
         let u16_attr = |c: &mut Self, a: u8| -> Result<u16> {
             let d = c.get_attribute_single(CipClass::Identity, 1, a)?;

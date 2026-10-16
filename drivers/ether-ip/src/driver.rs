@@ -158,6 +158,9 @@ pub struct Plc {
     pub stats: Mutex<PlcStats>,
     pub connected: AtomicBool,
     pub identity: Mutex<Option<crate::connection::IdentityInfo>>,
+    /// C's `plc->connection` under `plc->lock`: the scan thread holds it for
+    /// a pass, iocsh diagnostics borrow it between passes.
+    conn: Mutex<Option<Connection>>,
     stop: AtomicBool,
     started: AtomicBool,
 }
@@ -172,6 +175,7 @@ impl Plc {
             stats: Mutex::new(PlcStats::default()),
             connected: AtomicBool::new(false),
             identity: Mutex::new(None),
+            conn: Mutex::new(None),
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
         }
@@ -315,6 +319,23 @@ pub fn start_scan_tasks() -> usize {
     started
 }
 
+/// `drvEtherIP_describe`: describe `type_id` on every PLC, over the
+/// connection the scan thread holds between passes.
+pub fn describe(type_id: u16) {
+    for plc in all_plcs() {
+        match plc.conn.lock().as_mut() {
+            Some(c) => {
+                c.describe_type(type_id);
+            }
+            // C sends on the closed socket and fails there.
+            None => {
+                crate::eip_printf!(9, "EIP describe type 0x{type_id:04X}\n");
+                crate::eip_printf!(1, "EIP_describe_type: send failed\n");
+            }
+        }
+    }
+}
+
 /// Stop every scan thread (used by the IOC shutdown path and by tests).
 pub fn stop_scan_tasks() {
     for plc in all_plcs() {
@@ -327,143 +348,146 @@ pub fn stop_scan_tasks() {
 // ---------------------------------------------------------------------------
 
 fn scan_loop(plc: Arc<Plc>) {
-    let mut conn: Option<Connection> = None;
-
     while !plc.stop.load(Ordering::Relaxed) {
-        // -- connect ---------------------------------------------------------
-        if conn.is_none() {
-            let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
-            crate::eip_printf_time!(4, "EIP connecting {}\n", plc.name);
-            match Connection::startup(&plc.ip_addr, ETHERIP_PORT, plc.slot, timeout(), limit) {
-                Ok(mut c) => {
-                    *plc.identity.lock() = Some(c.identity.clone());
-                    if !complete_tag_infos(&plc, &mut c) {
-                        errlog_vprintf(format_args!(
-                            "EIP error during scan list completion for {}:{ETHERIP_PORT}\n",
-                            plc.ip_addr
-                        ));
-                        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
-                        c.shutdown();
-                        crate::eip_printf_time!(
-                            2,
-                            "drvEtherIP: PLC '{}' is disconnected\n",
-                            plc.name
-                        );
-                        plc.stats.lock().plc_errors += 1;
-                        std::thread::sleep(timeout());
-                        continue;
-                    }
-                    plc.connected.store(true, Ordering::Relaxed);
-                    conn = Some(c);
-                }
-                Err(_) => {
-                    errlog_vprintf(format_args!(
-                        "EIP connection failed for {}:{ETHERIP_PORT}\n",
-                        plc.ip_addr
-                    ));
-                    crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
-                    plc.connected.store(false, Ordering::Relaxed);
-                    plc.invalidate_tags();
-                    std::thread::sleep(timeout());
-                    continue;
-                }
-            }
-        }
-        let c = conn.as_mut().expect("connected above");
-        crate::eip_printf_time!(10, "drvEtherIP scan PLC '{}'\n", plc.name);
-
-        // -- scan every list that is due --------------------------------------
-        let lists: Vec<_> = plc.scanlists.lock().clone();
-        let start = Instant::now();
-        let mut next_due: Option<Instant> = None;
-        let mut failed = false;
-
-        for list in &lists {
-            if !list.enabled.load(Ordering::Relaxed) {
-                continue;
-            }
-            let due = *list.scheduled.lock();
-            if due <= start {
-                let t0 = Instant::now();
-                let ok = process_scan_list(c, list);
-                let elapsed = t0.elapsed().as_secs_f64();
-
-                {
-                    let mut s = list.stats.lock();
-                    s.scan_time = epics_now();
-                    s.last_scan_time = elapsed;
-                    if elapsed > s.max_scan_time {
-                        s.max_scan_time = elapsed;
-                    }
-                    if elapsed < s.min_scan_time || s.min_scan_time == 0.0 {
-                        s.min_scan_time = elapsed;
-                    }
-                    if !ok {
-                        s.list_errors += 1;
-                    }
-                }
-
-                if ok {
-                    // Re-schedule exactly, from the start of this scan.
-                    *list.scheduled.lock() = t0 + Duration::from_secs_f64(list.period);
-                } else {
-                    *list.scheduled.lock() = Instant::now() + timeout();
-                    plc.stats.lock().plc_errors += 1;
-                    failed = true;
-                    break;
-                }
-            }
-            let due = *list.scheduled.lock();
-            next_due = Some(match next_due {
-                Some(n) if n <= due => n,
-                _ => due,
-            });
-        }
-
-        if failed {
-            // Drop the session and reconnect on the next turn.
-            crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
-            if let Some(mut c) = conn.take() {
-                c.shutdown();
-            }
-            plc.connected.store(false, Ordering::Relaxed);
-            plc.invalidate_tags();
-            continue;
-        }
-
-        // -- sleep until the next list is due ---------------------------------
-        //
-        // UPSTREAM FIX: the C (`drvEtherIP.c:909-930`) computes this delay from
-        // a wall-clock `epicsTimeStamp`, so a backwards clock step yields a
-        // huge delay; the recovery branch then dereferences `list`, which the
-        // preceding `for` loop has already walked to NULL -- a guaranteed crash
-        // exactly when the clock misbehaves. A monotonic `Instant` cannot step
-        // backwards, so the whole failure mode is gone by construction, along
-        // with the `sched_errors` counter that only ever counted it (it is not
-        // reachable from the device support, so no PV disappears).
-        let now = Instant::now();
-        match next_due {
-            None => std::thread::sleep(MIN_TIMEOUT),
-            Some(due) if due > now => std::thread::sleep(due - now),
-            Some(due) => {
-                let delay = -(now - due).as_secs_f64();
-                if delay <= -SLEEP_QUANTUM {
-                    crate::eip_printf!(
-                        8,
-                        "drvEtherIP scan task slow, {} sec delay\n",
-                        format_g(delay, 6)
-                    );
-                    plc.stats.lock().slow_scans += 1;
-                }
-            }
+        // The pass holds the connection the way C's PLC_scan_task holds
+        // plc->lock; the sleep comes after it is released.
+        let pause = scan_pass(&plc, &mut plc.conn.lock());
+        if let Some(pause) = pause {
+            std::thread::sleep(pause);
         }
     }
 
-    if let Some(mut c) = conn {
+    if let Some(mut c) = plc.conn.lock().take() {
         c.shutdown();
     }
     plc.connected.store(false, Ordering::Relaxed);
     plc.started.store(false, Ordering::SeqCst);
+}
+
+/// One turn of C's `scan_loop:` label. Returns how long to sleep.
+fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> {
+    // -- connect ---------------------------------------------------------
+    if conn.is_none() {
+        let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
+        crate::eip_printf_time!(4, "EIP connecting {}\n", plc.name);
+        match Connection::startup(&plc.ip_addr, ETHERIP_PORT, plc.slot, timeout(), limit) {
+            Ok(mut c) => {
+                *plc.identity.lock() = Some(c.identity.clone());
+                if !complete_tag_infos(plc, &mut c) {
+                    errlog_vprintf(format_args!(
+                        "EIP error during scan list completion for {}:{ETHERIP_PORT}\n",
+                        plc.ip_addr
+                    ));
+                    crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+                    c.shutdown();
+                    crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
+                    plc.stats.lock().plc_errors += 1;
+                    return Some(timeout());
+                }
+                plc.connected.store(true, Ordering::Relaxed);
+                *conn = Some(c);
+            }
+            Err(_) => {
+                errlog_vprintf(format_args!(
+                    "EIP connection failed for {}:{ETHERIP_PORT}\n",
+                    plc.ip_addr
+                ));
+                crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
+                plc.connected.store(false, Ordering::Relaxed);
+                plc.invalidate_tags();
+                return Some(timeout());
+            }
+        }
+    }
+    let c = conn.as_mut().expect("connected above");
+    crate::eip_printf_time!(10, "drvEtherIP scan PLC '{}'\n", plc.name);
+
+    // -- scan every list that is due --------------------------------------
+    let lists: Vec<_> = plc.scanlists.lock().clone();
+    let start = Instant::now();
+    let mut next_due: Option<Instant> = None;
+    let mut failed = false;
+
+    for list in &lists {
+        if !list.enabled.load(Ordering::Relaxed) {
+            continue;
+        }
+        let due = *list.scheduled.lock();
+        if due <= start {
+            let t0 = Instant::now();
+            let ok = process_scan_list(c, list);
+            let elapsed = t0.elapsed().as_secs_f64();
+
+            {
+                let mut s = list.stats.lock();
+                s.scan_time = epics_now();
+                s.last_scan_time = elapsed;
+                if elapsed > s.max_scan_time {
+                    s.max_scan_time = elapsed;
+                }
+                if elapsed < s.min_scan_time || s.min_scan_time == 0.0 {
+                    s.min_scan_time = elapsed;
+                }
+                if !ok {
+                    s.list_errors += 1;
+                }
+            }
+
+            if ok {
+                // Re-schedule exactly, from the start of this scan.
+                *list.scheduled.lock() = t0 + Duration::from_secs_f64(list.period);
+            } else {
+                *list.scheduled.lock() = Instant::now() + timeout();
+                plc.stats.lock().plc_errors += 1;
+                failed = true;
+                break;
+            }
+        }
+        let due = *list.scheduled.lock();
+        next_due = Some(match next_due {
+            Some(n) if n <= due => n,
+            _ => due,
+        });
+    }
+
+    if failed {
+        // Drop the session and reconnect on the next turn.
+        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+        if let Some(mut c) = conn.take() {
+            c.shutdown();
+        }
+        plc.connected.store(false, Ordering::Relaxed);
+        plc.invalidate_tags();
+        return None;
+    }
+
+    // -- sleep until the next list is due ---------------------------------
+    //
+    // UPSTREAM FIX: the C (`drvEtherIP.c:909-930`) computes this delay from
+    // a wall-clock `epicsTimeStamp`, so a backwards clock step yields a
+    // huge delay; the recovery branch then dereferences `list`, which the
+    // preceding `for` loop has already walked to NULL -- a guaranteed crash
+    // exactly when the clock misbehaves. A monotonic `Instant` cannot step
+    // backwards, so the whole failure mode is gone by construction, along
+    // with the `sched_errors` counter that only ever counted it (it is not
+    // reachable from the device support, so no PV disappears).
+    let now = Instant::now();
+    match next_due {
+        None => Some(MIN_TIMEOUT),
+        Some(due) if due > now => Some(due - now),
+        Some(due) => {
+            let delay = -(now - due).as_secs_f64();
+            if delay <= -SLEEP_QUANTUM {
+                crate::eip_printf!(
+                    8,
+                    "drvEtherIP scan task slow, {} sec delay\n",
+                    format_g(delay, 6)
+                );
+                plc.stats.lock().slow_scans += 1;
+            }
+            None
+        }
+    }
 }
 
 fn epics_now() -> f64 {

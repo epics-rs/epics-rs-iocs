@@ -108,12 +108,12 @@ pub const STRUCT_STRING_STRIDE: usize = STRUCT_STRING_LEN_BYTES + STRUCT_STRING_
 // Little-endian primitives
 // ---------------------------------------------------------------------------
 
-fn rd_u16(b: &[u8], at: usize) -> Option<u16> {
+pub(crate) fn rd_u16(b: &[u8], at: usize) -> Option<u16> {
     let s = b.get(at..at + 2)?;
     Some(u16::from_le_bytes([s[0], s[1]]))
 }
 
-fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
     let s = b.get(at..at + 4)?;
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
@@ -330,8 +330,48 @@ pub mod service {
     pub const CIP_WRITE_DATA: u8 = 0x4D;
     pub const CM_UNCONNECTED_SEND: u8 = 0x52;
     pub const GET_INSTANCE_ATTR_LIST: u8 = 0x55;
+    pub const TEMPLATE_READ_DATA: u8 = 0x4C;
     /// Responses echo the request service with the high bit set.
     pub const REPLY_FLAG: u8 = 0x80;
+}
+
+/// `decode_extended_type`: a Logix symbol/member type word as text
+/// (bit 15 struct, bits 14-13 dimensions, bits 11-0 the CIP type).
+pub fn decode_extended_type(t: u16) -> String {
+    let atomic = match t & 0x0FFF {
+        0x00C1 => Some("BOOL"),
+        0x00C2 => Some("SINT"),
+        0x00C3 => Some("INT"),
+        0x00C7 => Some("UINT"),
+        0x00C4 => Some("DINT"),
+        0x00C5 => Some("LINT"),
+        0x00C9 => Some("ULINT"),
+        0x00CA => Some("REAL"),
+        0x00CB => Some("LREAL"),
+        _ => None,
+    };
+    match (t & 0xE000, atomic) {
+        (0x0000, Some(name)) => name.to_string(),
+        (0x2000, Some(name)) => format!("{name}[]"),
+        (0xA000, _) if t & 0x0FFF == STRUCT_STRING_HANDLE => "STRING[]".to_string(),
+        _ => format!("0x{t:04X}"),
+    }
+}
+
+/// `decode_type_and_info`: a template member's type plus its info word
+/// (`DINT`, `SINT[82]`, `BOOL bit 3`).
+pub fn decode_type_and_info(t: u16, info: u16) -> String {
+    let mut text = decode_extended_type(t);
+    if info > 0 {
+        if t == CipType::Bool.code() {
+            text.push_str(&format!(" bit {info}"));
+        } else if let Some(close) = text.find(']') {
+            text.replace_range(close.., &format!("{info}]"));
+        } else {
+            text.push_str(&format!(", info 0x{info:04X}"));
+        }
+    }
+    text
 }
 
 /// Byte size of an MR_Request header for a path of `path_words` words.
@@ -918,4 +958,20 @@ pub fn put_string(raw: &mut [u8], value: &str) -> bool {
     }
     raw[text_at + len] = 0;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The examples in C's `decode_type_and_info` comment, plus the bit and
+    /// unknown-type branches.
+    #[test]
+    fn template_member_types_decode_as_c_prints_them() {
+        assert_eq!(decode_type_and_info(0x00C4, 0), "DINT");
+        assert_eq!(decode_type_and_info(0x20C2, 0x52), "SINT[82]");
+        assert_eq!(decode_type_and_info(0x00C1, 3), "BOOL bit 3");
+        assert_eq!(decode_type_and_info(0xAFCE, 0), "STRING[]");
+        assert_eq!(decode_type_and_info(0x8123, 2), "0x8123, info 0x0002");
+    }
 }

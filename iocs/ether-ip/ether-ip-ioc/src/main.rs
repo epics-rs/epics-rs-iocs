@@ -153,6 +153,21 @@ async fn main() -> CaResult<()> {
     ));
 
     // drvEtherIP_report(<level>)
+    let describe = CommandDef::new(
+        "drvEtherIP_describe",
+        vec![ArgDesc {
+            name: "type ID",
+            arg_type: ArgType::Int,
+        }],
+        "drvEtherIP_describe type_ID",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            driver::describe(int_arg(args, 0).unwrap_or(0) as u16);
+            Ok(CommandOutcome::Continue)
+        },
+    );
+    app = app.register_startup_command(describe.clone());
+    app = app.register_shell_command(describe);
+
     let report = CommandDef::new(
         "drvEtherIP_report",
         vec![ArgDesc {
