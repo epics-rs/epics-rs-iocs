@@ -30,6 +30,7 @@
 //!   count, so a short read publishes uninitialised heap as currents.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
@@ -403,7 +404,24 @@ impl T4uDriver {
     /// meter will be re-synchronised by the next register dump.
     fn send(&self, command: String) {
         let line = format!("{command}{}", self.variant.eol());
-        let _ = self.cmd.send(&line);
+        let result = self.cmd.send(&line);
+        // drvT4U_EM.cpp:554-561; the direct driver has these commented out.
+        if self.variant == T4uVariant::Middle {
+            println!("Entered writeReadMeter()");
+            println!(
+                "Write status {}",
+                result.as_ref().map_or_else(status_code, |_| 0)
+            );
+        }
+    }
+
+    /// The `"%s: function %i name %s"` debug line drvT4U_EM's write methods
+    /// print (drvT4U_EM.cpp:291, :471).
+    fn print_function_name(&self, method: &str, reason: usize) {
+        if self.variant == T4uVariant::Middle {
+            let name = self.base.port_base.params.param_name(reason).unwrap_or("");
+            println!("{method}: function {reason} name {name}");
+        }
     }
 
     /// C++ `P_Range` in `writeInt32`: clip, write register 3 and, in the direct
@@ -537,9 +555,13 @@ impl PortDriver for T4uDriver {
         let p = self.params();
         let t = self.t4u;
 
+        if self.variant == T4uVariant::Middle {
+            println!("writeInt32: function {reason}");
+        }
         self.base
             .port_base
             .set_int32_param(reason, channel, value)?;
+        self.print_function_name("writeInt32", reason);
 
         if reason == t.bias_n_en {
             self.send(proto::cmd_bias_enable(value != 0, false));
@@ -580,7 +602,10 @@ impl PortDriver for T4uDriver {
             ));
         } else if reason == t.update_reg {
             match self.variant {
-                T4uVariant::Middle => self.send(proto::cmd_read_regs(100, 107)),
+                T4uVariant::Middle => {
+                    println!("Running updater.");
+                    self.send(proto::cmd_read_regs(100, 107));
+                }
                 T4uVariant::Direct => {
                     self.send(proto::cmd_read_regs(0, 49));
                     self.send(proto::cmd_read_regs(50, 99));
@@ -632,6 +657,7 @@ impl PortDriver for T4uDriver {
         self.base
             .port_base
             .set_float64_param(reason, channel, value)?;
+        self.print_function_name("writeFloat64", reason);
 
         if let Some(index) = t.pid_index(reason) {
             let reg = &proto::PID_REGS[index];
@@ -645,6 +671,11 @@ impl PortDriver for T4uDriver {
             self.write_averaging_time(value)?;
         }
 
+        if self.variant == T4uVariant::Middle {
+            // C prints this one without a newline (drvT4U_EM.cpp:499).
+            print!("About to exit from writeFloat64");
+            let _ = std::io::stdout().flush();
+        }
         if reason < t.first {
             return self.qe_write_float64(reason, channel, value);
         }
@@ -669,10 +700,11 @@ struct RegSink {
 }
 
 impl RegSink {
-    fn apply(&self, reg_num: i32, reg_val: u32) {
+    /// False for a register C++ `processRegVal` does not handle (its `-1`).
+    fn apply(&self, reg_num: i32, reg_val: u32) -> bool {
         use proto::RegUpdate::*;
         let Some(update) = proto::decode_reg(reg_num, reg_val) else {
-            return;
+            return false;
         };
 
         let set_int =
@@ -739,6 +771,7 @@ impl RegSink {
         if !values.is_empty() {
             let _ = self.handle.set_params_and_notify_blocking(0, values);
         }
+        true
     }
 }
 
@@ -900,8 +933,16 @@ fn cmd_iteration(ctx: &CmdContext, reader: &mut StreamReader, tick: &mut i32) ->
                 reader.flush();
                 return Ok(());
             };
+            // tr_on_command_socket is the middle-layer driver, whose loop
+            // prints these (drvT4U_EM.cpp:754-762).
             for (reg_num, reg_val) in proto::parse_reg_records(&payload) {
-                ctx.regs.apply(reg_num, reg_val);
+                println!("Processing reg {reg_num:3}");
+                if ctx.regs.apply(reg_num, reg_val) {
+                    println!(
+                        "Processed reg {reg_num:3} Value: {:10} 0x{reg_val:08x}",
+                        reg_val as i32
+                    );
+                }
             }
         }
         CmdName::Tr | CmdName::Ascii => {
