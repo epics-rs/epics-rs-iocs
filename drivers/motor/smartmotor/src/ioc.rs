@@ -12,8 +12,8 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
-use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
-use motor_common::model1::{Model1, SCAN_RATE};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
 use crate::smartmotor::{SmartMotorAxis, SmartMotorController};
@@ -42,7 +42,7 @@ pub fn smartmotor_config_command() -> CommandDef {
         ],
         "SmartMotorConfig(card, name)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
+            let card = c_int(args, 0);
             if !SMART_MOTOR.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }

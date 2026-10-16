@@ -12,8 +12,8 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::{EosRefusal, connect_with_eos};
-use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
-use motor_common::model1::{Model1, SCAN_RATE};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 
 use crate::pijeds::{PiJedsAxis, PiJedsController};
@@ -43,7 +43,7 @@ pub fn pijeds_config_command() -> CommandDef {
         ],
         "PIJEDSConfig(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
+            let card = c_int(args, 0);
             if !PIJEDS.has_card(card) {
                 return Ok(CommandOutcome::Continue);
             }
