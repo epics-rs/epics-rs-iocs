@@ -105,6 +105,14 @@ fn poller_loop(
             None
         };
 
+        // What a generator that ends this cycle puts back.
+        let wave_gen_restore = if state.lock().is_ok_and(|st| st.wave_gen.running) {
+            wave_gen::restore_outputs(&params, |r, a| handle.read_int32_blocking(r, a))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         // ---- Phase 2: uldaq reads (device lock held) ----
         // C `status`: the last uldaq call's result. A failed DIn, CIn or
         // AOutScanStatus ends the cycle's reads (C `goto error`).
@@ -143,7 +151,12 @@ fn poller_loop(
                     };
                     let wg_was_running = st.wave_gen.running;
                     if st.wave_gen.running {
-                        if let Err(code) = wave_gen::read_wave_gen(&dev, &mut st.wave_gen, &trace) {
+                        if let Err(code) = wave_gen::read_wave_gen(
+                            &dev,
+                            &mut st.wave_gen,
+                            &wave_gen_restore,
+                            &trace,
+                        ) {
                             status = code;
                             if prev_status == 0 {
                                 trace.report_error(status, FUNCTION, "Calling AOutScanStatus");

@@ -2,6 +2,7 @@ use meascomp::analog_out::AOutScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::trace::TraceMask;
 
 use crate::params::*;
@@ -297,6 +298,7 @@ pub fn start_wave_gen(
 pub fn read_wave_gen(
     device: &DaqDevice,
     state: &mut WaveGenState,
+    restore: &[(i32, i32)],
     trace: &SelfTrace,
 ) -> Result<(), UlError> {
     let (status, xfer) = device.analog_out_scan_status().map_err(|e| e.code)?;
@@ -313,7 +315,7 @@ pub fn read_wave_gen(
     }
 
     if status == SS_IDLE {
-        stop_wave_gen(device, state, trace);
+        stop_wave_gen(device, state, restore, trace);
     }
     Ok(())
 }
@@ -321,22 +323,42 @@ pub fn read_wave_gen(
 /// Stop the waveform generator and restore saved output values. C
 /// `stopWaveGen`; returns the `ulAOutScanStop` status, which C does not
 /// print.
-pub fn stop_wave_gen(device: &DaqDevice, state: &mut WaveGenState, trace: &SelfTrace) -> UlError {
+pub fn stop_wave_gen(
+    device: &DaqDevice,
+    state: &mut WaveGenState,
+    restore: &[(i32, i32)],
+    trace: &SelfTrace,
+) -> UlError {
     state.running = false;
     let err = device.analog_out_scan_stop().err().map_or(0, |e| e.code);
-    for ch in 0..MAX_ANALOG_OUT {
+    for &(ch, range) in restore {
         trace.report(
             &device.analog_out(
-                ch as i32,
-                BIP10VOLTS,
+                ch,
+                range,
                 AOUT_FF_NOSCALEDATA,
-                state.saved_outputs[ch],
+                state.saved_outputs[ch as usize],
             ),
             "stopWaveGen",
             "calling AOut",
         );
     }
     err
+}
+
+/// The outputs C `stopWaveGen` puts back: each enabled channel, with its
+/// ANALOG_OUT_RANGE.
+pub fn restore_outputs(
+    params: &MultiFunctionParams,
+    int: impl Fn(usize, i32) -> AsynResult<i32>,
+) -> AsynResult<Vec<(i32, i32)>> {
+    let mut restore = Vec::new();
+    for ch in 0..MAX_ANALOG_OUT as i32 {
+        if int(params.wave_gen_enable, ch)? != 0 {
+            restore.push((ch, int(params.analog_out_range, ch)?));
+        }
+    }
+    Ok(restore)
 }
 
 #[cfg(test)]

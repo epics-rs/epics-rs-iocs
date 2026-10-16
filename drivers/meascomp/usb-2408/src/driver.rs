@@ -391,6 +391,10 @@ impl MultiFunctionDriver {
         ]
     }
 
+    fn wave_gen_restore(&self) -> AsynResult<Vec<(i32, i32)>> {
+        wave_gen::restore_outputs(&self.params, |r, a| self.base.get_int32_param(r, a))
+    }
+
     /// A WaveGen setting write: `defineWaveform(addr)`, then
     /// `stopWaveGen(); startWaveGen();` of a running generator, statuses or-ed.
     fn wave_gen_setting_changed(
@@ -409,7 +413,8 @@ impl MultiFunctionDriver {
         if !st.wave_gen.running {
             return Ok(0);
         }
-        let stopped = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, trace);
+        let restore = self.wave_gen_restore()?;
+        let stopped = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, trace);
         Ok(stopped | self.start_wave_gen(&dev, &mut st.wave_gen, trace, updates)?)
     }
 
@@ -630,7 +635,8 @@ impl PortDriver for MultiFunctionDriver {
             if value != 0 && !st.wave_gen.running {
                 status = self.start_wave_gen(&dev, &mut st.wave_gen, &trace, &mut wave_arrays)?;
             } else if value == 0 && st.wave_gen.running {
-                status = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &trace);
+                let restore = self.wave_gen_restore()?;
+                status = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, &trace);
             }
         } else if self.wave_gen_settings().contains(&reason) {
             status = self.wave_gen_setting_changed(addr, &trace, &mut wave_arrays)?;
