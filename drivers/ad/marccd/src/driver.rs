@@ -348,6 +348,7 @@ pub fn create_marccd_detector(
     let ad_params = driver.ad.params;
     let marccd_params = driver.p;
     let pool = driver.ad.pool.clone();
+    let owner = driver.ad.owner.clone();
 
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the marCCD port runtime: {e}"))?;
@@ -366,6 +367,7 @@ pub fn create_marccd_detector(
         acq_start: acq_start.clone(),
         output: ArrayPublisher::new(array_output.clone()),
         pool: pool.clone(),
+        owner: owner.clone(),
     };
 
     let started = handle
@@ -388,7 +390,7 @@ pub fn create_marccd_detector(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
@@ -400,7 +402,10 @@ mod tests {
 
     /// A marServer that answers each command with `reply(command)` and logs
     /// what it was sent.
-    fn fake_server(name: &str, reply: fn(&str) -> &'static str) -> Arc<Mutex<Vec<String>>> {
+    pub(crate) fn fake_server(
+        name: &str,
+        reply: fn(&str) -> &'static str,
+    ) -> Arc<Mutex<Vec<String>>> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let log = Arc::new(Mutex::new(Vec::new()));

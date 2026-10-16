@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::driver::{ADDriver, ADStatus};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -48,6 +49,8 @@ pub(crate) struct Worker {
     pub acq_start: Arc<AtomicU64>,
     pub output: ArrayPublisher,
     pub pool: DriverPool,
+    /// The driver's attribute set, for C `getAttributes`.
+    pub owner: Arc<ArrayOwner>,
 }
 
 /// Current time as an f64 epoch second count (C `secPastEpoch + nsec/1e9`).
@@ -327,6 +330,7 @@ impl Worker {
             // C uses `acqStartTime` for the double timestamp, and
             // `updateTimeStamp` (current time) for the epicsTS.
             array.time_stamp = self.load_acq_start();
+            let _ = self.owner.get_attributes(&mut array).await;
             self.output.publish(array).await;
         }
         CamStatus::Success
@@ -925,5 +929,83 @@ async fn image_loop(w: Worker) {
         }
 
         w.get_image_data().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{create_marccd_detector, tests::fake_server};
+    use epics_rs::ad_core::attributes::NDAttrValue;
+    use epics_rs::ad_core::plugin::channel::ndarray_channel;
+    use epics_rs::asyn::registry::claim_port;
+
+    /// marCCD.cpp:327-328 reads the driver's attributes into every frame.
+    #[test]
+    fn each_frame_carries_the_driver_attributes() {
+        use tiff::encoder::{TiffEncoder, colortype};
+
+        let name = "MARCCD_ATTRS";
+        fake_server(name, |c| {
+            if c.starts_with("get_size") {
+                "4,4"
+            } else if c.starts_with("get_bin") {
+                "1,1"
+            } else if c.starts_with("get_") {
+                "0"
+            } else {
+                ""
+            }
+        });
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad) = (det.port_handle().clone(), det.ad_params);
+        let file = std::env::temp_dir().join(format!("{name}_{}.tif", std::process::id()));
+        TiffEncoder::new(std::fs::File::create(&file).unwrap())
+            .unwrap()
+            .write_image::<colortype::Gray16>(4, 4, &[7u16; 16])
+            .unwrap();
+        let path = file.to_string_lossy().into_owned();
+        h.write_int32_blocking(ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        h.write_float64_blocking(ad.acquire_period, 0, 2.5).unwrap();
+
+        let (sender, mut receiver) = ndarray_channel(&format!("{name}_SINK"), 4);
+        det.connect_downstream(sender);
+        let worker = Worker {
+            port: h.clone(),
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            image_event: Arc::new(Event::new()),
+            acq_start: Arc::new(AtomicU64::new(0)),
+            output: ArrayPublisher::new(det.array_output().clone()),
+            pool: det.pool().clone(),
+            owner: h
+                .with_driver_blocking::<MarccdDriver, _>(|d| d.ad.owner.clone())
+                .unwrap(),
+        };
+        let xml = r#"<Attributes>
+            <Attribute name="Period" type="PARAM" source="ACQ_PERIOD" datatype="DOUBLE"/>
+        </Attributes>"#;
+        rt::run_thread(move || async move {
+            let p = &worker.port;
+            p.write_octet(ad.base.attributes_file, 0, xml.as_bytes().to_vec())
+                .await
+                .unwrap();
+            p.write_octet(ad.base.full_file_name, 0, path.into_bytes())
+                .await
+                .unwrap();
+            assert_eq!(worker.get_image_data().await, CamStatus::Success);
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_file(&file);
+
+        let frame = receiver.blocking_recv().unwrap();
+        assert_eq!(
+            frame.attributes.get("Period").unwrap().value,
+            NDAttrValue::Float64(2.5)
+        );
+        std::mem::forget(det);
     }
 }

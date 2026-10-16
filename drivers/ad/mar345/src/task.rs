@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ImageMode;
+use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
@@ -55,6 +56,8 @@ pub struct Worker {
     pub acq_start: Arc<AtomicU64>,
     pub output: ArrayPublisher,
     pub pool: DriverPool,
+    /// The driver's attribute set, for C `getAttributes`.
+    pub owner: Arc<ArrayOwner>,
 }
 
 /// Current time as an f64 epoch second count (C `secPastEpoch + nsec/1e9`).
@@ -316,6 +319,7 @@ impl Worker {
         // current time (updateTimeStamp).
         array.time_stamp = self.load_acq_start();
         array.timestamp = EpicsTimestamp::now();
+        let _ = self.owner.get_attributes(&mut array).await;
         self.output.publish(array).await;
     }
 
@@ -410,4 +414,70 @@ impl Worker {
 /// Spawn the `mar345Task` worker thread.
 pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
     rt::run_thread_named("mar345Task", move || w.run())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{Mar345Driver, create_mar345_detector, tests::fake_server};
+    use epics_rs::ad_core::attributes::NDAttrValue;
+    use epics_rs::ad_core::plugin::channel::ndarray_channel;
+    use epics_rs::asyn::registry::claim_port;
+
+    /// mar345.cpp:215-216 reads the driver's attributes into every frame.
+    #[test]
+    fn each_frame_carries_the_driver_attributes() {
+        let name = "MAR345_ATTRS";
+        fake_server(name);
+        let det =
+            create_mar345_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad) = (det.port_handle().clone(), det.ad_params);
+        let xml = r#"<Attributes>
+            <Attribute name="Period" type="PARAM" source="ACQ_PERIOD" datatype="DOUBLE"/>
+        </Attributes>"#;
+        let file = std::env::temp_dir().join(format!("{name}_{}.mar", std::process::id()));
+        std::fs::write(&file, b"").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        h.write_int32_blocking(ad.base.array_size_x, 0, 4).unwrap();
+        h.write_int32_blocking(ad.base.array_size_y, 0, 4).unwrap();
+        h.write_float64_blocking(ad.acquire_period, 0, 2.5).unwrap();
+
+        let (sender, mut receiver) = ndarray_channel(&format!("{name}_SINK"), 4);
+        det.connect_downstream(sender);
+        let worker = Worker {
+            server: Server::new(h.clone(), crate::driver::tests::server_handle(name), ad),
+            p: det.mar345_params,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            abort: Arc::new(Event::new()),
+            mode: Arc::new(AtomicI32::new(0)),
+            acq_start: Arc::new(AtomicU64::new(0)),
+            output: ArrayPublisher::new(det.array_output().clone()),
+            pool: det.pool().clone(),
+            owner: h
+                .with_driver_blocking::<Mar345Driver, _>(|d| d.ad.owner.clone())
+                .unwrap(),
+        };
+        let writer = h.clone();
+        rt::run_thread(move || async move {
+            let (h, mut worker) = (writer, worker);
+            h.write_octet(ad.base.attributes_file, 0, xml.as_bytes().to_vec())
+                .await
+                .unwrap();
+            h.write_octet(ad.base.full_file_name, 0, path.into_bytes())
+                .await
+                .unwrap();
+            worker.get_image_data().await;
+        })
+        .join()
+        .unwrap();
+        let _ = std::fs::remove_file(&file);
+
+        let frame = receiver.blocking_recv().unwrap();
+        assert_eq!(
+            frame.attributes.get("Period").unwrap().value,
+            NDAttrValue::Float64(2.5)
+        );
+        std::mem::forget(det);
+    }
 }

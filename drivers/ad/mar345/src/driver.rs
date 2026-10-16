@@ -281,6 +281,7 @@ pub fn create_mar345_detector(
     let ad_params = driver.ad.params;
     let mar345_params = driver.p;
     let pool = driver.ad.pool.clone();
+    let owner = driver.ad.owner.clone();
 
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the mar345 port runtime: {e}"))?;
@@ -298,6 +299,7 @@ pub fn create_mar345_detector(
         acq_start,
         output: ArrayPublisher::new(array_output.clone()),
         pool: pool.clone(),
+        owner,
     };
     let tasks = vec![start_task(worker)];
 
@@ -312,7 +314,7 @@ pub fn create_mar345_detector(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::registry::claim_port;
@@ -320,7 +322,7 @@ mod tests {
     use std::io::Read;
 
     /// An IP port `{name}_IP` on a server that logs what it receives.
-    fn fake_server(name: &str) -> Arc<Mutex<String>> {
+    pub(crate) fn fake_server(name: &str) -> Arc<Mutex<String>> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let log = Arc::new(Mutex::new(String::new()));
@@ -347,6 +349,11 @@ mod tests {
         log
     }
 
+    /// The fake server port `{name}_IP`.
+    pub(crate) fn server_handle(name: &str) -> PortHandle {
+        get_port(&format!("{name}_IP")).unwrap().handle.clone()
+    }
+
     /// A driver on a fake server, outside any port runtime.
     fn driver(name: &str, max_memory: usize) -> Mar345Driver {
         fake_server(name);
@@ -358,7 +365,7 @@ mod tests {
                 stop: Arc::new(Event::new()),
                 abort: Arc::new(Event::new()),
                 mode: Arc::new(AtomicI32::new(0)),
-                server: get_port(&format!("{name}_IP")).unwrap().handle.clone(),
+                server: server_handle(name),
             },
         )
         .unwrap()
