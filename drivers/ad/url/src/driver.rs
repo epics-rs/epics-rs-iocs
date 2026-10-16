@@ -105,12 +105,7 @@ impl PortDriver for URLDriver {
             }
             Ok(())
         } else if reason < self.url_params.url_name {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0)
-            } else {
-                self.ad.write_int32_pool(reason, value).map(|_| ())
-            }
+            ADDriver::ad_write_int32(self, user, value)
         } else {
             Ok(())
         };
@@ -401,6 +396,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let pool = rt.pool();
         assert_eq!(pool.num_alloc_buffers() - pool.num_free_buffers(), 1);
+
+        // pArrays[0] is preAllocateBuffers' template (asynNDArrayDriver.cpp:717-726).
+        let p = &ad.base;
+        h.write_int32_blocking(p.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        let free = pool.num_free_buffers();
+        h.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
+        assert_eq!(pool.num_free_buffers(), free + 2);
         std::mem::forget(rt);
     }
 }

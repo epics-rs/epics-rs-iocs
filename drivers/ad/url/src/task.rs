@@ -7,7 +7,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray_pool::{DriverPool, PublishedArray};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -100,7 +100,6 @@ async fn set_shutter_via_handle(handle: &PortHandle, ad: &ADBaseParams, open: bo
 /// the caller (matching `URLTask`) only branches on that.
 async fn acquire_one_image(
     ctx: &AcquisitionContext,
-    last_image: &mut Option<PublishedArray>,
     start_time: EpicsTimestamp,
     image_counter: i32,
     num_images_counter: i32,
@@ -170,7 +169,7 @@ async fn acquire_one_image(
 
     let end_ts = EpicsTimestamp::now();
     // C releases pArrays[0] just before the alloc (URLDriver.cpp:132-133).
-    *last_image = None;
+    ctx.pool.owner().store_array(0, None);
     // C dereferences a refused alloc unchecked (URLDriver.cpp:133); here the frame
     // is dropped after the pool's limit line.
     let Ok(mut array) = ctx.pool.wrap(decoded.dims, decoded.data) else {
@@ -219,14 +218,12 @@ async fn acquire_one_image(
     if array_callbacks {
         ctx.publisher.publish(array.clone()).await;
     }
-    *last_image = Some(array);
+    ctx.pool.owner().store_array(0, Some(array.array().clone()));
 
     Ok(())
 }
 
 async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
-    // C `pArrays[0]`: the last image stays charged until the next alloc.
-    let mut last_image = None;
     loop {
         let _ = ctx
             .handle
@@ -299,7 +296,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 + 1;
             let image_result = acquire_one_image(
                 &ctx,
-                &mut last_image,
                 start_time,
                 image_counter,
                 num_images_counter,
