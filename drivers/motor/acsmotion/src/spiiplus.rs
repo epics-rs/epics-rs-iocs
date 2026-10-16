@@ -47,6 +47,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::calc::engine::cvt::fmt_g;
 use epics_rs::motor::controller_port::{
     ControllerCtx, ControllerParams, PROFILE_EXECUTE_DONE, ParamWrite, index,
 };
@@ -137,12 +138,10 @@ pub(crate) fn spiiplus_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Format a floating-point command argument as a plain decimal (never
-/// scientific), matching the controller's ASCII numeric parsing.
+/// A double in a command as C's `std::stringstream << double` writes it:
+/// `%g`, six significant digits.
 pub(crate) fn fmt(v: f64) -> String {
-    // Rust's f64 `Display` emits a shortest round-trip decimal with no exponent,
-    // which the SPiiPlus command interpreter accepts directly.
-    format!("{v}")
+    fmt_g(v, 6, false, false)
 }
 
 /// One axis's `SPIIPLUS_HOMING_*` parameters (C `home()` reads them at each
@@ -979,10 +978,12 @@ mod tests {
     }
 
     #[test]
-    fn fmt_is_plain_decimal_not_scientific() {
+    fn fmt_writes_six_significant_digits_as_c_streams_a_double() {
         assert_eq!(fmt(1000.0), "1000");
         assert_eq!(fmt(12.5), "12.5");
         assert_eq!(fmt(-0.25), "-0.25");
-        assert_eq!(fmt(0.0000001), "0.0000001");
+        assert_eq!(fmt(1.0 / 3.0), "0.333333");
+        assert_eq!(fmt(1234567.0), "1.23457e+06");
+        assert_eq!(fmt(0.0000001), "1e-07");
     }
 }
