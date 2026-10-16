@@ -1225,8 +1225,7 @@ impl TimePix3Driver {
             return Err("Acquisition start was cancelled");
         }
         if let Err(e) = self.http.get(serval::MEASUREMENT_START, TIMEOUT_CONFIG) {
-            self.http_failed(
-                "GET /measurement/start",
+            self.log_http(
                 &e,
                 HttpPrint::Failure(
                     "acquireStart GET /measurement/start",
@@ -1236,7 +1235,6 @@ impl TimePix3Driver {
             );
             return Err(FAILED);
         }
-        self.http_ok();
 
         if self.cmd_tx.try_send(Command::AcquisitionStarted).is_err() {
             return Err("Failed to create measurement monitor thread");
@@ -1294,8 +1292,7 @@ impl TimePix3Driver {
             match self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL) {
                 Ok(_) => stop_succeeded = true,
                 Err(e) => {
-                    self.http_failed(
-                        "GET /measurement/stop",
+                    self.log_http(
                         &e,
                         HttpPrint::Failure(
                             "transactional stop GET /measurement/stop",
@@ -1314,8 +1311,7 @@ impl TimePix3Driver {
                     }
                 }
                 Err(e) => {
-                    self.http_failed(
-                        "GET /measurement",
+                    self.log_http(
                         &e,
                         HttpPrint::Failure(
                             "transactional stop GET /measurement",
@@ -2505,6 +2501,33 @@ mod tests {
             format!("acquireStart stop prior measurement: GET {url}/measurement/stop HTTP 500");
         assert!(text.contains(&line), "{text:?}");
         std::mem::forget(runtime);
+    }
+
+    /// The stop transaction logs a refused stop without touching HttpCode
+    /// (acquisition_runtime.cpp:198-208, serval_http.cpp:186-201).
+    #[test]
+    fn a_refused_stop_leaves_the_http_code() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_STOP_CODE",
+            Arc::new(ServalHttp::new(&fake_serval("/measurement/stop"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let acquire = det.ad.params.acquire;
+        det.write_int32(&mut AsynUser::new(acquire), 1).unwrap();
+        det.ad
+            .port_base
+            .set_int32_param(det.p.http_code, 0, 7)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(acquire), 0).unwrap();
+        assert_eq!(det.int(det.p.http_code, 0), 7);
+        assert_eq!(
+            det.text(det.ad.params.status_message, 0),
+            "Acquisition stopped (remote state reconciled)"
+        );
     }
 
     /// An accumulation setting reads back clamped to C's range
