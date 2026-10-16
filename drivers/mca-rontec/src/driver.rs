@@ -161,6 +161,8 @@ fn c_atoi(bytes: &[u8]) -> i32 {
 pub struct RontecDriver {
     base: PortDriverBase,
     serial: PortHandle,
+    /// C `pPvt->serialPort`.
+    serial_port: String,
     addr: i32,
     /// `driverReasons`-equivalent: resolved once by
     /// [`mca::interface::McaReason::create_params`] at connect time,
@@ -221,6 +223,7 @@ impl RontecDriver {
         let driver = RontecDriver {
             base,
             serial: entry.handle,
+            serial_port: serial_port_name.to_owned(),
             addr: serial_port_addr,
             reasons,
             nchans: RONTEC_MAXCHANS as i32,
@@ -522,6 +525,20 @@ impl PortDriver for RontecDriver {
         Ok(())
     }
 
+    /// C `RontecReport` (`drvMcaRontec.c:548-559`).
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "Rontec {}: connected on serial port {}",
+            self.base.port_name, self.serial_port
+        );
+        if level >= 1 {
+            let _ = writeln!(out, "              maxChans: {RONTEC_MAXCHANS}");
+            let _ = writeln!(out, "              nchans:   {}", self.nchans);
+            let _ = writeln!(out, "              binning:  {}", self.binning);
+        }
+    }
+
     /// C `RontecRead`'s `mcaAcquiring` arm, reached only via `int32Read`
     /// (`drvMcaRontec.c:401-424`).
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
@@ -630,6 +647,7 @@ mod tests {
         RontecDriver {
             base,
             serial: serial_runtime.port_handle().clone(),
+            serial_port: "TESTRONTECSERIAL".to_owned(),
             addr: 0,
             reasons: dummy_reasons(),
             nchans: RONTEC_MAXCHANS as i32,
@@ -949,6 +967,27 @@ mod tests {
                 .contains("drvMcaRontec::int32ArrayWrite, write to Rontec not implemented\n")
         );
         assert!(rig.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn report_prints_c_rontec_report() {
+        let mut d = dummy_driver();
+        d.set_num_channels(&AsynUser::default(), 1024);
+        let mut out = String::new();
+        d.report(&mut out, 0);
+        assert_eq!(
+            out,
+            "Rontec TESTRONTEC: connected on serial port TESTRONTECSERIAL\n"
+        );
+        out.clear();
+        d.report(&mut out, 1);
+        assert_eq!(
+            out,
+            "Rontec TESTRONTEC: connected on serial port TESTRONTECSERIAL\n\
+             \x20             maxChans: 4096\n\
+             \x20             nchans:   1024\n\
+             \x20             binning:  4\n"
+        );
     }
 
     #[test]
