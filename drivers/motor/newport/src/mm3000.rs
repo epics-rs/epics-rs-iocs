@@ -506,8 +506,8 @@ impl Mm3000Axis {
         };
         drop(ctrl);
 
-        // C: first space-delimited token, `atof`, cast to integer counts.
-        let position = f64::from(nint(atof(tp.split_whitespace().next().unwrap_or(""))));
+        // C: first space-delimited token, `atof`, `(epicsInt32)` cast.
+        let position = atof(tp.split_whitespace().next().unwrap_or("")).trunc();
         s.position = position;
         s.encoder_position = if self.encoder_present { position } else { 0.0 };
         s.velocity = 0.0; // C: "Parse motor velocity? NEEDS WORK"
@@ -645,6 +645,25 @@ mod tests {
         let s = &axis.last_status;
         assert!(s.moving && s.direction && s.home && !s.comms_error && !s.problem);
         assert_eq!(s.position, 0.0);
+    }
+
+    /// C stores the TP reading through an `(epicsInt32)` cast, which
+    /// truncates toward zero.
+    #[test]
+    fn the_tp_position_truncates_as_c_casts() {
+        let (ctrl, _) = mm3000_line(
+            "mm3000Trunc",
+            &[
+                ("RC", "1=dc 2=dc"),
+                ("1MS", "@"),
+                ("1TP", "12.7"),
+                ("2MS", "@"),
+                ("2TP", "-12.7"),
+            ],
+        );
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        assert_eq!(Mm3000Axis::new(ctrl.clone(), 1).last_status.position, 12.0);
+        assert_eq!(Mm3000Axis::new(ctrl, 2).last_status.position, -12.0);
     }
 
     #[test]
