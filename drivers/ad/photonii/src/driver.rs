@@ -13,6 +13,7 @@ use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
@@ -259,10 +260,11 @@ impl PhotonIIRuntime {
 /// `command_handle` is the `drvAsynIPPort` that reaches p2util (C
 /// `PhotonIIConfig`'s `commandPort`).
 pub fn create_photonii_detector(
-    port_name: &str,
+    claim: &PortClaim,
     command_handle: PortHandle,
     max_memory: usize,
 ) -> AsynResult<PhotonIIRuntime> {
+    let port_name = claim.name();
     let shared = Arc::new(SharedState {
         stop_requested: AtomicBool::new(false),
     });
@@ -274,7 +276,7 @@ pub fn create_photonii_detector(
     let params = det.params;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 
