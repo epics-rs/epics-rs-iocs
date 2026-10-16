@@ -534,6 +534,16 @@ impl LoveDriver {
         self.models.lock().unwrap()[(addr - 1) as usize]
     }
 
+    /// C's `"%s error %s"` with `pport->pasynUser->errorMessage` (drvLove.c:1192-1325).
+    /// That user is the love port's own, which nothing writes, so the serial
+    /// request's text never reaches the record.
+    fn record_error(&self, e: AsynError) -> AsynError {
+        AsynError::Status {
+            status: e.status(),
+            message: format!("{} error ", self.base.port_name),
+        }
+    }
+
     fn do_read(&mut self, addr: i32, reason: usize) -> AsynResult<i32> {
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
@@ -637,10 +647,12 @@ impl PortDriver for LoveDriver {
 
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
         self.do_read(user.addr, user.reason)
+            .map_err(|e| self.record_error(e))
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.do_write(user.addr, user.reason, value)
+            .map_err(|e| self.record_error(e))
     }
 
     /// C `readUInt32` (`drvLove.c:1296-1333`) -- the `mask` argument is
@@ -651,7 +663,9 @@ impl PortDriver for LoveDriver {
     /// harmless here since the record layer re-applies (and shifts by) the
     /// same mask regardless.
     fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
-        let value = self.do_read(user.addr, user.reason)?;
+        let value = self
+            .do_read(user.addr, user.reason)
+            .map_err(|e| self.record_error(e))?;
         Ok((value as u32) & mask)
     }
 
@@ -665,6 +679,7 @@ impl PortDriver for LoveDriver {
         _mask: u32,
     ) -> AsynResult<()> {
         self.do_write(user.addr, user.reason, value as i32)
+            .map_err(|e| self.record_error(e))
     }
 }
 
@@ -862,6 +877,37 @@ mod tests {
         ] {
             assert!(out.contains(line), "missing {line:?} in {out:?}");
         }
+    }
+
+    /// A failed request reports C's `"<port> error "`, not the serial
+    /// port's own message (drvLove.c:1202).
+    #[test]
+    fn a_failed_write_reports_the_love_port_not_the_serial_text() {
+        let serial = TimeoutSerial {
+            base: PortDriverBase::new(
+                "LOVETESTERR",
+                1,
+                PortFlags {
+                    multi_device: false,
+                    can_block: true,
+                    destructible: true,
+                },
+            ),
+        };
+        let mut love = love_on(serial, "LOVETESTERRL");
+        let reason = COMMANDS
+            .iter()
+            .position(|c| matches!(c.write_conv, WriteConv::Data))
+            .unwrap();
+        let mut user = AsynUser::new(reason).with_addr(1);
+        let e = love.write_int32(&mut user, 5).unwrap_err();
+        assert_eq!(e.message(), "LOVETESTERRL error ");
+        // C `executeCommand` gives up with asynError (drvLove.c:768).
+        assert_eq!(e.status(), AsynStatus::Error);
+        let e = love
+            .read_int32(&AsynUser::new(reason).with_addr(1))
+            .unwrap_err();
+        assert_eq!(e.message(), "LOVETESTERRL error ");
     }
 
     /// C `reportIt` (drvLove.c:978-990): the port pair, then every address
