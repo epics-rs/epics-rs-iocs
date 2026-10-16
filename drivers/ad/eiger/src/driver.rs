@@ -18,27 +18,6 @@ use crate::trace::Trace;
 /// The file permissions the driver is willing to set (C `value & 0666`).
 const FILE_PERMS_MASK: i32 = 0o666;
 
-/// The outcome of the constructor's requests to the detector.
-///
-/// The single gate that keeps a constructor-time request from failing port
-/// creation: it records that a request failed and reports whether the caller
-/// may go on. C gets the same property for free — its
-/// constructor issues these requests and inspects none of their return codes
-/// (eigerDetector.cpp:1655-1673) — and a detector that answers once and then
-/// drops must still leave a port behind for `iocInit`.
-#[derive(Default)]
-struct BootRequests {
-    failed: bool,
-}
-
-impl BootRequests {
-    /// Run one constructor-time request; reports whether it succeeded.
-    fn run(&mut self, result: AsynResult<()>) -> bool {
-        self.failed |= result.is_err();
-        result.is_ok()
-    }
-}
-
 pub struct EigerDriver {
     pub ad: ADDriverBase,
     pub p: EigerParams,
@@ -108,27 +87,27 @@ impl EigerDriver {
         // that came back must not leave the operator reading "FAILED TO
         // CONNECT" off a working port. The initialization below may set it again.
         self.status_message("")?;
-        let mut q = BootRequests::default();
 
         // C tests the detector with a single fetch of `state` before it touches
         // anything else, and abandons the rest of the constructor when that
-        // fails (eigerDetector.cpp:229-235). Skipping the body then is not only
-        // what C does, it is what stops an unreachable detector from costing
-        // the 20 s request timeout a few hundred times over.
-        if q.run(self.fetch(self.p.state)) {
-            if !self.initialize_if_needed()? {
-                return self.ad.port_base.call_param_callbacks(0);
-            }
-            self.fetch_and_default(&mut q)?;
-        } else {
+        // fails (eigerDetector.cpp:229-235).
+        if self.fetch(self.p.state).is_err() {
             self.ops.trace.err(
                 "eigerDetector",
                 "Cannot fetch state. Eiger could be disconnected.",
             );
-        }
-
-        if q.failed {
             return self.boot_disconnected();
+        }
+        if !self.initialize_if_needed()? {
+            return self.ad.port_base.call_param_callbacks(0);
+        }
+        // Only parameter-library failures reach here, as only they reach C's
+        // `initParams` status (eigerDetector.cpp:425-429).
+        if self.fetch_and_default().is_err() {
+            self.ops
+                .trace
+                .err("eigerDetector", "unable to set detector parameters");
+            return Ok(());
         }
         self.ad.port_base.call_param_callbacks(0)
     }
@@ -181,13 +160,11 @@ impl EigerDriver {
 
     /// The body of C `eigerDetector::initParams` (eigerDetector.cpp:1621).
     ///
-    /// Every request to the detector goes through `q`. C issues the same
-    /// requests and looks at none of their return codes — only its local
-    /// `setIntegerParam` results reach `initParams`' own status — so a detector
-    /// that answers the state fetch and then drops still leaves a usable port
-    /// behind. The `?`s here are all parameter-library operations, which never
-    /// touch the detector.
-    fn fetch_and_default(&mut self, q: &mut BootRequests) -> AsynResult<()> {
+    /// C issues these requests and looks at none of their return codes — a
+    /// failed one prints its own lines and changes no status — so the `?`s
+    /// here are all parameter-library operations, which never touch the
+    /// detector.
+    fn fetch_and_default(&mut self) -> AsynResult<()> {
         let (updates, _failures) = self.ops.fetch_all();
         self.apply(updates)?;
 
@@ -204,7 +181,8 @@ impl EigerDriver {
         let roi_mode = self.ad.port_base.get_int32_param(self.p.roi_mode, 0)?;
         let restore = match self.ops.enum_index_of(self.p.roi_mode, "disabled") {
             Some(disabled) if disabled != roi_mode => {
-                q.run(self.put_int(self.p.roi_mode, disabled))
+                let _ = self.put_int(self.p.roi_mode, disabled);
+                true
             }
             _ => false,
         };
@@ -217,7 +195,7 @@ impl EigerDriver {
             .port_base
             .get_int32_param(self.p.nd_array_size_y, 0)?;
         if restore {
-            q.run(self.put_int(self.p.roi_mode, roi_mode));
+            let _ = self.put_int(self.p.roi_mode, roi_mode);
         }
 
         let base = &mut self.ad.port_base;
@@ -255,12 +233,12 @@ impl EigerDriver {
         // false)` writes `enum_values[1]` — "enabled" — and the monitor is
         // *switched on* by the very line meant to switch it off. See
         // `param::encode_bool`, which inverts nothing.
-        q.run(self.put_bool(self.p.monitor_enable, false));
+        let _ = self.put_bool(self.p.monitor_enable, false);
 
         // Values this driver requires to be constant.
-        q.run(self.put_bool(self.p.auto_summation, true));
-        q.run(self.put_int(self.p.fw_img_num_start, params::DEFAULT_NR_START));
-        q.run(self.put_int(self.p.monitor_buf_size, 1));
+        let _ = self.put_bool(self.p.auto_summation, true);
+        let _ = self.put_int(self.p.fw_img_num_start, params::DEFAULT_NR_START);
+        let _ = self.put_int(self.p.monitor_buf_size, 1);
         Ok(())
     }
 

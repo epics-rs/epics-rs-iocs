@@ -3,7 +3,7 @@
 //! The upfront `state` fetch only covers a detector that is already gone. C's
 //! constructor issues its `put`s afterwards and inspects none of their return
 //! codes (eigerDetector.cpp:1655-1673), so a detector that drops *between* the
-//! state fetch and the writes still has to leave a usable port behind.
+//! state fetch and the writes leaves a usable port and no status change.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -94,12 +94,16 @@ fn the_driver_is_created_when_the_detector_stops_answering_after_the_state_fetch
         "expected the constructor's writes on the wire, saw {}",
         puts.load(Ordering::Acquire)
     );
-    assert_eq!(
-        driver
-            .ad
-            .port_base
-            .get_int32_param(driver.ad.params.status, 0)
-            .unwrap(),
+    // C looks at none of those writes' return codes: each prints its own
+    // lines and no status changes (eigerDetector.cpp:1655-1673).
+    let base = &driver.ad.port_base;
+    assert_ne!(
+        base.get_int32_param(driver.ad.params.status, 0).unwrap(),
         ADStatus::Disconnected as i32
+    );
+    assert_eq!(
+        base.get_string_param(driver.ad.params.status_message, 0)
+            .unwrap(),
+        b""
     );
 }
