@@ -19,7 +19,7 @@ epicsEnvSet("HANDLE",  "gm10_0")
 gm10Init("$(HANDLE)", "192.168.1.100")
 
 # Per-instrument system records: module presence, error/alarm summary, the
-# four 1-second poll triggers, freeze/recording/compute mode.
+# three 1-second poll triggers, freeze/recording/compute mode.
 dbLoadRecords("$(GM10)/db/gm10_system.template", "P=$(P),DAU=$(DAU),HANDLE=$(HANDLE)")
 
 # One record set per configured channel, address-family template matching
