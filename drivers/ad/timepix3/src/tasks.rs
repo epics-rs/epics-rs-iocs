@@ -956,7 +956,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ],
             )
             .await;
-            publish_image(ctx, f.width, f.height, f.pixels).await;
+            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
         }
         (StreamKind::Img, Frame::Image(f)) => {
             let p = ctx.p;
@@ -1002,7 +1002,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ADDR,
             )
             .await;
-            publish_image(ctx, f.width, f.height, f.pixels).await;
+            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             let p = ctx.p;
@@ -1114,8 +1114,15 @@ async fn publish_accumulation(
     }
 }
 
-/// Push a preview frame down the plugin chain as an NDArray.
-async fn publish_image(ctx: &Arc<Ctx>, width: usize, height: usize, pixels: Vec<u32>) {
+/// Push a preview frame down the plugin chain as an NDArray. C stamps it with
+/// Serval's `frameNumber`, not NDArrayCounter (serval_stream.cpp:604, :1467).
+async fn publish_image(
+    ctx: &Arc<Ctx>,
+    frame_number: i32,
+    width: usize,
+    height: usize,
+    pixels: Vec<u32>,
+) {
     if ctx
         .handle
         .read_int32(ctx.ad.base.array_callbacks, 0)
@@ -1145,7 +1152,7 @@ async fn publish_image(ctx: &Arc<Ctx>, width: usize, height: usize, pixels: Vec<
         vec![NDDimension::new(width), NDDimension::new(height)],
         NDDataBuffer::U32(pixels),
     );
-    array.unique_id = counter;
+    array.unique_id = frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
     array.attributes = attributes;
@@ -1253,5 +1260,56 @@ mod tests {
         assert_eq!(adjust_code(&json!({"Adjust": null})), -1);
         assert_eq!(adjust_code(&json!({"Adjust": [1, 2]})), -2);
         assert_eq!(adjust_code(&json!({"Adjust": 7})), -3);
+    }
+
+    #[tokio::test]
+    async fn an_image_carries_the_serval_frame_number() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let driver =
+            crate::driver::TimePix3Driver::new("TPXUID", http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXUID").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut output = NDArrayOutput::new();
+        let (tx, mut rx) = ndarray_channel("TPXUID_SINK", 4);
+        output.add(tx);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            output: Arc::new(parking_lot::Mutex::new(output)),
+        });
+        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+
+        for (kind, frame_number) in [(StreamKind::PrvImg, 41), (StreamKind::Img, 97)] {
+            let frame = Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number,
+                time_at_frame: 0.0,
+                pixels: vec![1, 2],
+            });
+            handle_frame(&ctx, kind, frame).await;
+            let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no array")
+                .unwrap();
+            assert_eq!(array.unique_id, frame_number);
+        }
+        std::mem::forget(runtime);
     }
 }
