@@ -9,7 +9,7 @@
 //!
 //! Float64, push-only via I/O Intr (no read/write asynFloat64 methods at all
 //! -- `float64Methods = {}`, `capaNCDT6200Sup.c:566`):
-//! `A_DISP_CHAN{1-4}` = addr 1-4, all sharing [`DataDriver::disp_reason`]
+//! `A_DISP_CHAN{1-4}` = addr 1-4, all sharing `DataDriver::disp_reason`
 //! (one asynFloat64 interrupt source in C, addr-filtered per client --
 //! mirrored here as one asyn-rs param, addr-filtered by the framework's own
 //! `InterruptFilter`).
@@ -51,9 +51,9 @@
 //!
 //! - **#43 -- Inert `IPport` configure argument** (`capaNCDT6200Sup.c:698-707`):
 //!   upstream validated the argument non-empty but never read it -- the TCP
-//!   port was always hardcoded to [`PROTOCOL_TCP_PORT`] regardless of what
+//!   port was always hardcoded to `PROTOCOL_TCP_PORT` regardless of what
 //!   string was passed. [`configure`] now honors it: parsed as the TCP port
-//!   number, defaulting to [`PROTOCOL_TCP_PORT`] (10001) when omitted (`""`)
+//!   number, defaulting to `PROTOCOL_TCP_PORT` (10001) when omitted (`""`)
 //!   or `"0"`.
 //!
 //! # Framework gaps (documented, not silently worked around)
@@ -61,10 +61,10 @@
 //! - **`PortRuntimeHandle` must outlive `configure()`**: dropping the last
 //!   [`PortRuntimeHandle`] closes its internal shutdown channel and the
 //!   actor thread exits (empirically confirmed: a `PortHandle` clone
-//!   registered via [`asyn_record::register_port`] survives, but every
+//!   published via [`asyn_record::PortClaim::publish`] survives, but every
 //!   request through it then fails with "actor channel closed"). This module
 //!   retains both runtimes it creates (the outer port and the `_RBK` port)
-//!   in [`KEPT_PORT_RUNTIMES`] for the process lifetime via
+//!   in `KEPT_PORT_RUNTIMES` for the process lifetime via
 //!   [`keep_port_runtime_alive`]. **This is a real defect, confirmed at every
 //!   hand-rolled `*Init`/`*Config` iocsh command in this workspace that
 //!   calls `create_port_runtime` directly**: `iocs/syringepump-ioc/src/main.rs`'s
@@ -381,7 +381,7 @@ impl PortDriver for DataDriver {
     }
 
     /// No `asynDrvUser` interface in C at all -- every addr resolves to
-    /// *some* reason (see [`resolve_reason`]), never rejected at bind time.
+    /// *some* reason (see `resolve_reason`), never rejected at bind time.
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let addr = req.addr;
         Ok(DrvUserInfo::from_reason(resolve_reason(
@@ -660,7 +660,7 @@ fn resolve_tcp_port(ip_port: &str) -> AsynResult<u16> {
 /// `capaNCDT6200Configure` + `setLink` (`capaNCDT6200Sup.c:467-496,682-791`):
 /// build the internal `_RBK` transport port (`noAutoConnect=1,
 /// noProcessEos=1`) and this driver's own outer port, wire the late-bound
-/// self-handle the reader thread needs (see [`DataDriver::self_handle`]).
+/// self-handle the reader thread needs (see `DataDriver::self_handle`).
 /// Both ports are registered, as C's `drvAsynIPPortConfigure` registers the
 /// `_RBK` one.
 pub fn configure(
