@@ -18,6 +18,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
@@ -122,6 +123,7 @@ impl PortDriver for Mar345Driver {
             .set_int32_param(function, user.addr, value)?;
 
         let idle = self.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
+        let mut status = Ok(());
         if function == params.acquire {
             if value != 0 && idle {
                 // Wake the mar345 task to acquire.
@@ -152,11 +154,28 @@ impl PortDriver for Mar345Driver {
             }
         } else if function < p.first() {
             // Base-class parameter: pool controls plus plain stores.
-            self.ad.write_int32_pool(function, value)?;
+            status = self.ad.write_int32_pool(function, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mar345:writeInt32: error, status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mar345:writeInt32: function={function}, value={value}"),
+            ),
+        }
+        status
     }
 }
 
