@@ -960,6 +960,78 @@ pub fn put_string(raw: &mut [u8], value: &str) -> bool {
     true
 }
 
+/// `dump_raw_CIP_data`: the type and `elements` values of a ReadData reply,
+/// as one line. Stops where the data ends; C reads on past it.
+pub fn dump_raw_cip_data(raw: &[u8], elements: usize) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let t = rd_u16(raw, 0).unwrap_or(0);
+    let data = raw.get(TYPECODE_SIZE..).unwrap_or(&[]);
+    let mut put = |name: &str, size: usize, value: &dyn Fn(&[u8]) -> String| {
+        out.push_str(name);
+        for chunk in data.chunks_exact(size).take(elements) {
+            let _ = write!(out, " {}", value(chunk));
+        }
+    };
+    match CipType::from_code(t) {
+        CipType::Bool | CipType::Sint => {
+            let name = if t == CipType::Bool.code() {
+                "BOOL"
+            } else {
+                "SINT"
+            };
+            put(name, 1, &|b| b[0].to_string());
+        }
+        CipType::Int => put("INT", 2, &|b| u16::from_le_bytes([b[0], b[1]]).to_string()),
+        CipType::Dint => put("DINT", 4, &|b| {
+            i32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string()
+        }),
+        CipType::Lint | CipType::Ulint => {
+            let name = if t == CipType::Lint.code() {
+                "LINT"
+            } else {
+                "ULINT"
+            };
+            put(name, 8, &|b| {
+                format!("0x{:016X}", u64::from_le_bytes(b.try_into().unwrap()))
+            });
+        }
+        CipType::Real => put("REAL", 4, &|b| {
+            format!("{:.6}", f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }),
+        CipType::Lreal => put("LREAL", 8, &|b| {
+            format!("{:.6}", f64::from_le_bytes(b.try_into().unwrap()))
+        }),
+        CipType::Bits => put("BITS", 4, &|b| {
+            format!("0x{:08X}", u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }),
+        CipType::Struct => {
+            let sub = rd_u16(data, 0).unwrap_or(0);
+            if sub == STRUCT_STRING_HANDLE {
+                out.push_str("STRING");
+                for i in 0..elements {
+                    let base = 2 + i * STRUCT_STRING_STRIDE;
+                    let Some(len) = rd_u16(data, base) else { break };
+                    let len = usize::from(len).min(STRUCT_STRING_MAX);
+                    let text = data.get(base + STRUCT_STRING_LEN_BYTES..).unwrap_or(&[]);
+                    let text = &text[..len.min(text.len())];
+                    let end = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+                    let _ = write!(out, " '{}'", String::from_utf8_lossy(&text[..end]));
+                }
+            } else {
+                let _ = write!(out, "Unknown CIP struct (type 0x{t:04X}) 0x{sub:04X}: ");
+            }
+        }
+        // C's hexdump of CIP_Type_size(type) * elements is empty here:
+        // every other type has size 0.
+        _ => {
+            let _ = write!(out, "raw CIP data, unknown type 0x{t:04X}: ");
+        }
+    }
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,5 +1045,25 @@ mod tests {
         assert_eq!(decode_type_and_info(0x00C1, 3), "BOOL bit 3");
         assert_eq!(decode_type_and_info(0xAFCE, 0), "STRING[]");
         assert_eq!(decode_type_and_info(0x8123, 2), "0x8123, info 0x0002");
+    }
+
+    #[test]
+    fn raw_cip_data_dumps_as_c_prints_it() {
+        // DINT[2] = -1, 7.
+        let raw = [0xC4, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 7, 0, 0, 0];
+        assert_eq!(dump_raw_cip_data(&raw, 2), "DINT -1 7\n");
+        // INT prints unsigned, as C's CN_UINT does.
+        assert_eq!(dump_raw_cip_data(&[0xC3, 0, 0xFE, 0xFF], 1), "INT 65534\n");
+        assert_eq!(
+            dump_raw_cip_data(&[0xCA, 0, 0, 0, 0xC0, 0x3F], 1),
+            "REAL 1.500000\n"
+        );
+        let mut s = vec![0xA0, 0x02, 0xCE, 0x0F, 2, 0, 0, 0, b'h', b'i'];
+        s.resize(4 + STRUCT_STRING_STRIDE, 0);
+        assert_eq!(dump_raw_cip_data(&s, 1), "STRING 'hi'\n");
+        assert_eq!(
+            dump_raw_cip_data(&[0xC7, 0, 1, 0], 1),
+            "raw CIP data, unknown type 0x00C7: \n"
+        );
     }
 }

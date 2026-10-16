@@ -545,15 +545,43 @@ impl Connection {
     }
 
     /// Read one tag in one request. Returns the raw `[type][data]` buffer.
+    /// `EIP_read_tag`, with its failure lines.
     pub fn read_tag(&mut self, tag: &ParsedTag, elements: u16) -> Result<Vec<u8>> {
+        crate::eip_printf!(10, "EIP read tag\n");
         let mut msg = Vec::with_capacity(cip::read_data_size(tag));
         cip::encode_read_data(&mut msg, tag, elements);
 
-        let response = self.send_routed(&msg)?;
+        let response = match self.send_routed(&msg) {
+            Ok(r) => r,
+            Err(e) => {
+                match &e {
+                    EipError::Send(_) | EipError::TooLarge { .. } => {
+                        crate::eip_printf!(1, "EIP_read_tag: send failed\n")
+                    }
+                    EipError::TransactionMismatch { got, want } => crate::eip_printf!(
+                        2,
+                        "EIP_read_tag: Transaction id mismatch, got {got} expected {want}\n"
+                    ),
+                    EipError::Io(_) => crate::eip_printf!(1, "EIP_read_tag: No response\n"),
+                    _ => crate::eip_printf!(1, "EIP_read_tag: Failed tag '{tag}'\n"),
+                }
+                return Err(e);
+            }
+        };
         let n = response.len();
-        cip::check_read_data_response(&response, n)
-            .map(|d| d.to_vec())
-            .ok_or_else(|| cip_error(&response, cip::service::CIP_READ_DATA))
+        match cip::check_read_data_response(&response, n) {
+            Some(d) => {
+                if crate::EIP_VERBOSITY.load(std::sync::atomic::Ordering::Relaxed) >= 10 {
+                    crate::eip_printf!(10, "    Data =  ");
+                    crate::eip_printf!(0, "{}", cip::dump_raw_cip_data(d, usize::from(elements)));
+                }
+                Ok(d.to_vec())
+            }
+            None => {
+                crate::eip_printf!(1, "EIP_read_tag: Failed tag '{tag}'\n");
+                Err(cip_error(&response, cip::service::CIP_READ_DATA))
+            }
+        }
     }
 
     /// Write one tag in one request. `raw_data` excludes the leading type code.

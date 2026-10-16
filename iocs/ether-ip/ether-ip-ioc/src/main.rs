@@ -168,6 +168,47 @@ async fn main() -> CaResult<()> {
     app = app.register_startup_command(describe.clone());
     app = app.register_shell_command(describe);
 
+    let read_tag = CommandDef::new(
+        "drvEtherIP_read_tag",
+        vec![
+            ArgDesc {
+                name: "ip_addr",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "slot",
+                arg_type: ArgType::Int,
+            },
+            ArgDesc {
+                name: "tag_name",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "elements",
+                arg_type: ArgType::Int,
+            },
+            ArgDesc {
+                name: "timeout",
+                arg_type: ArgType::Int,
+            },
+        ],
+        "drvEtherIP_read_tag ip_addr slot tag_name elements timeout",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            let ip = string_arg(args, 0)?.unwrap_or_default();
+            let tag = string_arg(args, 2)?.unwrap_or_default();
+            driver::read_tag(
+                &ip,
+                int_arg(args, 1).unwrap_or(0) as u8,
+                &tag,
+                int_arg(args, 3).unwrap_or(0) as u16,
+                int_arg(args, 4).unwrap_or(0) as u64,
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    );
+    app = app.register_startup_command(read_tag.clone());
+    app = app.register_shell_command(read_tag);
+
     let report = CommandDef::new(
         "drvEtherIP_report",
         vec![ArgDesc {

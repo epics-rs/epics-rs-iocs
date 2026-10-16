@@ -336,6 +336,27 @@ pub fn describe(type_id: u16) {
     }
 }
 
+/// `drvEtherIP_read_tag`: a one-off connection that reads `tag_name` and
+/// dumps it. -1 when the PLC does not start up, else 0.
+pub fn read_tag(ip_addr: &str, slot: u8, tag_name: &str, elements: u16, timeout_ms: u64) -> i32 {
+    let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
+    let timeout = Duration::from_millis(timeout_ms);
+    let Ok(mut c) = Connection::startup(ip_addr, ETHERIP_PORT, slot, timeout, limit) else {
+        return -1;
+    };
+    if let Some(tag) = ParsedTag::parse(tag_name)
+        && let Ok(data) = c.read_tag(&tag, elements)
+    {
+        crate::eip_printf!(
+            0,
+            "{}",
+            cip::dump_raw_cip_data(&data, usize::from(elements))
+        );
+    }
+    c.shutdown();
+    0
+}
+
 /// Stop every scan thread (used by the IOC shutdown path and by tests).
 pub fn stop_scan_tasks() {
     for plc in all_plcs() {
@@ -878,23 +899,4 @@ pub fn report(level: i32) {
             }
         }
     }
-}
-
-/// `drvEtherIP_read_tag` -- a one-shot round-trip test, outside the scan tasks.
-pub fn read_tag_once(
-    ip: &str,
-    slot: u8,
-    tag: &str,
-    elements: u16,
-    timeout_ms: u32,
-) -> Result<Vec<u8>, EipError> {
-    let parsed = ParsedTag::parse(tag).ok_or(EipError::Malformed)?;
-    let mut c = Connection::startup(
-        ip,
-        ETHERIP_PORT,
-        slot,
-        Duration::from_millis(timeout_ms as u64),
-        BUFFER_LIMIT.load(Ordering::Relaxed) as usize,
-    )?;
-    c.read_tag(&parsed, elements)
 }
