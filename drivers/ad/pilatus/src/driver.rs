@@ -176,14 +176,13 @@ impl PortDriver for PilatusDriver {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
-        let mut status = Ok(());
-        if function == params.acquire {
-            self.ad.set_acquire(value)?;
+        // C's setIntegerParam(function, value): list 0, and its status stands
+        // unless a branch below replaces it.
+        let mut status = if function == params.acquire {
+            self.ad.set_acquire(value)
         } else {
-            self.ad
-                .port_base
-                .set_int32_param(function, user.addr, value)?;
-        }
+            self.ad.port_base.set_int32_param(function, 0, value)
+        };
 
         if function == params.acquire {
             if value != 0 && can_start {
@@ -246,10 +245,7 @@ impl PortDriver for PilatusDriver {
             .port_base
             .get_float64_param(function, 0)
             .unwrap_or(0.0);
-        let mut status = self
-            .ad
-            .port_base
-            .set_float64_param(function, user.addr, value);
+        let mut status = self.ad.port_base.set_float64_param(function, 0, value);
 
         if function == params.gain || function == p.energy || function == p.threshold {
             let auto_apply = self
@@ -278,16 +274,13 @@ impl PortDriver for PilatusDriver {
                     }
                 };
                 if let Some(v) = demanded {
-                    status = self.ad.port_base.set_float64_param(function, user.addr, v);
+                    status = self.ad.port_base.set_float64_param(function, 0, v);
                 }
                 self.send(Cmd::SetThreshold);
             } else {
                 // Put the old value back if we are deferring the threshold.
                 if function == p.threshold || function == p.energy {
-                    status = self
-                        .ad
-                        .port_base
-                        .set_float64_param(function, user.addr, old_value);
+                    status = self.ad.port_base.set_float64_param(function, 0, old_value);
                 }
             }
         } else if function == params.acquire_time
@@ -347,10 +340,7 @@ impl PortDriver for PilatusDriver {
         match &status {
             Err(e) => {
                 // C puts the old value back (pilatusDetector.cpp:1574-1580).
-                let _ = self
-                    .ad
-                    .port_base
-                    .set_float64_param(function, user.addr, old_value);
+                let _ = self.ad.port_base.set_float64_param(function, 0, old_value);
                 user.print(
                     TraceMask::ERROR,
                     file!(),
@@ -381,11 +371,12 @@ impl PortDriver for PilatusDriver {
         let payload = data.split(|&b| b == 0).next().unwrap_or(&[]);
         let value = String::from_utf8_lossy(payload).into_owned();
 
-        self.ad
+        // C's setStringParam(function, value): list 0, and its status stands
+        // unless ADDriver::writeOctet replaces it.
+        let mut status = self
+            .ad
             .port_base
-            .set_string_param(function, user.addr, value.clone())?;
-
-        let mut status = Ok(());
+            .set_string_param(function, 0, value.clone());
         if function == p.bad_pixel_file {
             self.send(Cmd::ReadBadPixelFile(value.clone()));
         } else if function == p.flat_field_file {
@@ -396,7 +387,7 @@ impl PortDriver for PilatusDriver {
             self.send(Cmd::Raw(cmd_oscill_axis(&value)));
         } else if function == p.cbf_template_file {
             self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
-        } else {
+        } else if function < p.first() {
             status = self.ad.write_octet(user, data).map(|_| ());
         }
 
@@ -591,6 +582,31 @@ mod tests {
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
         );
+    }
+
+    /// pilatusDetector.cpp:1399, :1471, :1606: the param sets are list 0
+    /// whatever the address.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let mut det = PilatusDriver::new("PILATUS_LIST0", 8, 8, 0, links).unwrap();
+        let p = det.p;
+        det.write_int32(&mut AsynUser::new(p.pixel_cutoff).with_addr(1), 3)
+            .unwrap();
+        det.write_float64(&mut AsynUser::new(p.delay_time).with_addr(1), 2.5)
+            .unwrap();
+        det.write_octet(&mut AsynUser::new(p.header_string).with_addr(1), b"h")
+            .unwrap();
+        let base = &det.ad.port_base;
+        assert_eq!(base.get_int32_param(p.pixel_cutoff, 0).unwrap(), 3);
+        assert_eq!(base.get_float64_param(p.delay_time, 0).unwrap(), 2.5);
+        assert_eq!(base.get_string_param(p.header_string, 0).unwrap(), b"h");
     }
 
     #[test]
