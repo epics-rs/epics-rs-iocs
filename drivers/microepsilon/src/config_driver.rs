@@ -270,7 +270,8 @@ impl ConfigDriver {
     }
 
     fn write_frame(&self, out: &str) -> AsynResult<()> {
-        self.handle.write_octet(TRANSPORT_REASON, out.as_bytes())?;
+        let frame = [out.as_bytes(), crate::connect::OUTPUT_EOS].concat();
+        self.handle.write_octet(TRANSPORT_REASON, &frame)?;
         Ok(())
     }
 
