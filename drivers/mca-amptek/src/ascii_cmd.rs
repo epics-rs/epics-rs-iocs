@@ -5,20 +5,10 @@
 //! `AppendCmdDesc`/`GetCmdDesc` are confirmed unreachable from
 //! `drvAmptek.cpp`'s call chain and are not ported).
 //!
-//! # Fixed (not reproduced) upstream defect
+//! # Preserved upstream quirk
 //! `AsciiCmdUtilities.h:17`: `#define Whitespace "\t\n\v\f\r\0x20"` --
-//! the trailing `\0x20` is parsed as the escape `\0` (NUL, terminates the
-//! C string literal right there) followed by the *literal* characters
-//! `x`, `2`, `0`, which never become part of the string
-//! `find_first_of`/`strlen` see. So the space character (0x20) the
-//! adjacent comment explicitly says should be stripped ("Chr$(32)") is
-//! silently never in the whitespace set C's `RemWhitespace` uses --
-//! internal spaces in a config line (e.g. `"TPEA = 12.5;"`) survive
-//! whitespace removal and get sent to the device as part of the ASCII
-//! command, which the DP5 firmware's `KEY=value;` grammar does not
-//! tolerate. `remove_whitespace` here strips the *intended* set (tab,
-//! LF, vertical tab, form feed, CR, space), matching the doc comment
-//! rather than the broken macro expansion.
+//! `\0` is a NUL that ends the literal, so the space its comment names is
+//! not in the set and `RemWhitespace` keeps spaces. Kept as C does.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -26,11 +16,11 @@ use std::path::Path;
 
 use crate::status::DppType;
 
-/// `CAsciiCmdUtilities::RemWhitespace` (`AsciiCmdUtilities.cpp:21-39`),
-/// with the space-character omission fixed -- see the module doc.
+/// `CAsciiCmdUtilities::RemWhitespace` (`AsciiCmdUtilities.cpp:21-39`):
+/// strips `\t\n\v\f\r` but not space -- see the module doc.
 fn remove_whitespace(line: &str) -> String {
     line.bytes()
-        .filter(|&b| !matches!(b, 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x20))
+        .filter(|&b| !(0x09..=0x0D).contains(&b))
         .map(|b| b as char)
         .collect()
 }
@@ -333,9 +323,9 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn remove_whitespace_strips_the_intended_set_including_space() {
-        assert_eq!(remove_whitespace("TPEA = 12.5 ;"), "TPEA=12.5;");
-        assert_eq!(remove_whitespace("A\tB\nC\x0BD\x0CE\rF G"), "ABCDEFG");
+    fn remove_whitespace_keeps_space_as_c() {
+        assert_eq!(remove_whitespace("TPEA = 12.5 ;"), "TPEA = 12.5 ;");
+        assert_eq!(remove_whitespace("A\tB\nC\x0BD\x0CE\rF G"), "ABCDEF G");
     }
 
     #[test]
@@ -347,7 +337,7 @@ mod tests {
         )
         .unwrap();
         let cfg = get_dp5_cfg_str(file.path());
-        assert_eq!(cfg, "TPEA=12.5;GAIN=100;");
+        assert_eq!(cfg, "TPEA = 12.5 ;GAIN=100;");
     }
 
     #[test]
