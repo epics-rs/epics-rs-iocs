@@ -201,7 +201,7 @@ impl NslsEmDriver {
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
         // C++ discards the connect and first-write statuses; the writeRead
         // that follows reports the failure.
-        let _ = self.command.handle().connect_addr_blocking(0);
+        let _ = self.command.handle().connect_blocking();
         let result = (|| -> AsynResult<String> {
             if out.len() > 1 {
                 let _ = self.command.write(out);
@@ -234,7 +234,7 @@ impl NslsEmDriver {
             }
             Ok(reply)
         })();
-        let _ = self.command.handle().disconnect_addr_blocking(0);
+        let _ = self.command.handle().disconnect_blocking();
         result
     }
 
