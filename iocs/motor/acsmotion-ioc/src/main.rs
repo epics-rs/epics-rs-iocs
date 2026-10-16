@@ -32,6 +32,9 @@ async fn main() -> CaResult<()> {
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
 
+    // asyn's devEpics, for SPiiPlusHoming.db.
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
     // Standard asyn iocsh commands — provides the serial/IP port configure verbs.
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);

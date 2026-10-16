@@ -19,9 +19,9 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_int,
     req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_controller_port};
 
-use crate::spiiplus::{HOME_LIMIT_INDEX, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
+use crate::spiiplus::{AcsMotionParams, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
 
 /// Command timeout (C `SPiiPlusComm` uses the asyn default; 2 s here).
 const ACSMOTION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -80,12 +80,16 @@ pub fn acsmotion_config_command() -> CommandDef {
                 OUTPUT_EOS,
                 EosRefusal::Ignored,
             )?;
-            let controller =
-                SpiiPlusController::new(handle, &port_name, num_axes, HOME_LIMIT_INDEX)
-                    .map_err(|e| format!("AcsMotionConfig: {e}"))?;
+            let controller = SpiiPlusController::new(handle, &port_name, num_axes)
+                .map_err(|e| format!("AcsMotionConfig: {e}"))?;
             let controller = Arc::new(Mutex::new(controller));
 
-            register_port(ctx, &port_name, num_axes as i32)?;
+            register_controller_port(
+                ctx.db().scan_control().interrupt_gate(),
+                &port_name,
+                num_axes as i32,
+                AcsMotionParams::new(controller.clone()),
+            )?;
             for index in 0..num_axes {
                 let is_virtual = virtual_axes.contains(&index);
                 let ax = SpiiPlusAxis::new(controller.clone(), index, is_virtual);

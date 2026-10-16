@@ -27,6 +27,8 @@ AcsMotionConfig("$(CTRL)", "$(IPPORT)", $(NUMAXES), 0.1, 1.0, "")
 
 # One motor record for axis 0.
 dbLoadRecords("$(ACSMOTION_IOC)/db/acsmotion.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+# Its homing parameters; homingMethod defaults to None, as in C.
+dbLoadRecords("$(ACSMOTION_IOC)/db/SPiiPlusHoming.db", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0,TIMEOUT=1")
 
 iocInit()
 
