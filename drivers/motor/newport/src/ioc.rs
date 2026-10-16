@@ -1889,8 +1889,7 @@ pub fn pm500_config_command() -> CommandDef {
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
-            let ax = Pm500Axis::new(controller.clone(), index)
-                .map_err(|e| format!("PM500Config: axis {index}: {e}"))?;
+            let ax = Pm500Axis::new(controller.clone(), index);
             PM500.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())

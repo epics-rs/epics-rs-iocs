@@ -37,7 +37,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -51,13 +51,6 @@ const READ_BUF: usize = 256;
 /// Axis letters, in controller channel order (C `PM500_axis_names`,
 /// `PM500_NUM_CHANNELS` 12).
 const PM500_AXIS_NAMES: [char; 12] = ['X', 'Y', 'Z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I'];
-
-fn pm_err(message: String) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message,
-    }
-}
 
 /// Controller communication state (C `cntrl->status`): one empty status
 /// reply is retried silently; a second consecutive one is a comm error.
@@ -171,25 +164,20 @@ impl Pm500Axis {
     /// → drive resolution by lookup (only the command precision survives the
     /// EGU boundary — module Units note). Performs blocking serial I/O under
     /// the controller lock.
-    pub fn new(controller: Arc<Mutex<Pm500Controller>>, index: usize) -> AsynResult<Self> {
-        let name = *PM500_AXIS_NAMES.get(index).ok_or_else(|| {
-            pm_err(format!(
-                "PM500: axis index {index} out of range 0..{}",
-                PM500_AXIS_NAMES.len()
-            ))
-        })?;
+    pub fn new(controller: Arc<Mutex<Pm500Controller>>, index: usize) -> Self {
+        let name = PM500_AXIS_NAMES[index];
         let digits = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // A failed read leaves C an empty firmware string, so resolution 0.0.
             let config = ctrl.command(&format!("{name}CONFIG?")).unwrap_or_default();
             max_digits(resolution_for_firmware(config.get(8..).unwrap_or("")))
         };
-        Ok(Self {
+        Self {
             controller,
             name,
             digits,
             last_status: MotorStatus::default(),
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Pm500Controller> {
@@ -418,7 +406,10 @@ mod tests {
             Ok(data.len())
         }
         fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
-            Err(pm_err("timeout".into()))
+            Err(epics_rs::asyn::error::AsynError::Status {
+                status: epics_rs::asyn::error::AsynStatus::Timeout,
+                message: "timeout".into(),
+            })
         }
     }
 
