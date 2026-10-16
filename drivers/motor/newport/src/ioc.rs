@@ -307,8 +307,9 @@ impl NewportHolder {
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
                 let handle = connect_serial(&serial_port, CONEX_TIMEOUT)?;
-                let axis = ConexAxis::new(handle, controller_id)
-                    .map_err(|e| format!("AG_CONEXCreateController: {e}"))?;
+                let Some(axis) = ConexAxis::new(handle, controller_id) else {
+                    return Ok(CommandOutcome::Continue);
+                };
                 let dtyp_key = format!("CONEX_{motor_port}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
 
