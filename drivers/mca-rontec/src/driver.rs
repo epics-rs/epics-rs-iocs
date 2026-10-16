@@ -86,15 +86,20 @@
 //!   request to `RONTEC_MAXCHANS`. A short reply is not an error, as in C:
 //!   it is logged and the persistent buffer is parsed anyway.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::asyn_record::{get_port, register_port};
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::runtime::config::RuntimeConfig;
+use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+use epics_rs::base::runtime::log::errlog_printf;
 
 use mca::interface::McaReason;
 
@@ -211,6 +216,19 @@ impl RontecDriver {
         Self::on_serial(port_name, entry.handle, serial_port_name, serial_port_addr)
     }
 
+    /// The tail of C `RontecConfig` (`drvMcaRontec.c:217-226`): publish the
+    /// port as `owner`'s. A refused name prints C's line and nothing fails,
+    /// because the iocsh wrapper drops `RontecConfig`'s status (`:618`).
+    pub fn register(self, owner: &Arc<InterruptGate>) {
+        let name = self.base.port_name.clone();
+        let registered = create_port_runtime(self, RuntimeConfig::default())
+            .ok()
+            .is_some_and(|(rt, _)| register_port(&name, rt.port_handle().clone(), owner).is_ok());
+        if !registered {
+            errlog_printf("RontecConfig ERROR: Can't register myself.\n");
+        }
+    }
+
     /// The part of C `RontecConfig` after the serial port is found.
     fn on_serial(
         port_name: &str,
@@ -250,7 +268,7 @@ impl RontecDriver {
         // (`drvMcaRontec.c:196-197`), status ignored.
         driver.input_eos = driver
             .serial
-            .submit_blocking(RequestOp::GetInputEos, driver.octet_user(RONTEC_TIMEOUT))
+            .submit_blocking(RequestOp::GetInputEos, driver.eos_user(RONTEC_TIMEOUT))
             .ok()
             .and_then(|r| r.data)
             .unwrap_or_default();
@@ -268,6 +286,12 @@ impl RontecDriver {
         AsynUser::new(OCTET_REASON)
             .with_addr(self.addr)
             .with_timeout(timeout)
+    }
+
+    /// C's `pasynOctetSyncIO` EOS calls take `lockPort`, which a down line
+    /// does not refuse (`asynOctetSyncIO.c:306`); `writeRead` queues and does.
+    fn eos_user(&self, timeout: Duration) -> AsynUser {
+        self.octet_user(timeout).queue_even_if_not_connected()
     }
 
     /// Which [`McaReason`] (if any) `self.reasons` resolved `idx` to.
@@ -351,7 +375,7 @@ impl RontecDriver {
         // port can run between them in both.
         let _ = self.serial.submit_blocking(
             RequestOp::SetInputEos { eos: Vec::new() },
-            self.octet_user(SPECTRUM_TIMEOUT),
+            self.eos_user(SPECTRUM_TIMEOUT),
         );
         let read_result = self.serial.submit_blocking(
             RequestOp::OctetWriteRead {
@@ -365,7 +389,7 @@ impl RontecDriver {
             RequestOp::SetInputEos {
                 eos: self.input_eos.clone(),
             },
-            self.octet_user(SPECTRUM_TIMEOUT),
+            self.eos_user(SPECTRUM_TIMEOUT),
         );
         let raw = match &read_result {
             Ok(r) => r.data.as_deref().unwrap_or_default(),
@@ -618,8 +642,6 @@ impl PortDriver for RontecDriver {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::request::RequestResult;
-    use epics_rs::asyn::runtime::config::RuntimeConfig;
-    use epics_rs::asyn::runtime::port::create_port_runtime;
 
     use super::*;
 
@@ -1081,6 +1103,68 @@ mod tests {
             .expect("get eos")
             .data;
         assert_eq!(eos.as_deref(), Some(&b"\r"[..]));
+    }
+
+    /// C `getInputEos` takes `lockPort`, so a serial line that is down at
+    /// `RontecConfig` still yields its EOS (`drvMcaRontec.c:197`).
+    #[test]
+    fn config_on_a_down_serial_line_saves_its_input_eos() {
+        let mut base = PortDriverBase::new("DOWNSER", 1, PortFlags::default());
+        base.set_auto_connect(false);
+        base.init_connected(false);
+        let (serial, _) = create_port_runtime(
+            FakeSerial {
+                base,
+                reply: rontec_reply,
+                pending: Vec::new(),
+                writes: Default::default(),
+                input_eos: b"\r".to_vec(),
+            },
+            RuntimeConfig::default(),
+        )
+        .expect("serial runtime");
+        let d = RontecDriver::on_serial("DOWNRONTEC", serial.port_handle().clone(), "DOWNSER", 0)
+            .expect("driver");
+        assert_eq!(d.input_eos, b"\r");
+    }
+
+    /// C `registerPort` refuses a taken name and `RontecConfig` prints its
+    /// line (`drvMcaRontec.c:224-226`); the command does not fail.
+    #[test]
+    fn a_duplicate_port_prints_c_cant_register_line() {
+        use epics_rs::base::runtime::log::{
+            errlog_add_listener, errlog_flush, errlog_remove_listener,
+        };
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_owned()));
+        let (serial, _) = create_port_runtime(
+            FakeSerial {
+                base: PortDriverBase::new("DUPSER", 1, PortFlags::default()),
+                reply: rontec_reply,
+                pending: Vec::new(),
+                writes: Default::default(),
+                input_eos: b"\r".to_vec(),
+            },
+            RuntimeConfig::default(),
+        )
+        .expect("serial runtime");
+        let gate = InterruptGate::opened();
+        for _ in 0..2 {
+            RontecDriver::on_serial("DUPRONTEC", serial.port_handle().clone(), "DUPSER", 0)
+                .expect("driver")
+                .register(&gate);
+        }
+        errlog_flush();
+        errlog_remove_listener(id);
+        let cant = "RontecConfig ERROR: Can't register myself.\n";
+        assert_eq!(
+            lines.lock().unwrap().iter().filter(|l| *l == cant).count(),
+            1,
+            "{:?}",
+            lines.lock().unwrap()
+        );
+        assert!(get_port("DUPRONTEC").is_some());
     }
 
     #[test]
