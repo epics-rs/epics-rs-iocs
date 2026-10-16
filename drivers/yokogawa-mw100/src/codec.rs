@@ -136,19 +136,15 @@ fn strip_trailing_zeros(s: &str) -> String {
 // static error-message table (`drvMW100.c:194-394`).
 // ---------------------------------------------------------------------
 
-/// `sscanf(inbuffer, "E1 %d %*s\r\n", &error_code) == 1` — space-separated
-/// (not GM10's comma/`:1:`-suffixed format); the trailing token is
-/// discarded, and `sscanf`'s return count is already satisfied once the
-/// leading `%d` assigns, regardless of what (if anything) follows.
+/// `sscanf(inbuffer, "E1 %d %*s\r\n", &error_code) == 1`: the format's
+/// space and `%d` both skip any whitespace (including none) and `%d`
+/// takes a sign, so only the literal `E1` and one digit are required.
 pub fn parse_error_code(payload: &str) -> Option<i32> {
-    let rest = payload.strip_prefix("E1 ")?;
-    let end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    if end == 0 {
-        return None;
+    let rest = payload.strip_prefix("E1")?;
+    match c_strtol(rest.as_bytes()) {
+        (_, 0) => None,
+        (code, _) => Some(code as i32),
     }
-    rest[..end].parse().ok()
 }
 
 #[derive(Debug)]
@@ -1598,6 +1594,12 @@ mod tests {
         assert_eq!(parse_error_code("E1 205 blah\r\n"), Some(205));
         assert_eq!(parse_error_code("E1 205\r\n"), Some(205));
         assert_eq!(parse_error_code("E0\r\n"), None);
+        // sscanf whitespace/sign leniency.
+        assert_eq!(parse_error_code("E1205\r\n"), Some(205));
+        assert_eq!(parse_error_code("E1   \t42 x\r\n"), Some(42));
+        assert_eq!(parse_error_code("E1 -7\r\n"), Some(-7));
+        assert_eq!(parse_error_code("E1 +7x\r\n"), Some(7));
+        assert_eq!(parse_error_code("E1 x\r\n"), None);
     }
 
     #[test]
