@@ -590,8 +590,9 @@ impl StatusOr {
         self.add(r);
     }
 
-    /// C's `return (asynStatus)status` with the errorMessage it formats; an
-    /// OR no `asynStatus` names (6, 7) is returned as asynError.
+    /// C's `return (asynStatus)status` with the errorMessage it formats; a
+    /// code past asynDisabled, which [`AsynStatus`] does not carry, is
+    /// returned as asynError.
     fn into_result(self, message: impl FnOnce(i32) -> String) -> AsynResult<()> {
         let status = match self.0 {
             0 => return Ok(()),
@@ -1693,6 +1694,25 @@ mod tests {
             failed_with(m.qe_write_int32(&AsynUser::new(range).with_addr(0), 1));
         assert_eq!(status, AsynStatus::Error);
         assert!(message.contains("status=6,"), "{message}");
+    }
+
+    /// drvQuadEM.cpp:424 ORs setIntegerParam's asynParamInvalidList (11) for
+    /// an address past the port's lists.
+    #[test]
+    fn a_refused_param_set_carries_cs_param_status() {
+        let mut m = FakeMeter::new(&[]);
+        let geometry = m.base.params.geometry;
+        let list = QE_MAX_DATA as i32 + 1;
+        assert_eq!(
+            failed_with(m.qe_write_int32(&AsynUser::new(geometry).with_addr(list), 1)),
+            (
+                AsynStatus::Error,
+                format!(
+                    "drvQuadEM:writeInt32: status=11, function={geometry}, \
+                     name=QE_GEOMETRY, value=1"
+                )
+            )
+        );
     }
 
     fn acquire_busy(m: &FakeMeter) -> i32 {
