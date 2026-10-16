@@ -12,10 +12,12 @@ use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
 use epics_rs::base::server::database::WriteDone;
+use epics_rs::base::server::driver_support::DriverSupport;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io;
-use std::net::{SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -1015,6 +1017,8 @@ fn ch_status_to_wire(status: ChStatus) -> u8 {
 /// One `mw100Init` entry (C `struct queue_link` plus its `devqueue`).
 struct Device {
     name: String,
+    address: Ipv4Addr,
+    cache: Arc<Mutex<Cache>>,
     /// `None` when the connect or load sequence failed.
     instrument: Option<Arc<Instrument>>,
 }
@@ -1048,15 +1052,17 @@ impl Registry {
         let Some(address) = address.and_then(inet_aton) else {
             return false;
         };
+        let cache = Arc::<Mutex<Cache>>::default();
         self.devices.lock().insert(
             0,
             Device {
                 name: name.clone(),
+                address,
+                cache: cache.clone(),
                 instrument: None,
             },
         );
-        let Ok(instrument) =
-            Instrument::connect(SocketAddrV4::new(address, PORT).into(), Arc::default())
+        let Ok(instrument) = Instrument::connect(SocketAddrV4::new(address, PORT).into(), cache)
         else {
             return false;
         };
@@ -1082,6 +1088,8 @@ impl Registry {
             0,
             Device {
                 name: name.to_string(),
+                address: Ipv4Addr::LOCALHOST,
+                cache: instrument.cache.clone(),
                 instrument: Some(instrument),
             },
         );
@@ -1097,6 +1105,33 @@ fn valid_device_name(name: &[u8]) -> bool {
                 && rest.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_')
         }
         None => false,
+    }
+}
+
+/// `mw100_report` (`drvMW100.c:459-505`).
+impl DriverSupport for Registry {
+    fn report(&self, level: i32) -> Option<String> {
+        let mut out = String::new();
+        for (cnt, device) in self.devices.lock().iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "    Yokogawa MW100 #{}: {} @ {}",
+                cnt + 1,
+                device.name,
+                device.address
+            );
+            if level != 0 {
+                out.push_str("        Modules:\n");
+                for (i, module) in device.cache.lock().modules.iter().take(6).enumerate() {
+                    if module.use_flag {
+                        let _ = writeln!(out, "        #{}: {}", i + 1, module.module_string);
+                    } else {
+                        let _ = writeln!(out, "        #{}: empty", i + 1);
+                    }
+                }
+            }
+        }
+        Some(out)
     }
 }
 
@@ -1432,7 +1467,7 @@ mod tests {
         }
         assert!(!registry.init_mw100(Some(b"dau1"), None));
         assert!(!registry.init_mw100(Some(b"dau1"), Some(b"localhost")));
-        assert!(registry.devices.lock().is_empty());
+        assert_eq!(registry.report(1).as_deref(), Some(""));
     }
 
     #[test]
@@ -1441,7 +1476,10 @@ mod tests {
         registry.insert_connected("dau1", connect_default_fixture());
         // Nothing listens at 192.0.2.1 (TEST-NET-1); a connect would hang.
         assert!(!registry.init_mw100(Some(b"dau1"), Some(b"192.0.2.1")));
-        assert_eq!(registry.devices.lock().len(), 1);
+        assert_eq!(
+            registry.report(0).as_deref(),
+            Some("    Yokogawa MW100 #1: dau1 @ 127.0.0.1\n")
+        );
     }
 
     #[test]
@@ -1461,12 +1499,24 @@ mod tests {
 
         assert!(registry.get("dau2").is_none());
         assert!(!registry.init_mw100(Some(b"dau2"), Some(b"192.0.2.1")));
-        let names: Vec<_> = registry
-            .devices
-            .lock()
-            .iter()
-            .map(|d| d.name.clone())
-            .collect();
-        assert_eq!(names, ["dau2", "first"]);
+        assert_eq!(
+            registry.report(1).unwrap(),
+            "    Yokogawa MW100 #1: dau2 @ 127.0.0.2\n\
+             \x20       Modules:\n\
+             \x20       #1: MX110-UNV-M06\n\
+             \x20       #2: empty\n\
+             \x20       #3: empty\n\
+             \x20       #4: empty\n\
+             \x20       #5: empty\n\
+             \x20       #6: empty\n\
+             \x20   Yokogawa MW100 #2: first @ 127.0.0.1\n\
+             \x20       Modules:\n\
+             \x20       #1: MX110-UNV-M06\n\
+             \x20       #2: empty\n\
+             \x20       #3: empty\n\
+             \x20       #4: empty\n\
+             \x20       #5: empty\n\
+             \x20       #6: empty\n"
+        );
     }
 }

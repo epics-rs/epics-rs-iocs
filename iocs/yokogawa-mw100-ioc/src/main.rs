@@ -6,7 +6,8 @@
 //! `mw100Init` startup command mirrors the C `mw100Init(netDevice, address)`
 //! iocsh command: it registers `netDevice` in the shared `Registry` and
 //! connects it; every record's `@netDevice CMD:ADDRESS` link resolves
-//! against that registry at `iocInit`.
+//! against that registry at `iocInit`, and `dbior` reports it as
+//! `drvMW100`.
 //!
 //! Usage:
 //!   cargo run -p yokogawa-mw100-ioc -- st.cmd
@@ -14,6 +15,7 @@
 use std::sync::Arc;
 
 use epics_rs::base::error::CaResult;
+use epics_rs::base::server::driver_support::register_driver_support;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -31,6 +33,7 @@ async fn main() -> CaResult<()> {
     };
 
     let registry = Arc::new(Registry::new());
+    register_driver_support("drvMW100", registry.clone());
     let init_registry = registry.clone();
 
     epics_rs::base::runtime::env::set_default("MW100", env!("CARGO_MANIFEST_DIR"));
