@@ -209,7 +209,7 @@ impl PortDriver for PilatusDriver {
                 self.send(Cmd::ReadStatus);
             }
         } else if function < p.first() {
-            status = self.ad.write_int32_pool(function, value).map(|_| ());
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -543,6 +543,34 @@ pub fn create_pilatus_detector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let mut det = PilatusDriver::new("PILATUS_BASE_WRITE", 8, 8, 0, links).unwrap();
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
 
     #[test]
     fn a_pair_write_sends_zero_for_its_unset_partner() {
