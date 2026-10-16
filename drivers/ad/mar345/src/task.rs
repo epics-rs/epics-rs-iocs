@@ -407,6 +407,20 @@ impl Worker {
     }
 }
 
+/// C runs `mar345::setShutter` (mar345.cpp:361-399) on the `writeInt32`
+/// caller; here it runs on a thread with its own marServer handle, so the
+/// port thread never waits on its own request queue.
+pub(crate) fn start_shutter_task(
+    mut server: Server,
+    mut rx: rt::CommandReceiver<bool>,
+) -> std::thread::JoinHandle<()> {
+    rt::run_thread_named("mar345Shutter", move || async move {
+        while let Some(open) = rx.recv().await {
+            server.set_shutter(open).await;
+        }
+    })
+}
+
 /// Spawn the `mar345Task` worker thread.
 pub(crate) fn start_task(w: Worker) -> std::thread::JoinHandle<()> {
     rt::run_thread_named("mar345Task", move || w.run())

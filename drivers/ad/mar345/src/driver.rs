@@ -26,11 +26,12 @@ use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
+use epics_rs::ad_core::runtime as rt;
 use parking_lot::Mutex;
 
 use crate::params::Mar345Params;
 use crate::server::Server;
-use crate::task::{Worker, start_task};
+use crate::task::{Worker, start_shutter_task, start_task};
 use crate::types::{EraseMode, Event, Mode, Resolution, ScanSize, Status, TriggerMode};
 
 /// The maximum image plate dimension (345 mm at 0.10 mm), C's `dims[0/1]` and
@@ -48,6 +49,8 @@ pub struct Mar345Driver {
     abort: Arc<Event>,
     /// C `mar345Mode_t mode`, shared with the worker.
     mode: Arc<AtomicI32>,
+    /// `mar345::setShutter` requests for the shutter thread.
+    shutter: rt::CommandSender<bool>,
     /// C `pData` (mar345.cpp:741-747): allocated once and never read, so it
     /// stays charged on the pool for the driver's life.
     _raw_buffer: Option<DriverArray>,
@@ -59,6 +62,7 @@ struct DriverLinks {
     stop: Arc<Event>,
     abort: Arc<Event>,
     mode: Arc<AtomicI32>,
+    shutter: rt::CommandSender<bool>,
 }
 
 impl Mar345Driver {
@@ -103,6 +107,7 @@ impl Mar345Driver {
             stop: links.stop,
             abort: links.abort,
             mode: links.mode,
+            shutter: links.shutter,
             _raw_buffer: raw_buffer.ok(),
         })
     }
@@ -163,8 +168,7 @@ impl PortDriver for Mar345Driver {
                 self.abort.signal();
             }
         } else if function < p.first() {
-            // Base-class parameter: pool controls plus plain stores.
-            status = self.ad.write_int32_pool(function, value).map(|_| ());
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -196,6 +200,11 @@ impl ADDriver for Mar345Driver {
 
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
+    }
+
+    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+        let _ = self.shutter.try_send(open);
+        Ok(())
     }
 }
 
@@ -250,6 +259,7 @@ pub fn create_mar345_detector(
     let stop = Arc::new(Event::new());
     let abort = Arc::new(Event::new());
     let mode = Arc::new(AtomicI32::new(Mode::Idle as i32));
+    let (shutter, shutter_rx) = rt::command_channel::<bool>(16);
     let acq_start = Arc::new(AtomicU64::new(0));
 
     let driver = Mar345Driver::new(
@@ -260,6 +270,7 @@ pub fn create_mar345_detector(
             stop: stop.clone(),
             abort: abort.clone(),
             mode: mode.clone(),
+            shutter,
         },
     )
     .map_err(|e| format!("failed to create mar345 driver: {e}"))?;
@@ -273,6 +284,7 @@ pub fn create_mar345_detector(
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
 
+    let shutter_server = Server::new(handle.clone(), server_handle.clone(), ad_params);
     let server = Server::new(handle, server_handle, ad_params);
     let worker = Worker {
         server,
@@ -285,7 +297,10 @@ pub fn create_mar345_detector(
         output: ArrayPublisher::new(array_output.clone()),
         pool: pool.clone(),
     };
-    let tasks = vec![start_task(worker)];
+    let tasks = vec![
+        start_task(worker),
+        start_shutter_task(shutter_server, shutter_rx),
+    ];
 
     Ok(Mar345Runtime {
         runtime_handle,
@@ -310,9 +325,66 @@ mod tests {
                 stop: Arc::new(Event::new()),
                 abort: Arc::new(Event::new()),
                 mode: Arc::new(AtomicI32::new(0)),
+                shutter: rt::command_channel::<bool>(1).0,
             },
         )
         .unwrap()
+    }
+
+    /// ADDriver.cpp:96-98 calls the virtual setShutter, which mar345
+    /// overrides to drive a detector shutter through marServer (:372-388).
+    #[test]
+    fn shutter_control_reaches_mar345s_set_shutter() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+
+        let name = "MAR345_SHUTTER";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(String::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            while let Ok(n @ 1..) = stream.read(&mut buf) {
+                seen.lock().push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let ip = format!("{name}_IP");
+        let claim = claim_port(&ip).unwrap();
+        let (ip_runtime, _) = create_port_runtime(
+            &claim,
+            DrvAsynIPPort::new(&ip, &addr).unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(ip_runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        std::mem::forget(ip_runtime);
+
+        let det = create_mar345_detector(&claim_port(name).unwrap(), &ip, 0).unwrap();
+        let (h, ad) = (det.port_handle(), det.ad_params);
+        h.write_int32_blocking(ad.shutter_mode, 0, ShutterMode::DetectorOnly as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.shutter_control, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !log.lock().contains("COMMAND SHUTTER OPEN") {
+            assert!(
+                Instant::now() < deadline,
+                "the open never reached marServer"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        while h.read_int32_blocking(ad.shutter_status, 0).unwrap() != 1 {
+            assert!(Instant::now() < deadline, "ADShutterStatus stayed closed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::mem::forget(det);
     }
 
     #[test]
