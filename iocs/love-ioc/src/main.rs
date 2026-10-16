@@ -166,24 +166,37 @@ async fn main() -> CaResult<()> {
                     _ => return Err("serAddr required".into()),
                 };
 
-                let port = init_serial_port(&ser_port, ser_addr)
-                    .map_err(|e| format!("drvLoveInit: {e}"))?;
+                // C drvLoveInit prints each failure and returns -1 without
+                // iocshSetError (drvLove.c:354-381).
+                let port = match init_serial_port(&ser_port, ser_addr) {
+                    Ok(port) => port,
+                    Err(line) => {
+                        ctx.println(&line);
+                        ctx.println(&format!(
+                            "drvLoveInit::failure to initialize serial port {ser_port}"
+                        ));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
                 let handle = SyncIOHandle::from_handle(port.clone(), ser_addr, COMMAND_TIMEOUT);
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
-                let driver = LoveDriver::new(&lov_port, &ser_port, handle, models.clone())
-                    .map_err(|e| format!("drvLoveInit: failed to initialize {lov_port}: {e}"))?;
+                let registered = LoveDriver::new(&lov_port, &ser_port, handle, models.clone())
+                    .and_then(|driver| create_port_runtime(driver, RuntimeConfig::default()))
+                    .and_then(|(runtime_handle, _actor_jh)| {
+                        epics_rs::asyn::asyn_record::register_port(
+                            &lov_port,
+                            runtime_handle.port_handle().clone(),
+                            ctx.db().scan_control().interrupt_gate(),
+                        )
+                    });
+                if registered.is_err() {
+                    ctx.println(&format!(
+                        "drvLoveInit::failure to register love port {lov_port}"
+                    ));
+                    return Ok(CommandOutcome::Continue);
+                }
                 love::registry::register(&lov_port, models);
-
-                let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("drvLoveInit: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &lov_port,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
 
                 // C `setDefaultEos` (drvLove.c:640-660).
                 let (lines, ok) = set_default_eos(&port, ser_addr, INPUT_EOS, OUTPUT_EOS);
@@ -218,7 +231,7 @@ async fn main() -> CaResult<()> {
                 },
             ],
             "drvLoveConfig lovPort addr model",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
+            move |args: &[ArgValue], ctx: &CommandContext| {
                 let lov_port = match &args[0] {
                     ArgValue::String(s) => s.to_str()?.to_owned(),
                     _ => return Err("lovPort required".into()),
@@ -232,12 +245,20 @@ async fn main() -> CaResult<()> {
                     _ => return Err("model required".into()),
                 };
 
-                let table = love::registry::lookup(&lov_port)
-                    .ok_or_else(|| format!("drvLoveConfig::failure to locate port {lov_port}"))?;
-                let model = Model::parse(&model_str)
-                    .ok_or_else(|| format!("drvLoveConfig::unsupported model \"{model_str}\""))?;
+                // C drvLoveConfig prints and returns -1 without iocshSetError
+                // (drvLove.c:458-480).
+                let Some(table) = love::registry::lookup(&lov_port) else {
+                    ctx.println(&format!("drvLoveConfig::failure to locate port {lov_port}"));
+                    return Ok(CommandOutcome::Continue);
+                };
+                let Some(model) = Model::parse(&model_str) else {
+                    ctx.println(&format!("drvLoveConfig::unsupported model \"{model_str}\""));
+                    return Ok(CommandOutcome::Continue);
+                };
+                // C indexes instr[addr-1] unchecked.
                 if !(1..=K_INSTRMAX as i32).contains(&addr) {
-                    return Err(format!("drvLoveConfig: addr {addr} out of range"));
+                    ctx.println(&format!("drvLoveConfig: addr {addr} out of range"));
+                    return Ok(CommandOutcome::Continue);
                 }
                 table.lock().unwrap()[(addr - 1) as usize] = model;
 
