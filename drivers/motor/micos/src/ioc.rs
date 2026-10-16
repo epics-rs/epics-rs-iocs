@@ -7,7 +7,8 @@
 //! `drvAsynIPPort` or a `drvAsynSerialPort`, so `connect_ip` is used (the lookup
 //! is transport-agnostic).
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
@@ -15,7 +16,8 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
+    arg_double_req, arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_double, req_int,
+    req_string,
 };
 use motor_common::{asyn_user, install, register_port};
 
@@ -31,6 +33,81 @@ const HYDRA_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Taurus command timeout.
 const TAURUS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// An axis whose C `axisRes_` a `*ChangeResolution` command replaces.
+trait ChangeResolution: Send {
+    fn change_resolution(&mut self, new_resolution: f64);
+}
+
+impl ChangeResolution for CorvusAxis {
+    fn change_resolution(&mut self, new_resolution: f64) {
+        CorvusAxis::change_resolution(self, new_resolution);
+    }
+}
+
+type ResolutionAxes = HashMap<String, Vec<Arc<Mutex<dyn ChangeResolution>>>>;
+
+/// The axes of every controller port, as C's `findAsynPortDriver` +
+/// `getAxis` reach them.
+fn resolution_axes() -> &'static Mutex<ResolutionAxes> {
+    static AXES: OnceLock<Mutex<ResolutionAxes>> = OnceLock::new();
+    AXES.get_or_init(Default::default)
+}
+
+fn register_resolution_axis(port: &str, axis: Arc<Mutex<dyn ChangeResolution>>) {
+    resolution_axes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(port.to_owned())
+        .or_default()
+        .push(axis);
+}
+
+/// C `<name>(portName, axisNo, newResolution)`; `source` is the C file its
+/// not-found line names.
+fn change_resolution_command(
+    name: &'static str,
+    port_arg: &'static str,
+    source: &'static str,
+) -> CommandDef {
+    CommandDef::new(
+        name,
+        vec![
+            arg_str_req(port_arg),
+            arg_int_req("Axis number"),
+            arg_double_req("Axis resolution"),
+        ],
+        format!("{name}(portName, axisNo, newResolution)"),
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port = req_string(args, 0, port_arg)?;
+            let axis_no = req_int(args, 1, "Axis number")?;
+            let new_resolution = req_double(args, 2, "Axis resolution")?;
+            let axes = resolution_axes().lock().unwrap_or_else(|e| e.into_inner());
+            let Some(axes) = axes.get(&port) else {
+                println!("{source}:{name}: Error port {port} not found");
+                return Ok(CommandOutcome::Continue);
+            };
+            let axis = usize::try_from(axis_no)
+                .ok()
+                .and_then(|i| axes.get(i))
+                .ok_or_else(|| format!("{name}: no axis {axis_no} on port {port}"))?;
+            axis.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .change_resolution(new_resolution);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Build the `SMCcorvusChangeResolution(portName, axisNo, newResolution)`
+/// command.
+pub fn corvus_change_resolution_command() -> CommandDef {
+    change_resolution_command(
+        "SMCcorvusChangeResolution",
+        "SMC corvus port name",
+        "SMCcorvusDriver.cpp",
+    )
+}
 
 /// Build the `SMCcorvusCreateController(portName, SMCcorvusPortName, numAxes,
 /// movingPollPeriod, idlePollPeriod)` command, periods in ms.
@@ -70,7 +147,9 @@ pub fn corvus_create_controller_command() -> CommandDef {
             for index in 0..num_axes as usize {
                 let ax = CorvusAxis::new(controller.clone(), index)
                     .map_err(|e| format!("SMCcorvusCreateController: axis {index}: {e}"))?;
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+                let ax = Arc::new(Mutex::new(ax));
+                register_resolution_axis(&port_name, ax.clone());
+                let motor: Arc<Mutex<dyn AsynMotor>> = ax;
                 install(
                     ctx,
                     asyn_user(&port_name, index as i32),
