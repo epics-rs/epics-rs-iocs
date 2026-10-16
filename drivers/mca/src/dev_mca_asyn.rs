@@ -26,7 +26,7 @@ use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, ReadStart,
 };
 use epics_rs::base::server::record::{
-    DbLinkType, DevSup, Dset, ProcessContext, Record, ScanType, register_dbd_devices,
+    DbLinkType, DevSup, Dset, Record, ScanType, register_dbd_devices,
 };
 use epics_rs::base::types::{EpicsValue, SharedArray};
 
@@ -42,7 +42,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
 use mca_rs::record::{
-    McaCommand, McaDset, McaRead, McaRecord, McaStart, McaStatus, Nack, Sent, StampSource, commands,
+    McaCommand, McaDset, McaRead, McaRecord, McaStart, McaStatus, Nack, Sent, commands,
 };
 
 use crate::interface::{ASYN_MCA_DTYP, McaReason};
@@ -57,8 +57,6 @@ pub struct DevMcaAsyn {
     /// `None` until `init` connects, and for good after it fails: C leaves
     /// that record in PACT (`devMcaAsyn.c:208-210`), so it never processes.
     port: Option<McaPort>,
-    /// This cycle's `TSE`/`TIME`, for the record's read-start stamp.
-    clock: StampSource,
 }
 
 /// The port side of `mcaAsynPvt` (`devMcaAsyn.c:38-56`): where C's
@@ -147,7 +145,6 @@ impl DevMcaAsyn {
             inp: inp.to_owned(),
             name: String::new(),
             port: None,
-            clock: StampSource::default(),
         }
     }
 
@@ -562,7 +559,6 @@ impl DeviceSupport for DevMcaAsyn {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        let clock = self.clock;
         let Some(port) = self.port.as_mut() else {
             return Ok(ReadStart::Synchronous);
         };
@@ -573,7 +569,7 @@ impl DeviceSupport for DevMcaAsyn {
             .handle
             .can_block()
             .then(|| (done.device_done(), done.priority()));
-        Ok(match mca.begin_device_cycle(port, clock, done.again()) {
+        Ok(match mca.begin_device_cycle(port, done.again()) {
             McaStart::Synchronous => ReadStart::Synchronous,
             McaStart::Pending => ReadStart::Pending,
             McaStart::Reentered => ReadStart::Reentered,
@@ -583,10 +579,6 @@ impl DeviceSupport for DevMcaAsyn {
     /// `read_begin` ran the whole device half.
     fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         Ok(DeviceReadOutcome::ok())
-    }
-
-    fn set_process_context(&mut self, ctx: &ProcessContext) {
-        self.clock = ctx.into();
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -646,7 +638,7 @@ fn mca_device_support(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSuppor
         return None;
     }
     match ctx.dtyp {
-        SOFT_MCA_DTYP => Some(Box::new(mca_rs::SoftMca::default())),
+        SOFT_MCA_DTYP => Some(Box::new(mca_rs::SoftMca)),
         ASYN_MCA_DTYP => Some(Box::new(DevMcaAsyn::new(ctx.inp))),
         _ => None,
     }
@@ -862,11 +854,10 @@ mod tests {
         fn cycle(&mut self) {
             fn pass(rec: &mut McaRecord, port: &mut McaPort) {
                 port.reads.nuse.store(rec.nuse, Ordering::Relaxed);
-                let clock = StampSource::default();
-                let mut start = rec.begin_device_cycle(port, clock, false);
+                let mut start = rec.begin_device_cycle(port, false);
                 while start == McaStart::Reentered {
                     pass(rec, port);
-                    start = rec.begin_device_cycle(port, clock, true);
+                    start = rec.begin_device_cycle(port, true);
                 }
             }
             pass(&mut self.rec, self.dev.port.as_mut().unwrap());
