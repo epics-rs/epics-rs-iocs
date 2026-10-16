@@ -95,7 +95,7 @@ pub enum OctetError {
 }
 
 impl OctetError {
-    /// The numeric code the C parser puts in its "Error: <n>" reply.
+    /// The numeric code the C parser puts in its `"Error: <n>"` reply.
     pub fn code(&self) -> i32 {
         match self {
             Self::BadAdsPort(_) => ERROR_OCTET_ADSPORT_OPTION_FAIL,

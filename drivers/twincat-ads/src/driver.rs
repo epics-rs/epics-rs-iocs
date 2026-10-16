@@ -11,7 +11,7 @@
 //!   change) or by the sum-up bulk read (`POLL_RATE=`, one round trip for up to
 //!   500 variables).
 //!
-//! Values decoded off the wire are cached in [`ParamState`] and pushed to
+//! Values decoded off the wire are cached in `ParamState` and pushed to
 //! records as I/O Intr interrupts tagged with the record's own asyn interface,
 //! so a `REAL` array reaches an `asynFloat32ArrayIn` waveform as `f32`s and a
 //! `LREAL` reaches an `ai` as `f64` — the pairing matrix lives in
