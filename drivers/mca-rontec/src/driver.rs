@@ -268,7 +268,7 @@ impl RontecDriver {
         // (`drvMcaRontec.c:196-197`), status ignored.
         driver.input_eos = driver
             .serial
-            .submit_blocking(RequestOp::GetInputEos, driver.octet_user(RONTEC_TIMEOUT))
+            .submit_blocking(RequestOp::GetInputEos, driver.eos_user(RONTEC_TIMEOUT))
             .ok()
             .and_then(|r| r.data)
             .unwrap_or_default();
@@ -286,6 +286,12 @@ impl RontecDriver {
         AsynUser::new(OCTET_REASON)
             .with_addr(self.addr)
             .with_timeout(timeout)
+    }
+
+    /// C's `pasynOctetSyncIO` EOS calls take `lockPort`, which a down line
+    /// does not refuse (`asynOctetSyncIO.c:306`); `writeRead` queues and does.
+    fn eos_user(&self, timeout: Duration) -> AsynUser {
+        self.octet_user(timeout).queue_even_if_not_connected()
     }
 
     /// Which [`McaReason`] (if any) `self.reasons` resolved `idx` to.
@@ -369,7 +375,7 @@ impl RontecDriver {
         // port can run between them in both.
         let _ = self.serial.submit_blocking(
             RequestOp::SetInputEos { eos: Vec::new() },
-            self.octet_user(SPECTRUM_TIMEOUT),
+            self.eos_user(SPECTRUM_TIMEOUT),
         );
         let read_result = self.serial.submit_blocking(
             RequestOp::OctetWriteRead {
@@ -383,7 +389,7 @@ impl RontecDriver {
             RequestOp::SetInputEos {
                 eos: self.input_eos.clone(),
             },
-            self.octet_user(SPECTRUM_TIMEOUT),
+            self.eos_user(SPECTRUM_TIMEOUT),
         );
         let raw = match &read_result {
             Ok(r) => r.data.as_deref().unwrap_or_default(),
@@ -1097,6 +1103,29 @@ mod tests {
             .expect("get eos")
             .data;
         assert_eq!(eos.as_deref(), Some(&b"\r"[..]));
+    }
+
+    /// C `getInputEos` takes `lockPort`, so a serial line that is down at
+    /// `RontecConfig` still yields its EOS (`drvMcaRontec.c:197`).
+    #[test]
+    fn config_on_a_down_serial_line_saves_its_input_eos() {
+        let mut base = PortDriverBase::new("DOWNSER", 1, PortFlags::default());
+        base.set_auto_connect(false);
+        base.init_connected(false);
+        let (serial, _) = create_port_runtime(
+            FakeSerial {
+                base,
+                reply: rontec_reply,
+                pending: Vec::new(),
+                writes: Default::default(),
+                input_eos: b"\r".to_vec(),
+            },
+            RuntimeConfig::default(),
+        )
+        .expect("serial runtime");
+        let d = RontecDriver::on_serial("DOWNRONTEC", serial.port_handle().clone(), "DOWNSER", 0)
+            .expect("driver");
+        assert_eq!(d.input_eos, b"\r");
     }
 
     /// C `registerPort` refuses a taken name and `RontecConfig` prints its
