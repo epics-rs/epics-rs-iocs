@@ -63,7 +63,7 @@ pub fn pigcs2_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 b"",
                 EosRefusal::BothFatal,
             )?;
-            let controller = PIGCS2Controller::new(handle)
+            let controller = PIGCS2Controller::new(handle, &asyn_port)
                 .map_err(|e| format!("PIGCS2CreateController: {e}"))?;
             let ident = controller.ident().to_string();
             let found: Vec<String> = controller.axis_names().to_vec();
