@@ -33,7 +33,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
-use motor_common::connect::{EosRefusal, connect_with_eos};
+use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -1491,7 +1491,14 @@ impl NewportHolder {
                     esp300::INPUT_EOS,
                     esp300::OUTPUT_EOS,
                     EosRefusal::InputFatal,
-                )?;
+                )
+                .map_err(|e| match e {
+                    EosConnectError::InputEos(_, e) => format!(
+                        "drvESP300.c:motor_init: ASYN setInputEos error = {}",
+                        e.status() as i32
+                    ),
+                    e => e.into(),
+                })?;
                 let controller = Esp300Controller::new(handle)
                     .map_err(|e| format!("ESP300CreateController: {e}"))?;
                 let ident = controller.ident().to_string();

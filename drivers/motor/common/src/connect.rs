@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -54,6 +55,34 @@ pub enum EosRefusal {
     BothFatal,
 }
 
+/// Why [`connect_with_eos`] failed, step by step, so a driver whose C prints
+/// its own message for a refused EOS (drvESP300.cc:687) can print it.
+#[derive(Debug)]
+pub enum EosConnectError {
+    PortNotFound(String),
+    InputEos(String, AsynError),
+    OutputEos(String, AsynError),
+}
+
+impl std::fmt::Display for EosConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PortNotFound(port) => write!(
+                f,
+                "octet port '{port}' not found (call drvAsynSerialPortConfigure or drvAsynIPPortConfigure first)"
+            ),
+            Self::InputEos(port, e) => write!(f, "unable to set input EOS on {port}: {e}"),
+            Self::OutputEos(port, e) => write!(f, "unable to set output EOS on {port}: {e}"),
+        }
+    }
+}
+
+impl From<EosConnectError> for String {
+    fn from(e: EosConnectError) -> Self {
+        e.to_string()
+    }
+}
+
 /// Connect to a pre-configured octet port by name and set the EOS the C
 /// driver sets on its `pasynUser` right after `pasynOctetSyncIO->connect`, so
 /// the wire framing does not depend on st.cmd. EOS lives on the port (per
@@ -64,20 +93,19 @@ pub fn connect_with_eos(
     input_eos: &[u8],
     output_eos: &[u8],
     refusal: EosRefusal,
-) -> Result<SyncIOHandle, String> {
-    let port = get_port(port_name).ok_or_else(|| {
-        format!("octet port '{port_name}' not found (call drvAsynSerialPortConfigure or drvAsynIPPortConfigure first)")
-    })?;
+) -> Result<SyncIOHandle, EosConnectError> {
+    let port =
+        get_port(port_name).ok_or_else(|| EosConnectError::PortNotFound(port_name.to_string()))?;
     let user = || AsynUser::new(0).with_addr(SERIAL_ADDR);
     let set_input = || {
         port.handle
             .set_input_eos_blocking(user(), input_eos)
-            .map_err(|e| format!("unable to set input EOS on {port_name}: {e}"))
+            .map_err(|e| EosConnectError::InputEos(port_name.to_string(), e))
     };
     let set_output = || {
         port.handle
             .set_output_eos_blocking(user(), output_eos)
-            .map_err(|e| format!("unable to set output EOS on {port_name}: {e}"))
+            .map_err(|e| EosConnectError::OutputEos(port_name.to_string(), e))
     };
     match refusal {
         EosRefusal::Ignored => {
@@ -144,7 +172,9 @@ mod tests {
 
     /// The create's verdict: `Ok(())` when it connected.
     fn connect(port: &str, refusal: EosRefusal) -> Result<(), String> {
-        connect_with_eos(port, Duration::from_secs(1), b"\n", b"\r", refusal).map(drop)
+        connect_with_eos(port, Duration::from_secs(1), b"\n", b"\r", refusal)
+            .map(drop)
+            .map_err(String::from)
     }
 
     #[test]
