@@ -284,6 +284,8 @@ struct Shared {
 pub struct FastSweepDriver {
     base: PortDriverBase,
     shared: Arc<Shared>,
+    /// C `inputName_`.
+    input_name: String,
 }
 
 /// The upstream interrupt subscriptions [`FastSweepDriver::connect`] sets up,
@@ -382,6 +384,7 @@ impl FastSweepDriver {
         let driver = FastSweepDriver {
             base,
             shared: Arc::clone(&shared),
+            input_name: input_port_name.to_owned(),
         };
         let subscriptions = FastSweepSubscriptions {
             data,
@@ -485,6 +488,36 @@ impl PortDriver for FastSweepDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C `report` (`drvFastSweep.cpp:360-370`). The `asynPortDriver::report`
+    /// it chains to is reproduced only as far as `PortDriverBase` exposes it:
+    /// the port line and the parameter list.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "fastSweep {}: connected, input={}",
+            self.base.port_name, self.input_name
+        );
+        if level >= 1 {
+            let state = self.shared.state.lock().unwrap();
+            let _ = writeln!(
+                out,
+                "    maxPoints={}, maxSignals={}, numAverage={}, numPoints={}, \
+                 numAcquired={}, elapsedTime={:.6}, acquring_={}",
+                state.max_points,
+                state.max_signals,
+                state.num_average,
+                state.num_points,
+                state.num_acquired,
+                state.elapsed_time,
+                i32::from(state.acquiring)
+            );
+        }
+        let _ = writeln!(out, "Port: {}", self.base.port_name);
+        if level >= 1 {
+            self.base.report_params(out, level);
+        }
     }
 
     /// C `writeInt32` (`drvFastSweep.cpp:292-325`).
@@ -781,6 +814,27 @@ mod tests {
         assert!(flags.multi_device && !flags.can_block && !flags.destructible);
         assert!(subscriptions.data.is_none());
         assert!(subscriptions.interval.is_none());
+    }
+
+    /// C `report`'s two lines (`drvFastSweep.cpp:362-367`).
+    #[test]
+    fn report_prints_the_c_lines() {
+        let (driver, _subscriptions) =
+            FastSweepDriver::connect("FSTESTREPORT", "FSTESTNOSUCHPORT", 2, 8, "", "").unwrap();
+        let mut out = String::new();
+        driver.report(&mut out, 1);
+        let mut lines = out.lines();
+        assert_eq!(
+            lines.next(),
+            Some("fastSweep FSTESTREPORT: connected, input=FSTESTNOSUCHPORT")
+        );
+        assert_eq!(
+            lines.next(),
+            Some(
+                "    maxPoints=8, maxSignals=2, numAverage=1, numPoints=0, \
+                 numAcquired=0, elapsedTime=0.000000, acquring_=0"
+            )
+        );
     }
 
     /// C `nextPoint`'s per-signal write + always-publish current channel /
