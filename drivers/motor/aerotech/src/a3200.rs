@@ -58,9 +58,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi, atol};
@@ -126,15 +128,28 @@ fn fmt(v: f64) -> String {
 /// mutex so command/reply pairs stay atomic (C `sendReceiveMutex`).
 pub struct A3200Controller {
     handle: SyncIOHandle,
+    /// The octet port `pController->pasynUser` prints on.
+    serial_port: String,
+    /// The motor port whose axis-0 user C's `PRINT(pAxis[0].logParam)`
+    /// lines go to.
+    motor_port: String,
     task_number: u32,
     linear: bool,
 }
 
 impl A3200Controller {
     /// Wrap a connected octet handle with the motion task number and move mode.
-    pub fn new(handle: SyncIOHandle, task_number: u32, linear: bool) -> Self {
+    pub fn new(
+        handle: SyncIOHandle,
+        serial_port: &str,
+        motor_port: &str,
+        task_number: u32,
+        linear: bool,
+    ) -> Self {
         Self {
             handle,
+            serial_port: serial_port.to_owned(),
+            motor_port: motor_port.to_owned(),
             task_number,
             linear,
         }
@@ -144,15 +159,66 @@ impl A3200Controller {
         Ok(trim_line(&self.handle.read_octet(0, READ_BUF)?))
     }
 
-    /// Write a command and read one reply line.
+    /// Write a command and read one reply line (C `sendAndReceive`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        // C sendAndReceive: pasynOctetSyncIO->writeRead; plain reads follow
-        // only for the value line after a bare ACK.
-        Ok(trim_line(&self.handle.write_read(
+        let mut result = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
+        if let Err(e) = &result {
+            let written = match e.octet_step() {
+                Some(OctetStep::Read) => cmd.len(),
+                _ => e.partial_write().unwrap_or(0),
+            };
+            if written != cmd.len() {
+                result = Err(a3200_err(e.message()));
+            } else if e.status() == AsynStatus::Timeout {
+                let mut retry = 1;
+                while retry <= 3 && matches!(&result, Err(e) if e.status() == AsynStatus::Timeout) {
+                    self.print_axis0(format_args!(
+                        "drvA3200Asyn:sendAndReceive: Retrying read, retry# = {retry}.\n"
+                    ));
+                    result = self.handle.read_octet(0, READ_BUF);
+                    retry += 1;
+                }
+                // C counts a success on the third retry as exhausted.
+                if retry > 3 {
+                    self.print_axis0(format_args!(
+                        "drvA3200Asyn:sendAndReceive: Retries exhausted on response to command = {cmd}.\n"
+                    ));
+                } else {
+                    let reply = result.as_deref().map(trim_line).unwrap_or_default();
+                    self.print_axis0(format_args!(
+                        "drvA3200Asyn:sendAndReceive: Retry succeeded for command = {cmd} with response = {reply}\n"
+                    ));
+                }
+            }
+        }
+        match result {
+            Ok(raw) => Ok(trim_line(&raw)),
+            Err(e) => {
+                PortManager::global().trace_manager().print(
+                    Some(&self.serial_port),
+                    Some(0),
+                    0,
+                    TraceMask::ERROR,
+                    format_args!(
+                        "drvA3200Asyn:sendAndReceive writeRead error, output={cmd} status={}, error={}\n",
+                        e.status() as i32,
+                        e.message()
+                    ),
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// C `PRINT(pController->pAxis[0].logParam, TERROR, ...)`.
+    fn print_axis0(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.motor_port),
+            Some(0),
             0,
-            cmd.as_bytes(),
-            READ_BUF,
-        )?))
+            TraceMask::ERROR,
+            args,
+        );
     }
 
     /// Send a command that returns only an ACK. Errors on fault/empty.

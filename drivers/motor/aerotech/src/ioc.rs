@@ -162,6 +162,8 @@ pub fn a3200_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller = Arc::new(Mutex::new(A3200Controller::new(
                 handle,
+                &asyn_port,
+                &card.to_string(),
                 task_number as u32,
                 linear,
             )));
