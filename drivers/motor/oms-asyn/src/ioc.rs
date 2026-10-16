@@ -99,7 +99,7 @@ fn oms_config_command(
                 Duration::from_millis(timeout_ms.max(0.0) as u64),
                 &format!("{controller_type}Config"),
             )?;
-            let controller = OmsController::new(handle, controller_type);
+            let controller = OmsController::new(handle, &asyn_port, controller_type);
             match controller.firmware_version() {
                 Ok(fw) => println!("{cmd_name}: {controller_type} firmware: {fw}"),
                 Err(e) => println!("{cmd_name}: warning: firmware read failed: {e}"),

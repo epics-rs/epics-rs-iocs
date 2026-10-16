@@ -54,7 +54,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::atoi;
@@ -88,15 +90,18 @@ fn is_notification(s: &str) -> bool {
 /// its axes behind a mutex so command/reply pairs stay atomic.
 pub struct OmsController {
     handle: SyncIOHandle,
+    /// The octet port `pasynUserSyncIOSerial` prints on.
+    serial_port: String,
     /// `"MAXnet"` or `"MXA"` (label only; the protocol is identical).
     controller_type: &'static str,
 }
 
 impl OmsController {
     /// Wrap a connected octet handle.
-    pub fn new(handle: SyncIOHandle, controller_type: &'static str) -> Self {
+    pub fn new(handle: SyncIOHandle, serial_port: &str, controller_type: &'static str) -> Self {
         Self {
             handle,
+            serial_port: serial_port.to_owned(),
             controller_type,
         }
     }
@@ -108,8 +113,23 @@ impl OmsController {
 
     /// Send a command expecting no reply (C `sendOnly`).
     pub fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
-        Ok(())
+        let e = match self.handle.write_octet(0, cmd.as_bytes()) {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        PortManager::global().trace_manager().print(
+            Some(&self.serial_port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            format_args!(
+                "drv{}Asyn:sendOnly: error sending command {cmd}, sent={}, status={}\n",
+                self.controller_type,
+                e.partial_write().unwrap_or(0),
+                e.status() as i32
+            ),
+        );
+        Err(e)
     }
 
     /// Send a command and read one reply, skipping any notification lines and
@@ -527,7 +547,11 @@ mod tests {
             0,
             std::time::Duration::from_secs(1),
         );
-        let controller = Arc::new(Mutex::new(OmsController::new(io, "MAXnet")));
+        let controller = Arc::new(Mutex::new(OmsController::new(
+            io,
+            "omsEncoderRatio",
+            "MAXnet",
+        )));
         let mut axis = OmsAxis::new(controller, 0).unwrap();
         let user = AsynUser::new(0);
         axis.set_encoder_ratio(&user, 4.0).unwrap();
