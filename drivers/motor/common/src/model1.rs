@@ -10,6 +10,14 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 
 use crate::iocsh::{DEFAULT_IDLE_POLL_MS, arg_int_req};
+
+/// An `iocshArgInt` as C reads it: 0 when absent or not an integer.
+pub fn c_int(args: &[ArgValue], i: usize) -> i32 {
+    match args.get(i) {
+        Some(ArgValue::Int(v)) => *v as i32,
+        _ => 0,
+    }
+}
 use crate::{TraceUser, install, register_model1_device};
 
 /// `SCAN_RATE`, the default polling rate in Hz (motor.h:127).
@@ -37,11 +45,10 @@ impl Model1 {
         }
     }
 
-    /// `<name>(num_cards, scan_rate)`, clamping both as every model-1
-    /// `Setup` does (e.g. drvSC800.cc:449-458). Building it adds the
-    /// driver's row to the motor DTYP menu, as its dbd line would.
+    /// `<name>(num_cards, scan_rate)`. Building it adds the driver's row to
+    /// the motor DTYP menu, as its dbd line would.
     pub fn setup_command(&'static self, name: &'static str) -> CommandDef {
-        register_model1_device(self.row);
+        self.register_row();
         CommandDef::new(
             name,
             vec![
@@ -50,26 +57,32 @@ impl Model1 {
             ],
             format!("{name}(num_cards, scan_rate)"),
             move |args: &[ArgValue], _ctx: &CommandContext| {
-                let int = |i| match args.get(i) {
-                    Some(ArgValue::Int(v)) => *v as i32,
-                    _ => 0,
-                };
-                let (num_cards, scan_rate) = (int(0), int(1));
-                let num_cards = if num_cards < 1 || num_cards > self.max_cards {
-                    self.max_cards
-                } else {
-                    num_cards
-                };
-                let scan_rate = if (1..=60).contains(&scan_rate) {
-                    scan_rate
-                } else {
-                    self.default_scan_rate
-                };
-                *self.setup.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((num_cards, scan_rate));
+                self.setup(c_int(args, 0), c_int(args, 1));
                 Ok(CommandOutcome::Continue)
             },
         )
+    }
+
+    /// Add the driver's row to the motor DTYP menu, for a driver whose
+    /// `Setup` takes more than [`Model1::setup_command`] parses.
+    pub fn register_row(&self) {
+        register_model1_device(self.row);
+    }
+
+    /// What every model-1 `Setup` does with its card count and scan rate,
+    /// clamping both (e.g. drvSC800.cc:449-458).
+    pub fn setup(&self, num_cards: i32, scan_rate: i32) {
+        let num_cards = if num_cards < 1 || num_cards > self.max_cards {
+            self.max_cards
+        } else {
+            num_cards
+        };
+        let scan_rate = if (1..=60).contains(&scan_rate) {
+            scan_rate
+        } else {
+            self.default_scan_rate
+        };
+        *self.setup.lock().unwrap_or_else(|e| e.into_inner()) = Some((num_cards, scan_rate));
     }
 
     /// Whether `Config` may fill `card`: C returns ERROR, silently, for a
