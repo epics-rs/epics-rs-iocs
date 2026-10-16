@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -41,7 +42,8 @@ impl D435iColorDriver {
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
         caps: CameraCapabilities,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad =
+            ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory, ASYN_CANBLOCK)?;
         let rs_params = D435iParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -311,7 +313,8 @@ impl D435iDepthDriver {
         max_size_y: i32,
         max_memory: usize,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad =
+            ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory, ASYN_CANBLOCK)?;
 
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Intel")?;
