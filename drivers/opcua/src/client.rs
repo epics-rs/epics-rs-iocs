@@ -16,8 +16,9 @@ use async_opcua::client::custom_types::DataTypeTreeBuilder;
 use async_opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, Session};
 use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
-    DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest, NodeId,
-    ReadValueId, StatusCode, TimestampsToReturn, Variant, WriteValue, custom::DataTypeTree,
+    DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, TimestampsToReturn, Variant,
+    WriteValue, custom::DataTypeTree,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -77,7 +78,7 @@ pub trait UaConnection: Send + Sync {
         &self,
         subscription_id: u32,
         items: Vec<MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode>;
+    ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode>;
     async fn disconnect(&self);
     /// The endpoint the session runs on, as the server described it.
     fn endpoint(&self) -> Option<EndpointDescription> {
@@ -313,12 +314,12 @@ impl UaConnection for AsyncOpcuaConnection {
         &self,
         subscription_id: u32,
         items: Vec<MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
+    ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode> {
         let created = self
             .session
             .create_monitored_items(subscription_id, TimestampsToReturn::Both, items)
             .await?;
-        Ok(created.iter().map(|item| item.result.status_code).collect())
+        Ok(created.into_iter().map(|item| item.result).collect())
     }
 
     async fn disconnect(&self) {

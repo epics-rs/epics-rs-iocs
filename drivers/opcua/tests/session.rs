@@ -154,11 +154,22 @@ impl UaConnection for Mock {
         &self,
         _subscription_id: u32,
         items: Vec<async_opcua::types::MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
-        let n = items.len();
+    ) -> Result<Vec<async_opcua::types::MonitoredItemCreateResult>, StatusCode> {
+        let results = items
+            .iter()
+            .map(|item| async_opcua::types::MonitoredItemCreateResult {
+                status_code: self
+                    .behaviour
+                    .lock()
+                    .monitor_status
+                    .unwrap_or(StatusCode::Good),
+                revised_sampling_interval: item.requested_parameters.sampling_interval,
+                revised_queue_size: item.requested_parameters.queue_size,
+                ..Default::default()
+            })
+            .collect();
         self.calls.lock().monitored.extend(items);
-        let status = self.behaviour.lock().monitor_status;
-        Ok(vec![status.unwrap_or(StatusCode::Good); n])
+        Ok(results)
     }
 
     async fn disconnect(&self) {
@@ -922,4 +933,65 @@ async fn a_value_the_server_pushes_reaches_the_item_its_handle_names() {
     assert_eq!(update.reason, ProcessReason::IncomingData);
     assert_eq!(update.data, Some(Variant::Int32(64)));
     assert!(leaf0.lock().queue.is_empty());
+}
+
+#[test]
+fn an_item_shows_itself_as_item_open62541_show_does() {
+    let (item0, _leaf0) = item("subs ns=2;s=Sensor register=y", INPUT);
+    let (handle, _worker) = session::create(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        Arc::new(MockConnector(Mock::arc())),
+    );
+    let mut item = item0.lock();
+    let info = item.leaves[0].lock().link.clone();
+    item.adopt(info, NodeId::new(2, "Sensor"), 0, handle);
+
+    assert_eq!(
+        item.show_line(),
+        "item ns=2;s=Sensor record=rec state=down status=Good dataDirty=n context=subs@sess \
+         sampling=0(-1) deadband=0 qsize=0(1) cqsize=3 discard=old timestamp=server \
+         bini=read output=n monitor=y registered=-(y)"
+    );
+}
+
+#[tokio::test]
+async fn an_item_shows_what_the_server_revised() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("subs ns=2;s=Sensor sampling=250 qsize=4", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    until(|| item0.lock().revised_queue_size == 4).await;
+
+    let line = item0.lock().show_line();
+    assert!(line.contains(" sampling=250(250) "), "{line}");
+    assert!(line.contains(" qsize=4(4) "), "{line}");
+}
+
+#[test]
+fn an_item_shows_the_size_of_its_element_tree() {
+    const ITEM: RecordKind = RecordKind {
+        is_output: false,
+        is_item_record: true,
+    };
+    let mut item = Item::pending();
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, text, kind) in [
+        ("ITEM", "subs ns=2;s=Struct", ITEM),
+        ("A_B", "ITEM element=a.b", INPUT),
+        ("A_C", "ITEM element=a.c", INPUT),
+        ("D", "ITEM element=d", INPUT),
+    ] {
+        let leaf = Leaf::new(record.to_string(), link(text, kind), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+
+    let line = item.show_line();
+    assert!(line.ends_with(" dataNodes=2 dataLeafs=3"), "{line}");
 }

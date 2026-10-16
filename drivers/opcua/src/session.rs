@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use async_opcua::types::{
     AttributeId, DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
-    NodeId, ReadValueId, StatusCode, Variant, WriteValue,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, Variant, WriteValue,
 };
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
@@ -762,11 +762,8 @@ impl SessionWorker {
     }
 
     /// `RegisterNodes` for the items whose link asked for it
-    /// (`SessionOpen62541::registerNodes`).
-    ///
-    /// The C prints every registered item to stdout unconditionally
-    /// (`SessionOpen62541.cpp:1470` — `it->show(0)` outside any debug guard);
-    /// this logs one line at debug level instead.
+    /// (`SessionOpen62541::registerNodes`), each shown as C does, outside any
+    /// debug guard.
     async fn register_nodes(&self, connection: &Arc<dyn UaConnection>) {
         let items = self.handle.items.lock().clone();
         let to_register: Vec<(usize, NodeId)> = items
@@ -774,7 +771,10 @@ impl SessionWorker {
             .enumerate()
             .filter_map(|(i, item)| {
                 let item = item.lock();
-                item.link.register_node.then(|| (i, item.node_id.clone()))
+                item.link.register_node.then(|| {
+                    println!("{}", item.show_line());
+                    (i, item.node_id.clone())
+                })
             })
             .collect();
         if to_register.is_empty() {
@@ -847,24 +847,47 @@ impl SessionWorker {
             if !requests.is_empty() {
                 // C creates the items one call each, so a failed batch is every
                 // item failing with its status.
-                let statuses = match connection.create_monitored_items(id, requests).await {
-                    Ok(statuses) => statuses,
-                    Err(status) => vec![status; monitored.len()],
+                let results = match connection.create_monitored_items(id, requests).await {
+                    Ok(results) => results,
+                    Err(status) => vec![
+                        MonitoredItemCreateResult {
+                            status_code: status,
+                            ..Default::default()
+                        };
+                        monitored.len()
+                    ],
                 };
-                for (item, status) in monitored.iter().zip(&statuses) {
-                    if status.is_bad() {
-                        let mut item = item.lock();
+                for (item, result) in monitored.iter().zip(&results) {
+                    let mut item = item.lock();
+                    let status = result.status_code;
+                    if status.is_good() {
+                        item.revised_sampling_interval = result.revised_sampling_interval;
+                        item.revised_queue_size = result.revised_queue_size;
+                        if config.debug >= 5 {
+                            println!(
+                                "** OPC UA record {} monitored item {} succeeded with id {} \
+                                 revised sampling interval {} revised queue size {}",
+                                item.addressing_record(),
+                                item.wire_node_id(),
+                                result.monitored_item_id,
+                                result.revised_sampling_interval,
+                                result.revised_queue_size
+                            );
+                        }
+                    } else {
                         eprintln!(
                             "OPC UA record {} monitored item {} failed with error {}",
                             item.addressing_record(),
                             item.wire_node_id(),
-                            status_name(*status)
+                            status_name(status)
                         );
-                        item.set_incoming_event(ProcessReason::ConnectionLoss, *status);
+                        item.set_incoming_event(ProcessReason::ConnectionLoss, status);
                     }
                 }
                 if config.debug > 0 {
-                    let last = statuses.last().copied().unwrap_or(StatusCode::Good);
+                    let last = results
+                        .last()
+                        .map_or(StatusCode::Good, |result| result.status_code);
                     println!(
                         "Subscription {}@{}: created {} monitored items ({})",
                         config.name,

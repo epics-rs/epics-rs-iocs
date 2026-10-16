@@ -114,8 +114,8 @@ impl UaConnection for Mock {
         &self,
         _subscription_id: u32,
         items: Vec<async_opcua::types::MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
-        Ok(vec![StatusCode::Good; items.len()])
+    ) -> Result<Vec<async_opcua::types::MonitoredItemCreateResult>, StatusCode> {
+        Ok(vec![Default::default(); items.len()])
     }
 
     async fn disconnect(&self) {}

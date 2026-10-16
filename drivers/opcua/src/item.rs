@@ -24,9 +24,9 @@ use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::link::{Bini, LinkInfo, TimestampSource};
+use crate::link::{Bini, LinkInfo, NodeIdentifier, TimestampSource};
 use crate::queue::{ConnectionStatus, ProcessReason, Update, UpdateQueue};
-use crate::session::{Priority, Request, SessionHandle};
+use crate::session::{Priority, Request, SessionHandle, status_name};
 use crate::value::{EnumChoices, type_name};
 
 /// One record's binding to an item (`DataElementOpen62541Leaf` +
@@ -110,6 +110,10 @@ pub struct Item {
     pub state: ConnectionStatus,
     /// The client handle its monitored item was created with.
     pub client_handle: u32,
+    /// What the server granted when the monitored item was last created; 0
+    /// until then (`ItemOpen62541::revisedSamplingInterval`/`revisedQueueSize`).
+    pub revised_sampling_interval: f64,
+    pub revised_queue_size: u32,
     /// Every record bound to this node.
     pub leaves: Vec<Arc<Mutex<Leaf>>>,
     /// The item's own last value, from which every leaf's element is taken.
@@ -161,6 +165,8 @@ impl Item {
             data_type: None,
             state: ConnectionStatus::Down,
             client_handle: 0,
+            revised_sampling_interval: 0.0,
+            revised_queue_size: 0,
             leaves: Vec::new(),
             last_value: None,
             last_status: StatusCode::Good,
@@ -424,6 +430,76 @@ impl Item {
         None
     }
 
+    /// `ItemOpen62541::show(0)`'s line.
+    pub fn show_line(&self) -> String {
+        let link = &self.link;
+        let mut out = String::from("item ns=");
+        if self.node_id.namespace != link.namespace_index {
+            out += &format!("{}({})", self.node_id.namespace, link.namespace_index);
+        } else {
+            out += &link.namespace_index.to_string();
+        }
+        match &link.identifier {
+            Some(NodeIdentifier::Numeric(n)) => out += &format!(";i={n}"),
+            Some(NodeIdentifier::String(s)) => out += &format!(";s={s}"),
+            None => out += ";s=",
+        }
+        out += &format!(
+            " record={} state={} status={} dataDirty={} context={}@{} sampling={}({}) \
+             deadband={} qsize={}({}) cqsize={} discard={} timestamp={}",
+            self.addressing_record(),
+            self.state.as_str(),
+            status_name(self.last_status),
+            yn(self.has_dirty_leaf()),
+            link.subscription().unwrap_or(""),
+            self.session.as_ref().map_or("", |s| s.name.as_str()),
+            self.revised_sampling_interval,
+            link.sampling_interval,
+            link.deadband,
+            self.revised_queue_size,
+            link.queue_size,
+            link.client_queue_size,
+            if link.discard_oldest { "old" } else { "new" },
+            link.timestamp.as_str(),
+        );
+        if link.timestamp == TimestampSource::Data {
+            out += &format!("@{}", link.timestamp_element);
+        }
+        out += &format!(
+            " bini={} output={} monitor={} registered=",
+            link.bini.as_str(),
+            yn(link.is_output),
+            yn(link.monitor),
+        );
+        match &self.registered_node_id {
+            Some(id) => out += &id.to_string(),
+            None => out += "-",
+        }
+        out += &format!("({})", yn(link.register_node));
+        // The C's element tree: an `opcuaItem` record is no leaf of it, and a
+        // leaf with an element path hangs under [ROOT] and one node per
+        // further path step.
+        let data_leaves: Vec<Vec<String>> = self
+            .leaves
+            .iter()
+            .filter_map(|leaf| {
+                let leaf = leaf.lock();
+                (!leaf.link.is_item_record).then(|| leaf.link.element_path.clone())
+            })
+            .collect();
+        let mut nodes: Vec<&[String]> = data_leaves
+            .iter()
+            .filter(|path| !path.is_empty())
+            .flat_map(|path| (0..path.len()).map(move |n| &path[..n]))
+            .collect();
+        nodes.sort();
+        nodes.dedup();
+        if !(nodes.is_empty() && data_leaves.len() == 1) {
+            out += &format!(" dataNodes={} dataLeafs={}", nodes.len(), data_leaves.len());
+        }
+        out
+    }
+
     /// The record whose link addresses the item's node (C `recConnector`).
     pub fn addressing_record(&self) -> String {
         self.leaves
@@ -568,4 +644,8 @@ pub fn with_element(
     Ok(Variant::ExtensionObject(ExtensionObject::from_message(
         updated,
     )))
+}
+
+fn yn(flag: bool) -> &'static str {
+    if flag { "y" } else { "n" }
 }
