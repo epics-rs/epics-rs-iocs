@@ -3,9 +3,11 @@
 #
 # The driver reports positions in controller-native engineering units. MRES is
 # the record's step (RRBV is an integer count and RDBD >= MRES), so set it to
-# the axis resolution, C's axisRes = clPeriod (motorMicos ships no Taurus
-# example). Changing DHLM/DLLM pushes the soft limits to the controller
-# (setnlimit).
+# the controller's "<n> getclperiod" reply: C uses that as axisRes and scales
+# wire = steps * axisRes, so its EGU is the controller unit only at
+# MRES = clPeriod. motorMicos ships no Taurus example, so the 0.0001 default is
+# a placeholder, not a C value. Changing DHLM/DLLM pushes the soft limits to the
+# controller (setnlimit).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "TAURUS_$(CARD)_$(N)")
