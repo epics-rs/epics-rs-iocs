@@ -18,7 +18,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-use epics_rs::ad_core::driver::{ADStatus, ImageMode};
+use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
@@ -71,40 +71,29 @@ impl NdStdArraysDriver {
     fn new(
         port_name: &str,
         max_memory: usize,
-        pool: Arc<NDArrayPool>,
-        queued_counter: Arc<QueuedArrayCounter>,
         publish_tx: rt::CommandSender<Arc<NDArray>>,
     ) -> AsynResult<Self> {
         // ASYN_CANBLOCK = 0, ASYN_MULTIDEVICE = 0, maxAddr = 1
         // (NDDriverStdArrays.cpp:47-52).
-        let mut port_base = PortDriverBase::new(
+        let ADDriverBase {
+            mut port_base,
+            params,
+            pool,
+            queued_counter,
+            ..
+        } = ADDriverBase::new(
             port_name,
             1,
+            0,
+            0,
+            max_memory,
             PortFlags {
                 can_block: false,
                 multi_device: false,
                 ..Default::default()
             },
-        );
-
-        let params = ADDriverParams::create(&mut port_base)?;
-        let ndsa = NdsaParams::create(&mut port_base)?;
-
-        // asynNDArrayDriver constructor defaults.
-        port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
-        port_base.set_int32_param(params.base.data_type, 0, NDDataType::UInt8 as u8 as i32)?;
-        port_base.set_int32_param(params.base.color_mode, 0, 0)?; // NDColorMode::Mono
-        port_base.set_int32_param(params.base.array_size_x, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size_y, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size_z, 0, 0)?;
-        port_base.set_int32_param(params.base.array_size, 0, 0)?;
-        port_base.set_int32_param(params.base.array_counter, 0, 0)?;
-        port_base.set_float64_param(
-            params.base.pool_max_memory,
-            0,
-            max_memory as f64 / MEGABYTE,
         )?;
-        port_base.set_int32_param(params.status, 0, ADStatus::Idle as i32)?;
+        let ndsa = NdsaParams::create(&mut port_base)?;
 
         // NDDriverStdArrays constructor (NDDriverStdArrays.cpp:70-86).
         port_base.set_string_param(params.base.manufacturer, 0, "NDDriverStdArrays")?;
@@ -560,17 +549,11 @@ pub fn create_nd_std_arrays(
     max_memory: usize,
 ) -> AsynResult<NdStdArraysRuntime> {
     let port_name = claim.name();
-    let pool = NDArrayPool::new(max_memory);
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
     let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
 
-    let driver = NdStdArraysDriver::new(
-        port_name,
-        max_memory,
-        pool.clone(),
-        queued_counter.clone(),
-        publish_tx,
-    )?;
+    let driver = NdStdArraysDriver::new(port_name, max_memory, publish_tx)?;
+    let pool = driver.pool.clone();
+    let queued_counter = driver.queued_counter.clone();
     let params = driver.params;
     let ndsa = driver.ndsa;
 
@@ -606,11 +589,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let pool = NDArrayPool::new(0);
-            let queued_counter = Arc::new(QueuedArrayCounter::new());
             let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
-            let det =
-                NdStdArraysDriver::new("NDSATEST", 0, pool, queued_counter, publish_tx).unwrap();
+            let det = NdStdArraysDriver::new("NDSATEST", 0, publish_tx).unwrap();
             Self { det, publish_rx }
         }
 
