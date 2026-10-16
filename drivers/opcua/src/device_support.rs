@@ -44,6 +44,7 @@ use std::time::SystemTime;
 
 use async_opcua::types::Variant;
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
@@ -354,7 +355,7 @@ impl OpcuaDevice {
         let outgoing = match self.outgoing_value(record, &incoming, choices.as_deref()) {
             Ok(v) => v,
             Err(e) => {
-                log::error!("{}: cannot write: {e}", self.record_name);
+                errlog_vprintf(format_args!("{} : {e}\n", self.record_name));
                 self.alarm = Some((WRITE_ALARM, INVALID));
                 return Ok(());
             }
@@ -381,7 +382,15 @@ impl OpcuaDevice {
         incoming: &Variant,
         choices: Option<&EnumChoices>,
     ) -> Result<Variant, String> {
-        let err = |e: value::ConvError| e.to_string();
+        // C's outgoing wording (`DataElementOpen62541Leaf.h:1088-1135`).
+        let err = |e: value::ConvError| match e {
+            value::ConvError::Unsupported { from, to } => {
+                format!("unsupported conversion from {from} to {to} for outgoing data")
+            }
+            value::ConvError::OutOfRange { .. } => "value out of range".to_string(),
+            value::ConvError::NotAnArray => "OPC UA data type is not an array".to_string(),
+            other => other.to_string(),
+        };
         match self.op {
             Op::Int32 => value::write_scalar(long(record, "VAL")?, incoming, choices).map_err(err),
             Op::Int64 => value::write_scalar(int64(record, "VAL")?, incoming, choices).map_err(err),
@@ -506,7 +515,7 @@ impl OpcuaDevice {
         match self.store(&data, choices.as_deref(), record) {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
-                log::error!("{}: incoming data unusable: {e}", self.record_name);
+                errlog_vprintf(format_args!("{} : {e}\n", self.record_name));
                 self.alarm = Some((READ_ALARM, INVALID));
                 // The C clears UDF even on a failed conversion: the scalar
                 // template cleared it at the pop and the array overload clears

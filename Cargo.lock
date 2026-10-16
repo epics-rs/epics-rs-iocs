@@ -3094,7 +3094,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]
@@ -3104,7 +3103,6 @@ name = "opcua-ioc"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "opcua",
 ]
 
