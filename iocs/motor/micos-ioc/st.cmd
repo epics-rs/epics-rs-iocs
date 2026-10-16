@@ -18,10 +18,10 @@ epicsEnvSet("NAXES",  "3")
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyS1", 0, 0, 0)
 
-# corvus framing: the driver appends the CR/LF command terminator, so only the
-# input EOS is configured here. Do not set an output EOS — the port would append
-# it a second time.
+# Port EOS as the C example sets it (motor.cmd.SMCcorvus:14-15);
+# the driver sends bare commands.
 asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
+asynOctetSetOutputEos("$(IPPORT)", 0, "\r\n")
 
 # ---- corvus controller ----
 # SMCcorvusCreateController(card, corvusPort, numAxes, [movingPollMs], [idlePollMs]).

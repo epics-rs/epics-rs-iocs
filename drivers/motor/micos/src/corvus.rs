@@ -3,7 +3,7 @@
 //! Ported from `motorMicos/micosApp/src/SMCcorvusDriver.cpp` (a model-3
 //! `asynMotorController`/`asynMotorAxis` pair). Connects over a `drvAsynIPPort`
 //! or `drvAsynSerialPort`; commands are ASCII, CR/LF-terminated (the startup
-//! script sets the input EOS, the driver owns output framing).
+//! script sets both EOS, as the C example does; the driver sends bare commands).
 //!
 //! ## Shared controller
 //!
@@ -52,9 +52,6 @@ use motor_common::util::atoi;
 /// Response buffer size.
 const READ_BUF: usize = 128;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r\n";
-
 /// `st` status-word bit set while any axis is moving.
 const STATUS_MOVING: i32 = 0x1;
 
@@ -80,23 +77,16 @@ impl CorvusController {
         Self { handle, num_axes }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected.
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
