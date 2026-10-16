@@ -125,7 +125,7 @@ impl OemAxis {
             homed: false,
             encoder_base: 0.0,
             position: 0.0,
-            direction: true,
+            direction: false,
         };
         axis.lock().configure(axis.address)?;
         Ok(axis)
