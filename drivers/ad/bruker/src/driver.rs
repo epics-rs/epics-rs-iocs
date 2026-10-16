@@ -240,9 +240,7 @@ impl PortDriver for BrukerDetector {
                 self.ad
                     .port_base
                     .set_int32_param(p.status, 0, ADStatus::Acquire as i32)?;
-                if self.commands.try_send(TaskCommand::Start).is_err() {
-                    self.trace_error("BISDetector:writeInt32: the acquisition task is not running");
-                }
+                let _ = self.commands.try_send(TaskCommand::Start);
             } else if value == 0 && !idle {
                 self.shared.stop_requested.store(true, Ordering::Release);
             }

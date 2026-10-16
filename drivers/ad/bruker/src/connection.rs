@@ -116,7 +116,6 @@ fn exchange(handle: &PortHandle, command: &str, timeout: Duration) -> Exchange {
         Ok(result) => {
             let bytes = result.data.unwrap_or_default();
             let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
-            log::debug!("bruker: '{command}' -> '{reply}'");
             Exchange {
                 reply,
                 result: Ok(()),
