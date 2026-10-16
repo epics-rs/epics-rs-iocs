@@ -28,19 +28,18 @@ asynSetOption("$(PORT)", 0, "stop",   "1")
 # drvAsynIPPortConfigure("$(PORT)", "192.168.0.10:701", 0, 0, 0)
 
 # ---- SPiiPlus controller ----
-# SPiiPlusSetup(maxControllers, [scanRate]) is accepted for startup-script
-# parity; the asyn-rs port allocates per SPiiPlusConfig call.
+# SPiiPlusSetup(num_cards, scan_rate in Hz)
 SPiiPlusSetup(1, 10)
 
-# SPiiPlusConfig(card, asynPort, [mode], [movingPollMs], [idlePollMs]) - mode is
+# SPiiPlusConfig(card, asyn port, mode) - mode is
 # BUF (default; ACSPL program buffers), DIR (direct command interpreter), or CON
 # (kinematic CONNECT). Axis count is auto-detected.
-SPiiPlusConfig(0, "$(PORT)", "DIR", 100, 1000)
+SPiiPlusConfig(0, "$(PORT)", "DIR")
 
-# One motor record per axis (DTYP SPIIPLUS_$(CARD)_0, _1, ...). The SPiiPlus
+# One motor record per axis (DTYP "SPiiPlus", OUT #C$(CARD) S0, S1, ...). The SPiiPlus
 # works in controller counts, so MRES = 1 and EGU = counts.
-dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m1,C=$(CARD),S=0")
+dbLoadRecords("$(ACSTECH80_IOC)/db/spiiplus.template", "P=$(P),M=m2,C=$(CARD),S=1")
 
 iocInit()
 
