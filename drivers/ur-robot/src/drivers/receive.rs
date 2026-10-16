@@ -27,6 +27,7 @@ pub const NUM_JOINTS: usize = 6;
 const SAFETY_STATUS_BITS_MASK: u32 = 0x7ff;
 
 use crate::drivers::STALE_AFTER;
+use crate::spdlog;
 
 /// Reconnect pacing for the poll thread: the first attempt fires on the
 /// unhealthy transition, later ones back off 1 s → 2 s → 5 s (cap). Each
@@ -306,23 +307,19 @@ fn connect_or_reconnect(slot: &mut Option<ReceiveInterface>, robot_ip: &str) -> 
             if iface.is_alive(STALE_AFTER) {
                 return true;
             }
-            log::info!("ur-robot: reconnecting to the RTDE receive interface");
-            match iface.reconnect() {
-                Ok(()) => true,
-                Err(e) => {
-                    log::error!("ur-robot: RTDE receive reconnect failed: {e}");
-                    false
-                }
-            }
+            spdlog::info(format_args!("Reconnecting to UR RTDE Receive interface"));
+            iface.reconnect().is_ok()
         }
         None => match ReceiveInterface::connect(robot_ip, false) {
             Ok(iface) => {
-                log::info!("ur-robot: connected to the RTDE receive interface");
+                spdlog::info(format_args!("Connected to UR RTDE Receive interface"));
                 *slot = Some(iface);
                 true
             }
             Err(e) => {
-                log::error!("ur-robot: RTDE receive connect failed: {e}");
+                spdlog::error(format_args!(
+                    "Failed to connected to UR RTDE Receive interface\n{e}"
+                ));
                 false
             }
         },
@@ -360,19 +357,27 @@ impl PortDriver for ReceiveDriver {
 
             let mut slot = self.iface.lock();
             let Some(iface) = slot.as_mut() else {
+                spdlog::error(format_args!("RTDE Receive interface not initialized"));
                 return Err(asyn_error("the RTDE receive interface is not initialised"));
             };
 
             if reason == p.disconnect {
+                spdlog::info(format_args!("Disconnecting from RTDE receive interface"));
                 iface.disconnect();
                 return Ok(());
             }
 
             if !iface.is_connected() {
+                spdlog::warn(format_args!("RTDE Receive interface not connected"));
                 return Err(asyn_error("the RTDE receive interface is not connected"));
             }
             Ok(())
         })();
+        if result.is_err() {
+            spdlog::error(format_args!(
+                "Communication error in RTDEReceive::writeInt32"
+            ));
+        }
         crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }
