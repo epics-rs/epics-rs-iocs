@@ -47,15 +47,15 @@ pub struct PilatusDriver {
 }
 
 /// The handles the driver hands to (and shares with) its worker threads.
-struct DriverLinks {
-    cmd_tx: rt::CommandSender<Cmd>,
-    start: Arc<Event>,
-    stop: Arc<Event>,
-    shared: Arc<Mutex<Shared>>,
+pub(crate) struct DriverLinks {
+    pub(crate) cmd_tx: rt::CommandSender<Cmd>,
+    pub(crate) start: Arc<Event>,
+    pub(crate) stop: Arc<Event>,
+    pub(crate) shared: Arc<Mutex<Shared>>,
 }
 
 impl PilatusDriver {
-    fn new(
+    pub(crate) fn new(
         port_name: &str,
         max_size_x: i32,
         max_size_y: i32,

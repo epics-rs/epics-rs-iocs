@@ -407,8 +407,19 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
         return;
     }
 
-    let (nx, ny) = max_size(&mut w.ctx).await;
-    let bad_pixels = w.shared.lock().bad_pixels.clone();
+    // readTiff checks the file against pFlatField's own dims (:678, :685).
+    let (dims, bad_pixels) = {
+        let s = w.shared.lock();
+        let dims = s
+            .flat_field
+            .as_ref()
+            .map(|f| (f.dims[0].size, f.dims[1].size));
+        (dims, s.bad_pixels.clone())
+    };
+    let Some((nx, ny)) = dims else {
+        w.ctx.callbacks().await;
+        return;
+    };
     let read = read_image_file(&mut w.ctx, file, None, 0.0, nx, ny, &bad_pixels).await;
     let (mut data, description) = match read {
         Ok(v) => v,
@@ -1054,6 +1065,70 @@ mod tests {
         assert!(matches!(&held.data, NDDataBuffer::I32(v) if v == &[5, 6]));
         assert_eq!(s.average_flat_field, 5.5);
         assert!(refill_flat_field(&mut Shared::default(), &[1, 2], None, 1.0).is_none());
+    }
+
+    /// readTiff rejects a file whose size is not pFlatField's
+    /// (pilatusDetector.cpp:678, :685), whatever MaxSizeX reads now.
+    #[test]
+    fn a_flat_field_file_sized_to_max_size_not_pflatfield_is_rejected() {
+        use crate::driver::{DriverLinks, PilatusDriver};
+        use epics_rs::ad_core::plugin::channel::NDArrayOutput;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let stop = Arc::new(Event::new());
+        let det = PilatusDriver::new(
+            "PILATUS_FLAT_DIMS",
+            2,
+            1,
+            0,
+            DriverLinks {
+                cmd_tx,
+                start: Arc::new(Event::new()),
+                stop: stop.clone(),
+                shared: shared.clone(),
+            },
+        )
+        .unwrap();
+        let (ad, p, pool) = (det.ad.params, det.p, det.ad.pool.clone());
+        shared.lock().flat_field = Some(PersistentArray::new(
+            pool.alloc(
+                vec![NDDimension::new(2), NDDimension::new(1)],
+                epics_rs::ad_core::ndarray::NDDataType::Int32,
+            )
+            .unwrap(),
+        ));
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("PILATUS_FLAT_DIMS").unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        h.write_int32_blocking(ad.max_size_x, 0, 3).unwrap();
+
+        let path = std::env::temp_dir().join(format!("pil-flat-{}.tif", std::process::id()));
+        let mut enc =
+            tiff::encoder::TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+        enc.write_image::<tiff::encoder::colortype::Gray32>(3, 1, &[7, 8, 9])
+            .unwrap();
+        let mut w = Worker {
+            ctx: Ctx::new(h.clone(), h.clone(), ad, p, stop),
+            shared: shared.clone(),
+            output: ArrayPublisher::new(Arc::new(Mutex::new(NDArrayOutput::new()))),
+            pool,
+        };
+        let file = path.to_string_lossy().into_owned();
+        let read = rt::run_thread_named("PilatusFlatTest", move || async move {
+            read_flat_field_file(&mut w, &file).await;
+        })
+        .join();
+        let _ = std::fs::remove_file(&path);
+        assert!(read.is_ok(), "readFlatFieldFile panicked");
+        assert_eq!(h.read_int32_blocking(p.flat_field_valid, 0).unwrap(), 0);
+        std::mem::forget(runtime);
     }
 
     #[test]
