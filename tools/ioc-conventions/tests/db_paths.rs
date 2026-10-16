@@ -1,18 +1,37 @@
-//! Every db load in `iocs/**/*.cmd` follows the one canonical form.
+//! Every db load in `iocs/**/*.cmd` resolves the way the IOC resolves it,
+//! and is written in the one canonical form.
 //!
-//! Rule: `dbLoadRecords`/`dbLoadTemplate` paths are `$(MACRO)/db/<file>`
-//! (no cwd-relative, no repo-root-relative, no `..` traversal, no
-//! `EPICS_DB_INCLUDE_PATH` search), where the IOC's own Rust sources give
-//! `MACRO` a `set_default` pointing at the owning directory. Crates that
-//! ship their templates ($(ADCORE) from ad-core-rs, $(SCALER) from
-//! scaler-rs) follow the same form; for those only the form is checked
-//! here — existence is the dependency's concern.
+//! Each startup script is run as iocsh runs it, from its own directory:
+//! the IOC's `set_default` macros and the framework's envPaths
+//! (`$(ADCORE)`, `$(ASYN)`, `$(AUTOSAVE)`, ... as the pinned epics-rs
+//! exports them) first, then every line macro-expanded in order,
+//! `epicsEnvSet` updating the environment and `<` running the fragment
+//! with it, so a fragment's `$(TEMPLATE)` is the including st.cmd's.
+//! A load then opens its file as `dbOpenFile` does: a path with a `/`
+//! as is, a bare name through `EPICS_DB_INCLUDE_PATH`, and every
+//! template `include` through that path too.
+//!
+//! Form: a path is `$(MACRO)/db/<file>` (no cwd-relative, no
+//! repo-root-relative, no `..` traversal) or a bare name found through a
+//! declared `EPICS_DB_INCLUDE_PATH`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// Macros whose owning directory lives in a dependency crate.
-const EXTERNAL: &[&str] = &["ADCORE", "SCALER"];
+/// envPaths macros the framework sets, and where each points in the crate
+/// that sets it.
+const FRAMEWORK: &[(&str, &str, &str)] = &[
+    ("ADCORE", "ad-core-rs", ""),
+    ("ASYN", "asyn-rs", ""),
+    ("AUTOSAVE", "epics-base-rs", "autosave"),
+    ("CALC", "epics-base-rs", "calc"),
+];
+
+/// The crates whose sources export [`FRAMEWORK`] macros.
+const FRAMEWORK_CRATES: &[&str] = &["ad-plugins-rs", "asyn-rs", "epics-base-rs"];
+
+/// Macros an IOC sets from a dependency crate's exported const.
+const EXTERNAL: &[(&str, &str)] = &[("SCALER", "scaler-rs")];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -22,52 +41,70 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn collect_cmd_files(dir: &Path, out: &mut Vec<PathBuf>) {
+fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("readable dir") {
         let path = entry.expect("dir entry").path();
         if path.is_dir() {
             if path.file_name().is_some_and(|n| n == "target") {
                 continue;
             }
-            collect_cmd_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "cmd") {
+            walk(&path, ext, out);
+        } else if path.extension().is_some_and(|e| e == ext) {
             out.push(path);
         }
     }
 }
 
-/// What a `set_default` in the IOC's sources points the macro at.
-enum MacroTarget {
-    /// `env!("CARGO_MANIFEST_DIR")` — the directory holding the .cmd file.
-    IocDir,
-    /// `concat!(env!("CARGO_MANIFEST_DIR"), "/..")` — the family directory.
-    FamilyDir,
-    /// A crate-exported const (e.g. `epics_rs::scaler::SCALER_DB_DIR`).
-    ExternalConst,
-}
-
-/// Scan `<ioc>/src/**.rs` (and nested crates') for `set_default("NAME", ...)`.
-fn macro_table(ioc_dir: &Path) -> HashMap<String, MacroTarget> {
-    let mut table = HashMap::new();
-    let mut rs_files = Vec::new();
-    fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("readable dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n == "target") {
-                    continue;
-                }
-                walk_rs(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
+/// The directory of every package in the resolved dependency graph.
+fn package_dirs(root: &Path) -> HashMap<String, PathBuf> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let out = std::process::Command::new(cargo)
+        .args(["metadata", "--format-version", "1", "--offline"])
+        .current_dir(root)
+        .output()
+        .expect("cargo metadata runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = String::from_utf8(out.stdout).expect("UTF-8 metadata");
+    let mut dirs = HashMap::new();
+    // A package object opens with its name and version (a dependency entry
+    // has no version) and names its manifest path further on.
+    let mut rest = json.as_str();
+    while let Some(pos) = rest.find(r#"{"name":""#) {
+        rest = &rest[pos + r#"{"name":""#.len()..];
+        if !rest
+            .find('"')
+            .is_some_and(|end| rest[end..].starts_with(r#"","version":""#))
+        {
+            continue;
+        }
+        let Some(end) = rest.find('"') else { break };
+        let name = rest[..end].to_string();
+        let Some(m) = rest.find(r#""manifest_path":""#) else {
+            break;
+        };
+        let tail = &rest[m + r#""manifest_path":""#.len()..];
+        let Some(mend) = tail.find('"') else { break };
+        let manifest = PathBuf::from(&tail[..mend]);
+        if let Some(dir) = manifest.parent() {
+            dirs.entry(name).or_insert_with(|| dir.to_path_buf());
         }
     }
-    walk_rs(ioc_dir, &mut rs_files);
+    dirs
+}
+
+/// `set_default("NAME", ...)` calls in the `.rs` files under `dir`, with the
+/// text after the name.
+fn set_defaults(dir: &Path) -> Vec<(String, String)> {
+    let mut rs_files = Vec::new();
+    walk(dir, "rs", &mut rs_files);
+    let mut found = Vec::new();
     for rs in rs_files {
         let text = std::fs::read_to_string(&rs).expect("readable source");
-        // rustfmt may wrap the call across lines, so tolerate whitespace
-        // between `set_default(` and the name literal.
+        // rustfmt may wrap the call across lines.
         let mut rest = text.as_str();
         while let Some(pos) = rest.find("set_default(") {
             rest = rest[pos + "set_default(".len()..].trim_start();
@@ -76,61 +113,175 @@ fn macro_table(ioc_dir: &Path) -> HashMap<String, MacroTarget> {
             };
             rest = stripped;
             let Some(end) = rest.find('"') else { break };
-            let name = &rest[..end];
-            let call_tail = &rest[end..rest.len().min(end + 200)];
-            let target = if call_tail.contains("\"/..\"") {
-                MacroTarget::FamilyDir
-            } else if call_tail.contains("CARGO_MANIFEST_DIR") {
-                MacroTarget::IocDir
+            let tail = &rest[end..rest.len().min(end + 200)];
+            found.push((rest[..end].to_string(), tail.to_string()));
+        }
+    }
+    found
+}
+
+/// The envPaths macros the pinned framework exports.
+fn framework_env(packages: &HashMap<String, PathBuf>) -> HashMap<String, String> {
+    let exported: HashSet<String> = FRAMEWORK_CRATES
+        .iter()
+        .filter_map(|c| packages.get(*c))
+        .flat_map(|dir| set_defaults(&dir.join("src")))
+        .map(|(name, _)| name)
+        .collect();
+    FRAMEWORK
+        .iter()
+        .filter(|(name, _, _)| exported.contains(*name))
+        .filter_map(|(name, krate, sub)| {
+            let dir = packages.get(*krate)?;
+            let dir = if sub.is_empty() {
+                dir.clone()
             } else {
-                MacroTarget::ExternalConst
+                dir.join(sub)
             };
-            table.insert(name.to_string(), target);
-        }
-    }
-    table
+            Some((name.to_string(), dir.to_str()?.to_string()))
+        })
+        .collect()
 }
 
-/// `epicsEnvSet("NAME", "literal")` pairs in one .cmd file, for expanding
-/// macros used inside the filename (e.g. quadEM's `$(TEMPLATE).template`).
-fn env_sets(text: &str) -> HashMap<String, String> {
-    let mut envs = HashMap::new();
+/// The IOC's own `set_default` macros: its crate dir, its family dir, or a
+/// dependency crate's dir.
+fn ioc_env(ioc_dir: &Path, packages: &HashMap<String, PathBuf>) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for (name, tail) in set_defaults(ioc_dir) {
+        let dir = if tail.contains("\"/..\"") {
+            ioc_dir.parent().map(Path::to_path_buf)
+        } else if tail.contains("CARGO_MANIFEST_DIR") {
+            Some(ioc_dir.to_path_buf())
+        } else {
+            EXTERNAL
+                .iter()
+                .find(|(n, _)| *n == name)
+                .and_then(|(_, krate)| packages.get(*krate).cloned())
+        };
+        if let Some(dir) = dir.and_then(|d| d.to_str().map(str::to_string)) {
+            env.insert(name, dir);
+        }
+    }
+    env
+}
+
+/// macLib expansion of `$(NAME)`, `${NAME}` and `$(NAME=default)`; an
+/// undefined macro stays as written.
+fn expand(text: &str, env: &HashMap<String, String>) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find('$') {
+        out.push_str(&rest[..pos]);
+        let tail = &rest[pos + 1..];
+        let close = match tail.chars().next() {
+            Some('(') => ')',
+            Some('{') => '}',
+            _ => {
+                out.push('$');
+                rest = tail;
+                continue;
+            }
+        };
+        let Some(end) = tail.find(close) else {
+            out.push_str(&rest[pos..]);
+            return out;
+        };
+        let body = &tail[1..end];
+        let (name, default) = match body.split_once('=') {
+            Some((n, d)) => (n, Some(d)),
+            None => (body, None),
+        };
+        match env.get(name).map(String::as_str).or(default) {
+            Some(v) => out.push_str(v),
+            None => out.push_str(&rest[pos..pos + 2 + end]),
+        }
+        rest = &tail[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// iocsh's argument split: blanks, commas and parentheses separate,
+/// double quotes group.
+fn args(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut has = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has = true;
+            }
+            c if !quoted && (c.is_whitespace() || matches!(c, ',' | '(' | ')')) => {
+                if has {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if has {
+        out.push(cur);
+    }
+    out
+}
+
+/// `dbOpenFile`: a name with a `/` opens as is, from the IOC's directory;
+/// a bare name is looked for along `EPICS_DB_INCLUDE_PATH`, or `.`.
+fn open_db(file: &str, cwd: &Path, env: &HashMap<String, String>) -> Option<PathBuf> {
+    if file.contains('/') {
+        let path = cwd.join(file);
+        return path.is_file().then_some(path);
+    }
+    let search = env.get("EPICS_DB_INCLUDE_PATH").map_or(".", String::as_str);
+    search
+        .split(':')
+        .map(|d| cwd.join(if d.is_empty() { "." } else { d }).join(file))
+        .find(|p| p.is_file())
+}
+
+/// Every `include` of `path`, transitively, opens through the search path.
+fn check_includes(
+    path: &Path,
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    seen: &mut HashSet<PathBuf>,
+    missing: &mut Vec<String>,
+) {
+    if !seen.insert(path.to_path_buf()) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
     for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("epicsEnvSet(\"") else {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("include") else {
             continue;
         };
-        let Some((name, rest)) = rest.split_once('"') else {
+        let Some(inc) = rest
+            .trim_start()
+            .strip_prefix('"')
+            .and_then(|r| r.split('"').next())
+        else {
             continue;
         };
-        let Some(pos) = rest.find('"') else { continue };
-        let Some(end) = rest[pos + 1..].find('"') else {
-            continue;
-        };
-        let value = &rest[pos + 1..pos + 1 + end];
-        if !value.contains('$') {
-            envs.insert(name.to_string(), value.to_string());
+        match open_db(inc, cwd, env) {
+            Some(found) => check_includes(&found, cwd, env, seen, missing),
+            None => missing.push(format!("{} includes {inc:?}", path.display())),
         }
     }
-    envs
 }
 
-/// The db search path, needed only for `include` lines *inside* templates
-/// (ADBase.template and friends ship with ad-core-rs). C resolves such
-/// includes through this path alone — not through the including file's own
-/// directory — so a module whose templates include same-dir files pairs its
-/// db dir onto the list, as C's quadEM iocTetrAMM/st.cmd:11 does with
-/// `"$(ADCORE)/db:$(QUADEM)/db"`. Sanctioned form: a colon-separated list
-/// whose every component is `$(MACRO)/db`.
-fn declares_canonical_include_path(text: &str) -> bool {
-    let Some(rest) = text.lines().find_map(|l| {
-        l.trim_start()
-            .strip_prefix(r#"epicsEnvSet("EPICS_DB_INCLUDE_PATH", ""#)
-    }) else {
-        return false;
-    };
-    let Some(value) = rest.split('"').next() else {
-        return false;
-    };
+/// `EPICS_DB_INCLUDE_PATH`'s sanctioned form: a colon list whose every
+/// component is `$(MACRO)/db`.
+fn is_canonical_include_path(value: &str) -> bool {
     !value.is_empty()
         && value.split(':').all(|c| {
             c.strip_prefix("$(")
@@ -145,162 +296,214 @@ fn declares_canonical_include_path(text: &str) -> bool {
         })
 }
 
-/// Does `dir/file` (transitively, within `dir`) include a template that is
-/// not present in `dir`? Such an include only resolves through the search
-/// path, so the loading st.cmd must declare [`CANONICAL_INCLUDE_PATH`].
-fn has_external_include(dir: &Path, file: &str, seen: &mut Vec<String>) -> bool {
-    if seen.iter().any(|s| s == file) {
-        return false;
-    }
-    seen.push(file.to_string());
-    let Ok(text) = std::fs::read_to_string(dir.join(file)) else {
-        return false;
-    };
-    for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("include") else {
-            continue;
-        };
-        let Some(inc) = rest
-            .trim_start()
-            .strip_prefix('"')
-            .and_then(|r| r.split('"').next())
-        else {
-            continue;
-        };
-        if !dir.join(inc).exists() || has_external_include(dir, inc, seen) {
-            return true;
-        }
-    }
-    false
+struct Run<'a> {
+    root: &'a Path,
+    failures: Vec<String>,
+    checked: usize,
+    visited: HashSet<PathBuf>,
+    /// The startup script being run, which a fragment's line is run from.
+    top: PathBuf,
 }
 
-fn expand(name_part: &str, envs: &HashMap<String, String>) -> Option<String> {
-    let mut out = String::new();
-    let mut rest = name_part;
-    while let Some(pos) = rest.find("$(") {
-        out.push_str(&rest[..pos]);
-        let tail = &rest[pos + 2..];
-        let end = tail.find(')')?;
-        out.push_str(envs.get(&tail[..end])?);
-        rest = &tail[end + 1..];
+impl Run<'_> {
+    fn at(&self, script: &Path, lineno: usize) -> String {
+        let rel = |p: &Path| p.strip_prefix(self.root).unwrap_or(p).display().to_string();
+        let mut at = format!("{}:{}", rel(script), lineno + 1);
+        if script != self.top {
+            at += &format!(" (from {})", rel(&self.top));
+        }
+        at
     }
-    out.push_str(rest);
-    Some(out)
+
+    /// Run `script` from `cwd` as iocsh does, checking each db load.
+    fn script(&mut self, script: &Path, cwd: &Path, env: &mut HashMap<String, String>, depth: u32) {
+        assert!(depth < 16, "{}: `<` nests too deep", script.display());
+        let script = script
+            .canonicalize()
+            .unwrap_or_else(|_| script.to_path_buf());
+        self.visited.insert(script.clone());
+        let text = std::fs::read_to_string(&script).expect("readable .cmd");
+        for (lineno, raw) in text.lines().enumerate() {
+            let raw = raw.trim_start();
+            if raw.is_empty() || raw.starts_with('#') {
+                continue;
+            }
+            let line = expand(raw, env);
+            if let Some(file) = line.strip_prefix('<') {
+                let file = cwd.join(file.trim());
+                if file.is_file() {
+                    self.script(&file, cwd, env, depth + 1);
+                } else {
+                    let at = self.at(&script, lineno);
+                    self.failures
+                        .push(format!("{at}: `<` finds no {}", file.display()));
+                }
+                continue;
+            }
+            let words = args(&line);
+            let Some(command) = words.first() else {
+                continue;
+            };
+            match command.as_str() {
+                "epicsEnvSet" if words.len() >= 3 => {
+                    if words[1] == "EPICS_DB_INCLUDE_PATH" {
+                        let declared = args(raw).get(2).cloned().unwrap_or_default();
+                        if !is_canonical_include_path(&declared) {
+                            let at = self.at(&script, lineno);
+                            self.failures.push(format!(
+                                "{at}: EPICS_DB_INCLUDE_PATH is not a colon list of \
+                                 $(MACRO)/db components: {declared:?}"
+                            ));
+                        }
+                    }
+                    env.insert(words[1].clone(), words[2].clone());
+                }
+                "dbLoadRecords" | "dbLoadTemplate" => {
+                    let written = args(raw).get(1).cloned().unwrap_or_default();
+                    let file = words.get(1).cloned().unwrap_or_default();
+                    let at = self.at(&script, lineno);
+                    self.load(&at, command == "dbLoadTemplate", &written, &file, cwd, env);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn load(
+        &mut self,
+        at: &str,
+        template: bool,
+        written: &str,
+        file: &str,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) {
+        self.checked += 1;
+        if written.contains("..") {
+            self.failures
+                .push(format!("{at}: path traversal in {written:?}"));
+            return;
+        }
+        if written.contains('/') {
+            let canonical = written
+                .strip_prefix("$(")
+                .and_then(|r| r.split_once(')'))
+                .and_then(|(_, r)| r.strip_prefix("/db/"))
+                .is_some_and(|f| !f.is_empty() && !f.contains('/'));
+            if !canonical {
+                self.failures
+                    .push(format!("{at}: not $(MACRO)/db/<file>: {written:?}"));
+                return;
+            }
+        } else if !env.contains_key("EPICS_DB_INCLUDE_PATH") {
+            self.failures.push(format!(
+                "{at}: bare {written:?} without EPICS_DB_INCLUDE_PATH opens from the cwd"
+            ));
+            return;
+        }
+        if file.contains("$(") || file.contains("${") {
+            self.failures.push(format!(
+                "{at}: {written:?} expands to {file:?}: macro undefined"
+            ));
+            return;
+        }
+        // dbLoadTemplate tries the name from the cwd before the path.
+        let found = if template && cwd.join(file).is_file() {
+            Some(cwd.join(file))
+        } else {
+            open_db(file, cwd, env)
+        };
+        let Some(found) = found else {
+            self.failures
+                .push(format!("{at}: {written:?} ({file}) does not open"));
+            return;
+        };
+        if !template {
+            let mut missing = Vec::new();
+            check_includes(&found, cwd, env, &mut HashSet::new(), &mut missing);
+            for m in missing {
+                self.failures
+                    .push(format!("{at}: {m}, which does not open"));
+            }
+        }
+    }
 }
 
 #[test]
 fn every_db_load_is_macro_form_and_resolvable() {
     let root = workspace_root();
+    let packages = package_dirs(&root);
+    let framework = framework_env(&packages);
     let mut cmd_files = Vec::new();
-    collect_cmd_files(&root.join("iocs"), &mut cmd_files);
+    walk(&root.join("iocs"), "cmd", &mut cmd_files);
     cmd_files.sort();
     assert!(!cmd_files.is_empty(), "no .cmd files found under iocs/");
+    // Startup scripts first; a fragment is checked from the scripts that
+    // include it, and on its own only when none does.
+    let (scripts, fragments): (Vec<_>, Vec<_>) = cmd_files.into_iter().partition(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("st"))
+    });
 
-    let mut failures = Vec::new();
-    let mut checked = 0usize;
-
-    for cmd in &cmd_files {
+    let mut run = Run {
+        root: &root,
+        failures: Vec::new(),
+        checked: 0,
+        visited: HashSet::new(),
+        top: PathBuf::new(),
+    };
+    for cmd in scripts.iter().chain(&fragments) {
+        let canonical = cmd.canonicalize().unwrap_or_else(|_| cmd.clone());
+        if run.visited.contains(&canonical) {
+            continue;
+        }
         let ioc_dir = cmd.parent().expect("cmd file has a parent");
-        let macros = macro_table(ioc_dir);
-        let text = std::fs::read_to_string(cmd).expect("readable .cmd");
-        let envs = env_sets(&text);
-        let mut needs_include_path = false;
-
-        for (lineno, line) in text.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with('#') {
-                continue;
-            }
-            for keyword in ["dbLoadRecords(\"", "dbLoadTemplate(\""] {
-                let Some(pos) = line.find(keyword) else {
-                    continue;
-                };
-                let arg = &line[pos + keyword.len()..];
-                let path = arg.split(['"', ',']).next().unwrap_or("");
-                checked += 1;
-                let at = format!(
-                    "{}:{}",
-                    cmd.strip_prefix(&root).unwrap_or(cmd).display(),
-                    lineno + 1
-                );
-
-                if path.contains("..") {
-                    failures.push(format!("{at}: path traversal in {path:?}"));
-                    continue;
-                }
-                let Some(rest) = path.strip_prefix("$(") else {
-                    failures.push(format!("{at}: not macro-form: {path:?}"));
-                    continue;
-                };
-                let Some((name, rest)) = rest.split_once(')') else {
-                    failures.push(format!("{at}: unclosed macro in {path:?}"));
-                    continue;
-                };
-                let external = EXTERNAL.contains(&name);
-                let Some(file) = rest.strip_prefix("/db/") else {
-                    failures.push(format!("{at}: not $({name})/db/<file>: {path:?}"));
-                    continue;
-                };
-                if file.contains('/') {
-                    failures.push(format!("{at}: nested path after db/: {path:?}"));
-                    continue;
-                }
-                let Some(file) = expand(file, &envs) else {
-                    failures.push(format!("{at}: unexpandable macro in filename {path:?}"));
-                    continue;
-                };
-                let local_db = match macros.get(name) {
-                    Some(MacroTarget::IocDir) => Some(ioc_dir.join("db")),
-                    Some(MacroTarget::FamilyDir) => {
-                        Some(ioc_dir.parent().expect("ioc dir has a parent").join("db"))
-                    }
-                    Some(MacroTarget::ExternalConst) => None,
-                    None if external => None,
-                    None => {
-                        failures.push(format!(
-                            "{at}: $({name}) has no set_default in {}",
-                            ioc_dir.strip_prefix(&root).unwrap_or(ioc_dir).display()
-                        ));
-                        None
-                    }
-                };
-                if let Some(db_dir) = local_db {
-                    if !db_dir.join(&file).exists() {
-                        failures.push(format!("{at}: $({name})/db/{file} missing"));
-                    } else if has_external_include(&db_dir, &file, &mut Vec::new()) {
-                        needs_include_path = true;
-                    }
-                }
-            }
-        }
-
-        // Template-internal `include "..."` lines resolve through the db
-        // search path, not through dbLoad's explicit path. An IOC whose
-        // templates include a shipped base template must declare the
-        // search path in the sanctioned `$(MACRO)/db` list form — anything
-        // else is the multi-convention drift this test exists to stop.
-        let declares = declares_canonical_include_path(&text);
-        if text.contains("EPICS_DB_INCLUDE_PATH") && !declares {
-            failures.push(format!(
-                "{}: EPICS_DB_INCLUDE_PATH is not a colon list of $(MACRO)/db components",
-                cmd.strip_prefix(&root).unwrap_or(cmd).display()
-            ));
-        }
-        if needs_include_path && !declares {
-            failures.push(format!(
-                "{}: templates have external includes but the file does not set EPICS_DB_INCLUDE_PATH",
-                cmd.strip_prefix(&root).unwrap_or(cmd).display()
-            ));
-        }
+        let mut env = framework.clone();
+        env.extend(ioc_env(ioc_dir, &packages));
+        run.top = canonical;
+        run.script(cmd, ioc_dir, &mut env, 0);
     }
 
     assert!(
-        checked > 300,
-        "suspiciously few db loads checked: {checked}"
+        run.checked > 300,
+        "suspiciously few db loads checked: {}",
+        run.checked
     );
     assert!(
-        failures.is_empty(),
+        run.failures.is_empty(),
         "non-canonical or unresolvable db loads:\n{}",
-        failures.join("\n")
+        run.failures.join("\n")
     );
+}
+
+#[test]
+fn a_fragment_sees_the_including_scripts_macros() {
+    let mut env = HashMap::from([("TEMPLATE".to_string(), "AH401B".to_string())]);
+    assert_eq!(
+        expand("$(QUADEM)/db/$(TEMPLATE).template", &env),
+        "$(QUADEM)/db/AH401B.template",
+        "an undefined macro stays as written"
+    );
+    env.insert("QUADEM".into(), "/q".into());
+    assert_eq!(expand("${QUADEM}/$(X=d)", &env), "/q/d");
+}
+
+#[test]
+fn a_bare_name_opens_through_the_include_path_only() {
+    let dir = std::env::temp_dir().join(format!("db-paths-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("db")).unwrap();
+    std::fs::write(dir.join("db/a.template"), "include \"b.template\"\n").unwrap();
+    let mut env = HashMap::new();
+    assert_eq!(open_db("a.template", &dir, &env), None);
+    env.insert("EPICS_DB_INCLUDE_PATH".to_string(), "x:db".to_string());
+    let found = open_db("a.template", &dir, &env).expect("found along the path");
+    let mut missing = Vec::new();
+    check_includes(&found, &dir, &env, &mut HashSet::new(), &mut missing);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    std::fs::write(dir.join("db/b.template"), "").unwrap();
+    missing.clear();
+    check_includes(&found, &dir, &env, &mut HashSet::new(), &mut missing);
+    assert!(missing.is_empty(), "{missing:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
