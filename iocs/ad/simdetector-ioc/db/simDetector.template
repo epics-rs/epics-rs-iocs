@@ -6,11 +6,42 @@
 
 include "ADBase.template"
 
-# DEVIATION: upstream re-declares $(P)$(R)ColorMode / ColorMode_RBV here to
-# narrow the menu to Mono / RGB1(2) / RGB2(3) / RGB3(4). `epics-base-rs`
-# rejects a duplicate record name across dbLoadRecords, so the ADBase.template
-# menu (which additionally offers Bayer and YUV*) is used unchanged. The driver
-# treats every unsupported colour mode as Mono; see `image::Layout`.
+# Redefine the color mode choices from ADBase.template to only have those that the simDetector
+# driver supports.  Keep the same values (xxVL), but change the menu numbers.
+
+record(mbbo, "$(P)$(R)ColorMode")
+{
+   field(ZRST, "Mono")
+   field(ZRVL, "0")
+   field(ONST, "RGB1")
+   field(ONVL, "2")
+   field(TWST, "RGB2")
+   field(TWVL, "3")
+   field(THST, "RGB3")
+   field(THVL, "4")
+   field(FRST, "")
+   field(FVST, "")
+   field(SXST, "")
+   field(SVST, "")
+   field(EIST, "")
+}
+
+record(mbbi, "$(P)$(R)ColorMode_RBV")
+{
+   field(ZRST, "Mono")
+   field(ZRVL, "0")
+   field(ONST, "RGB1")
+   field(ONVL, "2")
+   field(TWST, "RGB2")
+   field(TWVL, "3")
+   field(THST, "RGB3")
+   field(THVL, "4")
+   field(FRST, "")
+   field(FVST, "")
+   field(SXST, "")
+   field(SVST, "")
+   field(EIST, "")
+}
 
 # New records for simulation detector
 record(ao, "$(P)$(R)GainX")
