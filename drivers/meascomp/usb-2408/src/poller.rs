@@ -1,12 +1,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::param::ParamValue;
+use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
+use crate::driver::MultiFunctionDriver;
 use crate::params::*;
 use crate::trace::{SelfTrace, status_of};
 use crate::wave_dig::{self, WaveDigScan, WaveDigState};
@@ -69,9 +73,12 @@ fn poller_loop(
     // C `prevStatus`: a failing call is reported on the first cycle of an
     // outage only, and its end once.
     let mut prev_status = 0;
+    let mut start = Instant::now();
 
     loop {
-        let start = Instant::now();
+        // C's POLL_TIME_MS is the period from one pass's start to the next.
+        let poll_time = start.elapsed();
+        start = Instant::now();
 
         // ---- Phase 1: read config params (no device lock) ----
         let input_mode = handle
@@ -117,6 +124,7 @@ fn poller_loop(
         // C `status`: the last uldaq call's result. A failed DIn, CIn or
         // AOutScanStatus ends the cycle's reads (C `goto error`).
         let mut status = 0;
+        let mut goto_error = false;
         let snapshot = {
             let mut snap = PollSnapshot::default();
             if let Ok(dev) = device.lock() {
@@ -129,6 +137,7 @@ fn poller_loop(
                                 trace.report_error(status, FUNCTION, "Calling DIn");
                                 trace.print(TraceMask::ERROR, format_args!("portNumber=0"));
                             }
+                            goto_error = true;
                             break 'error;
                         }
                     }
@@ -141,6 +150,7 @@ fn poller_loop(
                                 if prev_status == 0 {
                                     trace.report_error(status, FUNCTION, "Calling CIn");
                                 }
+                                goto_error = true;
                                 break 'error;
                             }
                         }
@@ -161,6 +171,7 @@ fn poller_loop(
                             if prev_status == 0 {
                                 trace.report_error(status, FUNCTION, "Calling AOutScanStatus");
                             }
+                            goto_error = true;
                             break 'error;
                         }
                         snap.wave_gen_current_point = st.wave_gen.current_point;
@@ -249,77 +260,110 @@ fn poller_loop(
         }
         prev_status = status;
 
-        // ---- Phase 3: write results (no device lock) ----
+        // ---- Phase 3: set the results under the port, as C's setXxxParam
+        // calls do; a `goto error` cycle skips the callbacks.
+        let int = |reason, addr: usize, v: i32| {
+            ParamSetValue::new(reason, addr as i32, ParamValue::Int32(v))
+        };
+        let float = |reason, addr: usize, v: f64| {
+            ParamSetValue::new(reason, addr as i32, ParamValue::Float64(v))
+        };
+        let mut updates = vec![float(
+            params.poll_time_ms,
+            0,
+            poll_time.as_secs_f64() * 1000.0,
+        )];
         if let Some(data) = snapshot.digital_input {
             let changed = data ^ prev_digital_input;
             if force_callback || changed != 0 {
                 prev_digital_input = data;
                 force_callback = false;
-                let _ = handle.set_params_and_notify_blocking(
+                updates.push(ParamSetValue::uint32_digital(
+                    params.digital_input,
                     0,
-                    vec![ParamSetValue::uint32_digital(
-                        params.digital_input,
-                        0,
-                        data as u32,
-                        0xFFFF_FFFF,
-                        0,
-                    )],
-                );
+                    data as u32,
+                    0xFFFF_FFFF,
+                    0,
+                ));
             }
         }
         for (counter, value) in snapshot.counters.iter().enumerate() {
             if let Some(v) = value {
-                let _ =
-                    handle.write_int32_blocking(params.counter_value, counter as i32, *v as i32);
+                updates.push(int(params.counter_value, counter, *v as i32));
             }
         }
         if snapshot.wave_gen_running || snapshot.wave_gen_just_stopped {
-            let _ = handle.write_int32_blocking(
+            updates.push(int(
                 params.wave_gen_current_point,
                 0,
                 snapshot.wave_gen_current_point as i32,
-            );
+            ));
             if snapshot.wave_gen_just_stopped {
-                let _ = handle.write_int32_blocking(params.wave_gen_run, 0, 0);
+                updates.push(int(params.wave_gen_run, 0, 0));
             }
         }
         if snapshot.wave_dig_running {
-            let _ = handle.write_int32_blocking(
+            updates.push(int(
                 params.wave_dig_current_point,
                 0,
                 snapshot.wave_dig_current_point as i32,
-            );
-            if let Some(arrays) = snapshot.wave_dig_arrays {
-                // The scan ended: C stopWaveDig's RUN, readWaveDig callbacks
-                // and, under AUTO_RESTART, startWaveDig's parameters.
-                let _ = handle.set_params_and_notify_blocking(0, arrays);
-            }
+            ));
+            // The scan ended: C stopWaveDig's RUN, readWaveDig callbacks
+            // and, under AUTO_RESTART, startWaveDig's parameters.
+            updates.extend(snapshot.wave_dig_arrays.into_iter().flatten());
         } else {
             for ch in 0..MAX_ANALOG_IN {
                 if let Some(raw) = snapshot.ai_raw[ch] {
-                    let _ = handle.write_int32_blocking(params.analog_in_value, ch as i32, raw);
+                    updates.push(int(params.analog_in_value, ch, raw));
                 }
                 if let Some(v) = snapshot.ai_volts[ch] {
-                    let _ = handle.write_float64_blocking(params.voltage_in_value, ch as i32, v);
+                    updates.push(float(params.voltage_in_value, ch, v));
                 }
                 if let Some(t) = snapshot.ai_temp[ch] {
-                    let _ =
-                        handle.write_float64_blocking(params.temperature_in_value, ch as i32, t);
+                    updates.push(float(params.temperature_in_value, ch, t));
                 }
             }
         }
-
-        for addr in 0..MAX_SIGNALS as i32 {
-            let _ = handle.call_param_callbacks_blocking(addr);
-        }
-
-        let elapsed = start.elapsed();
-        let _ =
-            handle.write_float64_blocking(params.poll_time_ms, 0, elapsed.as_secs_f64() * 1000.0);
+        let _ = handle.with_driver_blocking::<MultiFunctionDriver, _>(move |driver| {
+            let base = driver.base_mut();
+            for update in updates {
+                let _ = apply(base, update);
+            }
+            if !goto_error {
+                for addr in 0..MAX_SIGNALS as i32 {
+                    let _ = base.call_param_callbacks(addr);
+                }
+            }
+        });
 
         let poll_ms = handle
             .read_float64_blocking(params.poll_sleep_ms, 0)
             .unwrap_or(50.0);
-        std::thread::sleep(Duration::from_millis(poll_ms as u64));
+        std::thread::sleep(Duration::from_secs_f64(poll_ms.max(0.0) / 1000.0));
+    }
+}
+
+/// One `setXxxParam` of the poll pass.
+fn apply(base: &mut PortDriverBase, update: ParamSetValue) -> AsynResult<()> {
+    match update {
+        ParamSetValue::Value {
+            reason,
+            addr,
+            value,
+        } => base.set_param_value(reason, addr, value),
+        ParamSetValue::UInt32Digital {
+            reason,
+            addr,
+            value,
+            mask,
+            interrupt_mask,
+        } => base.set_uint32_param(reason, addr, value, mask, interrupt_mask),
+        ParamSetValue::Status {
+            reason,
+            addr,
+            status,
+            alarm_status,
+            alarm_severity,
+        } => base.set_param_status(reason, addr, status, alarm_status, alarm_severity),
     }
 }
