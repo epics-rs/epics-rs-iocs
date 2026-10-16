@@ -122,7 +122,7 @@ impl DevMcaAsyn {
     /// C `init_record`'s `parseLink`, `connectDevice` and the 21
     /// `findDrvInfo` calls (`devMcaAsyn.c:121-204`), with C's messages. Any
     /// failure is C's `goto bad`.
-    fn connect(&self) -> Option<McaPort> {
+    fn connect(&self) -> Connect {
         let link = match parse_asyn_link(&self.inp) {
             Ok(link) => link,
             Err(e) => {
@@ -130,7 +130,7 @@ impl DevMcaAsyn {
                     "devMcaAsyn::init_record {} bad link {e}\n",
                     self.name
                 ));
-                return None;
+                return Connect::NoPort;
             }
         };
         let Some(entry) = get_port(&link.port_name) else {
@@ -143,7 +143,7 @@ impl DevMcaAsyn {
                     self.name, link.port_name
                 ),
             );
-            return None;
+            return Connect::NoPort;
         };
         let mut port = McaPort {
             handle: entry.handle,
@@ -172,12 +172,22 @@ impl DevMcaAsyn {
                             command.drv_info()
                         ),
                     );
-                    return None;
+                    return Connect::Unresolved(port);
                 }
             }
         }
-        Some(port)
+        Connect::Resolved(port)
     }
+}
+
+/// Where C `init_record` (`devMcaAsyn.c:100-212`) stopped.
+enum Connect {
+    Resolved(McaPort),
+    /// A `findDrvInfo` failed: the reasons after it stay 0, as `calloc`
+    /// left them.
+    Unresolved(McaPort),
+    /// The user never reached a port.
+    NoPort,
 }
 
 impl McaPort {
@@ -312,10 +322,14 @@ impl DeviceSupport for DevMcaAsyn {
     /// it. Without this, a driver never learns a setup field's db-loaded
     /// value (e.g. `NUSE`) until a client explicitly rewrites it after boot.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        let Some(port) = self.connect() else {
-            return Ok(DeviceInitOutcome::dead());
-        };
+        let connect = self.connect();
         let mca = Self::mca(record)?;
+        // C's `goto bad` returns 0, so the record still sends every setup
+        // command (`mcaRecord.c:463-487`) and only then sits in PACT.
+        let port = match &connect {
+            Connect::Resolved(port) | Connect::Unresolved(port) => Some(port),
+            Connect::NoPort => None,
+        };
         for command in [
             McaCommand::ChannelAdvanceSource(mca.chas as i32),
             McaCommand::NumChannels(mca.nuse),
@@ -332,8 +346,25 @@ impl DeviceSupport for DevMcaAsyn {
         ] {
             // C discards every one of these send_msg statuses
             // (`mcaRecord.c:464-487`).
-            let _ = port.send_command(command);
+            match port {
+                Some(port) => {
+                    let _ = port.send_command(command);
+                }
+                None => trace_error(
+                    None,
+                    0,
+                    0,
+                    format_args!(
+                        "devMcaAsyn::send_msg: {} error calling queueRequest, \
+                         asynManager::queueRequest asynUser not associated with a port",
+                        self.name
+                    ),
+                ),
+            }
         }
+        let Connect::Resolved(port) = connect else {
+            return Ok(DeviceInitOutcome::dead());
+        };
         self.port = Some(port);
         Ok(DeviceInitOutcome::ok())
     }
@@ -436,7 +467,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use epics_rs::asyn::asyn_record::register_port;
-    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
     use epics_rs::base::runtime::interrupt_accept::InterruptGate;
@@ -444,12 +475,13 @@ mod tests {
 
     use super::*;
 
-    /// An asyn MCA driver that logs every int32 write's reason and rejects
-    /// every `NumChannels` write.
+    /// An asyn MCA driver that logs every int32 write's reason, rejects
+    /// every `NumChannels` write and refuses the `refuse` drvInfo string.
     struct LoggingDriver {
         base: PortDriverBase,
         writes: Arc<Mutex<Vec<usize>>>,
         num_channels: usize,
+        refuse: Option<&'static str>,
     }
 
     impl PortDriver for LoggingDriver {
@@ -459,6 +491,14 @@ mod tests {
 
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.base
+        }
+
+        fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+            if self.refuse == Some(req.drv_info.as_str()) {
+                return Err(AsynError::ParamNotFound(req.drv_info.clone()));
+            }
+            let reason = self.base.params.find_param(&req.drv_info).unwrap();
+            Ok(DrvUserInfo::from_reason(reason))
         }
 
         fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -507,6 +547,15 @@ mod tests {
     }
 
     fn fixture(name: &str) -> Fixture {
+        let (f, outcome) = fixture_refusing(name, None);
+        assert!(matches!(outcome, DeviceInitOutcome::Ok(_)));
+        f.writes.lock().unwrap().clear();
+        f
+    }
+
+    /// A record initialised on a port whose driver refuses `refuse`'s
+    /// drvInfo; the writes the init made stay logged.
+    fn fixture_refusing(name: &str, refuse: Option<McaReason>) -> (Fixture, DeviceInitOutcome) {
         let mut base = PortDriverBase::new(
             name,
             1,
@@ -522,6 +571,7 @@ mod tests {
             base,
             writes: Arc::clone(&writes),
             num_channels: reasons[McaReason::NumChannels as usize],
+            refuse: refuse.map(McaReason::drv_info),
         };
         let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
         register_port(
@@ -531,15 +581,44 @@ mod tests {
         )
         .unwrap();
         let (dev, rec, outcome) = init_dev(&format!("@asyn({name})"));
-        assert!(matches!(outcome, DeviceInitOutcome::Ok(_)));
-        writes.lock().unwrap().clear();
-        Fixture {
+        let f = Fixture {
             _runtime: runtime,
             dev,
             rec,
             writes,
             reasons,
-        }
+        };
+        (f, outcome)
+    }
+
+    /// The int32 setup commands `mcaRecord.c:463-487` sends, in its order.
+    const INT32_SETUP: [McaReason; 8] = [
+        McaReason::ChannelAdvanceSource,
+        McaReason::NumChannels,
+        McaReason::Sequence,
+        McaReason::Prescale,
+        McaReason::PresetLowChannel,
+        McaReason::PresetHighChannel,
+        McaReason::PresetSweeps,
+        McaReason::AcquireMode,
+    ];
+
+    /// C's `goto bad` returns 0 (`devMcaAsyn.c:208-210`), so mca
+    /// `init_record` still sends every setup command: with the reasons it
+    /// resolved, and reason 0 for the ones after the failing `findDrvInfo`.
+    #[test]
+    fn a_failed_drv_info_still_sends_the_setup_commands() {
+        let (f, outcome) = fixture_refusing("MCATESTLASTINFO", Some(McaReason::ElapsedCounts));
+        assert!(matches!(outcome, DeviceInitOutcome::Dead { alarm: None }));
+        assert!(f.dev.port.is_none());
+        let resolved = INT32_SETUP.map(|reason| f.reasons[reason as usize]);
+        assert_eq!(*f.writes.lock().unwrap(), resolved);
+
+        let (f, outcome) = fixture_refusing("MCATESTNUSEINFO", Some(McaReason::NumChannels));
+        assert!(matches!(outcome, DeviceInitOutcome::Dead { alarm: None }));
+        let mut partial = [0; 8];
+        partial[0] = f.reasons[McaReason::ChannelAdvanceSource as usize];
+        assert_eq!(*f.writes.lock().unwrap(), partial);
     }
 
     #[test]
