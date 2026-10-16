@@ -381,8 +381,10 @@ impl Pm500Axis {
             done: !moving,
             moving,
             direction,
-            high_limit: on_limit && direction,
-            low_limit: on_limit && !direction,
+            // C sets only the switch in the travel direction on an 'L' and
+            // leaves the other as it was.
+            high_limit: on_limit && (direction || self.last_status.high_limit),
+            low_limit: on_limit && (!direction || self.last_status.low_limit),
             home: false,
             powered,
             // C sets RA_PROBLEM from an 'E' status but unconditionally
@@ -453,6 +455,7 @@ mod tests {
         base: epics_rs::asyn::port::PortDriverBase,
         reply: Vec<u8>,
         sent: Arc<Mutex<Vec<String>>>,
+        xr: Arc<Mutex<&'static str>>,
     }
 
     impl epics_rs::asyn::port::PortDriver for Scripted {
@@ -469,7 +472,7 @@ mod tests {
                 "XSTAT?" => "X0",
                 "YSTAT?" => "YE",
                 "XCONFIG?" => "XCONFIG 302",
-                "XR" => "XB+5.012",
+                "XR" => *self.xr.lock().unwrap(),
                 "XM?" => "XM1",
                 _ => "OK",
             }
@@ -485,30 +488,37 @@ mod tests {
         }
     }
 
-    /// drvPM500.cc motor_init ends each axis with set_status.
-    #[test]
-    fn axis_init_runs_set_status_after_config() {
+    type Line = (Pm500Axis, Arc<Mutex<Vec<String>>>, Arc<Mutex<&'static str>>);
+
+    /// drvPM500.cc motor_init for one controller and its `X` axis: the
+    /// axis, the wire log, and the `XR` reply.
+    fn pm500_axis(name: &str) -> Line {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
         use std::time::Duration;
 
         let sent = Arc::new(Mutex::new(Vec::new()));
+        let xr = Arc::new(Mutex::new("XB+5.012"));
         let line = Scripted {
-            base: PortDriverBase::new("pm500_init", 1, PortFlags::default()),
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
             reply: Vec::new(),
             sent: sent.clone(),
+            xr: xr.clone(),
         };
-        let (rt, _jh) = create_port_runtime(
-            &claim_port("pm500_init").unwrap(),
-            line,
-            RuntimeConfig::default(),
-        )
-        .unwrap();
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
+                .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
         let ctrl = Pm500Controller::new(io).unwrap();
         assert_eq!(ctrl.num_axes(), 1);
-        let axis = Pm500Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        (Pm500Axis::new(Arc::new(Mutex::new(ctrl)), 0), sent, xr)
+    }
+
+    /// drvPM500.cc motor_init ends each axis with set_status.
+    #[test]
+    fn axis_init_runs_set_status_after_config() {
+        let (axis, sent, _) = pm500_axis("pm500_init");
         assert_eq!(
             *sent.lock().unwrap(),
             [
@@ -526,6 +536,23 @@ mod tests {
         let s = &axis.last_status;
         assert_eq!(s.position, 5.012);
         assert!(s.moving && s.direction && s.powered && s.has_encoder);
+    }
+
+    /// drvPM500.cc set_status on an 'L' status sets only the switch in the
+    /// travel direction; a clear status clears both.
+    #[test]
+    fn a_limit_status_keeps_the_other_switch() {
+        let (mut axis, _, xr) = pm500_axis("pm500_limits");
+        let user = AsynUser::default();
+        let mut poll = |reply: &'static str| {
+            *xr.lock().unwrap() = reply;
+            let s = axis.poll(&user).unwrap();
+            (s.high_limit, s.low_limit)
+        };
+        assert_eq!(poll("XL+5.012"), (true, false));
+        assert_eq!(poll("XL-5.012"), (true, true));
+        assert_eq!(poll("XD-5.012"), (false, false));
+        assert_eq!(poll("XL-5.012"), (false, true));
     }
 
     #[test]
