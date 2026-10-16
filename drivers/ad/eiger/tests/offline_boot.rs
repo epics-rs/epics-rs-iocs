@@ -73,7 +73,12 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
 
 #[test]
 fn the_configure_command_fails_when_the_detector_does_not_answer() {
-    let result = create_eiger_detector_on_port("EIGER_OFFLINE_CFG", "127.0.0.1", dead_port(), 0);
+    let result = create_eiger_detector_on_port(
+        &epics_rs::asyn::registry::claim_port("EIGER_OFFLINE_CFG").unwrap(),
+        "127.0.0.1",
+        dead_port(),
+        0,
+    );
     assert!(matches!(
         result,
         Err(ConfigError::Rest("unable to parse response json"))

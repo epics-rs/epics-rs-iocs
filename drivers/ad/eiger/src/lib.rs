@@ -13,6 +13,7 @@ use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 
@@ -86,11 +87,11 @@ impl From<AsynError> for ConfigError {
 
 /// Create an Eiger detector port (C `eigerDetectorConfig`).
 pub fn create_eiger_detector(
-    port_name: &str,
+    claim: &PortClaim,
     hostname: &str,
     max_memory: usize,
 ) -> Result<EigerRuntime, ConfigError> {
-    create_eiger_detector_on_port(port_name, hostname, REST_PORT, max_memory)
+    create_eiger_detector_on_port(claim, hostname, REST_PORT, max_memory)
 }
 
 /// [`create_eiger_detector`] against a REST port other than 80.
@@ -99,11 +100,12 @@ pub fn create_eiger_detector(
 /// (`mApi(serverHostname, 80)`); this seam exists so a test can aim the driver
 /// at a socket it controls.
 pub fn create_eiger_detector_on_port(
-    port_name: &str,
+    claim: &PortClaim,
     hostname: &str,
     rest_port: u16,
     max_memory: usize,
 ) -> Result<EigerRuntime, ConfigError> {
+    let port_name = claim.name();
     // C builds `mApi` before its constructor body runs, so a detector that
     // cannot say which API it speaks leaves no driver at all.
     let rest = RestApi::open(hostname, rest_port).map_err(ConfigError::Rest)?;
@@ -145,7 +147,7 @@ pub fn create_eiger_detector_on_port(
     let ops = det.ops.clone();
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
 
     let outputs = Outputs::new();
     let shared = tasks::shared(
