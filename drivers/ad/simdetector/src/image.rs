@@ -829,6 +829,9 @@ impl SimEngine {
             dims_out[c] = NDDimension::new(3);
         }
 
+        // C releases pArrays[0] after the reset, just before the convert
+        // (simDetector.cpp:696).
+        pool.owner().store_array(0, None);
         pool.convert(raw, &dims_out, cfg.data_type)
             .map_err(|_| "error allocating buffer in convert()")
     }

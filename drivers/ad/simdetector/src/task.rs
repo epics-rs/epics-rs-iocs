@@ -219,8 +219,6 @@ async fn sim_task(mut ctx: SimTaskContext) {
         .await;
         ctx.set_shutter(true).await;
 
-        // C releases pArrays[0] just before the convert (simDetector.cpp:696).
-        ctx.pool.owner().store_array(0, None);
         let mut image = match ctx.compute_image(&mut engine).await {
             Ok(image) => image,
             Err(e) => {

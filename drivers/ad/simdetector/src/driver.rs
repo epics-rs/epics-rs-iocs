@@ -676,13 +676,28 @@ mod tests {
     /// An 8 x 8 detector set up for one 1 ms Single image, with the
     /// parameters the IOC's PINI records seed.
     fn single_image_detector(name: &str, array_callbacks: i32) -> SimDetectorRuntime {
+        single_image_detector_in(name, array_callbacks, 0)
+    }
+
+    fn single_image_detector_in(
+        name: &str,
+        array_callbacks: i32,
+        max_memory: usize,
+    ) -> SimDetectorRuntime {
         use epics_rs::ad_core::driver::ImageMode;
         use epics_rs::asyn::param::ParamValue;
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::request::ParamSetValue;
 
-        let rt =
-            create_sim_detector(&claim_port(name).unwrap(), 8, 8, NDDataType::UInt8, 0, 0).unwrap();
+        let rt = create_sim_detector(
+            &claim_port(name).unwrap(),
+            8,
+            8,
+            NDDataType::UInt8,
+            0,
+            max_memory,
+        )
+        .unwrap();
         let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
         h.set_params_and_notify_blocking(
             0,
@@ -810,6 +825,41 @@ mod tests {
         let free = pool.num_free_buffers();
         h.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
         assert_eq!(pool.num_free_buffers(), free + 2);
+        std::mem::forget(rt);
+    }
+
+    /// C releases pArrays[0] after the SimBuffers reset (simDetector.cpp:625-646,
+    /// :696), so a reset the pool refuses leaves the last image charged.
+    #[test]
+    fn a_refused_reset_keeps_the_last_image_in_parrays0() {
+        use std::time::{Duration, Instant};
+
+        let rt = single_image_detector_in("SIM_RESET_HOLD", 0, 5 * 64);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        let wait_idle = |count: i32| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() != count
+                && h.read_int32_blocking(ad.status, 0).unwrap() != ADStatus::Error as i32
+                || h.read_int32_blocking(ad.acquire_busy, 0).unwrap() != 0
+            {
+                assert!(Instant::now() < deadline, "acquisition did not end");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_idle(1);
+        let pool = rt.pool();
+        assert!(pool.owner().array(0).is_some());
+
+        h.write_int32_blocking(ad.base.data_type, 0, NDDataType::UInt16 as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_idle(1);
+        assert_eq!(
+            h.read_int32_blocking(ad.status, 0).unwrap(),
+            ADStatus::Error as i32
+        );
+        assert!(pool.owner().array(0).is_some());
         std::mem::forget(rt);
     }
 }
