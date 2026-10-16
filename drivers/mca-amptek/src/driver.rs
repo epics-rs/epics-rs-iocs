@@ -1162,7 +1162,8 @@ impl PortDriver for AmptekDriver {
                 || s.mcs_done
                 || !s.mca_enabled;
             if preset_done {
-                if self.acquiring && self.send_command(TransmitPacketType::DisableMcaMcs).is_ok() {
+                if self.acquiring {
+                    self.send_command(TransmitPacketType::DisableMcaMcs)?;
                     self.acquiring = false;
                 }
             } else {
@@ -1467,6 +1468,22 @@ mod tests {
             sent[1].starts_with("SCAI=1;SCAL=5;SCAH=5;SCAO=HIGH;SCAI=2;SCAL=1;SCAH=1;SCAO=HIGH;")
         );
         assert!(sent[1].ends_with("SCAI=8;SCAL=1;SCAH=1;SCAO=HIGH;"));
+    }
+
+    /// A failed `XMTPT_DISABLE_MCA_MCS` fails the read and keeps
+    /// `acquiring_` set (`drvAmptek.cpp:941-943`).
+    #[test]
+    fn acquiring_read_returns_disable_mca_mcs_error() {
+        let status = [0u8; 64];
+        let (mut driver, _fake) = driver_with_fake(move |req| match (req[2], req[3]) {
+            (0xF0, _) => None,
+            _ => default_reply(req, &status),
+        });
+        connect(&mut driver).unwrap();
+        driver.acquiring = true;
+        let user = AsynUser::new(driver.mca[McaReason::Acquiring as usize]);
+        assert!(driver.read_int32(&user).is_err());
+        assert!(driver.acquiring);
     }
 
     #[test]
