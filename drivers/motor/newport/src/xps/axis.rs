@@ -11,17 +11,23 @@
 //! wire scale (1.0 in the normal configuration; C's `stepSize_` instead
 //! converted its raw-step record boundary — the asyn-rs boundary is EGU).
 
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
-use super::controller::XpsController;
-use super::corrector;
+use super::controller::{SetPositionFailure, XpsController};
+use super::corrector::{self, CorrectorType, PidFailure};
 use super::rpc::{XpsError, XpsResult, XpsSocket};
+
+/// C `driverName` in XPSAxis.cpp.
+const DRIVER_NAME: &str = "XPSAxis";
 
 /// Velocity below which the axis is considered stopped (C
 /// `XPS_VELOCITY_DEADBAND`).
@@ -69,6 +75,9 @@ pub struct XpsAxis {
     /// Last group status code seen by [`poll`](AsynMotor::poll); `move` reads it
     /// to decide whether to auto-enable a disabled axis.
     axis_status: i32,
+    /// C's `pasynUser_`: the motor port and axis number every error line
+    /// prints on and names as `[port,axis]`.
+    trace: MotorTrace,
 }
 
 impl XpsAxis {
@@ -78,9 +87,19 @@ impl XpsAxis {
     pub fn new(
         controller: Arc<Mutex<XpsController>>,
         move_sock: XpsSocket,
+        motor_port: &str,
+        axis_no: i32,
         positioner_name: &str,
         step_size: f64,
     ) -> AsynResult<Self> {
+        let trace = MotorTrace::new(motor_port, axis_no);
+        if !positioner_name.contains('.') {
+            trace_error(
+                &trace,
+                "XPSAxis",
+                format_args!("positionerName must be of form group.positioner = {positioner_name}"),
+            );
+        }
         let group_name = group_of(positioner_name).to_string();
         let (min_jerk, max_jerk) = {
             let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
@@ -99,7 +118,31 @@ impl XpsAxis {
             min_jerk,
             max_jerk,
             axis_status: 0,
+            trace,
         })
+    }
+
+    /// `asynPrint(pasynUser_, ASYN_TRACE_ERROR, "%s:%s: ...", driverName,
+    /// functionName, ...)`.
+    fn error(&self, function: &str, args: fmt::Arguments<'_>) {
+        trace_error(&self.trace, function, args);
+    }
+
+    /// C's `pC_->portName` and `axisNo_`, as every `[%s,%d]` names them.
+    fn port(&self) -> &str {
+        self.trace.port()
+    }
+
+    fn axis_no(&self) -> i32 {
+        self.trace.addr()
+    }
+
+    /// C `getXPSError`/`ErrorStringGet` on the poll socket; C leaves the
+    /// buffer as it was when that call fails, here empty.
+    fn error_string(ctrl: &XpsController, code: i32) -> String {
+        ctrl.poll_socket()
+            .error_string_get(code)
+            .unwrap_or_default()
     }
 
     fn lock_controller(&self) -> MutexGuard<'_, XpsController> {
@@ -127,7 +170,18 @@ impl XpsAxis {
         // Disabled state (20..=36): auto-enable, or refuse the move.
         if (20..=36).contains(&self.axis_status) {
             if ctrl.auto_enable() {
-                sock.group_motion_enable(&self.group_name)?;
+                sock.group_motion_enable(&self.group_name)
+                    .inspect_err(|e| {
+                        self.error(
+                            "move",
+                            format_args!(
+                                "motorAxisMove[{},{}]: error performing GroupMotionEnable {}",
+                                self.port(),
+                                self.axis_no(),
+                                e.code()
+                            ),
+                        )
+                    })?;
             } else {
                 return Err(AsynError::Status {
                     status: AsynStatus::Error,
@@ -144,9 +198,134 @@ impl XpsAxis {
             acceleration * self.step_size,
             self.min_jerk,
             self.max_jerk,
-        )?;
+        )
+        .inspect_err(|e| {
+            self.error(
+                "move",
+                format_args!(
+                    "Error performing PositionerSGammaParametersSet[{},{}] {}: {}",
+                    self.port(),
+                    self.axis_no(),
+                    e.code(),
+                    Self::error_string(ctrl, e.code())
+                ),
+            )
+        })?;
         Ok(())
     }
+
+    /// The `GroupMoveAbsolute`/`GroupMoveRelative` verdict: C tolerates
+    /// `-27` (the motor record reversing direction aborts a move) and prints
+    /// every other error.
+    fn move_result(&self, command: &str, result: XpsResult<()>) -> AsynResult<()> {
+        match result {
+            Ok(()) | Err(XpsError::Api(-27)) => Ok(()),
+            Err(e) => {
+                self.error(
+                    "move",
+                    format_args!(
+                        "Error performing {command}[{},{}] {}",
+                        self.port(),
+                        self.axis_no(),
+                        e.code()
+                    ),
+                );
+                Err(e.into())
+            }
+        }
+    }
+
+    fn limits_get_error(&self, function: &str, e: &XpsError) {
+        self.error(
+            function,
+            format_args!(
+                "[{},{}]: error performing PositionerUserTravelLimitsGet status={}",
+                self.port(),
+                self.axis_no(),
+                e.code()
+            ),
+        )
+    }
+
+    /// C `setPID`'s line for the step that failed.
+    fn report_pid_failure(&self, failure: &PidFailure) {
+        let (port, axis) = (self.port(), self.axis_no());
+        let name = |ct: &CorrectorType| match ct {
+            CorrectorType::PiPosition => "PIPosition",
+            CorrectorType::PidFfVelocity => "PIDFFVelocity",
+            CorrectorType::PidFfAcceleration => "PIDFFAcceleration",
+            CorrectorType::PidDualFfVoltage => "PIDDualFFVoltage",
+            CorrectorType::NoCorrector | CorrectorType::Other => "",
+        };
+        match failure {
+            PidFailure::TypeGet(code) => self.error(
+                "setPID",
+                format_args!(
+                    "Error with PositionerCorrectorTypeGet. XPS: {port}, Axis: {axis}, XPS API Error: {code}"
+                ),
+            ),
+            PidFailure::Get(CorrectorType::PiPosition, code) => self.error(
+                "setPID",
+                format_args!(
+                    "Error with PositionerCorrectorPIPositionGet. Aborting setting PID XPS: {port}, Axis: {axis}, XPS API Error: {code}"
+                ),
+            ),
+            PidFailure::Set(CorrectorType::PiPosition, code) => self.error(
+                "setPID",
+                format_args!(
+                    "Error with PositionerCorrectorPIPositionSet: {port}, Axis: {axis}, XPS API Error: {code}"
+                ),
+            ),
+            PidFailure::Get(ct, code) => self.error(
+                "setPID",
+                format_args!(
+                    "Error with PositionerCorrector{}Get. Aborting setting PID {port}, Axis: {axis}, XPS API Error: {code}",
+                    name(ct)
+                ),
+            ),
+            PidFailure::Set(ct, code) => self.error(
+                "setPID",
+                format_args!(
+                    "Error with PositionerCorrector{}Set. Aborting setting PID {port}, Axis: {axis}, XPS API Error: {code}",
+                    name(ct)
+                ),
+            ),
+            PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error(
+                "setPID",
+                format_args!(
+                    ". XPS {port} axis {axis} corrector type is {type_name}. Cannot set PID."
+                ),
+            ),
+            PidFailure::Unsupported(_, type_name) => self.error(
+                "setPID",
+                format_args!(
+                    ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID."
+                ),
+            ),
+        }
+    }
+
+    /// C `doMoveToHome`'s failure exit: print, then `GroupKill` on the move
+    /// socket when C issues one.
+    fn move_to_home_failed(&self, message: &str, kill: bool) -> AsynError {
+        self.error("XPSAxis::doMoveToHome", format_args!("{message}"));
+        if kill {
+            let _ = self.move_sock.group_kill(&self.group_name);
+        }
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("XPS move-to-home for {}: {message}", self.group_name),
+        }
+    }
+}
+
+/// `asynPrint(pasynUser_, ASYN_TRACE_ERROR, "%s:%s: ...")` on an axis user.
+fn trace_error(trace: &MotorTrace, function: &str, args: fmt::Arguments<'_>) {
+    trace.print(
+        TraceMask::ERROR,
+        0,
+        format_args!("{DRIVER_NAME}:{function}: {args}"),
+    );
 }
 
 /// The group name is the prefix of `group.positioner` before the first `.`
@@ -212,7 +391,8 @@ impl AsynMotor for XpsAxis {
             let ctrl = self.lock_controller();
             self.prepare_move(&ctrl, velocity, acceleration)?;
         }
-        tolerate_dir_change(
+        self.move_result(
+            "GroupMoveAbsolute",
             self.move_sock
                 .group_move_absolute(&self.positioner_name, device_units),
         )
@@ -233,7 +413,8 @@ impl AsynMotor for XpsAxis {
             let ctrl = self.lock_controller();
             self.prepare_move(&ctrl, velocity, acceleration)?;
         }
-        tolerate_dir_change(
+        self.move_result(
+            "GroupMoveRelative",
             self.move_sock
                 .group_move_relative(&self.positioner_name, device_units),
         )
@@ -246,15 +427,30 @@ impl AsynMotor for XpsAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        let jog_error = |command: &str, e: &XpsError| {
+            self.error(
+                "moveVelocity",
+                format_args!(
+                    "[{},{}]: error calling {command} error={}",
+                    self.port(),
+                    self.axis_no(),
+                    e.code()
+                ),
+            )
+        };
         {
             let ctrl = self.lock_controller();
-            ctrl.poll_socket().group_jog_mode_enable(&self.group_name)?;
+            ctrl.poll_socket()
+                .group_jog_mode_enable(&self.group_name)
+                .inspect_err(|e| jog_error("GroupJogModeEnable", e))?;
         }
-        self.move_sock.group_jog_parameters_set(
-            &self.positioner_name,
-            velocity * self.step_size,
-            acceleration * self.step_size,
-        )?;
+        self.move_sock
+            .group_jog_parameters_set(
+                &self.positioner_name,
+                velocity * self.step_size,
+                acceleration * self.step_size,
+            )
+            .inspect_err(|e| jog_error("GroupJogParametersSet", e))?;
         Ok(())
     }
 
@@ -267,38 +463,77 @@ impl AsynMotor for XpsAxis {
         _forward: bool,
     ) -> AsynResult<()> {
         // The XPS home search takes no direction; C ignores `forwards`.
+        let home_error = |ctrl: &XpsController, command: &str, e: &XpsError| {
+            self.error(
+                "home",
+                format_args!(
+                    "[{},{}]: error calling {command} error={}",
+                    self.port(),
+                    self.axis_no(),
+                    Self::error_string(ctrl, e.code())
+                ),
+            )
+        };
         {
             let mut ctrl = self.lock_controller();
             // C home() clears referencing mode for every axis in the group.
             ctrl.set_group_referencing(&self.group_name, false);
+            let ctrl = &*ctrl;
             let sock = ctrl.poll_socket();
             // A Ready group (10..=18) will refuse home; kill it first.
             let status = sock.group_status_get(&self.group_name)?;
             if (10..=18).contains(&status) {
-                sock.group_kill(&self.group_name)?;
+                sock.group_kill(&self.group_name)
+                    .inspect_err(|e| home_error(ctrl, "GroupKill", e))?;
             }
             // If not initialized, initialize it.
             let status = sock.group_status_get(&self.group_name)?;
             if (0..=9).contains(&status) || status == 50 || status == 63 {
-                sock.group_initialize(&self.group_name)?;
+                sock.group_initialize(&self.group_name)
+                    .inspect_err(|e| home_error(ctrl, "GroupInitialize", e))?;
             }
         }
-        self.move_sock.group_home_search(&self.group_name)?;
+        if let Err(e) = self.move_sock.group_home_search(&self.group_name) {
+            home_error(&self.lock_controller(), "GroupHomeSearch", &e);
+            return Err(e.into());
+        }
         Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        // Captures only `trace`, so `axis_status` stays assignable below.
+        let stop_error = |command: &str, e: &XpsError| {
+            trace_error(
+                &self.trace,
+                "stopAxis",
+                format_args!(
+                    "[{},{}]: error calling {command} status={}",
+                    self.trace.port(),
+                    self.trace.addr(),
+                    e.code()
+                ),
+            )
+        };
         // A jog is stopped differently from a move, so read the status first.
         let status = {
             let ctrl = self.lock_controller();
-            ctrl.poll_socket().group_status_get(&self.group_name)?
+            ctrl.poll_socket()
+                .group_status_get(&self.group_name)
+                .inspect_err(|e| stop_error("GroupStatusGet", e))?
         };
         self.axis_status = status;
-        if status == 44 || status == 45 || status == 47 {
-            self.move_sock.group_move_abort(&self.group_name)?;
+        if (status == 44 || status == 45 || status == 47)
+            && let Err(e) = self.move_sock.group_move_abort(&self.group_name)
+        {
+            stop_error("GroupMoveAbort", &e);
+            // C retries the abort once before giving up.
+            let _ = self.move_sock.group_move_abort(&self.group_name);
+            return Err(e.into());
         }
         if status == 43 {
-            self.move_sock.group_kill(&self.group_name)?;
+            self.move_sock
+                .group_kill(&self.group_name)
+                .inspect_err(|e| stop_error("GroupKill", e))?;
         }
         Ok(())
     }
@@ -306,6 +541,12 @@ impl AsynMotor for XpsAxis {
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock_controller();
         if !ctrl.enable_set_position() {
+            self.error(
+                "setPosition",
+                format_args!(
+                    "XPS set position is disabled. Enable it by setting enableSetPosition parameter in XPSCreateController)."
+                ),
+            );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "XPS set position is disabled (enableSetPosition=0)".into(),
@@ -320,57 +561,124 @@ impl AsynMotor for XpsAxis {
                 ),
             });
         }
-        ctrl.set_position(
+        match ctrl.set_position(
             &self.positioner_name,
             &self.group_name,
             position * self.step_size,
-        )?;
-        Ok(())
+        ) {
+            Ok(()) => Ok(()),
+            Err(SetPositionFailure::Initialize(code)) => {
+                self.error(
+                    "setPosition",
+                    format_args!(
+                        "Error performing GroupKill/GroupInitialize({},{}). XPS API Error: {code}. Aborting set position.",
+                        self.port(),
+                        self.axis_no()
+                    ),
+                );
+                Err(XpsError::Api(code).into())
+            }
+            Err(SetPositionFailure::ReferencingStop(code)) => {
+                self.error(
+                    "setPosition",
+                    format_args!(
+                        "Error performing referencing set position ({},{}). XPS API Error: {code}.",
+                        self.port(),
+                        self.axis_no()
+                    ),
+                );
+                Ok(())
+            }
+        }
     }
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         let ctrl = self.lock_controller();
         let sock = ctrl.poll_socket();
-        if enable {
-            sock.group_motion_enable(&self.group_name)?;
+        let (command, result) = if enable {
+            (
+                "GroupMotionEnable",
+                sock.group_motion_enable(&self.group_name),
+            )
         } else {
-            sock.group_motion_disable(&self.group_name)?;
-        }
+            (
+                "GroupMotionDisable",
+                sock.group_motion_disable(&self.group_name),
+            )
+        };
+        result.inspect_err(|e| {
+            self.error(
+                "setClosedLoop",
+                format_args!(
+                    "[{},{}]: error calling {command} status={}",
+                    self.port(),
+                    self.axis_no(),
+                    e.code()
+                ),
+            )
+        })?;
         Ok(())
     }
 
     fn set_high_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `setHighLimit`: read both travel limits, then rewrite with the new
         // (device-unit) high limit and the existing low limit.
+        let device_value = position * self.step_size;
         let ctrl = self.lock_controller();
         let sock = ctrl.poll_socket();
-        let (low, _high) = sock.positioner_user_travel_limits_get(&self.positioner_name)?;
-        sock.positioner_user_travel_limits_set(
-            &self.positioner_name,
-            low,
-            position * self.step_size,
-        )?;
+        let (low, _high) = sock
+            .positioner_user_travel_limits_get(&self.positioner_name)
+            .inspect_err(|e| self.limits_get_error("setHighLimit", e))?;
+        sock.positioner_user_travel_limits_set(&self.positioner_name, low, device_value)
+            .inspect_err(|e| {
+                self.error(
+                    "setHighLimit",
+                    format_args!(
+                        "[{},{}]: error performing PositionerUserTravelLimitsSet for highLim={device_value:.6} status={}",
+                        self.port(),
+                        self.axis_no(),
+                        e.code()
+                    ),
+                )
+            })?;
         Ok(())
     }
 
     fn set_low_limit(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         // C `setLowLimit`: read both travel limits, then rewrite with the new
         // (device-unit) low limit and the existing high limit.
+        let device_value = position * self.step_size;
         let ctrl = self.lock_controller();
         let sock = ctrl.poll_socket();
-        let (_low, high) = sock.positioner_user_travel_limits_get(&self.positioner_name)?;
-        sock.positioner_user_travel_limits_set(
-            &self.positioner_name,
-            position * self.step_size,
-            high,
-        )?;
+        let (_low, high) = sock
+            .positioner_user_travel_limits_get(&self.positioner_name)
+            .inspect_err(|e| self.limits_get_error("setLowLimit", e))?;
+        sock.positioner_user_travel_limits_set(&self.positioner_name, device_value, high)
+            .inspect_err(|e| {
+                self.error(
+                    "setLowLimit",
+                    format_args!(
+                        "[{},{}]: error performing PositionerUserTravelLimitsSet for lowLim={device_value:.6} status={}",
+                        self.port(),
+                        self.axis_no(),
+                        e.code()
+                    ),
+                )
+            })?;
         Ok(())
     }
 
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
         let ctrl = self.lock_controller();
-        corrector::set_pid(ctrl.poll_socket(), &self.positioner_name, kind, gain)?;
-        Ok(())
+        corrector::set_pid(ctrl.poll_socket(), &self.positioner_name, kind, gain).map_err(
+            |failure| {
+                self.report_pid_failure(&failure);
+                AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("XPS setPID failed: {failure:?}"),
+                }
+            },
+        )
     }
 
     fn move_to_home(
@@ -392,13 +700,11 @@ impl AsynMotor for XpsAxis {
         // (safe on its own thread); we cap it (below) so a home switch that is
         // never reached cannot hang the async worker forever.
         if position == 0.0 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "XPS move-to-home for {} is not enabled (distance is 0)",
-                    self.positioner_name
-                ),
-            });
+            let message = format!(
+                "This function has not been enabled for axis {}",
+                self.axis_no()
+            );
+            return Err(self.move_to_home_failed(&message, false));
         }
         let mut distance = position * self.step_size;
 
@@ -408,9 +714,12 @@ impl AsynMotor for XpsAxis {
             self.move_sock.group_kill(&self.group_name)?;
         }
         thread::sleep(XPS_REFERENCING_SETTLE);
-        {
+        let initialized = {
             let ctrl = self.lock_controller();
-            ctrl.poll_socket().group_initialize(&self.group_name)?;
+            ctrl.poll_socket().group_initialize(&self.group_name)
+        };
+        if initialized.is_err() {
+            return Err(self.move_to_home_failed("error calling GroupInitialize", false));
         }
         thread::sleep(XPS_REFERENCING_SETTLE);
         self.move_sock.group_referencing_start(&self.group_name)?;
@@ -421,13 +730,9 @@ impl AsynMotor for XpsAxis {
         // Must now be in referencing mode (status 11).
         let group_status = self.locked_group_status()?;
         if group_status != XPS_STATUS_HOMING_DONE {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "XPS {} failed to enter referencing mode (status {group_status})",
-                    self.group_name
-                ),
-            });
+            return Err(
+                self.move_to_home_failed("error putting axis into referencing mode.", false)
+            );
         }
         // Flag referencing for the whole group (poll suppresses home/homed).
         {
@@ -439,47 +744,51 @@ impl AsynMotor for XpsAxis {
         let initial_hw = {
             let ctrl = self.lock_controller();
             ctrl.poll_socket()
-                .positioner_hardware_status_get(&self.positioner_name)?
+                .positioner_hardware_status_get(&self.positioner_name)
+        };
+        let Ok(initial_hw) = initial_hw else {
+            return Err(
+                self.move_to_home_failed("error calling PositionerHardwareStatusGet.", false)
+            );
         };
         distance = referencing_distance(distance, initial_hw);
 
         // Halve the velocity so the user can intervene before an overrun.
-        {
+        let slowed = {
             let ctrl = self.lock_controller();
             let sock = ctrl.poll_socket();
-            let (vel, accel, min_jerk, max_jerk) =
-                sock.positioner_sgamma_parameters_get(&self.positioner_name)?;
-            sock.positioner_sgamma_parameters_set(
-                &self.positioner_name,
-                vel / 2.0,
-                accel,
-                min_jerk,
-                max_jerk,
-            )?;
+            match sock.positioner_sgamma_parameters_get(&self.positioner_name) {
+                Err(_) => Err("Error performing PositionerSGammaParametersGet."),
+                Ok((vel, accel, min_jerk, max_jerk)) => sock
+                    .positioner_sgamma_parameters_set(
+                        &self.positioner_name,
+                        vel / 2.0,
+                        accel,
+                        min_jerk,
+                        max_jerk,
+                    )
+                    .map_err(|_| "Error performing PositionerSGammaParametersSet."),
+            }
+        };
+        if let Err(message) = slowed {
+            return Err(self.move_to_home_failed(message, true));
         }
         thread::sleep(XPS_REFERENCING_SETTLE);
 
         // Move toward the home switch (move socket).
-        if let Err(e) = self
+        if self
             .move_sock
             .group_move_relative(&self.positioner_name, distance)
+            .is_err()
         {
-            let _ = self.move_sock.group_kill(&self.group_name);
-            return Err(e.into());
+            return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
         }
         thread::sleep(XPS_REFERENCING_POLL);
 
         // Must be moving (status 44) to begin the switch-crossing wait.
         let group_status = self.locked_group_status()?;
         if group_status != 44 {
-            let _ = self.move_sock.group_kill(&self.group_name);
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "XPS move-to-home for {} did not start moving (status {group_status})",
-                    self.group_name
-                ),
-            });
+            return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
         }
         // Wait until the hardware status flips (crossed the switch), aborting
         // if the move stops for any other reason. Bounded (see DEVIATION above).
@@ -496,14 +805,8 @@ impl AsynMotor for XpsAxis {
             }
             let group_status = self.locked_group_status()?;
             if group_status != 44 {
-                let _ = self.move_sock.group_kill(&self.group_name);
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!(
-                        "XPS move-to-home for {} stopped before home (status {group_status})",
-                        self.group_name
-                    ),
-                });
+                // Move finished for some other reason.
+                return Err(self.move_to_home_failed("Error performing GroupMoveRelative.", true));
             }
             polls += 1;
             if polls >= XPS_REFERENCING_MAX_POLLS {
@@ -518,11 +821,12 @@ impl AsynMotor for XpsAxis {
             }
         }
         // Reached the switch: abort the move (poll socket, as C does).
-        let ctrl = self.lock_controller();
-        if let Err(e) = ctrl.poll_socket().group_move_abort(&self.group_name) {
-            drop(ctrl);
-            let _ = self.move_sock.group_kill(&self.group_name);
-            return Err(e.into());
+        let aborted = {
+            let ctrl = self.lock_controller();
+            ctrl.poll_socket().group_move_abort(&self.group_name)
+        };
+        if aborted.is_err() {
+            return Err(self.move_to_home_failed("Error performing GroupMoveAbort.", true));
         }
         Ok(())
     }
@@ -534,11 +838,33 @@ impl AsynMotor for XpsAxis {
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let sock = ctrl.poll_socket();
 
-        let axis_status = sock.group_status_get(&self.group_name)?;
-        let encoder = sock.group_position_current_get(&self.positioner_name)?;
-        let setpoint = sock.group_position_setpoint_get(&self.positioner_name)?;
-        let positioner_error = sock.positioner_error_get(&self.positioner_name)?;
-        let velocity = sock.group_velocity_current_get(&self.positioner_name)?;
+        let poll_error = |command: &str, e: &XpsError| {
+            self.error(
+                "poll",
+                format_args!(
+                    "[{},{}]: error calling {command} status={}",
+                    self.port(),
+                    self.axis_no(),
+                    e.code()
+                ),
+            )
+        };
+        let axis_status = sock
+            .group_status_get(&self.group_name)
+            .inspect_err(|e| poll_error("GroupStatusGet", e))?;
+        let encoder = sock
+            .group_position_current_get(&self.positioner_name)
+            .inspect_err(|e| poll_error("GroupPositionCurrentGet", e))?;
+        let setpoint = sock
+            .group_position_setpoint_get(&self.positioner_name)
+            .inspect_err(|e| poll_error("GroupPositionSetpointGet", e))?;
+        let positioner_error = sock
+            .positioner_error_get(&self.positioner_name)
+            .inspect_err(|e| poll_error("PositionerErrorGet", e))?;
+        // C's line names GroupPositionVelocityGet for this call (XPSAxis.cpp:746).
+        let velocity = sock
+            .group_velocity_current_get(&self.positioner_name)
+            .inspect_err(|e| poll_error("GroupPositionVelocityGet", e))?;
         // In referencing (move-to-home) mode C reports the axis as not homed /
         // not at home regardless of status (XPSAxis::poll 636/648).
         let referencing = ctrl.is_group_referencing(&self.group_name);
@@ -583,16 +909,6 @@ fn referencing_distance(distance: f64, hardware_status: i32) -> f64 {
         -distance
     } else {
         distance
-    }
-}
-
-/// C `move()` tolerates error `-27` (raised when the motor record reverses
-/// direction, aborting an in-flight move); every other error propagates.
-fn tolerate_dir_change(result: Result<(), XpsError>) -> AsynResult<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(XpsError::Api(-27)) => Ok(()),
-        Err(e) => Err(e.into()),
     }
 }
 

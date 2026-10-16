@@ -30,7 +30,9 @@
 use std::fmt;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use crate::util::{atof, atoi};
 
@@ -71,6 +73,17 @@ impl fmt::Display for XpsError {
 }
 
 impl std::error::Error for XpsError {}
+
+impl XpsError {
+    /// The `int` C's wrapper returns: the controller's code, or the `ret = -1`
+    /// it keeps when `SendAndReceive` left no reply to `sscanf`.
+    pub fn code(&self) -> i32 {
+        match self {
+            XpsError::Transport(_) => -1,
+            XpsError::Api(code) => *code,
+        }
+    }
+}
 
 impl From<AsynError> for XpsError {
     fn from(e: AsynError) -> Self {
@@ -177,13 +190,32 @@ pub enum SocketMode {
 /// [`Fire`]: SocketMode::Fire
 pub struct XpsSocket {
     handle: SyncIOHandle,
+    /// The asyn port `handle` is connected to: C prints its `SendAndReceive`
+    /// errors on that port's user.
+    port: String,
     mode: SocketMode,
 }
 
 impl XpsSocket {
-    /// Wrap an already-connected octet handle with the given send mode.
-    pub fn new(handle: SyncIOHandle, mode: SocketMode) -> Self {
-        Self { handle, mode }
+    /// Wrap an already-connected octet handle on asyn port `port` with the
+    /// given send mode.
+    pub fn new(handle: SyncIOHandle, port: &str, mode: SocketMode) -> Self {
+        Self {
+            handle,
+            port: port.to_string(),
+            mode,
+        }
+    }
+
+    /// `asynPrint(psock->pasynUser, ASYN_TRACE_ERROR, ...)`.
+    fn trace_error(&self, args: fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
     }
 
     /// Send a marshalled command and return its reply. The socket's [`mode`]
@@ -220,7 +252,14 @@ impl XpsSocket {
         // write; only the continuation chunks are plain reads.
         let mut buf = self
             .handle
-            .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)?;
+            .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+            .inspect_err(|e| {
+                self.trace_error(format_args!(
+                    "SendAndReceive error calling writeRead, output={cmd} status={}, error={}",
+                    e.status() as i32,
+                    e.message()
+                ))
+            })?;
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
             let chunk = self.handle.read_octet(OCTET_REASON, READ_BUF)?;
             buf.extend_from_slice(&chunk);
@@ -259,13 +298,28 @@ impl XpsSocket {
                     status: AsynStatus::Timeout,
                     ..
                 }) => return Ok(()),
-                Err(e) => return Err(XpsError::Transport(e)),
+                Err(e) => {
+                    // C prints only for asynError (asynOctetSocket.cpp:197).
+                    if e.status() == AsynStatus::Error {
+                        self.trace_error(format_args!(
+                            "SendAndReceive error calling write, output={cmd} status={}, error={}",
+                            e.status() as i32,
+                            e.message()
+                        ));
+                    }
+                    return Err(XpsError::Transport(e));
+                }
                 Ok(raw) => {
                     let reply = XpsReply(String::from_utf8_lossy(&raw).into_owned());
                     // The retry test is C's `atoi(valueRtrn)`; the verdict is the
                     // caller's `sscanf` on the reply it was left with.
-                    if atoi(&reply.0) == -1 {
-                        continue;
+                    match atoi(&reply.0) {
+                        -1 => continue,
+                        0 => {}
+                        _ => self.trace_error(format_args!(
+                            "SendAndReceive unexpected response ={}",
+                            reply.0
+                        )),
                     }
                     return match reply.code() {
                         0 => Ok(()),

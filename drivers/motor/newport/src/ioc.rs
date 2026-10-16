@@ -589,7 +589,7 @@ impl NewportHolder {
                 };
 
                 let handle = connect_ip(&poll_port, XPS_POLL_TIMEOUT)?;
-                let poll_sock = XpsSocket::new(handle, SocketMode::Query);
+                let poll_sock = XpsSocket::new(handle, &poll_port, SocketMode::Query);
                 let controller = XpsController::new(
                     poll_sock,
                     enable_set_position,
@@ -682,9 +682,16 @@ impl NewportHolder {
                 };
 
                 let handle = connect_ip(&move_port, XPS_MOVE_TIMEOUT)?;
-                let move_sock = XpsSocket::new(handle, SocketMode::Fire);
-                let ax = XpsAxis::new(controller, move_sock, &positioner_name, step_size)
-                    .map_err(|e| format!("XPSCreateAxis: {e}"))?;
+                let move_sock = XpsSocket::new(handle, &move_port, SocketMode::Fire);
+                let ax = XpsAxis::new(
+                    controller,
+                    move_sock,
+                    &motor_port,
+                    axis,
+                    &positioner_name,
+                    step_size,
+                )
+                .map_err(|e| format!("XPSCreateAxis: {e}"))?;
                 let dtyp_key = format!("XPS_{motor_port}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
 
@@ -1057,7 +1064,7 @@ impl NewportHolder {
                 // A dedicated blocking socket so the seconds-to-minutes-long
                 // execution never contends with the shared poll socket.
                 let handle = connect_ip(&exec_port, XPS_PVT_EXEC_TIMEOUT)?;
-                let exec_sock = XpsSocket::new(handle, SocketMode::Query);
+                let exec_sock = XpsSocket::new(handle, &exec_port, SocketMode::Query);
 
                 println!(
                     "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} pulses={num_pulses} over elements {start_pulses}..{end_pulses} (running on background thread)",
@@ -1288,7 +1295,7 @@ impl NewportHolder {
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
                 let handle = connect_ip(&poll_port, HXP_POLL_TIMEOUT)?;
-                let poll_sock = XpsSocket::new(handle, SocketMode::Query);
+                let poll_sock = XpsSocket::new(handle, &poll_port, SocketMode::Query);
                 // One group poll serves all six axis polls per period: cache
                 // for half the fastest poll interval.
                 let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
@@ -1296,7 +1303,7 @@ impl NewportHolder {
 
                 for axis_no in 0..NUM_HXP_AXES {
                     let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
-                    let move_sock = XpsSocket::new(handle, SocketMode::Fire);
+                    let move_sock = XpsSocket::new(handle, &move_port, SocketMode::Fire);
                     let ax = HxpAxis::new(controller.clone(), move_sock, axis_no);
                     let dtyp_key = format!("HXP_{motor_port}_{axis_no}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
@@ -1311,7 +1318,7 @@ impl NewportHolder {
                 }
 
                 let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
-                let move_sock = XpsSocket::new(handle, SocketMode::Fire);
+                let move_sock = XpsSocket::new(handle, &move_port, SocketMode::Fire);
                 holder
                     .hxp_controllers
                     .lock()

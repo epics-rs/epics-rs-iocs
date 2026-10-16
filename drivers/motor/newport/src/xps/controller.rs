@@ -52,6 +52,15 @@ pub struct ExecutionPlan {
     pub gathering_positioners: Vec<String>,
 }
 
+/// The [`XpsController::set_position`] step that failed, with its XPS code.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetPositionFailure {
+    /// `GroupKill`/`GroupInitialize`: the position was not set.
+    Initialize(i32),
+    /// `GroupReferencingStop`: C reports it and returns success.
+    ReferencingStop(i32),
+}
+
 /// Shared controller state for one XPS, owning the poll socket.
 pub struct XpsController {
     poll: XpsSocket,
@@ -171,18 +180,31 @@ impl XpsController {
     /// [`axes_in_group`] and report it rather than issuing a partial sequence.
     ///
     /// [`axes_in_group`]: XpsController::axes_in_group
-    pub fn set_position(&self, positioner: &str, group: &str, position: f64) -> XpsResult<()> {
-        // C: GroupKill's status is not checked before GroupInitialize.
+    ///
+    /// C checks only `GroupInitialize`, which aborts the sequence, and
+    /// `GroupReferencingStop`, which it reports and then returns success
+    /// for; the caller prints either line.
+    pub fn set_position(
+        &self,
+        positioner: &str,
+        group: &str,
+        position: f64,
+    ) -> Result<(), SetPositionFailure> {
         let _ = self.poll.group_kill(group);
-        self.poll.group_initialize(group)?;
+        self.poll
+            .group_initialize(group)
+            .map_err(|e| SetPositionFailure::Initialize(e.code()))?;
 
         // Settle after initialization so the stage does not oscillate.
         std::thread::sleep(self.set_position_settling);
 
-        self.poll.group_referencing_start(group)?;
+        let _ = self.poll.group_referencing_start(group);
+        let _ =
+            self.poll
+                .group_referencing_action_execute(positioner, "SetPosition", "None", position);
         self.poll
-            .group_referencing_action_execute(positioner, "SetPosition", "None", position)?;
-        self.poll.group_referencing_stop(group)
+            .group_referencing_stop(group)
+            .map_err(|e| SetPositionFailure::ReferencingStop(e.code()))
     }
 
     /// Whether `setPosition` is enabled (C `enableSetPosition_`).
