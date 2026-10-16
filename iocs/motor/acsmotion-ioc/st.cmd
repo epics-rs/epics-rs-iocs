@@ -9,7 +9,7 @@
 #============================================================
 
 epicsEnvSet("P",      "acs:")
-epicsEnvSet("CTRL",   "0")
+epicsEnvSet("CTRL",   "ACS1")
 epicsEnvSet("IPPORT", "acsAsyn")
 epicsEnvSet("HOST",   "192.168.1.100:701")
 epicsEnvSet("NUMAXES", "1")
@@ -20,14 +20,13 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "115200")
 
 # ---- SPiiPlus controller ----
-# AcsMotionConfig(card, asynPort, numAxes, [virtualAxisList], [homingMethod],
-#                 [movingPollMs], [idlePollMs]). homingMethod default 1
-#                 (limit+index); virtualAxisList is comma/space-separated
-#                 0-based indices.
-AcsMotionConfig("$(CTRL)", "$(IPPORT)", $(NUMAXES), "", 1, 100, 1000)
+# AcsMotionConfig(acsPort, asynPort, numAxes, movingPollPeriod, idlePollPeriod,
+#                 virtualAxisList). Poll periods in seconds; virtualAxisList is
+#                 comma-separated 0-based indices.
+AcsMotionConfig("$(CTRL)", "$(IPPORT)", $(NUMAXES), 0.1, 1.0, "")
 
-# One motor record for axis 0. DTYP = ACSMOTION_$(CTRL)_$(AXIS).
-dbLoadRecords("$(ACSMOTION_IOC)/db/acsmotion.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+# One motor record for axis 0.
+dbLoadRecords("$(ACSMOTION_IOC)/db/acsmotion.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
 

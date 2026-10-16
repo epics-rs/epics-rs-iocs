@@ -13,7 +13,6 @@ use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use motor_acsmotion::ioc::acsmotion_config_command;
-use motor_common::MotorHolder;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -38,9 +37,11 @@ async fn main() -> CaResult<()> {
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // SPiiPlus iocsh command + motor device support.
-    let holder = MotorHolder::new();
-    app = app.register_startup_command(acsmotion_config_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(acsmotion_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
