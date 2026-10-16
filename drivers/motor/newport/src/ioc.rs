@@ -1490,7 +1490,7 @@ impl NewportHolder {
                     ESP300_TIMEOUT,
                     esp300::INPUT_EOS,
                     esp300::OUTPUT_EOS,
-                    EosRefusal::BothFatal,
+                    EosRefusal::InputFatal,
                 )?;
                 let controller = Esp300Controller::new(handle)
                     .map_err(|e| format!("ESP300CreateController: {e}"))?;
