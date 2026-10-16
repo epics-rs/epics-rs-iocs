@@ -5,7 +5,7 @@
 //! Each axis owns a [`Route`] trajectory ([`crate::route`]) and integrates its
 //! motion forward in real time. The C driver runs a dedicated 0.1 s background
 //! thread (`motorSimTask`) that calls `process(delta)`; the asyn-rs port folds
-//! that into [`advance`](MotorSimAxis::advance), which every driver entry
+//! that into `MotorSimAxis::advance`, which every driver entry
 //! point calls first: it integrates the wall time elapsed since the last call
 //! in `DELTA` steps, so a command acts on the position the axis has at that
 //! instant and the hard-limit check runs at C's step size however sparse the
