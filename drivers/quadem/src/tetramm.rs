@@ -11,6 +11,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -794,11 +795,12 @@ impl TetrAmmRuntime {
 /// `max_memory` has no C++ analogue (the C++ pool is unbounded); it bounds the
 /// Rust `NDArrayPool`.
 pub fn create_tetramm(
-    port_name: &str,
+    claim: &PortClaim,
     qe_port_name: &str,
     ring_buffer_size: usize,
     max_memory: usize,
 ) -> AsynResult<TetrAmmRuntime> {
+    let port_name = claim.name();
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
     let driver = TetrAmmDriver::new(
@@ -816,7 +818,7 @@ pub fn create_tetramm(
     let num_resync = driver.num_resync.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let read_ctx = ReadContext {
@@ -858,7 +860,9 @@ pub fn create_tetramm(
 mod tests {
     use super::*;
     use crate::octet::create_ip_port;
+    use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
     /// A meter that went away is reported on the driver port's trace at
     /// `ASYN_TRACE_ERROR`, which C prints by default.
@@ -870,6 +874,7 @@ mod tests {
             Duration::from_millis(200),
             true,
             false,
+            &InterruptGate::opened(),
         )
         .unwrap();
         let handle = runtime.port_handle();
@@ -926,6 +931,7 @@ mod tests {
             Duration::from_millis(200),
             false,
             true,
+            &InterruptGate::opened(),
         )
         .unwrap();
         // The port runtime must outlive the test; the driver only holds an
@@ -1001,7 +1007,13 @@ mod tests {
     /// port stays, with no read thread.
     #[test]
     fn a_missing_qe_port_keeps_the_port_without_a_link() {
-        let rt = create_tetramm("QE_TETRA_NOQE", "QE_TETRA_NOQE_IP", 4, 0).unwrap();
+        let rt = create_tetramm(
+            &claim_port("QE_TETRA_NOQE").unwrap(),
+            "QE_TETRA_NOQE_IP",
+            4,
+            0,
+        )
+        .unwrap();
         assert!(rt._read_thread.is_none());
     }
 
@@ -1010,7 +1022,13 @@ mod tests {
     #[test]
     fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
         let (_meter, _runtime) = crate::octet::tests::eos_refusing_port("QE_TETRA_NOEOS_IP");
-        let rt = create_tetramm("QE_TETRA_NOEOS", "QE_TETRA_NOEOS_IP", 4, 0).unwrap();
+        let rt = create_tetramm(
+            &claim_port("QE_TETRA_NOEOS").unwrap(),
+            "QE_TETRA_NOEOS_IP",
+            4,
+            0,
+        )
+        .unwrap();
         let err = rt
             .port_handle()
             .write_int32_blocking(rt.nd_params.acquire, 0, 1)

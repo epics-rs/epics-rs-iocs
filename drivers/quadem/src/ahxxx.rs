@@ -21,6 +21,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -768,12 +769,13 @@ impl AhxxxRuntime {
 /// Rust `NDArrayPool`. `model_name` is one of `AH401B`, `AH401D`, `AH501`,
 /// `AH501BE`, `AH501C`, `AH501D`.
 pub fn create_ahxxx(
-    port_name: &str,
+    claim: &PortClaim,
     qe_port_name: &str,
     ring_buffer_size: usize,
     max_memory: usize,
     model_name: &str,
 ) -> AsynResult<AhxxxRuntime> {
+    let port_name = claim.name();
     // Any other name is C++'s QE_ModelUnknown, which reset() resolves from
     // the meter's firmware version.
     let model = proto::model_from_name(model_name);
@@ -796,7 +798,7 @@ pub fn create_ahxxx(
     let io = driver.io.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let read_ctx = ReadContext {
@@ -839,6 +841,8 @@ pub fn create_ahxxx(
 mod tests {
     use super::*;
     use epics_rs::asyn::interpose::PartialOctetRead;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
     /// `AsynError::PartialRead` is how `asyn-rs` 0.24+ carries a timed-out
     /// read's transferred bytes (see the module docs); a bare
@@ -865,7 +869,14 @@ mod tests {
     /// unbound asynUser.
     #[test]
     fn a_missing_qe_port_keeps_the_port_without_a_link() {
-        let rt = create_ahxxx("QE_AH_NOQE", "QE_AH_NOQE_IP", 4, 0, "AH501").unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_NOQE").unwrap(),
+            "QE_AH_NOQE_IP",
+            4,
+            0,
+            "AH501",
+        )
+        .unwrap();
         assert!(rt._read_thread.is_none());
         let err = rt
             .port_handle()
@@ -905,21 +916,23 @@ mod tests {
                 }
             }
         });
-        let (_io, meter) = crate::octet::create_ip_port(
+        let (_io, _meter) = crate::octet::create_ip_port(
             "QE_AH_UNKMODEL_IP",
             &addr.to_string(),
             proto::AHXXX_TIMEOUT,
             false,
             true,
+            &InterruptGate::opened(),
         )
         .unwrap();
-        epics_rs::asyn::asyn_record::register_port(
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_UNKMODEL").unwrap(),
             "QE_AH_UNKMODEL_IP",
-            meter.port_handle().clone(),
-            &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
+            4,
+            0,
+            "AH999",
         )
         .unwrap();
-        let rt = create_ahxxx("QE_AH_UNKMODEL", "QE_AH_UNKMODEL_IP", 4, 0, "AH999").unwrap();
         let model = rt
             .port_handle()
             .read_int32_blocking(rt.params.model, 0)
@@ -932,7 +945,14 @@ mod tests {
     #[test]
     fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
         let (_meter, _runtime) = crate::octet::tests::eos_refusing_port("QE_AH_NOEOS_IP");
-        let rt = create_ahxxx("QE_AH_NOEOS", "QE_AH_NOEOS_IP", 4, 0, "AH501D").unwrap();
+        let rt = create_ahxxx(
+            &claim_port("QE_AH_NOEOS").unwrap(),
+            "QE_AH_NOEOS_IP",
+            4,
+            0,
+            "AH501D",
+        )
+        .unwrap();
         let err = rt
             .port_handle()
             .write_int32_blocking(rt.nd_params.acquire, 0, 1)

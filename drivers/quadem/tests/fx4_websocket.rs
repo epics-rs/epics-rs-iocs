@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
+use epics_rs::asyn::registry::claim_port;
 use quadem::create_fx4;
 use quadem::drv_quad_em::{QE_CURRENT1, QE_CURRENT4, QE_SUM_ALL};
 use quadem::fx4_proto::{ADC_PATHS, GATE_PATH};
@@ -96,7 +97,13 @@ fn the_port_subscribes_polls_and_publishes_what_the_meter_sends() {
     });
 
     let address = addr_rx.recv_timeout(TIMEOUT).expect("meter address");
-    let port = create_fx4("FX4_TEST", &address.to_string(), 100, 1 << 20).expect("create_fx4");
+    let port = create_fx4(
+        &claim_port("FX4_TEST").unwrap(),
+        &address.to_string(),
+        100,
+        1 << 20,
+    )
+    .expect("create_fx4");
     let handle = port.port_handle();
 
     // A unit current scale makes the published current the raw ADC value.

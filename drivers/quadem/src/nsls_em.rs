@@ -24,9 +24,11 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
 use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QuadEmBase, QuadEmDevice, QuadEmParams,
@@ -96,6 +98,7 @@ fn ip_port(
     host_info: &str,
     no_auto_connect: bool,
     process_eos: bool,
+    owner: &Arc<InterruptGate>,
 ) -> AsynResult<(OctetIo, PortRuntimeHandle)> {
     create_ip_port(
         port_name,
@@ -103,6 +106,7 @@ fn ip_port(
         proto::NSLS_EM_TIMEOUT,
         no_auto_connect,
         process_eos,
+        owner,
     )
 }
 
@@ -113,6 +117,7 @@ fn find_module(
     port_name: &str,
     broadcast_address: &str,
     module_id: i32,
+    owner: &Arc<InterruptGate>,
 ) -> Transport {
     let mut transport = Transport {
         link: None,
@@ -124,7 +129,7 @@ fn find_module(
     // EOS interpose would keep reading past it until the read timed out.
     let udp_name = format!("UDP_{port_name}");
     let udp_host = format!("{broadcast_address}:{} UDP*", proto::BROADCAST_PORT);
-    let udp = match ip_port(&udp_name, &udp_host, false, false) {
+    let udp = match ip_port(&udp_name, &udp_host, false, false, owner) {
         Ok((udp, runtime)) => {
             transport.runtimes.push(runtime);
             udp
@@ -140,7 +145,7 @@ fn find_module(
         }
     };
 
-    match discover(base, &udp, port_name, module_id, &mut transport) {
+    match discover(base, &udp, port_name, module_id, owner, &mut transport) {
         Ok(link) => transport.link = Some(link),
         Err(()) => {
             asyn_print!(
@@ -161,6 +166,7 @@ fn discover(
     udp: &OctetIo,
     port_name: &str,
     module_id: i32,
+    owner: &Arc<InterruptGate>,
     transport: &mut Transport,
 ) -> Result<(OctetIo, OctetIo), ()> {
     // C++ discards the write status.
@@ -191,7 +197,7 @@ fn discover(
     let ip = found.ip.clone();
 
     let tcp_port = |name: String, port: u16, no_auto_connect: bool| {
-        ip_port(&name, &format!("{ip}:{port}"), no_auto_connect, true).map_err(|e| {
+        ip_port(&name, &format!("{ip}:{port}"), no_auto_connect, true, owner).map_err(|e| {
             asyn_print!(
                 *base,
                 ERROR,
@@ -598,12 +604,14 @@ impl NslsEmRuntime {
 /// `max_memory` has no C++ analogue (the C++ pool is unbounded); it bounds the
 /// Rust `NDArrayPool`.
 pub fn create_nsls_em(
-    port_name: &str,
+    claim: &PortClaim,
     broadcast_address: &str,
     module_id: i32,
     ring_buffer_size: usize,
     max_memory: usize,
+    owner: &Arc<InterruptGate>,
 ) -> AsynResult<NslsEmRuntime> {
+    let port_name = claim.name();
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
     let state: SharedState = Arc::new(parking_lot::Mutex::new(NslsState {
         scale_factor: 0.0,
@@ -611,7 +619,13 @@ pub fn create_nsls_em(
     }));
 
     let mut base = QuadEmBase::new(port_name, max_memory)?;
-    let transport = find_module(&base.port_base, port_name, broadcast_address, module_id);
+    let transport = find_module(
+        &base.port_base,
+        port_name,
+        broadcast_address,
+        module_id,
+        owner,
+    );
     let (command, data) = transport.link.unzip();
     if command.is_some() {
         base.port_base
@@ -652,7 +666,7 @@ pub fn create_nsls_em(
     let outputs = driver.base.outputs.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     // C++ creates the read thread only once the module is found.
@@ -726,6 +740,7 @@ mod tests {
             Duration::from_millis(50),
             true,
             true,
+            &InterruptGate::opened(),
         )
         .unwrap();
         std::mem::forget(runtime);
@@ -770,7 +785,13 @@ mod tests {
     #[test]
     fn a_missing_module_leaves_the_port_without_a_link() {
         let base = QuadEmBase::new("QE_NSLS_NF", 0).unwrap();
-        let transport = find_module(&base.port_base, "QE_NSLS_NF", "127.0.0.3", 9);
+        let transport = find_module(
+            &base.port_base,
+            "QE_NSLS_NF",
+            "127.0.0.3",
+            9,
+            &InterruptGate::opened(),
+        );
         assert!(transport.link.is_none());
         assert!(transport.find_failed);
         assert!(transport.modules.is_empty());

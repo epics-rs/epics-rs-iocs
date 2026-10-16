@@ -32,6 +32,7 @@ use tokio_tungstenite::tungstenite::Message;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -523,11 +524,12 @@ impl Fx4Runtime {
 /// `max_memory` has no C++ analogue (the C++ pool is unbounded); it bounds the
 /// Rust `NDArrayPool`.
 pub fn create_fx4(
-    port_name: &str,
+    claim: &PortClaim,
     fx4_ip: &str,
     ring_buffer_size: usize,
     max_memory: usize,
 ) -> AsynResult<Fx4Runtime> {
+    let port_name = claim.name();
     let uri = format!("ws://{fx4_ip}");
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
     let (out_tx, out_rx) = tokio_mpsc::unbounded_channel();
@@ -541,7 +543,7 @@ pub fn create_fx4(
     let outputs = driver.base.outputs.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let socket_ctx = SocketContext {

@@ -16,16 +16,19 @@
 //! delivered to the parser are identical; only the ownership of the EOS state
 //! changes, from shared mutable to per-call.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::request::{PortCalls, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
 /// asyn subaddress of a single-device octet port.
 const OCTET_ADDR: i32 = 0;
@@ -232,7 +235,7 @@ pub struct LockedOctet<'a> {
 
 impl LockedOctet<'_> {
     fn read(&mut self, op: RequestOp) -> AsynResult<ReadOutcome> {
-        let result = self.calls.call(op, octet_user(self.timeout))?;
+        let result = self.calls.call(&op, octet_user(self.timeout))?;
         Ok(ReadOutcome {
             data: result.data.unwrap_or_default(),
             eom: EomReason::from_bits_truncate(result.eom_reason),
@@ -253,12 +256,12 @@ impl LockedOctet<'_> {
     /// `pasynOctet->flush`.
     pub fn flush(&mut self) -> AsynResult<()> {
         self.calls
-            .call(RequestOp::Flush, octet_user(self.timeout))
+            .call(&RequestOp::Flush, octet_user(self.timeout))
             .map(drop)
     }
 
     fn set_eos(&mut self, op: RequestOp) -> AsynResult<()> {
-        self.calls.call(op, octet_user(self.timeout)).map(drop)
+        self.calls.call(&op, octet_user(self.timeout)).map(drop)
     }
 }
 
@@ -271,13 +274,20 @@ impl LockedOctet<'_> {
 ///
 /// `process_eos` installs the EOS interpose; leave it off for raw datagram or
 /// binary-framed reads, where an EOS scan would read past the frame.
+///
+/// The port is registered under `port_name` before its thread starts, as
+/// `drvAsynIPPortConfigure` does (drvAsynIPPort.c:1084-1089).
 pub fn create_ip_port(
     port_name: &str,
     host_info: &str,
     timeout: Duration,
     no_auto_connect: bool,
     process_eos: bool,
+    owner: &Arc<InterruptGate>,
 ) -> AsynResult<(OctetIo, PortRuntimeHandle)> {
+    let claim = claim_port(port_name).inspect_err(|_| {
+        println!("drvAsynIPPortConfigure: Can't register myself.");
+    })?;
     let mut driver = epics_rs::asyn::drivers::ip_port::DrvAsynIPPort::new(port_name, host_info)?;
     if no_auto_connect {
         driver.base_mut().init_auto_connect(false);
@@ -287,7 +297,8 @@ pub fn create_ip_port(
             epics_rs::asyn::interpose::eos::EosInterpose::default(),
         ));
     }
-    let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default())?;
+    claim.publish(runtime.port_handle().clone(), owner)?;
     let io = OctetIo::new(runtime.port_handle().clone(), timeout);
     Ok((io, runtime))
 }
@@ -334,13 +345,12 @@ pub(crate) mod tests {
 
     pub(crate) fn eos_refusing_port(name: &str) -> (OctetIo, PortRuntimeHandle) {
         let driver = NoInputEos(PortDriverBase::new(name, 1, PortFlags::default()));
-        let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
-        epics_rs::asyn::asyn_record::register_port(
-            name,
-            runtime.port_handle().clone(),
-            &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
-        )
-        .unwrap();
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
         let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100));
         (io, runtime)
     }
@@ -354,6 +364,7 @@ pub(crate) mod tests {
             Duration::from_millis(200),
             true,
             true,
+            &InterruptGate::opened(),
         )
         .unwrap();
         io.set_input_eos(b"\r\n").unwrap();
@@ -371,6 +382,7 @@ pub(crate) mod tests {
             Duration::from_millis(200),
             true,
             true,
+            &InterruptGate::opened(),
         )
         .unwrap();
         let err = io.locked_read_line(64).unwrap_err();

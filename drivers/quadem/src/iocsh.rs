@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use epics_rs::ad_core::ioc::{GenericDriverContext, PluginManager};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
+use epics_rs::asyn::manager::claim_port_driver;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::runtime::port::PortRuntimeHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -20,8 +21,9 @@ use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
 use crate::t4u::{T4uDirectError, T4uRuntime, create_t4u_direct_em, create_t4u_em};
 
-/// Publish a configured quadEM port: the asyn port itself, the sub-ports the
-/// driver built for itself, then its twelve NDArray fan-outs.
+/// Publish a configured quadEM port: the asyn port itself, then its twelve
+/// NDArray fan-outs. The sub-ports a driver builds for itself are published
+/// as it builds them.
 ///
 /// Address 0 (the Current1 time series) is the port's default NDArray source;
 /// addresses 1..=10 carry the remaining data items and address 11 the full 2-D
@@ -30,25 +32,18 @@ use crate::t4u::{T4uDirectError, T4uRuntime, create_t4u_direct_em, create_t4u_em
 pub fn register_quadem_port(
     mgr: &Arc<PluginManager>,
     owner: &Arc<InterruptGate>,
-    port_name: &str,
+    claim: PortClaim,
     handle: PortHandle,
     pool: Arc<NDArrayPool>,
     outputs: &[Arc<parking_lot::Mutex<NDArrayOutput>>],
-    sub_ports: &[PortRuntimeHandle],
 ) -> epics_rs::asyn::error::AsynResult<()> {
-    epics_rs::asyn::asyn_record::register_port(port_name, handle, owner)?;
-    for sub in sub_ports {
-        epics_rs::asyn::asyn_record::register_port(
-            sub.port_name(),
-            sub.port_handle().clone(),
-            owner,
-        )?;
-    }
+    let port_name = claim.name().to_string();
+    claim.publish(handle, owner)?;
 
     mgr.set_driver(Arc::new(GenericDriverContext::new(
         pool,
         outputs[0].clone(),
-        port_name,
+        &port_name,
         mgr.wiring(),
     )));
     for (addr, output) in outputs.iter().enumerate().take(QE_ADDR_ALL + 1).skip(1) {
@@ -116,8 +111,15 @@ pub fn ahxxx_configure_command(
                 _ => 100_000_000,
             };
 
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let rt = create_ahxxx(
-                &port_name,
+                &claim,
                 &qe_port_name,
                 ring_buffer_size,
                 max_memory,
@@ -128,11 +130,10 @@ pub fn ahxxx_configure_command(
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-                &[],
             )
             .map_err(|e| e.to_string())?;
 
@@ -199,23 +200,30 @@ pub fn nsls_em_configure_command(
                 _ => 100_000_000,
             };
 
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let rt = create_nsls_em(
-                &port_name,
+                &claim,
                 &broadcast_address,
                 module_id,
                 ring_buffer_size,
                 max_memory,
+                ctx.db().scan_control().interrupt_gate(),
             )
             .map_err(|e| format!("drvNSLS_EMConfigure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-                &rt.sub_ports,
             )
             .map_err(|e| e.to_string())?;
 
@@ -273,17 +281,23 @@ pub fn fx4_configure_command(
                 _ => 100_000_000,
             };
 
-            let rt = create_fx4(&port_name, &fx4_ip, ring_buffer_size, max_memory)
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
+            let rt = create_fx4(&claim, &fx4_ip, ring_buffer_size, max_memory)
                 .map_err(|e| format!("drvFX4Configure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-                &[],
             )
             .map_err(|e| e.to_string())?;
 
@@ -340,17 +354,23 @@ pub fn pcr4_configure_command(
                 _ => 100_000_000,
             };
 
-            let rt = create_pcr4(&port_name, &qe_port_name, ring_buffer_size, max_memory)
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
+            let rt = create_pcr4(&claim, &qe_port_name, ring_buffer_size, max_memory)
                 .map_err(|e| format!("drvPCR4Configure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-                &[],
             )
             .map_err(|e| e.to_string())?;
 
@@ -414,23 +434,30 @@ pub fn t4u_em_configure_command(
                 _ => 100_000_000,
             };
 
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let rt = create_t4u_em(
-                &port_name,
+                &claim,
                 &qt_host_address,
                 ring_buffer_size,
                 base_port_num,
                 max_memory,
+                ctx.db().scan_control().interrupt_gate(),
             )
             .map_err(|e| format!("drvT4U_EMConfigure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-                &rt.sub_ports,
             )
             .map_err(|e| e.to_string())?;
 
@@ -499,13 +526,21 @@ pub fn t4u_direct_em_configure_command(
                 _ => 100_000_000,
             };
 
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let rt = match create_t4u_direct_em(
-                &port_name,
+                &claim,
                 &t4u_address,
                 ring_buffer_size,
                 base_port_num,
                 &cfg_file_name,
                 max_memory,
+                ctx.db().scan_control().interrupt_gate(),
             ) {
                 Ok(rt) => rt,
                 Err(T4uDirectError::Thrown(what)) => {
@@ -518,11 +553,10 @@ pub fn t4u_direct_em_configure_command(
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
-                &rt.sub_ports,
             )
             .map_err(|e| e.to_string())?;
 

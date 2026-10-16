@@ -41,10 +41,12 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
 use crate::asyn_print;
 use crate::drv_quad_em::{
@@ -1123,10 +1125,11 @@ fn sub_port(
     name: &str,
     host: &str,
     timeout: Duration,
+    owner: &Arc<InterruptGate>,
     runtimes: &mut Vec<PortRuntimeHandle>,
     describe: impl FnOnce(&str, &str) -> String,
 ) -> Result<OctetIo, String> {
-    match create_ip_port(name, host, timeout, false, false) {
+    match create_ip_port(name, host, timeout, false, false, owner) {
         Ok((io, runtime)) => {
             runtimes.push(runtime);
             Ok(io)
@@ -1154,16 +1157,24 @@ fn command_port(
     port_name: &str,
     host: &str,
     variant: T4uVariant,
+    owner: &Arc<InterruptGate>,
     runtimes: &mut Vec<PortRuntimeHandle>,
 ) -> Result<OctetIo, String> {
     let name = format!("TCP_Command_{port_name}");
-    let port = sub_port(&name, host, variant.timeout(), runtimes, |name, host| {
-        format!(
-            "{}::drvT4U_EM error calling drvAsynIPPortConfigure for command port={name}, \
+    let port = sub_port(
+        &name,
+        host,
+        variant.timeout(),
+        owner,
+        runtimes,
+        |name, host| {
+            format!(
+                "{}::drvT4U_EM error calling drvAsynIPPortConfigure for command port={name}, \
              IP={host}, status=-1",
-            variant.name()
-        )
-    });
+                variant.name()
+            )
+        },
+    );
     println!(
         "Attempted command port: {name} connection to: {host}\nStatus: {}",
         if port.is_ok() { 0 } else { -1 }
@@ -1178,18 +1189,21 @@ fn command_port(
 /// `max_memory` has no C++ analogue (the C++ pool is unbounded); it bounds the
 /// Rust `NDArrayPool`.
 pub fn create_t4u_em(
-    port_name: &str,
+    claim: &PortClaim,
     qt_host_address: &str,
     ring_buffer_size: usize,
     base_port_num: u16,
     max_memory: usize,
+    owner: &Arc<InterruptGate>,
 ) -> AsynResult<T4uRuntime> {
+    let port_name = claim.name();
     let variant = T4uVariant::Middle;
     let mut runtimes = Vec::new();
     let link = command_port(
         port_name,
         &format!("{qt_host_address}:{base_port_num}"),
         variant,
+        owner,
         &mut runtimes,
     )
     .and_then(|cmd_io| {
@@ -1197,6 +1211,7 @@ pub fn create_t4u_em(
             &format!("TCP_Data_{port_name}"),
             &format!("{qt_host_address}:{}", u32::from(base_port_num) + 1),
             variant.timeout(),
+            owner,
             &mut runtimes,
             |name, host| {
                 format!(
@@ -1225,6 +1240,7 @@ pub fn create_t4u_em(
             max_memory,
         },
         CmdSink::Immediate(cmd),
+        claim,
     )
 }
 
@@ -1257,13 +1273,15 @@ impl std::fmt::Display for T4uDirectError {
 /// base_port_num, cfgFileName)`: commands go to the T4U's telnet port, data
 /// arrives as UDP datagrams on `base_port_num`.
 pub fn create_t4u_direct_em(
-    port_name: &str,
+    claim: &PortClaim,
     t4u_address: &str,
     ring_buffer_size: usize,
     base_port_num: u16,
     cfg_file_name: &str,
     max_memory: usize,
+    owner: &Arc<InterruptGate>,
 ) -> Result<T4uRuntime, T4uDirectError> {
+    let port_name = claim.name();
     let variant = T4uVariant::Direct;
 
     // inicpp reads a file that will not open as an empty one, and throws out
@@ -1282,6 +1300,7 @@ pub fn create_t4u_direct_em(
         port_name,
         &format!("{t4u_address}:{}", proto::T4U_CMD_PORT),
         variant,
+        owner,
         &mut runtimes,
     )
     .and_then(|cmd_io| {
@@ -1296,6 +1315,7 @@ pub fn create_t4u_direct_em(
                 u32::from(base_port_num).wrapping_sub(1)
             ),
             variant.timeout(),
+            owner,
             &mut runtimes,
             |name, host| {
                 format!(
@@ -1320,10 +1340,11 @@ pub fn create_t4u_direct_em(
             max_memory,
         },
         CmdSink::Queued(cmd_tx),
+        claim,
     )?)
 }
 
-fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
+fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime> {
     let variant = spec.variant;
     let (shared, trigger_rx) = QuadEmShared::new(spec.ring_buffer_size);
     let state: SharedState = Arc::new(parking_lot::Mutex::new(T4uState {
@@ -1344,7 +1365,7 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
     let t4u = driver.t4u;
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let regs = RegSink {
@@ -1410,6 +1431,7 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::registry::claim_port;
 
     /// C++ returns from the constructor when `drvAsynIPPortConfigure` fails:
     /// the port exists with drvQuadEM's defaults, and no meter thread runs.
@@ -1420,12 +1442,13 @@ mod tests {
         let path = std::env::temp_dir().join(format!("t4u-bad-{}.ini", std::process::id()));
         std::fs::write(&path, "[config\n").unwrap();
         let err = create_t4u_direct_em(
-            "T4U_BADINI",
+            &claim_port("T4U_BADINI").unwrap(),
             "127.0.0.1",
             4,
             5000,
             path.to_str().unwrap(),
             0,
+            &InterruptGate::opened(),
         )
         .err()
         .expect("no port");
@@ -1439,13 +1462,22 @@ mod tests {
 
     #[test]
     fn a_command_port_that_will_not_configure_keeps_the_port() {
-        let rt = create_t4u_em("QE_T4U_BADHOST", "[bad", 4, 5000, 0).unwrap();
+        let rt = create_t4u_em(
+            &claim_port("QE_T4U_BADHOST").unwrap(),
+            "[bad",
+            4,
+            5000,
+            0,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
         assert!(rt._meter_threads.is_none());
         assert!(rt.sub_ports.is_empty());
         // drvQuadEM never sets P_Model; only the linked constructor does.
         let model = rt.port_handle().read_int32_blocking(rt.params.model, 0);
         assert!(
-            matches!(model, Err(AsynError::ParamUndefined(_))),
+            matches!(&model, Err(AsynError::ParamAccess { source, .. })
+                if matches!(**source, AsynError::ParamUndefined(_))),
             "{model:?}"
         );
         // writeReadMeter's status is ignored, as on a linked port.
