@@ -10,8 +10,8 @@ use crate::cache::*;
 use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
+use epics_rs::base::server::driver_support::DriverSupport;
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -979,31 +979,59 @@ fn inet_aton(cp: &[u8]) -> Option<Ipv4Addr> {
     }
 }
 
-/// `gm10_connect` (`drvGM10.c:1539-1552`): a name-keyed registry populated
-/// by the `gm10Init` iocsh command.
+/// `gm10_connect` (`drvGM10.c:1539-1552`): `gm10_queue_list`, the handles
+/// `gm10Init` registered, newest first as C prepends them.
 #[derive(Default)]
 pub struct Registry {
-    instruments: Mutex<HashMap<String, Arc<Instrument>>>,
+    instruments: Mutex<Vec<(String, Arc<Instrument>)>>,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Self {
-            instruments: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     pub fn insert(&self, name: String, instrument: Arc<Instrument>) -> Result<(), &'static str> {
         let mut instruments = self.instruments.lock();
-        if instruments.contains_key(&name) {
+        if instruments.iter().any(|(n, _)| *n == name) {
             return Err("device already exists");
         }
-        instruments.insert(name, instrument);
+        instruments.insert(0, (name, instrument));
         Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<Instrument>> {
-        self.instruments.lock().get(name).cloned()
+        self.instruments
+            .lock()
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, i)| i.clone())
+    }
+}
+
+/// `drvGM10.report`, `gm10_report` (`drvGM10.c:265-311`).
+impl DriverSupport for Registry {
+    fn report(&self, level: i32) -> Option<String> {
+        let mut out = String::new();
+        for (cnt, (name, instrument)) in self.instruments.lock().iter().enumerate() {
+            out += &format!(
+                "    Yokogawa GM10 #{}: {name} @ {}\n",
+                cnt + 1,
+                instrument.peer_address
+            );
+            if level != 0 {
+                out += "        Modules:\n";
+                let cache = instrument.cache();
+                for (i, m) in cache.modules.iter().take(6).enumerate() {
+                    if m.use_flag {
+                        out += &format!("        #{}: {}\n", i + 1, m.module_string);
+                    } else {
+                        out += &format!("        #{}: empty\n", i + 1);
+                    }
+                }
+            }
+        }
+        Some(out)
     }
 }
 
@@ -1310,5 +1338,26 @@ mod tests {
         assert_eq!(registry.get("gm_1").unwrap().peer_address, "127.0.0.1");
         // No queue thread: the command is dropped and submit returns.
         instrument.submit(Command::ReadAllData);
+    }
+
+    #[test]
+    fn driver_report_lists_newest_first_with_modules_at_level_1() {
+        let registry = Registry::new();
+        registry
+            .insert("first".into(), Instrument::new("10.0.0.1".into()))
+            .unwrap();
+        registry
+            .insert("second".into(), connect_default_fixture())
+            .unwrap();
+        assert_eq!(
+            registry.report(0).unwrap(),
+            "    Yokogawa GM10 #1: second @ 127.0.0.1\n    Yokogawa GM10 #2: first @ 10.0.0.1\n"
+        );
+        let level1 = registry.report(1).unwrap();
+        assert!(level1.starts_with(
+            "    Yokogawa GM10 #1: second @ 127.0.0.1\n        Modules:\n        #1: GX90XA-06\n        #2: empty\n"
+        ));
+        assert_eq!(level1.matches("        #6: empty\n").count(), 2);
+        assert!(!level1.contains("#7:"));
     }
 }
