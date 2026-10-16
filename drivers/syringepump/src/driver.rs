@@ -15,7 +15,7 @@
 //! per-address `Model` (a genuinely runtime-configurable fact about which
 //! physical unit is wired to which address), a pump's letter is fixed by
 //! which template instantiation created the record -- so no `*Config`
-//! iocsh call is needed here; [`pump_letter`] is a pure positional lookup.
+//! iocsh call is needed here; `pump_letter` is a pure positional lookup.
 //!
 //! # Preserved upstream bug: only D's `setRun` is pump-parameterized
 //! `teledynePumpD.template`/`teledynePumpH.template` both hardcode
@@ -29,7 +29,7 @@
 //!
 //! This driver itself is NOT where that bug lives: every `do_*` method
 //! below resolves the pump letter uniformly from `user.addr` via
-//! [`pump_letter`], for every command, D or H, Run or otherwise -- a
+//! `pump_letter`, for every command, D or H, Run or otherwise -- a
 //! correctly-parameterized implementation. The bug is reproduced instead in
 //! `iocs/syringepump-ioc/db/teledynePumpD.template`/`teledynePumpH.template`,
 //! which hardcode `addr=0` (pump "A") in the ported OUT/INP link text for
@@ -43,12 +43,12 @@
 //! subroutine that computes a 2-hex-digit length prefix client-side before
 //! writing into `CmdReply.VAL`) has no direct asyn analogue -- asyn has no
 //! "write triggers reformatting of this record's own VAL" convention.
-//! Ported instead as a standard asyn write-then-read pair: [`write_octet`]
+//! Ported instead as a standard asyn write-then-read pair: [`write_octet`](PortDriver::write_octet)
 //! takes the raw, un-prefixed command text, computes the length prefix
 //! itself (removing the client-side `formatCmd` step -- a documented,
 //! wire-*equivalent* deviation: the exact same bytes reach the wire either
 //! way), executes the round trip, and caches the reply string;
-//! [`read_octet`] on the same reason returns that cached reply. Neither
+//! [`read_octet`](PortDriver::read_octet) on the same reason returns that cached reply. Neither
 //! `sendCmd` nor `ping` is wired into either ported db template (matching
 //! upstream, which doesn't wire them either) -- `sendCmd` is still exposed
 //! here for parity with `teled_d.proto`/`teled_h.proto`'s full command set,
