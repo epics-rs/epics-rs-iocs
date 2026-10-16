@@ -170,28 +170,27 @@ impl SmartMotorController {
     }
 
     /// Write one command to `axis` (C `send_mess`). In echo mode it carries the
-    /// axis address byte and the echo is read to `\n` and discarded, the input
-    /// EOS restored to `\r` afterwards.
-    fn send(&self, axis: usize, cmd: &str) -> AsynResult<()> {
-        if !self.echo {
-            self.writer.write_octet(0, cmd.as_bytes())?;
-            return Ok(());
-        }
-        let mut out = Vec::with_capacity(cmd.len() + 1);
-        out.push(FIRST_ADDR + axis as u8);
-        out.extend_from_slice(cmd.as_bytes());
-        let _ = self.port.set_input_eos_blocking(eos_user(), ECHO_EOS);
-        let sent = self.writer.write_octet(0, &out);
-        if sent.is_ok() {
+    /// axis address byte and the echo is read to `\n` and discarded. Like C
+    /// (drvSmartMotor.cc:441-454) no status is kept: a lost write shows up
+    /// in the reply read that follows, and the input EOS is restored to `\r`
+    /// either way.
+    fn send(&self, axis: usize, cmd: &str) {
+        if self.echo {
+            let mut out = Vec::with_capacity(cmd.len() + 1);
+            out.push(FIRST_ADDR + axis as u8);
+            out.extend_from_slice(cmd.as_bytes());
+            let _ = self.writer.write_octet(0, &out);
+            let _ = self.port.set_input_eos_blocking(eos_user(), ECHO_EOS);
             let _ = self.reader.read_octet(0, READ_BUF);
+        } else {
+            let _ = self.writer.write_octet(0, cmd.as_bytes());
         }
         let _ = self.port.set_input_eos_blocking(eos_user(), INPUT_EOS);
-        sent.map(|_| ())
     }
 
     /// Send a query to `axis` and return its `\r`-terminated reply (trimmed).
     fn query(&self, axis: usize, cmd: &str) -> AsynResult<String> {
-        self.send(axis, cmd)?;
+        self.send(axis, cmd);
         let raw = self.reader.read_octet(0, READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
@@ -229,19 +228,13 @@ impl SmartMotorAxis {
     /// Program speed/acceleration before a move (C sends `V=`/`A=` as separate
     /// transactions ahead of the move command). Non-positive values are skipped;
     /// acceleration is clamped to the controller minimum.
-    fn program_speeds(
-        ctrl: &SmartMotorController,
-        axis: usize,
-        velocity: f64,
-        acceleration: f64,
-    ) -> AsynResult<()> {
+    fn program_speeds(ctrl: &SmartMotorController, axis: usize, velocity: f64, acceleration: f64) {
         if velocity > 0.0 {
-            ctrl.send(axis, &format!("V={}", nint(velocity)))?;
+            ctrl.send(axis, &format!("V={}", nint(velocity)));
         }
         if acceleration > 0.0 {
-            ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)))?;
+            ctrl.send(axis, &format!("A={}", clamped_accel(acceleration)));
         }
-        Ok(())
     }
 }
 
@@ -255,9 +248,9 @@ impl AsynMotor for SmartMotorAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
-        ctrl.send(self.axis, &format!("P={}", nint(position)))?;
-        ctrl.send(self.axis, "G")?;
+        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
+        ctrl.send(self.axis, &format!("P={}", nint(position)));
+        ctrl.send(self.axis, "G");
         Ok(())
     }
 
@@ -270,9 +263,9 @@ impl AsynMotor for SmartMotorAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration)?;
-        ctrl.send(self.axis, &format!("D={}", nint(distance)))?;
-        ctrl.send(self.axis, "G")?;
+        SmartMotorAxis::program_speeds(&ctrl, self.axis, velocity, acceleration);
+        ctrl.send(self.axis, &format!("D={}", nint(distance)));
+        ctrl.send(self.axis, "G");
         Ok(())
     }
 
@@ -285,7 +278,7 @@ impl AsynMotor for SmartMotorAxis {
     ) -> AsynResult<()> {
         // C JOG: "MV\rV=<v>\rG" — velocity mode, set signed velocity, go.
         let ctrl = self.lock();
-        ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity)))?;
+        ctrl.send(self.axis, &format!("MV\rV={}\rG", nint(velocity)));
         Ok(())
     }
 
@@ -303,13 +296,13 @@ impl AsynMotor for SmartMotorAxis {
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.send(self.axis, "S")?;
+        ctrl.send(self.axis, "S");
         Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.send(self.axis, &format!("O={}", nint(position)))?;
+        ctrl.send(self.axis, &format!("O={}", nint(position)));
         Ok(())
     }
 
@@ -317,10 +310,10 @@ impl AsynMotor for SmartMotorAxis {
         let ctrl = self.lock();
         if enable {
             // C ENABLE_TORQUE: position mode, hold at the current actual position.
-            ctrl.send(self.axis, "MP\ra=@P\rP=a\rG")?;
+            ctrl.send(self.axis, "MP\ra=@P\rP=a\rG");
         } else {
             // C DISABL_TORQUE: de-energize.
-            ctrl.send(self.axis, "OFF")?;
+            ctrl.send(self.axis, "OFF");
         }
         Ok(())
     }
@@ -361,10 +354,10 @@ impl AsynMotor for SmartMotorAxis {
 
         // Latched right/left travel-limit flags: clear them if set (C Zr/Zl).
         if atoi(&ctrl.query(self.axis, "RBr")?) != 0 {
-            ctrl.send(self.axis, "Zr")?;
+            ctrl.send(self.axis, "Zr");
         }
         if atoi(&ctrl.query(self.axis, "RBl")?) != 0 {
-            ctrl.send(self.axis, "Zl")?;
+            ctrl.send(self.axis, "Zl");
         }
 
         // RBo != 0 means "not on commanded position" (C clears EA_POSITION).
@@ -420,6 +413,21 @@ mod tests {
     struct Chain {
         base: epics_rs::asyn::port::PortDriverBase,
         replies: std::collections::VecDeque<Vec<u8>>,
+        refuse_writes: Arc<std::sync::atomic::AtomicBool>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn chain(name: &str) -> Chain {
+        Chain {
+            base: epics_rs::asyn::port::PortDriverBase::new(
+                name,
+                1,
+                epics_rs::asyn::port::PortFlags::default(),
+            ),
+            replies: Default::default(),
+            refuse_writes: Default::default(),
+            reads: Default::default(),
+        }
     }
 
     impl epics_rs::asyn::port::PortDriver for Chain {
@@ -430,6 +438,12 @@ mod tests {
             &mut self.base
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            if self
+                .refuse_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(smartmotor_err("write refused"));
+            }
             self.replies.push_back(data.to_vec());
             if data.first() == Some(&FIRST_ADDR) {
                 self.replies.push_back(b"1".to_vec());
@@ -437,6 +451,8 @@ mod tests {
             Ok(data.len())
         }
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let reply = self.replies.pop_front().unwrap_or_default();
             buf[..reply.len()].copy_from_slice(&reply);
             Ok(reply.len())
@@ -445,18 +461,33 @@ mod tests {
 
     #[test]
     fn a_port_refusing_every_eos_set_still_finds_the_chain() {
-        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
-        let chain = Chain {
-            base: PortDriverBase::new("smartEosRefused", 1, PortFlags::default()),
-            replies: Default::default(),
-        };
-        let (rt, _actor) = create_port_runtime(chain, RuntimeConfig::default()).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(chain("smartEosRefused"), RuntimeConfig::default()).unwrap();
         let port = rt.port_handle().clone();
         assert!(port.set_input_eos_blocking(eos_user(), INPUT_EOS).is_err());
         let ctrl = SmartMotorController::new(port, Duration::from_secs(1)).unwrap();
         assert!(ctrl.echo);
         assert_eq!(ctrl.num_axes(), 1);
+    }
+
+    #[test]
+    fn a_refused_write_still_reads_the_echo_and_the_command_succeeds() {
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use std::sync::atomic::Ordering;
+
+        let chain = chain("smartWriteRefused");
+        let refuse = chain.refuse_writes.clone();
+        let reads = chain.reads.clone();
+        let (rt, _actor) = create_port_runtime(chain, RuntimeConfig::default()).unwrap();
+        let ctrl =
+            SmartMotorController::new(rt.port_handle().clone(), Duration::from_secs(1)).unwrap();
+        let mut axis = SmartMotorAxis::new(Arc::new(Mutex::new(ctrl)), 0);
+
+        refuse.store(true, Ordering::Relaxed);
+        let before = reads.load(Ordering::Relaxed);
+        axis.stop(&AsynUser::new(0), 0.0).unwrap();
+        assert_eq!(reads.load(Ordering::Relaxed), before + 1, "the echo read");
     }
 }
