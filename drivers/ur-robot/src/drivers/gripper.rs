@@ -207,7 +207,6 @@ impl GripperDriver {
         match gripper.connect().and_then(|()| gripper.get_var("STA")) {
             Ok(_) if gripper.is_connected() => {
                 spdlog::info(format_args!("Connected to gripper"));
-                self.apply_pending_activation(&mut gripper);
                 true
             }
             Ok(_) => {
@@ -218,22 +217,6 @@ impl GripperDriver {
                 spdlog::error(format_args!("{e}"));
                 false
             }
-        }
-    }
-
-    /// Deliver a boot-time `ACTIVATE` once the link is up (B3). The PINI
-    /// `$(AUTO_ACTIVATE=YES)` write lands before any connect can have
-    /// succeeded, so the cached value is the desired state and the
-    /// connection owner delivers it here. `activate` skips itself when the
-    /// gripper is already active, so a reconnect never re-runs the
-    /// activation cycle.
-    fn apply_pending_activation(&self, gripper: &mut RobotiqGripper) {
-        let p = self.params;
-        if self.base.get_int32_param(p.activate, 0).unwrap_or(0) == 0 {
-            return;
-        }
-        if let Err(e) = gripper.activate(false) {
-            spdlog::error(format_args!("{e}"));
         }
     }
 }
@@ -251,61 +234,9 @@ impl PortDriver for GripperDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.set_int32_param(reason, user.addr, value)?;
 
             if p.is_command(reason) && value == 0 {
-                return Ok(());
-            }
-
-            // The position range and unit configure the RobotiqGripper object,
-            // which outlives every (re)connect — nothing goes on the wire. They
-            // apply regardless of the link state, so the PINI writes at boot
-            // (robot off, gripper unreachable) cannot be lost. C gates them on
-            // the connection and the boot values are lost.
-            // MIN_POSITION / MAX_POSITION only stage the range; SET_POSITION_RANGE
-            // applies it.
-            if reason == p.min_position {
-                spdlog::debug(format_args!("setting min={value}"));
-                return Ok(());
-            }
-            if reason == p.max_position {
-                spdlog::debug(format_args!("setting max={value}"));
-                return Ok(());
-            }
-            if reason == p.set_position_range {
-                let min = self.base.get_int32_param(p.min_position, 0).unwrap_or(0);
-                let max = self.base.get_int32_param(p.max_position, 0).unwrap_or(0);
-                self.gripper.lock().set_native_position_range(min, max);
-                spdlog::debug(format_args!("setNativePositionRange(min={min}, max={max})"));
-                return Ok(());
-            }
-            if reason == p.position_unit {
-                match position_unit(value) {
-                    Some(unit) => {
-                        spdlog::debug(format_args!(
-                            "{}",
-                            match unit {
-                                Unit::Device => "Setting position unit to 'Device' (0,255)",
-                                Unit::Normalized => "Setting position unit to 'Normalized' (0,1.0)",
-                                Unit::Percent => "Setting position unit to 'Percent' (0,100%)",
-                                Unit::Mm => "Setting position unit to 'mm' (must define range)",
-                            }
-                        ));
-                        self.gripper.lock().set_unit(MoveParameter::Position, unit)
-                    }
-                    None => {
-                        spdlog::warn(format_args!("Unit {value} undefined, no action taken."));
-                    }
-                }
-                return Ok(());
-            }
-
-            // An ACTIVATE that arrives while the gripper is unreachable is the
-            // desired state, not an error: try_connect activates from the cached
-            // value once the link is up (the PINI `$(AUTO_ACTIVATE=YES)` write
-            // always lands before any connect can have succeeded). C errors
-            // and the boot-time activation is lost.
-            if reason == p.activate && !(self.robot_ready() && self.gripper.lock().is_connected()) {
+                self.base.set_int32_param(reason, user.addr, value)?;
                 return Ok(());
             }
 
@@ -326,7 +257,46 @@ impl PortDriver for GripperDriver {
                 spdlog::error(format_args!("Robotiq gripper not connected"));
                 return Err(refused());
             }
+            self.base.set_int32_param(reason, user.addr, value)?;
             if reason == p.connect {
+                return Ok(());
+            }
+
+            // MIN_POSITION / MAX_POSITION only stage the range; SET_POSITION_RANGE
+            // applies it.
+            if reason == p.min_position {
+                spdlog::debug(format_args!("setting min={value}"));
+                return Ok(());
+            }
+            if reason == p.max_position {
+                spdlog::debug(format_args!("setting max={value}"));
+                return Ok(());
+            }
+            if reason == p.set_position_range {
+                let min = self.base.get_int32_param(p.min_position, 0).unwrap_or(0);
+                let max = self.base.get_int32_param(p.max_position, 0).unwrap_or(0);
+                gripper.set_native_position_range(min, max);
+                spdlog::debug(format_args!("setNativePositionRange(min={min}, max={max})"));
+                return Ok(());
+            }
+            if reason == p.position_unit {
+                match position_unit(value) {
+                    Some(unit) => {
+                        spdlog::debug(format_args!(
+                            "{}",
+                            match unit {
+                                Unit::Device => "Setting position unit to 'Device' (0,255)",
+                                Unit::Normalized => "Setting position unit to 'Normalized' (0,1.0)",
+                                Unit::Percent => "Setting position unit to 'Percent' (0,100%)",
+                                Unit::Mm => "Setting position unit to 'mm' (must define range)",
+                            }
+                        ));
+                        gripper.set_unit(MoveParameter::Position, unit)
+                    }
+                    None => {
+                        spdlog::warn(format_args!("Unit {value} undefined, no action taken."));
+                    }
+                }
                 return Ok(());
             }
 
@@ -409,14 +379,18 @@ impl PortDriver for GripperDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.set_float64_param(reason, user.addr, value)?;
-
-            // SET_SPEED / SET_FORCE configure the RobotiqGripper object, which
-            // outlives every (re)connect — nothing goes on the wire until the
-            // next move. They apply regardless of the link state, so the PINI
-            // writes at boot (robot off, gripper unreachable) cannot be lost.
-            // C gates them on the connection and the boot values are lost.
+            if !self.robot_ready() {
+                spdlog::error(format_args!(
+                    "Robot must be powered and dashboard connected on to use gripper"
+                ));
+                return Err(refused());
+            }
             let mut gripper = self.gripper.lock();
+            if !gripper.is_connected() {
+                spdlog::error(format_args!("Robotiq gripper not connected"));
+                return Err(refused());
+            }
+            self.base.set_float64_param(reason, user.addr, value)?;
             if reason == p.set_speed {
                 spdlog::debug(format_args!("Setting speed to {value}"));
                 gripper.set_speed(value);
@@ -679,50 +653,59 @@ mod tests {
             },
         );
 
+        // A refusal (robot off) stores nothing, so nothing is flushed.
+        assert!(drv.write_int32(&mut AsynUser::new(p.open), 1).is_err());
+        assert!(!seen.lock().unwrap().contains(&p.open));
+
         // A successful write flushes immediately.
+        let (port, server) = spawn_recording_gripper(vec![("STA", 3)]);
+        drv.gripper().lock().set_port(port);
+        registry::dashboard("GRIP_B4_DASH")
+            .unwrap()
+            .set(DashboardState {
+                connected: true,
+                robot_mode: "Robotmode: IDLE".into(),
+                ..Default::default()
+            });
+        drv.write_int32(&mut AsynUser::new(p.connect), 1).unwrap();
         drv.write_float64(&mut AsynUser::new(p.set_speed), 0.5)
             .unwrap();
         assert!(seen.lock().unwrap().contains(&p.set_speed));
-
-        // An error exit (OPEN with the robot off) still flushes the value
-        // cached before the gate refused.
-        assert!(drv.write_int32(&mut AsynUser::new(p.open), 1).is_err());
-        assert!(seen.lock().unwrap().contains(&p.open));
+        drop(drv);
+        server.join().unwrap();
     }
 
-    /// The boot race B3 closes: at iocsh time the dashboard has not
-    /// connected, so every PINI write lands while the gripper is
-    /// unreachable. The settings configure the persistent gripper object
-    /// immediately, ACTIVATE is held as the desired state, and the first
-    /// successful connect delivers it.
+    /// PINI writes at boot reach a gripper that is unreachable: C refuses
+    /// each one before touching the gripper object, so nothing carries over
+    /// to the first connect (gripper_driver.cpp:152-166,197-213).
     #[test]
-    fn boot_writes_survive_to_the_first_connect() {
+    fn boot_writes_are_refused_and_not_staged() {
         let dash = DashboardHandle::new("127.0.0.1");
         registry::register_dashboard("GRIP_B3_DASH", dash.clone()).expect("fresh port name");
         let mut drv = GripperDriver::new("GRIP_B3", "GRIP_B3_DASH").expect("driver");
         let p = drv.params();
+        let fresh_range = drv.gripper().lock().native_position_range();
 
-        // The PINI writes: all must succeed unreachable (C errors and the
-        // values are lost).
-        drv.write_int32(&mut AsynUser::new(p.min_position), 10)
-            .unwrap();
-        drv.write_int32(&mut AsynUser::new(p.max_position), 200)
-            .unwrap();
-        drv.write_int32(&mut AsynUser::new(p.set_position_range), 1)
-            .unwrap();
-        drv.write_int32(&mut AsynUser::new(p.position_unit), 3)
-            .unwrap();
-        drv.write_float64(&mut AsynUser::new(p.set_speed), 0.5)
-            .unwrap();
-        drv.write_float64(&mut AsynUser::new(p.set_force), 0.25)
-            .unwrap();
-        drv.write_int32(&mut AsynUser::new(p.activate), 1).unwrap();
+        for (reason, value) in [
+            (p.min_position, 10),
+            (p.max_position, 200),
+            (p.set_position_range, 1),
+            (p.position_unit, 3),
+            (p.activate, 1),
+        ] {
+            assert!(drv.write_int32(&mut AsynUser::new(reason), value).is_err());
+        }
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.set_speed), 0.5)
+                .is_err()
+        );
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.set_force), 0.25)
+                .is_err()
+        );
+        assert_eq!(drv.gripper().lock().native_position_range(), fresh_range);
 
-        // The numeric settings reached the gripper object at write time.
-        assert_eq!(drv.gripper().lock().native_position_range(), (10, 200));
-
-        // The robot comes up; the fixture reports an already-active gripper
-        // (STA 3), so the delivered activation is its is_active probe.
+        // The robot comes up: the connect probe is the only traffic.
         let (port, server) = spawn_recording_gripper(vec![("STA", 3)]);
         drv.gripper().lock().set_port(port);
         dash.set(DashboardState {
@@ -730,17 +713,10 @@ mod tests {
             robot_mode: "Robotmode: IDLE".into(),
             ..Default::default()
         });
-
         drv.write_int32(&mut AsynUser::new(p.connect), 1).unwrap();
         drop(drv);
-
-        // One STA probe from try_connect, one from the pending activation.
         let seen = server.join().unwrap();
-        assert_eq!(
-            seen.iter().filter(|l| l.as_str() == "GET STA").count(),
-            2,
-            "expected the connect probe plus the deferred activation, saw: {seen:?}"
-        );
+        assert_eq!(seen, vec!["GET STA".to_string()]);
     }
 
     /// Without a cached ACTIVATE the connect must not touch the activation
