@@ -191,9 +191,7 @@ impl DeviceWorker for EurothermWorker {
 
     fn handle(&mut self, command: Self::Command) {
         // The C wrote the frame and never read a reply (devXxEurotherm.c:300-311).
-        if let Err(e) = self.transport.write(&command.0) {
-            log::error!("Eurotherm: write failed: {e}");
-        }
+        let _ = self.transport.write(&command.0);
     }
 }
 
