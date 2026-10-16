@@ -26,12 +26,9 @@ asynSetOption("$(SERIAL)", 0, "baud",   "921600")
 asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
-
-# NOTE (hardware path): the Agilis driver appends the CR/LF command terminator
-# itself and spaces writes by ~10 ms (the controller needs it). Input-response
-# framing relies on the serial read returning a complete reply; asyn-rs
-# (published 0.21.0) exposes no asynOctetSetInputEos iocsh command, so the
-# input terminator cannot be set here. Verify framing against real hardware.
+# The driver appends the CR/LF terminator itself (no output EOS); replies
+# are split by the input EOS.
+asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- Agilis controller + axes ----
 # AG_UCCreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs])

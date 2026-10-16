@@ -27,12 +27,9 @@ asynSetOption("$(SERIAL)", 0, "baud",   "115200")
 asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
-
-# NOTE (hardware path): the AGAP driver appends the CR/LF command terminator
-# itself, so no output EOS is required. Input-response framing relies on the
-# serial read returning a complete reply; asyn-rs (published 0.21.0) exposes no
-# asynOctetSetInputEos iocsh command, so the input terminator cannot be set
-# here. Verify response framing against real hardware before production use.
+# The driver appends the CR/LF terminator itself (no output EOS); replies
+# are split by the input EOS.
+asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- CONEX-AGAP controller (creates both U and V axes) ----
 # AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])

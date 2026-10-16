@@ -45,10 +45,8 @@ use crate::util::{leading_hex, parse_int_at, parse_value_at};
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
 
-/// Command line terminator (CR/LF). As with the SMC100 driver, this driver
-/// owns framing and appends the terminator itself rather than relying on port
-/// EOS (asyn-rs exposes no `asynOctetSetInputEos` iocsh command on the
-/// published release). See [`crate::smc100`] for the rationale.
+/// Command line terminator (CR/LF), appended by the driver on output; the
+/// reply is split by the port's input EOS. See [`crate::smc100`].
 const TERMINATOR: &[u8] = b"\r\n";
 
 // C `CONEX_TIMEOUT` (2 s) is applied where the transport is opened —

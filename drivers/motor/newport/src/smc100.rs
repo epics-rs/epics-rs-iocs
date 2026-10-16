@@ -34,10 +34,9 @@ use crate::protocol;
 const READ_BUF: usize = 256;
 
 /// Command line terminator. The SMC100 speaks CR/LF-terminated ASCII. The C
-/// driver relies on the asyn serial port's output EOS to append it
-/// (`asynOctetSetInputEos`/`OutputEos` set in st.cmd); asyn-rs exposes no
-/// iocsh EOS command yet, so this driver owns framing explicitly and appends
-/// the terminator itself. `crate::protocol` keeps the bare command text (as C
+/// driver relies on the asyn serial port's output EOS to append it; this
+/// driver appends it itself, so st.cmd sets only the input EOS (replies are
+/// still split by it). `crate::protocol` keeps the bare command text (as C
 /// `outString_` does), so the wire format stays unit-testable.
 const TERMINATOR: &[u8] = b"\r\n";
 
