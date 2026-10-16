@@ -764,6 +764,14 @@ mod tests {
         let pool = rt.pool();
         // pRaw_, pBackground_, pRamp_, pPeak_ and pArrays[0].
         assert_eq!(pool.num_alloc_buffers() - pool.num_free_buffers(), 5);
+
+        // pArrays[0] is preAllocateBuffers' template (asynNDArrayDriver.cpp:717-726).
+        let p = &ad.base;
+        h.write_int32_blocking(p.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        let free = pool.num_free_buffers();
+        h.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
+        assert_eq!(pool.num_free_buffers(), free + 2);
         std::mem::forget(rt);
     }
 }
