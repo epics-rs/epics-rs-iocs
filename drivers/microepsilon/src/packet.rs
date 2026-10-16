@@ -204,7 +204,8 @@ impl ReaderState {
             disp_sum: [0.0; MAX_CHANNELS],
             disp_sum_count: 0,
             pv_throttle,
-            pv_throttle_counter: pv_throttle,
+            // C's calloc'd `pvThrottleCounter`: the first valid packet pushes.
+            pv_throttle_counter: 0,
             stats: LinkStats::default(),
         }
     }
@@ -646,9 +647,15 @@ mod tests {
     fn process_data_packet_averages_across_throttled_cycles() {
         let mut state = ReaderState::new(2);
         state.is_communicating = true;
-        process_data_packet(&mut state, 1, [10.0, 0.0, 0.0, 0.0], true, true);
-        let update = process_data_packet(&mut state, 2, [20.0, 0.0, 0.0, 0.0], true, true).unwrap();
-        assert_eq!(update.values[0], 15.0);
+        // The first valid packet pushes on its own (C's counter starts at 0).
+        let first = process_data_packet(&mut state, 1, [10.0, 0.0, 0.0, 0.0], true, true).unwrap();
+        assert_eq!(first.values[0], 10.0);
+        assert_eq!(
+            process_data_packet(&mut state, 2, [20.0, 0.0, 0.0, 0.0], true, true),
+            None
+        );
+        let update = process_data_packet(&mut state, 3, [40.0, 0.0, 0.0, 0.0], true, true).unwrap();
+        assert_eq!(update.values[0], 30.0);
         assert!(update.valid);
     }
 
