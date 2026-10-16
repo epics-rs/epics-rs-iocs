@@ -6,8 +6,7 @@
 //! for `mbbi`/`bi`) — and does its own RS-485 ASCII/checksum framing
 //! against a *separate*, underlying octet port (found the same way the
 //! delaygen drivers find theirs: `crate::connect::init_serial_port` looks up
-//! an already-configured serial/IP port, wrapped in a blocking
-//! [`SyncIOHandle`]).
+//! an already-configured serial/IP port, driven by blocking requests).
 //!
 //! # EOS ownership
 //! `setDefaultEos` (`drvLove.c:640-660`) is called unconditionally at the
@@ -18,8 +17,7 @@
 //! `love.iocsh` ever call `asynOctetSetInputEos`/`asynOctetSetOutputEos`
 //! for Love). [`INPUT_EOS`]/[`OUTPUT_EOS`] carry the fixed bytes;
 //! `crate::connect::set_default_eos` applies them after the port is
-//! registered, as C does (it needs the raw `PortHandle`, which
-//! `SyncIOHandle` does not expose an accessor back to).
+//! registered, as C does.
 //!
 //! # Command table
 //! `COMMANDS` transcribes `CmdTable[]` (`drvLove.c:255-270`) verbatim: 12
@@ -84,8 +82,10 @@
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -347,7 +347,10 @@ pub struct LoveDriver {
     base: PortDriverBase,
     /// C `Serport::name`, for `reportIt`.
     ser_name: String,
-    handle: SyncIOHandle,
+    /// C `Serport::pasynUser`: the serial port, its address and timeout.
+    serial: PortHandle,
+    ser_addr: i32,
+    timeout: Duration,
     models: ModelTable,
     /// C `Instr::isConn`: set when the port thread first connects the
     /// address, which is just before its first request runs.
@@ -355,8 +358,8 @@ pub struct LoveDriver {
 }
 
 impl LoveDriver {
-    /// C `drvLoveInit(lovPort,serPort,serAddr)`. `handle` talks to the serial
-    /// port, which gets [`INPUT_EOS`]/[`OUTPUT_EOS`] after this port is
+    /// C `drvLoveInit(lovPort,serPort,serAddr)`. Requests go to `serial` at
+    /// `ser_addr` with `timeout`; the serial port gets [`INPUT_EOS`]/[`OUTPUT_EOS`] after this port is
     /// registered (`crate::connect::set_default_eos`). `models` is the shared per-address model table (see the
     /// `registry` module doc) -- the caller constructs it, passes a clone
     /// here, and registers another clone under `port_name` for a later
@@ -364,7 +367,9 @@ impl LoveDriver {
     pub fn new(
         port_name: &str,
         ser_name: &str,
-        handle: SyncIOHandle,
+        serial: PortHandle,
+        ser_addr: i32,
+        timeout: Duration,
         models: ModelTable,
     ) -> AsynResult<Self> {
         let base = PortDriverBase::new(
@@ -380,7 +385,9 @@ impl LoveDriver {
         Ok(Self {
             base,
             ser_name: ser_name.to_owned(),
-            handle,
+            serial,
+            ser_addr,
+            timeout,
             models,
             is_conn: [false; K_INSTRMAX],
         })
@@ -394,7 +401,10 @@ impl LoveDriver {
         for retry in 0..MAX_ATTEMPTS {
             std::thread::sleep(K_TUNE);
 
-            if let Err(e) = self.handle.write_octet(OCTET_REASON, frame.as_bytes()) {
+            let write = RequestOp::OctetWrite {
+                data: frame.as_bytes().to_vec(),
+            };
+            if let Err(e) = self.serial.submit_blocking(write, self.serial_user()) {
                 self.trace_error(&format!(
                     "drvLove::sendCommand - retries({retry}) {}\n",
                     status_text(e.status())
@@ -409,8 +419,19 @@ impl LoveDriver {
                 return Err(e);
             }
 
-            let raw = match self.handle.read_octet(OCTET_REASON, REPLY_BUF_SIZE) {
-                Ok(raw) => raw,
+            let read = RequestOp::OctetRead {
+                buf_size: REPLY_BUF_SIZE,
+            };
+            let raw = match self.serial.submit_blocking(read, self.serial_user()) {
+                Ok(result) => {
+                    let raw = result.data.unwrap_or_default();
+                    if EomReason::from_bits_truncate(result.eom_reason) != EomReason::EOS {
+                        self.trace_error("drvLove::recvReply eos failure\n");
+                        self.trace_read_failure(&frame, &raw);
+                        return Err(protocol_error("recvReply eos failure"));
+                    }
+                    raw
+                }
                 Err(e) => {
                     self.trace_error(&format!("drvLove::recvReply {}\n", status_text(e.status())));
                     if is_timeout(&e) {
@@ -438,6 +459,14 @@ impl LoveDriver {
         // C returns asynError, not the last attempt's asynTimeout, so the
         // record alarms READ/WRITE rather than TIMEOUT.
         Err(protocol_error("executeCommand retries exceeded"))
+    }
+
+    /// What C's `pasynOctetSyncIO` would queue for `Serport::pasynUser`.
+    fn serial_user(&self) -> AsynUser {
+        AsynUser::new(OCTET_REASON)
+            .with_addr(self.ser_addr)
+            .with_timeout(self.timeout)
+            .locking_port(self.serial.queue_lock_port_timeout())
     }
 
     fn trace_error(&self, msg: &str) {
@@ -577,6 +606,7 @@ impl PortDriver for LoveDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::sync_io::SyncIOHandle;
 
     #[test]
     fn command_table_names_and_strings_match_c_source() {
@@ -715,10 +745,10 @@ mod tests {
 
         let (runtime, _thread) =
             create_port_runtime(serial, RuntimeConfig::default()).expect("serial port runtime");
-        let handle =
-            SyncIOHandle::from_handle(runtime.port_handle().clone(), 0, Duration::from_millis(100));
         let models = std::sync::Arc::new(std::sync::Mutex::new([Model::default(); K_INSTRMAX]));
-        LoveDriver::new(name, "SER", handle, models).expect("love driver")
+        let serial = runtime.port_handle().clone();
+        LoveDriver::new(name, "SER", serial, 0, Duration::from_millis(100), models)
+            .expect("love driver")
     }
 
     /// Every timed-out attempt prints C's sendCommand and executeCommand
@@ -808,5 +838,62 @@ mod tests {
         let love = love_on(serial, "LOVETESTTMOL");
         let err = love.execute_command(1, "00").unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error);
+    }
+
+    /// Answers every read with a well-formed reply ended by `eom`.
+    struct ReplySerial {
+        base: PortDriverBase,
+        eom: EomReason,
+    }
+
+    impl PortDriver for ReplySerial {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+
+        fn io_read_octet_eom(
+            &mut self,
+            _user: &AsynUser,
+            buf: &mut [u8],
+        ) -> AsynResult<(usize, EomReason)> {
+            let body = b"L010000";
+            let reply = format!("\u{2}L010000{:02X}", calc_checksum(body));
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok((reply.len(), self.eom))
+        }
+    }
+
+    fn reply_love(name: &str, eom: EomReason) -> LoveDriver {
+        let base = PortDriverBase::new(&format!("{name}SER"), 1, PortFlags::default());
+        love_on(ReplySerial { base, eom }, name)
+    }
+
+    /// C `recvReply` (drvLove.c:844-848) refuses a reply the EOS did not end,
+    /// before `evalMessage` looks at it.
+    #[test]
+    fn a_reply_not_ended_by_the_eos_is_an_error() {
+        assert!(
+            reply_love("LOVETESTEOS", EomReason::EOS)
+                .execute_command(1, "00")
+                .is_ok()
+        );
+        for eom in [
+            EomReason::CNT,
+            EomReason::empty(),
+            EomReason::EOS | EomReason::CNT,
+        ] {
+            let err = reply_love("LOVETESTCNT", eom)
+                .execute_command(1, "00")
+                .unwrap_err();
+            assert_eq!(err.status(), AsynStatus::Error, "{eom:?}");
+        }
     }
 }

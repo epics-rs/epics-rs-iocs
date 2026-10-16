@@ -10,7 +10,6 @@ use std::time::Duration;
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
-use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
@@ -178,18 +177,24 @@ async fn main() -> CaResult<()> {
                         return Ok(CommandOutcome::Continue);
                     }
                 };
-                let handle = SyncIOHandle::from_handle(port.clone(), ser_addr, COMMAND_TIMEOUT);
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
-                let registered = LoveDriver::new(&lov_port, &ser_port, handle, models.clone())
-                    .and_then(|driver| create_port_runtime(driver, RuntimeConfig::default()))
-                    .and_then(|(runtime_handle, _actor_jh)| {
-                        epics_rs::asyn::asyn_record::register_port(
-                            &lov_port,
-                            runtime_handle.port_handle().clone(),
-                            ctx.db().scan_control().interrupt_gate(),
-                        )
-                    });
+                let registered = LoveDriver::new(
+                    &lov_port,
+                    &ser_port,
+                    port.clone(),
+                    ser_addr,
+                    COMMAND_TIMEOUT,
+                    models.clone(),
+                )
+                .and_then(|driver| create_port_runtime(driver, RuntimeConfig::default()))
+                .and_then(|(runtime_handle, _actor_jh)| {
+                    epics_rs::asyn::asyn_record::register_port(
+                        &lov_port,
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                });
                 if registered.is_err() {
                     ctx.println(&format!(
                         "drvLoveInit::failure to register love port {lov_port}"
