@@ -83,8 +83,12 @@ pub(crate) fn nint(f: f64) -> i32 {
 /// Shared MM4000/PM500 `maxDigits`/`res_decpts`: command decimal precision
 /// from the drive resolution, `(int)(-log10(stepSize)) + 2`, floored at 1.
 pub(crate) fn max_digits(step_size: f64) -> usize {
-    let digits = (-step_size.log10()) as i32 + 2;
-    digits.max(1) as usize
+    let x = -step_size.log10();
+    // C `(int)` on x86-64 turns NaN/inf (res <= 0) into INT_MIN, hence the floor.
+    if !x.is_finite() {
+        return 1;
+    }
+    (x as i32 + 2).max(1) as usize
 }
 
 /// Shared ESP300/MM3000 `recv_mess` retry predicate: a reply longer than 3
@@ -107,6 +111,8 @@ mod tests {
         assert_eq!(max_digits(0.1), 3);
         assert_eq!(max_digits(1.0), 2);
         assert_eq!(max_digits(100.0), 1); // -2 + 2 = 0 → floored at 1
+        assert_eq!(max_digits(0.0), 1); // C x86: (int)inf = INT_MIN → floored
+        assert_eq!(max_digits(-1.0), 1); // log10 NaN
     }
 
     #[test]

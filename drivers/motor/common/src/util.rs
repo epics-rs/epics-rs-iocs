@@ -100,8 +100,12 @@ pub fn nint(f: f64) -> i32 {
 /// Command decimal precision from a drive resolution, `(int)(-log10(res)) + 2`,
 /// floored at 1 (C `maxDigits`/`res_decpts`).
 pub fn max_digits(step_size: f64) -> usize {
-    let digits = (-step_size.log10()) as i32 + 2;
-    digits.max(1) as usize
+    let x = -step_size.log10();
+    // C `(int)` on x86-64 turns NaN/inf (res <= 0) into INT_MIN, hence the floor.
+    if !x.is_finite() {
+        return 1;
+    }
+    (x as i32 + 2).max(1) as usize
 }
 
 #[cfg(test)]
@@ -155,6 +159,8 @@ mod tests {
         assert_eq!(max_digits(0.1), 3);
         assert_eq!(max_digits(1.0), 2);
         assert_eq!(max_digits(100.0), 1);
+        assert_eq!(max_digits(0.0), 1); // C x86: (int)inf = INT_MIN → floored
+        assert_eq!(max_digits(-1.0), 1); // log10 NaN
     }
 
     #[test]
