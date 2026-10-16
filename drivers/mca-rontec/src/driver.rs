@@ -77,17 +77,14 @@
 //!   garbage rather than left at their last known value.
 //!   `RontecDriver::read_status` applies each parsed field only when its
 //!   `send_message` call actually succeeded.
-//! - **`int32ArrayRead` buffer overflow and silent short-read corruption**
-//!   (`drvMcaRontec.c:436-478`): (a) `nread = 4 + 4*maxChans` is written
-//!   into the fixed `pPvt->mcaBuffer[RONTEC_MAXCHANS*4+4]` with no check
-//!   that the caller's `maxChans` (ultimately the mca record's
-//!   client-writable `NUSE`, never clamped on this path) is `<=
-//!   RONTEC_MAXCHANS` -- an oversized `NUSE` overflows the fixed buffer.
-//!   (b) `if (nbytesIn != nread)` only logs; the function still parses
-//!   `mcaBuffer` as if the transfer fully succeeded, returning stale/garbage
-//!   spectrum data on a short read. `RontecDriver::read_spectrum` clamps
-//!   the request to `RONTEC_MAXCHANS` and returns an error instead of
-//!   fabricating data when the reply is short.
+//! - **`int32ArrayRead` buffer overflow** (`drvMcaRontec.c:436-478`):
+//!   `nread = 4 + 4*maxChans` is written into the fixed
+//!   `pPvt->mcaBuffer[RONTEC_MAXCHANS*4+4]` with no check that the caller's
+//!   `maxChans` (ultimately the mca record's client-writable `NUSE`, never
+//!   clamped on this path) is `<= RONTEC_MAXCHANS` -- an oversized `NUSE`
+//!   overflows the fixed buffer. `RontecDriver::read_spectrum` clamps the
+//!   request to `RONTEC_MAXCHANS`. A short reply is not an error, as in C:
+//!   it is logged and the persistent buffer is parsed anyway.
 
 use std::time::Duration;
 
@@ -103,6 +100,8 @@ use mca::interface::McaReason;
 
 /// C `#define RONTEC_MAXCHANS 4096` (`drvMcaRontec.c:28`).
 const RONTEC_MAXCHANS: usize = 4096;
+/// C `mcaBuffer[RONTEC_MAXCHANS*4 + 4]` (`drvMcaRontec.c:81`).
+const MCA_BUFFER_SIZE: usize = RONTEC_MAXCHANS * 4 + 4;
 /// C `#define RONTEC_MESSAGE_SIZE 100` (`drvMcaRontec.c:29`) -- the reply
 /// buffer size for plain ASCII exchanges (`sendMessage`).
 const RONTEC_MESSAGE_SIZE: usize = 100;
@@ -181,6 +180,9 @@ pub struct RontecDriver {
     ereal: i32,
     /// C `pPvt->acquiring`.
     acquiring: bool,
+    /// C `pPvt->mcaBuffer`: kept across transfers, so a short reply leaves
+    /// the previous transfer's tail in place exactly as in C.
+    mca_buffer: Vec<u8>,
 }
 
 impl RontecDriver {
@@ -228,6 +230,7 @@ impl RontecDriver {
             elive: 0,
             ereal: 0,
             acquiring: false,
+            mca_buffer: vec![0; MCA_BUFFER_SIZE],
         };
 
         // C: `sendMessage(pPvt, "$SM 4,0", NULL);` -- send 4 bytes/channel,
@@ -300,14 +303,12 @@ impl RontecDriver {
         result
     }
 
-    /// C `int32ArrayRead` (`drvMcaRontec.c:436-478`), with the buffer
-    /// overflow / silent-short-read defects fixed at source (module doc).
-    /// Returns the channels actually read (`<= max_chans_requested`).
-    fn read_spectrum(&self, max_chans_requested: usize) -> AsynResult<Vec<i32>> {
-        let max_chans = max_chans_requested.min(RONTEC_MAXCHANS);
-        if max_chans == 0 {
-            return Ok(Vec::new());
-        }
+    /// C `int32ArrayRead` (`drvMcaRontec.c:436-478`), with the request
+    /// clamped to `RONTEC_MAXCHANS` (module doc). Fills `data` and returns
+    /// its length; a short reply is logged and the rest of `data` comes from
+    /// the previous transfer's bytes, as C parses `pPvt->mcaBuffer` anyway.
+    fn read_spectrum(&mut self, data: &mut [i32]) -> usize {
+        let max_chans = data.len().min(RONTEC_MAXCHANS);
 
         // C: `sprintf(message, "$SS 0,%d,%d,%ld", binning, binning,
         // (long)maxChans*binning);`
@@ -323,20 +324,17 @@ impl RontecDriver {
         // C brackets a single `pasynOctetSyncIO->writeRead` (flush → write →
         // read) with `setInputEos("",0)` / `setInputEos(saved,len)`
         // (`drvMcaRontec.c:458,461-462`) so the binary reply isn't cut short
-        // by the ASCII input EOS. `RequestOp::OctetWriteRead{flush:true}` is
-        // the writeRead half (see `Self::send_message`'s doc); the EOS
-        // save/suppress/restore is issued explicitly around it the same way
-        // C issues its own three separate `pasynOctetSyncIO`/`pasynOctet`
-        // calls (there is no single actor op combining both).
+        // by the ASCII input EOS, ignoring every status but the length.
         let saved_eos = self
             .serial
-            .submit_blocking(RequestOp::GetInputEos, self.octet_user(SPECTRUM_TIMEOUT))?
-            .data
+            .submit_blocking(RequestOp::GetInputEos, self.octet_user(SPECTRUM_TIMEOUT))
+            .ok()
+            .and_then(|r| r.data)
             .unwrap_or_default();
-        self.serial.submit_blocking(
+        let _ = self.serial.submit_blocking(
             RequestOp::SetInputEos { eos: Vec::new() },
             self.octet_user(SPECTRUM_TIMEOUT),
-        )?;
+        );
         let read_result = self.serial.submit_blocking(
             RequestOp::OctetWriteRead {
                 data: message.into_bytes(),
@@ -345,40 +343,39 @@ impl RontecDriver {
             },
             self.octet_user(SPECTRUM_TIMEOUT),
         );
-        self.serial.submit_blocking(
+        let _ = self.serial.submit_blocking(
             RequestOp::SetInputEos { eos: saved_eos },
             self.octet_user(SPECTRUM_TIMEOUT),
-        )?;
-        let raw = read_result?
-            .data
-            .ok_or_else(|| protocol_error("int32ArrayRead: read returned no data"))?;
-
-        // Fixed defect: C proceeds to parse `mcaBuffer` even when
-        // `nbytesIn != nread`, returning stale/garbage data (module doc).
-        if raw.len() != nread {
-            return Err(protocol_error(format!(
-                "int32ArrayRead: short read, got {} bytes, expected {nread}",
-                raw.len()
-            )));
+        );
+        let raw = match &read_result {
+            Ok(r) => r.data.as_deref().unwrap_or_default(),
+            Err(e) => e.partial_read().map_or(&[][..], |p| &p.data),
+        };
+        let nbytes_in = raw.len().min(nread);
+        self.mca_buffer[..nbytes_in].copy_from_slice(&raw[..nbytes_in]);
+        if nbytes_in != nread {
+            self.serial.user_trace().print(
+                self.addr,
+                OCTET_REASON as i32,
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "drvMcaRontec::int32ArrayRead: error reading MCA data, nbytesIn={nbytes_in}, should be {nread}"
+                ),
+            );
         }
 
-        // C: `pin = &pPvt->mcaBuffer[4]; for (i=0;i<maxChans;i++) { ...
-        // data[i] = (temp[0]<<24)+(temp[1]<<16)+(temp[2]<<8)+temp[3]; }` --
-        // big-endian 32-bit reconstruction from 4 unsigned bytes.
-        // `i32::from_be_bytes` gives the identical bit pattern as defined
-        // behavior, in place of C's left-shift-into-the-sign-bit (technically
-        // UB, though reliable on every real two's-complement target).
-        let mut data = Vec::with_capacity(max_chans);
-        for i in 0..max_chans {
-            let off = 4 + i * 4;
-            data.push(i32::from_be_bytes([
-                raw[off],
-                raw[off + 1],
-                raw[off + 2],
-                raw[off + 3],
-            ]));
+        // C: `pin = &pPvt->mcaBuffer[4]; ... data[i] = (temp[0]<<24)+
+        // (temp[1]<<16)+(temp[2]<<8)+temp[3];` -- big-endian; `from_be_bytes`
+        // is the same bit pattern without C's shift into the sign bit.
+        for (value, bytes) in data[..max_chans]
+            .iter_mut()
+            .zip(self.mca_buffer[4..nread].as_chunks::<4>().0)
+        {
+            *value = i32::from_be_bytes(*bytes);
         }
-        Ok(data)
+        max_chans
     }
 
     /// C `mcaReadStatus`'s handler inside `RontecWrite`
@@ -396,7 +393,7 @@ impl RontecDriver {
         // real time" -- a side-effecting device interaction whose data is
         // discarded (`drvMcaRontec.c:311-312`); best-effort, matching C's
         // own disregard for this call's status.
-        let _ = self.read_spectrum(1);
+        self.read_spectrum(&mut [0]);
 
         // Preserved quirk: `elive` mirrors `ereal` from the same `"$MS"`
         // reply (module doc's "unfixable-without-spec" entry).
@@ -547,10 +544,7 @@ impl PortDriver for RontecDriver {
     }
 
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
-        let data = self.read_spectrum(buf.len())?;
-        let nactual = data.len();
-        buf[..nactual].copy_from_slice(&data);
-        Ok(nactual)
+        Ok(self.read_spectrum(buf))
     }
 }
 
@@ -633,6 +627,7 @@ mod tests {
             elive: 0,
             ereal: 0,
             acquiring: false,
+            mca_buffer: vec![0; MCA_BUFFER_SIZE],
         }
     }
 
@@ -879,6 +874,52 @@ mod tests {
             rig.trace()
                 .contains("drvMcaRontec::RontecRead got illegal command 3\n")
         );
+    }
+
+    /// `$SS` answered in full with 100.. the first time, then with only two
+    /// channels of 200.. .
+    fn spectrum_reply(cmd: &[u8]) -> Vec<u8> {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if !cmd.starts_with(b"$SS") {
+            return b"!OK".to_vec();
+        }
+        let (base, nchans) = match CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => (100i32, 4),
+            _ => (200, 2),
+        };
+        let mut reply = b"!SS\r".to_vec();
+        for i in 0..nchans {
+            reply.extend_from_slice(&(base + i).to_be_bytes());
+        }
+        reply
+    }
+
+    /// C `int32ArrayRead` logs a short reply but parses `mcaBuffer` anyway
+    /// and returns `maxChans` with `asynSuccess` (`drvMcaRontec.c:463-477`).
+    #[test]
+    fn a_short_spectrum_is_logged_and_parsed_from_the_kept_buffer() {
+        let rig = Rig::new("short", spectrum_reply);
+        let read = || {
+            rig.submit(
+                RequestOp::Int32ArrayRead { max_elements: 4 },
+                McaReason::Data,
+            )
+            .expect("short read is not an error")
+            .int32_array
+            .expect("array")
+            .to_vec()
+        };
+        assert_eq!(read(), [100, 101, 102, 103]);
+        assert!(!rig.trace().contains("int32ArrayRead"));
+        assert_eq!(read(), [200, 201, 102, 103]);
+        assert!(
+            rig.trace().contains(
+                "drvMcaRontec::int32ArrayRead: error reading MCA data, nbytesIn=12, should be 20\n"
+            ),
+            "{}",
+            rig.trace()
+        );
+        assert_eq!(rig.writes.lock().unwrap()[1], b"$SS 0,1,1,4");
     }
 
     #[test]
