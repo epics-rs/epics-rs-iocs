@@ -429,7 +429,8 @@ impl EtherIpDevice {
         if s & spco::TAG_TRANSFER_TIME != 0 {
             return Some(tag.data.lock().transfer_time);
         }
-        let stats = tag.list_stats.lock();
+        let stats = tag.list_stats();
+        let stats = stats.lock();
         if s & spco::LIST_ERRORS != 0 {
             return Some(stats.list_errors as f64);
         }

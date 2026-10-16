@@ -96,10 +96,17 @@ pub struct TagInfo {
     listeners: Mutex<Vec<Sender<()>>>,
     /// The stats of the list this tag lives in -- the statistics device
     /// support reads them through the tag (C `TagInfo.scanlist`).
-    pub list_stats: Arc<Mutex<ListStats>>,
+    /// Swapped when `add_tag` moves the tag to a faster list.
+    list_stats: Mutex<Arc<Mutex<ListStats>>>,
 }
 
 impl TagInfo {
+    /// The stats of the list this tag lives in -- the statistics device
+    /// support reads them through the tag (C `TagInfo.scanlist`).
+    pub fn list_stats(&self) -> Arc<Mutex<ListStats>> {
+        self.list_stats.lock().clone()
+    }
+
     /// Notify every bound record that this tag's value (or validity) changed.
     ///
     /// Never blocks: a full channel already has a pending pulse, and the record
@@ -190,38 +197,46 @@ impl Plc {
         }
     }
 
-    /// Register a tag for scanning at `period`, requesting at least `elements`
-    /// elements. If the tag already exists in *any* list of this PLC, the
-    /// existing one is reused and its element count maximized -- the C
-    /// (`drvEtherIP_add_tag`) does the same, so the first period a tag is
-    /// registered at wins.
+    /// `drvEtherIP_add_tag`: register a tag for scanning at `period`,
+    /// requesting at least `elements` elements. A tag already in a slower
+    /// list moves to the list at `period`; the list it leaves stays.
     pub fn add_tag(&self, period: f64, string_tag: &str, elements: usize) -> Option<Arc<TagInfo>> {
         let mut lists = self.scanlists.lock();
+        let get_list =
+            |lists: &mut Vec<Arc<ScanList>>| match lists.iter().find(|l| l.period == period) {
+                Some(l) => l.clone(),
+                None => {
+                    let l = Arc::new(ScanList {
+                        period,
+                        enabled: AtomicBool::new(true),
+                        tags: Mutex::new(Vec::new()),
+                        stats: Arc::new(Mutex::new(ListStats::default())),
+                        scheduled: Mutex::new(Instant::now()),
+                    });
+                    lists.push(l.clone());
+                    l
+                }
+            };
 
-        for list in lists.iter() {
+        let found = lists.iter().find_map(|list| {
             let tags = list.tags.lock();
-            if let Some(info) = tags.iter().find(|t| t.string_tag == string_tag) {
-                let mut n = info.elements.lock();
-                *n = (*n).max(elements);
-                return Some(info.clone());
+            let info = tags.iter().find(|t| t.string_tag == string_tag)?.clone();
+            Some((list.clone(), info))
+        });
+        if let Some((list, info)) = found {
+            if list.period > period {
+                list.tags.lock().retain(|t| !Arc::ptr_eq(t, &info));
+                let faster = get_list(&mut lists);
+                *info.list_stats.lock() = faster.stats.clone();
+                faster.tags.lock().push(info.clone());
             }
+            let mut n = info.elements.lock();
+            *n = (*n).max(elements);
+            drop(n);
+            return Some(info);
         }
 
-        let list = match lists.iter().find(|l| l.period == period) {
-            Some(l) => l.clone(),
-            None => {
-                let l = Arc::new(ScanList {
-                    period,
-                    enabled: AtomicBool::new(true),
-                    tags: Mutex::new(Vec::new()),
-                    stats: Arc::new(Mutex::new(ListStats::default())),
-                    scheduled: Mutex::new(Instant::now()),
-                });
-                lists.push(l.clone());
-                l
-            }
-        };
-
+        let list = get_list(&mut lists);
         let tag = ParsedTag::parse(string_tag)?;
         let info = Arc::new(TagInfo {
             string_tag: string_tag.to_string(),
@@ -229,7 +244,7 @@ impl Plc {
             elements: Mutex::new(elements),
             data: Mutex::new(TagData::default()),
             listeners: Mutex::new(Vec::new()),
-            list_stats: list.stats.clone(),
+            list_stats: Mutex::new(list.stats.clone()),
         });
         list.tags.lock().push(info.clone());
         Some(info)
@@ -1203,5 +1218,23 @@ mod registry_tests {
             .filter(|n| n.starts_with("regorder_"))
             .collect();
         assert_eq!(names, ["regorder_b", "regorder_a"]);
+    }
+
+    /// drvEtherIP.c:1278: a tag registered again at a shorter period moves
+    /// to that list, the list it left stays, and a longer period leaves it.
+    #[test]
+    fn a_faster_period_moves_the_tag_and_keeps_the_old_list() {
+        let plc = Plc::new("addtag_move", "10.0.0.9", 0);
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        assert!(Arc::ptr_eq(&plc.add_tag(0.5, "T", 4).unwrap(), &tag));
+        assert!(Arc::ptr_eq(&plc.add_tag(2.0, "T", 2).unwrap(), &tag));
+        let lists = plc.scanlists.lock();
+        let shape: Vec<_> = lists
+            .iter()
+            .map(|l| (l.period, l.tags.lock().len()))
+            .collect();
+        assert_eq!(shape, [(1.0, 0), (0.5, 1)]);
+        assert!(Arc::ptr_eq(&tag.list_stats(), &lists[1].stats));
+        assert_eq!(*tag.elements.lock(), 4);
     }
 }
