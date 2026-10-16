@@ -20,10 +20,6 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "115200")
 
-# A3200 framing: replies end with "\n"; the driver owns the "\n" output
-# terminator, so only the input EOS is set here. Do NOT set an output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n")
-
 # ---- A3200 controller ----
 # A3200AsynConfig(card, asynPort, numAxes, [taskNumber], [linear], [movingPollMs],
 #                 [idlePollMs], [timeoutMs]). Discovers axis names 0..numAxes and

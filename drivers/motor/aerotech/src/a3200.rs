@@ -73,8 +73,9 @@ fn trim_line(raw: &[u8]) -> String {
     s.trim_end_matches(['\r', '\n', '\0']).to_string()
 }
 
-/// Command terminator appended by the driver (C `ASCII_EOS_STR`).
-const TERMINATOR: &[u8] = b"\n";
+/// Port EOS set at connect (C `ASCII_EOS_STR`, drvA3200Asyn.cc:890-891).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\n";
 
 /// Decimal places used when formatting outgoing numeric values.
 const PRECISION: usize = 6;
@@ -139,13 +140,6 @@ impl A3200Controller {
         }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     fn read_line(&self) -> AsynResult<String> {
         Ok(trim_line(&self.handle.read_octet(0, READ_BUF)?))
     }
@@ -156,7 +150,7 @@ impl A3200Controller {
         // only for the value line after a bare ACK.
         Ok(trim_line(&self.handle.write_read(
             0,
-            &Self::framed(cmd),
+            cmd.as_bytes(),
             READ_BUF,
         )?))
     }
@@ -569,11 +563,6 @@ impl AsynMotor for A3200Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn framed_appends_terminator() {
-        assert_eq!(A3200Controller::framed("ENABLE X"), b"ENABLE X\n");
-    }
 
     #[test]
     fn fmt_uses_fixed_precision() {

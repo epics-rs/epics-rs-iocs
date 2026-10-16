@@ -15,13 +15,13 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::{connect_ip, connect_with_eos};
+use motor_common::connect::connect_with_eos;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
 
-use crate::a3200::{A3200_MAX_AXES, A3200Axis, A3200Controller};
+use crate::a3200::{self, A3200_MAX_AXES, A3200Axis, A3200Controller};
 use crate::ensemble::{self, ENSEMBLE_MAX_AXES, EnsembleAxis, EnsembleController};
 
 /// Default communication timeout when the `timeoutMs` arg is omitted.
@@ -145,9 +145,11 @@ pub fn a3200_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 5, 6)?;
             let timeout_ms = opt_double(args, 7, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
 
-            let handle = connect_ip(
+            let handle = connect_with_eos(
                 &asyn_port,
                 Duration::from_millis(timeout_ms.max(0.0) as u64),
+                a3200::INPUT_EOS,
+                a3200::OUTPUT_EOS,
             )?;
             let controller = Arc::new(Mutex::new(A3200Controller::new(
                 handle,
