@@ -115,8 +115,10 @@ impl SmartMotorController {
     /// echoed, then probe each axis address up to the first that does not
     /// answer `0`/`1` in three tries. Performs blocking serial I/O.
     pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
-        port.set_output_eos_blocking(eos_user(), OUTPUT_EOS)?;
-        port.set_input_eos_blocking(eos_user(), INPUT_EOS)?;
+        // C ignores every setInputEos/setOutputEos status
+        // (drvSmartMotor.cc:449-454, 598-601).
+        let _ = port.set_output_eos_blocking(eos_user(), OUTPUT_EOS);
+        let _ = port.set_input_eos_blocking(eos_user(), INPUT_EOS);
         let mut ctrl = Self {
             writer: SyncIOHandle::from_handle(port.clone(), 0, timeout),
             reader: SyncIOHandle::from_handle(port.clone(), 0, RECV_TIMEOUT),
@@ -178,12 +180,12 @@ impl SmartMotorController {
         let mut out = Vec::with_capacity(cmd.len() + 1);
         out.push(FIRST_ADDR + axis as u8);
         out.extend_from_slice(cmd.as_bytes());
-        self.port.set_input_eos_blocking(eos_user(), ECHO_EOS)?;
+        let _ = self.port.set_input_eos_blocking(eos_user(), ECHO_EOS);
         let sent = self.writer.write_octet(0, &out);
         if sent.is_ok() {
             let _ = self.reader.read_octet(0, READ_BUF);
         }
-        self.port.set_input_eos_blocking(eos_user(), INPUT_EOS)?;
+        let _ = self.port.set_input_eos_blocking(eos_user(), INPUT_EOS);
         sent.map(|_| ())
     }
 
@@ -411,5 +413,50 @@ mod tests {
         assert_eq!(clamped_accel(2.4), 2); // NINT rounds down
         assert_eq!(clamped_accel(2.5), 3); // NINT rounds up
         assert_eq!(clamped_accel(100.0), 100);
+    }
+
+    /// A daisy chain of one echoing SmartMotor on a port with no EOS support
+    /// of its own, so every EOS set is refused.
+    struct Chain {
+        base: epics_rs::asyn::port::PortDriverBase,
+        replies: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Chain {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.replies.push_back(data.to_vec());
+            if data.first() == Some(&FIRST_ADDR) {
+                self.replies.push_back(b"1".to_vec());
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = self.replies.pop_front().unwrap_or_default();
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    #[test]
+    fn a_port_refusing_every_eos_set_still_finds_the_chain() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let chain = Chain {
+            base: PortDriverBase::new("smartEosRefused", 1, PortFlags::default()),
+            replies: Default::default(),
+        };
+        let (rt, _actor) = create_port_runtime(chain, RuntimeConfig::default()).unwrap();
+        let port = rt.port_handle().clone();
+        assert!(port.set_input_eos_blocking(eos_user(), INPUT_EOS).is_err());
+        let ctrl = SmartMotorController::new(port, Duration::from_secs(1)).unwrap();
+        assert!(ctrl.echo);
+        assert_eq!(ctrl.num_axes(), 1);
     }
 }
