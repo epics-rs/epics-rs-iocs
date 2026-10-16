@@ -11,17 +11,9 @@
 //! C's `send_msg`/`asynCallback` is a two-phase, `pact`/`rdng`/`rdns`-flagged
 //! dance: `mcaData`/`mcaReadStatus` requests are queued
 //! (`pact=1; rdng|rdns=1`) and only completed (`process()`'d again) once
-//! asyn's callback fires. `mca-rs`'s `cycle` module already collapsed that
-//! into a synchronous contract for device support authors: every
-//! [`crate::interface::McaReason`] other than `Data`/`ReadStatus` is a plain
-//! command dispatched via `McaRecord::take_device_requests()`; the status
-//! read (`ReadStatus`) is unconditional every cycle (C's `send_msg`
-//! effectively always queues `mcaReadStatus` after any of the other
-//! commands complete); and whether the spectrum (`Data`) must also be read
-//! is decided by `McaRecord::apply_status`'s return value. `Data` and
-//! `ReadStatus` therefore never appear in `take_device_requests()`'s output
-//! -- seeing either there would be a logic error in `mca-rs` itself, not
-//! something this device support needs to guard against.
+//! asyn's callback fires. Here the record drives the whole device half of
+//! its cycle through [`McaDset`] (`McaRecord::run_device_cycle`), and the
+//! read each callback would complete runs inside the send that queues it.
 //!
 //! This device support uses blocking asyn calls (`PortHandle::*_blocking`),
 //! matching every other synchronous-poll device support in this workspace
@@ -33,7 +25,7 @@ use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_rs::base::server::record::{
-    DbLinkType, DevSup, Dset, Record, ScanType, register_dbd_devices,
+    DbLinkType, DevSup, Dset, ProcessContext, Record, ScanType, register_dbd_devices,
 };
 use epics_rs::base::types::{EpicsValue, SharedArray};
 
@@ -48,7 +40,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
-use mca_rs::record::{McaCommand, McaRecord, McaStatus, commands};
+use mca_rs::record::{McaCommand, McaDset, McaRecord, McaStatus, Nack, StampSource, commands};
 
 use crate::interface::{ASYN_MCA_DTYP, McaReason};
 
@@ -62,6 +54,8 @@ pub struct DevMcaAsyn {
     /// `None` until `init` connects, and for good after it fails: C leaves
     /// that record in PACT (`devMcaAsyn.c:208-210`), so it never processes.
     port: Option<McaPort>,
+    /// This cycle's `TSE`/`TIME`, for the record's read-start stamp.
+    clock: StampSource,
 }
 
 /// `mcaAsynPvt` (`devMcaAsyn.c:38-56`) of a connected record.
@@ -83,6 +77,9 @@ struct McaPort {
     status: McaStatus,
     /// C's `data`/`nread`, kept across reads for the same reason.
     data: SharedArray<i32>,
+    /// `pmca->nuse` as this cycle began: the channel count C's `mcaData`
+    /// callback reads (`devMcaAsyn.c:357`).
+    nuse: i32,
 }
 
 /// C `asynPrint(pasynUser, ASYN_TRACE_ERROR, ...)` for a user on `port`
@@ -105,6 +102,7 @@ impl DevMcaAsyn {
             inp: inp.to_owned(),
             name: String::new(),
             port: None,
+            clock: StampSource::default(),
         }
     }
 
@@ -151,6 +149,7 @@ impl DevMcaAsyn {
             reasons: [0; McaReason::COUNT],
             status: McaStatus::default(),
             data: SharedArray::default(),
+            nuse: 0,
         };
         // `pasynUser->reason` as the previous create left it.
         let mut reason = 0;
@@ -241,11 +240,9 @@ impl McaPort {
     /// `StopAcquire`/`Erase` write `0`, matching C's `parg=NULL -> ivalue=0`
     /// convention for the argument-less commands (`devMcaAsyn.c:264-282`).
     ///
-    /// `Data`/`ReadStatus` are structurally unreachable --
-    /// `McaRecord::take_device_requests()` never yields them (see module
-    /// doc) -- but the match must stay exhaustive against
-    /// [`McaCommand`], so they are explicit no-op arms rather than a
-    /// wildcard that would silently swallow a real future variant.
+    /// `Data`/`ReadStatus` are reads, which [`McaDset::send_msg`] runs
+    /// before it gets here; they stay explicit no-op arms so a new
+    /// [`McaCommand`] variant fails to compile instead of being swallowed.
     fn send_command(&self, command: McaCommand) -> AsynResult<()> {
         match command {
             McaCommand::Data | McaCommand::ReadStatus => Ok(()),
@@ -274,8 +271,8 @@ impl McaPort {
     /// itself first), then read the five status scalars. Always run, once
     /// per device-support cycle -- C's `mcaReadStatus` is not conditionally
     /// queued (see module doc). Every status is discarded, as in C.
-    fn read_status(&mut self) {
-        let _ = self.write_i32(McaReason::ReadStatus, 0);
+    fn read_status(&mut self) -> Result<(), Nack> {
+        queued(self.write_i32(McaReason::ReadStatus, 0))?;
         let mut status = self.status;
         let mut acquiring = i32::from(status.acquiring);
         self.read_i32(McaReason::Acquiring, &mut acquiring);
@@ -285,19 +282,55 @@ impl McaPort {
         self.read_f64(McaReason::ElapsedCounts, &mut status.total_counts);
         self.read_f64(McaReason::DwellTime, &mut status.dwell_time);
         self.status = status;
+        Ok(())
     }
 
     /// C `asynCallback`'s `mcaData` branch (`devMcaAsyn.c:355-358`):
     /// `pasynInt32Array->read(..., pPvt->data, pmca->nuse, &pPvt->nread)`,
     /// status discarded.
-    fn read_spectrum(&mut self, max_elements: usize) {
+    fn read_spectrum(&mut self) -> Result<(), Nack> {
+        let max_elements = self.nuse.max(0) as usize;
         let user = AsynUser::new(self.reasons[McaReason::Data as usize]).with_addr(self.addr);
-        if let Ok(result) = self
+        let result = self
             .handle
-            .submit_blocking(RequestOp::Int32ArrayRead { max_elements }, user)
-        {
-            self.data = result.int32_array.unwrap_or_default();
+            .submit_blocking(RequestOp::Int32ArrayRead { max_elements }, user);
+        if let Ok(result) = &result {
+            self.data = result.int32_array.clone().unwrap_or_default();
         }
+        queued(result.map(drop))
+    }
+}
+
+/// C `send_msg`'s status (`devMcaAsyn.c:331-337`): -1 only when
+/// `queueRequest` refuses; `asynCallback` discards the driver's own status.
+fn queued(result: AsynResult<()>) -> Result<(), Nack> {
+    match result {
+        Err(e) if e.is_queue_refused() => Err(Nack),
+        _ => Ok(()),
+    }
+}
+
+/// C `send_msg` (`devMcaAsyn.c:229-338`) and `read_array` (`:395-407`),
+/// run synchronously: the reads C's `asynCallback` completes (`:342-391`)
+/// happen inside the send that queues them.
+impl McaDset for McaPort {
+    fn send_msg(&mut self, command: McaCommand) -> Result<(), Nack> {
+        match command {
+            McaCommand::Data => self.read_spectrum(),
+            McaCommand::ReadStatus => self.read_status(),
+            command => queued(self.send_command(command)),
+        }
+    }
+
+    fn read_status(&mut self, _mca: &McaRecord) -> Result<McaStatus, Nack> {
+        McaPort::read_status(self)?;
+        Ok(self.status)
+    }
+
+    /// C copies whatever the last `mcaData` callback left in its buffer.
+    fn read_array(&mut self, mca: &mut McaRecord) -> Result<(), Nack> {
+        mca.land_spectrum_read(EpicsValue::LongArray(self.data.clone()))
+            .map_err(|_| Nack)
     }
 }
 
@@ -316,11 +349,9 @@ impl DeviceSupport for DevMcaAsyn {
     /// Also reproduces the record-level `init_record`'s OWN second half
     /// (`mcaRecord.c:463-487`, "Initialize hardware to agree with the
     /// record"): every setup field's db-loaded value is sent to the driver
-    /// once, here, unconditionally -- independent of the runtime
-    /// NEWV/`special()` write path ([`McaRecord::take_device_requests`]),
-    /// which only yields a field the first time a *later* `caput` changes
-    /// it. Without this, a driver never learns a setup field's db-loaded
-    /// value (e.g. `NUSE`) until a client explicitly rewrites it after boot.
+    /// once, here, unconditionally -- the record's NEWV path sends a field
+    /// only after a *later* put changes it, so without this a driver never
+    /// learns a setup field's db-loaded value (e.g. `NUSE`).
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let connect = self.connect();
         let mca = Self::mca(record)?;
@@ -369,34 +400,21 @@ impl DeviceSupport for DevMcaAsyn {
         Ok(DeviceInitOutcome::ok())
     }
 
-    /// One process cycle, restructured from C's `send_msg` + `asynCallback`
-    /// (`devMcaAsyn.c:262-416`) per the module doc: dispatch every pending
-    /// command, unconditionally resample status, and read the spectrum only
-    /// if the status update says a client asked for it or acquisition just
-    /// finished (`McaRecord::apply_status`'s return value -- C's
-    /// `rdng`/`pact` two-phase gate collapsed to one bool).
-    ///
-    /// C's `asynCallback` ignores every driver status (`devMcaAsyn.c:355-391`),
-    /// so a failing driver neither alarms the record nor cuts the cycle short.
+    /// The device half of one process cycle, C `mcaRecord.c:509-790`, run
+    /// by the record against this dset.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        let clock = self.clock;
         let Some(port) = self.port.as_mut() else {
             return Ok(DeviceReadOutcome::ok());
         };
         let mca = Self::mca(record)?;
-
-        for command in mca.take_device_requests() {
-            let _ = port.send_command(command);
-        }
-
-        port.read_status();
-        let must_read_spectrum = mca.apply_status(port.status);
-
-        if must_read_spectrum {
-            port.read_spectrum(mca.nuse.max(0) as usize);
-            mca.land_spectrum_read(EpicsValue::LongArray(port.data.clone()))?;
-        }
-
+        port.nuse = mca.nuse;
+        mca.run_device_cycle(port, clock);
         Ok(DeviceReadOutcome::ok())
+    }
+
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.clock = ctx.into();
     }
 
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
@@ -456,7 +474,7 @@ fn mca_device_support(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSuppor
         return None;
     }
     match ctx.dtyp {
-        SOFT_MCA_DTYP => Some(Box::new(mca_rs::SoftMca)),
+        SOFT_MCA_DTYP => Some(Box::new(mca_rs::SoftMca::default())),
         ASYN_MCA_DTYP => Some(Box::new(DevMcaAsyn::new(ctx.inp))),
         _ => None,
     }
@@ -648,6 +666,29 @@ mod tests {
                 f.reasons[McaReason::ReadStatus as usize],
             ]
         );
+        assert_eq!(f.rec.nack, 0, "send_msg queued it, so C acknowledged");
+    }
+
+    /// C `send_msg` returns -1 when `queueRequest` refuses
+    /// (`devMcaAsyn.c:331-337`), so the record raises NACK and, for the
+    /// status read, drops ACQG (`mcaRecord.c:670-674`).
+    #[test]
+    fn a_refused_queue_is_a_nack() {
+        let mut f = fixture("MCATESTREFUSE");
+        f.dev
+            .port
+            .as_ref()
+            .unwrap()
+            .handle
+            .set_enable(-1, false)
+            .unwrap();
+        f.rec.put_field("NUSE", EpicsValue::Long(4)).unwrap();
+        f.rec.special("NUSE", true).unwrap();
+        f.rec.acqg = 1;
+        f.dev.read(&mut f.rec).unwrap();
+        assert!(f.writes.lock().unwrap().is_empty());
+        assert_eq!(f.rec.nack, 1);
+        assert_eq!(f.rec.acqg, 0);
     }
 
     /// `mcaSupport.dbd:10-11`: "Soft Channel" is mca DTYP 0 and binds
