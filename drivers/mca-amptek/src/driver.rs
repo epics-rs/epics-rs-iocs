@@ -774,11 +774,8 @@ impl AmptekDriver {
             output_level: 0,
         }; MAX_SCAS];
         for (i, sca) in scas.iter_mut().enumerate() {
-            let [low, high, level] = reasons.map(|reason| {
-                self.base
-                    .get_int32_param_strict(reason, i as i32)
-                    .unwrap_or(0)
-            });
+            let [low, high, level] =
+                reasons.map(|reason| self.base.get_int32_param(reason, i as i32).unwrap_or(0));
             *sca = ScaFields {
                 low_channel: low,
                 high_channel: high,
@@ -1246,7 +1243,7 @@ impl PortDriver for AmptekDriver {
             }
             Ok(i32::from(self.acquiring))
         } else {
-            self.base.get_int32_param_strict(user.reason, PARAM_ADDR)
+            self.base.get_int32_param(user.reason, PARAM_ADDR)
         }
     }
 
@@ -1260,7 +1257,7 @@ impl PortDriver for AmptekDriver {
         } else if user.reason == self.mca[McaReason::ElapsedCounts as usize] {
             Ok(s.slow_count)
         } else {
-            self.base.get_float64_param_strict(user.reason, PARAM_ADDR)
+            self.base.get_float64_param(user.reason, PARAM_ADDR)
         }
     }
 
@@ -1280,7 +1277,7 @@ impl PortDriver for AmptekDriver {
 
     /// `asynPortDriver::readOctet` at `PARAM_ADDR`.
     fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
-        let bytes = self.base.get_string_param_strict(user.reason, PARAM_ADDR)?;
+        let bytes = self.base.get_string_param(user.reason, PARAM_ADDR)?;
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
@@ -1526,7 +1523,7 @@ mod tests {
         driver.write_int32(&mut user, 1).unwrap();
 
         assert_eq!(driver.base.get_int32_param(low, 0).unwrap(), 5);
-        assert!(driver.base.get_int32_param_strict(low, 3).is_err());
+        assert!(driver.base.get_int32_param(low, 3).is_err());
         assert_eq!(
             driver.read_int32(&AsynUser::new(low).with_addr(3)).unwrap(),
             5
