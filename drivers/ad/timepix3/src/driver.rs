@@ -1521,6 +1521,9 @@ impl PortDriver for TimePix3Driver {
             self.init_acquisition()
         } else if reason == p.stem_dwell_time || reason == p.tof_min || reason == p.tof_max {
             self.send_measurement_config()
+        } else if reason < p.http_code {
+            // ADDriver::writeFloat64 is asynPortDriver's (ADTimePix.cpp:1100-1104).
+            self.ad.port_base.write_float64_param(user, value)
         } else {
             Ok(())
         };
@@ -2013,6 +2016,57 @@ mod tests {
             "{e}"
         );
         assert_eq!(det.int(p.bias_enable, 0), 0);
+    }
+
+    /// A base-class float write runs asynPortDriver::writeFloat64, whose
+    /// line precedes ADTimePix's (ADTimePix.cpp:1100-1112).
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_BASE_F64";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let delay = det.ad.params.shutter_open_delay;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_float64_blocking(delay, 0, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = adlog::log(
+            adlog::WRITE_FLOAT64,
+            &format!("function={delay} value=2.000000"),
+        );
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+        std::mem::forget(runtime);
     }
 
     /// A NumImages write in single mode is clamped to 1 and says so on
