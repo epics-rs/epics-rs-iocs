@@ -19,7 +19,7 @@ use epics_rs::base::server::device_support::{
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status;
-use epics_rs::base::server::record::{AlarmSeverity, Record};
+use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
@@ -276,6 +276,8 @@ fn put_bits(raw: &mut [u8], mut element: usize, mut mask: u32, bits: usize, rval
 // ---------------------------------------------------------------------------
 
 pub struct EtherIpDevice {
+    /// The record name, for C's `rec->name` in the lines it prints.
+    name: String,
     link_text: String,
     is_output: bool,
     link: Option<Link>,
@@ -288,6 +290,7 @@ pub struct EtherIpDevice {
 impl EtherIpDevice {
     fn new(link_text: &str, is_output: bool) -> EtherIpDevice {
         EtherIpDevice {
+            name: String::new(),
             link_text: link_text.to_string(),
             is_output,
             link: None,
@@ -396,6 +399,10 @@ fn scan_period(record: &dyn Record) -> Option<f64> {
 impl DeviceSupport for EtherIpDevice {
     fn dtyp(&self) -> &str {
         DTYP
+    }
+
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_string();
     }
 
     // Every C init_record/analyze_link failure returns an `S_*` status after
@@ -532,10 +539,7 @@ impl DeviceSupport for EtherIpDevice {
                             .ok_or(())
                     }
                     "waveform" => read_waveform(raw, element, record).map(|v| (v, true)),
-                    other => {
-                        log::error!("devEtherIP: unsupported input record type '{other}'");
-                        Err(())
-                    }
+                    _ => Err(()),
                 }
             }
         };
@@ -644,8 +648,7 @@ impl DeviceSupport for EtherIpDevice {
                     None => false,
                 }
             }
-            other => {
-                log::error!("devEtherIP: unsupported output record type '{other}'");
+            _ => {
                 drop(data);
                 self.write_alarm();
                 return Ok(());
@@ -653,7 +656,7 @@ impl DeviceSupport for EtherIpDevice {
         };
 
         if changed {
-            tag.request_write(&mut data);
+            tag.request_write(&mut data, &self.name);
         }
         drop(data);
         self.no_alarm();
@@ -696,7 +699,7 @@ impl EtherIpDevice {
                     if plc != val {
                         if force {
                             cip::put_double(&mut data.buf, element, val);
-                            tag.request_write(&mut data);
+                            tag.request_write(&mut data, &self.name);
                         } else {
                             record.set_val(EpicsValue::Double(plc))?;
                         }
@@ -712,7 +715,7 @@ impl EtherIpDevice {
                     if plc != rval {
                         if force {
                             cip::put_dint(&mut data.buf, element, rval);
-                            tag.request_write(&mut data);
+                            tag.request_write(&mut data, &self.name);
                         } else if !record.apply_raw_readback(plc) {
                             record.set_val(EpicsValue::Long(plc))?;
                         }
@@ -729,7 +732,7 @@ impl EtherIpDevice {
                 if plc != val {
                     if force {
                         cip::put_dint(&mut data.buf, element, val);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else {
                         record.set_val(EpicsValue::Long(plc))?;
                     }
@@ -748,7 +751,7 @@ impl EtherIpDevice {
                 if plc != val {
                     if force {
                         cip::put_lint(&mut data.buf, element, val);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else {
                         record.set_val(EpicsValue::Int64(plc))?;
                     }
@@ -765,7 +768,7 @@ impl EtherIpDevice {
                 if plc != rval {
                     if force {
                         put_bits(&mut data.buf, element, mask, bits, rval);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else if !record.apply_raw_readback(plc as i32) {
                         record.set_val(EpicsValue::Long(plc as i32))?;
                     }
@@ -785,14 +788,13 @@ impl EtherIpDevice {
                 if plc != val {
                     if force {
                         cip::put_string(&mut data.buf, &val);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else {
                         record.set_val(EpicsValue::String(plc.into()))?;
                     }
                 }
             }
-            other => {
-                log::error!("devEtherIP: unsupported output record type '{other}'");
+            _ => {
                 drop(data);
                 self.read_alarm();
                 return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
@@ -883,16 +885,23 @@ fn i32_field(record: &dyn Record, name: &str) -> i32 {
 // The statistics-reset bo (DTYP "EtherIPReset")
 // ---------------------------------------------------------------------------
 
-pub struct EtherIpResetDevice;
+#[derive(Default)]
+pub struct EtherIpResetDevice {
+    name: String,
+}
 
 impl DeviceSupport for EtherIpResetDevice {
     fn dtyp(&self) -> &str {
         DTYP_RESET
     }
 
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_string();
+    }
+
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if i32_field(record, "RVAL") != 0 {
-            log::info!("devEtherIP: resetting PLC statistics");
+            println!("'{}': resetting PLC statistics", self.name);
             driver::reset_statistics();
         }
         Ok(())
@@ -907,7 +916,7 @@ impl DeviceSupport for EtherIpResetDevice {
 /// link text taken verbatim from INP or OUT.
 pub fn device_factory(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> {
     match ctx.dtyp {
-        DTYP_RESET => Some(Box::new(EtherIpResetDevice)),
+        DTYP_RESET => Some(Box::new(EtherIpResetDevice::default())),
         DTYP => {
             let (text, is_output) = if !ctx.out.is_empty() {
                 (ctx.out, true)

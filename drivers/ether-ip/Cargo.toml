@@ -7,7 +7,6 @@ publish = false
 [dependencies]
 chrono = "0.4"
 epics-rs = { workspace = true }
-log = "0.4"
 parking_lot = "0.12"
 thiserror = "2"
 tokio = { version = "1", features = ["sync"] }

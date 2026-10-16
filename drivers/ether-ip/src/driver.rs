@@ -108,9 +108,9 @@ impl TagInfo {
     /// Device support side of the write handshake: stage the value in the tag
     /// buffer, then flag it. The scan thread clears `do_write` and sets
     /// `is_writing` when it picks the write up.
-    pub fn request_write(&self, data: &mut TagData) {
+    pub fn request_write(&self, data: &mut TagData, record: &str) {
         if data.do_write {
-            log::debug!("EIP '{}': already writing", self.string_tag);
+            crate::eip_printf!(6, "'{record}': already writing\n");
         } else {
             data.do_write = true;
         }
