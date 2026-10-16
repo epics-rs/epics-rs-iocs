@@ -1,40 +1,35 @@
-//! The three marCCD worker threads and the acquisition state machine.
+//! The two marCCD worker threads and the acquisition state machine.
 //!
-//! * `MarccdCmdTask` executes the server work C does inline in `writeInt32` /
-//!   `writeFloat64` (`set_bin`, `set_gating`, `set_readout_mode`,
-//!   `set_frameshift`, `set_stability`, `get_state` for `ADReadStatus`,
-//!   `saveFile` for `NDWriteFile`) plus the `ADAcquire == 1` `getState`
-//!   precondition and start-event signalling.
 //! * `MarccdTask` is C's `marCCDTask` acquisition state machine
 //!   (`collectNormal` / `collectSeries`).
 //! * `MarccdImageTask` is C's `getImageDataTask` — the overlapped
 //!   correction/readback path.
 //!
-//! All three reach the marServer socket through the shared [`Server`] behind a
-//! `tokio::sync::Mutex`, exactly as C's three contexts share the driver lock.
+//! Where C's tasks hold the driver lock, these run their step on the driver
+//! through [`Worker::locked`], so marServer I/O always happens on the port
+//! actor, exactly once per C call.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::driver::{ADDriver, ADStatus};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::trace::TraceMask;
-use tokio::sync::Mutex as AsyncMutex;
 
+use crate::driver::MarccdDriver;
 use crate::file_name::{format_file_template, full_file_template};
 use crate::image::decode_tiff;
-use crate::protocol::{cmd_dezinger, cmd_readout, cmd_set_bin, cmd_writefile};
 use crate::protocol::{
-    cmd_set_frameshift, cmd_set_gating, cmd_set_readout_mode, cmd_set_stability,
-    cmd_start_series_timed, cmd_start_series_triggered_itemp, cmd_start_series_triggered_timed,
+    cmd_dezinger, cmd_readout, cmd_start_series_timed, cmd_start_series_triggered_itemp,
+    cmd_start_series_triggered_timed,
 };
-use crate::server::Server;
 use crate::types::{
     CamStatus, Event, FILE_READ_DELAY, FrameType, ImageMode, MARCCD_POLL_DELAY, MAX_FILENAME_LEN,
     TASK_ACQUIRE, TASK_CORRECT, TASK_DEZINGER, TASK_READ, TASK_STATE_BUSY, TASK_STATE_ERROR,
@@ -42,41 +37,10 @@ use crate::types::{
     test_task_status,
 };
 
-/// Work C performs synchronously inside an asyn `write*` callback. A Rust
-/// `PortDriver` method must not block on another port, so the actor enqueues
-/// these instead.
-#[derive(Debug)]
-pub enum Cmd {
-    /// The server round-trips C runs at the end of the constructor:
-    /// `getServerMode`, `getConfig`, `getState`.
-    Init,
-    /// C's `ADAcquire == 1` branch: `getState`, and if the acquire task is not
-    /// already queued/executing, clear a stale stop and signal the start event.
-    StartAcquire,
-    /// C's `ADBinX` / `ADBinY` branch: `set_bin,<x>,<y>`.
-    SetBin,
-    /// C's `marCCDGateMode` branch (server mode 2 only): `set_gating,<v>` then
-    /// `getConfig`.
-    SetGating(i32),
-    /// C's `marCCDReadoutMode` branch (server mode 2 only):
-    /// `set_readout_mode,<v>` then `getConfig`.
-    SetReadoutMode(i32),
-    /// C's `marCCDFrameShift` branch: `set_frameshift,<v>` then `getConfig`.
-    SetFrameShift(i32),
-    /// C's `ADReadStatus` branch: `getState`.
-    ReadStatus,
-    /// C's `NDWriteFile` branch: `saveFile(correctedFlag, 1)`.
-    WriteFile,
-    /// C's `marCCDStability` branch: `set_stability,<v>` then `getConfig`.
-    SetStability(f64),
-    /// `ADDriver::writeInt32`'s `ADShutterControl` call of the virtual
-    /// `marCCD::setShutter` (ADDriver.cpp:96-98, marCCD.cpp:712-750).
-    SetShutter(bool),
-}
-
 /// Everything a worker thread needs to reach the driver.
 pub(crate) struct Worker {
-    pub server: Arc<AsyncMutex<Server>>,
+    /// The marCCD port, whose actor is the driver lock.
+    pub port: PortHandle,
     pub start: Arc<Event>,
     pub stop: Arc<Event>,
     pub image_event: Arc<Event>,
@@ -104,8 +68,23 @@ fn epoch_secs(t: SystemTime) -> i64 {
 }
 
 impl Worker {
-    async fn trace_error(&self, message: &str) {
-        self.server.lock().await.trace(TraceMask::ERROR, message);
+    /// C `lock()` … `unlock()` around one step: run `f` on the driver, on its
+    /// port actor. A stopped port yields `R::default()`.
+    pub(crate) async fn locked<R: Default + Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut MarccdDriver) -> R + Send + 'static,
+    ) -> R {
+        self.port
+            .with_driver::<MarccdDriver, R>(f)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// C `asynPrint(pasynUserSelf, mask, ...)`.
+    fn trace(&self, mask: TraceMask, message: &str) {
+        self.port
+            .trace()
+            .output(self.port.port_name(), mask, message);
     }
 
     fn store_acq_start(&self, v: f64) {
@@ -116,22 +95,18 @@ impl Worker {
         f64::from_bits(self.acq_start.load(Ordering::Relaxed))
     }
 
-    /// C `getState`, locking the shared server for the round-trip.
+    /// C `getState`.
     async fn get_state(&self) -> i32 {
-        self.server.lock().await.get_state().await
+        self.locked(|d| d.get_state()).await
     }
 
     // -----------------------------------------------------------------------
-    // acquireFrame / readoutFrame / saveFile
+    // acquireFrame / readoutFrame
     // -----------------------------------------------------------------------
 
     /// C `acquireFrame`.
     async fn acquire_frame(&self, exposure_time: f64, use_shutter: bool) {
-        let trigger_mode = {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            srv.get_i32(srv.ad.trigger_mode).await
-        };
+        let trigger_mode = self.locked(|d| d.get_i32(d.ad.params.trigger_mode)).await;
 
         // Wait for the acquire task to be done with the previous acquisition.
         let mut s = self.get_state().await;
@@ -142,13 +117,12 @@ impl Worker {
             s = self.get_state().await;
         }
 
-        {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            srv.set_str(srv.ad.status_message, "Starting exposure");
-            srv.write_server("start").await;
-            srv.callbacks().await;
-        }
+        self.locked(|d| {
+            d.set_str(d.ad.params.status_message, "Starting exposure");
+            d.write_server("start");
+            d.callbacks();
+        })
+        .await;
 
         // Wait for acquisition to actually start.
         let mut s = self.get_state().await;
@@ -161,7 +135,7 @@ impl Worker {
 
         let start = Instant::now();
         if use_shutter {
-            self.server.lock().await.set_shutter(true).await;
+            self.set_shutter(true).await;
         }
 
         // Wait for the exposure time, aborting on the stop event. In internal
@@ -190,21 +164,29 @@ impl Worker {
             if time_remaining < 0.0 {
                 time_remaining = 0.0;
             }
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            srv.set_f64(srv.ad.time_remaining, time_remaining);
-            srv.callbacks().await;
+            self.locked(move |d| {
+                d.set_f64(d.ad.params.time_remaining, time_remaining);
+                d.callbacks();
+            })
+            .await;
         }
 
-        {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            srv.set_f64(srv.ad.time_remaining, 0.0);
-            srv.callbacks().await;
-        }
+        self.locked(|d| {
+            d.set_f64(d.ad.params.time_remaining, 0.0);
+            d.callbacks();
+        })
+        .await;
         if use_shutter {
-            self.server.lock().await.set_shutter(false).await;
+            self.set_shutter(false).await;
         }
+    }
+
+    /// C `setShutter(open)` from the acquisition task.
+    async fn set_shutter(&self, open: bool) {
+        self.locked(move |d| {
+            let _ = ADDriver::set_shutter(d, open);
+        })
+        .await;
     }
 
     /// C `readoutFrame`.
@@ -228,17 +210,16 @@ impl Worker {
             }
         }
 
-        {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
+        let name = file_name.unwrap_or_default().to_string();
+        let command = cmd_readout(buffer_number, file_name);
+        self.locked(move |d| {
             if has_file {
-                let name = file_name.unwrap().to_string();
-                srv.set_str(srv.ad.base.full_file_name, name);
-                srv.callbacks().await;
+                d.set_str(d.ad.params.base.full_file_name, &name);
+                d.callbacks();
             }
-            srv.write_server(&cmd_readout(buffer_number, file_name))
-                .await;
-        }
+            d.write_server(&command);
+        })
+        .await;
 
         // Wait for the readout to start.
         let mut s = self.get_state().await;
@@ -293,54 +274,13 @@ impl Worker {
 
     /// C `saveFile`.
     async fn save_file(&self, corrected_flag: i32, wait: bool) {
-        // Wait for any previous write to complete.
-        let mut s = self.get_state().await;
-        while test_task_status(s, TASK_WRITE, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0
-            || task_state(s) >= TASK_STATE_BUSY
-        {
-            rt::sleep(secs(MARCCD_POLL_DELAY)).await;
-            s = self.get_state().await;
-        }
-
-        self.server.lock().await.write_header().await;
-        let full_file_name = self.create_file_name().await;
-        {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            srv.write_server(&cmd_writefile(&full_file_name, corrected_flag))
-                .await;
-            srv.set_str(srv.ad.base.full_file_name, full_file_name.clone());
-            srv.callbacks().await;
-        }
-        if !wait {
-            return;
-        }
-        let mut s = self.get_state().await;
-        while test_task_status(s, TASK_WRITE, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0
-            || task_state(s) >= TASK_STATE_BUSY
-        {
-            rt::sleep(secs(MARCCD_POLL_DELAY)).await;
-            s = self.get_state().await;
-        }
+        self.locked(move |d| d.save_file(corrected_flag, wait))
+            .await;
     }
 
     /// C `asynNDArrayDriver::createFileName`.
     async fn create_file_name(&self) -> String {
-        let mut guard = self.server.lock().await;
-        let srv = &mut *guard;
-        let base = srv.ad.base;
-        let file_path = srv.get_str(base.file_path, MAX_FILENAME_LEN).await;
-        let file_name = srv.get_str(base.file_name, MAX_FILENAME_LEN).await;
-        let template = srv.get_str(base.file_template, MAX_FILENAME_LEN).await;
-        let file_number = srv.get_i32(base.file_number).await;
-        let auto_increment = srv.get_i32(base.auto_increment).await;
-
-        let full = format_file_template(&template, &file_path, &file_name, file_number)
-            .unwrap_or_default();
-        if auto_increment != 0 {
-            srv.set_i32(base.file_number, file_number + 1);
-        }
-        full
+        self.locked(|d| d.create_file_name()).await
     }
 
     // -----------------------------------------------------------------------
@@ -350,29 +290,21 @@ impl Worker {
     /// C `getImageData`.
     async fn get_image_data(&self) -> CamStatus {
         // Inquire about the image dimensions.
-        self.server.lock().await.get_config().await;
-
-        let (full_file_name, nx, ny, image_counter, array_callbacks) = {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            let base = srv.ad.base;
-            let full = srv.get_str(base.full_file_name, MAX_FILENAME_LEN).await;
-            let nx = srv.get_i32(base.array_size_x).await;
-            let ny = srv.get_i32(base.array_size_y).await;
-            let ic = srv.get_i32(base.array_counter).await;
-            let ac = srv.get_i32(base.array_callbacks).await;
-            (full, nx.max(0) as usize, ny.max(0) as usize, ic, ac)
-        };
-
-        {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            srv.set_str(
-                srv.ad.status_message,
-                format!("Reading TIFF file {full_file_name}"),
-            );
-            srv.callbacks().await;
-        }
+        let (full_file_name, nx, ny, image_counter, array_callbacks) = self
+            .locked(|d| {
+                d.get_config();
+                let base = d.ad.params.base;
+                let full = d.get_str(base.full_file_name, MAX_FILENAME_LEN);
+                let nx = d.get_i32(base.array_size_x);
+                let ny = d.get_i32(base.array_size_y);
+                let ic = d.get_i32(base.array_counter);
+                let ac = d.get_i32(base.array_callbacks);
+                let message = format!("Reading TIFF file {full}");
+                d.set_str(d.ad.params.status_message, &message);
+                d.callbacks();
+                (full, nx.max(0) as usize, ny.max(0) as usize, ic, ac)
+            })
+            .await;
 
         let data = match self.read_tiff(&full_file_name, nx, ny).await {
             Ok(d) => d,
@@ -408,11 +340,7 @@ impl Worker {
     /// with a buffer it never filled — the caller then publishes stale pixels.
     /// This returns [`CamStatus::Error`] instead so no image is published.
     async fn read_tiff(&self, file: &str, nx: usize, ny: usize) -> Result<Vec<u16>, CamStatus> {
-        let timeout = {
-            let mut guard = self.server.lock().await;
-            let srv = &mut *guard;
-            srv.get_f64(srv.p.tiff_timeout).await
-        };
+        let timeout = self.locked(|d| d.get_f64(d.p.tiff_timeout)).await;
         let t_start = Instant::now();
         let start_time = epoch_secs(SystemTime::now());
 
@@ -429,11 +357,13 @@ impl Worker {
                     let modified = match f.metadata().and_then(|m| m.modified()) {
                         Ok(m) => epoch_secs(m),
                         Err(e) => {
-                            self.trace_error(&format!(
-                                "marCCD::readTiff error calling fstat, errno={} {file}",
-                                e.raw_os_error().unwrap_or(0)
-                            ))
-                            .await;
+                            self.trace(
+                                TraceMask::ERROR,
+                                &format!(
+                                    "marCCD::readTiff error calling fstat, errno={} {file}",
+                                    e.raw_os_error().unwrap_or(0)
+                                ),
+                            );
                             return Err(CamStatus::Error);
                         }
                     };
@@ -452,16 +382,16 @@ impl Worker {
             delta_time = t_start.elapsed().as_secs_f64();
         }
         if !opened {
-            self.trace_error(&format!(
-                "marCCD::readTiff timeout waiting for file to be created {file}"
-            ))
-            .await;
+            self.trace(
+                TraceMask::ERROR,
+                &format!("marCCD::readTiff timeout waiting for file to be created {file}"),
+            );
             if file_exists {
-                self.trace_error(
+                self.trace(
+                    TraceMask::ERROR,
                     "  file exists but is more than 10 seconds old, possible clock \
                      synchronization problem",
-                )
-                .await;
+                );
             }
             return Err(CamStatus::Error);
         }
@@ -476,21 +406,25 @@ impl Worker {
                     break;
                 }
                 Ok(img) if img.width as usize != nx => {
-                    self.trace_error(&format!(
-                        "marCCD::readTiff, image width incorrect ={}, should be {nx}",
-                        img.width
-                    ))
-                    .await;
+                    self.trace(
+                        TraceMask::ERROR,
+                        &format!(
+                            "marCCD::readTiff, image width incorrect ={}, should be {nx}",
+                            img.width
+                        ),
+                    );
                 }
                 Ok(img) => {
-                    self.trace_error(&format!(
-                        "marCCD::readTiff, image length incorrect ={}, should be {ny}",
-                        img.height
-                    ))
-                    .await;
+                    self.trace(
+                        TraceMask::ERROR,
+                        &format!(
+                            "marCCD::readTiff, image length incorrect ={}, should be {ny}",
+                            img.height
+                        ),
+                    );
                 }
                 Err(_) => {
-                    self.server.lock().await.trace(
+                    self.trace(
                         TraceMask::FLOW,
                         &format!("marCCD::readTiff, error reading TIFF file {file}"),
                     );
@@ -513,111 +447,6 @@ impl Worker {
 }
 
 // ---------------------------------------------------------------------------
-// Command thread
-// ---------------------------------------------------------------------------
-
-pub(crate) fn start_cmd_task(
-    w: Worker,
-    rx: rt::CommandReceiver<Cmd>,
-) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("MarccdCmdTask", move || cmd_loop(w, rx))
-}
-
-async fn cmd_loop(w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
-    // C `pData` (marCCD.cpp:1556-1560): allocated once and never read, so it
-    // stays charged on the pool for the driver's life.
-    let mut _raw_buffer: Option<DriverArray> = None;
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            Cmd::Init => {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                // C constructor: getServerMode -> getConfig -> getState; it
-                // returns at a failed getServerMode (marCCD.cpp:1543-1549).
-                if srv.get_server_mode().await.is_err() {
-                    let msg = format!(
-                        "marCCD:marCCD: error calling getServerMode for server port {}",
-                        srv.server_port_name()
-                    );
-                    srv.trace(TraceMask::ERROR, &msg);
-                    continue;
-                }
-                srv.get_config().await;
-                srv.get_state().await;
-                let dims = vec![
-                    NDDimension::new(srv.get_i32(srv.ad.max_size_x).await as usize),
-                    NDDimension::new(srv.get_i32(srv.ad.max_size_y).await as usize),
-                ];
-                _raw_buffer = w.pool.alloc(dims, NDDataType::Int16).ok();
-            }
-            Cmd::StartAcquire => {
-                let s = w.get_state().await;
-                if test_task_status(s, TASK_ACQUIRE, TASK_STATUS_QUEUED | TASK_STATUS_EXECUTING)
-                    == 0
-                {
-                    // Kill any stale stop event, then wake the marCCD task.
-                    w.stop.try_wait();
-                    w.start.signal();
-                }
-            }
-            Cmd::SetBin => {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                let bin_x = srv.get_i32(srv.ad.bin_x).await;
-                let bin_y = srv.get_i32(srv.ad.bin_y).await;
-                srv.write_server(&cmd_set_bin(bin_x, bin_y)).await;
-            }
-            Cmd::SetGating(value) => {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                if srv.server_mode == 2 {
-                    srv.write_server(&cmd_set_gating(value)).await;
-                    srv.get_config().await;
-                }
-            }
-            Cmd::SetReadoutMode(value) => {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                if srv.server_mode == 2 {
-                    srv.write_server(&cmd_set_readout_mode(value)).await;
-                    srv.get_config().await;
-                }
-            }
-            Cmd::SetFrameShift(value) => {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                srv.write_server(&cmd_set_frameshift(value)).await;
-                srv.get_config().await;
-            }
-            Cmd::ReadStatus => {
-                w.get_state().await;
-            }
-            Cmd::WriteFile => {
-                let frame_type = {
-                    let mut guard = w.server.lock().await;
-                    let srv = &mut *guard;
-                    srv.get_i32(srv.ad.frame_type).await
-                };
-                // Raw frames are saved uncorrected.
-                let corrected_flag = if frame_type == FrameType::Raw as i32 {
-                    0
-                } else {
-                    1
-                };
-                w.save_file(corrected_flag, true).await;
-            }
-            Cmd::SetStability(value) => {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                srv.write_server(&cmd_set_stability(value)).await;
-                srv.get_config().await;
-            }
-            Cmd::SetShutter(open) => w.server.lock().await.set_shutter(open).await,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Acquisition thread
 // ---------------------------------------------------------------------------
 
@@ -628,30 +457,22 @@ pub(crate) fn start_det_task(w: Worker) -> std::thread::JoinHandle<()> {
 /// C `marCCDTask`.
 async fn det_loop(w: Worker) {
     loop {
-        let acquire = {
-            let mut guard = w.server.lock().await;
-            let srv = &mut *guard;
-            srv.get_i32(srv.ad.acquire).await
-        };
+        let acquire = w.locked(|d| d.get_i32(d.ad.params.acquire)).await;
         if acquire == 0 {
-            {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                srv.set_str(srv.ad.status_message, "Waiting for acquire command");
-                srv.callbacks().await;
-            }
+            w.locked(|d| {
+                d.set_str(d.ad.params.status_message, "Waiting for acquire command");
+                d.callbacks();
+            })
+            .await;
             w.start.wait();
-            let mut guard = w.server.lock().await;
-            let srv = &mut *guard;
-            srv.set_i32(srv.ad.num_images_counter, 0);
-            srv.callbacks().await;
+            w.locked(|d| {
+                d.set_i32(d.ad.params.num_images_counter, 0);
+                d.callbacks();
+            })
+            .await;
         }
 
-        let image_mode = {
-            let mut guard = w.server.lock().await;
-            let srv = &mut *guard;
-            srv.get_i32(srv.ad.image_mode).await
-        };
+        let image_mode = w.locked(|d| d.get_i32(d.ad.params.image_mode)).await;
         match ImageMode::from_i32(image_mode) {
             Some(ImageMode::Single | ImageMode::Multiple | ImageMode::Continuous) => {
                 collect_normal(&w).await;
@@ -666,41 +487,30 @@ async fn det_loop(w: Worker) {
     }
 }
 
-/// C `setIntegerParam(ADAcquire, 0)` at acquisition completion; ADAcquireBusy
-/// follows that store, WaitForPlugins included (asynNDArrayDriver.cpp:636-663).
-async fn set_acquire_off(w: &Worker) {
-    let mut guard = w.server.lock().await;
-    let srv = &mut *guard;
-    srv.set_i32(srv.ad.acquire, 0);
-}
-
 /// C `collectNormal`.
 async fn collect_normal(w: &Worker) {
-    let (image_mode, frame_type, acquire_time, auto_save, overlap, shutter_mode, array_callbacks) = {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        let image_mode = srv.get_i32(srv.ad.image_mode).await;
-        let frame_type = srv.get_i32(srv.ad.frame_type).await;
-        let acquire_time = srv.get_f64(srv.ad.acquire_time).await;
-        let auto_save = srv.get_i32(srv.ad.base.auto_save).await;
-        let overlap = srv.get_i32(srv.p.overlap).await;
-        let shutter_mode = srv.get_i32(srv.ad.shutter_mode).await;
-        let array_callbacks = srv.get_i32(srv.ad.base.array_callbacks).await;
-        (
-            image_mode,
-            frame_type,
-            acquire_time,
-            auto_save,
-            overlap,
-            shutter_mode,
-            array_callbacks,
-        )
-    };
+    let (image_mode, frame_type, acquire_time, auto_save, overlap, shutter_mode, array_callbacks) =
+        w.locked(|d| {
+            let ad = d.ad.params;
+            (
+                d.get_i32(ad.image_mode),
+                d.get_i32(ad.frame_type),
+                d.get_f64(ad.acquire_time),
+                d.get_i32(ad.base.auto_save),
+                d.get_i32(d.p.overlap),
+                d.get_i32(ad.shutter_mode),
+                d.get_i32(ad.base.array_callbacks),
+            )
+        })
+        .await;
     let wait = overlap == 0;
     // ADShutterModeNone == 0.
     let use_shutter = shutter_mode != 0;
     if auto_save != 0 {
-        w.server.lock().await.write_header().await;
+        w.locked(|d| {
+            d.write_header();
+        })
+        .await;
     }
 
     w.store_acq_start(now_epoch_f64());
@@ -739,7 +549,7 @@ async fn collect_normal(w: &Worker) {
                 if status.is_err() {
                     completed = false;
                 } else {
-                    w.server.lock().await.write_server(&cmd_dezinger(1)).await;
+                    write_server(w, cmd_dezinger(1)).await;
                     let mut s = w.get_state().await;
                     while test_task_status(
                         s,
@@ -761,11 +571,7 @@ async fn collect_normal(w: &Worker) {
                 completed = false;
             } else {
                 // If the user aborted then ADAcquire will be 0.
-                let acquire = {
-                    let mut guard = w.server.lock().await;
-                    let srv = &mut *guard;
-                    srv.get_i32(srv.ad.acquire).await
-                };
+                let acquire = w.locked(|d| d.get_i32(d.ad.params.acquire)).await;
                 if acquire == 0 {
                     completed = false;
                 } else {
@@ -774,7 +580,7 @@ async fn collect_normal(w: &Worker) {
                     if status.is_err() {
                         completed = false;
                     } else {
-                        w.server.lock().await.write_server(&cmd_dezinger(0)).await;
+                        write_server(w, cmd_dezinger(0)).await;
                         let mut s = w.get_state().await;
                         while test_task_status(
                             s,
@@ -786,7 +592,7 @@ async fn collect_normal(w: &Worker) {
                             rt::sleep(secs(MARCCD_POLL_DELAY)).await;
                             s = w.get_state().await;
                         }
-                        w.server.lock().await.write_server("correct").await;
+                        write_server(w, "correct".to_string()).await;
                         let mut s = w.get_state().await;
                         while test_task_status(
                             s,
@@ -811,15 +617,15 @@ async fn collect_normal(w: &Worker) {
     // C runs the counter increments and the overlap/readback dispatch only when
     // no `goto cleanup` fired.
     if completed {
-        {
-            let mut guard = w.server.lock().await;
-            let srv = &mut *guard;
-            let image_counter = srv.get_i32(srv.ad.base.array_counter).await + 1;
-            srv.set_i32(srv.ad.base.array_counter, image_counter);
-            let num_images_counter = srv.get_i32(srv.ad.num_images_counter).await + 1;
-            srv.set_i32(srv.ad.num_images_counter, num_images_counter);
-            srv.callbacks().await;
-        }
+        w.locked(|d| {
+            let ad = d.ad.params;
+            let image_counter = d.get_i32(ad.base.array_counter) + 1;
+            d.set_i32(ad.base.array_counter, image_counter);
+            let num_images_counter = d.get_i32(ad.num_images_counter) + 1;
+            d.set_i32(ad.num_images_counter, num_images_counter);
+            d.callbacks();
+        })
+        .await;
 
         // If a file was saved and array callbacks are on, read it back.
         if auto_save != 0 && array_callbacks != 0 && frame_type != FrameType::Background as i32 {
@@ -832,91 +638,74 @@ async fn collect_normal(w: &Worker) {
     }
 
     // cleanup
-    if image_mode == ImageMode::Multiple as i32 {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        let num_images = srv.get_i32(srv.ad.num_images).await;
-        let num_images_counter = srv.get_i32(srv.ad.num_images_counter).await;
-        if num_images_counter >= num_images {
-            srv.set_i32(srv.ad.acquire, 0);
-        }
-    }
-    if image_mode == ImageMode::Single as i32 {
-        set_acquire_off(w).await;
-    }
-
-    let acquire = {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        srv.get_i32(srv.ad.acquire).await
-    };
+    let (acquire, acquire_period) = w
+        .locked(move |d| {
+            let ad = d.ad.params;
+            if image_mode == ImageMode::Multiple as i32 {
+                let num_images = d.get_i32(ad.num_images);
+                let num_images_counter = d.get_i32(ad.num_images_counter);
+                if num_images_counter >= num_images {
+                    d.set_i32(ad.acquire, 0);
+                }
+            }
+            // C `setIntegerParam(ADAcquire, 0)` at acquisition completion;
+            // ADAcquireBusy follows that store, WaitForPlugins included
+            // (asynNDArrayDriver.cpp:636-663).
+            if image_mode == ImageMode::Single as i32 {
+                d.set_i32(ad.acquire, 0);
+            }
+            (d.get_i32(ad.acquire), d.get_f64(ad.acquire_period))
+        })
+        .await;
     if acquire != 0 {
         // Continuous or multiple mode: sleep until the acquire period expires or
         // acquire is set to stop.
         let elapsed = now_epoch_f64() - w.load_acq_start();
-        let acquire_period = {
-            let mut guard = w.server.lock().await;
-            let srv = &mut *guard;
-            srv.get_f64(srv.ad.acquire_period).await
-        };
         let delay_time = acquire_period - elapsed;
         if delay_time > 0.0 {
-            {
-                let mut guard = w.server.lock().await;
-                let srv = &mut *guard;
-                srv.set_i32(srv.ad.status, ADStatus::Waiting as i32);
-                srv.callbacks().await;
-            }
+            w.locked(|d| {
+                d.set_i32(d.ad.params.status, ADStatus::Waiting as i32);
+                d.callbacks();
+            })
+            .await;
             w.stop.wait_timeout(secs(delay_time));
         }
     }
 
-    w.server.lock().await.callbacks().await;
+    w.locked(|d| d.callbacks()).await;
+}
+
+/// C `writeServer` from the acquisition task.
+async fn write_server(w: &Worker, command: String) {
+    w.locked(move |d| {
+        d.write_server(&command);
+    })
+    .await;
+}
+
+/// The parameters C's `collectSeries` reads at its top.
+#[derive(Default)]
+struct SeriesParams {
+    frame_type: i32,
+    image_mode: i32,
+    auto_increment: i32,
+    num_images: i32,
+    acquire_time: f64,
+    acquire_period: f64,
+    tiff_timeout: f64,
+    shutter_mode: i32,
+    trigger_mode: i32,
+    file_path: String,
+    file_name: String,
+    file_number: i32,
+    series_file_template: String,
+    series_file_digits: i32,
+    series_file_first: i32,
 }
 
 /// C `collectSeries`.
 async fn collect_series(w: &Worker) {
-    let params = {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        let frame_type = srv.get_i32(srv.ad.frame_type).await;
-        let image_mode = srv.get_i32(srv.ad.image_mode).await;
-        let auto_increment = srv.get_i32(srv.ad.base.auto_increment).await;
-        let num_images = srv.get_i32(srv.ad.num_images).await;
-        let acquire_time = srv.get_f64(srv.ad.acquire_time).await;
-        let acquire_period = srv.get_f64(srv.ad.acquire_period).await;
-        let tiff_timeout = srv.get_f64(srv.p.tiff_timeout).await;
-        let shutter_mode = srv.get_i32(srv.ad.shutter_mode).await;
-        let trigger_mode = srv.get_i32(srv.ad.trigger_mode).await;
-        let file_path = srv.get_str(srv.ad.base.file_path, MAX_FILENAME_LEN).await;
-        let file_name = srv.get_str(srv.ad.base.file_name, MAX_FILENAME_LEN).await;
-        let file_number = srv.get_i32(srv.ad.base.file_number).await;
-        let series_file_template = srv
-            .get_str(srv.p.series_file_template, MAX_FILENAME_LEN)
-            .await;
-        let series_file_digits = srv.get_i32(srv.p.series_file_digits).await;
-        let series_file_first = srv.get_i32(srv.p.series_file_first).await;
-        let overlap = srv.get_i32(srv.p.overlap).await;
-        (
-            frame_type,
-            image_mode,
-            auto_increment,
-            num_images,
-            acquire_time,
-            acquire_period,
-            tiff_timeout,
-            shutter_mode,
-            trigger_mode,
-            file_path,
-            file_name,
-            file_number,
-            series_file_template,
-            series_file_digits,
-            series_file_first,
-            overlap,
-        )
-    };
-    let (
+    let SeriesParams {
         frame_type,
         image_mode,
         auto_increment,
@@ -932,13 +721,34 @@ async fn collect_series(w: &Worker) {
         series_file_template,
         series_file_digits,
         series_file_first,
-        _overlap,
-    ) = params;
+    } = w
+        .locked(|d| {
+            let ad = d.ad.params;
+            let p = d.p;
+            SeriesParams {
+                frame_type: d.get_i32(ad.frame_type),
+                image_mode: d.get_i32(ad.image_mode),
+                auto_increment: d.get_i32(ad.base.auto_increment),
+                num_images: d.get_i32(ad.num_images),
+                acquire_time: d.get_f64(ad.acquire_time),
+                acquire_period: d.get_f64(ad.acquire_period),
+                tiff_timeout: d.get_f64(p.tiff_timeout),
+                shutter_mode: d.get_i32(ad.shutter_mode),
+                trigger_mode: d.get_i32(ad.trigger_mode),
+                file_path: d.get_str(ad.base.file_path, MAX_FILENAME_LEN),
+                file_name: d.get_str(ad.base.file_name, MAX_FILENAME_LEN),
+                file_number: d.get_i32(ad.base.file_number),
+                series_file_template: d.get_str(p.series_file_template, MAX_FILENAME_LEN),
+                series_file_digits: d.get_i32(p.series_file_digits),
+                series_file_first: d.get_i32(p.series_file_first),
+            }
+        })
+        .await;
 
     let use_shutter = shutter_mode != 0;
 
     if frame_type != FrameType::Normal as i32 {
-        w.server.lock().await.trace(
+        w.trace(
             TraceMask::ERROR,
             "marCCD:collectSeries: error, frame type must be Normal",
         );
@@ -951,7 +761,7 @@ async fn collect_series(w: &Worker) {
         match format_file_template(&series_file_template, &file_path, &file_name, file_number) {
             Some(s) => s,
             None => {
-                w.server.lock().await.trace(
+                w.trace(
                     TraceMask::ERROR,
                     "marCCD:collectSeries: error creating base file name",
                 );
@@ -963,11 +773,14 @@ async fn collect_series(w: &Worker) {
         };
     let full_file_template = full_file_template(series_file_digits);
 
-    w.server.lock().await.write_header().await;
+    w.locked(|d| {
+        d.write_header();
+    })
+    .await;
     w.store_acq_start(now_epoch_f64());
 
     if use_shutter {
-        w.server.lock().await.set_shutter(true).await;
+        w.set_shutter(true).await;
     }
 
     let file_suffix = ".tif";
@@ -999,7 +812,7 @@ async fn collect_series(w: &Worker) {
                     )
                 }
             };
-            w.server.lock().await.write_server(&cmd).await;
+            write_server(w, cmd).await;
         }
         Some(ImageMode::SeriesTimed) => {
             let cmd = cmd_start_series_timed(
@@ -1011,18 +824,17 @@ async fn collect_series(w: &Worker) {
                 file_suffix,
                 series_file_digits,
             );
-            w.server.lock().await.write_server(&cmd).await;
+            write_server(w, cmd).await;
         }
         _ => {}
     }
 
     // Bump the TIFF timeout while waiting for the series files to appear.
-    {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        srv.set_f64(srv.p.tiff_timeout, tiff_timeout + acquire_period);
-        srv.callbacks().await;
-    }
+    w.locked(move |d| {
+        d.set_f64(d.p.tiff_timeout, tiff_timeout + acquire_period);
+        d.callbacks();
+    })
+    .await;
 
     for i in 0..num_images {
         let full_file_name = format_file_template(
@@ -1032,24 +844,25 @@ async fn collect_series(w: &Worker) {
             i + series_file_first,
         )
         .unwrap_or_default();
-        {
-            let mut guard = w.server.lock().await;
-            let srv = &mut *guard;
-            srv.set_str(srv.ad.base.full_file_name, full_file_name);
-            srv.callbacks().await;
-        }
+        w.locked(move |d| {
+            d.set_str(d.ad.params.base.full_file_name, &full_file_name);
+            d.callbacks();
+        })
+        .await;
         let status = w.get_image_data().await;
         if status.is_err() {
-            w.server.lock().await.write_server("abort").await;
+            write_server(w, "abort".to_string()).await;
             break;
         }
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        let image_counter = srv.get_i32(srv.ad.base.array_counter).await + 1;
-        srv.set_i32(srv.ad.base.array_counter, image_counter);
-        let num_images_counter = srv.get_i32(srv.ad.num_images_counter).await + 1;
-        srv.set_i32(srv.ad.num_images_counter, num_images_counter);
-        srv.callbacks().await;
+        w.locked(|d| {
+            let ad = d.ad.params;
+            let image_counter = d.get_i32(ad.base.array_counter) + 1;
+            d.set_i32(ad.base.array_counter, image_counter);
+            let num_images_counter = d.get_i32(ad.num_images_counter) + 1;
+            d.set_i32(ad.num_images_counter, num_images_counter);
+            d.callbacks();
+        })
+        .await;
     }
 
     finish_series(w, tiff_timeout, use_shutter, auto_increment, file_number).await;
@@ -1063,26 +876,23 @@ async fn finish_series(
     auto_increment: i32,
     file_number: i32,
 ) {
-    {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        srv.set_f64(srv.p.tiff_timeout, tiff_timeout);
-        srv.callbacks().await;
-    }
+    w.locked(move |d| {
+        d.set_f64(d.p.tiff_timeout, tiff_timeout);
+        d.callbacks();
+    })
+    .await;
     if use_shutter {
-        w.server.lock().await.set_shutter(false).await;
+        w.set_shutter(false).await;
     }
-    if auto_increment != 0 {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        srv.set_i32(srv.ad.base.file_number, file_number + 1);
-    }
-    {
-        let mut guard = w.server.lock().await;
-        let srv = &mut *guard;
-        srv.set_i32(srv.ad.acquire, 0);
-        srv.callbacks().await;
-    }
+    w.locked(move |d| {
+        let ad = d.ad.params;
+        if auto_increment != 0 {
+            d.set_i32(ad.base.file_number, file_number + 1);
+        }
+        d.set_i32(ad.acquire, 0);
+        d.callbacks();
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------

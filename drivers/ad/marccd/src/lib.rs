@@ -18,16 +18,6 @@
 //!
 //! # Deviations from the C driver
 //!
-//! * **marServer I/O runs on worker threads.** A Rust `PortDriver` method
-//!   executes inside its port actor's current-thread runtime and cannot block
-//!   on a second port, so the three C contexts (the port thread's
-//!   `writeInt32` / `writeFloat64` inline work, `marCCDTask`, `getImageDataTask`)
-//!   become three worker threads sharing one [`server::Server`] behind a
-//!   `tokio::sync::Mutex` — the analog of C's driver lock. Command order and
-//!   the marServer byte stream are unchanged; only the moment a record's write
-//!   callback returns differs, and `getServerMode` / `getConfig` / `getState`
-//!   run just after construction (via [`task::Cmd::Init`]) instead of
-//!   synchronously inside it.
 //! * **The exposure timer is emulated inline.** C arms an `epicsTimer` that
 //!   signals the stop event when the internal-trigger exposure time expires;
 //!   this port folds that deadline into the exposure wait loop, so no separate

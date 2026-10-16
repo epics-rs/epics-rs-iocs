@@ -73,7 +73,6 @@ dependencies = [
  "parking_lot",
  "tempfile",
  "tiff",
- "tokio",
 ]
 
 [[package]]

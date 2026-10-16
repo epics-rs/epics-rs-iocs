@@ -312,7 +312,7 @@ Records (`iocs/ad/marccd-ioc/db/marCCD.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p marccd-ioc --release -- iocs/ad/marccd-ioc/st.cmd`
 
-Deviation: the upstream template's duplicate `MarState_RBV` definition was dropped as a retro-fixed upstream defect (`doc/upstream-c-defects.md` #15). Server I/O runs on three worker threads sharing one `Server` behind a `tokio::sync::Mutex` (the analog of the C driver lock), since a `PortDriver` method can't block on a second port from its own actor; command order and the wire bytes are unchanged, only the moment a record's write callback returns differs.
+Deviation: the upstream template's duplicate `MarState_RBV` definition was dropped as a retro-fixed upstream defect (`doc/upstream-c-defects.md` #15). Server I/O runs on the port actor, C's driver lock: inline in `writeInt32` / `writeFloat64`, and through `PortHandle::with_driver` from the acquisition and image threads.
 
 ---
 
