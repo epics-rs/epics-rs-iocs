@@ -16,7 +16,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_with_eos;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -56,7 +56,13 @@ pub fn pigcs2_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let num_axes = num_axes as usize;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_with_eos(&asyn_port, PIGCS2_TIMEOUT, b"\n", b"")?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIGCS2_TIMEOUT,
+                b"\n",
+                b"",
+                EosRefusal::BothFatal,
+            )?;
             let controller = PIGCS2Controller::new(handle)
                 .map_err(|e| format!("PIGCS2CreateController: {e}"))?;
             let ident = controller.ident().to_string();
