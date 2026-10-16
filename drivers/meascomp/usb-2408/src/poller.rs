@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 
@@ -177,16 +176,6 @@ fn poller_loop(
         // ---- Phase 3: log + write results (no device lock) ----
         for msg in &snapshot.errors {
             log::warn!("USB-2408 poller {msg}");
-        }
-        if let Some(msg) = snapshot.errors.last() {
-            let _ = handle.set_params_and_notify_blocking(
-                0,
-                vec![ParamSetValue::new(
-                    params.last_error_message,
-                    0,
-                    ParamValue::Octet(msg.clone().into_bytes().into()),
-                )],
-            );
         }
 
         if let Some(data) = snapshot.digital_input {

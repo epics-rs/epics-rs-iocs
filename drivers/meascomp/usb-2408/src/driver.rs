@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -170,11 +169,6 @@ impl MultiFunctionDriver {
         let last_error = self.apply_updates(wave_arrays).or(last_error);
         if let Some(msg) = last_error {
             log::error!("{msg}");
-            let _ = self.base.params.set_value(
-                self.params.last_error_message,
-                0,
-                ParamValue::Octet(msg.into_bytes().into()),
-            );
         }
         self.base.call_param_callbacks(addr)?;
         Ok(())
@@ -712,11 +706,6 @@ impl PortDriver for MultiFunctionDriver {
 
         if let Some(msg) = last_error {
             log::error!("{msg}");
-            let _ = self.base.params.set_value(
-                self.params.last_error_message,
-                0,
-                ParamValue::Octet(msg.into_bytes().into()),
-            );
         }
         self.base.call_param_callbacks(addr)?;
         Ok(())
