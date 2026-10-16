@@ -206,8 +206,11 @@ pub struct ControlInner {
     pub cmd_joints: [f64; NUM_JOINTS],
     /// Commanded TCP pose: x,y,z metres, rx,ry,rz radians.
     pub cmd_pose: [f64; NUM_JOINTS],
-    /// TCP offset: x,y,z metres, rx,ry,rz radians.
-    pub tcp_offset: [f64; NUM_JOINTS],
+    /// TCP offset: x,y,z metres, rx,ry,rz radians. `None` until a
+    /// `TCP_OFFSET` write stages one — only then may a (re)connect deliver
+    /// it, so an IOC that never wrote an offset leaves the robot's own
+    /// setting alone.
+    pub tcp_offset: Option<[f64; NUM_JOINTS]>,
     /// Jog speeds: m/s and rad/s.
     pub jog_speeds: [f64; NUM_JOINTS],
     pub jog_acceleration: f64,
@@ -239,7 +242,7 @@ impl Default for ControlInner {
             iface: None,
             cmd_joints: [0.0; NUM_JOINTS],
             cmd_pose: [0.0; NUM_JOINTS],
-            tcp_offset: [0.0; NUM_JOINTS],
+            tcp_offset: None,
             jog_speeds: [0.0; NUM_JOINTS],
             jog_acceleration: 0.0,
             new_jog: false,
@@ -267,6 +270,18 @@ impl ControlInner {
         self.iface
             .as_ref()
             .is_some_and(ControlInterface::is_connected)
+    }
+
+    /// Deliver the staged TCP offset once the link is up (B3). PINI
+    /// processes the six `TCPOffset_*` records at boot, before any connect
+    /// can have succeeded, so the offset is carried here until the
+    /// connection owner can apply it; a failure leaves it staged for the
+    /// next reconnect.
+    fn apply_cached_settings(&mut self) {
+        let Some(offset) = self.tcp_offset else {
+            return;
+        };
+        let _ = self.iface_mut().and_then(|i| i.set_tcp(&offset));
     }
 
     fn iface_mut(&mut self) -> UrResult<&mut ControlInterface> {
@@ -418,7 +433,10 @@ impl ControlDriver {
                 }
                 spdlog::debug(format_args!("Reconnecting to UR RTDE Control interface"));
                 match iface.reconnect() {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        inner.apply_cached_settings();
+                        true
+                    }
                     Err(e) => {
                         spdlog::error(format_args!("Failed to reconnect: {e}"));
                         false
@@ -429,6 +447,7 @@ impl ControlDriver {
                 Ok(iface) => {
                     spdlog::info(format_args!("Connected to UR RTDE Control interface"));
                     inner.iface = Some(iface);
+                    inner.apply_cached_settings();
                     true
                 }
                 Err(e) => {
@@ -438,18 +457,6 @@ impl ControlDriver {
                     false
                 }
             },
-        }
-    }
-
-    /// C's gate at the top of every write: no usable interface is refused
-    /// before anything is stored.
-    fn refuse_unless_connected(&self) -> AsynResult<()> {
-        let inner = self.inner.lock();
-        if inner.connected() {
-            Ok(())
-        } else {
-            print_unusable(&inner);
-            Err(refused())
         }
     }
 
@@ -522,7 +529,6 @@ impl PortDriver for ControlDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.refuse_unless_connected()?;
             self.base.set_float64_param(reason, addr, value)?;
 
             // Only the four per-axis parameters take one address per joint; a
@@ -541,6 +547,11 @@ impl PortDriver for ControlDriver {
                     refused()
                 })?;
 
+            // Every arm below stages IOC-local state, so none of them needs the
+            // link up — PINI processes these records at boot, before any connect
+            // can have succeeded. TCP_OFFSET is the one that also reaches the
+            // device: connected, it applies now; disconnected, the staged offset
+            // waits for try_connect (C refuses the write and the offset is lost).
             let mut inner = self.inner.lock();
             if reason == p.custom_script_timeout {
                 inner.custom_script_timeout = Duration::from_secs_f64(value.max(0.0));
@@ -568,19 +579,22 @@ impl PortDriver for ControlDriver {
                 inner.new_jog = true;
             } else if reason == p.tcp_offset {
                 // x,y,z arrive in mm; rx,ry,rz are already radians.
-                inner.tcp_offset[index] = if index >= 3 { value } else { value / 1000.0 };
-                let offset = inner.tcp_offset;
+                let offset = inner.tcp_offset.get_or_insert([0.0; NUM_JOINTS]);
+                offset[index] = if index >= 3 { value } else { value / 1000.0 };
+                let offset = *offset;
                 spdlog::debug(format_args!(
                     "Setting TCP offset to [{}] m,rad",
                     offset.map(|v| format!("{v:.4}")).join(",")
                 ));
-                inner
-                    .iface_mut()
-                    .and_then(|i| i.set_tcp(&offset))
-                    .map_err(|e| {
-                        spdlog::error(format_args!("{e}"));
-                        refused()
-                    })?;
+                if inner.connected() {
+                    inner
+                        .iface_mut()
+                        .and_then(|i| i.set_tcp(&offset))
+                        .map_err(|e| {
+                            spdlog::error(format_args!("{e}"));
+                            refused()
+                        })?;
+                }
             } else if reason == p.joint_speed {
                 inner.joint_speed = deg_to_rad(value);
                 spdlog::debug(format_args!(
@@ -627,9 +641,9 @@ impl PortDriver for ControlDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
+            self.base.set_int32_param(reason, user.addr, value)?;
 
             if p.is_command(reason) && value == 0 {
-                self.base.set_int32_param(reason, user.addr, value)?;
                 return Ok(());
             }
 
@@ -639,6 +653,12 @@ impl PortDriver for ControlDriver {
                 } else {
                     Err(refused())
                 };
+            }
+
+            if reason == p.run_custom_script_file {
+                let path = self.inner.lock().custom_script_path.clone();
+                return self
+                    .run_custom_script(&path.clone(), || std::fs::read_to_string(&path).ok());
             }
 
             let mut inner = self.inner.lock();
@@ -657,20 +677,7 @@ impl PortDriver for ControlDriver {
                 }
             }
 
-            if !inner.connected() {
-                print_unusable(&inner);
-                return Err(refused());
-            }
-            drop(inner);
-            self.base.set_int32_param(reason, user.addr, value)?;
-
-            if reason == p.run_custom_script_file {
-                let path = self.inner.lock().custom_script_path.clone();
-                return self
-                    .run_custom_script(&path.clone(), || std::fs::read_to_string(&path).ok());
-            }
-
-            let mut inner = self.inner.lock();
+            // These only stage state for a later command; they do not need the link.
             if reason == p.waypoint_move {
                 inner.waypoint_move = value != 0;
                 return Ok(());
@@ -678,6 +685,11 @@ impl PortDriver for ControlDriver {
             if reason == p.waypoint_action_done {
                 inner.waypoint_action_done = value != 0;
                 return Ok(());
+            }
+
+            if !inner.connected() {
+                print_unusable(&inner);
+                return Err(refused());
             }
 
             let mut updates: Vec<ParamSetValue> = Vec::new();
@@ -830,7 +842,6 @@ impl PortDriver for ControlDriver {
             let text = String::from_utf8_lossy(data)
                 .trim_end_matches('\0')
                 .to_string();
-            self.refuse_unless_connected()?;
             self.base
                 .set_string_param(reason, user.addr, text.clone())?;
 
@@ -1231,61 +1242,96 @@ mod tests {
         assert_eq!(int_update(&updates, p.motion_done_count), Some(2));
     }
 
-    /// PINI writes at boot reach a control port whose interface never
-    /// connected: C refuses each one before storing anything
-    /// (rtde_control_driver.cpp:331-341,421-439,598-608).
+    /// The boot race B3 closes for the control port: PINI writes the six
+    /// `TCPOffset_*` records (and every dynamics setting) at iocsh time,
+    /// before any connect can have succeeded. The writes stage IOC-local
+    /// state and succeed; the staged offset survives a delivery attempt
+    /// without a link, so the next reconnect can retry it.
     #[test]
-    fn a_write_with_no_control_interface_is_refused_and_not_staged() {
+    fn a_boot_time_tcp_offset_stages_until_a_connect_can_deliver_it() {
         let dash = DashboardHandle::new("127.0.0.1");
         dash.set(DashboardState {
             polyscope: Some(PolyScopeVersion::default()),
             ..Default::default()
         });
-        registry::register_dashboard("CTRL_DOWN_DASH", dash).expect("fresh port name");
-        registry::register_receive("CTRL_DOWN_RECV", ReceiveHandle::new())
+        registry::register_dashboard("CTRL_B3_DASH", dash).expect("fresh port name");
+        registry::register_receive("CTRL_B3_RECV", ReceiveHandle::new()).expect("fresh port name");
+        let script_server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let script_port = script_server.local_addr().expect("addr").port();
+        let mut drv =
+            ControlDriver::with_script_port("CTRL_B3", "CTRL_B3_DASH", "CTRL_B3_RECV", script_port)
+                .expect("driver");
+        let p = drv.params();
+
+        // Never written: nothing staged, and a connect must leave the
+        // robot's own offset alone.
+        assert_eq!(drv.inner().lock().tcp_offset, None);
+
+        for (addr, value) in [
+            (0, 1000.0),
+            (1, 2000.0),
+            (2, 3000.0),
+            (3, 0.1),
+            (4, 0.2),
+            (5, 0.3),
+        ] {
+            drv.write_float64(&mut AsynUser::new(p.tcp_offset).with_addr(addr), value)
+                .unwrap();
+        }
+        drv.write_float64(&mut AsynUser::new(p.joint_speed), 30.0)
+            .unwrap();
+
+        let inner = drv.inner();
+        assert_eq!(
+            inner.lock().tcp_offset,
+            Some([1.0, 2.0, 3.0, 0.1, 0.2, 0.3])
+        );
+        assert!((inner.lock().joint_speed - deg_to_rad(30.0)).abs() < 1e-12);
+
+        // A delivery attempt without a link keeps the offset staged.
+        inner.lock().apply_cached_settings();
+        assert_eq!(
+            inner.lock().tcp_offset,
+            Some([1.0, 2.0, 3.0, 0.1, 0.2, 0.3])
+        );
+    }
+
+    /// Scalar float parameters take addr 0 only; the per-axis parameters
+    /// take one address per joint (#27: a scalar write at addr 1..5 must
+    /// fail, not silently pass because 1 < NUM_JOINTS).
+    #[test]
+    fn a_scalar_float_write_takes_address_zero_only() {
+        let dash = DashboardHandle::new("127.0.0.1");
+        dash.set(DashboardState {
+            polyscope: Some(PolyScopeVersion::default()),
+            ..Default::default()
+        });
+        registry::register_dashboard("CTRL_B3_ADDR_DASH", dash).expect("fresh port name");
+        registry::register_receive("CTRL_B3_ADDR_RECV", ReceiveHandle::new())
             .expect("fresh port name");
         let script_server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let script_port = script_server.local_addr().expect("addr").port();
         let mut drv = ControlDriver::with_script_port(
-            "CTRL_DOWN",
-            "CTRL_DOWN_DASH",
-            "CTRL_DOWN_RECV",
+            "CTRL_B3_ADDR",
+            "CTRL_B3_ADDR_DASH",
+            "CTRL_B3_ADDR_RECV",
             script_port,
         )
         .expect("driver");
         let p = drv.params();
 
-        for (reason, addr, value) in [
-            (p.tcp_offset, 0, 1000.0),
-            (p.joint_cmd, 1, 45.0),
-            (p.joint_speed, 0, 30.0),
-            (p.jog_acceleration, 0, 0.5),
-            (p.custom_script_timeout, 0, 5.0),
-        ] {
-            assert!(
-                drv.write_float64(&mut AsynUser::new(reason).with_addr(addr), value)
-                    .is_err()
-            );
-        }
         assert!(
-            drv.write_int32(&mut AsynUser::new(p.waypoint_move), 1)
+            drv.write_float64(&mut AsynUser::new(p.joint_speed).with_addr(1), 30.0)
                 .is_err()
         );
         assert!(
-            drv.write_octet(&mut AsynUser::new(p.custom_script_file), b"/")
+            drv.write_float64(&mut AsynUser::new(p.tcp_offset).with_addr(5), 0.1)
+                .is_ok()
+        );
+        assert!(
+            drv.write_float64(&mut AsynUser::new(p.tcp_offset).with_addr(6), 0.1)
                 .is_err()
         );
-
-        let inner = drv.inner();
-        let inner = inner.lock();
-        let fresh = ControlInner::default();
-        assert_eq!(inner.tcp_offset, fresh.tcp_offset);
-        assert_eq!(inner.cmd_joints, fresh.cmd_joints);
-        assert_eq!(inner.joint_speed, fresh.joint_speed);
-        assert_eq!(inner.jog_acceleration, fresh.jog_acceleration);
-        assert_eq!(inner.custom_script_timeout, fresh.custom_script_timeout);
-        assert!(!inner.waypoint_move && !inner.new_jog);
-        assert_eq!(inner.custom_script_path, fresh.custom_script_path);
     }
 
     /// C's constructor throws before the port is usable when the dashboard
