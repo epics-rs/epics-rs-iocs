@@ -758,6 +758,29 @@ impl AmptekDriver {
         }
     }
 
+    /// C `getIntegerParam(index, &v)` as its callers see it: `paramList`
+    /// zeroes `v` before the lookup (`asynPortDriver.cpp:304`), and every
+    /// drvAmptek caller of these three ignores the status.
+    fn int_param(&self, reason: usize) -> i32 {
+        self.base.get_int32_param(reason, PARAM_ADDR).unwrap_or(0)
+    }
+
+    /// C `getDoubleParam`; see [`Self::int_param`] (`asynPortDriver.cpp:386`).
+    fn double_param(&self, reason: usize) -> f64 {
+        self.base
+            .get_float64_param(reason, PARAM_ADDR)
+            .unwrap_or(0.0)
+    }
+
+    /// C `getStringParam(index, std::string&)` into a fresh `string`, which
+    /// stays empty when the lookup throws (`asynPortDriver.cpp:572-591`).
+    fn string_param(&self, reason: usize) -> String {
+        self.base
+            .get_string_param(reason, PARAM_ADDR)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
+    }
+
     /// `drvAmptek::sendSCAs` (`drvAmptek.cpp:479-508`). C's
     /// `getIntegerParam(i, ...)` zeroes `itemp` for a param never set at
     /// addr `i` (`asynPortDriver.cpp:304`), and on this non-multidevice port
@@ -792,97 +815,34 @@ impl AmptekDriver {
         let a = &self.amptek;
         let m = &self.mca;
         let fields = ConfigFields {
-            clock: self
-                .base
-                .get_int32_param(a[AmptekReason::Clock as usize], 0)? as u8,
-            input_polarity: self
-                .base
-                .get_int32_param(a[AmptekReason::InputPolarity as usize], 0)?
-                as u8,
-            peaking_time: self
-                .base
-                .get_float64_param(a[AmptekReason::PeakingTime as usize], 0)?,
-            fast_peaking_time: self
-                .base
-                .get_int32_param(a[AmptekReason::FastPeakingTime as usize], 0)?
-                as u8,
-            flat_top_time: self
-                .base
-                .get_float64_param(a[AmptekReason::FlatTopTime as usize], 0)?,
-            gain: self
-                .base
-                .get_float64_param(a[AmptekReason::Gain as usize], 0)?,
-            slow_threshold: self
-                .base
-                .get_float64_param(a[AmptekReason::SlowThreshold as usize], 0)?,
-            fast_threshold: self
-                .base
-                .get_float64_param(a[AmptekReason::FastThreshold as usize], 0)?,
-            num_channels: self
-                .base
-                .get_int32_param(m[McaReason::NumChannels as usize], 0)?,
-            gate: self
-                .base
-                .get_int32_param(a[AmptekReason::Gate as usize], 0)? as u8,
-            preset_real_time: self
-                .base
-                .get_float64_param(m[McaReason::PresetRealTime as usize], 0)?,
-            preset_live_time: self
-                .base
-                .get_float64_param(m[McaReason::PresetLiveTime as usize], 0)?,
-            preset_counts: self
-                .base
-                .get_float64_param(m[McaReason::PresetCounts as usize], 0)?,
-            preset_low_channel: self
-                .base
-                .get_int32_param(m[McaReason::PresetLowChannel as usize], 0)?,
-            preset_high_channel: self
-                .base
-                .get_int32_param(m[McaReason::PresetHighChannel as usize], 0)?,
-            mca_source: self
-                .base
-                .get_int32_param(a[AmptekReason::McaSource as usize], 0)?
-                as u8,
-            pur_enable: self
-                .base
-                .get_int32_param(a[AmptekReason::PurEnable as usize], 0)?
-                as u8,
-            set_high_voltage: self
-                .base
-                .get_int32_param(a[AmptekReason::SetHighVoltage as usize], 0)?,
-            set_det_temp: self
-                .base
-                .get_float64_param(a[AmptekReason::SetDetTemp as usize], 0)?,
-            mcs_low_channel: self
-                .base
-                .get_int32_param(a[AmptekReason::MCSLowChannel as usize], 0)?,
-            mcs_high_channel: self
-                .base
-                .get_int32_param(a[AmptekReason::MCSHighChannel as usize], 0)?,
-            dwell_time: self
-                .base
-                .get_float64_param(m[McaReason::DwellTime as usize], 0)?,
-            aux_out1: self
-                .base
-                .get_int32_param(a[AmptekReason::AuxOut1 as usize], 0)? as u8,
-            aux_out2: self
-                .base
-                .get_int32_param(a[AmptekReason::AuxOut2 as usize], 0)? as u8,
-            aux_out34: self
-                .base
-                .get_int32_param(a[AmptekReason::AuxOut34 as usize], 0)?,
-            connect1: self
-                .base
-                .get_int32_param(a[AmptekReason::Connect1 as usize], 0)?
-                as u8,
-            connect2: self
-                .base
-                .get_int32_param(a[AmptekReason::Connect2 as usize], 0)?
-                as u8,
-            sca_output_width: self
-                .base
-                .get_int32_param(a[AmptekReason::SCAOutputWidth as usize], 0)?
-                as u8,
+            clock: self.int_param(a[AmptekReason::Clock as usize]) as u8,
+            input_polarity: self.int_param(a[AmptekReason::InputPolarity as usize]) as u8,
+            peaking_time: self.double_param(a[AmptekReason::PeakingTime as usize]),
+            fast_peaking_time: self.int_param(a[AmptekReason::FastPeakingTime as usize]) as u8,
+            flat_top_time: self.double_param(a[AmptekReason::FlatTopTime as usize]),
+            gain: self.double_param(a[AmptekReason::Gain as usize]),
+            slow_threshold: self.double_param(a[AmptekReason::SlowThreshold as usize]),
+            fast_threshold: self.double_param(a[AmptekReason::FastThreshold as usize]),
+            num_channels: self.int_param(m[McaReason::NumChannels as usize]),
+            gate: self.int_param(a[AmptekReason::Gate as usize]) as u8,
+            preset_real_time: self.double_param(m[McaReason::PresetRealTime as usize]),
+            preset_live_time: self.double_param(m[McaReason::PresetLiveTime as usize]),
+            preset_counts: self.double_param(m[McaReason::PresetCounts as usize]),
+            preset_low_channel: self.int_param(m[McaReason::PresetLowChannel as usize]),
+            preset_high_channel: self.int_param(m[McaReason::PresetHighChannel as usize]),
+            mca_source: self.int_param(a[AmptekReason::McaSource as usize]) as u8,
+            pur_enable: self.int_param(a[AmptekReason::PurEnable as usize]) as u8,
+            set_high_voltage: self.int_param(a[AmptekReason::SetHighVoltage as usize]),
+            set_det_temp: self.double_param(a[AmptekReason::SetDetTemp as usize]),
+            mcs_low_channel: self.int_param(a[AmptekReason::MCSLowChannel as usize]),
+            mcs_high_channel: self.int_param(a[AmptekReason::MCSHighChannel as usize]),
+            dwell_time: self.double_param(m[McaReason::DwellTime as usize]),
+            aux_out1: self.int_param(a[AmptekReason::AuxOut1 as usize]) as u8,
+            aux_out2: self.int_param(a[AmptekReason::AuxOut2 as usize]) as u8,
+            aux_out34: self.int_param(a[AmptekReason::AuxOut34 as usize]),
+            connect1: self.int_param(a[AmptekReason::Connect1 as usize]) as u8,
+            connect2: self.int_param(a[AmptekReason::Connect2 as usize]) as u8,
+            sca_output_width: self.int_param(a[AmptekReason::SCAOutputWidth as usize]) as u8,
         };
         let command_string = config::format_configuration(&fields);
         self.send_command_string(&command_string)
@@ -1081,9 +1041,8 @@ impl AmptekDriver {
                         s.high_voltage,
                     )?;
                 } else {
-                    let setpoint = self
-                        .base
-                        .get_int32_param(self.amptek[AmptekReason::SetHighVoltage as usize], 0)?;
+                    let setpoint =
+                        self.int_param(self.amptek[AmptekReason::SetHighVoltage as usize]);
                     self.base.set_float64_param(
                         self.amptek[AmptekReason::HighVoltage as usize],
                         0,
@@ -1194,18 +1153,10 @@ impl PortDriver for AmptekDriver {
         } else if reason == self.mca[McaReason::ReadStatus as usize] {
             status = self.handle_read_status();
         } else if reason == self.amptek[AmptekReason::LoadConfigFile as usize] {
-            let file_name = String::from_utf8_lossy(
-                self.base
-                    .get_string_param(self.amptek[AmptekReason::ConfigFile as usize], 0)?,
-            )
-            .into_owned();
+            let file_name = self.string_param(self.amptek[AmptekReason::ConfigFile as usize]);
             status = self.send_configuration_file(&file_name);
         } else if reason == self.amptek[AmptekReason::SaveConfigFile as usize] {
-            let file_name = String::from_utf8_lossy(
-                self.base
-                    .get_string_param(self.amptek[AmptekReason::ConfigFile as usize], 0)?,
-            )
-            .into_owned();
+            let file_name = self.string_param(self.amptek[AmptekReason::ConfigFile as usize]);
             status = self.save_configuration_file(&file_name);
         } else if reason == self.amptek[AmptekReason::SCALowChannel as usize]
             || reason == self.amptek[AmptekReason::SCAHighChannel as usize]
@@ -1542,6 +1493,47 @@ mod tests {
             sent[1].starts_with("SCAI=1;SCAL=5;SCAH=0;SCAO=HIGH;SCAI=2;SCAL=0;SCAH=0;SCAO=OFF;")
         );
         assert!(sent[1].ends_with("SCAI=8;SCAL=0;SCAH=0;SCAO=OFF;"));
+    }
+
+    /// A param the device never reported sends C's zeroed value
+    /// (`asynPortDriver.cpp:304`, `:386`): the readback set only CLCK and
+    /// MCAC, and a Gain write still sends the whole configuration.
+    #[test]
+    fn send_configuration_sends_zero_for_an_undefined_param() {
+        let status = [0u8; 64];
+        let (mut driver, fake) = driver_with_fake(move |req| default_reply(req, &status));
+        connect(&mut driver).unwrap();
+        let gain = driver.amptek[AmptekReason::Gain as usize];
+        assert!(driver.base.get_float64_param(gain, 0).is_err());
+        let polarity = driver.amptek[AmptekReason::InputPolarity as usize];
+        assert!(driver.base.get_int32_param(polarity, 0).is_err());
+        driver.write_float64(&mut AsynUser::new(gain), 2.5).unwrap();
+
+        let requests = fake.requests.lock().unwrap();
+        let sent: Vec<String> = requests
+            .iter()
+            .filter(|r| (r[2], r[3]) == (0x20, 0x02))
+            .map(|r| String::from_utf8_lossy(&r[6..r.len() - 2]).into_owned())
+            .collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].starts_with("CLCK=AUTO;AINP=POS;TPEA=0.000000;"),
+            "{}",
+            sent[0]
+        );
+        assert!(sent[0].contains("GAIN=2.500000;"), "{}", sent[0]);
+    }
+
+    /// An unset ConfigFile is C's empty `string` (`drvAmptek.cpp:897-903`):
+    /// the save fails opening "", not on the param.
+    #[test]
+    fn save_config_file_with_no_file_name_tries_the_empty_name() {
+        let status = [0u8; 64];
+        let (mut driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        connect(&mut driver).unwrap();
+        let save = driver.amptek[AmptekReason::SaveConfigFile as usize];
+        let err = driver.write_int32(&mut AsynUser::new(save), 1).unwrap_err();
+        assert!(!matches!(err, AsynError::ParamUndefined(_)), "{err:?}");
     }
 
     /// A failed `XMTPT_DISABLE_MCA_MCS` fails the read and keeps
