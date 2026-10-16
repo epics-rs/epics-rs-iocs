@@ -43,8 +43,9 @@ use motor_common::util::atof;
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
 
-/// Command terminator (C `MDT695_OUT_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect (C `MDT695_IN_EOS`/`MDT695_OUT_EOS`, drvMDT695.cc:555-558).
+pub const INPUT_EOS: &[u8] = b"\r";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Axis letters by 0-based signal (C `MDT694_axis`).
 const AXIS_LETTERS: [char; 3] = ['X', 'Y', 'Z'];
@@ -148,16 +149,9 @@ impl Mdt695Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected (C `cmnd_response == false`).
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
@@ -170,7 +164,7 @@ impl Mdt695Controller {
     /// Write a query and return its reply line. C send_mess flushes the input
     /// before every write (drvMDT695.cc:393), as `write_read` does.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(trim_line(&raw))
     }
 }

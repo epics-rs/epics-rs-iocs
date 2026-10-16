@@ -14,12 +14,12 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
+use motor_common::connect::connect_with_eos;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
 
-use crate::mdt695::{Mdt695Axis, Mdt695Controller};
+use crate::mdt695::{INPUT_EOS, Mdt695Axis, Mdt695Controller, OUTPUT_EOS};
 
 /// Serial command timeout (C `TIMEOUT` 2 s).
 const MDT695_TIMEOUT: Duration = Duration::from_secs(2);
@@ -64,7 +64,7 @@ pub fn mdt695_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-            let handle = connect_serial(&asyn_port, MDT695_TIMEOUT)?;
+            let handle = connect_with_eos(&asyn_port, MDT695_TIMEOUT, INPUT_EOS, OUTPUT_EOS)?;
             let controller =
                 Mdt695Controller::new(handle).map_err(|e| format!("MDT695Config: {e}"))?;
             let ident = controller.ident().to_string();

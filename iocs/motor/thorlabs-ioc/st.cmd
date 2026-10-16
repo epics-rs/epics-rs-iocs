@@ -24,11 +24,6 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MDT695 framing: the driver appends the CR command terminator, so only the
-# input EOS is configured here (replies are CR terminated). Do not set an output
-# EOS — the port would append it a second time.
-asynOctetSetInputEos("$(SERIAL)", 0, "\r")
-
 # ---- MDT695 controller ----
 # MDT695Setup(maxControllers, [scanRate]) is accepted for startup-script parity;
 # the asyn-rs port allocates per MDT695Config call.
