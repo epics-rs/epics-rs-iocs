@@ -773,13 +773,9 @@ pub fn create_ahxxx(
     max_memory: usize,
     model_name: &str,
 ) -> AsynResult<AhxxxRuntime> {
+    // Any other name is C++'s QE_ModelUnknown, which reset() resolves from
+    // the meter's firmware version.
     let model = proto::model_from_name(model_name);
-    if model == QeModel::Unknown {
-        return Err(error(format!(
-            "drvAHxxxConfigure: unknown model '{model_name}'; use one of \
-             AH401B, AH401D, AH501, AH501BE, AH501C, AH501D"
-        )));
-    }
 
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
     let ah401_series = Arc::new(AtomicBool::new(proto::is_ah401_series(model)));
@@ -882,6 +878,52 @@ mod tests {
                 .contains("asynManager::queueLockPort not connected"),
             "{err}"
         );
+    }
+
+    /// C++ keeps an unrecognised model name as QE_ModelUnknown and lets
+    /// reset() take the model from `VER ?`.
+    #[test]
+    fn an_unknown_model_name_is_resolved_from_the_firmware() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            while let Ok(n) = sock.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let reply: &[u8] = if buf[..n].starts_with(b"VER") {
+                    b"AH501D 3.0\r\n"
+                } else {
+                    b"ACK\r\n"
+                };
+                if sock.write_all(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        let (_io, meter) = crate::octet::create_ip_port(
+            "QE_AH_UNKMODEL_IP",
+            &addr.to_string(),
+            proto::AHXXX_TIMEOUT,
+            false,
+            true,
+        )
+        .unwrap();
+        epics_rs::asyn::asyn_record::register_port(
+            "QE_AH_UNKMODEL_IP",
+            meter.port_handle().clone(),
+            &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
+        )
+        .unwrap();
+        let rt = create_ahxxx("QE_AH_UNKMODEL", "QE_AH_UNKMODEL_IP", 4, 0, "AH999").unwrap();
+        let model = rt
+            .port_handle()
+            .read_int32_blocking(rt.params.model, 0)
+            .unwrap();
+        assert_eq!(model, QeModel::Ah501d as i32);
     }
 
     #[test]
