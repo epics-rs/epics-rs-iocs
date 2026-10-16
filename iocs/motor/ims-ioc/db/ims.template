@@ -1,12 +1,13 @@
-# IMS MDrivePlus: one motor record for the controller's single axis. DTYP is the
-# motorPort string passed to ImsMDrivePlusCreateController.
+# IMS MDrivePlus: one motor record for the controller's single axis, ADDR 0 of
+# motor port PORT as in C's basic_asyn_motor.db.
 #
 # MCode positions/velocities/accelerations are integer motor steps (no
 # resolution scaling), so MRES = 1 and EGU is "steps". VELO/ACCL are in
 # steps/second and steps/second^2.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "$(MPORT)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000)")
     field(ACCL, "$(ACCL=0.2)")

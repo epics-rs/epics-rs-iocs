@@ -13,7 +13,6 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_common::MotorHolder;
 use motor_ims::ioc::ims_create_controller_command;
 
 #[epics_rs::base::epics_main]
@@ -40,9 +39,11 @@ async fn main() -> CaResult<()> {
 
     // IMS config command creates the controller + its single axis on one motor
     // device support (DTYP = motorPort).
-    let holder = MotorHolder::new();
-    app = app.register_startup_command(ims_create_controller_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(ims_create_controller_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
