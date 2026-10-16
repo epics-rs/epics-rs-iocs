@@ -11,17 +11,9 @@
 //!
 //! ## Units
 //!
-//! The C driver carries a per-axis `resolution_` (mm-or-deg per microstep or
-//! per encoder count, derived from `FBK?`/`REZ?`/`UST?`/`ENC?`) purely to
-//! convert between the record's raw-step boundary and the controller's
-//! physical units. The asyn-rs motor boundary is dial-frame EGU (the
-//! controller's own mm/deg), so every `× resolution_` (positions, velocities,
-//! accelerations sent) and `÷ resolution_` (positions read) cancels: values
-//! pass through unscaled. Consequently the `FBK?`/`REZ?`/`UST?`/`ENC?` probes,
-//! whose only consumer was `resolution_`, are not issued — only `VER?` (model,
-//! for the MMC-ETH ignore) and `VMX?` (max velocity, for the jog-percent
-//! calculation) survive. The record's `MRES` carries the physical resolution
-//! for display and is operator-configured in the substitution file.
+//! As C, the record's steps are scaled by the per-axis `resolution_` (mm-or-deg
+//! per microstep or per encoder count, derived from `FBK?`/`REZ?`/`UST?`/
+//! `ENC?`) into the controller's units, and `POS?` is divided back.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -111,8 +103,21 @@ fn parse_model(version: &str) -> i32 {
     }
 }
 
+/// C `resolution_` in mm-or-deg per record step: an open-loop MMC-200's `REZ`
+/// is tens of picometres per full step, an MMC-1xx's steps per µm (or
+/// milli-degree); closed loop uses the encoder's `ENC` (µm per count).
+fn resolution(model: i32, closed_loop: i32, rez: i32, micro_steps: i32, encoder: f64) -> f64 {
+    if closed_loop != 0 {
+        encoder / 1e3
+    } else if model == 200 {
+        f64::from(rez) * 1e-8 / f64::from(micro_steps)
+    } else {
+        1e-3 / f64::from(rez)
+    }
+}
+
 /// Parse a `POS?` reply `#<theoretical>,<encoder>` into `(position, encoder)`
-/// in EGU (C `sscanf("#%lf,%lf")`). A missing encoder field reads 0.
+/// in controller units (C `sscanf("#%lf,%lf")`). A missing encoder field reads 0.
 fn parse_position(reply: &str) -> (f64, f64) {
     let body = reply.get(1..).unwrap_or("");
     match body.split_once(',') {
@@ -130,8 +135,11 @@ pub struct Mmc200Axis {
     model: i32,
     /// False for the MMC-ETH module (`model_ == 999`): polling is disabled.
     active: bool,
-    /// C `maxVelocity_` from `VMX?`, in EGU/sec — the jog `JOG %` denominator.
+    /// C `maxVelocity_` from `VMX?`, in controller units/sec — the jog `JOG %`
+    /// denominator.
     max_velocity: f64,
+    /// C `resolution_`: controller units per record step.
+    resolution: f64,
     /// Controller-wide `ignoreLimits` flag (C `ignoreLimits_`).
     ignore_limits: bool,
     /// Last polled status, reused on the comm-failure early exit.
@@ -139,10 +147,10 @@ pub struct Mmc200Axis {
 }
 
 impl Mmc200Axis {
-    /// Construct the axis at 0-based `index`, running the surviving part of the
-    /// C per-motor init: `VER?` (model, for the MMC-ETH ignore) and, for a real
-    /// axis, `VMX?` (max velocity for jog). Performs blocking serial I/O under
-    /// the controller lock.
+    /// Construct the axis at 0-based `index`, running the C per-motor init:
+    /// `VER?` (model, for the MMC-ETH ignore) and, for a real axis, the
+    /// `FBK?`/`REZ?`/`UST?`/`ENC?` resolution probes and `VMX?` (max velocity
+    /// for jog). Performs blocking serial I/O under the controller lock.
     pub fn new(
         controller: Arc<Mutex<Mmc200Controller>>,
         index: usize,
@@ -172,6 +180,7 @@ impl Mmc200Axis {
                 model,
                 active: false,
                 max_velocity: 0.0,
+                resolution: 1.0,
                 ignore_limits,
                 last_status: MotorStatus {
                     done: true,
@@ -179,6 +188,18 @@ impl Mmc200Axis {
                 },
             };
         }
+
+        let mut reply_int = |cmd: &str| {
+            let reply = query(format!("{axis_index}{cmd}"));
+            atoi(reply.get(1..).unwrap_or(""))
+        };
+        let closed_loop = reply_int("FBK?");
+        let rez = reply_int("REZ?");
+        // Only the MMC-200 has a variable microstep count.
+        let micro_steps = if model == 200 { reply_int("UST?") } else { 1 };
+        let enc = query(format!("{axis_index}ENC?"));
+        let encoder_resolution = atof(enc.get(1..).unwrap_or(""));
+        let resolution = resolution(model, closed_loop, rez, micro_steps, encoder_resolution);
 
         let vmx = query(format!("{axis_index}VMX?"));
         let max_velocity = atof(vmx.get(1..).unwrap_or(""));
@@ -190,6 +211,7 @@ impl Mmc200Axis {
             model,
             active: true,
             max_velocity,
+            resolution,
             ignore_limits,
             last_status: MotorStatus {
                 problem: error,
@@ -203,17 +225,18 @@ impl Mmc200Axis {
     }
 
     /// C `sendAccelAndVelocity`: `VEL`, then `ACC` and `DEC` (accel used for
-    /// both). Values are EGU/sec and EGU/sec² (the `× resolution_` cancels at
-    /// the EGU boundary — module Units note).
+    /// both), each scaled by `resolution_`.
     fn send_accel_vel(
+        &self,
         ctrl: &Mmc200Controller,
-        axis: i32,
         acceleration: f64,
         velocity: f64,
     ) -> AsynResult<()> {
-        ctrl.write(&format!("{axis}VEL{velocity:.3}"))?;
-        ctrl.write(&format!("{axis}ACC{acceleration:.3}"))?;
-        ctrl.write(&format!("{axis}DEC{acceleration:.3}"))?;
+        let axis = self.axis_index;
+        let res = self.resolution;
+        ctrl.write(&format!("{axis}VEL{:.3}", velocity * res))?;
+        ctrl.write(&format!("{axis}ACC{:.3}", acceleration * res))?;
+        ctrl.write(&format!("{axis}DEC{:.3}", acceleration * res))?;
         Ok(())
     }
 
@@ -240,8 +263,8 @@ impl AsynMotor for Mmc200Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        Self::send_accel_vel(&ctrl, n, acceleration, velocity)?;
-        ctrl.write(&format!("{n}MVA{position:.6}"))?;
+        self.send_accel_vel(&ctrl, acceleration, velocity)?;
+        ctrl.write(&format!("{n}MVA{:.6}", position * self.resolution))?;
         Ok(())
     }
 
@@ -255,8 +278,8 @@ impl AsynMotor for Mmc200Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        Self::send_accel_vel(&ctrl, n, acceleration, velocity)?;
-        ctrl.write(&format!("{n}MVR{distance:.6}"))?;
+        self.send_accel_vel(&ctrl, acceleration, velocity)?;
+        ctrl.write(&format!("{n}MVR{:.6}", distance * self.resolution))?;
         Ok(())
     }
 
@@ -268,13 +291,12 @@ impl AsynMotor for Mmc200Axis {
         acceleration: f64,
     ) -> AsynResult<()> {
         // C `moveVelocity`: the JOG command takes a speed as a percentage of
-        // max velocity. Under the EGU boundary velocity is already EGU/sec, so
-        // the percentage is `velocity / maxVelocity_ * 100` (the `×
-        // resolution_` in C cancels), clamped to ±100.
+        // max velocity, clamped to ±100.
         let n = self.axis_index;
-        let jog_percent = (velocity / self.max_velocity * 100.0).clamp(-100.0, 100.0);
+        let jog_percent =
+            (velocity * self.resolution / self.max_velocity * 100.0).clamp(-100.0, 100.0);
         let ctrl = self.lock();
-        ctrl.write(&format!("{n}JAC{acceleration:.3}"))?;
+        ctrl.write(&format!("{n}JAC{:.3}", acceleration * self.resolution))?;
         ctrl.write(&format!("{n}JOG{jog_percent:.3}"))?;
         Ok(())
     }
@@ -289,7 +311,7 @@ impl AsynMotor for Mmc200Axis {
     ) -> AsynResult<()> {
         let n = self.axis_index;
         let ctrl = self.lock();
-        Self::send_accel_vel(&ctrl, n, acceleration, velocity)?;
+        self.send_accel_vel(&ctrl, acceleration, velocity)?;
         // C `HCG1` selects the forward home direction, `HCG0` the reverse.
         ctrl.write(&format!("{n}HCG{}", if forward { 1 } else { 0 }))?;
         ctrl.write(&format!("{n}HOM"))?;
@@ -360,8 +382,8 @@ impl AsynMotor for Mmc200Axis {
                     (status & STA_HIGH_LIMIT != 0, status & STA_LOW_LIMIT != 0)
                 };
                 self.last_status = MotorStatus {
-                    position,
-                    encoder_position: encoder,
+                    position: position / self.resolution,
+                    encoder_position: encoder / self.resolution,
                     velocity: 0.0,
                     done,
                     moving: !done,
@@ -411,6 +433,13 @@ mod tests {
         // Too short (C: strlen <= 8).
         assert_eq!(parse_model("#MMC-200"), -1);
         assert_eq!(parse_model("#"), -1);
+    }
+
+    #[test]
+    fn resolution_follows_model_and_loop_mode() {
+        assert_eq!(resolution(200, 0, 1000, 8, 0.0), 1000.0 * 1e-8 / 8.0);
+        assert_eq!(resolution(100, 0, 50, 1, 0.0), 1e-3 / 50.0);
+        assert_eq!(resolution(200, 1, 1000, 8, 0.01), 0.01 / 1e3);
     }
 
     #[test]

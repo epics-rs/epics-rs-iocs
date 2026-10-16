@@ -1,10 +1,9 @@
 # Micronix MMC-100/200: one motor record per axis. Load once per axis with
 # ADDR = 0-based axis index of port PORT; the driver maps index
 # 0,1,2,... to controller axes 1,2,3,...
-# Positions travel the driver boundary in EGU (controller units, mm or deg)
-# directly; MRES only sets the record's raw-count resolution (display/deadband
-# granularity) and should match the axis's physical resolution. Velocities are
-# EGU/sec.
+# The driver scales the record's steps by the axis resolution read from the
+# controller (FBK?/REZ?/UST?/ENC?), as C; MRES equal to it gives EGU in the
+# controller's mm or deg.
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "asynMotor")
