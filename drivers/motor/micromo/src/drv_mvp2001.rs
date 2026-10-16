@@ -13,7 +13,9 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -155,11 +157,11 @@ pub struct DrvMvp2001Axis {
     /// `motor_info->position`.
     position: i32,
     /// The record's PREM and POST for the move it sends next.
-    strings: Option<(Vec<u8>, Vec<u8>)>,
+    strings: Option<(Vec<u8>, Option<PostMessage>)>,
     /// The move in flight's POST, `nodeptr->postmsgptr`. C never sends it:
     /// every `build_trans` restarts the transaction, which clears the
     /// pointer before the move is queued.
-    post: Option<Vec<u8>>,
+    post: Option<PostMessage>,
 }
 
 impl DrvMvp2001Axis {
@@ -223,7 +225,7 @@ impl DrvMvp2001Axis {
     /// motion commands, and its POST becomes the one `poll` sends.
     fn send_move(&mut self, setup: &[String], motion: &[String]) {
         let (prem, post) = self.strings.take().unwrap_or_default();
-        self.post = (!post.is_empty()).then_some(post);
+        self.post = post;
         for command in setup {
             self.send(command);
         }
@@ -367,8 +369,13 @@ impl AsynMotor for DrvMvp2001Axis {
         Ok(())
     }
 
-    fn set_move_strings(&mut self, _user: &AsynUser, prem: &[u8], post: &[u8]) -> AsynResult<()> {
-        self.strings = Some((prem.to_vec(), post.to_vec()));
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings = Some((prem.to_vec(), post));
         Ok(())
     }
 
@@ -417,7 +424,8 @@ impl AsynMotor for DrvMvp2001Axis {
             (status.high_limit && status.direction) || (status.low_limit && !status.direction);
         let status = status.clone();
         if (status.done || ls_active)
-            && let Some(post) = self.post.take()
+            && let Some(post) = self.post.take().map(|p| p.get())
+            && !post.is_empty()
         {
             // POST goes as the record holds it, with no address.
             self.lock().send(post);

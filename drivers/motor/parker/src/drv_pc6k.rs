@@ -10,7 +10,9 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -184,11 +186,11 @@ pub struct DrvPc6kAxis {
     /// `motor_info->position`.
     position: i32,
     /// The record's PREM and POST for the move it sends next.
-    strings: Option<(Vec<u8>, Vec<u8>)>,
+    strings: Option<(Vec<u8>, Option<PostMessage>)>,
     /// The move in flight's POST, `nodeptr->postmsgptr`. C never sends it:
     /// every `build_trans` restarts the transaction, which clears the
     /// pointer before the move is queued.
-    post: Option<Vec<u8>>,
+    post: Option<PostMessage>,
     /// When the last motion started: C's motor task reads no status until
     /// `MOTION_DELAY` after it, the GO's prompt read away by then.
     started: Option<Instant>,
@@ -246,7 +248,7 @@ impl DrvPc6kAxis {
     /// The record's PREM, sent as it is, and its POST kept for `poll`.
     fn prem(&mut self) {
         let (prem, post) = self.strings.take().unwrap_or_default();
-        self.post = (!post.is_empty()).then_some(post);
+        self.post = post;
         self.lock().command(prem);
     }
 
@@ -392,8 +394,13 @@ impl AsynMotor for DrvPc6kAxis {
         Ok(())
     }
 
-    fn set_move_strings(&mut self, _user: &AsynUser, prem: &[u8], post: &[u8]) -> AsynResult<()> {
-        self.strings = Some((prem.to_vec(), post.to_vec()));
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings = Some((prem.to_vec(), post));
         Ok(())
     }
 
@@ -455,7 +462,8 @@ impl AsynMotor for DrvPc6kAxis {
         status.problem = false;
         let status = status.clone();
         if (status.done || ls_active)
-            && let Some(post) = self.post.take()
+            && let Some(post) = self.post.take().map(|p| p.get())
+            && !post.is_empty()
         {
             self.lock().send(post);
         }

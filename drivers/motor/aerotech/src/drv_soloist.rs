@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -150,11 +152,11 @@ pub struct DrvSoloistAxis {
     setup: AxisSetup,
     status: MotorStatus,
     /// The record's PREM and POST for the move it sends next.
-    strings: Option<(Vec<u8>, Vec<u8>)>,
+    strings: Option<(Vec<u8>, Option<PostMessage>)>,
     /// The move in flight's POST, `nodeptr->postmsgptr`. C sends it without
     /// reading its reply, which every later status read then takes for its
     /// own; its reply is read away here.
-    post: Option<Vec<u8>>,
+    post: Option<PostMessage>,
 }
 
 impl DrvSoloistAxis {
@@ -207,7 +209,7 @@ impl DrvSoloistAxis {
     /// `motion` after the record's PREM line, its POST kept for `poll`.
     fn motion(&mut self, motion: &str) {
         let (prem, post) = self.strings.take().unwrap_or_default();
-        self.post = (!post.is_empty()).then_some(post);
+        self.post = post;
         let mut msg = prem;
         if !msg.is_empty() {
             msg.push(b'\n');
@@ -329,8 +331,13 @@ impl AsynMotor for DrvSoloistAxis {
         Ok(())
     }
 
-    fn set_move_strings(&mut self, _user: &AsynUser, prem: &[u8], post: &[u8]) -> AsynResult<()> {
-        self.strings = Some((prem.to_vec(), post.to_vec()));
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings = Some((prem.to_vec(), post));
         Ok(())
     }
 
@@ -387,7 +394,8 @@ impl AsynMotor for DrvSoloistAxis {
         status.problem = false;
         let status = status.clone();
         if (status.done || ls_active)
-            && let Some(post) = self.post.take()
+            && let Some(post) = self.post.take().map(|p| p.get())
+            && !post.is_empty()
         {
             self.send(post);
         }
