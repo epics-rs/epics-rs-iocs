@@ -26,10 +26,11 @@
 //! connected socket, a behavior change C does not have).
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::time::Duration;
 
 use epics_rs::base::net::iface_v4;
+use epics_rs::ca::hostname::ip_addr_to_a;
 
 use crate::net_finder;
 
@@ -106,6 +107,13 @@ fn interface_broadcast_list() -> Vec<SocketAddrV4> {
         .collect()
 }
 
+/// `ipAddrToA` of a broadcast list node, whose port is still 0
+/// (`DppSocket.cpp:34,148`).
+fn ip_addr_to_a_port0(ip: Ipv4Addr) -> String {
+    let addr = SocketAddr::V4(SocketAddrV4::new(ip, 0));
+    String::from_utf8_lossy(&ip_addr_to_a(addr)).into_owned()
+}
+
 pub struct AmptekUdpTransport {
     socket: UdpSocket,
     /// The DP5 command port every send targets. Always
@@ -126,8 +134,16 @@ impl AmptekUdpTransport {
     /// `DppSocket.cpp:128-136` -- enabled once here instead, since this
     /// transport only ever broadcasts on the NetFinder discovery path).
     pub fn bind() -> io::Result<Self> {
-        let mut transport = Self::bind_on_command_port(DP5_COMMAND_PORT)?;
-        transport.broadcast_list = interface_broadcast_list();
+        let mut transport = Self::bind_on_command_port(DP5_COMMAND_PORT).inspect_err(|_| {
+            println!("epicsSocketCreate failed");
+        })?;
+        let list = interface_broadcast_list();
+        println!("Found {} broadcast interfaces ...", list.len());
+        println!("Broadcast list ...");
+        for dest in &list {
+            println!("{}", ip_addr_to_a_port0(*dest.ip()));
+        }
+        transport.broadcast_list = list;
         Ok(transport)
     }
 
@@ -209,6 +225,10 @@ impl AmptekUdpTransport {
         let mut loops = 0;
         for dest in &self.broadcast_list {
             let rand = net_finder::create_rand();
+            println!(
+                "interface broadcast address {}",
+                ip_addr_to_a_port0(*dest.ip())
+            );
             // C ignores the SendNetFinderBroadCast result.
             let _ = self
                 .socket
@@ -306,7 +326,6 @@ impl AmptekUdpTransport {
 mod tests {
     use super::*;
     use crate::protocol;
-    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

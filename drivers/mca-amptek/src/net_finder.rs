@@ -57,8 +57,12 @@ pub fn have_netfinder_packet(buf: &[u8], rand: u16, num_bytes: usize) -> bool {
     let nonce = buf[2] == rand_hi && buf[3] == rand_lo;
     if num_bytes >= 32 && buf[0] == 0x01 && nonce {
         true
+    } else if buf[0] == 0x00 && nonce {
+        println!("unknown packet type");
+        false
     } else {
-        !(buf[0] == 0x00 && nonce)
+        println!("no packet test");
+        true
     }
 }
 
