@@ -33,7 +33,7 @@ use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::device_support::{DeviceInitOutcome, DeviceReadOutcome, DeviceSupport};
 use epics_rs::base::server::record::{
-    DbLinkType, DevSup, Dset, Record, ScanType, register_device_row,
+    DbLinkType, DevSup, Dset, Record, ScanType, register_dbd_devices,
 };
 use epics_rs::base::types::{EpicsValue, SharedArray};
 
@@ -390,6 +390,14 @@ impl DeviceSupport for DevMcaAsyn {
     }
 }
 
+/// `mcaSupport.dbd`'s `device(mca,CONSTANT,devMCA_soft,"Soft Channel")`.
+pub static DEV_MCA_SOFT: DevSup = DevSup {
+    name: "devMCA_soft",
+    choice: SOFT_MCA_DTYP,
+    link_type: DbLinkType::Constant,
+    dset: Dset::new(6, &[2, 4, 5], false),
+};
+
 /// `mcaSupport.dbd`'s `device(mca,INST_IO,devMcaAsyn,"asynMCA")`; the dset
 /// (`devMcaAsyn.c:89-97`) fills init_record, send_msg and read_array.
 pub static DEV_MCA_ASYN: DevSup = DevSup {
@@ -399,17 +407,28 @@ pub static DEV_MCA_ASYN: DevSup = DevSup {
     dset: Dset::new(6, &[2, 4, 5], false),
 };
 
-/// Give every `DTYP "asynMCA"` mca record devMcaAsyn, and
-/// put `asynMCA` in the mca DTYP menu: a dynamic support adds no menu row,
-/// and mca has none of its own, so without the row `DTYP` reads empty.
+const SOFT_MCA_DTYP: &str = "Soft Channel";
+
+/// mca's whole devList in `mcaSupport.dbd:10-11` order.
+static MCA_DEVICES: [DevSup; 2] = [DEV_MCA_SOFT, DEV_MCA_ASYN];
+
+/// Put mca's `mcaSupport.dbd` devList in the DTYP menu and bind it.
 pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
-    register_device_row("mca", &DEV_MCA_ASYN);
-    app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != ASYN_MCA_DTYP {
-            return None;
-        }
-        Some(Box::new(DevMcaAsyn::new(ctx.inp)) as Box<dyn DeviceSupport>)
-    })
+    register_dbd_devices("mca", &MCA_DEVICES);
+    app.register_dynamic_device_support(mca_device_support)
+}
+
+/// `"Soft Channel"` is every record type's choice, and a dynamic factory
+/// outranks the built-in soft supports, so only an mca record is served.
+fn mca_device_support(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> {
+    if ctx.record_type != "mca" {
+        return None;
+    }
+    match ctx.dtyp {
+        SOFT_MCA_DTYP => Some(Box::new(mca_rs::SoftMca)),
+        ASYN_MCA_DTYP => Some(Box::new(DevMcaAsyn::new(ctx.inp))),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -550,5 +569,73 @@ mod tests {
                 f.reasons[McaReason::ReadStatus as usize],
             ]
         );
+    }
+
+    /// `mcaSupport.dbd:10-11`: "Soft Channel" is mca DTYP 0 and binds
+    /// devMCA_soft, "asynMCA" is 1, and another record type's "Soft Channel"
+    /// is left to its own support.
+    #[test]
+    fn soft_channel_is_the_first_mca_dtyp_and_binds_the_soft_device() {
+        use std::collections::HashMap;
+
+        use epics_rs::base::runtime::task::test_block_on;
+        use epics_rs::base::server::database::ProcStack;
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+
+        let _ = register_dev_mca_asyn(IocApplication::new());
+        let db = r#"
+record(waveform, "MCASOFTWF") { field(NELM, "4") field(FTVL, "LONG") }
+record(mca, "MCASOFT") {
+    field(DTYP, "Soft Channel")
+    field(INP, "MCASOFTWF")
+    field(NMAX, "4")
+}
+"#;
+        test_block_on(async {
+            let (name, factory) = mca_rs::mca_record_factory();
+            let (db, _) = IocBuilder::new()
+                .register_record_type(name, factory)
+                .register_dynamic_device_support(mca_device_support)
+                .db_string(db, &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let get = |pv: &str| db.get_pv(pv).unwrap();
+            assert_eq!(get("MCASOFT.DTYP").to_f64(), Some(0.0));
+            db.put_record_field_from_ca_no_notify(
+                "MCASOFT",
+                "DTYP",
+                EpicsValue::String("asynMCA".into()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(get("MCASOFT.DTYP").to_f64(), Some(1.0));
+            db.put_record_field_from_ca_no_notify(
+                "MCASOFT",
+                "DTYP",
+                EpicsValue::String("Soft Channel".into()),
+            )
+            .await
+            .unwrap();
+
+            db.put_pv("MCASOFTWF", EpicsValue::LongArray(vec![1, 2, 3, 4].into()))
+                .await
+                .unwrap();
+            db.process_record_with_links("MCASOFT", &mut ProcStack::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                get("MCASOFT.VAL"),
+                EpicsValue::LongArray(vec![1, 2, 3, 4].into())
+            );
+            let epid = DeviceSupportContext {
+                record_type: "epid",
+                dtyp: SOFT_MCA_DTYP,
+                inp: "",
+                out: "",
+            };
+            assert!(mca_device_support(&epid).is_none());
+        });
     }
 }
