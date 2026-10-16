@@ -1,5 +1,5 @@
-# SmarAct MCS2: one motor record per channel. Load once per channel with N =
-# 0-based channel index (DTYP MCS2_$(CARD)_$(N)); the channel number equals N.
+# SmarAct MCS2: one motor record per channel, ADDR the 0-based channel on
+# controller port PORT.
 #
 # The driver reports positions in nanometres (linear positioners) or
 # micro-degrees (rotary), scaling the controller's picometre/nano-degree units
@@ -9,7 +9,8 @@
 # encoder/target position when a sensor is present.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "MCS2_$(CARD)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000000)")
     field(ACCL, "$(ACCL=0.5)")
