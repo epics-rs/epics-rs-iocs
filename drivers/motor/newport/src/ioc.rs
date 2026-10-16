@@ -1756,13 +1756,20 @@ impl NewportHolder {
                 let serial_port = req_string(args, 1, "serialPort")?;
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-                let handle = connect_serial(&serial_port, PM500_TIMEOUT)?;
-                let controller = Pm500Controller::new(handle)
-                    .map_err(|e| format!("PM500CreateController: {e}"))?;
+                // C `motor_init` drops a controller it cannot connect to or
+                // that leaves `SVN?` unanswered without a word
+                // (drvPM500.cc:577, :671-672); one with no axes has
+                // nothing to create.
+                let Ok(handle) = connect_serial(&serial_port, PM500_TIMEOUT) else {
+                    return Ok(CommandOutcome::Continue);
+                };
+                let Some(controller) = Pm500Controller::new(handle) else {
+                    return Ok(CommandOutcome::Continue);
+                };
                 let ident = controller.ident().to_string();
                 let num_axes = controller.num_axes();
                 if num_axes == 0 {
-                    return Err("PM500CreateController: no axes discovered".into());
+                    return Ok(CommandOutcome::Continue);
                 }
                 let controller = Arc::new(Mutex::new(controller));
 
