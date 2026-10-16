@@ -10,7 +10,7 @@
 #============================================================
 
 epicsEnvSet("P",      "MVP:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "MVP1")
 epicsEnvSet("SERIAL", "SERIAL1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
@@ -29,16 +29,16 @@ asynSetOption("$(SERIAL)", 0, "stop",   "1")
 asynOctetSetInputEos("$(SERIAL)", 0, "\r")
 
 # ---- MVP2001 controller + axes ----
-# MVP2001CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
-MVP2001CreateController(0, "$(SERIAL)", 1, 100, 1000)
+# MVP2001CreateController(portName, MVP2001PortName, numAxes, movingPollPeriod, idlePollPeriod).
+MVP2001CreateController("$(CTRL)", "$(SERIAL)", 1, 100, 1000)
 
-# MVP2001CreateAxis(card, axisNo, encLinesPerRev, maxCurrentMa, limitPolarity).
+# MVP2001CreateAxis(portName, axisNo, encLinesPerRev, maxCurrentMa, limitPolarity).
 # axisNo is 0-based; limitPolarity 1 = normally-open, 0 = normally-closed.
-MVP2001CreateAxis(0, 0, 512, 1000, 1)
+MVP2001CreateAxis("$(CTRL)", 0, 512, 1000, 1)
 
-# One motor record per axis (DTYP MVP2001_$(CARD)_0). Positions cross the driver
+# One motor record per axis (OUT @asyn($(CTRL),axis)). Positions cross the driver
 # boundary in the controller's native encoder counts, so MRES = 1.
-dbLoadRecords("$(MICROMO_IOC)/db/mvp2001.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(MICROMO_IOC)/db/mvp2001.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
 
