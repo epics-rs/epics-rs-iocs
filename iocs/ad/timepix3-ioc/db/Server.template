@@ -1749,12 +1749,7 @@ record(ai, "$(P)$(R)PrvHstFrameCount_RBV")
     field(SCAN, "I/O Intr")
 }
 
-# UPSTREAM DEFECT (Server.template:1752): an `ai` carrying DTYP asynInt64 —
-# asynInt64 device support has no `ai` dset, and even where a client tolerates
-# it the double conversion is lossy above 2^53. Its Img twin
-# (Server.template:657, TPX3_IMG_TOTAL_COUNTS) is an int64in, which is what a
-# 64-bit counter needs.
-record(int64in, "$(P)$(R)PrvHstTotalCounts_RBV")
+record(ai, "$(P)$(R)PrvHstTotalCounts_RBV")
 {
     field(DESC, "Total counts across all frames")
     field(DTYP, "asynInt64")
