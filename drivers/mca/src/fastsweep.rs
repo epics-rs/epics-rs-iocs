@@ -91,6 +91,8 @@ use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::services::PortServices;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::interface::McaReason;
@@ -302,8 +304,8 @@ pub struct FastSweepDriver {
 /// moment the two lists' lengths diverge, and silently doing nothing (or
 /// worse, hitting an unrelated param) whenever they happen to overlap.
 pub struct FastSweepSubscriptions {
-    data_sub: InterruptSubscription,
-    data_rx: InterruptReceiver,
+    /// `None` when the input could not be connected (C still creates the port).
+    data: Option<(InterruptSubscription, InterruptReceiver)>,
     interval: Option<(InterruptSubscription, InterruptReceiver)>,
     shared: Arc<Shared>,
 }
@@ -312,12 +314,10 @@ impl FastSweepDriver {
     /// C `initFastSweep(portName, inputName, maxSignals, maxPoints,
     /// dataString, intervalString)` (`drvFastSweep.cpp:57-211`).
     ///
-    /// The upstream `asynInt32Array` data connection is mandatory (matches
-    /// C's hard-fail `goto error` if either the interface lookup, the
-    /// `drvUserCreate`, or the `registerInterruptUser` fails). The
-    /// `asynFloat64` interval connection is best-effort (matches C: a
-    /// failed `drvUserCreate` here leaves `numAverage_` at its default `1`
-    /// rather than failing the whole driver).
+    /// As in C, a missing input port, data param or interval param prints
+    /// C's message and stops connecting the input, but the port is still
+    /// created (C's constructor `goto error` only skips the rest,
+    /// `drvFastSweep.cpp:134-210`); `numAverage_` then stays `1`.
     ///
     /// Returns the driver plus a [`FastSweepSubscriptions`] the caller must
     /// pass to [`start`] once it has wrapped the driver in a port runtime
@@ -344,9 +344,6 @@ impl FastSweepDriver {
             interval_drv_info
         };
 
-        let input = get_port(input_port_name)
-            .ok_or_else(|| asyn_error(format!("no asyn port named '{input_port_name}'")))?;
-
         let mut base = PortDriverBase::new(
             port_name,
             max_signals,
@@ -372,52 +369,91 @@ impl FastSweepDriver {
             current_channel_reason: current_channel_idx,
         });
 
-        let data_req = DrvUserRequest::new(data_drv_info, 0).with_iface(InterfaceType::Int32Array);
-        let data_info = input.handle.drv_user_create_blocking(&data_req)?;
-        let (data_sub, data_rx) = input.handle.interrupts().register_interrupt_user(
-            InterruptFilter {
-                reason: Some(data_info.reason),
-                ..Default::default()
-            },
-            // Only the first `maxSignals` elements are read.
-            max_signals * std::mem::size_of::<i32>(),
+        let (data, interval) = connect_input(
+            input_port_name,
+            max_signals,
+            data_drv_info,
+            interval_drv_info,
+            &shared,
         );
-
-        // Best-effort: C falls back to `numAverage_ = 1` rather than
-        // failing the driver when no interval source is configured
-        // (`drvFastSweep.cpp:200-208`).
-        let interval_req =
-            DrvUserRequest::new(interval_drv_info, 0).with_iface(InterfaceType::Float64);
-        let interval =
-            if let Ok(interval_info) = input.handle.drv_user_create_blocking(&interval_req) {
-                // C's one-time `pasynFloat64SyncIO->read` seed before any
-                // callback arrives (`drvFastSweep.cpp:207`).
-                if let Ok(seed) = input.handle.read_float64_blocking(interval_info.reason, 0) {
-                    shared.state.lock().unwrap().callback_interval = seed;
-                }
-                Some(input.handle.interrupts().register_interrupt_user(
-                    InterruptFilter {
-                        reason: Some(interval_info.reason),
-                        ..Default::default()
-                    },
-                    0,
-                ))
-            } else {
-                None
-            };
 
         let driver = FastSweepDriver {
             base,
             shared: Arc::clone(&shared),
         };
         let subscriptions = FastSweepSubscriptions {
-            data_sub,
-            data_rx,
+            data,
             interval,
             shared,
         };
         Ok((driver, subscriptions))
     }
+}
+
+/// C `asynPrint(pasynUser, ASYN_TRACE_ERROR, "drvFastSweep:drvFastSweep:, ...")`
+/// for a user on `port` (`None`: a user no port accepted).
+fn trace_error(port: Option<&str>, args: std::fmt::Arguments<'_>) {
+    PortServices::global().trace().print(
+        port,
+        port.map(|_| 0),
+        0,
+        TraceMask::ERROR,
+        format_args!("drvFastSweep:drvFastSweep:, {args}"),
+    );
+}
+
+type Subscription = (InterruptSubscription, InterruptReceiver);
+
+/// The input half of C's constructor (`drvFastSweep.cpp:132-208`): the data
+/// subscription, then the interval subscription and its seed read.
+fn connect_input(
+    input_port_name: &str,
+    max_signals: usize,
+    data_drv_info: &str,
+    interval_drv_info: &str,
+    shared: &Shared,
+) -> (Option<Subscription>, Option<Subscription>) {
+    let Some(input) = get_port(input_port_name) else {
+        trace_error(None, format_args!("connectDevice failed"));
+        return (None, None);
+    };
+    let port = Some(input_port_name);
+
+    let data_req = DrvUserRequest::new(data_drv_info, 0).with_iface(InterfaceType::Int32Array);
+    let Ok(data_info) = input.handle.drv_user_create_blocking(&data_req) else {
+        trace_error(port, format_args!("error in drvUser for {data_drv_info}"));
+        return (None, None);
+    };
+    let data = input.handle.interrupts().register_interrupt_user(
+        InterruptFilter {
+            reason: Some(data_info.reason),
+            ..Default::default()
+        },
+        // Only the first `maxSignals` elements are read.
+        max_signals * std::mem::size_of::<i32>(),
+    );
+
+    let interval_req = DrvUserRequest::new(interval_drv_info, 0).with_iface(InterfaceType::Float64);
+    let Ok(interval_info) = input.handle.drv_user_create_blocking(&interval_req) else {
+        trace_error(
+            port,
+            format_args!("cannot connect to asynFloat64SyncIO for input {input_port_name}"),
+        );
+        return (Some(data), None);
+    };
+    let interval = input.handle.interrupts().register_interrupt_user(
+        InterruptFilter {
+            reason: Some(interval_info.reason),
+            ..Default::default()
+        },
+        0,
+    );
+    // C's one-time `pasynFloat64SyncIO->read` seed, status ignored
+    // (`drvFastSweep.cpp:207`).
+    if let Ok(seed) = input.handle.read_float64_blocking(interval_info.reason, 0) {
+        shared.state.lock().unwrap().callback_interval = seed;
+    }
+    (Some(data), Some(interval))
 }
 
 /// Starts the data/interval publisher threads against `handle` -- the
@@ -428,12 +464,13 @@ impl FastSweepDriver {
 /// step instead of inside `connect` itself.
 pub fn start(handle: PortHandle, subscriptions: FastSweepSubscriptions) {
     let FastSweepSubscriptions {
-        data_sub,
-        data_rx,
+        data,
         interval,
         shared,
     } = subscriptions;
-    spawn_data_thread(data_sub, data_rx, handle.clone(), Arc::clone(&shared));
+    if let Some((data_sub, data_rx)) = data {
+        spawn_data_thread(data_sub, data_rx, handle.clone(), Arc::clone(&shared));
+    }
     if let Some((interval_sub, interval_rx)) = interval {
         spawn_interval_thread(interval_sub, interval_rx, handle, shared);
     }
@@ -729,6 +766,17 @@ mod tests {
         state.data_callback(&[-2], &reasons, 999);
         state.data_callback(&[-3], &reasons, 999);
         assert_eq!(state.p_data[0], -2);
+    }
+
+    /// C creates the port even when the input port does not exist
+    /// (`drvFastSweep.cpp:134-139`, `initFastSweep` returns success).
+    #[test]
+    fn connect_creates_the_port_without_its_input() {
+        let (driver, subscriptions) =
+            FastSweepDriver::connect("FSTESTNOINPUT", "FSTESTNOSUCHPORT", 1, 4, "", "").unwrap();
+        assert_eq!(&*driver.base().port_name, "FSTESTNOINPUT");
+        assert!(subscriptions.data.is_none());
+        assert!(subscriptions.interval.is_none());
     }
 
     /// C `nextPoint`'s per-signal write + always-publish current channel /
