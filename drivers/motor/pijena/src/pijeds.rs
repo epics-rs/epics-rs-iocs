@@ -25,11 +25,9 @@
 //!
 //! ## Units
 //!
-//! The asyn-rs motor boundary is dial-frame EGU. The C driver's
-//! `drive_resolution` (`1/10^EDS_MAX_RES` = 0.001) only bridges the record's
-//! raw-step boundary to the controller's physical units (µm) and **cancels** at
-//! the EGU boundary, so this port works directly in physical units: positions
-//! pass through, the record's `MRES` is `drive_resolution`, and its `EGU` is µm.
+//! As C, the record's steps are scaled by `drive_resolution`
+//! (`1/10^EDS_MAX_RES` = 0.001) into the controller's µm on `set`/`sr`, and the
+//! `mess` reply is `NINT(µm / drive_resolution)` steps.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -50,7 +48,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::util::{atof, atoi};
+use motor_common::util::{atof, atoi, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 128;
@@ -59,10 +57,12 @@ const READ_BUF: usize = 128;
 /// value is formatted with this many decimals.
 const MAX_RES: usize = 3;
 
-/// Settle tolerance for done detection, in physical units. C computes
-/// `fdbk_tolerance = 10^(EDS_MAX_RES-1)` in raw steps; times `drive_resolution`
-/// (`10^-EDS_MAX_RES`) that is `10^-1` = 0.1 physical units.
-const TOLERANCE: f64 = 0.1;
+/// µm per record step (C `drive_resolution = 1/10^EDS_MAX_RES`).
+const DRIVE_RESOLUTION: f64 = 0.001;
+
+/// Settle tolerance for done detection, in steps (C `fdbk_tolerance =
+/// 10^(EDS_MAX_RES-1)`).
+const TOLERANCE: f64 = 100.0;
 
 /// Status-word bit 7: closed-loop (torque-enabled) mode.
 const STATUS_CLOSE_LOOP: i32 = 0x80;
@@ -175,7 +175,7 @@ pub struct PiJedsAxis {
     controller: Arc<Mutex<PiJedsController>>,
     /// 0-based axis index; the wire axis number is the same (E-516 axes 0..5).
     axis: usize,
-    /// Last feedback position (physical units); C `motor_info->position`.
+    /// Last feedback position (steps); C `motor_info->position`.
     prev_position: f64,
     /// Consecutive settled polls while moving; C `no_motion_count`.
     no_motion_count: u32,
@@ -208,14 +208,24 @@ impl PiJedsAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Send an absolute move to `position` (physical units), optionally setting
+    /// Send an absolute move to `position` (steps), optionally setting
     /// the slew velocity first (C `SET_VELOCITY` + `MOVE_ABS`).
     fn issue_move(&mut self, position: f64, velocity: f64) -> AsynResult<()> {
         let ctrl = self.lock();
         if velocity > 0.0 {
-            ctrl.write_cmd(&format!("sr,{},{:.*}", self.axis, MAX_RES, velocity))?;
+            ctrl.write_cmd(&format!(
+                "sr,{},{:.*}",
+                self.axis,
+                MAX_RES,
+                velocity * DRIVE_RESOLUTION
+            ))?;
         }
-        ctrl.write_cmd(&format!("set,{},{:.*}", self.axis, MAX_RES, position))?;
+        ctrl.write_cmd(&format!(
+            "set,{},{:.*}",
+            self.axis,
+            MAX_RES,
+            position * DRIVE_RESOLUTION
+        ))?;
         drop(ctrl);
         self.moving = true;
         self.no_motion_count = 0;
@@ -264,7 +274,12 @@ impl AsynMotor for PiJedsAxis {
     ) -> AsynResult<()> {
         // C JOG only sets the slew rate — the E-516 has no continuous jog.
         let ctrl = self.lock();
-        ctrl.write_cmd(&format!("sr,{},{:.*}", self.axis, MAX_RES, velocity.abs()))
+        ctrl.write_cmd(&format!(
+            "sr,{},{:.*}",
+            self.axis,
+            MAX_RES,
+            (velocity * DRIVE_RESOLUTION).abs()
+        ))
     }
 
     fn home(
@@ -304,7 +319,11 @@ impl AsynMotor for PiJedsAxis {
 
         // A read is OK only when both queries returned a parseable value.
         let status_word = status_reply.ok().as_deref().and_then(value_field).map(atoi);
-        let position = pos_reply.ok().as_deref().and_then(value_field).map(atof);
+        let position = pos_reply
+            .ok()
+            .as_deref()
+            .and_then(value_field)
+            .map(|v| f64::from(nint(atof(v) / DRIVE_RESOLUTION)));
 
         let (Some(status_word), Some(position)) = (status_word, position) else {
             // C: first failure after NORMAL is a silent RETRY; a repeat failure
@@ -435,12 +454,12 @@ mod tests {
     fn a_stop_mid_travel_still_ends_in_done() {
         let mut axis = stage_axis("pijeds_stop");
         let user = AsynUser::default();
-        axis.move_absolute(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
+        axis.move_absolute(&user, 5000.0, 0.0, 0.0, 0.0).unwrap();
         assert!(!axis.poll(&user).unwrap().done);
         axis.stop(&user, 0.0).unwrap();
         let done = (0..20).any(|_| axis.poll(&user).unwrap().done);
         assert!(done, "the stage settled at 5 but never reported done");
-        assert_eq!(axis.poll(&user).unwrap().position, 5.0);
+        assert_eq!(axis.poll(&user).unwrap().position, 5000.0);
     }
 
     /// C motor_init sets EA_PRESENT on every axis (drvPIJEDS.cc:666-667), so
@@ -470,10 +489,8 @@ mod tests {
     }
 
     #[test]
-    fn tolerance_matches_c_fdbk_tolerance() {
-        // 10^(MAX_RES-1) raw steps * drive_resolution (10^-MAX_RES) = 10^-1.
-        let steps = 10f64.powi(MAX_RES as i32 - 1);
-        let res = 1.0 / 10f64.powi(MAX_RES as i32);
-        assert!((steps * res - TOLERANCE).abs() < 1e-12);
+    fn resolution_and_tolerance_match_c() {
+        assert_eq!(DRIVE_RESOLUTION, 1.0 / 10f64.powi(MAX_RES as i32));
+        assert_eq!(TOLERANCE, 10f64.powi(MAX_RES as i32 - 1));
     }
 }

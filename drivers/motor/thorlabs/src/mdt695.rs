@@ -19,11 +19,8 @@
 //! ## Units
 //!
 //! The controller works in volts (`<axis>R?` returns volts, `<axis>V` takes
-//! volts). The C driver scales the record's raw steps by a fixed
-//! `drive_resolution` (0.1) to reach volts and divides on readback; at the
-//! asyn-rs motor boundary, which is dial-frame EGU, that scaling cancels, so
-//! this port works directly in volts (`EGU` is V). The record's `MRES` must
-//! still be `drive_resolution`: raw counts are integers, so it is the step.
+//! volts). As C, the record's steps are scaled by the fixed `drive_resolution`
+//! (0.1 V) and the readback is `NINT(volts / drive_resolution)` steps.
 //!
 //! ## Echo
 //!
@@ -38,7 +35,7 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, Pol
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
-use motor_common::util::atof;
+use motor_common::util::{atof, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
@@ -51,6 +48,9 @@ pub const OUTPUT_EOS: &[u8] = b"\r";
 const AXIS_LETTERS: [char; 3] = ['X', 'Y', 'Z'];
 
 /// Map a 0-based axis index to its wire letter, clamped to the last channel.
+/// Volts per record step (C `MDT695_RESOLUTION`).
+const DRIVE_RESOLUTION: f64 = 0.1;
+
 fn axis_letter(index: usize) -> char {
     AXIS_LETTERS[index.min(AXIS_LETTERS.len() - 1)]
 }
@@ -209,7 +209,11 @@ impl AsynMotor for Mdt695Axis {
     ) -> AsynResult<()> {
         // Set the channel output voltage: "<axis>V<volts>" (C "#V%.1f").
         let ctrl = self.lock();
-        ctrl.write_only(&format!("{}V{:.1}", self.letter, position))
+        ctrl.write_only(&format!(
+            "{}V{:.1}",
+            self.letter,
+            position * DRIVE_RESOLUTION
+        ))
     }
 
     fn move_relative(
@@ -289,7 +293,7 @@ impl AsynMotor for Mdt695Axis {
         let comms_error = ctrl.comm_state == CommState::CommErr;
         drop(ctrl);
         if let Some(volts) = reading {
-            self.prev_position = volts;
+            self.prev_position = f64::from(nint(volts / DRIVE_RESOLUTION));
         }
         let position = self.prev_position;
 

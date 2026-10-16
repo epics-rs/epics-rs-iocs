@@ -26,12 +26,9 @@
 //!
 //! ## Units
 //!
-//! Per the SCU README, the controller works in microns (linear) / millidegrees
-//! (rotary) and the driver deliberately reports motor-record *steps* scaled by
-//! `STEPS_PER_EGU` (1000): 1000 steps is one micron or one millidegree. This is
-//! an intentional unit choice (not a resolution bridge), so it is preserved —
-//! positions cross the driver boundary in steps, `MRES` = 1, and setting
-//! `MRES` = 0.001 makes the record read in microns/millidegrees.
+//! The controller works in microns (linear) / millidegrees (rotary); the
+//! record hands the driver raw steps and C's `STEPS_PER_EGU` (1000) makes one
+//! micron or millidegree 1000 steps, so `MRES` = 0.001 reads in those units.
 //!
 //! ## Hold time
 //!
@@ -171,6 +168,8 @@ fn parse_char_reply(reply: &str) -> Option<(String, char)> {
 }
 
 /// Parse a `:A<axis>A<angle>R<rev>` rotary reply into (angle, revolutions).
+// C getAngle tests `4 != sscanf` on a 3-conversion format, so C fails every
+// rotary poll; rs parses the reply.
 fn parse_angle(reply: &str) -> Option<(f64, i64)> {
     let s = reply.trim().strip_prefix(":A")?;
     let a = s.find('A')?;
