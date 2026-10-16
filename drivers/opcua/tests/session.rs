@@ -948,7 +948,7 @@ fn an_item_shows_itself_as_item_open62541_show_does() {
 
     assert_eq!(
         item.show_line(),
-        "item ns=2;s=Sensor record=rec state=down status=Good dataDirty=n context=subs@sess \
+        "item ns=2;s=Sensor record=rec state=down status=BadServerNotConnected dataDirty=n context=subs@sess \
          sampling=0(-1) deadband=0 qsize=0(1) cqsize=3 discard=old timestamp=server \
          bini=read output=n monitor=y registered=-(y)"
     );

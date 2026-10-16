@@ -169,7 +169,7 @@ impl Item {
             revised_queue_size: 0,
             leaves: Vec::new(),
             last_value: None,
-            last_status: StatusCode::Good,
+            last_status: StatusCode::BadServerNotConnected,
             last_timestamp: None,
             type_tree: None,
             timestamp_element_reported: false,
