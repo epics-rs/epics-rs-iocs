@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::session::SessionConfig;
+use crate::session::{SessionConfig, status_name};
 use crate::subscription::SubscriptionConfig;
 
 /// Where the PKI file store lives when neither the client nor the session says.
@@ -182,23 +182,31 @@ impl UaConnector for AsyncOpcuaConnector {
             builder = builder.private_key_path(key);
         }
 
-        let mut client = builder
-            .client()
-            .map_err(|errors| format!("client configuration is invalid: {}", errors.join(", ")))?;
+        let mut client = builder.client().map_err(|errors| {
+            format!(
+                "security discovery and setup failed with status {}",
+                errors.join(", ")
+            )
+        })?;
 
         let endpoint = config.endpoint_description();
         let identity = config.identity.token()?;
         let (session, event_loop) = client
             .connect_to_matching_endpoint(endpoint, identity)
             .await
-            .map_err(|e| format!("connecting to {} failed: {e}", config.url))?;
+            .map_err(|e| {
+                format!(
+                    "connect service failed with status {}",
+                    status_name(e.status())
+                )
+            })?;
 
         let handle = event_loop.spawn();
         session
             .wait_for_connection()
             .await
             .then_some(())
-            .ok_or_else(|| format!("session to {} did not come up", config.url))?;
+            .ok_or_else(|| "connect service failed (session did not activate)".to_string())?;
 
         Ok(Arc::new(AsyncOpcuaConnection {
             session,
@@ -349,7 +357,7 @@ impl Identity {
                 certificate,
                 private_key,
             } => IdentityToken::new_x509_path(certificate, private_key)
-                .map_err(|e| format!("reading the identity certificate failed: {e}"))?,
+                .map_err(|e| format!("loading client certificate {certificate} failed: {e}"))?,
         })
     }
 }

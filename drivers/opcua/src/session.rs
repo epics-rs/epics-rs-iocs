@@ -15,6 +15,7 @@ use async_opcua::types::{
     AttributeId, DataValue, EndpointDescription, MonitoredItemCreateRequest, NodeId, ReadValueId,
     StatusCode, Variant, WriteValue,
 };
+use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
@@ -102,9 +103,9 @@ impl SessionConfig {
             }
             "nodes-max" | "batch-nodes" => {
                 if name == "batch-nodes" {
-                    log::warn!(
-                        "DEPRECATION WARNING: option 'batch-nodes' is deprecated; use 'nodes-max'."
-                    );
+                    errlog_vprintf(format_args!(
+                        "DEPRECATED: option 'batch-nodes'; use 'nodes-max' instead\n"
+                    ));
                 }
                 self.nodes_max = count(value)?;
             }
@@ -331,18 +332,27 @@ impl SessionWorker {
     /// The worker's whole life: connect, serve, reconnect.
     pub async fn run(mut self) {
         let mut connect_now = self.autoconnect();
+        // `opcuaConnect` asked for this attempt (C `connect(manual)`).
+        let mut manual = false;
         loop {
             if self.connection.is_none() {
                 if !connect_now {
                     match self.control.recv().await {
-                        Some(Control::Connect) => connect_now = true,
+                        Some(Control::Connect) => {
+                            connect_now = true;
+                            manual = true;
+                        }
                         Some(Control::Disconnect) => continue,
                         None => return,
                     }
                     continue;
                 }
-                if let Err(e) = self.connect().await {
-                    log::error!("session {}: {e}", self.handle.name);
+                let attempt = self.connect().await;
+                let was_manual = std::mem::take(&mut manual);
+                if let Err(e) = attempt {
+                    if was_manual || self.debug() > 0 {
+                        errlog_vprintf(format_args!("OPC UA session {}: {e}\n", self.handle.name));
+                    }
                     // `opcua_ConnectTimeout` is both the connect timeout and the
                     // interval between attempts (`iocshVariables.h:24`).
                     let retry = defaults::CONNECT_TIMEOUT.get().max(0.1);
@@ -373,21 +383,17 @@ impl SessionWorker {
         self.handle.config.lock().autoconnect
     }
 
+    fn debug(&self) -> u32 {
+        self.handle.config.lock().debug
+    }
+
     async fn connect(&mut self) -> Result<(), String> {
         let config = self.handle.config.lock().clone();
         let connection = self.connector.connect(&config).await?;
-        self.server = connection
-            .server_info()
-            .await
-            .map_err(|e| format!("reading the server's capabilities failed: {e}"))?;
+        // C reads each capability on its own and keeps its default when the
+        // read fails, with no print (`SessionOpen62541.cpp:2447-2484`).
+        self.server = connection.server_info().await.unwrap_or_default();
         let type_tree = connection.type_tree().await.ok();
-        if type_tree.is_none() {
-            log::warn!(
-                "session {}: the server's type dictionary could not be read; \
-                 enumerations and structures will not resolve",
-                self.handle.name
-            );
-        }
 
         self.rebuild_node_ids();
         self.register_nodes(&connection).await;
@@ -414,7 +420,6 @@ impl SessionWorker {
         *self.handle.status.lock() = ConnectionStatus::Up;
 
         self.start_subscriptions(&connection).await;
-        log::info!("session {} is up", self.handle.name);
         Ok(())
     }
 
@@ -581,7 +586,19 @@ impl SessionWorker {
                 true
             }
             Err(status) => {
-                log::error!("session {}: read failed: {status}", self.handle.name);
+                if is_connection_error(status) {
+                    errlog_vprintf(format_args!(
+                        "OPC UA session {}: (requestRead) beginRead service failed with status {}\n",
+                        self.handle.name,
+                        status_name(status)
+                    ));
+                } else if self.debug() > 0 {
+                    println!(
+                        "Session {}: (readComplete) for read service failed with status {}",
+                        self.handle.name,
+                        status_name(status)
+                    );
+                }
                 for handle in handles {
                     if let Some(item) = items.get(*handle as usize) {
                         item.lock()
@@ -659,7 +676,19 @@ impl SessionWorker {
                 true
             }
             Err(status) => {
-                log::error!("session {}: write failed: {status}", self.handle.name);
+                if is_connection_error(status) {
+                    errlog_vprintf(format_args!(
+                        "OPC UA session {}: (requestWrite) beginWrite service failed with status {}\n",
+                        self.handle.name,
+                        status_name(status)
+                    ));
+                } else if self.debug() > 0 {
+                    println!(
+                        "Session {}: (writeComplete) for write service failed with status {}",
+                        self.handle.name,
+                        status_name(status)
+                    );
+                }
                 for item in &written {
                     item.lock()
                         .set_incoming_event(ProcessReason::WriteFailure, status);
@@ -674,7 +703,9 @@ impl SessionWorker {
     fn rebuild_node_ids(&self) {
         let map = self.handle.config.lock().namespace_map.clone();
         let mut remap: HashMap<u16, u16> = HashMap::new();
-        for (local, uri) in &map {
+        // An unread namespace array is no mapping to report on, as in C.
+        let read = !self.server.namespace_array.is_empty();
+        for (local, uri) in map.iter().filter(|_| read) {
             match self
                 .server
                 .namespace_array
@@ -684,11 +715,10 @@ impl SessionWorker {
                 Some(index) => {
                     remap.insert(*local, index as u16);
                 }
-                None => log::error!(
-                    "session {}: the server has no namespace '{uri}'; \
-                     items in namespace {local} keep their configured index",
+                None => errlog_vprintf(format_args!(
+                    "OPC UA session {}: locally mapped namespace '{uri}' not found on server\n",
                     self.handle.name
-                ),
+                )),
             }
         }
 
@@ -727,15 +757,22 @@ impl SessionWorker {
         let ids: Vec<NodeId> = to_register.iter().map(|(_, id)| id.clone()).collect();
         match connection.register_nodes(&ids).await {
             Ok(registered) => {
+                if self.debug() > 0 {
+                    println!(
+                        "Session {}: (registerNodes) registerNodes service ok ({} nodes registered)",
+                        self.handle.name,
+                        registered.len()
+                    );
+                }
                 for ((i, _), id) in to_register.iter().zip(registered) {
-                    log::debug!("session {}: registered node {id}", self.handle.name);
                     items[*i].lock().registered_node_id = Some(id);
                 }
             }
-            Err(status) => log::error!(
-                "session {}: registering nodes failed: {status}",
-                self.handle.name
-            ),
+            Err(status) => errlog_vprintf(format_args!(
+                "OPC UA session {}: (registerNodes) registerNodes service failed with status {}\n",
+                self.handle.name,
+                status_name(status)
+            )),
         }
     }
 
@@ -881,6 +918,11 @@ fn monitored_item_request(item: &Item) -> MonitoredItemCreateRequest {
 }
 
 /// Which failures mean the session is gone rather than the request being bad.
+/// C `UA_StatusCode_name`: the code's name without the info bits.
+pub(crate) fn status_name(status: StatusCode) -> &'static str {
+    status.sub_code().name()
+}
+
 fn is_connection_error(status: StatusCode) -> bool {
     matches!(
         status,
