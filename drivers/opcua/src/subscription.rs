@@ -1,6 +1,9 @@
 //! Subscription configuration (`Subscription.cpp`, `SubscriptionOpen62541.cpp`).
 
+use epics_rs::base::runtime::log::errlog_vprintf;
+
 use crate::defaults;
+use crate::session::strtoul;
 
 /// `opcuaSubscription(NAME, SESSION, INTERVAL, [options])`
 /// (`iocshIntegration.cpp:159-201`).
@@ -35,22 +38,24 @@ impl SubscriptionConfig {
         }
     }
 
-    /// The subscription options of `opcuaSubscription`
-    /// (`SubscriptionOpen62541.cpp:80-107`).
-    pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), String> {
-        match name {
-            "debug" => {
-                self.debug = value
-                    .parse()
-                    .map_err(|_| format!("invalid value '{value}' for option 'debug'"))?;
-            }
-            "priority" => {
-                self.priority = value
-                    .parse()
-                    .map_err(|_| format!("invalid value '{value}' for option 'priority'"))?;
-            }
-            _ => return Err(format!("unknown subscription option '{name}'")),
+    /// One `key=value` subscription option (`SubscriptionOpen62541::setOption`);
+    /// a bad name or value is reported and passed over, as in the C.
+    pub fn set_option(&mut self, name: &str, value: &str) {
+        if self.debug > 0 || name == "debug" {
+            eprintln!(
+                "Subscription {}: setting option {name} to {value}",
+                self.name
+            );
         }
-        Ok(())
+        match name {
+            "debug" => self.debug = strtoul(value) as u32,
+            "priority" => match u8::try_from(strtoul(value)) {
+                Ok(priority) => self.priority = priority,
+                Err(_) => errlog_vprintf(format_args!(
+                    "option '{name}' value out of range - ignored\n"
+                )),
+            },
+            _ => errlog_vprintf(format_args!("unknown option '{name}' - ignored\n")),
+        }
     }
 }

@@ -326,7 +326,7 @@ fn session_options_are_parsed() {
     config.set_option("debug", "2").unwrap();
     config.set_option("autoconnect", "no").unwrap();
     config.set_option("nodes-max", "100").unwrap();
-    config.set_option("read-timeout-min", "5.5").unwrap();
+    config.set_option("read-timeout-min", "5").unwrap();
     config.set_option("sec-mode", "SignAndEncrypt").unwrap();
     config.set_option("sec-id", "/etc/opcua/creds").unwrap();
     config.set_option("pki-dir", "/etc/pki").unwrap();
@@ -334,7 +334,7 @@ fn session_options_are_parsed() {
     assert_eq!(config.debug, 2);
     assert!(!config.autoconnect);
     assert_eq!(config.nodes_max, 100);
-    assert_eq!(config.read_timeout_min, 5.5);
+    assert_eq!(config.read_timeout_min, 5.0);
     assert_eq!(
         config.security_mode,
         opcua::client::SecurityMode::SignAndEncrypt
@@ -344,10 +344,27 @@ fn session_options_are_parsed() {
 }
 
 #[test]
-fn an_unknown_session_option_is_rejected() {
+fn a_bad_session_option_is_passed_over() {
+    // C reports an unknown name or bad mode and goes on; strtoul reads "x"
+    // as 0 and "0x10" as 16.
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    assert!(config.set_option("nonsense", "1").is_err());
-    assert!(config.set_option("nodes-max", "x").is_err());
+    config.set_option("nonsense", "1").unwrap();
+    config.set_option("sec-mode", "Bogus").unwrap();
+    config.set_option("nodes-max", "0x10").unwrap();
+    assert_eq!(config.nodes_max, 16);
+    config.set_option("nodes-max", "x").unwrap();
+    assert_eq!(config.nodes_max, 0);
+    assert_eq!(config.security_mode, opcua::client::SecurityMode::Best);
+}
+
+#[test]
+fn an_illegal_autoconnect_is_the_one_option_error() {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(
+        config.set_option("autoconnect", "maybe"),
+        Err("illegal value 'm'".to_string())
+    );
+    assert!(config.autoconnect);
 }
 
 /// `setupIdentity` on a credentials file holding `contents`.
@@ -413,11 +430,14 @@ fn an_unusable_credentials_file_falls_back_to_the_anonymous_token() {
 #[test]
 fn subscription_options_are_parsed() {
     let mut config = SubscriptionConfig::new("subs", "sess");
-    config.set_option("priority", "5").unwrap();
-    config.set_option("debug", "1").unwrap();
+    config.set_option("priority", "5");
+    config.set_option("debug", "1");
     assert_eq!(config.priority, 5);
     assert_eq!(config.debug, 1);
-    assert!(config.set_option("nonsense", "1").is_err());
+    // Reported and passed over, as in the C.
+    config.set_option("nonsense", "1");
+    config.set_option("priority", "256");
+    assert_eq!(config.priority, 5);
 }
 
 // -------------------------------------------------------------------- connecting

@@ -113,7 +113,8 @@ impl Registry {
             .iter_mut()
             .find(|s| s.name == name)
             .expect("the subscription is on the session it was added to");
-        subscription.set_option(key, value)
+        subscription.set_option(key, value);
+        Ok(())
     }
 
     /// `opcuaMapNamespace` (`iocshIntegration.cpp:452-490`).

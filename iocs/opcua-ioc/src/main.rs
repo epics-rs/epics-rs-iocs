@@ -96,9 +96,11 @@ fn commands(
                 }
                 let mut config = SessionConfig::new(&name, &url);
                 for (key, value) in options(args, 2)? {
-                    config
-                        .set_option(&key, &value)
-                        .map_err(|e| format!("opcuaSession {name}: {e}"))?;
+                    // The C's catch: report, and apply no further option.
+                    if let Err(e) = config.set_option(&key, &value) {
+                        eprintln!("ERROR : {e}");
+                        break;
+                    }
                 }
                 registry
                     .add_session(config)
@@ -139,9 +141,7 @@ fn commands(
                     config.publishing_interval = *interval;
                 }
                 for (key, value) in options(args, 3)? {
-                    config
-                        .set_option(&key, &value)
-                        .map_err(|e| format!("opcuaSubscription {name}: {e}"))?;
+                    config.set_option(&key, &value);
                 }
                 registry
                     .add_subscription(config)

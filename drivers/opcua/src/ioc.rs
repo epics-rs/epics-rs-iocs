@@ -72,7 +72,11 @@ pub fn set_options(
     }
     for name in &names {
         for (key, value) in options {
-            registry.set_option(name, key, value)?;
+            // The C's catch: report, and apply nothing further.
+            if let Err(e) = registry.set_option(name, key, value) {
+                eprintln!("ERROR : {e}");
+                return Ok(names.len());
+            }
         }
     }
     Ok(names.len())

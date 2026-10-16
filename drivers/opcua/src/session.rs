@@ -172,46 +172,50 @@ impl SessionConfig {
         }
     }
 
-    /// One `key=value` session option (`SessionOpen62541.cpp:159-260`).
+    /// One `key=value` session option (`SessionOpen62541::setOption`). As in
+    /// the C a bad name or value is reported and passed over; `Err` is only
+    /// the C's exception (an illegal `autoconnect`), which ends the option list.
     pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), String> {
-        let number = |v: &str| -> Result<f64, String> {
-            v.parse()
-                .map_err(|_| format!("invalid value '{v}' for option '{name}'"))
-        };
-        let count = |v: &str| -> Result<u32, String> {
-            v.parse()
-                .map_err(|_| format!("invalid value '{v}' for option '{name}'"))
-        };
+        if self.debug > 0 || name == "debug" {
+            eprintln!("Session {}: setting option {name} to {value}", self.name);
+        }
+        // C reads every count with strtoul and stores it narrowed.
+        let count = || strtoul(value) as u32;
         match name {
-            "debug" => self.debug = count(value)?,
-            "autoconnect" => {
-                self.autoconnect =
-                    matches!(value.chars().next(), Some('y' | 'Y' | 't' | 'T' | '1'));
-            }
+            "sec-mode" => match SecurityMode::parse(value) {
+                Some(mode) => self.security_mode = mode,
+                None => errlog_vprintf(format_args!(
+                    "invalid security-mode (valid: best None Sign SignAndEncrypt)\n"
+                )),
+            },
+            "sec-policy" => self.security_policy = Some(value.to_string()),
+            "sec-id" => self.identity_file = Some(value.to_string()),
+            "debug" => self.debug = count(),
             "nodes-max" | "batch-nodes" => {
                 if name == "batch-nodes" {
                     errlog_vprintf(format_args!(
                         "DEPRECATED: option 'batch-nodes'; use 'nodes-max' instead\n"
                     ));
                 }
-                self.nodes_max = count(value)?;
+                self.nodes_max = count();
             }
-            "read-nodes-max" => self.read_nodes_max = count(value)?,
-            "read-timeout-min" => self.read_timeout_min = number(value)?,
-            "read-timeout-max" => self.read_timeout_max = number(value)?,
-            "write-nodes-max" => self.write_nodes_max = count(value)?,
-            "write-timeout-min" => self.write_timeout_min = number(value)?,
-            "write-timeout-max" => self.write_timeout_max = number(value)?,
-            "sec-mode" => {
-                self.security_mode = SecurityMode::parse(value)
-                    .ok_or_else(|| format!("invalid security mode '{value}'"))?;
+            "read-nodes-max" => self.read_nodes_max = count(),
+            "read-timeout-min" => self.read_timeout_min = count() as f64,
+            "read-timeout-max" => self.read_timeout_max = count() as f64,
+            "write-nodes-max" => self.write_nodes_max = count(),
+            "write-timeout-min" => self.write_timeout_min = count() as f64,
+            "write-timeout-max" => self.write_timeout_max = count() as f64,
+            "autoconnect" => {
+                if let Some(c) = value.chars().next() {
+                    self.autoconnect = get_yes_no(c)?;
+                }
             }
-            "sec-policy" => self.security_policy = Some(value.to_string()),
-            "sec-id" => self.identity_file = Some(value.to_string()),
+            // Not C session options: the C sets these through opcuaSetupPKI
+            // and opcuaClientCertificate.
             "pki-dir" => self.pki_dir = Some(value.to_string()),
             "cert" => self.certificate_path = Some(value.to_string()),
             "key" => self.private_key_path = Some(value.to_string()),
-            _ => return Err(format!("unknown session option '{name}'")),
+            _ => errlog_vprintf(format_args!("unknown option '{name}' - ignored\n")),
         }
         Ok(())
     }
@@ -1075,5 +1079,47 @@ fn strerror(e: &std::io::Error) -> String {
     match text.find(" (os error") {
         Some(end) => text[..end].to_string(),
         None => text,
+    }
+}
+
+/// C `strtoul(s, nullptr, 0)`: leading whitespace, an optional sign, then the
+/// longest prefix in base 16 (`0x`), 8 (`0`) or 10; nothing parsed is 0 and a
+/// minus sign wraps.
+pub(crate) fn strtoul(s: &str) -> u64 {
+    let s = s.trim_start();
+    let (negative, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (radix, digits) = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
+        && hex.starts_with(|c: char| c.is_ascii_hexdigit())
+    {
+        (16, hex)
+    } else if s.starts_with('0') {
+        (8, s)
+    } else {
+        (10, s)
+    };
+    let mut value: u64 = 0;
+    for c in digits.chars() {
+        let Some(d) = c.to_digit(radix) else { break };
+        value = value.saturating_mul(radix as u64).saturating_add(d as u64);
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
+/// C `getYesNo` (`linkParser.cpp:44`).
+pub(crate) fn get_yes_no(c: char) -> Result<bool, String> {
+    if "YyTt1".contains(c) {
+        Ok(true)
+    } else if "NnFf0".contains(c) {
+        Ok(false)
+    } else {
+        Err(format!("illegal value '{c}'"))
     }
 }
