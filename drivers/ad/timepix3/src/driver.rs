@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::driver::ADDriverBase;
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -866,6 +866,16 @@ impl TimePix3Driver {
     }
 }
 
+impl ADDriver for TimePix3Driver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
+    }
+}
+
 impl PortDriver for TimePix3Driver {
     fn base(&self) -> &PortDriverBase {
         &self.ad.port_base
@@ -1018,6 +1028,10 @@ impl PortDriver for TimePix3Driver {
                     status: AsynStatus::Error,
                     message: "timepix3: the connection task is not running".into(),
                 })
+        } else if reason < p.http_code {
+            // ADTIMEPIX_FIRST_PARAM is ADTimePixHttpCode (ADTimePix.h:467,
+            // ADTimePix.cpp:860-863).
+            ADDriver::ad_write_int32(self, user, value)
         } else {
             Ok(())
         };
@@ -1194,5 +1208,39 @@ impl PortDriver for TimePix3Driver {
         let n = buf.len().min(data.len());
         buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_BASE_WRITE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(p.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
     }
 }
