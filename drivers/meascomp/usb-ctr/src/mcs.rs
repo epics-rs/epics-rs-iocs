@@ -70,14 +70,16 @@ impl McsState {
     }
 }
 
-/// Erase all MCS buffers.
-pub fn erase_mcs(state: &mut McsState) {
+/// Clear the first `num_points` of every spectrum and restart the elapsed
+/// clock, which an acquisition in progress keeps counting from. C
+/// `USBCTR::eraseMCS`; the time bases are left alone.
+pub fn erase_mcs(state: &mut McsState, num_points: usize) {
     for buf in &mut state.mcs_buffers {
-        buf.iter_mut().for_each(|v| *v = 0);
+        let n = num_points.min(buf.len());
+        buf[..n].fill(0);
     }
-    state.abs_time_buffer.iter_mut().for_each(|v| *v = 0.0);
-    state.time_buffer.iter_mut().for_each(|v| *v = 0.0);
     state.current_point = 0;
+    state.start_time = current_time_secs();
 }
 
 /// Compute the time waveform based on dwell time.

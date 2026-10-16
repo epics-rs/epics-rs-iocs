@@ -312,8 +312,30 @@ impl PortDriver for CtrDriver {
                 self.base.params.set_value(reason, addr, value)?;
             }
         } else if reason == self.params.mca_erase {
-            let mut st = self.state.lock().unwrap();
-            mcs::erase_mcs(&mut st.mcs);
+            let port = &self.base.port_name;
+            user.print(
+                TraceMask::FLOW,
+                file!(),
+                line!(),
+                format_args!("USBCTR:writeInt32: [{port} addr={addr}]: erased"),
+            );
+            let num_points = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
+            mcs::erase_mcs(
+                &mut self.state.lock().unwrap().mcs,
+                num_points.max(0) as usize,
+            );
+            self.base
+                .params
+                .set_int32(self.params.mcs_current_point, 0, 0)?;
+            for i in 0..MAX_MCS_COUNTERS as i32 {
+                self.base
+                    .params
+                    .set_float64(self.params.mca_elapsed_live, i, 0.0)?;
+                self.base
+                    .params
+                    .set_float64(self.params.mca_elapsed_real, i, 0.0)?;
+                self.base.call_param_callbacks(i)?;
+            }
         } else if reason == self.params.mca_num_channels && value > self.max_time_points as i32 {
             let max = self.max_time_points as i32;
             self.base
