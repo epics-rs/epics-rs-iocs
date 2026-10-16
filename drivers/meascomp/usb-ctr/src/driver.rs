@@ -241,6 +241,17 @@ impl PortDriver for CtrDriver {
         } else if reason == self.params.mca_erase {
             let mut st = self.state.lock().unwrap();
             mcs::erase_mcs(&mut st.mcs);
+        } else if reason == self.params.mca_num_channels && value > self.max_time_points as i32 {
+            let max = self.max_time_points as i32;
+            self.base
+                .params
+                .set_int32(self.params.mca_num_channels, 0, max)?;
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("USBCTR:writeInt32:  # channels={value} too large, max={max}"),
+            );
         }
 
         self.base.call_param_callbacks(addr)?;
