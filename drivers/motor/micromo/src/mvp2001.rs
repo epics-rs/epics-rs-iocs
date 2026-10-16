@@ -362,10 +362,12 @@ impl AsynMotor for Mvp2001Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
-        let (handle, _) = SyncIOHandle::connect_port("MVP2001_NONE", 0, Duration::ZERO);
+        let (handle, _) =
+            SyncIOHandle::connect_port("MVP2001_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mvp2001Controller::new(handle, 1)));
         let axis = Mvp2001Axis::new(controller, 0, 512, 500, 1);
         assert_eq!(axis.sample_period, DEFAULT_SAMPLE_PERIOD);

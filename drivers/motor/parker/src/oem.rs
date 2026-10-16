@@ -342,10 +342,16 @@ fn switch_from_is(is: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn an_axis_of_a_missing_port_is_still_built() {
-        let (handle, _) = SyncIOHandle::connect_port("OEM_NONE", 0, std::time::Duration::ZERO);
+        let (handle, _) = SyncIOHandle::connect_port(
+            "OEM_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
         let controller = Arc::new(Mutex::new(OemController::new(handle)));
         assert_eq!(OemAxis::new(controller, 0).address, 1);
     }

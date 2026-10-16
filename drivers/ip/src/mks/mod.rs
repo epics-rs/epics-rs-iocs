@@ -19,6 +19,7 @@ use std::time::Duration;
 use epics_rs::asyn::adapter::parse_asyn_link;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::QueuePriority;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{CellBody, PortCalls, RequestCell, RequestOp, Unrun};
@@ -73,7 +74,7 @@ fn print(handle: &PortHandle, mask: TraceMask, args: std::fmt::Arguments<'_>) {
 /// `pasynOctetSyncIO->writeReadOnce(port, 0, data, ..., TIMEOUT, ...)`,
 /// with its own failure line.
 fn write_read_once(port: &str, data: &[u8]) -> Result<Vec<u8>, ()> {
-    let (io, connected) = SyncIOHandle::connect_port(port, ADDR, TIMEOUT);
+    let (io, connected) = SyncIOHandle::connect_port(port, ADDR, TIMEOUT, InterfaceType::Octet);
     if let Err(e) = connected {
         io.print(
             0,

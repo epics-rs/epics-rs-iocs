@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -102,7 +103,8 @@ fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
 /// still created.
 fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<SyncIOHandle> {
     let trace = MotorTrace::new(self_port, 0);
-    let (handle, connected) = SyncIOHandle::connect_port(port, addr, PMAC_TIMEOUT);
+    let (handle, connected) =
+        SyncIOHandle::connect_port(port, addr, PMAC_TIMEOUT, InterfaceType::Octet);
     let kept = match connected.and_then(|()| handle.port()) {
         Err(_) => {
             trace.print_self(

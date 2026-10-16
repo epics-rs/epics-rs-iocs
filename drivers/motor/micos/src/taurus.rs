@@ -358,10 +358,12 @@ impl AsynMotor for TaurusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
-        let (handle, _) = SyncIOHandle::connect_port("TAURUS_NONE", 0, Duration::ZERO);
+        let (handle, _) =
+            SyncIOHandle::connect_port("TAURUS_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
         let axis = TaurusAxis::new(controller, 0);
         assert_eq!((axis.neg_travel_limit, axis.pos_travel_limit), (0.0, 0.0));

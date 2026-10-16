@@ -513,13 +513,18 @@ impl AsynMotor for ScuAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     /// smarActSCUMotorDriver.cpp:185-193: a failed probe bails and the axis
     /// stays, its poll then failing on the same user.
     #[test]
     fn an_axis_of_an_unconnected_controller_is_kept() {
-        let (handle, status) =
-            SyncIOHandle::connect_port("scu-missing-port", 0, std::time::Duration::from_millis(10));
+        let (handle, status) = SyncIOHandle::connect_port(
+            "scu-missing-port",
+            0,
+            std::time::Duration::from_millis(10),
+            InterfaceType::Octet,
+        );
         assert!(status.is_err());
         let controller = Arc::new(Mutex::new(ScuController::new(handle)));
         let (mut axis, probed) = ScuAxis::new(controller, 3, "scu-motor", 1);

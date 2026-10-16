@@ -280,10 +280,16 @@ impl AsynMotor for C300Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn a_controller_of_a_missing_port_is_still_built() {
-        let (handle, _) = SyncIOHandle::connect_port("C300_NONE", 0, std::time::Duration::ZERO);
+        let (handle, _) = SyncIOHandle::connect_port(
+            "C300_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
         let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
         let axis = C300Axis::new(controller, 0);
         assert!(!axis.has_encoder);

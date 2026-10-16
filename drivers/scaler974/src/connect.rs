@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::services::PortServices;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::{TraceManager, TraceMask};
@@ -40,7 +41,7 @@ impl OctetLink {
 /// `SyncIOHandle` is not `Clone`; both handles wrap the same underlying
 /// `PortHandle`, whose requests are serialized by the port's actor.
 pub fn connect_octet(port_name: &str, addr: i32, timeout: Duration) -> (OctetLink, AsynResult<()>) {
-    let (sync, status) = SyncIOHandle::connect_port(port_name, addr, timeout);
+    let (sync, status) = SyncIOHandle::connect_port(port_name, addr, timeout, InterfaceType::Octet);
     let trace = match sync.port() {
         Ok(port) => port.trace().clone(),
         Err(_) => PortServices::global().trace().clone(),

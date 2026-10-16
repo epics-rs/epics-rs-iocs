@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -309,7 +310,8 @@ pub fn create_ip_port(
 /// hands back a user — unbound on a missing port, beside `connectDevice`'s
 /// refusal (asynManager.c:1339-1342).
 pub fn connect_octet(port_name: &str, timeout: Duration) -> (OctetIo, AsynResult<()>) {
-    let (user, status) = SyncIOHandle::connect_port(port_name, OCTET_ADDR, timeout);
+    let (user, status) =
+        SyncIOHandle::connect_port(port_name, OCTET_ADDR, timeout, InterfaceType::Octet);
     let io = match user.port() {
         Ok(port) => OctetIo::new(port.clone(), timeout),
         Err(_) => OctetIo::unbound(timeout),

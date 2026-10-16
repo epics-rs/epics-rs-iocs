@@ -360,10 +360,12 @@ impl AsynMotor for HydraAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_still_built() {
-        let (handle, _) = SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO);
+        let (handle, _) =
+            SyncIOHandle::connect_port("HYDRA_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(HydraController::new(handle)));
         assert_eq!(HydraAxis::new(controller, 0).motor_form, 0);
     }

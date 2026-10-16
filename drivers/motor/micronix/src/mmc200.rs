@@ -410,11 +410,13 @@ impl AsynMotor for Mmc200Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use std::time::Duration;
 
     #[test]
     fn an_axis_of_an_unanswering_controller_is_built_with_a_problem() {
-        let (handle, _) = SyncIOHandle::connect_port("MMC200_NONE", 0, Duration::ZERO);
+        let (handle, _) =
+            SyncIOHandle::connect_port("MMC200_NONE", 0, Duration::ZERO, InterfaceType::Octet);
         let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
         let axis = Mmc200Axis::new(controller, 0, false);
         assert_eq!(axis.model, -1);

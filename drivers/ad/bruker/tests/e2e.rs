@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interpose::eos::EosInterpose;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
@@ -472,9 +473,11 @@ fn a_scan_without_an_acquire_time_still_reaches_bis() {
 /// detector; only its BIS traffic fails.
 #[test]
 fn a_detector_whose_socket_ports_are_missing_still_boots() {
-    let (command, status) = SyncIOHandle::connect_port("BISNONE_COMMAND", 0, Duration::ZERO);
+    let (command, status) =
+        SyncIOHandle::connect_port("BISNONE_COMMAND", 0, Duration::ZERO, InterfaceType::Octet);
     assert!(status.is_err());
-    let (status_user, status) = SyncIOHandle::connect_port("BISNONE_STATUS", 0, Duration::ZERO);
+    let (status_user, status) =
+        SyncIOHandle::connect_port("BISNONE_STATUS", 0, Duration::ZERO, InterfaceType::Octet);
     assert!(status.is_err());
     let detector = create_bruker_detector(&claim_port("BISNONE").unwrap(), command, status_user, 0)
         .expect("the detector port");

@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -330,7 +331,8 @@ pub fn create_marccd_detector(
     max_memory: usize,
 ) -> Result<MarccdRuntime, String> {
     let port_name = claim.name();
-    let (server, connected) = SyncIOHandle::connect_port(server_port, 0, Duration::ZERO);
+    let (server, connected) =
+        SyncIOHandle::connect_port(server_port, 0, Duration::ZERO, InterfaceType::Octet);
 
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
@@ -457,8 +459,12 @@ pub(crate) mod tests {
     /// A driver on a silent fake server, outside any port runtime.
     fn driver(name: &str) -> MarccdDriver {
         fake_server(name, |_| "");
-        let (server, connected) =
-            SyncIOHandle::connect_port(&format!("{name}_IP"), 0, Duration::ZERO);
+        let (server, connected) = SyncIOHandle::connect_port(
+            &format!("{name}_IP"),
+            0,
+            Duration::ZERO,
+            InterfaceType::Octet,
+        );
         connected.unwrap();
         let links = DriverLinks {
             server,

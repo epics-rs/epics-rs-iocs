@@ -639,6 +639,7 @@ impl ControllerParams for AcsMotionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     #[test]
     fn a_controller_of_a_missing_port_keeps_its_axes() {
@@ -646,6 +647,7 @@ mod tests {
             "spiiplus-missing-port",
             0,
             std::time::Duration::from_millis(10),
+            InterfaceType::Octet,
         );
         assert!(status.is_err());
         let ctrl = Arc::new(Mutex::new(SpiiPlusController::new(handle, "ACS", 2)));

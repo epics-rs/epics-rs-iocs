@@ -345,6 +345,7 @@ mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::interfaces::InterfaceType;
     use epics_rs::asyn::registry::claim_port;
     use std::time::Duration;
 
@@ -430,7 +431,8 @@ mod tests {
     /// with no p2util port configured the detector port still exists.
     #[test]
     fn a_detector_whose_command_port_is_missing_still_boots() {
-        let (cmd, status) = SyncIOHandle::connect_port("PII_NONE_CMD", 0, Duration::ZERO);
+        let (cmd, status) =
+            SyncIOHandle::connect_port("PII_NONE_CMD", 0, Duration::ZERO, InterfaceType::Octet);
         assert!(status.is_err());
         let rt = create_photonii_detector(&claim_port("PII_NONE").unwrap(), cmd, 1 << 20)
             .expect("the detector port");

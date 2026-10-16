@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -77,7 +78,8 @@ pub fn connect_link(port_name: &str, io_port: &str, timeout: Duration) -> SyncIO
             "SmarActMCSController: unable to connect serial channel\n"
         ));
     }
-    let (junk, _) = SyncIOHandle::connect_port(io_port, 0, Duration::from_secs(2));
+    let (junk, _) =
+        SyncIOHandle::connect_port(io_port, 0, Duration::from_secs(2), InterfaceType::Octet);
     let got_junk = match junk.read_octet(0, 100) {
         Ok(bytes) => bytes.len(),
         Err(e) => e.partial_read().map_or(0, |p| p.data.len()),

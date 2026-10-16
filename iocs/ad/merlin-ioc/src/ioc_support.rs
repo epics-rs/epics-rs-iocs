@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
@@ -113,8 +114,10 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
                 // C ignores both connect statuses (merlinDetector.cpp:1398-1401):
                 // a missing socket port leaves a user whose every transfer fails.
-                let (cmd, _) = SyncIOHandle::connect_port(&cmd_port, 0, Duration::ZERO);
-                let (data, _) = SyncIOHandle::connect_port(&data_port, 0, Duration::ZERO);
+                let (cmd, _) =
+                    SyncIOHandle::connect_port(&cmd_port, 0, Duration::ZERO, InterfaceType::Octet);
+                let (data, _) =
+                    SyncIOHandle::connect_port(&data_port, 0, Duration::ZERO, InterfaceType::Octet);
 
                 let rt =
                     create_merlin_detector(&claim, cmd, data, size_x, size_y, det_type, max_memory)

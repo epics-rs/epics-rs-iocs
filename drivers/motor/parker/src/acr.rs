@@ -324,12 +324,18 @@ impl AsynMotor for AcrAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::interfaces::InterfaceType;
 
     /// A failed PPU query keeps the axis with no encoder or gain support and
     /// refuses motion rather than dividing by an unset PPU.
     #[test]
     fn an_axis_of_a_missing_port_is_kept_and_never_scales() {
-        let (handle, _) = SyncIOHandle::connect_port("ACR_NONE", 0, std::time::Duration::ZERO);
+        let (handle, _) = SyncIOHandle::connect_port(
+            "ACR_NONE",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
         let controller = Arc::new(Mutex::new(AcrController::new(handle)));
         let mut axis = AcrAxis::new(controller, 0);
         assert_eq!(axis.pulses_per_unit, None);
@@ -352,7 +358,12 @@ mod tests {
     /// and a negative PPU scales as C does.
     #[test]
     fn a_zero_ppu_never_scales() {
-        let (handle, _) = SyncIOHandle::connect_port("ACR_PPU0", 0, std::time::Duration::ZERO);
+        let (handle, _) = SyncIOHandle::connect_port(
+            "ACR_PPU0",
+            0,
+            std::time::Duration::ZERO,
+            InterfaceType::Octet,
+        );
         let mut axis = AcrAxis::new(Arc::new(Mutex::new(AcrController::new(handle))), 0);
         axis.pulses_per_unit = Some(0.0);
         assert_eq!(axis.scaled(1.0).unwrap_err().message(), "AXIS0: PPU is 0");

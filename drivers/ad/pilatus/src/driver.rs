@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::interfaces::InterfaceType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -474,7 +475,8 @@ pub fn create_pilatus_detector(
     max_memory: usize,
 ) -> Result<PilatusRuntime, String> {
     let port_name = claim.name();
-    let (cam_handle, _) = SyncIOHandle::connect_port(camserver_port, 0, Duration::ZERO);
+    let (cam_handle, _) =
+        SyncIOHandle::connect_port(camserver_port, 0, Duration::ZERO, InterfaceType::Octet);
     let cam_handle = Arc::new(cam_handle);
 
     let (cmd_tx, cmd_rx) = rt::command_channel::<Cmd>(64);
