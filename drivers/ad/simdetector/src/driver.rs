@@ -6,6 +6,7 @@ use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -276,13 +277,14 @@ impl SimDetectorRuntime {
 /// allocate. `ad-core-rs` 0.22.1's `NDArrayPool` is bounded by `maxMemory`
 /// only, so `max_buffers` is accepted for iocsh signature parity and ignored.
 pub fn create_sim_detector(
-    port_name: &str,
+    claim: &PortClaim,
     max_size_x: i32,
     max_size_y: i32,
     data_type: NDDataType,
     _max_buffers: i32,
     max_memory: usize,
 ) -> AsynResult<SimDetectorRuntime> {
+    let port_name = claim.name();
     let (start_tx, start_rx) = rt::command_channel::<Signal>(1);
     let (stop_tx, stop_rx) = rt::command_channel::<Signal>(1);
 
@@ -298,7 +300,7 @@ pub fn create_sim_detector(
     // ownership of it and the IOC still needs to attach plugin senders.
     let queued_counter = det.ad.queued_counter.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
     let task_handle = start_sim_task(SimTaskContext {
