@@ -8,6 +8,7 @@
 use std::net::TcpListener;
 
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::asyn::error::AsynError;
 
 use eiger::driver::{EigerConfig, EigerDriver, MAX_ASYN_ADDRESS, MONITOR_ASYN_ADDRESS};
 use eiger::params::Model;
@@ -102,12 +103,13 @@ fn the_port_has_cs_eleven_addresses() {
     // ADDriver(portName, MAX_ASYN_ADDRESS, ...), eigerDetector.cpp:190.
     let base = &driver.ad.port_base;
     let counter = driver.ad.params.base.array_counter;
-    assert!(
-        base.get_int32_param(counter, MONITOR_ASYN_ADDRESS as i32)
-            .is_ok()
-    );
-    assert!(
-        base.get_int32_param(counter, MAX_ASYN_ADDRESS as i32)
-            .is_err()
-    );
+    // Lists past 0 are never set, so a held address reads ParamUndefined.
+    assert!(matches!(
+        base.get_int32_param(counter, MONITOR_ASYN_ADDRESS as i32),
+        Err(AsynError::ParamUndefined(_))
+    ));
+    assert!(matches!(
+        base.get_int32_param(counter, MAX_ASYN_ADDRESS as i32),
+        Err(AsynError::AddressOutOfRange(_))
+    ));
 }
