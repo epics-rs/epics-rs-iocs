@@ -9,7 +9,7 @@ use meascomp::device::DaqDevice;
 
 use crate::params::*;
 use crate::trace::{SelfTrace, status_of};
-use crate::wave_dig::{self, WaveDigState};
+use crate::wave_dig::{self, WaveDigScan, WaveDigState};
 use crate::wave_gen::{self, WaveGenState};
 
 /// Shared state between driver and poller.
@@ -44,10 +44,8 @@ struct PollSnapshot {
     wave_gen_running: bool,
     wave_gen_current_point: usize,
     wave_gen_just_stopped: bool,
-    /// Running at the start of the cycle; `wave_dig_restarted` is the
-    /// AUTO_RESTART of a scan that ended in it.
+    /// Running at the start of the cycle.
     wave_dig_running: bool,
-    wave_dig_restarted: bool,
     wave_dig_current_point: usize,
     /// Array callbacks of a digitizer scan that ended this cycle, built
     /// while the state lock is held and pushed after it is released.
@@ -93,6 +91,19 @@ fn poller_loop(
                 .read_int32_blocking(params.temperature_scale, ch as i32)
                 .unwrap_or(uldaq_sys::TS_CELSIUS);
         }
+
+        // What a digitizer scan that ends this cycle restarts with.
+        let restart = if state.lock().is_ok_and(|st| st.wave_dig.running) {
+            WaveDigScan::read_restart(
+                &params,
+                |r, a| handle.read_int32_blocking(r, a),
+                |r, a| handle.read_float64_blocking(r, a),
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
 
         // ---- Phase 2: uldaq reads (device lock held) ----
         // C `status`: the last uldaq call's result. A failed DIn, CIn or
@@ -145,7 +156,13 @@ fn poller_loop(
                     snap.wave_gen_just_stopped = wg_was_running && !st.wave_gen.running;
 
                     if st.wave_dig.running {
-                        match wave_dig::read_wave_dig(&dev, &mut st.wave_dig, &params, &trace) {
+                        match wave_dig::read_wave_dig(
+                            &dev,
+                            &mut st.wave_dig,
+                            &params,
+                            restart.as_ref(),
+                            &trace,
+                        ) {
                             Ok(arrays) => snap.wave_dig_arrays = arrays,
                             // Linux C does not `goto error` here.
                             Err(code) => {
@@ -157,7 +174,6 @@ fn poller_loop(
                         }
                         snap.wave_dig_current_point = st.wave_dig.current_point;
                         snap.wave_dig_running = true;
-                        snap.wave_dig_restarted = st.wave_dig.running;
                     } else {
                         for ch in 0..MAX_ANALOG_IN {
                             let ch_i = ch as i32;
@@ -261,11 +277,8 @@ fn poller_loop(
                 snapshot.wave_dig_current_point as i32,
             );
             if let Some(arrays) = snapshot.wave_dig_arrays {
-                // The scan ended: C stopWaveDig's readWaveDig callbacks.
-                // Under AUTO_RESTART it is running again and RUN stays 1.
-                if !snapshot.wave_dig_restarted {
-                    let _ = handle.write_int32_blocking(params.wave_dig_run, 0, 0);
-                }
+                // The scan ended: C stopWaveDig's RUN, readWaveDig callbacks
+                // and, under AUTO_RESTART, startWaveDig's parameters.
                 let _ = handle.set_params_and_notify_blocking(0, arrays);
             }
         } else {

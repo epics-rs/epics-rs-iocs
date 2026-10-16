@@ -156,12 +156,8 @@ impl MultiFunctionDriver {
         user: &AsynUser,
         value: i32,
         status: UlError,
-        mut wave_arrays: Vec<ParamSetValue>,
-        time_wf: Option<ParamSetValue>,
+        wave_arrays: Vec<ParamSetValue>,
     ) -> AsynResult<()> {
-        if let Some(update) = time_wf {
-            wave_arrays.push(update);
-        }
         self.apply_updates(wave_arrays)?;
         let addr = device_addr(user.addr);
         self.base.call_param_callbacks(addr)?;
@@ -259,7 +255,6 @@ impl PortDriver for MultiFunctionDriver {
         // Collected under the state lock, applied after it is dropped: both
         // helpers borrow the driver, and apply_updates needs it mutably.
         let mut wave_arrays: Vec<ParamSetValue> = Vec::new();
-        let mut time_wf: Option<ParamSetValue> = None;
 
         if reason == self.params.counter_reset {
             let dev = self.device.lock().unwrap();
@@ -363,91 +358,32 @@ impl PortDriver for MultiFunctionDriver {
             // stop only when running. The busy record echoes the driver's own
             // value back, so an unguarded start would hit ERR_ALREADY_ACTIVE.
             if value != 0 && !st.wave_dig.running {
-                let first_chan = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_first_chan, 0)?
-                    as usize;
-                let num_chans = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_num_chans, 0)?
-                    as usize;
-                // C hands a non-positive count to ulAInScan, which refuses it.
-                let num_points = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_num_points, 0)?
-                    .max(0) as usize;
-                let dwell = self.base.get_float64_param(self.params.wave_dig_dwell, 0)?;
-                let input_mode = self.base.get_int32_param(self.params.analog_in_mode, 0)?;
-                let ranges = (first_chan..first_chan + num_chans)
-                    .map(|chan| {
-                        self.base
-                            .get_int32_param(self.params.analog_in_range, chan as i32)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let ext_trig = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_ext_trigger, 0)?
-                    != 0;
-                let ext_clk = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_ext_clock, 0)?
-                    != 0;
-                let cont = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_continuous, 0)?
-                    != 0;
-                let retrig = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_retrigger, 0)?
-                    != 0;
-                let burst = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_burst_mode, 0)?
-                    != 0;
-                st.wave_dig.auto_restart = self
-                    .base
-                    .get_int32_param(self.params.wave_dig_auto_restart, 0)?
-                    != 0;
-
-                if let Err(code) = wave_dig::start_wave_dig(
-                    &dev,
-                    &mut st.wave_dig,
-                    &WaveDigScan {
-                        first_chan,
-                        num_chans,
-                        num_points,
-                        dwell,
-                        input_mode,
-                        ranges,
-                        ext_trigger: ext_trig,
-                        ext_clock: ext_clk,
-                        continuous: cont,
-                        retrigger: retrig,
-                        burst_mode: burst,
-                    },
-                    &trace,
-                ) {
-                    status = code;
-                    self.base.params.set_int32(reason, addr, 0)?;
-                } else {
-                    self.base.params.set_float64(
-                        self.params.wave_dig_dwell_actual,
-                        0,
-                        st.wave_dig.dwell_actual,
-                    )?;
-                    self.base.params.set_float64(
-                        self.params.wave_dig_total_time,
-                        0,
-                        st.wave_dig.dwell_actual * num_points as f64,
-                    )?;
-                    time_wf = Some(wave_dig::time_wf_update(&self.params, &st.wave_dig));
+                let scan = WaveDigScan::read(
+                    &self.params,
+                    |r, a| self.base.get_int32_param(r, a),
+                    |r, a| self.base.get_float64_param(r, a),
+                )?;
+                match wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace)
+                {
+                    Ok(started) => wave_arrays = started,
+                    Err(code) => {
+                        status = code;
+                        self.base.params.set_int32(reason, addr, 0)?;
+                    }
                 }
             } else if value == 0 && st.wave_dig.running {
-                wave_arrays = wave_dig::stop_wave_dig(&dev, &mut st.wave_dig, &self.params, &trace);
-                if st.wave_dig.running {
-                    // AUTO_RESTART started it again.
-                    self.base.params.set_int32(reason, addr, 1)?;
-                }
+                let restart = WaveDigScan::read_restart(
+                    &self.params,
+                    |r, a| self.base.get_int32_param(r, a),
+                    |r, a| self.base.get_float64_param(r, a),
+                )?;
+                wave_arrays = wave_dig::stop_wave_dig(
+                    &dev,
+                    &mut st.wave_dig,
+                    &self.params,
+                    restart.as_ref(),
+                    &trace,
+                );
             }
         } else if reason == self.params.wave_dig_read_wf {
             if value != 0 {
@@ -641,7 +577,7 @@ impl PortDriver for MultiFunctionDriver {
             }
         }
 
-        self.finish_write(user, value, status, wave_arrays, time_wf)
+        self.finish_write(user, value, status, wave_arrays)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {

@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
@@ -17,7 +18,6 @@ pub struct WaveDigState {
     pub first_chan: usize,
     pub num_points: usize,
     pub current_point: usize,
-    pub auto_restart: bool,
     /// Scan buffer (f64, allocated by ulAInScan).
     pub scan_buffer: Vec<f64>,
     /// Per-channel waveform data [channel][point], in volts.
@@ -27,8 +27,6 @@ pub struct WaveDigState {
     /// Time waveform per point.
     pub time_buffer: Vec<f32>,
     pub dwell_actual: f64,
-    /// The settings of the last start, which an auto-restart reuses.
-    pub last_scan: Option<WaveDigScan>,
 }
 
 impl WaveDigState {
@@ -43,13 +41,11 @@ impl WaveDigState {
             first_chan: 0,
             num_points: max_points,
             current_point: 0,
-            auto_restart: false,
             scan_buffer: Vec::new(),
             channel_buffers,
             abs_time_buffer: vec![0.0; max_points],
             time_buffer: vec![0.0; max_points],
             dwell_actual: 0.001,
-            last_scan: None,
         }
     }
 }
@@ -71,14 +67,59 @@ pub struct WaveDigScan {
     pub burst_mode: bool,
 }
 
+impl WaveDigScan {
+    /// C `startWaveDig`'s parameter reads, through whichever owner of the
+    /// store the caller is: the port actor directly, the poller by request.
+    pub fn read(
+        params: &MultiFunctionParams,
+        int: impl Fn(usize, i32) -> AsynResult<i32>,
+        float: impl Fn(usize, i32) -> AsynResult<f64>,
+    ) -> AsynResult<Self> {
+        let first_chan = int(params.wave_dig_first_chan, 0)?.max(0) as usize;
+        let num_chans = int(params.wave_dig_num_chans, 0)?.max(0) as usize;
+        let ranges = (first_chan..first_chan + num_chans)
+            .map(|chan| int(params.analog_in_range, chan as i32))
+            .collect::<AsynResult<Vec<_>>>()?;
+        Ok(Self {
+            first_chan,
+            num_chans,
+            // C hands a non-positive count to ulAInScan, which refuses it.
+            num_points: int(params.wave_dig_num_points, 0)?.max(0) as usize,
+            dwell: float(params.wave_dig_dwell, 0)?,
+            input_mode: int(params.analog_in_mode, 0)?,
+            ranges,
+            ext_trigger: int(params.wave_dig_ext_trigger, 0)? != 0,
+            ext_clock: int(params.wave_dig_ext_clock, 0)? != 0,
+            continuous: int(params.wave_dig_continuous, 0)? != 0,
+            retrigger: int(params.wave_dig_retrigger, 0)? != 0,
+            burst_mode: int(params.wave_dig_burst_mode, 0)? != 0,
+        })
+    }
+
+    /// What `stopWaveDig` restarts with: the current settings, read when the
+    /// scan ends, if WAVEDIG_AUTO_RESTART is set.
+    pub fn read_restart(
+        params: &MultiFunctionParams,
+        int: impl Fn(usize, i32) -> AsynResult<i32>,
+        float: impl Fn(usize, i32) -> AsynResult<f64>,
+    ) -> AsynResult<Option<Self>> {
+        if int(params.wave_dig_auto_restart, 0)? == 0 {
+            return Ok(None);
+        }
+        Self::read(params, int, float).map(Some)
+    }
+}
+
 /// Start the waveform digitizer (analog input scan). C `startWaveDig`;
-/// the error is the uldaq status it reported.
+/// `Ok` carries the parameters it sets, the error the uldaq status it
+/// reported.
 pub fn start_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
+    params: &MultiFunctionParams,
     scan: &WaveDigScan,
     trace: &SelfTrace,
-) -> Result<(), UlError> {
+) -> Result<Vec<ParamSetValue>, UlError> {
     const FUNCTION: &str = "startWaveDig";
     let WaveDigScan {
         first_chan,
@@ -139,12 +180,10 @@ pub fn start_wave_dig(
         options |= SO_BURSTMODE;
     }
 
-    state.last_scan = Some(scan.clone());
-
     let result = device.analog_in_scan(
         &AInScanConfig {
             low_chan: first_chan as i32,
-            high_chan: (first_chan + num_chans - 1) as i32,
+            high_chan: first_chan as i32 + num_chans as i32 - 1,
             input_mode,
             // The queue sets each channel's range.
             range: BIP10VOLTS,
@@ -162,7 +201,7 @@ pub fn start_wave_dig(
 
     state.dwell_actual = 1.0 / rate;
     state.running = true;
-    let last_chan = first_chan + num_chans - 1;
+    let last_chan = first_chan as i32 + num_chans as i32 - 1;
     trace.print(
         TraceMask::FLOW,
         format_args!(
@@ -175,7 +214,21 @@ pub fn start_wave_dig(
     for i in 0..num_points {
         state.time_buffer[i] = (i as f64 * state.dwell_actual) as f32;
     }
-    Ok(())
+    Ok(vec![
+        ParamSetValue::new(params.wave_dig_current_point, 0, ParamValue::Int32(0)),
+        ParamSetValue::new(
+            params.wave_dig_dwell_actual,
+            0,
+            ParamValue::Float64(state.dwell_actual),
+        ),
+        ParamSetValue::new(params.wave_dig_run, 0, ParamValue::Int32(1)),
+        ParamSetValue::new(
+            params.wave_dig_total_time,
+            0,
+            ParamValue::Float64(state.dwell_actual * num_points as f64),
+        ),
+        time_wf_update(params, state),
+    ])
 }
 
 /// Number of complete scan points behind `current_index`.
@@ -200,6 +253,7 @@ pub fn read_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
     params: &MultiFunctionParams,
+    restart: Option<&WaveDigScan>,
     trace: &SelfTrace,
 ) -> Result<Option<Vec<ParamSetValue>>, UlError> {
     let (status, xfer) = device.analog_in_scan_status().map_err(|e| e.code)?;
@@ -230,30 +284,37 @@ pub fn read_wave_dig(
     }
 
     if status == SS_IDLE {
-        return Ok(Some(stop_wave_dig(device, state, params, trace)));
+        return Ok(Some(stop_wave_dig(device, state, params, restart, trace)));
     }
     Ok(None)
 }
 
-/// C `stopWaveDig`: hand the acquired points to the records
-/// (`readWaveDig`), stop the scan, and start it again under AUTO_RESTART.
+/// C `stopWaveDig`: clear RUN, hand the acquired points to the records
+/// (`readWaveDig`), stop the scan, and under AUTO_RESTART start it again
+/// with `restart`, the settings read as it ends.
 pub fn stop_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
     params: &MultiFunctionParams,
+    restart: Option<&WaveDigScan>,
     trace: &SelfTrace,
 ) -> Vec<ParamSetValue> {
     state.running = false;
-    let updates = waveform_updates(params, state, trace);
+    let mut updates = vec![ParamSetValue::new(
+        params.wave_dig_run,
+        0,
+        ParamValue::Int32(0),
+    )];
+    updates.extend(waveform_updates(params, state, trace));
     trace.report(
         &device.analog_in_scan_stop(),
         "stopWaveDig",
         "Stopping AIn scan",
     );
-    if state.auto_restart
-        && let Some(scan) = state.last_scan.clone()
+    if let Some(scan) = restart
+        && let Ok(started) = start_wave_dig(device, state, params, scan, trace)
     {
-        let _ = start_wave_dig(device, state, &scan, trace);
+        updates.extend(started);
     }
     updates
 }
