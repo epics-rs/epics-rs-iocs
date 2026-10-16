@@ -35,10 +35,11 @@ pub mod t4u;
 pub mod t4u_proto;
 pub mod tetramm;
 pub mod tetramm_proto;
+pub mod trace;
 
 pub use ahxxx::{AhxxxRuntime, create_ahxxx};
 pub use fx4::{Fx4Runtime, create_fx4};
 pub use nsls_em::{NslsEmRuntime, create_nsls_em};
 pub use pcr4::{Pcr4Runtime, create_pcr4};
-pub use t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};
+pub use t4u::{T4uDirectError, T4uRuntime, create_t4u_direct_em, create_t4u_em};
 pub use tetramm::{TetrAmmRuntime, create_tetramm};

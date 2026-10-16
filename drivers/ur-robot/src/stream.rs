@@ -6,7 +6,7 @@
 //!
 //! **Invariant:** once a [`StateStream`] is spawned, the reader thread is the
 //! only owner of the [`Session`]'s read half. Commands go out through a
-//! [`SessionWriter`] on the same socket (a socket is full-duplex), never through
+//! [`SessionWriter`](crate::session::SessionWriter) on the same socket (a socket is full-duplex), never through
 //! the session the reader owns.
 
 use std::collections::HashMap;
@@ -20,6 +20,35 @@ use parking_lot::Mutex;
 use crate::error::{UrError, UrResult};
 use crate::session::Session;
 use crate::state::Value;
+
+/// Whose `receiveCallback` a stream is: the two print differently when the
+/// connection goes.
+#[derive(Debug, Clone, Copy)]
+pub enum Iface {
+    Receive,
+    Control,
+}
+
+impl Iface {
+    fn print_lost(self, e: &UrError) {
+        match self {
+            // C's EOF is a std::system_error the boost catch does not take.
+            Iface::Receive => match e {
+                UrError::PeerClosed => {
+                    eprintln!("RTDEReceiveInterface: Robot closed the connection!")
+                }
+                e => eprintln!("RTDEReceiveInterface boost system Exception: {e}"),
+            },
+            Iface::Control => {
+                if matches!(e, UrError::PeerClosed) {
+                    eprintln!("RTDEControlInterface: Robot closed the connection!");
+                }
+                eprintln!("RTDEControlInterface: Could not receive data from robot...");
+                eprintln!("RTDEControlInterface Exception: {e}");
+            }
+        }
+    }
+}
 
 /// The newest robot state received from the controller.
 #[derive(Debug, Clone, Default)]
@@ -88,7 +117,7 @@ pub struct StateStream {
 impl StateStream {
     /// Take ownership of a session on which synchronisation has already been
     /// started, and drain it on a background thread.
-    pub fn spawn(mut session: Session) -> Self {
+    pub fn spawn(mut session: Session, iface: Iface) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
             snapshot: Snapshot::default(),
             connected: true,
@@ -110,7 +139,7 @@ impl StateStream {
                     // Timed out with nothing to read: quiet, not gone.
                     Ok(None) => {}
                     Err(e) => {
-                        log::error!("ur-robot: RTDE stream lost: {e}");
+                        iface.print_lost(&e);
                         thread_shared.lock().connected = false;
                         break;
                     }

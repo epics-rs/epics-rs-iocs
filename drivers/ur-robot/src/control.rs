@@ -7,7 +7,7 @@
 //! (1 = ready for a command, 2 = done with the command).
 //!
 //! All 23 input recipes are registered, because the controller numbers recipes
-//! by registration order and the ones we send on (named in [`recipe`]) sit in
+//! by registration order and the ones we send on (named in `recipe`) sit in
 //! the middle of that sequence. Beyond the commands urRobot's `RTDEControl`
 //! driver issues, the surface carries the streaming commands (servoJ, speedJ,
 //! forceMode, the watchdog kick) and their support calls for planned-move
@@ -20,7 +20,7 @@ use crate::error::{RefusalReason, UrError, UrResult, verify_within};
 use crate::rtde::{CommandType, ControllerVersion, Payload, RobotCommand, default_frequency};
 use crate::script::{self, Injection, SCRIPT_PORT, ScriptClient};
 use crate::session::{DEFAULT_TIMEOUT, Session, SessionWriter};
-use crate::stream::{Snapshot, StateStream};
+use crate::stream::{Iface, Snapshot, StateStream};
 
 /// `UR_CONTROLLER_RDY_FOR_CMD` (rtde_control_interface.h:19).
 const CONTROLLER_RDY_FOR_CMD: i32 = 1;
@@ -178,7 +178,7 @@ impl ControlInterface {
         session.send_start()?;
 
         let writer = session.writer()?;
-        let stream = StateStream::spawn(session);
+        let stream = StateStream::spawn(session, Iface::Control);
         stream.wait_first_state(FIRST_STATE_TIMEOUT)?;
         self.stream = Some(stream);
         self.writer = Some(writer);
@@ -517,7 +517,7 @@ impl ControlInterface {
             // A script error (e.g. an unsolvable inverse kinematics) kills the
             // script, and then DONE never arrives.
             if !self.is_program_running()? {
-                log::error!("ur-robot: the RTDE control script stopped mid-command");
+                eprintln!("RTDEControlInterface: RTDE control script is not running!");
                 return self.refused(RefusalReason::NotRunning);
             }
             if self.is_stopped_by_safety()? {
@@ -539,7 +539,7 @@ impl ControlInterface {
             return self.refused(RefusalReason::NotRunning);
         }
         if !self.is_program_running()? {
-            log::error!("ur-robot: the RTDE control script is not running");
+            eprintln!("RTDEControlInterface: RTDE control script is not running!");
             return self.refused(RefusalReason::NotRunning);
         }
         if let Some(reason) = self.wait_for_state(CONTROLLER_RDY_FOR_CMD, GET_READY_TIMEOUT)? {
@@ -626,7 +626,6 @@ impl ControlInterface {
     /// `reuploadScript()` — kill whatever is running, then send the script again.
     pub fn reupload_script(&mut self) -> UrResult<()> {
         if self.is_program_running()? {
-            log::info!("ur-robot: a script was running on the controller, stopping it");
             self.stop_script()?;
             self.dashboard.stop()?;
             std::thread::sleep(Duration::from_millis(100));

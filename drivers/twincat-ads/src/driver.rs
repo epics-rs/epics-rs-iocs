@@ -1342,7 +1342,7 @@ impl PortDriver for AdsPortDriver {
         self.write_array(user, &[AdsType::Real64], &bytes)
     }
 
-    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, _level: i32) {
         let cfg = &self.shared.cfg;
         let _ = writeln!(
             out,

@@ -18,9 +18,10 @@ use parking_lot::Mutex;
 
 use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
-use crate::error::{UrError, UrResult};
+use crate::error::UrResult;
 use crate::gripper::{MoveMode, MoveParameter, ObjectStatus, RobotiqGripper, Unit};
 use crate::registry::{self, DashboardHandle};
+use crate::spdlog;
 
 /// The C++ driver hard-codes `RobotiqGripper(ip)`, whose socket timeout is
 /// 2 s in ur_rtde.
@@ -197,18 +198,24 @@ impl GripperDriver {
 
     fn try_connect(&self) -> bool {
         if !self.robot_ready() {
-            log::error!("ur-robot: cannot connect to the gripper; the robot must be powered on");
+            spdlog::error(format_args!(
+                "Unable to connect to gripper. Robot must be powered on."
+            ));
             return false;
         }
         let mut gripper = self.gripper.lock();
         match gripper.connect().and_then(|()| gripper.get_var("STA")) {
-            Ok(_) => {
-                log::info!("ur-robot: connected to the gripper");
+            Ok(_) if gripper.is_connected() => {
+                spdlog::info(format_args!("Connected to gripper"));
                 self.apply_pending_activation(&mut gripper);
                 true
             }
+            Ok(_) => {
+                spdlog::info(format_args!("not connected"));
+                false
+            }
             Err(e) => {
-                log::error!("ur-robot: gripper connect failed: {e}");
+                spdlog::error(format_args!("{e}"));
                 false
             }
         }
@@ -226,7 +233,7 @@ impl GripperDriver {
             return;
         }
         if let Err(e) = gripper.activate(false) {
-            log::error!("ur-robot: deferred gripper activation failed: {e}");
+            spdlog::error(format_args!("{e}"));
         }
     }
 }
@@ -244,7 +251,7 @@ impl PortDriver for GripperDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_int32(reason, user.addr, value)?;
+            self.base.set_int32_param(reason, user.addr, value)?;
 
             if p.is_command(reason) && value == 0 {
                 return Ok(());
@@ -257,20 +264,37 @@ impl PortDriver for GripperDriver {
             // the connection and the boot values are lost.
             // MIN_POSITION / MAX_POSITION only stage the range; SET_POSITION_RANGE
             // applies it.
-            if reason == p.min_position || reason == p.max_position {
+            if reason == p.min_position {
+                spdlog::debug(format_args!("setting min={value}"));
+                return Ok(());
+            }
+            if reason == p.max_position {
+                spdlog::debug(format_args!("setting max={value}"));
                 return Ok(());
             }
             if reason == p.set_position_range {
                 let min = self.base.params.get_int32(p.min_position, 0).unwrap_or(0);
                 let max = self.base.params.get_int32(p.max_position, 0).unwrap_or(0);
                 self.gripper.lock().set_native_position_range(min, max);
+                spdlog::debug(format_args!("setNativePositionRange(min={min}, max={max})"));
                 return Ok(());
             }
             if reason == p.position_unit {
                 match position_unit(value) {
-                    Some(unit) => self.gripper.lock().set_unit(MoveParameter::Position, unit),
+                    Some(unit) => {
+                        spdlog::debug(format_args!(
+                            "{}",
+                            match unit {
+                                Unit::Device => "Setting position unit to 'Device' (0,255)",
+                                Unit::Normalized => "Setting position unit to 'Normalized' (0,1.0)",
+                                Unit::Percent => "Setting position unit to 'Percent' (0,100%)",
+                                Unit::Mm => "Setting position unit to 'mm' (must define range)",
+                            }
+                        ));
+                        self.gripper.lock().set_unit(MoveParameter::Position, unit)
+                    }
                     None => {
-                        log::warn!("ur-robot: position unit {value} is undefined; no action taken");
+                        spdlog::warn(format_args!("Unit {value} undefined, no action taken."));
                     }
                 }
                 return Ok(());
@@ -282,27 +306,30 @@ impl PortDriver for GripperDriver {
             // always lands before any connect can have succeeded). C errors
             // and the boot-time activation is lost.
             if reason == p.activate && !(self.robot_ready() && self.gripper.lock().is_connected()) {
-                log::info!("ur-robot: gripper activation deferred until the gripper connects");
                 return Ok(());
             }
 
             if !self.robot_ready() {
+                spdlog::error(format_args!(
+                    "Robot must be powered and dashboard connected on to use gripper"
+                ));
                 return Err(asyn_error(
                     "the robot must be powered on and the dashboard connected to use the gripper",
                 ));
             }
 
             if reason == p.connect {
-                return if self.try_connect() {
-                    Ok(())
-                } else {
-                    Err(asyn_error("could not connect to the gripper"))
-                };
+                spdlog::debug(format_args!("Connecting to gripper"));
+                self.try_connect();
             }
 
             let mut gripper = self.gripper.lock();
             if !gripper.is_connected() {
+                spdlog::error(format_args!("Robotiq gripper not connected"));
                 return Err(asyn_error("the Robotiq gripper is not connected"));
+            }
+            if reason == p.connect {
+                return Ok(());
             }
 
             let mut calibrated = None;
@@ -314,16 +341,20 @@ impl PortDriver for GripperDriver {
             // MoveStatus transition that will never come.
             let mut refused = None;
             let result: UrResult<()> = if reason == p.activate {
+                spdlog::debug(format_args!("Activating gripper"));
                 gripper.activate(false)
             } else if reason == p.open {
                 (|| {
                     if gripper.is_open()?
                         || gripper.object_detection_status()? == ObjectStatus::StoppedOuterObject
                     {
-                        log::warn!("ur-robot: gripper already open or stopped at an outer object");
+                        spdlog::warn(format_args!(
+                            "Gripper already open or stopped at outer object"
+                        ));
                         refused = Some(p.open);
                         return Ok(());
                     }
+                    spdlog::debug(format_args!("Opening gripper"));
                     gripper.open(MoveMode::StartMove).map(|_| ())
                 })()
             } else if reason == p.close {
@@ -331,22 +362,27 @@ impl PortDriver for GripperDriver {
                     if gripper.is_closed()?
                         || gripper.object_detection_status()? == ObjectStatus::StoppedInnerObject
                     {
-                        log::warn!(
-                            "ur-robot: gripper already closed or stopped at an inner object"
-                        );
+                        spdlog::warn(format_args!(
+                            "Gripper already closed or stopped at inner object"
+                        ));
                         refused = Some(p.close);
                         return Ok(());
                     }
+                    spdlog::debug(format_args!("Closing gripper"));
                     gripper.close(MoveMode::StartMove).map(|_| ())
                 })()
             } else if reason == p.auto_calibrate {
+                spdlog::debug(format_args!("Auto calibrating open/close positions"));
                 match gripper.is_active() {
                     Ok(true) => gripper.auto_calibrate(None).inspect(|()| {
+                        spdlog::debug(format_args!("Auto calibration done"));
                         calibrated = Some(1);
                     }),
-                    Ok(false) => Err(UrError::Protocol(
-                        "activate the gripper before auto-calibrating".into(),
-                    )),
+                    // C prints and succeeds: not an exception (gripper_driver.cpp:291-293).
+                    Ok(false) => {
+                        spdlog::error(format_args!("Activate gripper before autocalibrating"));
+                        Ok(())
+                    }
                     Err(e) => Err(e),
                 }
             } else {
@@ -355,13 +391,19 @@ impl PortDriver for GripperDriver {
             drop(gripper);
 
             if let Some(v) = calibrated {
-                self.base.params.set_int32(p.is_calibrated, 0, v)?;
+                self.base.set_int32_param(p.is_calibrated, 0, v)?;
             }
             if let Some(param) = refused {
-                self.base.params.set_int32(param, 0, 0)?;
+                self.base.set_int32_param(param, 0, 0)?;
             }
-            result.map_err(|e| asyn_error(format!("gripper command failed: {e}")))
+            result.map_err(|e| {
+                spdlog::error(format_args!("{e}"));
+                asyn_error(format!("gripper command failed: {e}"))
+            })
         })();
+        if result.is_err() {
+            spdlog::debug(format_args!("Error in Gripper::writeInt32"));
+        }
         crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 
@@ -369,7 +411,7 @@ impl PortDriver for GripperDriver {
         let result: AsynResult<()> = (|| {
             let reason = user.reason;
             let p = self.params;
-            self.base.params.set_float64(reason, user.addr, value)?;
+            self.base.set_float64_param(reason, user.addr, value)?;
 
             // SET_SPEED / SET_FORCE configure the RobotiqGripper object, which
             // outlives every (re)connect — nothing goes on the wire until the
@@ -378,8 +420,10 @@ impl PortDriver for GripperDriver {
             // C gates them on the connection and the boot values are lost.
             let mut gripper = self.gripper.lock();
             if reason == p.set_speed {
+                spdlog::debug(format_args!("Setting speed to {value}"));
                 gripper.set_speed(value);
             } else if reason == p.set_force {
+                spdlog::debug(format_args!("Setting force to {value}"));
                 gripper.set_force(value);
             }
             Ok(())
@@ -412,7 +456,7 @@ pub fn start_poller(
                         match poll_once(params, &mut g) {
                             Ok(updates) => (updates, true),
                             Err(e) => {
-                                log::error!("ur-robot: gripper poll error: {e}");
+                                spdlog::error(format_args!("Gripper poll error: {e}"));
                                 g.disconnect();
                                 (
                                     vec![ParamSetValue::new(

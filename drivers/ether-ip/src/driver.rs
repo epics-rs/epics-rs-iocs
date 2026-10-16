@@ -16,9 +16,14 @@ use tokio::sync::mpsc::Sender;
 use crate::cip::{self, CipType, ParsedTag};
 use crate::connection::{Connection, EipError};
 use crate::encap::{self, ETHERIP_PORT};
+use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::server::records::printf::format_g;
 
 /// `EIP_TIMEOUT` -- default connect / response timeout.
 pub const DEFAULT_TIMEOUT_MS: u32 = 5000;
+
+/// `epicsThreadSleepQuantum()` on POSIX: one clock tick, 1/100 s.
+const SLEEP_QUANTUM: f64 = 0.01;
 
 /// `EIP_MIN_TIMEOUT` -- the idle delay when no scan list is due.
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -103,9 +108,9 @@ impl TagInfo {
     /// Device support side of the write handshake: stage the value in the tag
     /// buffer, then flag it. The scan thread clears `do_write` and sets
     /// `is_writing` when it picks the write up.
-    pub fn request_write(&self, data: &mut TagData) {
+    pub fn request_write(&self, data: &mut TagData, record: &str) {
         if data.do_write {
-            log::debug!("EIP '{}': already writing", self.string_tag);
+            crate::eip_printf!(6, "'{record}': already writing\n");
         } else {
             data.do_write = true;
         }
@@ -153,6 +158,9 @@ pub struct Plc {
     pub stats: Mutex<PlcStats>,
     pub connected: AtomicBool,
     pub identity: Mutex<Option<crate::connection::IdentityInfo>>,
+    /// C's `plc->connection` under `plc->lock`: the scan thread holds it for
+    /// a pass, iocsh diagnostics borrow it between passes.
+    conn: Mutex<Option<Connection>>,
     stop: AtomicBool,
     started: AtomicBool,
 }
@@ -167,6 +175,7 @@ impl Plc {
             stats: Mutex::new(PlcStats::default()),
             connected: AtomicBool::new(false),
             identity: Mutex::new(None),
+            conn: Mutex::new(None),
             stop: AtomicBool::new(false),
             started: AtomicBool::new(false),
         }
@@ -300,14 +309,52 @@ pub fn start_scan_tasks() -> usize {
             .name(name)
             .spawn(move || scan_loop(p))
         {
-            Ok(_) => started += 1,
-            Err(e) => {
-                plc.started.store(false, Ordering::SeqCst);
-                log::error!("EIP: cannot start scan task for PLC '{}': {e}", plc.name);
+            Ok(_) => {
+                crate::eip_printf!(5, "drvEtherIP: launch scan task for PLC '{}'\n", plc.name);
+                started += 1;
             }
+            Err(_) => plc.started.store(false, Ordering::SeqCst),
         }
     }
     started
+}
+
+/// `drvEtherIP_describe`: describe `type_id` on every PLC, over the
+/// connection the scan thread holds between passes.
+pub fn describe(type_id: u16) {
+    for plc in all_plcs() {
+        match plc.conn.lock().as_mut() {
+            Some(c) => {
+                c.describe_type(type_id);
+            }
+            // C sends on the closed socket and fails there.
+            None => {
+                crate::eip_printf!(9, "EIP describe type 0x{type_id:04X}\n");
+                crate::eip_printf!(1, "EIP_describe_type: send failed\n");
+            }
+        }
+    }
+}
+
+/// `drvEtherIP_read_tag`: a one-off connection that reads `tag_name` and
+/// dumps it. -1 when the PLC does not start up, else 0.
+pub fn read_tag(ip_addr: &str, slot: u8, tag_name: &str, elements: u16, timeout_ms: u64) -> i32 {
+    let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
+    let timeout = Duration::from_millis(timeout_ms);
+    let Ok(mut c) = Connection::startup(ip_addr, ETHERIP_PORT, slot, timeout, limit) else {
+        return -1;
+    };
+    if let Some(tag) = ParsedTag::parse(tag_name)
+        && let Ok(data) = c.read_tag(&tag, elements)
+    {
+        crate::eip_printf!(
+            0,
+            "{}",
+            cip::dump_raw_cip_data(&data, usize::from(elements))
+        );
+    }
+    c.shutdown();
+    0
 }
 
 /// Stop every scan thread (used by the IOC shutdown path and by tests).
@@ -322,122 +369,146 @@ pub fn stop_scan_tasks() {
 // ---------------------------------------------------------------------------
 
 fn scan_loop(plc: Arc<Plc>) {
-    let mut conn: Option<Connection> = None;
-
     while !plc.stop.load(Ordering::Relaxed) {
-        // -- connect ---------------------------------------------------------
-        if conn.is_none() {
-            let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
-            match Connection::startup(&plc.ip_addr, ETHERIP_PORT, plc.slot, timeout(), limit) {
-                Ok(mut c) => {
-                    log::info!(
-                        "EIP: PLC '{}' connected ({}), '{}'",
-                        plc.name,
-                        plc.ip_addr,
-                        c.identity.name
-                    );
-                    *plc.identity.lock() = Some(c.identity.clone());
-                    if !complete_tag_infos(&plc, &mut c) {
-                        log::error!("EIP: PLC '{}': not a single tag could be read", plc.name);
-                        plc.stats.lock().plc_errors += 1;
-                        std::thread::sleep(timeout());
-                        continue;
-                    }
-                    plc.connected.store(true, Ordering::Relaxed);
-                    conn = Some(c);
-                }
-                Err(e) => {
-                    log::warn!("EIP: PLC '{}' is disconnected: {e}", plc.name);
-                    plc.connected.store(false, Ordering::Relaxed);
-                    plc.invalidate_tags();
-                    std::thread::sleep(timeout());
-                    continue;
-                }
-            }
-        }
-        let c = conn.as_mut().expect("connected above");
-
-        // -- scan every list that is due --------------------------------------
-        let lists: Vec<_> = plc.scanlists.lock().clone();
-        let start = Instant::now();
-        let mut next_due: Option<Instant> = None;
-        let mut failed = false;
-
-        for list in &lists {
-            if !list.enabled.load(Ordering::Relaxed) {
-                continue;
-            }
-            let due = *list.scheduled.lock();
-            if due <= start {
-                let t0 = Instant::now();
-                let ok = process_scan_list(c, list);
-                let elapsed = t0.elapsed().as_secs_f64();
-
-                {
-                    let mut s = list.stats.lock();
-                    s.scan_time = epics_now();
-                    s.last_scan_time = elapsed;
-                    if elapsed > s.max_scan_time {
-                        s.max_scan_time = elapsed;
-                    }
-                    if elapsed < s.min_scan_time || s.min_scan_time == 0.0 {
-                        s.min_scan_time = elapsed;
-                    }
-                    if !ok {
-                        s.list_errors += 1;
-                    }
-                }
-
-                if ok {
-                    // Re-schedule exactly, from the start of this scan.
-                    *list.scheduled.lock() = t0 + Duration::from_secs_f64(list.period);
-                } else {
-                    *list.scheduled.lock() = Instant::now() + timeout();
-                    plc.stats.lock().plc_errors += 1;
-                    failed = true;
-                    break;
-                }
-            }
-            let due = *list.scheduled.lock();
-            next_due = Some(match next_due {
-                Some(n) if n <= due => n,
-                _ => due,
-            });
-        }
-
-        if failed {
-            // Drop the session and reconnect on the next turn.
-            plc.connected.store(false, Ordering::Relaxed);
-            conn = None;
-            plc.invalidate_tags();
-            continue;
-        }
-
-        // -- sleep until the next list is due ---------------------------------
-        //
-        // UPSTREAM FIX: the C (`drvEtherIP.c:909-930`) computes this delay from
-        // a wall-clock `epicsTimeStamp`, so a backwards clock step yields a
-        // huge delay; the recovery branch then dereferences `list`, which the
-        // preceding `for` loop has already walked to NULL -- a guaranteed crash
-        // exactly when the clock misbehaves. A monotonic `Instant` cannot step
-        // backwards, so the whole failure mode is gone by construction, along
-        // with the `sched_errors` counter that only ever counted it (it is not
-        // reachable from the device support, so no PV disappears).
-        let now = Instant::now();
-        match next_due {
-            None => std::thread::sleep(MIN_TIMEOUT),
-            Some(due) if due > now => std::thread::sleep(due - now),
-            Some(_) => {
-                plc.stats.lock().slow_scans += 1;
-            }
+        // The pass holds the connection the way C's PLC_scan_task holds
+        // plc->lock; the sleep comes after it is released.
+        let pause = scan_pass(&plc, &mut plc.conn.lock());
+        if let Some(pause) = pause {
+            std::thread::sleep(pause);
         }
     }
 
-    if let Some(mut c) = conn {
+    if let Some(c) = plc.conn.lock().take() {
         c.shutdown();
     }
     plc.connected.store(false, Ordering::Relaxed);
     plc.started.store(false, Ordering::SeqCst);
+}
+
+/// One turn of C's `scan_loop:` label. Returns how long to sleep.
+fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> {
+    // -- connect ---------------------------------------------------------
+    if conn.is_none() {
+        let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
+        crate::eip_printf_time!(4, "EIP connecting {}\n", plc.name);
+        match Connection::startup(&plc.ip_addr, ETHERIP_PORT, plc.slot, timeout(), limit) {
+            Ok(mut c) => {
+                *plc.identity.lock() = Some(c.identity.clone());
+                if !complete_tag_infos(plc, &mut c) {
+                    errlog_vprintf(format_args!(
+                        "EIP error during scan list completion for {}:{ETHERIP_PORT}\n",
+                        plc.ip_addr
+                    ));
+                    crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+                    c.shutdown();
+                    crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
+                    plc.stats.lock().plc_errors += 1;
+                    return Some(timeout());
+                }
+                plc.connected.store(true, Ordering::Relaxed);
+                *conn = Some(c);
+            }
+            Err(_) => {
+                errlog_vprintf(format_args!(
+                    "EIP connection failed for {}:{ETHERIP_PORT}\n",
+                    plc.ip_addr
+                ));
+                crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
+                plc.connected.store(false, Ordering::Relaxed);
+                plc.invalidate_tags();
+                return Some(timeout());
+            }
+        }
+    }
+    let c = conn.as_mut().expect("connected above");
+    crate::eip_printf_time!(10, "drvEtherIP scan PLC '{}'\n", plc.name);
+
+    // -- scan every list that is due --------------------------------------
+    let lists: Vec<_> = plc.scanlists.lock().clone();
+    let start = Instant::now();
+    let mut next_due: Option<Instant> = None;
+    let mut failed = false;
+
+    for list in &lists {
+        if !list.enabled.load(Ordering::Relaxed) {
+            continue;
+        }
+        let due = *list.scheduled.lock();
+        if due <= start {
+            let t0 = Instant::now();
+            let ok = process_scan_list(c, list);
+            let elapsed = t0.elapsed().as_secs_f64();
+
+            {
+                let mut s = list.stats.lock();
+                s.scan_time = epics_now();
+                s.last_scan_time = elapsed;
+                if elapsed > s.max_scan_time {
+                    s.max_scan_time = elapsed;
+                }
+                if elapsed < s.min_scan_time || s.min_scan_time == 0.0 {
+                    s.min_scan_time = elapsed;
+                }
+                if !ok {
+                    s.list_errors += 1;
+                }
+            }
+
+            if ok {
+                // Re-schedule exactly, from the start of this scan.
+                *list.scheduled.lock() = t0 + Duration::from_secs_f64(list.period);
+            } else {
+                *list.scheduled.lock() = Instant::now() + timeout();
+                plc.stats.lock().plc_errors += 1;
+                failed = true;
+                break;
+            }
+        }
+        let due = *list.scheduled.lock();
+        next_due = Some(match next_due {
+            Some(n) if n <= due => n,
+            _ => due,
+        });
+    }
+
+    if failed {
+        // Drop the session and reconnect on the next turn.
+        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+        if let Some(c) = conn.take() {
+            c.shutdown();
+        }
+        plc.connected.store(false, Ordering::Relaxed);
+        plc.invalidate_tags();
+        return None;
+    }
+
+    // -- sleep until the next list is due ---------------------------------
+    //
+    // UPSTREAM FIX: the C (`drvEtherIP.c:909-930`) computes this delay from
+    // a wall-clock `epicsTimeStamp`, so a backwards clock step yields a
+    // huge delay; the recovery branch then dereferences `list`, which the
+    // preceding `for` loop has already walked to NULL -- a guaranteed crash
+    // exactly when the clock misbehaves. A monotonic `Instant` cannot step
+    // backwards, so the whole failure mode is gone by construction, along
+    // with the `sched_errors` counter that only ever counted it (it is not
+    // reachable from the device support, so no PV disappears).
+    let now = Instant::now();
+    match next_due {
+        None => Some(MIN_TIMEOUT),
+        Some(due) if due > now => Some(due - now),
+        Some(due) => {
+            let delay = -(now - due).as_secs_f64();
+            if delay <= -SLEEP_QUANTUM {
+                crate::eip_printf!(
+                    8,
+                    "drvEtherIP scan task slow, {} sec delay\n",
+                    format_g(delay, 6)
+                );
+                plc.stats.lock().slow_scans += 1;
+            }
+            None
+        }
+    }
 }
 
 fn epics_now() -> f64 {
@@ -456,8 +527,10 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
     let mut tried = 0usize;
     let mut ok = 0usize;
 
+    crate::eip_printf!(5, "complete_PLC_ScanList_TagInfos PLC '{}':\n", plc.name);
     let lists: Vec<_> = plc.scanlists.lock().clone();
     for list in lists {
+        crate::eip_printf!(5, "- Scanlist {:.2}\n", list.period);
         let tags: Vec<_> = list.tags.lock().clone();
         for info in tags {
             tried += 1;
@@ -476,21 +549,24 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
                     let type_and_data = d.r_response - 4;
                     d.w_request = d.r_request + type_and_data;
                     d.w_response = 4;
+                    crate::eip_printf!(
+                        5,
+                        "  tag '{}': req {}, resp {} bytes\n",
+                        info.string_tag,
+                        d.r_request,
+                        d.r_response
+                    );
 
                     if data.len() < encap::BUFFER_SIZE {
                         d.buf = data;
                         d.valid_data_size = d.buf.len();
                     } else {
-                        log::warn!(
-                            "EIP: rejecting tag '{}' data size of {} bytes",
-                            info.string_tag,
-                            data.len()
-                        );
+                        print_rejected(&info.string_tag, data.len());
                         d.valid_data_size = 0;
                     }
                 }
-                Err(e) => {
-                    log::warn!("EIP: tag '{}': cannot read: {e}", info.string_tag);
+                Err(_) => {
+                    crate::eip_printf!(3, "tag '{}': Cannot read!\n", info.string_tag);
                     let mut d = info.data.lock();
                     d.r_request = 0;
                     d.r_response = 0;
@@ -503,7 +579,11 @@ fn complete_tag_infos(plc: &Arc<Plc>, c: &mut Connection) -> bool {
         }
     }
 
-    log::debug!("EIP: PLC '{}': tried {tried} tags, got {ok} tags", plc.name);
+    crate::eip_printf!(
+        5,
+        "complete_PLC_ScanList_TagInfos PLC '{}': tried {tried} tags, got {ok} tags\n",
+        plc.name
+    );
     ok > 0 || tried == 0
 }
 
@@ -513,6 +593,8 @@ struct Item {
     /// The write half of the handshake was taken for this pass.
     writing: bool,
     request: Vec<u8>,
+    /// The response size this item was budgeted at.
+    response_size: usize,
 }
 
 /// C `determine_MultiRequest_count` + the build half of `process_ScanList`,
@@ -588,12 +670,21 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
         let multi_resp = cip::multi_response_size(items.len() + 1, try_resp);
 
         if multi_req > limit || multi_resp > limit {
+            crate::eip_printf!(
+                8,
+                " Skipping tag '{}', reached buffer limit at req/resp: {}, {}\n",
+                info.string_tag,
+                cip::multi_request_size(items.len(), requests_size),
+                cip::multi_response_size(items.len(), responses_size)
+            );
             if items.is_empty() {
-                log::error!(
-                    "EIP: tag '{}' can never be transferred: it alone exceeds the \
-                     buffer limit of {limit} bytes (request {multi_req}, response {multi_resp})",
+                crate::eip_printf!(
+                    2,
+                    "Tag '{}' can never be read because it alone exceeds buffer limit of {limit} bytes,\n",
                     info.string_tag
                 );
+                crate::eip_printf!(3, " Request   size: {try_req:>10} bytes\n");
+                crate::eip_printf!(3, " Response  size: {try_resp:>10} bytes\n");
                 // Give the write handshake back -- this pass will never send it.
                 if writing {
                     info.data.lock().is_writing = false;
@@ -608,8 +699,17 @@ fn build_multi_request(limit: usize, tags: &[Arc<TagInfo>], start: usize) -> (Ve
             info: info.clone(),
             writing,
             request,
+            response_size: resp,
         });
         at += 1;
+    }
+    if at == tags.len() {
+        crate::eip_printf!(
+            8,
+            " End of list, total req/resp: {}, {}\n",
+            cip::multi_request_size(items.len(), requests_size),
+            cip::multi_response_size(items.len(), responses_size)
+        );
     }
     (items, at)
 }
@@ -634,31 +734,45 @@ fn process_scan_list(c: &mut Connection, list: &Arc<ScanList>) -> bool {
 
         let t0 = Instant::now();
         let response = match c.send_routed(&multi) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("EIP process_ScanList: {e}");
+            Ok(r) => Some(r),
+            Err(EipError::Send(_) | EipError::TooLarge { .. }) => {
+                crate::eip_printf_time!(2, "EIP process_ScanList: Error while sending request\n");
+                release_writes(&items);
+                return false;
+            }
+            Err(EipError::TransactionMismatch { got, want }) => {
+                crate::eip_printf_time!(2, "EIP process_ScanList: Mismatch in transaction ID\n");
+                crate::eip_printf!(2, "expected {want} received {got}\n");
+                release_writes(&items);
+                return false;
+            }
+            Err(EipError::Malformed | EipError::EncapStatus { .. }) => None,
+            Err(_) => {
+                crate::eip_printf_time!(2, "EIP process_ScanList: No response\n");
                 release_writes(&items);
                 return false;
             }
         };
         let transfer_time = t0.elapsed().as_secs_f64();
 
-        if !cip::check_multi_request_response(&response) {
-            log::error!(
-                "EIP process_ScanList: error in response for tags {:?}",
-                items.iter().map(|i| &i.info.string_tag).collect::<Vec<_>>()
+        let Some(response) = response.filter(|r| cip::check_multi_request_response(r)) else {
+            crate::eip_printf_time!(2, "EIP process_ScanList: Error in response\n");
+            for (i, item) in items.iter().enumerate() {
+                crate::eip_printf!(2, "Tag {i}: '{}'\n", item.info.string_tag);
+            }
+            crate::eip_printf!(
+                2,
+                "Request size: {} bytes, response size: {}, buffer limit: {limit}\n",
+                cip::multi_request_size(items.len(), items.iter().map(|i| i.request.len()).sum()),
+                cip::multi_response_size(items.len(), items.iter().map(|i| i.response_size).sum())
             );
             release_writes(&items);
             return false;
-        }
+        };
 
         let n = response.len();
         for (i, item) in items.iter().enumerate() {
             let Some(sub) = cip::get_multi_request_response(&response, n, i) else {
-                log::error!(
-                    "EIP process_ScanList: missing sub-response {i} for '{}'",
-                    item.info.string_tag
-                );
                 release_writes(&items);
                 return false;
             };
@@ -686,6 +800,14 @@ fn release_writes(items: &[Item]) {
     }
 }
 
+/// `reserve_tag_data`'s refusal of a value that would not fit `EIP_BUFFER_SIZE`.
+fn print_rejected(tag: &str, size: usize) {
+    crate::eip_printf!(
+        2,
+        "EIP reserve_tag_data: rejecting tag '{tag}' data size of {size} bytes\n"
+    );
+}
+
 fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
     let mut d = item.info.data.lock();
     d.transfer_time = transfer_time;
@@ -693,7 +815,7 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
     if item.writing {
         d.is_writing = false;
         if !cip::check_write_data_response(sub) {
-            log::error!("EIP: CIPWrite failed for '{}'", item.info.string_tag);
+            crate::eip_printf_time!(0, "EIP: CIPWrite failed for '{}'\n", item.info.string_tag);
             d.valid_data_size = 0;
         }
         return;
@@ -704,8 +826,9 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
             if d.do_write {
                 // A record staged a write while this read was in flight; keep
                 // its data, the next pass sends it (C process_ScanList).
-                log::debug!(
-                    "EIP '{}': device support requested a write in the middle of a read cycle",
+                crate::eip_printf!(
+                    8,
+                    "EIP '{}': Device support requested write in middle of read cycle.\n",
                     item.info.string_tag
                 );
             } else if data.len() < encap::BUFFER_SIZE {
@@ -713,18 +836,11 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
                 d.buf.extend_from_slice(data);
                 d.valid_data_size = data.len();
             } else {
-                log::warn!(
-                    "EIP: rejecting tag '{}' data size of {} bytes",
-                    item.info.string_tag,
-                    data.len()
-                );
+                print_rejected(&item.info.string_tag, data.len());
                 d.valid_data_size = 0;
             }
         }
-        _ => {
-            log::warn!("EIP: read failed for '{}'", item.info.string_tag);
-            d.valid_data_size = 0;
-        }
+        _ => d.valid_data_size = 0,
     }
 }
 
@@ -783,23 +899,4 @@ pub fn report(level: i32) {
             }
         }
     }
-}
-
-/// `drvEtherIP_read_tag` -- a one-shot round-trip test, outside the scan tasks.
-pub fn read_tag_once(
-    ip: &str,
-    slot: u8,
-    tag: &str,
-    elements: u16,
-    timeout_ms: u32,
-) -> Result<Vec<u8>, EipError> {
-    let parsed = ParsedTag::parse(tag).ok_or(EipError::Malformed)?;
-    let mut c = Connection::startup(
-        ip,
-        ETHERIP_PORT,
-        slot,
-        Duration::from_millis(timeout_ms as u64),
-        BUFFER_LIMIT.load(Ordering::Relaxed) as usize,
-    )?;
-    c.read_tag(&parsed, elements)
 }

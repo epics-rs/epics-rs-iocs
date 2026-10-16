@@ -6,5 +6,4 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn"] }
-log = "0.4"
 thiserror = "2"

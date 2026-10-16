@@ -74,6 +74,22 @@ async fn main() -> CaResult<()> {
         },
     ));
 
+    let verbosity = CommandDef::new(
+        "EIP_verbosity",
+        vec![ArgDesc {
+            name: "value",
+            arg_type: ArgType::Int,
+        }],
+        "EIP_verbosity value",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            let value = int_arg(args, 0).unwrap_or(0) as i32;
+            ether_ip::EIP_VERBOSITY.store(value, Ordering::Relaxed);
+            Ok(CommandOutcome::Continue)
+        },
+    );
+    app = app.register_startup_command(verbosity.clone());
+    app = app.register_shell_command(verbosity);
+
     // EIP_timeout(<milliseconds>)
     app = app.register_startup_command(CommandDef::new(
         "EIP_timeout",
@@ -137,6 +153,62 @@ async fn main() -> CaResult<()> {
     ));
 
     // drvEtherIP_report(<level>)
+    let describe = CommandDef::new(
+        "drvEtherIP_describe",
+        vec![ArgDesc {
+            name: "type ID",
+            arg_type: ArgType::Int,
+        }],
+        "drvEtherIP_describe type_ID",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            driver::describe(int_arg(args, 0).unwrap_or(0) as u16);
+            Ok(CommandOutcome::Continue)
+        },
+    );
+    app = app.register_startup_command(describe.clone());
+    app = app.register_shell_command(describe);
+
+    let read_tag = CommandDef::new(
+        "drvEtherIP_read_tag",
+        vec![
+            ArgDesc {
+                name: "ip_addr",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "slot",
+                arg_type: ArgType::Int,
+            },
+            ArgDesc {
+                name: "tag_name",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "elements",
+                arg_type: ArgType::Int,
+            },
+            ArgDesc {
+                name: "timeout",
+                arg_type: ArgType::Int,
+            },
+        ],
+        "drvEtherIP_read_tag ip_addr slot tag_name elements timeout",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            let ip = string_arg(args, 0)?.unwrap_or_default();
+            let tag = string_arg(args, 2)?.unwrap_or_default();
+            driver::read_tag(
+                &ip,
+                int_arg(args, 1).unwrap_or(0) as u8,
+                &tag,
+                int_arg(args, 3).unwrap_or(0) as u16,
+                int_arg(args, 4).unwrap_or(0) as u64,
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    );
+    app = app.register_startup_command(read_tag.clone());
+    app = app.register_shell_command(read_tag);
+
     let report = CommandDef::new(
         "drvEtherIP_report",
         vec![ArgDesc {
@@ -156,8 +228,7 @@ async fn main() -> CaResult<()> {
     // so they start after iocInit -- the C does the same from its device-support
     // `init(run==1)` hook, which calls drvEtherIP_restart().
     app = app.register_after_init(|| {
-        let n = driver::start_scan_tasks();
-        log::info!("EIP: started {n} scan task(s)");
+        driver::start_scan_tasks();
     });
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await

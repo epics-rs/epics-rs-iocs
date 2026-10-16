@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use epics_rs::asyn::asyn_record::claim_port;
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -191,18 +192,27 @@ async fn main() -> CaResult<()> {
 
                 let handle = connect_octet(&io_port, io_addr, COMMAND_TIMEOUT)
                     .map_err(|e| format!("drvAsynDG645: {e}"))?;
+                let claim = match claim_port(&my_port) {
+                    Ok(claim) => claim,
+                    Err(_) => {
+                        ctx.println(&format!(
+                            "drvAsynDG645::drvAsynDG645 port {my_port} can't register port"
+                        ));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
                 let driver = Dg645Driver::new(&my_port, handle)
                     .map_err(|e| format!("drvAsynDG645: failed to initialize {my_port}: {e}"))?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("drvAsynDG645: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &my_port,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },
@@ -260,18 +270,27 @@ async fn main() -> CaResult<()> {
 
                 let handle = connect_octet(&io_port, io_addr, COMMAND_TIMEOUT)
                     .map_err(|e| format!("drvAsynColby: {e}"))?;
+                let claim = match claim_port(&my_port) {
+                    Ok(claim) => claim,
+                    Err(_) => {
+                        ctx.println(&format!(
+                            "drvAsynColby::init {my_port}: failure to register port"
+                        ));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
                 let driver = ColbyDriver::new(&my_port, handle, &units, iface)
                     .map_err(|e| format!("drvAsynColby: failed to initialize {my_port}: {e}"))?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("drvAsynColby: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &my_port,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },
@@ -313,19 +332,28 @@ async fn main() -> CaResult<()> {
 
                 let handle = connect_octet(&io_port, io_addr, COHERENT_SDG_COMMAND_TIMEOUT)
                     .map_err(|e| format!("drvAsynCoherentSDG: {e}"))?;
+                let claim = match claim_port(&my_port) {
+                    Ok(claim) => claim,
+                    Err(_) => {
+                        ctx.println(&format!(
+                            "drvAsynCoherentSDG::init {my_port}: failure to register port"
+                        ));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
                 let driver = CoherentSdgDriver::new(&my_port, handle).map_err(|e| {
                     format!("drvAsynCoherentSDG: failed to initialize {my_port}: {e}")
                 })?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("drvAsynCoherentSDG: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &my_port,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },

@@ -108,12 +108,12 @@ pub const STRUCT_STRING_STRIDE: usize = STRUCT_STRING_LEN_BYTES + STRUCT_STRING_
 // Little-endian primitives
 // ---------------------------------------------------------------------------
 
-fn rd_u16(b: &[u8], at: usize) -> Option<u16> {
+pub(crate) fn rd_u16(b: &[u8], at: usize) -> Option<u16> {
     let s = b.get(at..at + 2)?;
     Some(u16::from_le_bytes([s[0], s[1]]))
 }
 
-fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
     let s = b.get(at..at + 4)?;
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
@@ -330,8 +330,48 @@ pub mod service {
     pub const CIP_WRITE_DATA: u8 = 0x4D;
     pub const CM_UNCONNECTED_SEND: u8 = 0x52;
     pub const GET_INSTANCE_ATTR_LIST: u8 = 0x55;
+    pub const TEMPLATE_READ_DATA: u8 = 0x4C;
     /// Responses echo the request service with the high bit set.
     pub const REPLY_FLAG: u8 = 0x80;
+}
+
+/// `decode_extended_type`: a Logix symbol/member type word as text
+/// (bit 15 struct, bits 14-13 dimensions, bits 11-0 the CIP type).
+pub fn decode_extended_type(t: u16) -> String {
+    let atomic = match t & 0x0FFF {
+        0x00C1 => Some("BOOL"),
+        0x00C2 => Some("SINT"),
+        0x00C3 => Some("INT"),
+        0x00C7 => Some("UINT"),
+        0x00C4 => Some("DINT"),
+        0x00C5 => Some("LINT"),
+        0x00C9 => Some("ULINT"),
+        0x00CA => Some("REAL"),
+        0x00CB => Some("LREAL"),
+        _ => None,
+    };
+    match (t & 0xE000, atomic) {
+        (0x0000, Some(name)) => name.to_string(),
+        (0x2000, Some(name)) => format!("{name}[]"),
+        (0xA000, _) if t & 0x0FFF == STRUCT_STRING_HANDLE => "STRING[]".to_string(),
+        _ => format!("0x{t:04X}"),
+    }
+}
+
+/// `decode_type_and_info`: a template member's type plus its info word
+/// (`DINT`, `SINT[82]`, `BOOL bit 3`).
+pub fn decode_type_and_info(t: u16, info: u16) -> String {
+    let mut text = decode_extended_type(t);
+    if info > 0 {
+        if t == CipType::Bool.code() {
+            text.push_str(&format!(" bit {info}"));
+        } else if let Some(close) = text.find(']') {
+            text.replace_range(close.., &format!("{info}]"));
+        } else {
+            text.push_str(&format!(", info 0x{info:04X}"));
+        }
+    }
+    text
 }
 
 /// Byte size of an MR_Request header for a path of `path_words` words.
@@ -524,7 +564,16 @@ pub fn encode_write_string(
     let head = 2 + 2 * tag.path_words() + 2 + 2 + 2 + 2 + 2;
     if head + len + 1 > buf_limit {
         len = buf_limit.saturating_sub(head + 1);
-        log::warn!("EIP: string too long for request package, truncated to {len} bytes");
+        // C prints `raw_data` with %s: the struct head up to its first NUL.
+        let head_end = raw_data
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(raw_data.len());
+        crate::eip_printf!(
+            2,
+            "{} is too long to fit in request package.  Truncated to {len} bytes\n",
+            String::from_utf8_lossy(&raw_data[..head_end])
+        );
     }
 
     out.push(service::CIP_WRITE_DATA);
@@ -672,7 +721,10 @@ pub fn get_double(raw: &[u8], element: usize) -> Option<f64> {
         CipType::Ulint => rd_u64(raw, at).map(|v| v as f64),
         CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as f64),
         CipType::Lreal => rd_u64(raw, at).map(f64::from_bits),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_double: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -693,7 +745,10 @@ pub fn get_dint(raw: &[u8], element: usize) -> Option<i32> {
         CipType::Lint | CipType::Ulint => rd_u64(raw, at).map(|v| v as i64 as i32),
         CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as i32),
         CipType::Lreal => rd_u64(raw, at).map(|v| f64::from_bits(v) as i32),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_DINT: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -710,7 +765,10 @@ pub fn get_udint(raw: &[u8], element: usize) -> Option<u32> {
         CipType::Dint | CipType::Bits => rd_u32(raw, at),
         CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as u32),
         CipType::Lreal => rd_u64(raw, at).map(|v| f64::from_bits(v) as u32),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_UDINT: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -720,7 +778,10 @@ pub fn get_lint(raw: &[u8], element: usize) -> Option<i64> {
     let at = elem_off(t, element);
     match t {
         CipType::Lint | CipType::Ulint => rd_u64(raw, at).map(|v| v as i64),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_LINT: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -729,7 +790,14 @@ pub fn get_usint(raw: &[u8], element: usize) -> Option<u8> {
     let t = typecode(raw)?;
     match t {
         CipType::Bool | CipType::Sint => raw.get(elem_off(t, element)).copied(),
-        _ => None,
+        _ => {
+            crate::eip_printf!(
+                1,
+                "EIP get_CIP_USINT: cannot handle type 0x{:04X}\n",
+                t.code()
+            );
+            None
+        }
     }
 }
 
@@ -758,18 +826,28 @@ pub fn get_string(raw: &[u8], element: usize, max: usize) -> Option<String> {
         CipType::Struct => {
             let handle = rd_u16(raw, TYPECODE_SIZE)?;
             if handle != STRUCT_STRING_HANDLE {
-                log::warn!("EIP get_string: unknown struct handle 0x{handle:04X}");
+                crate::eip_printf!(1, "EIP get_CIP_STRING: unknown subtype 0x{handle:04X}\n");
                 return None;
             }
             let base = TYPECODE_SIZE + 2 + element * STRUCT_STRING_STRIDE;
             let len = rd_u16(raw, base)? as usize;
+            if len >= max {
+                crate::eip_printf!(
+                    5,
+                    "EIP get_CIP_STRING: Truncating from {len} to {cap} chars (plus terminator)\n"
+                );
+            }
             // base+2 is the "no idea what this is" pad word.
             let text = raw.get(base + STRUCT_STRING_LEN_BYTES..)?;
             let n = len.min(cap).min(text.len()).min(STRUCT_STRING_BUF);
             &text[..n]
         }
         other => {
-            log::warn!("EIP get_string: unhandled type {other:?}");
+            crate::eip_printf!(
+                1,
+                "EIP get_CIP_STRING: unknown type 0x{:04X}\n",
+                other.code()
+            );
             return None;
         }
     };
@@ -790,7 +868,10 @@ pub fn put_double(raw: &mut [u8], element: usize, value: f64) -> bool {
         CipType::Lint | CipType::Ulint => wr_slice(raw, at, &(value as i64).to_le_bytes()),
         CipType::Real => wr_slice(raw, at, &(value as f32).to_bits().to_le_bytes()),
         CipType::Lreal => wr_slice(raw, at, &value.to_bits().to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_double: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
@@ -805,7 +886,10 @@ pub fn put_dint(raw: &mut [u8], element: usize, value: i32) -> bool {
         CipType::Lint | CipType::Ulint => wr_slice(raw, at, &(value as i64).to_le_bytes()),
         CipType::Real => wr_slice(raw, at, &(value as f32).to_bits().to_le_bytes()),
         CipType::Lreal => wr_slice(raw, at, &(value as f64).to_bits().to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_DINT: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
@@ -819,7 +903,10 @@ pub fn put_udint(raw: &mut [u8], element: usize, value: u32) -> bool {
         CipType::Dint | CipType::Bits => wr_slice(raw, at, &value.to_le_bytes()),
         CipType::Real => wr_slice(raw, at, &(value as f32).to_bits().to_le_bytes()),
         CipType::Lreal => wr_slice(raw, at, &(value as f64).to_bits().to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_UDINT: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
@@ -829,20 +916,26 @@ pub fn put_lint(raw: &mut [u8], element: usize, value: i64) -> bool {
     let at = elem_off(t, element);
     match t {
         CipType::Lint | CipType::Ulint => wr_slice(raw, at, &value.to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_LINT: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
 /// Set the text of a Logix STRING struct in place, leaving the rest of the
 /// buffer alone. Returns false for a non-STRING buffer.
 pub fn put_string(raw: &mut [u8], value: &str) -> bool {
-    let Some(CipType::Struct) = typecode(raw) else {
+    let Some(t) = typecode(raw) else { return false };
+    if t != CipType::Struct {
+        crate::eip_printf!(1, "EIP put_CIP_STRING: unknown type 0x{:04X}\n", t.code());
         return false;
-    };
+    }
     let Some(handle) = rd_u16(raw, TYPECODE_SIZE) else {
         return false;
     };
     if handle != STRUCT_STRING_HANDLE {
+        crate::eip_printf!(1, "EIP put_CIP_STRING: unknown subtype 0x{handle:04X}\n");
         return false;
     }
     let len_at = TYPECODE_SIZE + 2;
@@ -865,4 +958,112 @@ pub fn put_string(raw: &mut [u8], value: &str) -> bool {
     }
     raw[text_at + len] = 0;
     true
+}
+
+/// `dump_raw_CIP_data`: the type and `elements` values of a ReadData reply,
+/// as one line. Stops where the data ends; C reads on past it.
+pub fn dump_raw_cip_data(raw: &[u8], elements: usize) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let t = rd_u16(raw, 0).unwrap_or(0);
+    let data = raw.get(TYPECODE_SIZE..).unwrap_or(&[]);
+    let mut put = |name: &str, size: usize, value: &dyn Fn(&[u8]) -> String| {
+        out.push_str(name);
+        for chunk in data.chunks_exact(size).take(elements) {
+            let _ = write!(out, " {}", value(chunk));
+        }
+    };
+    match CipType::from_code(t) {
+        CipType::Bool | CipType::Sint => {
+            let name = if t == CipType::Bool.code() {
+                "BOOL"
+            } else {
+                "SINT"
+            };
+            put(name, 1, &|b| b[0].to_string());
+        }
+        CipType::Int => put("INT", 2, &|b| u16::from_le_bytes([b[0], b[1]]).to_string()),
+        CipType::Dint => put("DINT", 4, &|b| {
+            i32::from_le_bytes([b[0], b[1], b[2], b[3]]).to_string()
+        }),
+        CipType::Lint | CipType::Ulint => {
+            let name = if t == CipType::Lint.code() {
+                "LINT"
+            } else {
+                "ULINT"
+            };
+            put(name, 8, &|b| {
+                format!("0x{:016X}", u64::from_le_bytes(b.try_into().unwrap()))
+            });
+        }
+        CipType::Real => put("REAL", 4, &|b| {
+            format!("{:.6}", f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }),
+        CipType::Lreal => put("LREAL", 8, &|b| {
+            format!("{:.6}", f64::from_le_bytes(b.try_into().unwrap()))
+        }),
+        CipType::Bits => put("BITS", 4, &|b| {
+            format!("0x{:08X}", u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }),
+        CipType::Struct => {
+            let sub = rd_u16(data, 0).unwrap_or(0);
+            if sub == STRUCT_STRING_HANDLE {
+                out.push_str("STRING");
+                for i in 0..elements {
+                    let base = 2 + i * STRUCT_STRING_STRIDE;
+                    let Some(len) = rd_u16(data, base) else { break };
+                    let len = usize::from(len).min(STRUCT_STRING_MAX);
+                    let text = data.get(base + STRUCT_STRING_LEN_BYTES..).unwrap_or(&[]);
+                    let text = &text[..len.min(text.len())];
+                    let end = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+                    let _ = write!(out, " '{}'", String::from_utf8_lossy(&text[..end]));
+                }
+            } else {
+                let _ = write!(out, "Unknown CIP struct (type 0x{t:04X}) 0x{sub:04X}: ");
+            }
+        }
+        // C's hexdump of CIP_Type_size(type) * elements is empty here:
+        // every other type has size 0.
+        _ => {
+            let _ = write!(out, "raw CIP data, unknown type 0x{t:04X}: ");
+        }
+    }
+    out.push('\n');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The examples in C's `decode_type_and_info` comment, plus the bit and
+    /// unknown-type branches.
+    #[test]
+    fn template_member_types_decode_as_c_prints_them() {
+        assert_eq!(decode_type_and_info(0x00C4, 0), "DINT");
+        assert_eq!(decode_type_and_info(0x20C2, 0x52), "SINT[82]");
+        assert_eq!(decode_type_and_info(0x00C1, 3), "BOOL bit 3");
+        assert_eq!(decode_type_and_info(0xAFCE, 0), "STRING[]");
+        assert_eq!(decode_type_and_info(0x8123, 2), "0x8123, info 0x0002");
+    }
+
+    #[test]
+    fn raw_cip_data_dumps_as_c_prints_it() {
+        // DINT[2] = -1, 7.
+        let raw = [0xC4, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 7, 0, 0, 0];
+        assert_eq!(dump_raw_cip_data(&raw, 2), "DINT -1 7\n");
+        // INT prints unsigned, as C's CN_UINT does.
+        assert_eq!(dump_raw_cip_data(&[0xC3, 0, 0xFE, 0xFF], 1), "INT 65534\n");
+        assert_eq!(
+            dump_raw_cip_data(&[0xCA, 0, 0, 0, 0xC0, 0x3F], 1),
+            "REAL 1.500000\n"
+        );
+        let mut s = vec![0xA0, 0x02, 0xCE, 0x0F, 2, 0, 0, 0, b'h', b'i'];
+        s.resize(4 + STRUCT_STRING_STRIDE, 0);
+        assert_eq!(dump_raw_cip_data(&s, 1), "STRING 'hi'\n");
+        assert_eq!(
+            dump_raw_cip_data(&[0xC7, 0, 1, 0], 1),
+            "raw CIP data, unknown type 0x00C7: \n"
+        );
+    }
 }

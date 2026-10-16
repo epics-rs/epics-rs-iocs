@@ -30,6 +30,7 @@
 //!   count, so a short read publishes uninitialised heap as currents.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread;
@@ -40,17 +41,21 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
+use crate::asyn_print;
 use crate::drv_quad_em::{
-    self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QuadEmBase, QuadEmDevice,
-    QuadEmParams, QuadEmShared,
+    self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QuadEmBase, QuadEmDevice, QuadEmParams,
+    QuadEmShared,
 };
 use crate::octet::{OctetIo, create_ip_port};
 use crate::t4u_proto::{self as proto, CalTable, Calibration, ChannelCal, CmdName, DirectFrame};
+use crate::trace::status_code;
 
 /// C++ `epicsThreadSleep(1.0)` after an unexpected socket error.
 const ERROR_BACKOFF: Duration = Duration::from_secs(1);
@@ -321,6 +326,29 @@ impl T4uDriver {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
         let t4u = T4uParams::create(&mut base.port_base, variant)?;
 
+        // C++ `currRange_`, set before the ports are configured.
+        state.lock().range = match variant {
+            T4uVariant::Middle => 0,
+            T4uVariant::Direct => proto::NUM_RANGES as i32 - 1,
+        };
+        let full = calibration.map(|c| c.cw).unwrap_or_default();
+
+        // C++ returns from the constructor at the first port that will not
+        // configure: the port stays, with drvQuadEM's defaults and no meter.
+        if let Err(line) = &spec.transport.link {
+            asyn_print!(base.port_base, ERROR, "{line}");
+            return Ok(Self {
+                base,
+                shared,
+                state,
+                t4u,
+                variant,
+                cmd,
+                calibration,
+                full,
+            });
+        }
+
         let p = base.params;
         let sample_time = match variant {
             T4uVariant::Middle => MIDDLE_SAMPLE_TIME,
@@ -347,16 +375,7 @@ impl T4uDriver {
             acq.values_per_read = DEFAULT_VALUES_PER_READ;
             acq.num_channels = QE_MAX_INPUTS as i32;
         }
-        {
-            let mut st = state.lock();
-            st.sample_time = sample_time;
-            st.range = match variant {
-                T4uVariant::Middle => 0,
-                T4uVariant::Direct => proto::NUM_RANGES as i32 - 1,
-            };
-        }
-
-        let full = calibration.map(|c| c.cw).unwrap_or_default();
+        state.lock().sample_time = sample_time;
 
         let mut this = Self {
             base,
@@ -382,17 +401,28 @@ impl T4uDriver {
         self.base.params
     }
 
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
-    }
-
-    /// C++ `writeReadMeter`. As upstream, a failed send is logged and the write
-    /// still succeeds: the parameter is already in the library and the meter
-    /// will be re-synchronised by the next register dump.
+    /// C++ `writeReadMeter`. As upstream, a failed send is ignored and the
+    /// write still succeeds: the parameter is already in the library and the
+    /// meter will be re-synchronised by the next register dump.
     fn send(&self, command: String) {
         let line = format!("{command}{}", self.variant.eol());
-        if let Err(e) = self.cmd.send(&line) {
-            log::error!("{}: sending {command:?} failed: {e}", self.variant.name());
+        let result = self.cmd.send(&line);
+        // drvT4U_EM.cpp:554-561; the direct driver has these commented out.
+        if self.variant == T4uVariant::Middle {
+            println!("Entered writeReadMeter()");
+            println!(
+                "Write status {}",
+                result.as_ref().map_or_else(status_code, |_| 0)
+            );
+        }
+    }
+
+    /// The `"%s: function %i name %s"` debug line drvT4U_EM's write methods
+    /// print (drvT4U_EM.cpp:291, :471).
+    fn print_function_name(&self, method: &str, reason: usize) {
+        if self.variant == T4uVariant::Middle {
+            let name = self.base.port_base.params.param_name(reason).unwrap_or("");
+            println!("{method}: function {reason} name {name}");
         }
     }
 
@@ -464,7 +494,7 @@ impl T4uDriver {
     /// C++ `P_AveragingTime` in `writeFloat64`: `NumAverage = int(averagingTime
     /// / sampleTime)`. Unlike the other quadEM drivers this truncates rather
     /// than rounding, because the T4U has no `readStatus` to recompute it.
-    fn set_averaging_time(&mut self, value: f64) -> AsynResult<()> {
+    fn write_averaging_time(&mut self, value: f64) -> AsynResult<()> {
         let num_average = {
             let mut st = self.state.lock();
             st.averaging_time = value;
@@ -475,70 +505,6 @@ impl T4uDriver {
             .set_int32_param(self.params().num_average, 0, num_average)?;
         self.shared.acq.lock().num_average = num_average;
         Ok(())
-    }
-
-    /// The `function < FIRST_T4U_COMMAND` fallthrough into
-    /// `drvQuadEM::writeInt32`.
-    ///
-    /// Every `drvQuadEM` hook the T4U could override is a no-op, so only the
-    /// branches with an effect of their own are left: the ring flush, the
-    /// acquire-mode stop, and the caches the callback task and the read threads
-    /// consume.
-    fn base_write_int32(&mut self, reason: usize, value: i32) -> AsynResult<()> {
-        let p = self.params();
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.shared.acq.lock().acquire_mode = value;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-        } else if reason == p.values_per_read {
-            self.shared.acq.lock().values_per_read = value;
-        } else if reason == p.num_channels {
-            self.shared.acq.lock().num_channels = value;
-        } else if reason == p.trigger_mode {
-            self.shared.acq.lock().trigger_mode = value;
-        } else {
-            self.base.write_int32_pool(reason)?;
-        }
-        Ok(())
-    }
-
-    /// Mirror a parameter write into the shared position snapshot the read
-    /// threads consume.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
     }
 }
 
@@ -560,6 +526,11 @@ impl QuadEmDevice for T4uDriver {
     fn set_acquire(&mut self, _value: i32) -> AsynResult<()> {
         Ok(())
     }
+
+    /// C++ `drvT4U_EM::reset` / `drvT4UDirect_EM::reset` do nothing.
+    fn reset(&mut self) -> AsynResult<()> {
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -575,6 +546,10 @@ impl PortDriver for T4uDriver {
         &mut self.base.port_base
     }
 
+    /// C++ `drvT4U_EM::report` and `drvT4UDirect_EM::report` return without
+    /// printing, not even the base report.
+    fn report(&mut self, _out: &mut dyn std::fmt::Write, _level: i32) {}
+
     /// C++ `drvT4U_EM::writeInt32` / `drvT4UDirect_EM::writeInt32`.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
@@ -582,9 +557,13 @@ impl PortDriver for T4uDriver {
         let p = self.params();
         let t = self.t4u;
 
+        if self.variant == T4uVariant::Middle {
+            println!("writeInt32: function {reason}");
+        }
         self.base
             .port_base
             .set_int32_param(reason, channel, value)?;
+        self.print_function_name("writeInt32", reason);
 
         if reason == t.bias_n_en {
             self.send(proto::cmd_bias_enable(value != 0, false));
@@ -625,7 +604,10 @@ impl PortDriver for T4uDriver {
             ));
         } else if reason == t.update_reg {
             match self.variant {
-                T4uVariant::Middle => self.send(proto::cmd_read_regs(100, 107)),
+                T4uVariant::Middle => {
+                    println!("Running updater.");
+                    self.send(proto::cmd_read_regs(100, 107));
+                }
                 T4uVariant::Direct => {
                     self.send(proto::cmd_read_regs(0, 49));
                     self.send(proto::cmd_read_regs(50, 99));
@@ -659,11 +641,11 @@ impl PortDriver for T4uDriver {
             self.send(proto::cmd_write(proto::REG_READS_PER_PACKET, value));
         }
 
+        // C++ returns here for its own functions, without callbacks; their
+        // readbacks post when the meter's register dump comes back.
         if reason < t.first {
-            self.base_write_int32(reason, value)?;
+            return self.qe_write_int32(reason, channel, value);
         }
-
-        self.base.port_base.call_param_callbacks(channel)?;
         Ok(())
     }
 
@@ -677,7 +659,7 @@ impl PortDriver for T4uDriver {
         self.base
             .port_base
             .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
+        self.print_function_name("writeFloat64", reason);
 
         if let Some(index) = t.pid_index(reason) {
             let reg = &proto::PID_REGS[index];
@@ -688,17 +670,17 @@ impl PortDriver for T4uDriver {
         } else if reason == t.bias_p_voltage {
             self.send(proto::cmd_write(proto::REG_BIAS_P_VOLTAGE, value as i32));
         } else if reason == p.averaging_time {
-            self.set_averaging_time(value)?;
+            self.write_averaging_time(value)?;
         }
 
-        // The `function < FIRST_T4U_COMMAND` fallthrough into
-        // drvQuadEM::writeFloat64. Every hook it would call is a no-op for the
-        // T4U, so only the averaging-time ring flush is left.
-        if reason < t.first && reason == p.averaging_time {
-            self.shared.ring.lock().flush();
+        if self.variant == T4uVariant::Middle {
+            // C prints this one without a newline (drvT4U_EM.cpp:499).
+            print!("About to exit from writeFloat64");
+            let _ = std::io::stdout().flush();
         }
-
-        self.base.port_base.call_param_callbacks(channel)?;
+        if reason < t.first {
+            return self.qe_write_float64(reason, channel, value);
+        }
         Ok(())
     }
 }
@@ -720,11 +702,11 @@ struct RegSink {
 }
 
 impl RegSink {
-    fn apply(&self, reg_num: i32, reg_val: u32) {
+    /// False for a register C++ `processRegVal` does not handle (its `-1`).
+    fn apply(&self, reg_num: i32, reg_val: u32) -> bool {
         use proto::RegUpdate::*;
         let Some(update) = proto::decode_reg(reg_num, reg_val) else {
-            log::debug!("T4U: unhandled register {reg_num} = {reg_val:#x}");
-            return;
+            return false;
         };
 
         let set_int =
@@ -791,6 +773,7 @@ impl RegSink {
         if !values.is_empty() {
             let _ = self.handle.set_params_and_notify_blocking(0, values);
         }
+        true
     }
 }
 
@@ -896,8 +879,7 @@ fn cmd_thread(ctx: CmdContext) {
     let mut reader = StreamReader::new(ctx.io.clone());
     let mut tick = 0i32;
     loop {
-        if let Err(e) = cmd_iteration(&ctx, &mut reader, &mut tick) {
-            log::error!("{}: command socket error: {e}", ctx.variant.name());
+        if cmd_iteration(&ctx, &mut reader, &mut tick).is_err() {
             reader.flush();
             thread::sleep(ERROR_BACKOFF);
         }
@@ -953,8 +935,16 @@ fn cmd_iteration(ctx: &CmdContext, reader: &mut StreamReader, tick: &mut i32) ->
                 reader.flush();
                 return Ok(());
             };
+            // tr_on_command_socket is the middle-layer driver, whose loop
+            // prints these (drvT4U_EM.cpp:754-762).
             for (reg_num, reg_val) in proto::parse_reg_records(&payload) {
-                ctx.regs.apply(reg_num, reg_val);
+                println!("Processing reg {reg_num:3}");
+                if ctx.regs.apply(reg_num, reg_val) {
+                    println!(
+                        "Processed reg {reg_num:3} Value: {:10} 0x{reg_val:08x}",
+                        reg_val as i32
+                    );
+                }
             }
         }
         CmdName::Tr | CmdName::Ascii => {
@@ -966,10 +956,6 @@ fn cmd_iteration(ctx: &CmdContext, reader: &mut StreamReader, tick: &mut i32) ->
             }
         }
         CmdName::Unknown => {
-            log::warn!(
-                "{}: unknown command {verb:?} on the command socket",
-                ctx.variant.name()
-            );
             reader.flush();
         }
     }
@@ -991,7 +977,6 @@ struct DataContext {
     shared: Arc<QuadEmShared>,
     state: SharedState,
     regs: RegSink,
-    variant: T4uVariant,
 }
 
 impl DataContext {
@@ -1013,8 +998,7 @@ impl DataContext {
 fn middle_data_thread(ctx: DataContext) {
     let mut reader = StreamReader::new(ctx.io.clone());
     loop {
-        if let Err(e) = middle_data_iteration(&ctx, &mut reader) {
-            log::error!("{}: data socket error: {e}", ctx.variant.name());
+        if middle_data_iteration(&ctx, &mut reader).is_err() {
             reader.flush();
             thread::sleep(ERROR_BACKOFF);
         }
@@ -1028,17 +1012,13 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
     match kind {
         b'r' => {
             let Some(rest) = reader.read_line(proto::MAX_COMMAND_LEN)? else {
-                log::error!("drvT4U_EM: over-long text data line");
                 reader.flush();
                 return Ok(());
             };
             let line = format!("r{}", String::from_utf8_lossy(&rest));
             match proto::parse_read_line(&line) {
                 Some(sample) => ctx.publish(vec![sample]),
-                None => {
-                    log::error!("drvT4U_EM: malformed text data line: {line:?}");
-                    reader.flush();
-                }
+                None => reader.flush(),
             }
         }
         b'B' => {
@@ -1049,7 +1029,6 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
                 return Ok(());
             };
             if header[0] != 1 {
-                log::error!("drvT4U_EM: unknown binary frame type {}", header[0]);
                 reader.flush();
                 return Ok(());
             }
@@ -1059,21 +1038,21 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
             };
             // C++ checks only the read status here, not the byte count, so a
             // short read publishes whatever the uninitialised heap buffer held.
-            let Some(payload) = reader.take_exact(bc.payload_len)? else {
-                log::error!(
-                    "drvT4U_EM: short binary payload, expected {} bytes",
-                    bc.payload_len
-                );
-                reader.flush();
-                return Ok(());
+            let payload = match reader.take_exact(bc.payload_len) {
+                Ok(Some(payload)) => payload,
+                failed => {
+                    // No payload within the timeout is C's asynTimeout.
+                    let status =
+                        failed.map_or_else(|e| status_code(&e), |_| AsynStatus::Timeout as i32);
+                    println!("Error reading data payload: {status}.");
+                    reader.flush();
+                    return Ok(());
+                }
             };
             let (range, cal) = ctx.range_and_cal();
             ctx.publish(proto::decode_samples(&payload, bc.units, range, &cal));
         }
-        other => {
-            log::error!("drvT4U_EM: unknown data header byte {other:#x}");
-            reader.flush();
-        }
+        _ => reader.flush(),
     }
     Ok(())
 }
@@ -1085,8 +1064,7 @@ fn direct_data_thread(ctx: DataContext) {
             Ok(outcome) if outcome.data.is_empty() => continue,
             Ok(outcome) => outcome.data,
             Err(e) if is_timeout(&e) => continue,
-            Err(e) => {
-                log::error!("drvT4UDirect_EM: data socket error: {e}");
+            Err(_) => {
                 thread::sleep(ERROR_BACKOFF);
                 continue;
             }
@@ -1102,8 +1080,7 @@ fn direct_data_thread(ctx: DataContext) {
                     ctx.regs.apply(reg_num, reg_val);
                 }
             }
-            Err(e) => {
-                log::warn!("drvT4UDirect_EM: dropping a data frame: {e:?}");
+            Err(_) => {
                 let _ = ctx.io.flush();
             }
         }
@@ -1121,10 +1098,11 @@ pub struct T4uRuntime {
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    /// The sub-ports the driver built; dropping them closes the sockets.
-    _transport: Vec<PortRuntimeHandle>,
-    _cmd_thread: thread::JoinHandle<()>,
-    _data_thread: thread::JoinHandle<()>,
+    /// The sub-ports the driver built; dropping them closes the sockets. C++
+    /// registers them by name, so `st.cmd` can trace them.
+    pub sub_ports: Vec<PortRuntimeHandle>,
+    /// The meter threads; absent when a port would not configure.
+    _meter_threads: Option<[thread::JoinHandle<()>; 2]>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -1135,9 +1113,29 @@ impl T4uRuntime {
 }
 
 struct Transport {
-    cmd_io: OctetIo,
-    data_io: OctetIo,
+    /// The command and data sockets, or the `asynPrint` line C++ gives for
+    /// the port that would not configure.
+    link: Result<(OctetIo, OctetIo), String>,
     runtimes: Vec<PortRuntimeHandle>,
+}
+
+/// C++ `drvAsynIPPortConfigure` of one sub-port, with the constructor's error
+/// line when it fails (`status` is the configure call's -1).
+fn sub_port(
+    name: &str,
+    host: &str,
+    timeout: Duration,
+    owner: &Arc<InterruptGate>,
+    runtimes: &mut Vec<PortRuntimeHandle>,
+    describe: impl FnOnce(&str, &str) -> String,
+) -> Result<OctetIo, String> {
+    match create_ip_port(name, host, timeout, false, false, owner) {
+        Ok((io, runtime)) => {
+            runtimes.push(runtime);
+            Ok(io)
+        }
+        Err(_) => Err(describe(name, host)),
+    }
 }
 
 /// Everything the two `create_*` entry points differ in.
@@ -1153,6 +1151,37 @@ struct Build {
     max_memory: usize,
 }
 
+/// The command port, with the line both C++ constructors print after
+/// `drvAsynIPPortConfigure` whatever it returned.
+fn command_port(
+    port_name: &str,
+    host: &str,
+    variant: T4uVariant,
+    owner: &Arc<InterruptGate>,
+    runtimes: &mut Vec<PortRuntimeHandle>,
+) -> Result<OctetIo, String> {
+    let name = format!("TCP_Command_{port_name}");
+    let port = sub_port(
+        &name,
+        host,
+        variant.timeout(),
+        owner,
+        runtimes,
+        |name, host| {
+            format!(
+                "{}::drvT4U_EM error calling drvAsynIPPortConfigure for command port={name}, \
+             IP={host}, status=-1",
+                variant.name()
+            )
+        },
+    );
+    println!(
+        "Attempted command port: {name} connection to: {host}\nStatus: {}",
+        if port.is_ok() { 0 } else { -1 }
+    );
+    port
+}
+
 /// C++ `drvT4U_EMConfigure(portName, qtHostAddress, ringBufferSize,
 /// base_port_num)`: the Qt middle layer listens for commands on `base_port_num`
 /// and streams data on `base_port_num + 1`.
@@ -1160,110 +1189,162 @@ struct Build {
 /// `max_memory` has no C++ analogue (the C++ pool is unbounded); it bounds the
 /// Rust `NDArrayPool`.
 pub fn create_t4u_em(
-    port_name: &str,
+    claim: &PortClaim,
     qt_host_address: &str,
     ring_buffer_size: usize,
     base_port_num: u16,
     max_memory: usize,
+    owner: &Arc<InterruptGate>,
 ) -> AsynResult<T4uRuntime> {
+    let port_name = claim.name();
     let variant = T4uVariant::Middle;
-    let (cmd_io, cmd_runtime) = create_ip_port(
-        &format!("TCP_Command_{port_name}"),
+    let mut runtimes = Vec::new();
+    let link = command_port(
+        port_name,
         &format!("{qt_host_address}:{base_port_num}"),
-        variant.timeout(),
-        false,
-        false,
-    )?;
-    let (data_io, data_runtime) = create_ip_port(
-        &format!("TCP_Data_{port_name}"),
-        &format!("{qt_host_address}:{}", base_port_num + 1),
-        variant.timeout(),
-        false,
-        false,
-    )?;
+        variant,
+        owner,
+        &mut runtimes,
+    )
+    .and_then(|cmd_io| {
+        let data_io = sub_port(
+            &format!("TCP_Data_{port_name}"),
+            &format!("{qt_host_address}:{}", u32::from(base_port_num) + 1),
+            variant.timeout(),
+            owner,
+            &mut runtimes,
+            |name, host| {
+                format!(
+                    "drvT4U_EM::drvT4U_EM error calling drvAsynIPPortConfigure for data \
+                     port={name}, IP={host}, status=-1"
+                )
+            },
+        )?;
+        Ok((cmd_io, data_io))
+    });
+    // An unlinked port has no socket to write to; C++ dereferences a null
+    // asynUser there.
+    let cmd = match &link {
+        Ok((cmd_io, _)) => cmd_io.clone(),
+        Err(_) => OctetIo::unbound(variant.timeout()),
+    };
 
     build(
         Build {
             port_name: port_name.to_string(),
             variant,
-            transport: Transport {
-                cmd_io: cmd_io.clone(),
-                data_io,
-                runtimes: vec![cmd_runtime, data_runtime],
-            },
+            transport: Transport { link, runtimes },
             queue: None,
             calibration: None,
             ring_buffer_size,
             max_memory,
         },
-        CmdSink::Immediate(cmd_io),
+        CmdSink::Immediate(cmd),
+        claim,
     )
+}
+
+/// Why [`create_t4u_direct_em`] built no port.
+#[derive(Debug)]
+pub enum T4uDirectError {
+    /// The `std::logic_error` inicpp throws out of the constructor on a
+    /// malformed calibration file; its `what()`. C iocsh catches it and keeps
+    /// running (iocsh.cpp:1275-1284).
+    Thrown(String),
+    Asyn(AsynError),
+}
+
+impl From<AsynError> for T4uDirectError {
+    fn from(e: AsynError) -> Self {
+        Self::Asyn(e)
+    }
+}
+
+impl std::fmt::Display for T4uDirectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Thrown(what) => f.write_str(what),
+            Self::Asyn(e) => e.fmt(f),
+        }
+    }
 }
 
 /// C++ `drvT4UDirect_EMConfigure(portName, T4U_Address, ringBufferSize,
 /// base_port_num, cfgFileName)`: commands go to the T4U's telnet port, data
 /// arrives as UDP datagrams on `base_port_num`.
 pub fn create_t4u_direct_em(
-    port_name: &str,
+    claim: &PortClaim,
     t4u_address: &str,
     ring_buffer_size: usize,
     base_port_num: u16,
     cfg_file_name: &str,
     max_memory: usize,
-) -> AsynResult<T4uRuntime> {
+    owner: &Arc<InterruptGate>,
+) -> Result<T4uRuntime, T4uDirectError> {
+    let port_name = claim.name();
     let variant = T4uVariant::Direct;
 
-    // C++ aborts the IOC when the calibration file will not load; there is no
-    // usable default, since an unparsed table would send NaN slopes to the
-    // meter on the first range change.
-    let text = std::fs::read_to_string(cfg_file_name)
-        .map_err(|e| error(format!("T4U: reading {cfg_file_name}: {e}")))?;
-    let calibration =
-        proto::parse_calibration(&text).map_err(|e| error(format!("T4U: {cfg_file_name}: {e}")))?;
+    // inicpp reads a file that will not open as an empty one, and throws out
+    // of the constructor on a malformed line.
+    let text = std::fs::read(cfg_file_name).unwrap_or_default();
+    let ini = proto::parse_ini(&String::from_utf8_lossy(&text)).map_err(T4uDirectError::Thrown)?;
+    let Some(calibration) = proto::parse_calibration(&ini) else {
+        println!("Error in calibration file.  Aborting.");
+        // C++ `exit(1)`, which runs the epicsAtExit list through atexit().
+        epics_rs::base::runtime::exit::call_at_exits();
+        std::process::exit(1);
+    };
 
-    // The C++ host spec is "127.0.0.1:base-1:base UDP": the driver binds the
-    // local port the T4U streams to, and the remote endpoint only gives the
-    // socket a peer.
-    let remote_port = base_port_num
-        .checked_sub(1)
-        .ok_or_else(|| error("T4U: the UDP data port must be at least 1"))?;
-
-    let (cmd_io, cmd_runtime) = create_ip_port(
-        &format!("TCP_Command_{port_name}"),
+    let mut runtimes = Vec::new();
+    let link = command_port(
+        port_name,
         &format!("{t4u_address}:{}", proto::T4U_CMD_PORT),
-        variant.timeout(),
-        false,
-        false,
-    )?;
-    let (data_io, data_runtime) = create_ip_port(
-        &format!("UDP_Data_{port_name}"),
-        &format!("127.0.0.1:{remote_port}:{base_port_num} UDP"),
-        variant.timeout(),
-        false,
-        false,
-    )?;
+        variant,
+        owner,
+        &mut runtimes,
+    )
+    .and_then(|cmd_io| {
+        // The C++ host spec is "127.0.0.1:base-1:base UDP": the driver binds
+        // the local port the T4U streams to, and the remote endpoint only
+        // gives the socket a peer. `base_port_num` is unsigned in C++, so 0
+        // gives a remote port that will not parse.
+        let data_io = sub_port(
+            &format!("UDP_Data_{port_name}"),
+            &format!(
+                "127.0.0.1:{}:{base_port_num} UDP",
+                u32::from(base_port_num).wrapping_sub(1)
+            ),
+            variant.timeout(),
+            owner,
+            &mut runtimes,
+            |name, host| {
+                format!(
+                    "drvT4UDirect_EM::drvT4U_EM error calling drvAsynIPPortConfigure for UDP \
+                     data port={name}, IP={host}, status=-1"
+                )
+            },
+        )?;
+        Ok((cmd_io, data_io))
+    });
 
     let (cmd_tx, cmd_rx) = sync_channel::<String>(proto::CMD_QUEUE_LEN);
 
-    build(
+    Ok(build(
         Build {
             port_name: port_name.to_string(),
             variant,
-            transport: Transport {
-                cmd_io,
-                data_io,
-                runtimes: vec![cmd_runtime, data_runtime],
-            },
+            transport: Transport { link, runtimes },
             queue: Some(cmd_rx),
             calibration: Some(calibration),
             ring_buffer_size,
             max_memory,
         },
         CmdSink::Queued(cmd_tx),
-    )
+        claim,
+    )?)
 }
 
-fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
+fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime> {
     let variant = spec.variant;
     let (shared, trigger_rx) = QuadEmShared::new(spec.ring_buffer_size);
     let state: SharedState = Arc::new(parking_lot::Mutex::new(T4uState {
@@ -1284,7 +1365,7 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
     let t4u = driver.t4u;
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let regs = RegSink {
@@ -1295,33 +1376,35 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
         state: state.clone(),
     };
 
-    let cmd_ctx = CmdContext {
-        io: transport.cmd_io,
-        regs: regs.clone(),
-        variant,
-        queue,
-    };
-    let cmd_thread_handle = thread::Builder::new()
-        .name(format!("{}_Cmd_Task", variant.name()))
-        .spawn(move || cmd_thread(cmd_ctx))
-        .expect("failed to spawn the T4U command thread");
+    let meter_threads = transport.link.ok().map(|(cmd_io, data_io)| {
+        let cmd_ctx = CmdContext {
+            io: cmd_io,
+            regs: regs.clone(),
+            variant,
+            queue,
+        };
+        let cmd_thread_handle = thread::Builder::new()
+            .name(format!("{}_Cmd_Task", variant.name()))
+            .spawn(move || cmd_thread(cmd_ctx))
+            .expect("failed to spawn the T4U command thread");
 
-    let data_ctx = DataContext {
-        io: transport.data_io,
-        handle: handle.clone(),
-        params,
-        shared: shared.clone(),
-        state,
-        regs,
-        variant,
-    };
-    let data_thread_handle = thread::Builder::new()
-        .name(format!("{}_Data_Task", variant.name()))
-        .spawn(move || match variant {
-            T4uVariant::Middle => middle_data_thread(data_ctx),
-            T4uVariant::Direct => direct_data_thread(data_ctx),
-        })
-        .expect("failed to spawn the T4U data thread");
+        let data_ctx = DataContext {
+            io: data_io,
+            handle: handle.clone(),
+            params,
+            shared: shared.clone(),
+            state,
+            regs,
+        };
+        let data_thread_handle = thread::Builder::new()
+            .name(format!("{}_Data_Task", variant.name()))
+            .spawn(move || match variant {
+                T4uVariant::Middle => middle_data_thread(data_ctx),
+                T4uVariant::Direct => direct_data_thread(data_ctx),
+            })
+            .expect("failed to spawn the T4U data thread");
+        [cmd_thread_handle, data_thread_handle]
+    });
 
     let callback_thread = qe::start_callback_task(CallbackContext {
         trigger_rx,
@@ -1339,9 +1422,67 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
         nd_params,
         pool,
         outputs,
-        _transport: transport.runtimes,
-        _cmd_thread: cmd_thread_handle,
-        _data_thread: data_thread_handle,
+        sub_ports: transport.runtimes,
+        _meter_threads: meter_threads,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::registry::claim_port;
+
+    /// C++ returns from the constructor when `drvAsynIPPortConfigure` fails:
+    /// the port exists with drvQuadEM's defaults, and no meter thread runs.
+    /// inicpp throws out of the constructor on a malformed line; C iocsh
+    /// catches it, so the IOC carries on and only this port is missing.
+    #[test]
+    fn a_malformed_calibration_file_is_thrown_not_fatal() {
+        let path = std::env::temp_dir().join(format!("t4u-bad-{}.ini", std::process::id()));
+        std::fs::write(&path, "[config\n").unwrap();
+        let err = create_t4u_direct_em(
+            &claim_port("T4U_BADINI").unwrap(),
+            "127.0.0.1",
+            4,
+            5000,
+            path.to_str().unwrap(),
+            0,
+            &InterruptGate::opened(),
+        )
+        .err()
+        .expect("no port");
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            matches!(&err, T4uDirectError::Thrown(what)
+                if what == "l.1: ini parsing failed, section not closed"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_port_that_will_not_configure_keeps_the_port() {
+        let rt = create_t4u_em(
+            &claim_port("QE_T4U_BADHOST").unwrap(),
+            "[bad",
+            4,
+            5000,
+            0,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        assert!(rt._meter_threads.is_none());
+        assert!(rt.sub_ports.is_empty());
+        // drvQuadEM never sets P_Model; only the linked constructor does.
+        let model = rt.port_handle().read_int32_blocking(rt.params.model, 0);
+        assert!(
+            matches!(&model, Err(AsynError::ParamAccess { source, .. })
+                if matches!(**source, AsynError::ParamUndefined(_))),
+            "{model:?}"
+        );
+        // writeReadMeter's status is ignored, as on a linked port.
+        rt.port_handle()
+            .write_int32_blocking(rt.params.range, 0, 1)
+            .unwrap();
+    }
 }

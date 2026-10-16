@@ -19,7 +19,7 @@ use epics_rs::base::server::device_support::{
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status;
-use epics_rs::base::server::record::{AlarmSeverity, Record};
+use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
@@ -276,6 +276,8 @@ fn put_bits(raw: &mut [u8], mut element: usize, mut mask: u32, bits: usize, rval
 // ---------------------------------------------------------------------------
 
 pub struct EtherIpDevice {
+    /// The record name, for C's `rec->name` in the lines it prints.
+    name: String,
     link_text: String,
     is_output: bool,
     link: Option<Link>,
@@ -288,6 +290,7 @@ pub struct EtherIpDevice {
 impl EtherIpDevice {
     fn new(link_text: &str, is_output: bool) -> EtherIpDevice {
         EtherIpDevice {
+            name: String::new(),
             link_text: link_text.to_string(),
             is_output,
             link: None,
@@ -356,20 +359,10 @@ impl EtherIpDevice {
 /// how many array elements it wants. Both come from the record, so this runs in
 /// `init()` where the record is available.
 fn record_shape(record: &dyn Record) -> (usize, usize) {
-    let nobt = || match record.get_field("NOBT") {
-        Some(EpicsValue::Short(n)) if n > 0 => n as usize,
-        _ => 1,
-    };
     match record.record_type() {
         "bi" | "bo" => (1, 1),
-        "mbbi" | "mbbo" | "mbbiDirect" | "mbboDirect" => (nobt(), 1),
-        "waveform" => {
-            let nelm = match record.get_field("NELM") {
-                Some(EpicsValue::Long(n)) if n > 0 => n as usize,
-                _ => 1,
-            };
-            (0, nelm)
-        }
+        "mbbi" | "mbbo" | "mbbiDirect" | "mbboDirect" => (count_field(record, "NOBT"), 1),
+        "waveform" => (0, count_field(record, "NELM")),
         _ => (0, 1),
     }
 }
@@ -398,10 +391,22 @@ impl DeviceSupport for EtherIpDevice {
         DTYP
     }
 
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_string();
+    }
+
     // Every C init_record/analyze_link failure returns an `S_*` status after
     // an errlogPrintf, never touching pact (`devEtherIP.c:884-1007,1183-1205`)
     // — the record scans on: the `Err` shape, kept by every `?` below.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        // C's mbbi/mbbo(Direct) `init_record` zero SHFT (devEtherIP.c:1331,
+        // 1355,1563,1597): the tag's NOBT bits are the raw value, unshifted.
+        if matches!(
+            record.record_type(),
+            "mbbi" | "mbbo" | "mbbiDirect" | "mbboDirect"
+        ) {
+            record.put_field("SHFT", EpicsValue::UShort(0))?;
+        }
         let (bits, count) = record_shape(record);
         let link = parse_link(&self.link_text, count, bits)
             .map_err(|e| CaError::InvalidValue(format!("devEtherIP: {e}")))?;
@@ -527,20 +532,11 @@ impl DeviceSupport for EtherIpDevice {
                     "stringin" => cip::get_string(raw, element, MAX_STRING_SIZE)
                         .map(|s| (EpicsValue::String(s.into()), true))
                         .ok_or(()),
-                    "lsi" => {
-                        let sizv = match record.get_field("SIZV") {
-                            Some(EpicsValue::UShort(n)) if n > 0 => n as usize,
-                            _ => MAX_STRING_SIZE,
-                        };
-                        cip::get_string(raw, element, sizv)
-                            .map(|s| (EpicsValue::String(s.into()), true))
-                            .ok_or(())
-                    }
+                    "lsi" => cip::get_string(raw, element, count_field(record, "SIZV"))
+                        .map(|s| (EpicsValue::String(s.into()), true))
+                        .ok_or(()),
                     "waveform" => read_waveform(raw, element, record).map(|v| (v, true)),
-                    other => {
-                        log::error!("devEtherIP: unsupported input record type '{other}'");
-                        Err(())
-                    }
+                    _ => Err(()),
                 }
             }
         };
@@ -649,8 +645,7 @@ impl DeviceSupport for EtherIpDevice {
                     None => false,
                 }
             }
-            other => {
-                log::error!("devEtherIP: unsupported output record type '{other}'");
+            _ => {
                 drop(data);
                 self.write_alarm();
                 return Ok(());
@@ -658,7 +653,7 @@ impl DeviceSupport for EtherIpDevice {
         };
 
         if changed {
-            tag.request_write(&mut data);
+            tag.request_write(&mut data, &self.name);
         }
         drop(data);
         self.no_alarm();
@@ -701,7 +696,7 @@ impl EtherIpDevice {
                     if plc != val {
                         if force {
                             cip::put_double(&mut data.buf, element, val);
-                            tag.request_write(&mut data);
+                            tag.request_write(&mut data, &self.name);
                         } else {
                             record.set_val(EpicsValue::Double(plc))?;
                         }
@@ -717,7 +712,7 @@ impl EtherIpDevice {
                     if plc != rval {
                         if force {
                             cip::put_dint(&mut data.buf, element, rval);
-                            tag.request_write(&mut data);
+                            tag.request_write(&mut data, &self.name);
                         } else if !record.apply_raw_readback(plc) {
                             record.set_val(EpicsValue::Long(plc))?;
                         }
@@ -734,7 +729,7 @@ impl EtherIpDevice {
                 if plc != val {
                     if force {
                         cip::put_dint(&mut data.buf, element, val);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else {
                         record.set_val(EpicsValue::Long(plc))?;
                     }
@@ -753,7 +748,7 @@ impl EtherIpDevice {
                 if plc != val {
                     if force {
                         cip::put_lint(&mut data.buf, element, val);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else {
                         record.set_val(EpicsValue::Int64(plc))?;
                     }
@@ -770,7 +765,7 @@ impl EtherIpDevice {
                 if plc != rval {
                     if force {
                         put_bits(&mut data.buf, element, mask, bits, rval);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else if !record.apply_raw_readback(plc as i32) {
                         record.set_val(EpicsValue::Long(plc as i32))?;
                     }
@@ -790,14 +785,13 @@ impl EtherIpDevice {
                 if plc != val {
                     if force {
                         cip::put_string(&mut data.buf, &val);
-                        tag.request_write(&mut data);
+                        tag.request_write(&mut data, &self.name);
                     } else {
                         record.set_val(EpicsValue::String(plc.into()))?;
                     }
                 }
             }
-            other => {
-                log::error!("devEtherIP: unsupported output record type '{other}'");
+            _ => {
                 drop(data);
                 self.read_alarm();
                 return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
@@ -827,10 +821,7 @@ impl EtherIpDevice {
 /// the registration reserves. Identical behaviour for the (usual) unindexed
 /// link, where `element == 0`.
 fn read_waveform(raw: &[u8], element: usize, record: &dyn Record) -> Result<EpicsValue, ()> {
-    let nelm = match record.get_field("NELM") {
-        Some(EpicsValue::Long(n)) if n > 0 => n as usize,
-        _ => 1,
-    };
+    let nelm = count_field(record, "NELM");
     match cip::typecode(raw) {
         Some(CipType::Real) | Some(CipType::Lreal) => {
             let mut v = Vec::with_capacity(nelm);
@@ -858,46 +849,51 @@ fn read_waveform(raw: &[u8], element: usize, record: &dyn Record) -> Result<Epic
 }
 
 fn nobt(record: &dyn Record) -> usize {
-    match record.get_field("NOBT") {
-        Some(EpicsValue::Short(n)) if n > 0 => n as usize,
-        _ => 1,
-    }
+    count_field(record, "NOBT")
 }
 
+// Numeric fields are read through `to_f64`, never by matching one
+// `EpicsValue` variant: each record type picks its own (waveform NELM is
+// ULong, mbbi NOBT UShort, mbbiDirect NOBT Short).
 fn f64_field(record: &dyn Record, name: &str) -> f64 {
-    match record.get_field(name) {
-        Some(EpicsValue::Double(v)) => v,
-        Some(EpicsValue::Float(v)) => v as f64,
-        Some(EpicsValue::Long(v)) => v as f64,
-        _ => 0.0,
-    }
+    record
+        .get_field(name)
+        .and_then(|v| v.to_f64())
+        .unwrap_or(0.0)
 }
 
+/// An `epicsInt32`/`epicsUInt32` field as its 32 bits (RVAL is ULong on
+/// bo/mbbo).
 fn i32_field(record: &dyn Record, name: &str) -> i32 {
-    match record.get_field(name) {
-        Some(EpicsValue::Long(v)) => v,
-        Some(EpicsValue::ULong(v)) => v as i32,
-        Some(EpicsValue::Short(v)) => v as i32,
-        Some(EpicsValue::Enum(v)) => v as i32,
-        Some(EpicsValue::Double(v)) => v as i32,
-        _ => 0,
-    }
+    f64_field(record, name) as i64 as i32
+}
+
+/// NELM / NOBT / SIZV, used as C uses them: unclamped.
+fn count_field(record: &dyn Record, name: &str) -> usize {
+    f64_field(record, name) as usize
 }
 
 // ---------------------------------------------------------------------------
 // The statistics-reset bo (DTYP "EtherIPReset")
 // ---------------------------------------------------------------------------
 
-pub struct EtherIpResetDevice;
+#[derive(Default)]
+pub struct EtherIpResetDevice {
+    name: String,
+}
 
 impl DeviceSupport for EtherIpResetDevice {
     fn dtyp(&self) -> &str {
         DTYP_RESET
     }
 
+    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+        self.name = name.to_string();
+    }
+
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
         if i32_field(record, "RVAL") != 0 {
-            log::info!("devEtherIP: resetting PLC statistics");
+            println!("'{}': resetting PLC statistics", self.name);
             driver::reset_statistics();
         }
         Ok(())
@@ -912,7 +908,7 @@ impl DeviceSupport for EtherIpResetDevice {
 /// link text taken verbatim from INP or OUT.
 pub fn device_factory(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> {
     match ctx.dtyp {
-        DTYP_RESET => Some(Box::new(EtherIpResetDevice)),
+        DTYP_RESET => Some(Box::new(EtherIpResetDevice::default())),
         DTYP => {
             let (text, is_output) = if !ctx.out.is_empty() {
                 (ctx.out, true)
@@ -936,6 +932,53 @@ mod tests {
             v.extend_from_slice(&w.to_le_bytes());
         }
         v
+    }
+
+    #[test]
+    fn multi_bit_records_zero_shft_at_init() {
+        use epics_rs::base::server::records::{
+            mbbi::MbbiRecord, mbbi_direct::MbbiDirectRecord, mbbo::MbboRecord,
+            mbbo_direct::MbboDirectRecord,
+        };
+        let records: [Box<dyn Record>; 4] = [
+            Box::new(MbbiRecord::default()),
+            Box::new(MbbiDirectRecord::default()),
+            Box::new(MbboRecord::default()),
+            Box::new(MbboDirectRecord::default()),
+        ];
+        for mut record in records {
+            record.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+            // The link names no PLC, so init refuses after the SHFT reset.
+            let mut dev =
+                EtherIpDevice::new("@nosuchplc tag", record.record_type().starts_with("mbbo"));
+            let _ = dev.init(&mut *record);
+            assert_eq!(
+                record.get_field("SHFT"),
+                Some(EpicsValue::UShort(0)),
+                "{}",
+                record.record_type()
+            );
+        }
+    }
+
+    #[test]
+    fn record_shape_reads_each_record_types_own_field_variant() {
+        use epics_rs::base::server::records::{
+            mbbi::MbbiRecord, mbbi_direct::MbbiDirectRecord, mbbo::MbboRecord,
+            waveform::WaveformRecord,
+        };
+        let mut wf = WaveformRecord::default();
+        wf.put_field("NELM", EpicsValue::ULong(40)).unwrap();
+        assert_eq!(record_shape(&wf), (0, 40));
+        let multi: [Box<dyn Record>; 3] = [
+            Box::new(MbbiRecord::default()),
+            Box::new(MbboRecord::default()),
+            Box::new(MbbiDirectRecord::default()),
+        ];
+        for mut record in multi {
+            record.put_field("NOBT", EpicsValue::Short(2)).unwrap();
+            assert_eq!(record_shape(&*record), (2, 1), "{}", record.record_type());
+        }
     }
 
     // -- link parsing --------------------------------------------------------

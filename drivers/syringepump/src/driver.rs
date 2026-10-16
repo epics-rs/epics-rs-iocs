@@ -15,7 +15,7 @@
 //! per-address `Model` (a genuinely runtime-configurable fact about which
 //! physical unit is wired to which address), a pump's letter is fixed by
 //! which template instantiation created the record -- so no `*Config`
-//! iocsh call is needed here; [`pump_letter`] is a pure positional lookup.
+//! iocsh call is needed here; `pump_letter` is a pure positional lookup.
 //!
 //! # Preserved upstream bug: only D's `setRun` is pump-parameterized
 //! `teledynePumpD.template`/`teledynePumpH.template` both hardcode
@@ -29,7 +29,7 @@
 //!
 //! This driver itself is NOT where that bug lives: every `do_*` method
 //! below resolves the pump letter uniformly from `user.addr` via
-//! [`pump_letter`], for every command, D or H, Run or otherwise -- a
+//! `pump_letter`, for every command, D or H, Run or otherwise -- a
 //! correctly-parameterized implementation. The bug is reproduced instead in
 //! `iocs/syringepump-ioc/db/teledynePumpD.template`/`teledynePumpH.template`,
 //! which hardcode `addr=0` (pump "A") in the ported OUT/INP link text for
@@ -43,12 +43,12 @@
 //! subroutine that computes a 2-hex-digit length prefix client-side before
 //! writing into `CmdReply.VAL`) has no direct asyn analogue -- asyn has no
 //! "write triggers reformatting of this record's own VAL" convention.
-//! Ported instead as a standard asyn write-then-read pair: [`write_octet`]
+//! Ported instead as a standard asyn write-then-read pair: [`write_octet`](PortDriver::write_octet)
 //! takes the raw, un-prefixed command text, computes the length prefix
 //! itself (removing the client-side `formatCmd` step -- a documented,
 //! wire-*equivalent* deviation: the exact same bytes reach the wire either
 //! way), executes the round trip, and caches the reply string;
-//! [`read_octet`] on the same reason returns that cached reply. Neither
+//! [`read_octet`](PortDriver::read_octet) on the same reason returns that cached reply. Neither
 //! `sendCmd` nor `ping` is wired into either ported db template (matching
 //! upstream, which doesn't wire them either) -- `sendCmd` is still exposed
 //! here for parity with `teled_d.proto`/`teled_h.proto`'s full command set,
@@ -210,7 +210,8 @@ impl TeledyneDriver {
     }
 
     fn write_frame(&self, out: &str) -> AsynResult<()> {
-        self.handle.write_octet(OCTET_REASON, out.as_bytes())?;
+        let frame = [out.as_bytes(), crate::connect::EOS].concat();
+        self.handle.write_octet(OCTET_REASON, &frame)?;
         Ok(())
     }
 
@@ -454,6 +455,19 @@ impl PortDriver for TeledyneDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The writer frames the command, so a port that refuses the EOS still
+    /// sends the CR StreamDevice appends (AsynDriverInterface.cc:650-663).
+    #[test]
+    fn a_command_carries_its_cr_on_a_port_refusing_eos() {
+        let written = crate::connect::tests::eos_refusing_port("SP_FRAME_IO");
+        let handle =
+            crate::connect::connect_octet("SP_FRAME_IO", 0, std::time::Duration::from_secs(1))
+                .unwrap();
+        let drv = TeledyneDriver::new("SP_FRAME", handle, Family::D, 6);
+        drv.write_frame("6RUN").unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"6RUN\r");
+    }
 
     #[test]
     fn command_available_for_gates_h_only_commands() {

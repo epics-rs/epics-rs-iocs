@@ -14,16 +14,18 @@ use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::drv_quad_em::{
-    self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeTriggerMode,
-    QeTriggerPolarity, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
+    self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QeTriggerMode, QeTriggerPolarity,
+    QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
-use crate::octet::{OctetIo, connect_octet};
+use crate::octet::{OctetIo, connect_octet, reply_text};
 use crate::pcr4_proto::{self as proto, DataLine};
+use crate::{asyn_print, trace};
 
 /// Poll interval of C++'s `epicsThreadSleep(0.01)` handshake loop.
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
@@ -31,15 +33,6 @@ const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 const READ_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// C++ `reset`: `epicsThreadSleep(1.0)` between probes.
 const RESET_POLL: Duration = Duration::from_secs(1);
-
-/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
-/// the bytes transferred before it. A bare `AsynError::Status` variant match
-/// would miss that wrapper and misclassify every partial-transfer timeout —
-/// routine on this port, since it installs the EOS interpose — as an
-/// unexpected error.
-fn is_timeout(e: &AsynError) -> bool {
-    e.status() == AsynStatus::Timeout
-}
 
 fn error(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -57,6 +50,8 @@ pub struct Pcr4Driver {
     io: OctetIo,
     shared: Arc<QuadEmShared>,
     firmware_version: String,
+    /// C++ `QEPortName_`, printed by [`PortDriver::report`].
+    qe_port_name: String,
     /// C++ `versionNumber_`, parsed out of the `PCR4v<n>` firmware string and
     /// used only to pick the range enum.
     version_number: i32,
@@ -66,14 +61,32 @@ impl Pcr4Driver {
     fn new(
         port_name: &str,
         qe_port_name: &str,
+        (io, status): (OctetIo, AsynResult<()>),
         max_memory: usize,
         shared: Arc<QuadEmShared>,
     ) -> AsynResult<Self> {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
-        let io = connect_octet(qe_port_name, proto::PCR4_TIMEOUT)?;
-        // C++ sets the input EOS at the top of every setAcquire; it never
-        // changes, so it is set once here. See `octet`.
-        io.set_input_eos(b"\r\n")?;
+        let unlinked = |base, io| Self {
+            base,
+            io,
+            shared: shared.clone(),
+            firmware_version: String::new(),
+            qe_port_name: qe_port_name.to_string(),
+            version_number: 0,
+        };
+        // C++ returns from its constructor here and keeps the port, with no
+        // meter link and no read thread.
+        if let Err(e) = status {
+            println!(
+                "drvPCR4::drvPCR4: error calling pasynOctetSyncIO->connect, status={}, error={}",
+                trace::status_code(&e),
+                e.message_display()
+            );
+            return Ok(unlinked(base, io));
+        }
+        // C++ sets the input EOS only in setAcquire, where a refusal fails the
+        // acquire; it is set here too so the firmware query frames on it.
+        let _ = io.set_input_eos(b"\r\n");
 
         base.port_base
             .set_int32_param(base.params.model, 0, QeModel::Pcr4 as i32)?;
@@ -89,28 +102,16 @@ impl Pcr4Driver {
             acq.num_channels = QE_MAX_INPUTS as i32;
         }
 
-        let mut this = Self {
-            base,
-            io,
-            shared,
-            firmware_version: String::new(),
-            version_number: 0,
-        };
+        let mut this = unlinked(base, io);
 
-        // C++ constructor calls getFirmwareVersion() under the port lock; the
-        // meter may be offline at IOC start, so a failure is logged, not fatal.
-        if let Err(e) = this.get_firmware_version() {
-            log::warn!("drvPCR4: reading the firmware version at startup failed: {e}");
-        }
+        // C++ constructor calls getFirmwareVersion() under the port lock and
+        // ignores its status: the meter may be offline at IOC start.
+        let _ = this.get_firmware_version();
         Ok(this)
     }
 
     fn params(&self) -> QuadEmParams {
         self.base.params
-    }
-
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
     }
 
     // --- I/O helpers (C++ writeReadMeter / sendCommand) ---
@@ -124,15 +125,19 @@ impl Pcr4Driver {
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
         let resp = self.write_read_meter(out)?;
         if resp != proto::ACK {
-            log::error!("drvPCR4: outString={out} expected ACK, received {resp}");
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvPCR4::sendCommand: error, outString={out} expected ACK, received {resp}"
+            );
             return Err(error(format!("PCR4: {out} -> {resp}, expected ACK")));
         }
         if prev_acquiring {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -145,7 +150,7 @@ impl Pcr4Driver {
     /// the revision 0, and `readEnum` then refuses to offer range choices —
     /// which is what upstream's `default:` branch does for an unknown revision.
     fn get_firmware_version(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
+        let _ = self.set_acquire(0);
         self.firmware_version = "Unknown".into();
         let resp = self.write_read_meter(proto::CMD_VERSION)?;
         match proto::parse_version(&resp) {
@@ -153,39 +158,13 @@ impl Pcr4Driver {
                 self.firmware_version = firmware;
                 self.version_number = version;
             }
-            None => {
-                log::error!("drvPCR4: unrecognised VERSION:? reply: {resp}");
-                self.version_number = 0;
-            }
+            None => self.version_number = 0,
         }
         let idx = self.params().firmware;
         self.base
             .port_base
             .set_string_param(idx, 0, self.firmware_version.clone())?;
         Ok(())
-    }
-
-    /// C++ `drvPCR4::reset`.
-    fn reset(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
-        self.send_command(proto::CMD_RESET)?;
-        // Wait for the meter to start communicating again, or give up after
-        // RESET_WAIT_LOOPS seconds.
-        let mut back = false;
-        for _ in 0..proto::RESET_WAIT_LOOPS {
-            thread::sleep(RESET_POLL);
-            if self.write_read_meter(proto::CMD_VERSION).is_ok() {
-                back = true;
-                break;
-            }
-        }
-        if !back {
-            log::error!(
-                "drvPCR4: no response from the meter {} seconds after RESET",
-                proto::RESET_WAIT_LOOPS
-            );
-        }
-        self.base_reset()
     }
 
     /// C++ `drvPCR4::setAcquireParams`: recompute the sample time, then push
@@ -198,17 +177,16 @@ impl Pcr4Driver {
         let p = self.params();
         let prev_acquiring = self.shared.is_acquiring();
 
-        let range = self.base.port_base.get_int32_param(p.range, 0)?;
-        let num_channels = self.base.port_base.get_int32_param(p.num_channels, 0)?;
-        let trigger_mode = self.base.port_base.get_int32_param(p.trigger_mode, 0)?;
-        let trigger_polarity = QeTriggerPolarity::from_i32(
-            self.base.port_base.get_int32_param(p.trigger_polarity, 0)?,
-        );
-        let values_per_read = self.base.port_base.get_int32_param(p.values_per_read, 0)?;
-        let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
+        let range = qe::int_param(&self.base.port_base, p.range, 0);
+        let num_channels = qe::int_param(&self.base.port_base, p.num_channels, 0);
+        let trigger_mode = qe::int_param(&self.base.port_base, p.trigger_mode, 0);
+        let trigger_polarity =
+            QeTriggerPolarity::from_i32(qe::int_param(&self.base.port_base, p.trigger_polarity, 0));
+        let values_per_read = qe::int_param(&self.base.port_base, p.values_per_read, 0);
+        let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
 
         if prev_acquiring || trigger_mode != 0 {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
 
         let sample_time = proto::sample_time(values_per_read);
@@ -236,7 +214,7 @@ impl Pcr4Driver {
         // In free-run the caller (setAcquire) starts the acquisition itself;
         // only a triggered acquisition is restarted from here.
         if prev_acquiring && trigger_mode != 0 {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -246,15 +224,15 @@ impl Pcr4Driver {
     /// As in the other quadEM ports the `goto error` path skips the
     /// `setAcquire(1)` restore, so a status read that fails leaves the meter
     /// stopped.
-    fn read_status_inner(&mut self) -> AsynResult<()> {
+    fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("PCR4: bad {what} response: {resp}"));
 
-        let resp = self.write_read_meter(proto::CMD_RANGE_QUERY)?;
+        let resp = last.query(&self.io, proto::CMD_RANGE_QUERY, proto::MAX_COMMAND_LEN)?;
         let range = proto::parse_range(&resp).ok_or_else(|| bad("RANGE:?", &resp))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
-        let resp = self.write_read_meter(proto::CMD_CHANNELS_QUERY)?;
+        let resp = last.query(&self.io, proto::CMD_CHANNELS_QUERY, proto::MAX_COMMAND_LEN)?;
         let num_channels =
             proto::parse_num_channels(&resp).ok_or_else(|| bad("CHANNELS:?", &resp))?;
         self.base
@@ -262,7 +240,7 @@ impl Pcr4Driver {
             .set_int32_param(p.num_channels, 0, num_channels)?;
         self.shared.acq.lock().num_channels = num_channels;
 
-        let resp = self.write_read_meter(proto::CMD_SPR_QUERY)?;
+        let resp = last.query(&self.io, proto::CMD_SPR_QUERY, proto::MAX_COMMAND_LEN)?;
         let values_per_read =
             proto::parse_values_per_read(&resp).ok_or_else(|| bad("SPR:?", &resp))?;
         self.base
@@ -275,7 +253,7 @@ impl Pcr4Driver {
             .port_base
             .set_float64_param(p.sample_time, 0, sample_time)?;
 
-        let resp = self.write_read_meter(proto::CMD_BIAS_QUERY)?;
+        let resp = last.query(&self.io, proto::CMD_BIAS_QUERY, proto::MAX_COMMAND_LEN)?;
         match proto::parse_bias_status(&resp).ok_or_else(|| bad("BIASSTATUS:?", &resp))? {
             None => self.base.port_base.set_int32_param(p.hvs_readback, 0, 0)?,
             Some(volts) => {
@@ -289,8 +267,8 @@ impl Pcr4Driver {
         // In external-bulb mode the meter delivers one sample per trigger, so
         // the ring buffer averages whatever arrives rather than a fixed count.
         let trigger_mode =
-            QeTriggerMode::from_i32(self.base.port_base.get_int32_param(p.trigger_mode, 0)?);
-        let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
+            QeTriggerMode::from_i32(qe::int_param(&self.base.port_base, p.trigger_mode, 0));
+        let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
         let num_average = if trigger_mode == QeTriggerMode::ExtBulb {
             0
         } else {
@@ -322,6 +300,7 @@ impl QuadEmDevice for Pcr4Driver {
         if value == 1 && self.shared.is_acquiring() {
             return Ok(());
         }
+        trace::ensure_input_eos(&self.io, &self.base.port_base, "drvPCR4::setAcquire")?;
 
         if value == 0 {
             // Tell the read thread to stop, then wait for it to leave the read.
@@ -335,6 +314,8 @@ impl QuadEmDevice for Pcr4Driver {
             let _ = self.write_read_meter(proto::CMD_TRIGGER_STOP);
             let stopped = self.write_read_meter(proto::CMD_ACQUIRE_STOP);
             let acked = matches!(&stopped, Ok(resp) if resp == proto::ACK);
+            // C++ returns the status of the last exchange that looked for it.
+            let mut status = stopped.map(drop);
             if !acked {
                 // The ACK is somewhere in the stream of samples still in
                 // flight: read until a line ends in it, or until the meter
@@ -345,41 +326,46 @@ impl QuadEmDevice for Pcr4Driver {
                             if outcome.eom.contains(EomReason::EOS)
                                 && proto::ends_with_ack(&outcome.data)
                             {
+                                status = Ok(());
                                 break;
                             }
-                            log::warn!(
-                                "drvPCR4: waiting for the ACK response, nread={}",
+                            asyn_print!(
+                                self.base.port_base,
+                                WARNING,
+                                "drvPCR4::setAcquire waiting for ACK response, nread={}",
                                 outcome.data.len()
                             );
                         }
                         Err(e) => {
-                            log::error!("drvPCR4: error waiting for the ACK response: {e}");
+                            asyn_print!(
+                                self.base.port_base,
+                                ERROR,
+                                "drvPCR4::setAcquire error waiting for ACK response, status={}",
+                                trace::status_code(&e)
+                            );
+                            status = Err(e);
                             break;
                         }
                     }
                 }
             }
 
-            self.base_set_acquire(0)?;
-            return Ok(());
+            let _ = self.base_set_acquire(0);
+            return status;
         }
 
-        self.base_set_acquire(1)?;
+        let _ = self.base_set_acquire(1);
         // Pushing the settings also flushes any stale input.
-        self.set_acquire_params()?;
+        let _ = self.set_acquire_params();
 
-        let trigger_mode = self
-            .base
-            .port_base
-            .get_int32_param(self.params().trigger_mode, 0)?;
-        if trigger_mode == 0 {
-            // A triggered acquisition was already started by TRIGGER:START in
-            // setAcquireParams; free-run needs the explicit start.
-            if let Err(e) = self.io.write(proto::CMD_ACQUIRE_START) {
-                self.shared.set_acquiring(false);
-                return Err(e);
-            }
-        }
+        let trigger_mode = qe::int_param(&self.base.port_base, self.params().trigger_mode, 0);
+        // A triggered acquisition was already started by TRIGGER:START in
+        // setAcquireParams; free-run needs the explicit start.
+        let status = if trigger_mode == 0 {
+            self.io.write(proto::CMD_ACQUIRE_START).map(drop)
+        } else {
+            Ok(())
+        };
 
         // Setting the flag before the signal keeps the read thread from going
         // straight back to sleep; C++ orders it the other way because both
@@ -389,7 +375,10 @@ impl QuadEmDevice for Pcr4Driver {
         while !self.shared.is_reading_active() {
             thread::sleep(HANDSHAKE_POLL);
         }
-        Ok(())
+        if status.is_err() {
+            self.shared.set_acquiring(false);
+        }
+        status
     }
 
     fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {
@@ -419,25 +408,20 @@ impl QuadEmDevice for Pcr4Driver {
     /// C++ `drvPCR4::setBiasState`: `"BIAS:ON"`/`"BIAS:OFF"`, followed by the
     /// bias voltage — the meter rejects the voltage while the bias is off, so
     /// it has to be re-sent when the bias comes on.
+    /// Both commands are sent; C++ returns the last one's status.
     fn set_bias_state(&mut self, value: i32) -> AsynResult<()> {
-        self.send_command(proto::cmd_bias_state(value != 0))?;
+        let mut status = self.send_command(proto::cmd_bias_state(value != 0));
         if value != 0 {
-            let volts = self
-                .base
-                .port_base
-                .get_float64_param(self.params().bias_voltage, 0)?;
-            self.set_bias_voltage(volts)?;
+            let volts = qe::double_param(&self.base.port_base, self.params().bias_voltage, 0);
+            status = self.set_bias_voltage(volts);
         }
-        Ok(())
+        status
     }
 
     /// C++ `drvPCR4::setBiasVoltage`: `"SETBIAS:%f"`, skipped while the bias
     /// is off because the meter answers with an error.
     fn set_bias_voltage(&mut self, value: f64) -> AsynResult<()> {
-        let bias_state = self
-            .base
-            .port_base
-            .get_int32_param(self.params().bias_state, 0)?;
+        let bias_state = qe::int_param(&self.base.port_base, self.params().bias_state, 0);
         if bias_state == 0 {
             return Ok(());
         }
@@ -446,22 +430,60 @@ impl QuadEmDevice for Pcr4Driver {
 
     /// C++ `drvPCR4::readStatus`.
     fn read_status(&mut self) -> AsynResult<()> {
-        let trigger_mode = self
-            .base
-            .port_base
-            .get_int32_param(self.params().trigger_mode, 0)?;
+        let trigger_mode = qe::int_param(&self.base.port_base, self.params().trigger_mode, 0);
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring || trigger_mode != 0 {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
-        if let Err(e) = self.read_status_inner() {
-            log::error!("drvPCR4: readStatus failed: {e}");
+        let mut last = trace::StatusExchange::default();
+        if let Err(e) = self.read_status_inner(&mut last) {
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvPCR4::getStatus: error, outString={}, inString={}",
+                last.out,
+                last.inp
+            );
             return Err(e);
         }
         if prev_acquiring || trigger_mode != 0 {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
+    }
+
+    fn set_num_acquire(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_trigger_polarity(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+
+    /// C++ `drvPCR4::reset`.
+    fn reset(&mut self) -> AsynResult<()> {
+        let _ = self.set_acquire(0);
+        // C++ ignores RESET's status: a meter that did not answer it is still
+        // waited for, and reported when it never comes back.
+        let _ = self.send_command(proto::CMD_RESET);
+        // Wait for the meter to start communicating again, or give up after
+        // RESET_WAIT_LOOPS seconds.
+        let mut back = false;
+        for _ in 0..proto::RESET_WAIT_LOOPS {
+            thread::sleep(RESET_POLL);
+            if self.write_read_meter(proto::CMD_VERSION).is_ok() {
+                back = true;
+                break;
+            }
+        }
+        if !back {
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvPCR4::reset: error, no response from meter after {} seconds",
+                proto::RESET_WAIT_LOOPS
+            );
+        }
+        self.base_reset()
     }
 }
 
@@ -476,6 +498,37 @@ impl PortDriver for Pcr4Driver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base.port_base
+    }
+
+    /// C++ `drvPCR4::report`: above details 0 the meter is stopped, asked for
+    /// its NETCONFIG, and restarted after the base report. `numResync_` is
+    /// never incremented by C++ (drvPCR4.cpp:78 is its only store), so it
+    /// prints 0.
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "drvPCR4: port={}, IP port={}, firmware version={}, numResync=0",
+            self.base.port_base.port_name, self.qe_port_name, self.firmware_version
+        );
+        let mut prev_acquiring = false;
+        if level > 0 {
+            prev_acquiring = self.shared.is_acquiring();
+            let _ = self.set_acquire(0);
+            let reply = reply_text(self.write_read_meter(proto::CMD_NETCONFIG));
+            let _ = writeln!(out, "NETCONFIG response from meter:\n{reply}");
+        }
+        self.asyn_port_driver_report(out, level);
+        if prev_acquiring {
+            let _ = self.set_acquire(1);
+        }
+    }
+
+    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        self.qe_write_int32(user.reason, user.addr, value)
+    }
+
+    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        self.qe_write_float64(user.reason, user.addr, value)
     }
 
     /// C++ `drvPCR4::readEnum`: the range choices are a function of the
@@ -501,138 +554,9 @@ impl PortDriver for Pcr4Driver {
             .collect();
         Ok((entries.len(), entries))
     }
-
-    /// C++ `drvQuadEM::writeInt32` with the PCR4 overrides bound in.
-    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_int32_param(reason, channel, value)?;
-
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-            self.set_acquire(value)?;
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.set_acquire(0)?;
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.shared.acq.lock().acquire_mode = value;
-            self.set_acquire_mode(value)?;
-            self.read_status()?;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.bias_state {
-            self.set_bias_state(value)?;
-            self.read_status()?;
-        } else if reason == p.num_channels {
-            self.set_num_channels(value)?;
-            self.read_status()?;
-        } else if reason == p.trigger_mode || reason == p.trigger_polarity {
-            // drvPCR4 routes both through setAcquireParams.
-            self.set_acquire_params()?;
-            self.read_status()?;
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-            self.set_acquire_params()?;
-            self.read_status()?;
-        } else if reason == p.resolution || reason == p.ping_pong || reason == p.bias_interlock {
-            // setResolution, setPingPong and setBiasInterlock are drvQuadEM
-            // dummies for this driver: only readStatus runs.
-            self.read_status()?;
-        } else if reason == p.range {
-            if channel == 0 {
-                self.set_range(value)?;
-            }
-            self.read_status()?;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
-        } else if reason == p.values_per_read {
-            self.set_values_per_read(value)?;
-            self.read_status()?;
-        } else if reason == p.read_format {
-            // The PCR4 has no binary format; drvPCR4 does not override
-            // setReadFormat.
-            self.read_status()?;
-        } else if reason == p.read_status {
-            // C++ skips this while acquiring: too disruptive.
-            if !self.shared.is_acquiring() {
-                self.read_status()?;
-            }
-        } else if reason == p.reset {
-            self.reset()?;
-            self.read_status()?;
-        } else if self.base.write_int32_pool(reason)? {
-            // Handled by the NDArray pool controls.
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
-    }
-
-    /// C++ `drvQuadEM::writeFloat64` with the PCR4 overrides bound in.
-    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
-
-        if reason == p.averaging_time {
-            self.shared.ring.lock().flush();
-            self.set_averaging_time(value)?;
-            self.read_status()?;
-        } else if reason == p.bias_voltage {
-            self.set_bias_voltage(value)?;
-            self.read_status()?;
-        } else if reason == p.integration_time {
-            // The PCR4's integration time is set through SPR; drvPCR4 does not
-            // override setIntegrationTime.
-            self.read_status()?;
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
-    }
 }
 
-impl Pcr4Driver {
-    /// Mirror a parameter write into the shared position snapshot the read
-    /// thread consumes.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
-    }
-}
+impl Pcr4Driver {}
 
 // ===========================================================================
 // Read thread
@@ -663,34 +587,28 @@ fn read_thread(ctx: ReadContext) {
             ctx.shared.set_reading_active(true);
         }
 
-        let outcome = match ctx.io.read_line(proto::ASCII_BUFFER_SIZE) {
-            Ok(o) => o,
-            Err(e) => {
-                if !is_timeout(&e) {
-                    log::error!("drvPCR4: unexpected error reading meter: {e}");
+        let read = ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE);
+        let outcome = match read {
+            Ok(o) if o.eom.contains(EomReason::EOS) => o,
+            _ => {
+                if trace::read_result(&read).0 != AsynStatus::Timeout {
+                    trace::print_read_error(&ctx.handle, "drvPCR4::readThread", &read);
                     thread::sleep(READ_ERROR_BACKOFF);
                 }
                 continue;
             }
         };
-        if !outcome.eom.contains(EomReason::EOS) {
-            log::error!(
-                "drvPCR4: unexpected error reading meter, nRead={}, eom={:?}",
-                outcome.data.len(),
-                outcome.eom
-            );
-            thread::sleep(READ_ERROR_BACKOFF);
-            continue;
-        }
 
         let num_channels = ctx.shared.acq.lock().num_channels;
         match proto::parse_data_line(&outcome.as_str(), num_channels) {
             DataLine::TriggerOn => {
                 num_trig_starts += 1;
                 if next_expected_edge != 0 {
-                    log::error!(
-                        "drvPCR4: extra trigger start, numTrigStarts={num_trig_starts}, \
-                         numTrigEnds={num_trig_ends}"
+                    asyn_print!(
+                        ctx.handle,
+                        ERROR,
+                        "drvPCR4::readThread Extra trigger start, numTrigStarts={num_trig_starts}, \
+                         numTrigsEnds={num_trig_ends}"
                     );
                 }
                 next_expected_edge = 1;
@@ -698,9 +616,11 @@ fn read_thread(ctx: ReadContext) {
             DataLine::TriggerOff => {
                 num_trig_ends += 1;
                 if next_expected_edge != 1 {
-                    log::error!(
-                        "drvPCR4: extra trigger end, numTrigStarts={num_trig_starts}, \
-                         numTrigEnds={num_trig_ends}"
+                    asyn_print!(
+                        ctx.handle,
+                        ERROR,
+                        "drvPCR4::readThread Extra trigger end, numTrigStarts={num_trig_starts}, \
+                         numTrigsEnds={num_trig_ends}"
                     );
                 }
                 next_expected_edge = 0;
@@ -725,7 +645,8 @@ pub struct Pcr4Runtime {
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    _read_thread: thread::JoinHandle<()>,
+    /// `None` when the constructor found no QE port.
+    _read_thread: Option<thread::JoinHandle<()>>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -740,14 +661,21 @@ impl Pcr4Runtime {
 /// `max_memory` has no C++ analogue (the C++ pool is unbounded); it bounds the
 /// Rust `NDArrayPool`.
 pub fn create_pcr4(
-    port_name: &str,
+    claim: &PortClaim,
     qe_port_name: &str,
     ring_buffer_size: usize,
     max_memory: usize,
 ) -> AsynResult<Pcr4Runtime> {
+    let port_name = claim.name();
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
-    let driver = Pcr4Driver::new(port_name, qe_port_name, max_memory, shared.clone())?;
+    let driver = Pcr4Driver::new(
+        port_name,
+        qe_port_name,
+        connect_octet(qe_port_name, proto::PCR4_TIMEOUT),
+        max_memory,
+        shared.clone(),
+    )?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
     let pool = driver.base.pool.clone();
@@ -755,7 +683,7 @@ pub fn create_pcr4(
     let io = driver.io.clone();
     let acquire_param = nd_params.acquire;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
     let read_ctx = ReadContext {
@@ -764,10 +692,12 @@ pub fn create_pcr4(
         params,
         shared: shared.clone(),
     };
-    let read_thread_handle = thread::Builder::new()
-        .name("drvPCR4Task".into())
-        .spawn(move || read_thread(read_ctx))
-        .expect("failed to spawn drvPCR4Task");
+    let read_thread_handle = read_ctx.io.handle().is_some().then(|| {
+        thread::Builder::new()
+            .name("drvPCR4Task".into())
+            .spawn(move || read_thread(read_ctx))
+            .expect("failed to spawn drvPCR4Task")
+    });
 
     let callback_thread = qe::start_callback_task(CallbackContext {
         trigger_rx,
@@ -788,4 +718,110 @@ pub fn create_pcr4(
         _read_thread: read_thread_handle,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::octet::create_ip_port;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    /// A meter that answers every `\r`-terminated command with `ACK`.
+    fn ack_meter() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            while reader.read_until(b'\r', &mut line).unwrap_or(0) > 0 {
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&line).trim().to_string());
+                line.clear();
+                let _ = out.write_all(b"ACK\r\n");
+            }
+        });
+        (addr, log)
+    }
+
+    #[test]
+    fn a_detailed_report_stops_the_meter_and_asks_its_netconfig() {
+        let (addr, log) = ack_meter();
+        let (io, runtime) = create_ip_port(
+            "QE_PCR4_NET_IP",
+            &addr,
+            Duration::from_millis(200),
+            false,
+            true,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        std::mem::forget(runtime);
+        io.set_output_eos(b"\r").unwrap();
+        let mut drv = Pcr4Driver::new(
+            "QE_PCR4_NET",
+            "QE_PCR4_NET",
+            (io, Ok(())),
+            0,
+            QuadEmShared::new(16).0,
+        )
+        .unwrap();
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains("NETCONFIG response from meter:\nACK\n"),
+            "{out}"
+        );
+        // The constructor's firmware query comes first.
+        let stop = [
+            proto::CMD_TRIGGER_STOP,
+            proto::CMD_ACQUIRE_STOP,
+            "NETCONFIG",
+        ];
+        assert!(
+            log.lock().unwrap().ends_with(&stop.map(String::from)),
+            "{:?}",
+            log.lock().unwrap()
+        );
+    }
+
+    /// C++ prints the connect failure and returns from its constructor: the
+    /// port stays, with no read thread.
+    #[test]
+    fn a_missing_qe_port_keeps_the_port_without_a_link() {
+        let rt = create_pcr4(
+            &claim_port("QE_PCR4_NOQE").unwrap(),
+            "QE_PCR4_NOQE_IP",
+            4,
+            0,
+        )
+        .unwrap();
+        assert!(rt._read_thread.is_none());
+    }
+
+    /// C++ sets the input EOS only in setAcquire (drvPCR4.cpp:356-363): a port
+    /// that refuses it keeps the driver and fails the acquire instead.
+    #[test]
+    fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
+        let (_meter, _runtime) = crate::octet::tests::eos_refusing_port("QE_PCR4_NOEOS_IP");
+        let rt = create_pcr4(
+            &claim_port("QE_PCR4_NOEOS").unwrap(),
+            "QE_PCR4_NOEOS_IP",
+            4,
+            0,
+        )
+        .unwrap();
+        let err = rt
+            .port_handle()
+            .write_int32_blocking(rt.nd_params.acquire, 0, 1)
+            .unwrap_err();
+        assert_eq!(err.status(), epics_rs::asyn::error::AsynStatus::Error);
+        assert_eq!(err.message(), "no input EOS");
+    }
 }

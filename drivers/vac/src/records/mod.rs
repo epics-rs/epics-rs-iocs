@@ -1,39 +1,65 @@
 //! Custom record types: `vs` (vacuum gauge) and `digitel` (ion pump).
 //!
-//! Both are registered from the IOC crate with
-//! `IocApplication::register_record_type`; no `.dbd` file is involved, because
-//! the framework's database loader resolves field types from
-//! [`Record::declared_fields`](epics_rs::base::server::record::Record::declared_fields)
-//! and menu choices from `menu_field_choices`. A field the record does not
-//! declare falls through to `dbCommon` — which is how `INP`, `SCAN` and the
-//! alarm-severity fields reach the record instance.
+//! Their field tables, menus and `device()` rows are generated from the C
+//! `.dbd` files vendored under `dbd/` ([`dbd_generated`]) and handed to base by
+//! [`register_vac_dbd`], C's `dbLoadDatabase` of `vacSupport.dbd`.
 
+pub mod dbd_generated;
 pub mod digitel;
+mod dsets;
 pub mod vs;
 
-/// Declare a record's scalar fields once, generating the `FieldDesc` table and
-/// the `get_field` / `put_field` bodies from the same list.
+/// Hand vac's generated `.dbd` to base: the two record types, their menus,
+/// and the `asyn DigitelPump` / `asyn VacSen` `DTYP` choices. Idempotent.
+pub fn register_vac_dbd() {
+    use dbd_generated::{DBD, RECORD_TYPES, devices};
+    epics_rs::base::server::record::register_contributed_dbd(&DBD);
+    for &record_type in RECORD_TYPES {
+        let rows = devices(record_type).unwrap_or_default();
+        epics_rs::base::server::record::register_dbd_devices(record_type, rows);
+    }
+}
+
+/// `recGblGetGraphicDouble` / `recGblGetControlDouble` — the two are one
+/// body — for a field the record's rset does not list: the declared type's
+/// range, 0/0 for a type with none. `None` for a field that is not one of the
+/// record's own `fields` (a dbCommon field), which base routes the same way.
 ///
-/// Each entry is `"NAME": Variant = struct_field, read_only`, where `Variant` is
-/// the [`EpicsValue`](epics_rs::base::types::EpicsValue) variant that carries the
-/// field's `.dbd` type. `read_only` is `true` for `special(SPC_NOMOD)` fields,
-/// which the C record refuses to let a client write.
+/// vac's rsets answer every field themselves, so a record type base has no
+/// table for never reaches base's guess at which fields it lists.
+pub(crate) fn rec_gbl_range(
+    fields: &'static [epics_rs::base::server::record::FieldDesc],
+    field: &str,
+) -> Option<(f64, f64)> {
+    let desc = fields.iter().find(|f| f.name == field)?;
+    Some(
+        epics_rs::base::server::recgbl::rec_gbl_get_control_double(desc.declared_dbf)
+            .unwrap_or((0.0, 0.0)),
+    )
+}
+
+/// `recGblGetAlarmDouble` for one of the record's own `fields`; `None` for a
+/// dbCommon field, as [`rec_gbl_range`].
+pub(crate) fn rec_gbl_alarm(
+    fields: &'static [epics_rs::base::server::record::FieldDesc],
+    field: &str,
+) -> Option<(f64, f64, f64, f64)> {
+    fields
+        .iter()
+        .any(|f| f.name == field)
+        .then(epics_rs::base::server::recgbl::rec_gbl_get_alarm_double)
+}
+
+/// Generate a record's scalar `get_field` / `put_field` bodies from one list.
 ///
-/// Fields absent from the list (`INP`, `SCAN`, `HHSV`, ...) are dbCommon fields
-/// and are served by the framework.
+/// Each entry is `"NAME": Variant = struct_field`, where `Variant` is the
+/// [`EpicsValue`](epics_rs::base::types::EpicsValue) variant that carries the
+/// field's `.dbd` type.
 macro_rules! record_fields {
     (
-        $list:ident, $get:ident, $put:ident, $rec:ty;
-        $( $name:literal : $variant:ident = $field:ident , $ro:literal );+ $(;)?
+        $get:ident, $put:ident, $rec:ty;
+        $( $name:literal : $variant:ident = $field:ident );+ $(;)?
     ) => {
-        static $list: &[::epics_rs::base::server::record::FieldDesc] = &[
-            $(::epics_rs::base::server::record::FieldDesc::new(
-                $name,
-                $crate::records::dbf_type_of!($variant),
-                $ro,
-            )),+
-        ];
-
         fn $get(r: &$rec, name: &str) -> Option<::epics_rs::base::types::EpicsValue> {
             match name {
                 $($name => Some(::epics_rs::base::types::EpicsValue::$variant(r.$field)),)+
@@ -60,32 +86,6 @@ macro_rules! record_fields {
     };
 }
 
-/// The `DBF_*` type each `EpicsValue` variant carries.
-macro_rules! dbf_type_of {
-    (Short) => {
-        ::epics_rs::base::types::DbFieldType::Short
-    };
-    (UShort) => {
-        ::epics_rs::base::types::DbFieldType::UShort
-    };
-    (Long) => {
-        ::epics_rs::base::types::DbFieldType::Long
-    };
-    (ULong) => {
-        ::epics_rs::base::types::DbFieldType::ULong
-    };
-    (Float) => {
-        ::epics_rs::base::types::DbFieldType::Float
-    };
-    (Double) => {
-        ::epics_rs::base::types::DbFieldType::Double
-    };
-    (Enum) => {
-        ::epics_rs::base::types::DbFieldType::Enum
-    };
-}
-
-pub(crate) use dbf_type_of;
 pub(crate) use record_fields;
 
 /// `recGblSetSevr`'s return value, which the C `checkAlarms` routines branch on
@@ -98,7 +98,7 @@ pub(crate) fn set_sevr(
     epics_rs::base::server::recgbl::rec_gbl_set_sevr(common, stat, sevr)
 }
 
-/// `menu(menuAlarmSevr)` index → [`AlarmSeverity`]. A record's `HHSV`/`LLSV`/
+/// `menu(menuAlarmSevr)` index → [`AlarmSeverity`](epics_rs::base::server::record::AlarmSeverity). A record's `HHSV`/`LLSV`/
 /// `HSV`/`LSV` are dbCommon-typed menu fields, so they arrive as raw indices.
 pub(crate) fn severity_of(index: u16) -> epics_rs::base::server::record::AlarmSeverity {
     use epics_rs::base::server::record::AlarmSeverity;
@@ -107,5 +107,34 @@ pub(crate) fn severity_of(index: u16) -> epics_rs::base::server::record::AlarmSe
         2 => AlarmSeverity::Major,
         3 => AlarmSeverity::Invalid,
         _ => AlarmSeverity::NoAlarm,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use epics_rs::base::server::record::Record;
+
+    /// Every field the `.dbd` declares is served by the record, as the type it
+    /// declares.
+    #[test]
+    fn every_declared_field_is_served_as_declared() {
+        let records: [Box<dyn Record>; 2] = [
+            Box::new(super::digitel::DigitelRecord::default()),
+            Box::new(super::vs::VsRecord::default()),
+        ];
+        for rec in &records {
+            for f in rec.declared_fields() {
+                let v = rec
+                    .get_field(f.name)
+                    .unwrap_or_else(|| panic!("{}.{} not served", rec.record_type(), f.name));
+                assert_eq!(
+                    v.db_field_type(),
+                    f.dbf_type,
+                    "{}.{}",
+                    rec.record_type(),
+                    f.name
+                );
+            }
+        }
     }
 }

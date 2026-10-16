@@ -8,9 +8,10 @@ use epics_rs::base::server::record::{
     AlarmSeverity, CommonFields, DeclaredFields, FieldDesc, FieldIx, FieldMetadataOverride,
     ProcessOutcome, Record, declared_set,
 };
-use epics_rs::base::types::{DbFieldType, DbfCode, EpicsValue};
+use epics_rs::base::types::EpicsValue;
 
-use super::{record_fields, set_sevr, severity_of};
+use super::dbd_generated::VS_FIELDS;
+use super::{rec_gbl_alarm, rec_gbl_range, record_fields, set_sevr, severity_of};
 
 /// `chgc` bits — `vsRecord.c:60-66`. `special()` sets one per `SPC_MOD` field
 /// touched since the last process; `readWrite_vs` consumes them.
@@ -21,13 +22,6 @@ pub const SP1_FIELD: u16 = 0x0010;
 pub const SP2_FIELD: u16 = 0x0020;
 pub const SP3_FIELD: u16 = 0x0040;
 pub const SP4_FIELD: u16 = 0x0080;
-
-/// `menu(vsOFFON)`.
-const OFFON: &[&str] = &["Off", "On"];
-/// `menu(vsTYPE)`.
-const TYPE_CHOICES: &[&str] = &["GP307", "GP350", "MM200", "CC10", "MX200"];
-/// `menu(menuAlarmSevr)`.
-const ALARM_SEVR: &[&str] = &["NO_ALARM", "MINOR", "MAJOR", "INVALID"];
 
 /// `vsOFFON_On`.
 const ON: u16 = 1;
@@ -110,8 +104,9 @@ pub struct VsRecord {
     /// clears `pr->udf` on every `pact == 1` return, including both error
     /// returns, so UDF is cleared as soon as the device support has run at all.
     pub dev_ran: bool,
-    /// `recGblSetSevr(pr, READ_ALARM, INVALID_ALARM)` raised by device support.
-    pub read_alarm: bool,
+    /// The `recGblSetSevr(pr, <stat>, INVALID_ALARM)` device support raised:
+    /// READ_ALARM from a reply, COMM_ALARM from a refused `queueRequest`.
+    pub dev_alarm: Option<u16>,
 }
 
 impl Default for VsRecord {
@@ -179,150 +174,68 @@ impl Default for VsRecord {
             hyst: 0.0,
             lalm: 0.0,
             dev_ran: false,
-            read_alarm: false,
+            dev_alarm: None,
         }
     }
 }
 
 // Array-backed fields are handled outside the macro.
 record_fields! {
-    SCALAR_FIELDS, get_scalar, put_scalar, VsRecord;
-    "TYPE": Enum = tipe, true;
-    "ERR": Short = err, false;
-    "PREC": Short = prec, false;
-    "IG1S": Enum = ig1s, false;
-    "IG2S": Enum = ig2s, false;
-    "DGSS": Enum = dgss, false;
-    "IG1R": Enum = ig1r, true;
-    "IG2R": Enum = ig2r, true;
-    "DGSR": Enum = dgsr, true;
-    "FLTR": Enum = fltr, true;
-    "VAL": Double = val, true;
-    "PRES": Double = pres, true;
-    "CGAP": Double = cgap, true;
-    "CGBP": Double = cgbp, true;
-    "LPRS": Double = lprs, true;
-    "LCAP": Double = lcap, true;
-    "LCBP": Double = lcbp, true;
-    "CHGC": UShort = chgc, true;
-    "HOPR": Float = hopr, false;
-    "LOPR": Float = lopr, false;
-    "HLPR": Float = hlpr, false;
-    "LLPR": Float = llpr, false;
-    "HAPR": Float = hapr, false;
-    "LAPR": Float = lapr, false;
-    "HALR": Float = halr, false;
-    "LALR": Float = lalr, false;
-    "HBPR": Float = hbpr, false;
-    "LBPR": Float = lbpr, false;
-    "HBLR": Float = hblr, false;
-    "LBLR": Float = lblr, false;
-    "PI1S": Enum = pi1s, true;
-    "PI2S": Enum = pi2s, true;
-    "PDSS": Enum = pdss, true;
-    "PIG1": Enum = pig1, true;
-    "PIG2": Enum = pig2, true;
-    "PDGS": Enum = pdgs, true;
-    "PFLT": Enum = pflt, true;
-    "PVAL": Double = pval, true;
-    "PPRE": Double = ppre, true;
-    "PCGA": Double = pcga, true;
-    "PCGB": Double = pcgb, true;
-    "PLPE": Double = plpe, true;
-    "PLCA": Double = plca, true;
-    "PLCB": Double = plcb, true;
-    "HIHI": Float = hihi, false;
-    "LOLO": Float = lolo, false;
-    "HIGH": Float = high, false;
-    "LOW": Float = low, false;
-    "HHSV": Enum = hhsv, false;
-    "LLSV": Enum = llsv, false;
-    "HSV": Enum = hsv, false;
-    "LSV": Enum = lsv, false;
-    "HYST": Double = hyst, false;
-    "LALM": Double = lalm, true;
-}
-
-/// `SP1`..`SP6` / `PSP1`..`PSP6` (menu readbacks) and `SP1S`..`SP4S`,
-/// `SP1R`..`SP4R`, `PS1S`..`PS4S`, `PS1R`..`PS4R` (doubles).
-static INDEXED_FIELDS: &[FieldDesc] = &{
-    use epics_rs::base::types::DbFieldType::{Double, Enum};
-    const fn f(
-        name: &'static str,
-        dbf_type: epics_rs::base::types::DbFieldType,
-        ro: bool,
-    ) -> FieldDesc {
-        FieldDesc::new(name, dbf_type, ro)
-    }
-    [
-        f("SP1", Enum, true),
-        f("SP2", Enum, true),
-        f("SP3", Enum, true),
-        f("SP4", Enum, true),
-        f("SP5", Enum, true),
-        f("SP6", Enum, true),
-        f("PSP1", Enum, true),
-        f("PSP2", Enum, true),
-        f("PSP3", Enum, true),
-        f("PSP4", Enum, true),
-        f("PSP5", Enum, true),
-        f("PSP6", Enum, true),
-        f("SP1S", Double, false),
-        f("SP2S", Double, false),
-        f("SP3S", Double, false),
-        f("SP4S", Double, false),
-        f("SP1R", Double, true),
-        f("SP2R", Double, true),
-        f("SP3R", Double, true),
-        f("SP4R", Double, true),
-        f("PS1S", Double, true),
-        f("PS2S", Double, true),
-        f("PS3S", Double, true),
-        f("PS4S", Double, true),
-        f("PS1R", Double, true),
-        f("PS2R", Double, true),
-        f("PS3R", Double, true),
-        f("PS4R", Double, true),
-    ]
-};
-
-static ALL_FIELDS: std::sync::LazyLock<Vec<FieldDesc>> = std::sync::LazyLock::new(|| {
-    // `field(INP,DBF_INLINK) special(SPC_NOMOD)` in `vsRecord.dbd`.
-    let inp = FieldDesc {
-        declared_dbf: DbfCode::Inlink,
-        ..FieldDesc::new("INP", DbFieldType::String, true)
-    };
-    // Each menu field declares `DBF_MENU` and carries its choices, as the
-    // `.dbd` does. The loader's refusal gate resolves menu names by identity
-    // against base's generated tables, so an external menu never resolves
-    // there — but its numeric arms do not decide `DBF_MENU` either, so the
-    // label reaches the apply path, which reads `menu_field_choices`.
-    SCALAR_FIELDS
-        .iter()
-        .chain(INDEXED_FIELDS.iter())
-        .cloned()
-        .chain(std::iter::once(inp))
-        .map(|mut f| {
-            f.menu = menu_of(f.name);
-            if f.menu.is_some() {
-                f.declared_dbf = DbfCode::Menu;
-            }
-            f
-        })
-        .collect()
-});
-
-/// The `.dbd` menu of each menu field — the single owner both
-/// `Record::menu_field_choices` and the declared descriptors read.
-fn menu_of(field: &str) -> Option<&'static [&'static str]> {
-    match field {
-        "TYPE" => Some(TYPE_CHOICES),
-        "HHSV" | "LLSV" | "HSV" | "LSV" => Some(ALARM_SEVR),
-        "IG1S" | "IG2S" | "DGSS" | "IG1R" | "IG2R" | "DGSR" | "FLTR" => Some(OFFON),
-        "PI1S" | "PI2S" | "PDSS" | "PIG1" | "PIG2" | "PDGS" | "PFLT" => Some(OFFON),
-        _ if matches!(indexed(field), Some(("SPn" | "PSPn", _))) => Some(OFFON),
-        _ => None,
-    }
+    get_scalar, put_scalar, VsRecord;
+    "TYPE": Enum = tipe;
+    "ERR": Short = err;
+    "PREC": Short = prec;
+    "IG1S": Enum = ig1s;
+    "IG2S": Enum = ig2s;
+    "DGSS": Enum = dgss;
+    "IG1R": Enum = ig1r;
+    "IG2R": Enum = ig2r;
+    "DGSR": Enum = dgsr;
+    "FLTR": Enum = fltr;
+    "VAL": Double = val;
+    "PRES": Double = pres;
+    "CGAP": Double = cgap;
+    "CGBP": Double = cgbp;
+    "LPRS": Double = lprs;
+    "LCAP": Double = lcap;
+    "LCBP": Double = lcbp;
+    "CHGC": UShort = chgc;
+    "HOPR": Float = hopr;
+    "LOPR": Float = lopr;
+    "HLPR": Float = hlpr;
+    "LLPR": Float = llpr;
+    "HAPR": Float = hapr;
+    "LAPR": Float = lapr;
+    "HALR": Float = halr;
+    "LALR": Float = lalr;
+    "HBPR": Float = hbpr;
+    "LBPR": Float = lbpr;
+    "HBLR": Float = hblr;
+    "LBLR": Float = lblr;
+    "PI1S": Enum = pi1s;
+    "PI2S": Enum = pi2s;
+    "PDSS": Enum = pdss;
+    "PIG1": Enum = pig1;
+    "PIG2": Enum = pig2;
+    "PDGS": Enum = pdgs;
+    "PFLT": Enum = pflt;
+    "PVAL": Double = pval;
+    "PPRE": Double = ppre;
+    "PCGA": Double = pcga;
+    "PCGB": Double = pcgb;
+    "PLPE": Double = plpe;
+    "PLCA": Double = plca;
+    "PLCB": Double = plcb;
+    "HIHI": Float = hihi;
+    "LOLO": Float = lolo;
+    "HIGH": Float = high;
+    "LOW": Float = low;
+    "HHSV": Enum = hhsv;
+    "LLSV": Enum = llsv;
+    "HSV": Enum = hsv;
+    "LSV": Enum = lsv;
+    "HYST": Double = hyst;
+    "LALM": Double = lalm;
 }
 
 /// `SP<n>`/`PSP<n>` (1..=6) and `SP<n>S`/`SP<n>R`/`PS<n>S`/`PS<n>R` (1..=4).
@@ -457,13 +370,7 @@ impl Record for VsRecord {
     }
 
     fn declared_fields(&self) -> &'static [FieldDesc] {
-        let fields: &Vec<FieldDesc> = &ALL_FIELDS;
-        // `ALL_FIELDS` is a `LazyLock` that lives for the whole program.
-        unsafe { std::slice::from_raw_parts(fields.as_ptr(), fields.len()) }
-    }
-
-    fn menu_field_choices(&self, field: &str) -> Option<&'static [&'static str]> {
-        menu_of(field)
+        VS_FIELDS
     }
 
     /// `pp(TRUE)` in `vsRecord.dbd`.
@@ -532,23 +439,19 @@ impl Record for VsRecord {
     /// `|| (alrm_chg_flg)` clauses). The `*S` setting fields are not in that
     /// list — their posts are gated on `chgc` / their own shadow.
     fn alarm_cycle_monitored_fields(&self) -> DeclaredFields {
-        // `ALL_FIELDS` is built at run time, so the set resolves on first use.
-        static MONITORED: std::sync::LazyLock<[FieldIx; 21]> = std::sync::LazyLock::new(|| {
-            declared_set(
-                ALL_FIELDS.as_slice(),
-                [
-                    "VAL", "PRES", "IG1R", "IG2R", "DGSR", "FLTR", "SP1", "SP2", "SP3", "SP4",
-                    "SP5", "SP6", "SP1R", "SP2R", "SP3R", "SP4R", "LPRS", "CGAP", "LCAP", "CGBP",
-                    "LCBP",
-                ],
-            )
-        });
-        &*MONITORED
+        static MONITORED: [FieldIx; 21] = declared_set(
+            VS_FIELDS,
+            [
+                "VAL", "PRES", "IG1R", "IG2R", "DGSR", "FLTR", "SP1", "SP2", "SP3", "SP4", "SP5",
+                "SP6", "SP1R", "SP2R", "SP3R", "SP4R", "LPRS", "CGAP", "LCAP", "CGBP", "LCBP",
+            ],
+        );
+        &MONITORED
     }
 
     fn check_alarms(&mut self, common: &mut CommonFields) {
-        if self.read_alarm {
-            set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
+        if let Some(stat) = self.dev_alarm {
+            set_sevr(common, stat, AlarmSeverity::Invalid);
         }
         // C returns immediately on UDF; the framework's `rec_gbl_check_udf`
         // raises `UDF_ALARM` at `UDFS`.
@@ -578,12 +481,12 @@ impl Record for VsRecord {
             "LPRS" => Some((self.hlpr as f64, self.llpr as f64)),
             "LCAP" => Some((self.halr as f64, self.lalr as f64)),
             "LCBP" => Some((self.hblr as f64, self.lblr as f64)),
-            _ => None,
+            _ => rec_gbl_range(VS_FIELDS, field),
         };
 
         let ctrl_limits = match field {
             "VAL" | "PRES" | "CGAP" | "CGBP" => Some((self.hopr as f64, self.lopr as f64)),
-            _ => None,
+            _ => rec_gbl_range(VS_FIELDS, field),
         };
 
         // Alarm limits are published only while an ion gauge is switched on;
@@ -597,7 +500,7 @@ impl Record for VsRecord {
                 self.lolo as f64,
             )),
             "VAL" | "PRES" => Some((0.0, 0.0, 0.0, 0.0)),
-            _ => None,
+            _ => rec_gbl_alarm(VS_FIELDS, field),
         };
 
         Some(FieldMetadataOverride {
@@ -786,7 +689,7 @@ mod tests {
     fn a_device_read_alarm_outranks_the_limit_alarms() {
         let mut r = VsRecord {
             dev_ran: true,
-            read_alarm: true,
+            dev_alarm: Some(alarm_status::READ_ALARM),
             hhsv: 1,
             hihi: 1e-6,
             val: 1e-5,
@@ -849,9 +752,11 @@ mod tests {
                 1e-12f32 as f64
             ))
         );
-        assert_eq!(
-            r.field_metadata_override("CGAP").unwrap().alarm_limits,
-            None
-        );
+        let (a, b, c, d) = r
+            .field_metadata_override("CGAP")
+            .unwrap()
+            .alarm_limits
+            .unwrap();
+        assert!([a, b, c, d].iter().all(|v| v.is_nan()));
     }
 }

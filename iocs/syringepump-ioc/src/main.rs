@@ -45,6 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::base::error::CaResult;
@@ -234,17 +235,18 @@ async fn main() -> CaResult<()> {
 
                 let handle = connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT)
                     .map_err(|e| format!("TeledyneDInit: {e}"))?;
+                let claim = claim_port(&port).map_err(|e| format!("TeledyneDInit: {e}"))?;
                 let driver = TeledyneDriver::new(&port, handle, Family::D, unit);
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("TeledyneDInit: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },
@@ -295,17 +297,18 @@ async fn main() -> CaResult<()> {
 
                 let handle = connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT)
                     .map_err(|e| format!("TeledyneHInit: {e}"))?;
+                let claim = claim_port(&port).map_err(|e| format!("TeledyneHInit: {e}"))?;
                 let driver = TeledyneDriver::new(&port, handle, Family::H, unit);
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("TeledyneHInit: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 Ok(CommandOutcome::Continue)
             },

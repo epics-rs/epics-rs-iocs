@@ -15,6 +15,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -121,8 +122,7 @@ impl DeviceWorker for Nd261Worker {
                     ParamValue::Int32(status::OK),
                 ));
             }
-            Err(e) => {
-                log::error!("ND261: read failed: {e}");
+            Err(_) => {
                 values.push(ParamSetValue::new(
                     p.position,
                     0,
@@ -135,9 +135,7 @@ impl DeviceWorker for Nd261Worker {
                 ));
             }
         }
-        if let Err(e) = self.handle.set_params_and_notify_blocking(0, values) {
-            log::error!("ND261: publishing failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify_blocking(0, values);
     }
 
     fn handle(&mut self, _command: Self::Command) {}
@@ -145,18 +143,19 @@ impl DeviceWorker for Nd261Worker {
 
 /// `ND261Config(port, octetPort, [pollPeriod])`.
 pub fn create_nd261(
-    port_name: &str,
+    claim: &PortClaim,
     octet_port: &str,
     poll_period: Duration,
 ) -> AsynResult<IpPortRuntime> {
+    let port_name = claim.name();
     let io = connect_octet(octet_port, ND261_TIMEOUT).map_err(crate::asyn_error)?;
     let (commands, rx) = std::sync::mpsc::channel::<Nd261Command>();
     let driver = Nd261Driver::new(port_name, commands)?;
     let params = driver.params();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let worker = Nd261Worker {
-        transport: Transport::new(io),
+        transport: io,
         handle: runtime_handle.port_handle().clone(),
         params,
     };

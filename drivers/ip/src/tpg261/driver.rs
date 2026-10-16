@@ -11,6 +11,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::asyn_error;
@@ -20,8 +21,12 @@ use crate::worker::{DeviceWorker, Transport};
 /// Command timeout (`TPG261_TIMEOUT`, `devTPG261.c:87`).
 pub const TPG261_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// A command string to send to the controller (`SPn,...`, `SEN,...`, `UNI,n`).
-pub struct TpgCommand(pub String);
+/// A command string to send to the controller (`SPn,...`, `SEN,...`, `UNI,n`),
+/// and the parameter that stands where C prints the record name.
+pub struct TpgCommand {
+    pub text: String,
+    pub who: String,
+}
 
 #[derive(Clone, Copy)]
 pub struct TpgParams {
@@ -110,9 +115,9 @@ impl TpgDriver {
         }
     }
 
-    fn send(&self, command: String) -> AsynResult<()> {
+    fn send(&self, text: String, who: String) -> AsynResult<()> {
         self.commands
-            .send(TpgCommand(command))
+            .send(TpgCommand { text, who })
             .map_err(|_| asyn_error("TPG261: the worker thread is gone"))
     }
 }
@@ -130,12 +135,18 @@ impl PortDriver for TpgDriver {
         let (reason, addr) = (user.reason, user.addr);
         let p = self.params;
         let gauge = self.gauge(addr)?;
-        self.base.params.set_int32(reason, addr, value)?;
+        self.base.set_int32_param(reason, addr, value)?;
 
         if reason == p.set_sensor {
-            self.send(protocol::write_sensor(gauge, value != 0))
+            self.send(
+                protocol::write_sensor(gauge, value != 0),
+                format!("TPG_SET_SENSOR[{addr}]"),
+            )
         } else if reason == p.set_units {
-            self.send(protocol::write_units(value))
+            self.send(
+                protocol::write_units(value),
+                format!("TPG_SET_UNITS[{addr}]"),
+            )
         } else {
             Ok(())
         }
@@ -145,10 +156,13 @@ impl PortDriver for TpgDriver {
         let (reason, addr) = (user.reason, user.addr);
         let p = self.params;
         let gauge = self.gauge(addr)?;
-        self.base.params.set_float64(reason, addr, value)?;
+        self.base.set_float64_param(reason, addr, value)?;
 
         if let Some(index) = p.set_setpoint.iter().position(|&r| r == reason) {
-            return self.send(protocol::write_setpoint(gauge, index, value));
+            return self.send(
+                protocol::write_setpoint(gauge, index, value),
+                format!("TPG_SP{}_SET[{addr}]", index + 1),
+            );
         }
         Ok(())
     }
@@ -170,59 +184,92 @@ impl TpgWorker {
     }
 
     /// Command, ACK/NAK, `<ENQ>`, data — the two-exchange TPG26x transaction
-    /// (`devTPG261.c::devTPG261Callback`).
-    fn transact(&self, command: &str) -> Result<String, String> {
-        let acknowledgement = self
-            .transport
-            .write_read(format!("{command}\r").as_bytes())?;
-        protocol::check_ack(&acknowledgement).map_err(|e: TpgError| e.to_string())?;
-        let data = self.transport.write_read(&[ENQ])?;
+    /// (`devTPG261.c::devTPG261Callback`), with the error lines it prints.
+    /// `who` stands where C prints the record name.
+    fn transact(&self, command: &str, who: &str) -> Result<String, ()> {
+        let acknowledgement = self.exchange(format!("{command}\r").as_bytes()).ok_or(())?;
+        match protocol::check_ack(&acknowledgement) {
+            Ok(()) => {}
+            Err(TpgError::Nak) => {
+                self.transport.print(
+                    TraceMask::ERROR,
+                    format_args!("devTPG261::devTPG261Callback Cmd {who} message Error "),
+                );
+                return Err(());
+            }
+            Err(_) => {
+                self.print_too_small("Cmd", who);
+                return Err(());
+            }
+        }
+        // The <ENQ> goes out in the same C callback, so it always "runs".
+        let data = self.exchange(&[ENQ]).unwrap_or_default();
         let data = data.trim().to_string();
         if data.is_empty() {
-            return Err("empty data reply".to_string());
+            self.print_too_small("Val", who);
+            return Err(());
         }
         Ok(data)
+    }
+
+    fn exchange(&self, data: &[u8]) -> Option<String> {
+        self.transport
+            .exchange(data)
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
+    }
+
+    fn print_too_small(&self, stage: &str, who: &str) {
+        self.transport.print(
+            TraceMask::ERROR,
+            format_args!("devTPG261::devTPG261Callback {stage} {who} message too small=0"),
+        );
     }
 
     fn poll_gauge(&mut self, addr: i32, gauge: u8, states: Option<[i32; 4]>) {
         let p = self.params;
         let mut values: Vec<ParamSetValue> = Vec::new();
 
-        match self
-            .transact(&protocol::read_pressure(gauge))
-            .and_then(|raw| protocol::parse_pressure(&raw).map_err(|e| e.to_string()))
+        let who = format!("TPG_PRESSURE[{addr}]");
+        if let Ok((status, pressure)) = self
+            .transact(&protocol::read_pressure(gauge), &who)
+            .and_then(|raw| protocol::parse_pressure(&raw).map_err(|_| ()))
         {
-            Ok((status, pressure)) => {
-                values.push(ParamSetValue::new(
-                    p.pressure,
-                    addr,
-                    ParamValue::Float64(pressure),
-                ));
-                let code = match status {
-                    GaugeStatus::Ok => 0,
-                    GaugeStatus::NoSensor => 4,
-                    GaugeStatus::Error(other) => other,
-                };
-                values.push(ParamSetValue::new(
-                    p.gauge_status,
-                    addr,
-                    ParamValue::Int32(code),
-                ));
-            }
-            Err(e) => log::error!("TPG261: read pressure of gauge {gauge} failed: {e}"),
+            values.push(ParamSetValue::new(
+                p.pressure,
+                addr,
+                ParamValue::Float64(pressure),
+            ));
+            let code = match status {
+                GaugeStatus::Ok => 0,
+                GaugeStatus::NoSensor => 4,
+                GaugeStatus::Error(other) => {
+                    self.transport.print(
+                        TraceMask::ERROR,
+                        format_args!("devTPG261::readAi Gauge error {who} status =[{other}] "),
+                    );
+                    other
+                }
+            };
+            values.push(ParamSetValue::new(
+                p.gauge_status,
+                addr,
+                ParamValue::Int32(code),
+            ));
         }
 
         for index in 0..SETPOINTS_PER_GAUGE {
-            match self
-                .transact(&protocol::read_setpoint(gauge, index))
-                .and_then(|raw| protocol::parse_setpoint(&raw).map_err(|e| e.to_string()))
+            if let Ok(value) = self
+                .transact(
+                    &protocol::read_setpoint(gauge, index),
+                    &format!("TPG_SP{}_VAL[{addr}]", index + 1),
+                )
+                .and_then(|raw| protocol::parse_setpoint(&raw).map_err(|_| ()))
             {
-                Ok(value) => values.push(ParamSetValue::new(
+                values.push(ParamSetValue::new(
                     p.setpoint_value[index],
                     addr,
                     ParamValue::Float64(value),
-                )),
-                Err(e) => log::error!("TPG261: read setpoint {index} of gauge {gauge}: {e}"),
+                ));
             }
             if let Some(states) = states {
                 let relay = usize::from(protocol::setpoint_number(gauge, index)) - 1;
@@ -234,10 +281,8 @@ impl TpgWorker {
             }
         }
 
-        if !values.is_empty()
-            && let Err(e) = self.handle.set_params_and_notify_blocking(addr, values)
-        {
-            log::error!("TPG261: publishing gauge {gauge} parameters failed: {e}");
+        if !values.is_empty() {
+            let _ = self.handle.set_params_and_notify_blocking(addr, values);
         }
     }
 }
@@ -250,37 +295,19 @@ impl DeviceWorker for TpgWorker {
 
         // SPS, SEN, UNI and TID answer for both gauges at once, so they are read
         // once per poll and fanned out.
-        let states = match self
-            .transact(&protocol::read_setpoint_states())
-            .and_then(|raw| protocol::parse_setpoint_states(&raw).map_err(|e| e.to_string()))
-        {
-            Ok(states) => Some(states),
-            Err(e) => {
-                log::error!("TPG261: read setpoint states failed: {e}");
-                None
-            }
-        };
-        let sensors = match self
-            .transact(&protocol::read_sensor_states())
-            .and_then(|raw| protocol::parse_sensor_states(&raw).map_err(|e| e.to_string()))
-        {
-            Ok(sensors) => Some(sensors),
-            Err(e) => {
-                log::error!("TPG261: read sensor states failed: {e}");
-                None
-            }
-        };
-        let units = match self
-            .transact(&protocol::read_units())
-            .and_then(|raw| protocol::parse_units(&raw).map_err(|e| e.to_string()))
-        {
-            Ok(units) => Some(units),
-            Err(e) => {
-                log::error!("TPG261: read units failed: {e}");
-                None
-            }
-        };
-        let ids = self.transact(&protocol::read_gauge_id()).ok();
+        let states = self
+            .transact(&protocol::read_setpoint_states(), "TPG_SP1_STATE")
+            .and_then(|raw| protocol::parse_setpoint_states(&raw).map_err(|_| ()))
+            .ok();
+        let sensors = self
+            .transact(&protocol::read_sensor_states(), "TPG_SENSOR")
+            .and_then(|raw| protocol::parse_sensor_states(&raw).map_err(|_| ()))
+            .ok();
+        let units = self
+            .transact(&protocol::read_units(), "TPG_UNITS")
+            .and_then(|raw| protocol::parse_units(&raw).map_err(|_| ()))
+            .ok();
+        let ids = self.transact(&protocol::read_gauge_id(), "TPG_ID").ok();
 
         for gauge in 1..=NUM_GAUGES as u8 {
             let addr = i32::from(gauge) - 1;
@@ -295,29 +322,91 @@ impl DeviceWorker for TpgWorker {
             if let Some(units) = units {
                 shared.push(ParamSetValue::new(p.units, addr, ParamValue::Int32(units)));
             }
-            if let Some(raw) = ids.as_deref() {
-                match protocol::parse_gauge_id(raw, gauge) {
-                    Ok(id) => shared.push(ParamSetValue::new(
-                        p.gauge_id,
-                        addr,
-                        ParamValue::Octet(id.into_bytes().into()),
-                    )),
-                    Err(e) => log::error!("TPG261: gauge {gauge} id: {e}"),
-                }
-            }
-            if !shared.is_empty()
-                && let Err(e) = self.handle.set_params_and_notify_blocking(addr, shared)
+            if let Some(raw) = ids.as_deref()
+                && let Ok(id) = protocol::parse_gauge_id(raw, gauge)
             {
-                log::error!("TPG261: publishing gauge {gauge} status failed: {e}");
+                shared.push(ParamSetValue::new(
+                    p.gauge_id,
+                    addr,
+                    ParamValue::Octet(id.into_bytes().into()),
+                ));
+            }
+            if !shared.is_empty() {
+                let _ = self.handle.set_params_and_notify_blocking(addr, shared);
             }
             self.poll_gauge(addr, gauge, states);
         }
     }
 
     fn handle(&mut self, command: Self::Command) {
-        let TpgCommand(text) = command;
-        if let Err(e) = self.transact(&text) {
-            log::error!("TPG261: command {text:?} failed: {e}");
+        let _ = self.transact(&command.text, &command.who);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::test_support::{refused_transport, silent_transport, traced};
+
+    fn params() -> TpgParams {
+        TpgParams {
+            pressure: 0,
+            gauge_status: 1,
+            setpoint_value: [2, 3],
+            setpoint_state: [4, 5],
+            sensor: 6,
+            units: 7,
+            gauge_id: 8,
+            set_setpoint: [9, 10],
+            set_sensor: 11,
+            set_units: 12,
         }
+    }
+
+    /// A controller that never answers prints devTPG261Callback's Cmd line
+    /// once per transaction, and nothing else.
+    #[test]
+    fn a_silent_controller_prints_cmd_message_too_small() {
+        let (transport, path, runtime) = silent_transport("TPG_SILENT");
+        let mut worker = TpgWorker::new(transport, runtime.port_handle().clone(), params());
+        worker.poll();
+        worker.handle(TpgCommand {
+            text: "UNI,1".into(),
+            who: "TPG_SET_UNITS[0]".into(),
+        });
+        let lines = traced(&path);
+        let who: Vec<&str> = lines
+            .iter()
+            .map(|l| {
+                l.split("devTPG261::devTPG261Callback Cmd ")
+                    .nth(1)
+                    .and_then(|rest| rest.strip_suffix(" message too small=0"))
+                    .unwrap_or_else(|| panic!("{l:?}"))
+            })
+            .collect();
+        assert_eq!(
+            who,
+            [
+                "TPG_SP1_STATE",
+                "TPG_SENSOR",
+                "TPG_UNITS",
+                "TPG_ID",
+                "TPG_PRESSURE[0]",
+                "TPG_SP1_VAL[0]",
+                "TPG_SP2_VAL[0]",
+                "TPG_PRESSURE[1]",
+                "TPG_SP1_VAL[1]",
+                "TPG_SP2_VAL[1]",
+                "TPG_SET_UNITS[0]",
+            ]
+        );
+    }
+
+    /// A request the port refused never reached C's callback: no line.
+    #[test]
+    fn a_refused_request_prints_nothing() {
+        let (transport, path, runtime) = refused_transport("TPG_REFUSED");
+        TpgWorker::new(transport, runtime.port_handle().clone(), params()).poll();
+        assert_eq!(traced(&path), Vec::<String>::new());
     }
 }

@@ -19,6 +19,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::registry::{PortClaim, claim_port};
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::iocsh::registry::*;
@@ -66,11 +67,12 @@ fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, Strin
 
 fn register(
     ports: &Ports,
-    name: &str,
+    claim: PortClaim,
     owner: &Arc<InterruptGate>,
     port: IpPortRuntime,
 ) -> Result<(), String> {
-    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), owner)
+    claim
+        .publish(port.port_handle().clone(), owner)
         .map_err(|e| e.to_string())?;
     ports.lock().expect("port list poisoned").push(port);
     Ok(())
@@ -132,11 +134,12 @@ async fn main() -> CaResult<()> {
                 let address = u8::try_from(address)
                     .map_err(|_| format!("MPCConfig: address {address} is not 0..255"))?;
                 let poll = poll_arg(args, 3, 1.0)?;
-                let port = create_mpc(&name, &octet, address, poll)
+                let claim = claim_port(&name).map_err(|e| format!("MPCConfig failed: {e}"))?;
+                let port = create_mpc(&claim, &octet, address, poll)
                     .map_err(|e| format!("MPCConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -169,11 +172,12 @@ async fn main() -> CaResult<()> {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let poll = poll_arg(args, 2, 2.0)?;
-                let port = create_tpg261(&name, &octet, poll)
+                let claim = claim_port(&name).map_err(|e| format!("TPG261Config failed: {e}"))?;
+                let port = create_tpg261(&claim, &octet, poll)
                     .map_err(|e| format!("TPG261Config failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -221,11 +225,12 @@ async fn main() -> CaResult<()> {
                 let relays = u8::try_from(relays)
                     .map_err(|_| format!("TelevacConfig: numRelays {relays} is not 0..8"))?;
                 let poll = poll_arg(args, 4, 1.0)?;
-                let port = create_televac(&name, &octet, stations, relays, poll)
+                let claim = claim_port(&name).map_err(|e| format!("TelevacConfig failed: {e}"))?;
+                let port = create_televac(&claim, &octet, stations, relays, poll)
                     .map_err(|e| format!("TelevacConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -266,11 +271,12 @@ async fn main() -> CaResult<()> {
                 let gauges = u8::try_from(gauges)
                     .map_err(|_| format!("MKSConfig: numGauges {gauges} is not 1..5"))?;
                 let poll = poll_arg(args, 3, 1.0)?;
-                let port = create_mks(&name, &octet, gauges, poll)
+                let claim = claim_port(&name).map_err(|e| format!("MKSConfig failed: {e}"))?;
+                let port = create_mks(&claim, &octet, gauges, poll)
                     .map_err(|e| format!("MKSConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -303,11 +309,12 @@ async fn main() -> CaResult<()> {
                 let name = string_arg(args, 0)?;
                 let octet = string_arg(args, 1)?;
                 let poll = poll_arg(args, 2, 1.0)?;
-                let port = create_nd261(&name, &octet, poll)
+                let claim = claim_port(&name).map_err(|e| format!("ND261Config failed: {e}"))?;
+                let port = create_nd261(&claim, &octet, poll)
                     .map_err(|e| format!("ND261Config failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -343,11 +350,13 @@ async fn main() -> CaResult<()> {
                 let group = int_arg(args, 2)?;
                 let group = u8::try_from(group)
                     .map_err(|_| format!("EurothermConfig: groupAddress {group} is not 0..9"))?;
-                let port = create_eurotherm(&name, &octet, group)
+                let claim =
+                    claim_port(&name).map_err(|e| format!("EurothermConfig failed: {e}"))?;
+                let port = create_eurotherm(&claim, &octet, group)
                     .map_err(|e| format!("EurothermConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;

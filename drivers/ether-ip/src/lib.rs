@@ -19,3 +19,49 @@ pub mod connection;
 pub mod device;
 pub mod driver;
 pub mod encap;
+
+use std::io::Write;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// `EIP_verbosity` (`ether_ip.c:364`): a line prints when its level is at or
+/// below this.
+pub static EIP_VERBOSITY: AtomicI32 = AtomicI32::new(4);
+
+/// `EIP_printf`: the text goes to stderr as given, newline included.
+pub fn eip_printf(level: i32, args: std::fmt::Arguments<'_>) {
+    if level > EIP_VERBOSITY.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::io::stderr().write_fmt(args);
+}
+
+/// `EIP_printf_time`: [`fn@eip_printf`] behind a local `%Y/%m/%d %H:%M:%S.%04f`
+/// stamp.
+pub fn eip_printf_time(level: i32, args: std::fmt::Arguments<'_>) {
+    if level > EIP_VERBOSITY.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = chrono::Local::now();
+    let mut err = std::io::stderr().lock();
+    let _ = write!(
+        err,
+        "{}.{:04} ",
+        now.format("%Y/%m/%d %H:%M:%S"),
+        now.timestamp_subsec_nanos() / 100_000
+    );
+    let _ = err.write_fmt(args);
+}
+
+#[macro_export]
+macro_rules! eip_printf_time {
+    ($level:expr, $($arg:tt)*) => {
+        $crate::eip_printf_time($level, format_args!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! eip_printf {
+    ($level:expr, $($arg:tt)*) => {
+        $crate::eip_printf($level, format_args!($($arg)*))
+    };
+}

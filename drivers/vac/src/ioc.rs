@@ -19,12 +19,14 @@ use crate::records::vs::VsRecord;
 
 /// The `vs` record-type factory, for `IocApplication::register_record_type`.
 pub fn vs_record_factory() -> (&'static str, RecordFactory) {
+    crate::records::register_vac_dbd();
     ("vs", Box::new(|| Box::new(VsRecord::default())))
 }
 
 /// The `digitel` record-type factory, for
 /// `IocApplication::register_record_type`.
 pub fn digitel_record_factory() -> (&'static str, RecordFactory) {
+    crate::records::register_vac_dbd();
     ("digitel", Box::new(|| Box::new(DigitelRecord::default())))
 }
 

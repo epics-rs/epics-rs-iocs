@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 epics-rs = { workspace = true, features = ["asyn"] }
-log = "0.4"
 parking_lot = "0.12"
 thiserror = "2"

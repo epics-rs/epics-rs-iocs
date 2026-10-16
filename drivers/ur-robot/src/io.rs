@@ -157,8 +157,10 @@ impl IoInterface {
         match self.session.send_command(&cmd) {
             Ok(()) => Ok(()),
             Err(first) => {
-                log::warn!("ur-robot: RTDE I/O lost the connection ({first}); reconnecting");
+                println!("RTDEIOInterface: Lost connection to robot...");
+                eprintln!("{first}");
                 self.session.disconnect(false);
+                println!("RTDEIOInterface: Robot is disconnected, reconnecting...");
                 self.reconnect()?;
                 self.session.send_command(&cmd)
             }

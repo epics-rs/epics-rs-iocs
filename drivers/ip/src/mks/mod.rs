@@ -29,9 +29,11 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
+use epics_rs::asyn::trace::TraceMask;
 
 use crate::connect::connect_octet;
 use crate::runtime::IpPortRuntime;
@@ -40,6 +42,9 @@ use protocol::{GaugeType, MAX_GAUGES, Reading};
 
 /// Command timeout (`TIMEOUT`, `devAiMKS.c:65`).
 pub const MKS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The reply length C accepts from every 937 query (`nread != 7`).
+const REPLY_LEN: usize = 7;
 
 /// The MKS port is read-only, so the worker takes no commands.
 pub enum MksCommand {}
@@ -144,18 +149,36 @@ impl MksWorker {
     }
 
     fn publish(&self, addr: i32, values: Vec<ParamSetValue>) {
-        if !values.is_empty()
-            && let Err(e) = self.handle.set_params_and_notify_blocking(addr, values)
-        {
-            log::error!("MKS: publishing address {addr} failed: {e}");
+        if !values.is_empty() {
+            let _ = self.handle.set_params_and_notify_blocking(addr, values);
         }
+    }
+
+    /// One of `initAi`'s `writeReadOnce` reads, refused unless it returns the
+    /// 7 characters C requires. `who` stands where C prints the record name.
+    fn read_config(&self, command: &str, who: &str) -> Result<String, ()> {
+        let reply = self.transact(command).unwrap_or_default();
+        if reply.len() != REPLY_LEN {
+            self.transport.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "devAiMKS ERROR, record={who}, nread={}, response=\n{reply}",
+                    reply.len()
+                ),
+            );
+            return Err(());
+        }
+        Ok(reply)
     }
 
     /// Read `SU` and `SG` and publish the units, gauge type and range of every
     /// gauge (`devAiMKS.c::initAi`).
-    fn configure(&mut self) -> Result<Vec<Option<GaugeConfig>>, String> {
-        let units = self.transact(protocol::READ_UNITS)?.trim().to_string();
-        let types = self.transact(protocol::READ_GAUGE_TYPES)?;
+    fn configure(&mut self) -> Result<Vec<Option<GaugeConfig>>, ()> {
+        let units = self
+            .read_config(protocol::READ_UNITS, "MKS_UNITS")?
+            .trim()
+            .to_string();
+        let types = self.read_config(protocol::READ_GAUGE_TYPES, "MKS_GAUGE_TYPE")?;
         let multiplier = protocol::unit_multiplier(&units);
         let p = self.params;
 
@@ -193,7 +216,10 @@ impl MksWorker {
                     config.push(Some(GaugeConfig { low, high }));
                 }
                 None => {
-                    log::error!("MKS: gauge {gauge} reports an unknown type {code:?}");
+                    self.transport.print(
+                        TraceMask::ERROR,
+                        format_args!("devAiMKS, unknown gauge type {code}"),
+                    );
                     config.push(None);
                 }
             }
@@ -210,10 +236,7 @@ impl DeviceWorker for MksWorker {
         if self.config.is_none() {
             match self.configure() {
                 Ok(config) => self.config = Some(config),
-                Err(e) => {
-                    log::error!("MKS: reading the controller configuration failed: {e}");
-                    return;
-                }
+                Err(()) => return,
             }
         }
         let config = self.config.clone().unwrap_or_default();
@@ -221,12 +244,10 @@ impl DeviceWorker for MksWorker {
 
         for gauge in 1..=self.gauges {
             let addr = i32::from(gauge) - 1;
+            // C decodes only a 7-character reply (`callbackAi`).
             let raw = match self.transact(&protocol::read_pressure(gauge)) {
-                Ok(raw) => raw,
-                Err(e) => {
-                    log::error!("MKS: read gauge {gauge} failed: {e}");
-                    continue;
-                }
+                Ok(raw) if raw.len() == REPLY_LEN => raw,
+                _ => continue,
             };
             let limits = config.get(usize::from(gauge - 1)).copied().flatten();
             let (value, code) = match protocol::parse_reading(&raw) {
@@ -238,7 +259,13 @@ impl DeviceWorker for MksWorker {
                 // alarms nor logs, and leaves the record's value alone.
                 Reading::Spurious => continue,
                 Reading::Unknown => {
-                    log::error!("MKS: gauge {gauge} sent an unknown reply {raw:?}");
+                    self.transport.print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "devAiMKS record=MKS_PRESSURE[{addr}], unknown response len={} response={raw}",
+                            raw.len()
+                        ),
+                    );
                     (None, status::UNKNOWN)
                 }
             };
@@ -260,11 +287,12 @@ impl DeviceWorker for MksWorker {
 
 /// `MKSConfig(port, octetPort, numGauges, [pollPeriod])`.
 pub fn create_mks(
-    port_name: &str,
+    claim: &PortClaim,
     octet_port: &str,
     gauges: u8,
     poll_period: Duration,
 ) -> AsynResult<IpPortRuntime> {
+    let port_name = claim.name();
     if gauges == 0 || usize::from(gauges) > MAX_GAUGES {
         return Err(crate::asyn_error(format!(
             "MKS: numGauges must be 1..{MAX_GAUGES}, got {gauges}"
@@ -276,9 +304,9 @@ pub fn create_mks(
     let driver = MksDriver::new(port_name, commands)?;
     let params = driver.params();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let worker = MksWorker {
-        transport: Transport::new(io),
+        transport: io,
         handle: runtime_handle.port_handle().clone(),
         params,
         gauges,
@@ -286,4 +314,39 @@ pub fn create_mks(
     };
     let thread = worker::spawn(port_name, worker, rx, poll_period);
     Ok(IpPortRuntime::new(runtime_handle, thread))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::test_support::{refused_transport, traced};
+
+    /// A dead controller fails initAi's units read with C's error line,
+    /// and the poll stops there.
+    #[test]
+    fn a_failed_units_read_prints_devaimks_error() {
+        let (transport, path, runtime) = refused_transport("MKS_TRACE");
+        let mut worker = MksWorker {
+            transport,
+            handle: runtime.port_handle().clone(),
+            params: MksParams {
+                pressure: 0,
+                status: 1,
+                units: 2,
+                gauge_type: 3,
+                low_limit: 4,
+                high_limit: 5,
+            },
+            gauges: 1,
+            config: None,
+        };
+        worker.poll();
+        let lines = traced(&path);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].ends_with("devAiMKS ERROR, record=MKS_UNITS, nread=0, response="),
+            "{lines:?}"
+        );
+        assert!(worker.config.is_none());
+    }
 }

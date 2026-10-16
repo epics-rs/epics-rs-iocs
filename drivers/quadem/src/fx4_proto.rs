@@ -78,12 +78,19 @@ pub fn get_message() -> String {
 }
 
 /// C++ `drvFX4::onMessage`: split a received frame into its event name and
-/// payload. A frame without an `event` member is ignored, as it is upstream.
-pub fn parse_message(payload: &str) -> Option<(String, Value)> {
-    let response: Value = serde_json::from_str(payload).ok()?;
-    let event = response.get("event")?.as_str()?.to_string();
+/// payload. A frame without an `event` member is ignored, as it is upstream;
+/// one that is not JSON, or whose `event` is not a string, throws there and
+/// is the error C++ reports. The text is serde's, not nlohmann's.
+pub fn parse_message(payload: &str) -> Result<Option<(String, Value)>, String> {
+    let response: Value = serde_json::from_str(payload).map_err(|e| e.to_string())?;
+    let Some(event) = response.get("event") else {
+        return Ok(None);
+    };
+    let event = event
+        .as_str()
+        .ok_or_else(|| format!("event must be a string, but is {event}"))?;
     let data = response.get("data").cloned().unwrap_or(Value::Null);
-    Some((event, data))
+    Ok(Some((event.to_string(), data)))
 }
 
 // ===========================================================================
@@ -148,6 +155,9 @@ pub struct Fx4Cache {
     timestamp_mismatch: bool,
     trigger_active: bool,
     num_trigger_values: i32,
+    /// C++ `onMessageEvent`'s `ASYN_TRACE_ERROR` lines, for the caller to
+    /// print on the driver port.
+    errors: Vec<String>,
 }
 
 impl Fx4Cache {
@@ -166,6 +176,11 @@ impl Fx4Cache {
         self.timestamp_mismatch = false;
         self.trigger_active = false;
         self.num_trigger_values = 0;
+    }
+
+    /// The error lines the last [`Fx4Cache::ingest`] calls produced.
+    pub fn take_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.errors)
     }
 
     pub fn gate_level(&self) -> GateLevel {
@@ -262,13 +277,13 @@ impl Fx4Cache {
 
         if min_size != max_size {
             if !self.synchronized {
-                log::error!(
-                    "drvFX4: not synchronized and different number of samples per channel={} {} {} {}",
+                self.errors.push(format!(
+                    "drvFX4::onMessageEvent not synchronized and different number of samples per channel={} {} {} {}",
                     self.adc[0].len(),
                     self.adc[1].len(),
                     self.adc[2].len(),
                     self.adc[3].len()
-                );
+                ));
                 for q in &mut self.adc {
                     q.clear();
                 }
@@ -278,7 +293,7 @@ impl Fx4Cache {
             self.synchronized = true;
         }
 
-        for _ in 0..min_size {
+        for i in 0..min_size {
             let mut values = [0.0; FX4_NUM_CHANS];
             let mut times = [0.0; FX4_NUM_CHANS];
             for j in 0..FX4_NUM_CHANS {
@@ -289,17 +304,15 @@ impl Fx4Cache {
 
             if times[1..].iter().any(|t| *t != times[0]) {
                 if !self.timestamp_mismatch {
-                    log::error!(
-                        "drvFX4: timestamps are not the same for a sample: {} {} {} {}",
-                        times[0],
-                        times[1],
-                        times[2],
-                        times[3]
-                    );
+                    self.errors.push(format!(
+                        "drvFX4::onMessageEvent timestamps are not the same for sample {i} {:.6} {:.6} {:.6} {:.6}",
+                        times[0], times[1], times[2], times[3]
+                    ));
                     self.timestamp_mismatch = true;
                 }
             } else if self.timestamp_mismatch {
-                log::error!("drvFX4: timestamps back to normal");
+                self.errors
+                    .push("drvFX4::onMessageEvent timestamps back to normal".to_string());
                 self.timestamp_mismatch = false;
             }
 
@@ -443,17 +456,19 @@ mod tests {
 
     #[test]
     fn parse_message_needs_an_event_name() {
-        let (event, data) = parse_message(r#"{"event":"update","data":{"a":1}}"#).unwrap();
+        let (event, data) = parse_message(r#"{"event":"update","data":{"a":1}}"#)
+            .unwrap()
+            .unwrap();
         assert_eq!(event, "update");
         assert_eq!(data["a"], json!(1));
 
         // No event member, a non-string event, and malformed JSON are ignored.
-        assert!(parse_message(r#"{"data":{}}"#).is_none());
-        assert!(parse_message(r#"{"event":7}"#).is_none());
-        assert!(parse_message("not json").is_none());
+        assert!(parse_message(r#"{"data":{}}"#).unwrap().is_none());
+        assert!(parse_message(r#"{"event":7}"#).is_err());
+        assert!(parse_message("not json").is_err());
 
         // A frame with no data member parses with a null payload.
-        let (event, data) = parse_message(r#"{"event":"update"}"#).unwrap();
+        let (event, data) = parse_message(r#"{"event":"update"}"#).unwrap().unwrap();
         assert_eq!(event, "update");
         assert_eq!(data, Value::Null);
     }

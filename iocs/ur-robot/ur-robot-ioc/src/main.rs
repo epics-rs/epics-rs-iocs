@@ -16,6 +16,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::manager::claim_port_driver;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::iocsh::registry::*;
@@ -52,11 +54,12 @@ fn poll_arg(args: &[ArgValue], i: usize, default: f64) -> Result<Duration, Strin
 
 fn register(
     ports: &Ports,
-    name: &str,
+    claim: PortClaim,
     owner: &Arc<InterruptGate>,
     port: UrPortRuntime,
 ) -> Result<(), String> {
-    epics_rs::asyn::asyn_record::register_port(name, port.port_handle().clone(), owner)
+    claim
+        .publish(port.port_handle().clone(), owner)
         .map_err(|e| e.to_string())?;
     ports.lock().expect("port list poisoned").push(port);
     Ok(())
@@ -112,11 +115,17 @@ async fn main() -> CaResult<()> {
                 let name = string_arg(args, 0)?;
                 let ip = string_arg(args, 1)?;
                 let poll = poll_arg(args, 2, 0.1)?;
-                let port = create_dashboard(&name, &ip, poll)
+                // asynPortDriver registers the port before the driver body
+                // connects to the robot (asynPortDriver.cpp:4031-4040).
+                let claim = match claim_port_driver(&name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let port = create_dashboard(&claim, &ip, poll)
                     .map_err(|e| format!("URDashboardConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -149,11 +158,17 @@ async fn main() -> CaResult<()> {
                 let name = string_arg(args, 0)?;
                 let ip = string_arg(args, 1)?;
                 let poll = poll_arg(args, 2, 0.02)?;
-                let port = create_receive(&name, &ip, poll)
+                // asynPortDriver registers the port before the driver body
+                // connects to the robot (asynPortDriver.cpp:4031-4040).
+                let claim = match claim_port_driver(&name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let port = create_receive(&claim, &ip, poll)
                     .map_err(|e| format!("RTDEReceiveConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -190,11 +205,17 @@ async fn main() -> CaResult<()> {
                 // Unused (the io port never polls) but validated, so a bad
                 // period is rejected here exactly like on the other ports.
                 poll_arg(args, 2, 0.1)?;
+                // asynPortDriver registers the port before the driver body
+                // connects to the robot (asynPortDriver.cpp:4031-4040).
+                let claim = match claim_port_driver(&name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
                 let port =
-                    create_io(&name, &ip).map_err(|e| format!("RTDEInOutConfig failed: {e}"))?;
+                    create_io(&claim, &ip).map_err(|e| format!("RTDEInOutConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -232,11 +253,17 @@ async fn main() -> CaResult<()> {
                 let dash = string_arg(args, 1)?;
                 let recv = string_arg(args, 2)?;
                 let poll = poll_arg(args, 3, 0.02)?;
-                let port = create_control(&name, &dash, &recv, poll)
+                // asynPortDriver registers the port before the driver body
+                // connects to the robot (asynPortDriver.cpp:4031-4040).
+                let claim = match claim_port_driver(&name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let port = create_control(&claim, &dash, &recv, poll)
                     .map_err(|e| format!("RTDEControlConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;
@@ -269,11 +296,17 @@ async fn main() -> CaResult<()> {
                 let name = string_arg(args, 0)?;
                 let dash = string_arg(args, 1)?;
                 let poll = poll_arg(args, 2, 0.02)?;
-                let port = create_gripper(&name, &dash, poll)
+                // asynPortDriver registers the port before the driver body
+                // connects to the robot (asynPortDriver.cpp:4031-4040).
+                let claim = match claim_port_driver(&name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let port = create_gripper(&claim, &dash, poll)
                     .map_err(|e| format!("URGripperConfig failed: {e}"))?;
                 register(
                     &ports,
-                    &name,
+                    claim,
                     ctx.db().scan_control().interrupt_gate(),
                     port,
                 )?;

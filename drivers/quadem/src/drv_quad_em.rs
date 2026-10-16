@@ -24,6 +24,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use crate::asyn_print;
+use crate::trace::AsynPrint;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
 use epics_rs::ad_core::plugin::channel::{
@@ -31,7 +33,7 @@ use epics_rs::ad_core::plugin::channel::{
 };
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriverBase, PortFlags};
@@ -370,6 +372,18 @@ pub fn compute_positions(raw: &[f64; QE_MAX_INPUTS], cfg: &PositionConfig) -> [f
     d
 }
 
+/// `getIntegerParam` as the quadEM drivers call it, status ignored: a param
+/// nothing has set yet reads as zero, which stands for the uninitialised
+/// variable C reads into.
+pub fn int_param(base: &PortDriverBase, index: usize, addr: i32) -> i32 {
+    base.get_int32_param(index, addr).unwrap_or(0)
+}
+
+/// `getDoubleParam` with its status ignored; see [`int_param`].
+pub fn double_param(base: &PortDriverBase, index: usize, addr: i32) -> f64 {
+    base.get_float64_param(index, addr).unwrap_or(0.0)
+}
+
 /// C++ `numAverage = (int)((averagingTime / sampleTime) + 0.5)`.
 ///
 /// Reproduces the C truncating cast (including the negative and non-finite
@@ -431,6 +445,11 @@ impl RingState {
         self.ring_count += 1;
         self.raw_count += 1;
         overflowed
+    }
+
+    /// C++ `epicsRingBytesUsedBytes / sampleSize`.
+    pub fn used(&self) -> usize {
+        self.buf.len()
     }
 
     /// Drain `n` samples, oldest first. `None` when fewer than `n` are
@@ -552,7 +571,63 @@ pub struct QuadEmShared {
     pub array_counter: AtomicI32,
 }
 
+/// C's `int status; status |= ...`: the first failure, kept while the
+/// remaining steps still run.
+#[derive(Default)]
+struct StatusOr(Option<AsynError>);
+
+impl StatusOr {
+    fn add<T>(&mut self, r: AsynResult<T>) {
+        if let (None, Err(e)) = (&self.0, r) {
+            self.0 = Some(e);
+        }
+    }
+
+    fn into_result(self) -> AsynResult<()> {
+        self.0.map_or(Ok(()), Err)
+    }
+}
+
 impl QuadEmShared {
+    /// The read threads' and callback task's copy of an integer parameter C
+    /// reads back with `getIntegerParam` (or `valuesPerRead_`, which
+    /// `drvQuadEM::writeInt32` assigns): the written value, raw.
+    fn shadow_int32(&self, p: &QuadEmParams, reason: usize, value: i32) {
+        if reason == p.geometry {
+            self.pos.lock().geometry = value;
+        } else if reason == p.acquire_mode {
+            self.acq.lock().acquire_mode = value;
+        } else if reason == p.num_acquire {
+            self.acq.lock().num_acquire = value;
+        } else if reason == p.values_per_read {
+            self.acq.lock().values_per_read = value;
+        }
+    }
+
+    /// As [`Self::shadow_int32`], for the per-input position settings.
+    fn shadow_float64(&self, p: &QuadEmParams, reason: usize, addr: i32, value: f64) {
+        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
+        let j = addr.clamp(0, 1) as usize;
+        let mut pos = self.pos.lock();
+        if reason == p.current_offset {
+            pos.current_offset[i] = value;
+        } else if reason == p.current_scale {
+            pos.current_scale[i] = value;
+        } else if reason == p.position_offset {
+            pos.position_offset[j] = value;
+        } else if reason == p.position_scale {
+            pos.position_scale[j] = value;
+        } else if reason == p.weight_xsum {
+            pos.weight_xsum[i] = value;
+        } else if reason == p.weight_ysum {
+            pos.weight_ysum[i] = value;
+        } else if reason == p.weight_xdelta {
+            pos.weight_xdelta[i] = value;
+        } else if reason == p.weight_ydelta {
+            pos.weight_ydelta[i] = value;
+        }
+    }
+
     pub fn new(ring_buffer_size: usize) -> (Arc<Self>, rt::CommandReceiver<i32>) {
         let capacity = if ring_buffer_size == 0 {
             QE_DEFAULT_RING_BUFFER_SIZE
@@ -590,13 +665,18 @@ impl QuadEmShared {
     }
 
     /// C++ `drvQuadEM::triggerCallbacks`. Returns `false` when nothing was
-    /// pending (`rawCount_ < 1`, e.g. a Read press while idle).
-    pub fn trigger_callbacks(&self) -> bool {
+    /// pending (`rawCount_ < 1`, e.g. a Read press while idle). `port` is the
+    /// driver port the failure is reported on.
+    pub fn trigger_callbacks(&self, port: &dyn AsynPrint) -> bool {
         let Some(n) = self.ring.lock().take_raw_count() else {
             return false;
         };
         if self.trigger_tx.try_send(n).is_err() {
-            log::error!("quadEM: trigger message queue full, dropping {n} samples");
+            asyn_print!(
+                *port,
+                ERROR,
+                "drvQuadEM::triggerCallbacks, error calling epicsMessageQueueSend"
+            );
             return false;
         }
         true
@@ -623,7 +703,11 @@ impl QuadEmShared {
             (overflowed, ring.ring_overflows)
         };
         if overflowed {
-            log::warn!("quadEM: ring buffer overflow");
+            asyn_print!(
+                *handle,
+                WARNING,
+                "drvQuadEM::computePositions warning ring buffer overflow"
+            );
             let _ = handle.set_params_and_notify_blocking(
                 0,
                 vec![ParamSetValue::new(
@@ -636,7 +720,7 @@ impl QuadEmShared {
 
         let num_average = self.acq.lock().num_average;
         if num_average > 0 && self.ring.lock().raw_count >= num_average {
-            self.trigger_callbacks();
+            self.trigger_callbacks(handle);
         }
 
         // C++ sets QE_DOUBLE_DATA and fires callbacks on each of the 11
@@ -720,8 +804,136 @@ pub trait QuadEmDevice {
     fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {
         Ok(())
     }
+    fn set_trigger_polarity(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    fn set_num_acquire(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+    /// `drvQuadEM::setRange(int chan, epicsInt32 value)`.
+    fn set_channel_range(&mut self, _channel: i32, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
     fn read_status(&mut self) -> AsynResult<()> {
         Ok(())
+    }
+    /// `drvQuadEM::reset` is pure virtual; [`Self::base_reset`] is its body.
+    fn reset(&mut self) -> AsynResult<()>;
+
+    /// C++ `drvQuadEM::writeInt32`. Every step runs whatever an earlier one
+    /// returned, as C's `status |=` does; the first failure is what the record
+    /// sees.
+    fn qe_write_int32(&mut self, reason: usize, channel: i32, value: i32) -> AsynResult<()> {
+        let p = self.qe_base().params;
+        let acquire = self.qe_base().nd_params.acquire;
+        let shared = self.qe_shared().clone();
+        let mut status = StatusOr::default();
+
+        status.add(if reason == acquire {
+            self.qe_base().set_ad_acquire(channel, value)
+        } else {
+            self.qe_base()
+                .port_base
+                .set_int32_param(reason, channel, value)
+        });
+        shared.shadow_int32(&p, reason, value);
+
+        if reason == acquire {
+            if value != 0 {
+                shared.ring.lock().flush();
+            }
+            status.add(self.set_acquire(value));
+        } else if reason == p.acquire_mode {
+            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
+                status.add(self.set_acquire(0));
+                let _ = self.qe_base().set_ad_acquire(0, 0);
+            }
+            status.add(self.set_acquire_mode(value));
+            status.add(self.read_status());
+        } else if reason == p.bias_state {
+            status.add(self.set_bias_state(value));
+            status.add(self.read_status());
+        } else if reason == p.bias_interlock {
+            status.add(self.set_bias_interlock(value));
+            status.add(self.read_status());
+        } else if reason == p.num_channels {
+            status.add(self.set_num_channels(value));
+            status.add(self.read_status());
+        } else if reason == p.num_acquire {
+            status.add(self.set_num_acquire(value));
+            status.add(self.read_status());
+        } else if reason == p.ping_pong {
+            status.add(self.set_ping_pong(value));
+            status.add(self.read_status());
+        } else if reason == p.range {
+            if channel == 0 {
+                status.add(self.set_range(value));
+            } else {
+                status.add(self.set_channel_range(channel, value));
+            }
+            status.add(self.read_status());
+        } else if reason == p.read_data {
+            shared.trigger_callbacks(&self.qe_base().port_base);
+        } else if reason == p.resolution {
+            status.add(self.set_resolution(value));
+            status.add(self.read_status());
+        } else if reason == p.trigger_mode {
+            status.add(self.set_trigger_mode(value));
+            status.add(self.read_status());
+        } else if reason == p.trigger_polarity {
+            status.add(self.set_trigger_polarity(value));
+            status.add(self.read_status());
+        } else if reason == p.values_per_read {
+            status.add(self.set_values_per_read(value));
+            status.add(self.read_status());
+        } else if reason == p.read_format {
+            status.add(self.set_read_format(value));
+            status.add(self.read_status());
+        } else if reason == p.read_status {
+            // Not while acquiring: too disruptive.
+            if !shared.is_acquiring() {
+                status.add(self.read_status());
+            }
+        } else if reason == p.reset {
+            status.add(self.reset());
+            status.add(self.read_status());
+        } else {
+            status.add(self.qe_base().write_int32_pool(reason));
+        }
+
+        // C's callParamCallbacks() posts address 0 only; the other addresses
+        // post from computePositions while data flows.
+        status.add(self.qe_base().port_base.call_param_callbacks(0));
+        status.into_result()
+    }
+
+    /// C++ `drvQuadEM::writeFloat64`, with [`Self::qe_write_int32`]'s status rule.
+    fn qe_write_float64(&mut self, reason: usize, channel: i32, value: f64) -> AsynResult<()> {
+        let p = self.qe_base().params;
+        let shared = self.qe_shared().clone();
+        let mut status = StatusOr::default();
+
+        status.add(
+            self.qe_base()
+                .port_base
+                .set_float64_param(reason, channel, value),
+        );
+        shared.shadow_float64(&p, reason, channel, value);
+
+        if reason == p.averaging_time {
+            status.add(self.set_averaging_time(value));
+            shared.ring.lock().flush();
+            status.add(self.read_status());
+        } else if reason == p.bias_voltage {
+            status.add(self.set_bias_voltage(value));
+            status.add(self.read_status());
+        } else if reason == p.integration_time {
+            status.add(self.set_integration_time(value));
+            status.add(self.read_status());
+        }
+
+        status.add(self.qe_base().port_base.call_param_callbacks(0));
+        status.into_result()
     }
 
     /// `drvQuadEM::setAcquire`: starting an acquisition clears `NumAcquired`.
@@ -736,40 +948,53 @@ pub trait QuadEmDevice {
     }
 
     /// `drvQuadEM::reset`: push every cached EPICS setting back to the meter,
-    /// re-read the status, then restore the acquire state. C++ discards each
-    /// setter's status, so the port keeps resetting even when the meter
-    /// rejects one command.
+    /// re-read the status, then restore the acquire state. C++ discards every
+    /// status, the last `setAcquire`'s included, and returns success.
     fn base_reset(&mut self) -> AsynResult<()> {
         let p = self.qe_base().params;
         let acquire_param = self.qe_base().nd_params.acquire;
-        let base = &mut self.qe_base().port_base;
+        // C's `iValue` / `dValue`: an unset param leaves the previous read's
+        // value in them.
+        let (mut i, mut d) = (0, 0.0);
+        let mut int = |s: &mut Self, index| {
+            if let Ok(v) = s.qe_base().port_base.get_int32_param(index, 0) {
+                i = v;
+            }
+            i
+        };
+        let mut double = |s: &mut Self, index| {
+            if let Ok(v) = s.qe_base().port_base.get_float64_param(index, 0) {
+                d = v;
+            }
+            d
+        };
 
-        let range = base.get_int32_param(p.range, 0)?;
-        let values_per_read = base.get_int32_param(p.values_per_read, 0)?;
-        let averaging_time = base.get_float64_param(p.averaging_time, 0)?;
-        let trigger_mode = base.get_int32_param(p.trigger_mode, 0)?;
-        let num_channels = base.get_int32_param(p.num_channels, 0)?;
-        let bias_state = base.get_int32_param(p.bias_state, 0)?;
-        let bias_interlock = base.get_int32_param(p.bias_interlock, 0)?;
-        let bias_voltage = base.get_float64_param(p.bias_voltage, 0)?;
-        let resolution = base.get_int32_param(p.resolution, 0)?;
-        let read_format = base.get_int32_param(p.read_format, 0)?;
-        let integration_time = base.get_float64_param(p.integration_time, 0)?;
-        let acquire = base.get_int32_param(acquire_param, 0)?;
-
-        let _ = self.set_range(range);
-        let _ = self.set_values_per_read(values_per_read);
-        let _ = self.set_averaging_time(averaging_time);
-        let _ = self.set_trigger_mode(trigger_mode);
-        let _ = self.set_num_channels(num_channels);
-        let _ = self.set_bias_state(bias_state);
-        let _ = self.set_bias_interlock(bias_interlock);
-        let _ = self.set_bias_voltage(bias_voltage);
-        let _ = self.set_resolution(resolution);
-        let _ = self.set_read_format(read_format);
-        let _ = self.set_integration_time(integration_time);
+        let v = int(self, p.range);
+        let _ = self.set_range(v);
+        let v = int(self, p.values_per_read);
+        let _ = self.set_values_per_read(v);
+        let v = double(self, p.averaging_time);
+        let _ = self.set_averaging_time(v);
+        let v = int(self, p.trigger_mode);
+        let _ = self.set_trigger_mode(v);
+        let v = int(self, p.num_channels);
+        let _ = self.set_num_channels(v);
+        let v = int(self, p.bias_state);
+        let _ = self.set_bias_state(v);
+        let v = int(self, p.bias_interlock);
+        let _ = self.set_bias_interlock(v);
+        let v = double(self, p.bias_voltage);
+        let _ = self.set_bias_voltage(v);
+        let v = int(self, p.resolution);
+        let _ = self.set_resolution(v);
+        let v = int(self, p.read_format);
+        let _ = self.set_read_format(v);
+        let v = double(self, p.integration_time);
+        let _ = self.set_integration_time(v);
         let _ = self.read_status();
-        self.set_acquire(acquire)
+        let v = int(self, acquire_param);
+        let _ = self.set_acquire(v);
+        Ok(())
     }
 }
 
@@ -849,6 +1074,27 @@ impl QuadEmBase {
         })
     }
 
+    /// The `ADAcquire` branch of `asynNDArrayDriver::setIntegerParam`
+    /// (asynNDArrayDriver.cpp:639-653), which every `drvQuadEM` write of
+    /// `ADAcquire` goes through: `ADAcquireBusy` follows it, except that a stop
+    /// with `WaitForPlugins` set leaves it busy while arrays are still queued.
+    pub fn set_ad_acquire(&mut self, list: i32, value: i32) -> AsynResult<()> {
+        let p = self.nd_params;
+        let busy = if value != 0 {
+            Some(1)
+        } else if int_param(&self.port_base, p.wait_for_plugins, list) == 0
+            || self.queued.iter().all(|q| q.get() == 0)
+        {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(busy) = busy {
+            self.port_base.set_int32_param(p.acquire_busy, list, busy)?;
+        }
+        self.port_base.set_int32_param(p.acquire, list, value)
+    }
+
     /// Pool branch of `asynNDArrayDriver::writeInt32`, which `drvQuadEM`
     /// reaches through its `function < FIRST_QE_COMMAND` fallthrough.
     ///
@@ -903,7 +1149,11 @@ impl QuadEmBase {
     /// Attach a downstream plugin to one asyn address' NDArray stream.
     pub fn connect_downstream(&self, addr: usize, mut sender: NDArraySender) {
         let Some(out) = self.outputs.get(addr) else {
-            log::error!("quadEM: connect_downstream: address {addr} out of range");
+            asyn_print!(
+                self.port_base,
+                ERROR,
+                "drvQuadEM::connect_downstream: address {addr} out of range"
+            );
             return;
         };
         sender.set_queued_counter(self.queued[addr].clone());
@@ -930,9 +1180,21 @@ pub struct CallbackContext {
 
 /// C++ `drvQuadEM::doDataCallbacks`.
 async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
-    let Some(samples) = ctx.shared.ring.lock().drain(num_read) else {
-        log::error!("quadEM: not enough samples in ring buffer, expected {num_read}");
-        return false;
+    let drained = {
+        let mut ring = ctx.shared.ring.lock();
+        ring.drain(num_read)
+            .ok_or((ring.used(), ring.raw_count, ring.ring_count))
+    };
+    let samples = match drained {
+        Ok(samples) => samples,
+        Err((ring_size, raw_count, ring_count)) => {
+            asyn_print!(
+                ctx.handle,
+                ERROR,
+                "drvQuadEM::doDataCallbacks: not enough bytes in ring buffer, expecting {num_read} actually {ring_size}, rawCount_={raw_count}, ringCount_={ring_count}"
+            );
+            return false;
+        }
     };
 
     let counter = ctx.shared.array_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1210,5 +1472,167 @@ mod tests {
         assert_eq!(ring.raw_count, 0);
         // C++ epicsRingBytesFlush does not reset P_RingOverflows.
         assert_eq!(ring.ring_overflows, 3);
+    }
+
+    /// A meter whose setters log their call and fail when told to.
+    struct FakeMeter {
+        base: QuadEmBase,
+        shared: Arc<QuadEmShared>,
+        calls: Vec<&'static str>,
+        failing: &'static [&'static str],
+    }
+
+    impl FakeMeter {
+        fn new(failing: &'static [&'static str]) -> Self {
+            Self {
+                base: QuadEmBase::new("QE_FAKE_DISPATCH", 0).unwrap(),
+                shared: QuadEmShared::new(16).0,
+                calls: Vec::new(),
+                failing,
+            }
+        }
+
+        fn step(&mut self, name: &'static str) -> AsynResult<()> {
+            self.calls.push(name);
+            if self.failing.contains(&name) {
+                return Err(AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Disconnected,
+                    message: name.into(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    impl QuadEmDevice for FakeMeter {
+        fn qe_base(&mut self) -> &mut QuadEmBase {
+            &mut self.base
+        }
+        fn qe_shared(&self) -> &Arc<QuadEmShared> {
+            &self.shared
+        }
+        fn set_acquire(&mut self, _value: i32) -> AsynResult<()> {
+            self.step("set_acquire")
+        }
+        fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {
+            self.step("set_acquire_mode")
+        }
+        fn set_range(&mut self, _value: i32) -> AsynResult<()> {
+            self.step("set_range")
+        }
+        fn set_channel_range(&mut self, _channel: i32, _value: i32) -> AsynResult<()> {
+            self.step("set_channel_range")
+        }
+        fn set_bias_voltage(&mut self, _value: f64) -> AsynResult<()> {
+            self.step("set_bias_voltage")
+        }
+        fn read_status(&mut self) -> AsynResult<()> {
+            self.step("read_status")
+        }
+        fn reset(&mut self) -> AsynResult<()> {
+            self.step("reset")
+        }
+    }
+
+    fn failed_with(r: AsynResult<()>) -> String {
+        match r {
+            Err(AsynError::Status { message, .. }) => message,
+            other => panic!("expected a status error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_setter_still_reads_status_and_fails_the_write() {
+        let mut m = FakeMeter::new(&["set_range"]);
+        let range = m.base.params.range;
+        assert_eq!(failed_with(m.qe_write_int32(range, 0, 3)), "set_range");
+        assert_eq!(m.calls, ["set_range", "read_status"]);
+        assert_eq!(m.base.port_base.get_int32_param(range, 0).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_failed_status_read_fails_an_accepted_setting() {
+        let mut m = FakeMeter::new(&["read_status"]);
+        let bias_voltage = m.base.params.bias_voltage;
+        assert_eq!(
+            failed_with(m.qe_write_float64(bias_voltage, 0, 50.0)),
+            "read_status"
+        );
+        assert_eq!(m.calls, ["set_bias_voltage", "read_status"]);
+    }
+
+    #[test]
+    fn the_first_failure_is_the_one_reported() {
+        let mut m = FakeMeter::new(&["set_acquire", "set_acquire_mode", "read_status"]);
+        let (acquire, acquire_mode) = (m.base.nd_params.acquire, m.base.params.acquire_mode);
+        m.base.port_base.set_int32_param(acquire, 0, 1).unwrap();
+        let single = QeAcquireMode::Single as i32;
+        assert_eq!(
+            failed_with(m.qe_write_int32(acquire_mode, 0, single)),
+            "set_acquire"
+        );
+        assert_eq!(m.calls, ["set_acquire", "set_acquire_mode", "read_status"]);
+        assert_eq!(m.base.port_base.get_int32_param(acquire, 0).unwrap(), 0);
+        assert_eq!(m.shared.acq.lock().acquire_mode, single);
+    }
+
+    fn acquire_busy(m: &FakeMeter) -> i32 {
+        let busy = m.base.nd_params.acquire_busy;
+        m.base.port_base.get_int32_param(busy, 0).unwrap()
+    }
+
+    /// `asynNDArrayDriver::setIntegerParam`: `ADAcquireBusy` follows `ADAcquire`.
+    #[test]
+    fn acquire_busy_follows_acquire_without_wait_for_plugins() {
+        let mut m = FakeMeter::new(&[]);
+        let acquire = m.base.nd_params.acquire;
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        assert_eq!(acquire_busy(&m), 1);
+        m.base.queued[3].increment();
+        m.qe_write_int32(acquire, 0, 0).unwrap();
+        assert_eq!(acquire_busy(&m), 0);
+    }
+
+    #[test]
+    fn a_stop_with_wait_for_plugins_stays_busy_while_arrays_are_queued() {
+        let mut m = FakeMeter::new(&[]);
+        let (acquire, wait) = (m.base.nd_params.acquire, m.base.nd_params.wait_for_plugins);
+        m.base.port_base.set_int32_param(wait, 0, 1).unwrap();
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        m.base.queued[3].increment();
+        m.qe_write_int32(acquire, 0, 0).unwrap();
+        assert_eq!(acquire_busy(&m), 1);
+
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        m.base.queued[3].decrement();
+        m.qe_write_int32(acquire, 0, 0).unwrap();
+        assert_eq!(acquire_busy(&m), 0);
+    }
+
+    #[test]
+    fn leaving_continuous_mode_clears_acquire_busy() {
+        let mut m = FakeMeter::new(&[]);
+        let (acquire, acquire_mode) = (m.base.nd_params.acquire, m.base.params.acquire_mode);
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        m.qe_write_int32(acquire_mode, 0, QeAcquireMode::Single as i32)
+            .unwrap();
+        assert_eq!(acquire_busy(&m), 0);
+    }
+
+    #[test]
+    fn a_channel_range_goes_to_the_per_channel_setter() {
+        let mut m = FakeMeter::new(&[]);
+        let range = m.base.params.range;
+        m.qe_write_int32(range, 0, 1).unwrap();
+        m.qe_write_int32(range, 2, 1).unwrap();
+        assert_eq!(
+            m.calls,
+            [
+                "set_range",
+                "read_status",
+                "set_channel_range",
+                "read_status"
+            ]
+        );
     }
 }

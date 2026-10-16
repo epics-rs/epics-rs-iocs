@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::error::UrResult;
 use crate::rtde::{ControllerVersion, default_frequency};
 use crate::session::{DEFAULT_TIMEOUT, Session};
-use crate::stream::{Snapshot, StateStream};
+use crate::stream::{Iface, Snapshot, StateStream};
 
 /// Wait for the first robot state, as the C++ constructor does.
 const FIRST_STATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -116,17 +116,15 @@ pub fn output_variables(
         for i in 12..=19 {
             vars.push(format!("output_double_register_{}", offset + i));
         }
+    } else if use_upper_range_registers {
+        eprintln!(
+            "Warning! The upper range of the double output registers are only available \
+             on PolyScope versions >3.9 or >5.3"
+        );
     } else {
-        log::warn!(
-            "ur-robot: PolyScope {}.{} is too old for the {} range of output registers; \
-             they will not be published",
-            version.major,
-            version.minor,
-            if use_upper_range_registers {
-                "upper"
-            } else {
-                "lower"
-            }
+        eprintln!(
+            "Warning! The lower range of the double output registers are only available \
+             on PolyScope versions >3.4"
         );
     }
 
@@ -166,7 +164,7 @@ impl ReceiveInterface {
         session.send_output_setup(&variables, default_frequency(version))?;
         session.send_start()?;
 
-        let stream = StateStream::spawn(session);
+        let stream = StateStream::spawn(session, Iface::Receive);
         stream.wait_first_state(FIRST_STATE_TIMEOUT)?;
         self.stream = Some(stream);
         Ok(())

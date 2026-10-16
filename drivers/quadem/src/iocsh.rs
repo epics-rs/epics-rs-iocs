@@ -1,18 +1,14 @@
-//! iocsh verbs every quadEM IOC needs to build the octet port its driver
-//! talks through.
-//!
-//! `drvAsynIPPortConfigure` and `drvAsynSerialPortConfigure` come from
-//! `asyn-rs`. `asynOctetSetInputEos` / `asynOctetSetOutputEos` are provided
-//! here instead: the `asyn-rs` versions resolve a port name through a
-//! `PortManager`, which the port-configure verbs do not populate — they
-//! register into the `asyn_record` registry, which is what these look in.
+//! iocsh `drv*Configure` verbs for the quadEM drivers. The octet port and
+//! EOS verbs an `st.cmd` uses first come from `AdIoc`'s asyn command set.
 
 use std::sync::{Arc, Mutex};
 
 use epics_rs::ad_core::ioc::{GenericDriverContext, PluginManager};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
+use epics_rs::asyn::manager::claim_port_driver;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -23,111 +19,11 @@ use crate::drv_quad_em::QE_ADDR_ALL;
 use crate::fx4::{Fx4Runtime, create_fx4};
 use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
-use crate::t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};
-
-/// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`),
-/// restricted to the escapes an octet EOS can carry.
-pub fn raw_from_escaped(src: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(src.len());
-    let mut chars = src.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            continue;
-        }
-        match chars.next() {
-            Some('r') => out.push(b'\r'),
-            Some('n') => out.push(b'\n'),
-            Some('t') => out.push(b'\t'),
-            Some('a') => out.push(0x07),
-            Some('b') => out.push(0x08),
-            Some('f') => out.push(0x0c),
-            Some('v') => out.push(0x0b),
-            Some('0') => out.push(0),
-            Some('\\') => out.push(b'\\'),
-            Some('\'') => out.push(b'\''),
-            Some('"') => out.push(b'"'),
-            Some(other) => {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
-            }
-            None => out.push(b'\\'),
-        }
-    }
-    out
-}
-
-fn eos_command(name: &'static str, input: bool) -> CommandDef {
-    CommandDef::new(
-        name,
-        vec![
-            ArgDesc {
-                name: "portName",
-                arg_type: ArgType::String,
-            },
-            ArgDesc {
-                name: "addr",
-                arg_type: ArgType::Int,
-            },
-            ArgDesc {
-                name: "eos",
-                arg_type: ArgType::String,
-            },
-        ],
-        format!("{name} portName addr eos"),
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = match args.first() {
-                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
-                _ => return Err("portName required".into()),
-            };
-            let addr = match args.get(1) {
-                Some(ArgValue::Int(a)) => *a as i32,
-                _ => 0,
-            };
-            // C `asynSetEos` (asynShellCommands.c:238-240).
-            let user = epics_rs::asyn::user::AsynUser::default()
-                .with_addr(addr)
-                .with_timeout(std::time::Duration::from_secs(2))
-                .queue_even_if_not_connected();
-            let eos = match args.get(2) {
-                Some(ArgValue::String(s)) => raw_from_escaped(s.to_str()?),
-                _ => Vec::new(),
-            };
-            let Some(entry) = epics_rs::asyn::asyn_record::get_port(&port) else {
-                ctx.println(&format!("{name}: port '{port}' not found"));
-                return Ok(CommandOutcome::Continue);
-            };
-            let res = if input {
-                entry.handle.set_input_eos_blocking(user, &eos)
-            } else {
-                entry.handle.set_output_eos_blocking(user, &eos)
-            };
-            if let Err(e) = res {
-                ctx.println(&format!("{name}: {e}"));
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// The four startup verbs a quadEM `st.cmd` uses before its `drv*Configure`
-/// call: create the octet port, then frame it.
-pub fn octet_port_commands() -> Vec<CommandDef> {
-    vec![
-        epics_rs::asyn::iocsh::drv_asyn_ip_port_configure_command(
-            epics_rs::asyn::services::PortServices::global(),
-        ),
-        epics_rs::asyn::iocsh::drv_asyn_serial_port_configure_command(
-            epics_rs::asyn::services::PortServices::global(),
-        ),
-        eos_command("asynOctetSetInputEos", true),
-        eos_command("asynOctetSetOutputEos", false),
-    ]
-}
+use crate::t4u::{T4uDirectError, T4uRuntime, create_t4u_direct_em, create_t4u_em};
 
 /// Publish a configured quadEM port: the asyn port itself, then its twelve
-/// NDArray fan-outs.
+/// NDArray fan-outs. The sub-ports a driver builds for itself are published
+/// as it builds them.
 ///
 /// Address 0 (the Current1 time series) is the port's default NDArray source;
 /// addresses 1..=10 carry the remaining data items and address 11 the full 2-D
@@ -136,17 +32,18 @@ pub fn octet_port_commands() -> Vec<CommandDef> {
 pub fn register_quadem_port(
     mgr: &Arc<PluginManager>,
     owner: &Arc<InterruptGate>,
-    port_name: &str,
+    claim: PortClaim,
     handle: PortHandle,
     pool: Arc<NDArrayPool>,
     outputs: &[Arc<parking_lot::Mutex<NDArrayOutput>>],
 ) -> epics_rs::asyn::error::AsynResult<()> {
-    epics_rs::asyn::asyn_record::register_port(port_name, handle, owner)?;
+    let port_name = claim.name().to_string();
+    claim.publish(handle, owner)?;
 
     mgr.set_driver(Arc::new(GenericDriverContext::new(
         pool,
         outputs[0].clone(),
-        port_name,
+        &port_name,
         mgr.wiring(),
     )));
     for (addr, output) in outputs.iter().enumerate().take(QE_ADDR_ALL + 1).skip(1) {
@@ -214,8 +111,15 @@ pub fn ahxxx_configure_command(
                 _ => 100_000_000,
             };
 
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let rt = create_ahxxx(
-                &port_name,
+                &claim,
                 &qe_port_name,
                 ring_buffer_size,
                 max_memory,
@@ -226,7 +130,7 @@ pub fn ahxxx_configure_command(
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
@@ -296,19 +200,27 @@ pub fn nsls_em_configure_command(
                 _ => 100_000_000,
             };
 
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let rt = create_nsls_em(
-                &port_name,
+                &claim,
                 &broadcast_address,
                 module_id,
                 ring_buffer_size,
                 max_memory,
+                ctx.db().scan_control().interrupt_gate(),
             )
             .map_err(|e| format!("drvNSLS_EMConfigure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
@@ -369,13 +281,20 @@ pub fn fx4_configure_command(
                 _ => 100_000_000,
             };
 
-            let rt = create_fx4(&port_name, &fx4_ip, ring_buffer_size, max_memory)
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
+            let rt = create_fx4(&claim, &fx4_ip, ring_buffer_size, max_memory)
                 .map_err(|e| format!("drvFX4Configure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
@@ -435,13 +354,20 @@ pub fn pcr4_configure_command(
                 _ => 100_000_000,
             };
 
-            let rt = create_pcr4(&port_name, &qe_port_name, ring_buffer_size, max_memory)
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
+            let rt = create_pcr4(&claim, &qe_port_name, ring_buffer_size, max_memory)
                 .map_err(|e| format!("drvPCR4Configure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
@@ -508,19 +434,27 @@ pub fn t4u_em_configure_command(
                 _ => 100_000_000,
             };
 
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let rt = create_t4u_em(
-                &port_name,
+                &claim,
                 &qt_host_address,
                 ring_buffer_size,
                 base_port_num,
                 max_memory,
+                ctx.db().scan_control().interrupt_gate(),
             )
             .map_err(|e| format!("drvT4U_EMConfigure: {e}"))?;
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
@@ -592,20 +526,34 @@ pub fn t4u_direct_em_configure_command(
                 _ => 100_000_000,
             };
 
-            let rt = create_t4u_direct_em(
-                &port_name,
+            // asynPortDriver registers the port before the driver body runs
+            // (asynPortDriver.cpp:4031-4040).
+            let claim = match claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
+            let rt = match create_t4u_direct_em(
+                &claim,
                 &t4u_address,
                 ring_buffer_size,
                 base_port_num,
                 &cfg_file_name,
                 max_memory,
-            )
-            .map_err(|e| format!("drvT4UDirect_EMConfigure: {e}"))?;
+                ctx.db().scan_control().interrupt_gate(),
+            ) {
+                Ok(rt) => rt,
+                Err(T4uDirectError::Thrown(what)) => {
+                    ctx.eprintln(&cpp_error(&what));
+                    return Ok(CommandOutcome::Failed);
+                }
+                Err(e) => return Err(format!("drvT4UDirect_EMConfigure: {e}")),
+            };
 
             register_quadem_port(
                 &mgr,
                 ctx.db().scan_control().interrupt_gate(),
-                &port_name,
+                claim,
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
@@ -618,6 +566,17 @@ pub fn t4u_direct_em_configure_command(
     )
 }
 
+/// iocsh's line for an exception a command throws (iocsh.cpp:1276-1278).
+fn cpp_error(what: &str) -> String {
+    let line = format!("C++ error: {what}");
+    if epics_rs::base::server::iocsh::use_ansi_color() {
+        use epics_rs::base::runtime::log::{ANSI_ESC_RED, ANSI_ESC_RESET};
+        format!("{ANSI_ESC_RED}{line}{ANSI_ESC_RESET}")
+    } else {
+        line
+    }
+}
+
 /// C++ takes the base port number as an `int` and passes it to `%d`; a value
 /// outside the TCP/UDP port range is a typo in `st.cmd`, so it is rejected here
 /// rather than wrapped.
@@ -627,31 +586,5 @@ fn port_number(arg: Option<&ArgValue>, name: &str) -> Result<u16, String> {
             u16::try_from(*n).map_err(|_| format!("{name}: {n} is not a valid port number"))
         }
         _ => Err(format!("{name} required")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::raw_from_escaped;
-
-    #[test]
-    fn decodes_crlf_input_eos() {
-        assert_eq!(raw_from_escaped("\\r\\n"), b"\r\n");
-    }
-
-    #[test]
-    fn decodes_cr_output_eos() {
-        assert_eq!(raw_from_escaped("\\r"), b"\r");
-    }
-
-    #[test]
-    fn passes_through_plain_text_and_backslash() {
-        assert_eq!(raw_from_escaped("ab"), b"ab");
-        assert_eq!(raw_from_escaped("\\\\"), b"\\");
-    }
-
-    #[test]
-    fn empty_eos_decodes_to_empty() {
-        assert_eq!(raw_from_escaped(""), b"");
     }
 }

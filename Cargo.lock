@@ -1476,8 +1476,8 @@ dependencies = [
 name = "ether-ip"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "epics-rs",
- "log",
  "parking_lot",
  "thiserror 2.0.18",
  "tokio",
@@ -1489,7 +1489,6 @@ version = "0.1.0"
 dependencies = [
  "epics-rs",
  "ether-ip",
- "log",
  "tokio",
 ]
 
@@ -2132,7 +2131,6 @@ name = "ip-devices"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "thiserror 2.0.18",
 ]
 
@@ -3462,7 +3460,6 @@ version = "0.1.0"
 dependencies = [
  "epics-rs",
  "futures-util",
- "log",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -4775,8 +4772,8 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 name = "ur-robot"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "epics-rs",
- "log",
  "parking_lot",
  "thiserror 2.0.18",
 ]
