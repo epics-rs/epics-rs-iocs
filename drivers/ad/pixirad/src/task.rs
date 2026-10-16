@@ -136,10 +136,11 @@ async fn data_loop(ctx: DataContext) {
     let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, Duration::from_secs(30));
     let mut decoder = Decoder::new(ctx.sensor);
     let pixels_per_color = ctx.sensor.image_pixels();
-    // C allocated the NDArray only when ColorsCollected was 0 and memcpy'd into
-    // it whatever the count was, so a first frame that arrived with a stale
-    // non-zero count wrote through a null pointer. Here any frame with no image
-    // to go into allocates one.
+    // C allocates the NDArray only when ColorsCollected is 0 and memcpys into
+    // it whatever the count is (pixirad.cpp:1023-1044), so a frame with no
+    // image to go into (a refused colour-0 alloc, a stale count) wrote
+    // through a null pointer. Here it is dropped and still takes its colour
+    // slot: an image starts only at colour 0.
     let mut image: Option<Image> = None;
 
     loop {
@@ -186,33 +187,32 @@ async fn data_loop(ctx: DataContext) {
         if image.as_ref().is_some_and(|i| i.colors != num_colors) {
             image = None;
         }
-        if image.is_none() {
+        if colors_collected == 0 {
             // C allocates whether or not NDArrayCallbacks is set
-            // (pixirad.cpp:1033) and dereferences a refusal; here the frame is
-            // dropped after the pool's limit line.
-            let Ok(mut array) = ctx
+            // (pixirad.cpp:1033); a refusal has printed the pool's limit line.
+            image = ctx
                 .pool
                 .alloc(image_dims(ctx.sensor, num_colors), NDDataType::UInt16)
-            else {
-                continue;
-            };
-            array.timestamp = EpicsTimestamp::now();
-            image = Some(Image {
-                array,
-                colors: num_colors,
-            });
+                .ok()
+                .map(|mut array| {
+                    array.timestamp = EpicsTimestamp::now();
+                    Image {
+                        array,
+                        colors: num_colors,
+                    }
+                });
         }
-        let building = image.as_mut().expect("allocated above");
-        let NDDataBuffer::U16(pixels) = &mut building.array.data else {
-            unreachable!("allocated as NDUInt16")
-        };
-
-        let offset = if num_colors == 1 {
-            0
-        } else {
-            COLOR_OFFSET_MAP[colors_collected] * pixels_per_color
-        };
-        pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
+        if let Some(building) = image.as_mut() {
+            let NDDataBuffer::U16(pixels) = &mut building.array.data else {
+                unreachable!("allocated as NDUInt16")
+            };
+            let offset = if num_colors == 1 {
+                0
+            } else {
+                COLOR_OFFSET_MAP[colors_collected] * pixels_per_color
+            };
+            pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
+        }
         colors_collected += 1;
 
         let udp_updates = vec![
@@ -244,6 +244,10 @@ async fn data_loop(ctx: DataContext) {
         if colors_collected < num_colors {
             continue;
         }
+        // Every colour is in, but the image they belonged to was refused.
+        let Some(Image { array, colors }) = image.take() else {
+            continue;
+        };
 
         // Every colour is in: this is an image.
         let unique_id = sync
@@ -259,10 +263,6 @@ async fn data_loop(ctx: DataContext) {
             .read_int32(ctx.ad_params.base.array_callbacks)
             .unwrap_or(1)
             != 0;
-
-        // The next colour 0 starts a new image with its own start time
-        // (pixirad.cpp:1023-1025).
-        let Image { array, colors } = image.take().expect("an image is being built");
 
         let mut updates = vec![
             ParamSetValue::new(

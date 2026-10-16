@@ -728,6 +728,7 @@ mod tests {
     struct DataTask {
         handle: PortHandle,
         ad: ADBaseParams,
+        params: PixiradParams,
         frames: std::sync::mpsc::SyncSender<Frame>,
         arrays: epics_rs::ad_core::plugin::channel::NDArrayReceiver,
         frame_bytes: usize,
@@ -765,6 +766,7 @@ mod tests {
             Self {
                 handle,
                 ad,
+                params,
                 frames,
                 arrays,
                 frame_bytes: crate::decode::Decoder::new(sensor).frame_bytes(false),
@@ -819,6 +821,39 @@ mod tests {
         t.send_frame();
         assert_eq!(t.counter(), 1);
         drop(held);
+        t.send_frame();
+        assert_eq!(t.arrays.blocking_recv().unwrap().unique_id, 2);
+    }
+
+    /// C fills colour `colorsCollected` of the image the colour-0 frame
+    /// allocated (pixirad.cpp:1023-1044): after a refused colour-0 alloc the
+    /// next frame is still colour 1, and a new image starts at colour 0.
+    #[test]
+    fn a_refused_colour_zero_loses_its_image_not_the_colour_order() {
+        // Room for one 476 x 512 x 2 NDUInt16 image.
+        let mut t = DataTask::start("PIXI_COLOUR", 1_000_000);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        t.handle
+            .write_int32_blocking(t.ad.frame_type, 0, FrameType::TwoColors as i32)
+            .unwrap();
+        t.send_frame();
+        t.send_frame();
+        let held = t.arrays.blocking_recv().unwrap();
+        assert_eq!(held.unique_id, 1);
+
+        t.send_frame(); // colour 0, refused
+        // The rendezvous returns once the refused frame is done.
+        t.send_frame(); // colour 1 of the refused image
+        let colors_collected = t
+            .handle
+            .read_int32_blocking(t.params.colors_collected, 0)
+            .unwrap();
+        assert_eq!(colors_collected, 1, "the refused frame took no colour slot");
+        drop(held);
+        t.send_frame(); // colour 0 of the next
+        assert_eq!(t.arrays.pending(), 0);
         t.send_frame();
         assert_eq!(t.arrays.blocking_recv().unwrap().unique_id, 2);
     }
