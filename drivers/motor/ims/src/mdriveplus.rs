@@ -118,10 +118,10 @@ impl ImsMDrivePlusAxis {
         Ok(())
     }
 
-    /// Write a query and read one reply line (C `writeReadController`).
+    /// Write a query and read one reply line (C `writeReadController`:
+    /// `pasynOctetSyncIO->writeRead`, which flushes a stray line first).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &self.framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &self.framed(cmd), READ_BUF)?;
         let s = String::from_utf8_lossy(&raw);
         Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
