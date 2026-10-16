@@ -68,21 +68,6 @@ impl MarccdDriver {
         let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
-        let params = ad.params;
-        let base = &mut ad.port_base;
-        // C constructor defaults (marCCD.cpp:1563-1574).
-        base.set_string_param(params.base.manufacturer, 0, "MAR")?;
-        base.set_string_param(params.base.model, 0, "CCD")?;
-        base.set_int32_param(params.base.data_type, 0, NDDataType::Int16 as i32)?;
-        base.set_int32_param(params.image_mode, 0, ImageMode::Single as i32)?;
-        base.set_int32_param(params.trigger_mode, 0, TriggerMode::Internal as i32)?;
-        base.set_float64_param(params.acquire_time, 0, 1.0)?;
-        base.set_float64_param(params.acquire_period, 0, 0.0)?;
-        base.set_int32_param(params.num_images, 0, 1)?;
-        base.set_int32_param(p.overlap, 0, 0)?;
-        base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION)?;
-        base.set_float64_param(p.tiff_timeout, 0, 20.0)?;
-
         Ok(Self {
             ad,
             p,
@@ -95,17 +80,17 @@ impl MarccdDriver {
         })
     }
 
-    /// The end of C's constructor (marCCD.cpp:1542-1560): `getServerMode`,
-    /// returning at a failure, then `getConfig`, `getState` and the `pData`
-    /// allocation.
-    fn init(&mut self) {
+    /// The end of C's constructor (marCCD.cpp:1542-1580): `getServerMode`,
+    /// `getConfig`, `getState`, the `pData` allocation and the defaults.
+    /// `false` where C returns before creating the threads.
+    fn init(&mut self) -> bool {
         if self.get_server_mode().is_err() {
             let msg = format!(
                 "marCCD:marCCD: error calling getServerMode for server port {}",
                 self.server.port_name()
             );
             self.trace(TraceMask::ERROR, &msg);
-            return;
+            return false;
         }
         self.get_config();
         self.get_state();
@@ -114,6 +99,28 @@ impl MarccdDriver {
             NDDimension::new(self.get_i32(self.ad.params.max_size_y) as usize),
         ];
         self._raw_buffer = self.ad.pool.alloc(dims, NDDataType::Int16).ok();
+        if self.set_defaults().is_err() {
+            println!("marCCD: unable to set camera parameters");
+            return false;
+        }
+        true
+    }
+
+    /// C constructor defaults (marCCD.cpp:1563-1574).
+    fn set_defaults(&mut self) -> AsynResult<()> {
+        let (params, p) = (self.ad.params, self.p);
+        let base = &mut self.ad.port_base;
+        base.set_string_param(params.base.manufacturer, 0, "MAR")?;
+        base.set_string_param(params.base.model, 0, "CCD")?;
+        base.set_int32_param(params.base.data_type, 0, NDDataType::Int16 as i32)?;
+        base.set_int32_param(params.image_mode, 0, ImageMode::Single as i32)?;
+        base.set_int32_param(params.trigger_mode, 0, TriggerMode::Internal as i32)?;
+        base.set_float64_param(params.acquire_time, 0, 1.0)?;
+        base.set_float64_param(params.acquire_period, 0, 0.0)?;
+        base.set_int32_param(params.num_images, 0, 1)?;
+        base.set_int32_param(p.overlap, 0, 0)?;
+        base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION)?;
+        base.set_float64_param(p.tiff_timeout, 0, 20.0)
     }
 }
 
@@ -361,10 +368,14 @@ pub fn create_marccd_detector(
         pool: pool.clone(),
     };
 
-    handle
+    let started = handle
         .with_driver_blocking::<MarccdDriver, _>(MarccdDriver::init)
         .map_err(|e| format!("marCCD init failed: {e}"))?;
-    let tasks = vec![start_det_task(worker()), start_image_task(worker())];
+    let tasks = if started {
+        vec![start_det_task(worker()), start_image_task(worker())]
+    } else {
+        Vec::new()
+    };
 
     Ok(MarccdRuntime {
         runtime_handle,
@@ -383,6 +394,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::error::AsynError;
     use epics_rs::asyn::registry::claim_port;
     use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
@@ -550,6 +562,20 @@ mod tests {
         let (_det, sent) = after_init("MARCCD_BAD_MODE", |_| "7");
         assert_eq!(sent[0], "get_mode");
         assert!(sent[1].starts_with("set_bin"), "{sent:?}");
+    }
+
+    /// marCCD.cpp:1543-1549 returns from the constructor at a failed
+    /// getServerMode, before the defaults (:1563-1574) and the threads.
+    #[test]
+    fn a_failed_get_server_mode_skips_the_defaults_and_the_tasks() {
+        let (det, _) = after_init("MARCCD_BAD_MODE_DEFAULTS", |_| "7");
+        let h = det.port_handle();
+        let manufacturer = h.get_string_param_blocking(det.ad_params.base.manufacturer, 0, 256);
+        assert!(
+            matches!(manufacturer, Err(AsynError::ParamUndefined(_))),
+            "{manufacturer:?}"
+        );
+        assert!(det.tasks.is_empty());
     }
 
     #[test]
