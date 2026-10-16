@@ -224,8 +224,10 @@ impl PmncController {
     /// each module's type via `DRT` (8753 → 3 channels, 8751 → 1). Performs
     /// blocking I/O.
     pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
-        port.set_input_eos_blocking(eos_user(), PROMPT_EOS)?;
-        port.set_output_eos_blocking(eos_user(), CMND_EOS)?;
+        // C ignores every setInputEos/setOutputEos status
+        // (drvPMNC87xx.cc:586, 595, 720, 727, 873-874).
+        let _ = port.set_input_eos_blocking(eos_user(), PROMPT_EOS);
+        let _ = port.set_output_eos_blocking(eos_user(), CMND_EOS);
         let mut ctrl = Self {
             handle: SyncIOHandle::from_handle(port.clone(), 0, timeout),
             port,
@@ -330,9 +332,9 @@ impl PmncController {
         if !self.change_eos {
             return self.command(&cmd);
         }
-        self.port.set_input_eos_blocking(eos_user(), NL_EOS)?;
+        let _ = self.port.set_input_eos_blocking(eos_user(), NL_EOS);
         let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
-        self.port.set_input_eos_blocking(eos_user(), PROMPT_EOS)?;
+        let _ = self.port.set_input_eos_blocking(eos_user(), PROMPT_EOS);
         Self::trimmed(raw?)
     }
 
@@ -760,5 +762,52 @@ mod tests {
         assert_eq!(parse_mpv_line("A0 M0=100"), Some((0, 0)));
         assert_eq!(parse_mpv_line("A2 M1=250"), Some((2, 1)));
         assert_eq!(parse_mpv_line("junk"), None);
+    }
+    /// A 1.5.4 controller with one 8753 module, on a port with no EOS support
+    /// of its own, so every EOS set is refused.
+    struct Pmnc {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Pmnc {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.reply = match data {
+                b"VER" => b"Version 1.5.4>".to_vec(),
+                b"DRT" => b"A0=1>".to_vec(),
+                b"STA 0" => b"A0=0x05\n".to_vec(),
+                _ => b">".to_vec(),
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    #[test]
+    fn a_port_refusing_every_eos_set_still_configures_and_reads_status() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let pmnc = Pmnc {
+            base: PortDriverBase::new("pmncEosRefused", 1, PortFlags::default()),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(pmnc, RuntimeConfig::default()).unwrap();
+        let port = rt.port_handle().clone();
+        assert!(port.set_input_eos_blocking(eos_user(), NL_EOS).is_err());
+        let ctrl = PmncController::new(port, Duration::from_secs(1)).unwrap();
+        assert!(ctrl.change_eos);
+        assert_eq!(ctrl.num_axes(), 3);
+        assert_eq!(ctrl.status(0).unwrap(), "A0=0x05");
     }
 }
