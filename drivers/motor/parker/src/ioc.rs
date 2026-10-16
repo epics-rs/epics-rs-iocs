@@ -15,10 +15,10 @@ use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_controller_port, register_port};
 
 use crate::acr::{AcrAxis, AcrController};
-use crate::oem::{OemAxis, OemController};
+use crate::oem::{OemAxis, OemController, OemParams};
 
 /// Command timeout.
 const OEM_TIMEOUT: Duration = Duration::from_secs(1);
@@ -49,8 +49,6 @@ pub fn oem_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(ctx, &port_name, num_axes as i32)?;
-
             let (handle, _) = connect_controller(
                 &oem_port,
                 OEM_TIMEOUT,
@@ -60,7 +58,13 @@ pub fn oem_create_controller_command() -> CommandDef {
                 ),
             );
             set_eos_ignored(&handle, b"\r", b"\r");
-            let controller = Arc::new(Mutex::new(OemController::new(handle)));
+            let controller = Arc::new(Mutex::new(OemController::new(handle, num_axes as usize)));
+            register_controller_port(
+                ctx.db().scan_control().interrupt_gate(),
+                &port_name,
+                num_axes as i32,
+                OemParams::new(controller.clone()),
+            )?;
 
             for index in 0..num_axes as usize {
                 let ax = OemAxis::new(controller.clone(), index);

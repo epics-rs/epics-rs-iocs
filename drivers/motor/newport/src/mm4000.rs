@@ -782,9 +782,9 @@ impl AsynMotor for Mm4000Axis {
             problem: data.problem,
             comms_error: data.comms_error,
             // C motorAxisInit defaults motorAxisHasClosedLoop on for every
-            // axis; the TC closed-loop probe result is stored but unused.
+            // axis and never sets motorAxisHasEncoder; the TC closed-loop
+            // probe result is stored but unused.
             gain_support: true,
-            has_encoder: true,
             // The MM4000 move transaction has no base-velocity (VB) command.
             vbas_supported: false,
             ..MotorStatus::default()
