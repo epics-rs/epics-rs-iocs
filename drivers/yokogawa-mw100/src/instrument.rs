@@ -13,7 +13,7 @@ use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
 use epics_rs::base::server::database::WriteDone;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -98,6 +98,7 @@ pub enum Command {
 enum Done {
     Wait(mpsc::Sender<()>),
     Process(WriteDone),
+    NoRecord,
 }
 
 struct Job {
@@ -136,10 +137,13 @@ impl Instrument {
         let peer_address = stream.peer_addr()?.ip().to_string();
         let cache = Arc::new(Mutex::new(Cache::default()));
         let interrupts = Arc::new(Interrupts::default());
+        let (tx, rx) = mpsc::channel::<Job>();
         let mut actor = Actor {
             stream,
             cache: cache.clone(),
             interrupts: interrupts.clone(),
+            rx,
+            backlog: VecDeque::new(),
         };
 
         match wire::read_response(&mut actor.stream)? {
@@ -162,10 +166,9 @@ impl Instrument {
         actor.load_input_values(None)?;
         actor.load_output_values(None)?;
 
-        let (tx, rx) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("mw100-instrument".to_string())
-            .spawn(move || actor.run(rx))
+            .spawn(move || actor.run())
             .map_err(|e| io::Error::other(e.to_string()))?;
 
         Ok(Arc::new(Self {
@@ -502,11 +505,14 @@ pub struct Actor {
     stream: TcpStream,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
+    rx: mpsc::Receiver<Job>,
+    /// Jobs taken off `rx` ahead of one the actor queued itself, in order.
+    backlog: VecDeque<Job>,
 }
 
 impl Actor {
-    fn run(mut self, rx: mpsc::Receiver<Job>) {
-        while let Ok(job) = rx.recv() {
+    fn run(mut self) {
+        while let Some(job) = self.backlog.pop_front().or_else(|| self.rx.recv().ok()) {
             let _ = self.process(job.command);
             match job.done {
                 Done::Wait(tx) => {
@@ -515,8 +521,19 @@ impl Actor {
                 Done::Process(done) => {
                     let _ = done.complete(done.priority(), Ok(()));
                 }
+                Done::NoRecord => {}
             }
         }
+    }
+
+    /// C `qmesg(dq, NULL, ...)` from the queue thread: the job goes behind
+    /// everything already queued.
+    fn queue_self(&mut self, command: Command) {
+        self.backlog.extend(self.rx.try_iter());
+        self.backlog.push_back(Job {
+            command,
+            done: Done::NoRecord,
+        });
     }
 
     fn process(&mut self, command: Command) -> io::Result<()> {
@@ -687,31 +704,30 @@ impl Actor {
     }
 
     /// `load_status` (`drvMW100.c:686-728`): only `status[4]`'s bottom 3
-    /// bits are used. On a settings-mode 1-to-0 transition, immediately
-    /// refreshes infos (C fire-and-forgets this via `qmesg`; this single
-    /// actor thread just runs it inline).
+    /// bits are used. A settings-mode 1-to-0 transition queues an info
+    /// reload (`drvMW100.c:704-713`).
     fn load_status(&mut self) -> io::Result<()> {
         let payload = self.expect_ascii(&cmd_is0())?;
         let status = parse_is0(&payload)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed IS0 body"))?;
         let s4 = status[4];
-        let should_refresh_infos;
+        let settings_ended;
         {
             let mut cache = self.cache.lock();
             if s4 & 1 != 0 {
                 cache.settings_mode = true;
-                should_refresh_infos = false;
+                settings_ended = false;
             } else {
-                should_refresh_infos = cache.settings_mode;
+                settings_ended = cache.settings_mode;
                 cache.settings_mode = false;
             }
             cache.measurement_mode = s4 & 2 != 0;
             cache.compute_mode = s4 & 4 != 0;
         }
-        self.interrupts.fire(InterruptCategory::Status);
-        if should_refresh_infos {
-            self.load_infos()?;
+        if settings_ended {
+            self.queue_self(Command::ReadAllInfos);
         }
+        self.interrupts.fire(InterruptCategory::Status);
         Ok(())
     }
 
@@ -1115,11 +1131,20 @@ pub(crate) mod test_support {
         listener: TcpListener,
         responses: Vec<Vec<u8>>,
     ) -> std::thread::JoinHandle<Vec<String>> {
+        spawn_gated_fake_device(listener, responses, None)
+    }
+
+    /// [`spawn_fake_device`], holding reply `n` back until `gate` fires.
+    pub(crate) fn spawn_gated_fake_device(
+        listener: TcpListener,
+        responses: Vec<Vec<u8>>,
+        gate: Option<(usize, mpsc::Receiver<()>)>,
+    ) -> std::thread::JoinHandle<Vec<String>> {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream.write_all(b"E0\r\n").unwrap();
             let mut received = Vec::new();
-            for response in responses {
+            for (n, response) in responses.into_iter().enumerate() {
                 let mut line = Vec::new();
                 let mut byte = [0u8; 1];
                 loop {
@@ -1132,6 +1157,11 @@ pub(crate) mod test_support {
                     }
                 }
                 received.push(String::from_utf8(line).unwrap());
+                if let Some((at, gate)) = &gate
+                    && *at == n
+                {
+                    gate.recv().unwrap();
+                }
                 stream.write_all(&response).unwrap();
             }
             received
@@ -1182,6 +1212,55 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn settings_end_queues_the_info_reload_behind_queued_jobs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut settings = b"000x".repeat(8);
+        settings[16..19].copy_from_slice(b"001");
+        let responses = vec![
+            b"E0\r\n".to_vec(),
+            cf0_one_input_analog_module(),
+            ascii_frame(&settings), // IS0: settings mode
+            fe1_one_signal_channel(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            one_record_fd1_binary(),
+            empty_fo1_binary(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            is0_all_zero(),          // IS0: settings mode ended
+            one_record_fd1_binary(), // the job queued behind it
+            fe1_one_signal_channel(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+        ];
+        let (release, gate) = mpsc::channel();
+        let device = spawn_gated_fake_device(listener, responses, Some((12, gate)));
+        let instrument = Instrument::connect_to(addr).unwrap();
+        assert!(instrument.get_settings_mode());
+        assert!(instrument.send(Command::ReadStatus, Done::NoRecord));
+        assert!(instrument.send(Command::ReadAllInputs, Done::NoRecord));
+        release.send(()).unwrap();
+        let received = device.join().unwrap();
+        assert_eq!(
+            received[12..],
+            [
+                "IS0\r\n",
+                "FD1,001,A300\r\n",
+                "FE1,001,A300\r\n",
+                "FO0,001,060\r\n",
+                "AO?\r\n",
+                "XD?\r\n",
+                "SO?\r\n",
+            ]
+        );
+    }
 
     #[test]
     fn fe1_skipped_channel_reads_skip_off() {
