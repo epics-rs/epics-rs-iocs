@@ -30,8 +30,7 @@
 //! `setInputEos(pasynUser, "\n", 1)` right after connecting — the port owns
 //! the terminator (the `motor-port-eos-ownership` convention; here the C picks
 //! port-owned framing, same class as the C-862 but with `"\n"` both ways).
-//! `SyncIOHandle` exposes no driver-side EOS hook, so both EOS values are set
-//! from `st.cmd` (`asynOctetSetInputEos`/`asynOctetSetOutputEos`, `"\n"`) and
+//! `PIE516Config` sets both through `connect_with_eos` and
 //! [`PIE516Controller::send`] writes **bare** command bytes.
 //!
 //! **Documented deviation — the redundant trailing terminator.** C

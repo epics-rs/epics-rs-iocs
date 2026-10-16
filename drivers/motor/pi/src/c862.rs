@@ -15,8 +15,7 @@
 //! hardcodes the asyn sub-address to 0, ignoring `cntrl->asyn_address`
 //! entirely at the transport layer. The "address" is instead a protocol-level
 //! multi-drop selector (below) — this port connects via
-//! [`motor_common::connect::connect_serial`], exactly like every other octet
-//! driver in this workspace.
+//! [`motor_common::connect::connect_with_eos`].
 //!
 //! ## Wire shape — the port owns framing (not the driver)
 //!
@@ -29,17 +28,10 @@
 //! Mclennan PM304 port (which appends its own terminator and leaves the
 //! port's output EOS unset) — see the `motor-port-eos-ownership` convention:
 //! which one applies is a per-C-driver fact, not a template to copy.
-//! `SyncIOHandle` (unlike the real `pasynUser`) exposes no method for a
-//! driver to configure a port's EOS itself, so this port pushes both EOS
-//! settings into `st.cmd` (`asynOctetSetInputEos`/`asynOctetSetOutputEos`)
-//! instead of setting them from [`PIC862Controller::new`] — same wire
-//! result, different call site. [`PIC862Controller::send`] therefore writes
-//! **bare** command bytes with no manual terminator.
+//! `PIC862Config` sets both the same way, and [`PIC862Controller::send`]
+//! therefore writes **bare** command bytes with no manual terminator.
 //!
-//! Input terminator: `"\n\x03"` (LF then ASCII ETX, 2 bytes) — `\x03` is
-//! representable as a 2-hex-digit `\x` escape in `st.cmd` (this port's
-//! `asyn-rs` iocsh escape decoder has no octal-triplet form, so the C
-//! header's `"\n\003"` spelling doesn't carry over literally).
+//! Input terminator: `"\n\x03"` (LF then ASCII ETX, 2 bytes).
 //!
 //! `recv_mess` unconditionally drops the **last** received byte
 //! (`com[nread - 1] = '\0'; /* Strip trailing CR. */`) after the port's own

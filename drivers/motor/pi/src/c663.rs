@@ -11,15 +11,14 @@
 //! Same as C-862: pure `pasynOctetSyncIO` despite the iocsh argument label
 //! "asyn address (GPIB)" — `motor_init`'s `connect(cntrl->asyn_port, 0, ...)`
 //! hardcodes the asyn sub-address to 0. Connects via
-//! [`motor_common::connect::connect_serial`].
+//! [`motor_common::connect::connect_with_eos`].
 //!
 //! ## Wire shape — the port owns framing
 //! `motor_init` calls `pasynOctetSyncIO->setOutputEos(pasynUser, "\r", 1)`
 //! and `setInputEos(pasynUser, "\n\x03", 2)` right after connecting;
 //! `send_mess`'s buffer never appends a terminator (`strcat(local_buff,
 //! com)` only). Same ownership as C-862 — see the `motor-port-eos-ownership`
-//! convention. `SyncIOHandle` has no driver-side EOS-set hook, so both EOS
-//! values are set from `st.cmd` instead of from [`PIC663Controller::new`].
+//! convention. `PIC663Config` sets both EOS values the same way.
 //!
 //! `recv_mess` unconditionally drops the **last** received byte (C
 //! `com[nread - 1] = '\0'; /* Strip traling CR. */` — a real typo in the C

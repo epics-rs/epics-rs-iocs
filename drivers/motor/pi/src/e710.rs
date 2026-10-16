@@ -18,8 +18,8 @@
 //!
 //! ## EOS ownership
 //! C `motor_init` sets output and input EOS to `"\n"` itself, so the asyn port
-//! owns framing: this port writes bare command bytes and the `st.cmd` example
-//! sets `"\n"` both ways. Commands carry a trailing `,` (the E-710 command
+//! owns framing: `PIE710Config` sets `"\n"` both ways and this port writes
+//! bare command bytes. Commands carry a trailing `,` (the E-710 command
 //! separator), which is the last byte before the port-appended `"\n"`.
 //!
 //! ## Connect handshake (C `motor_init`)

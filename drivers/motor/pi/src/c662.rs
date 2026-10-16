@@ -12,8 +12,8 @@
 //! `motor_init` sets `setOutputEos("\n")` **and** `setInputEos("\n")` after
 //! connecting, and `send_mess`'s `local_buff` never appends a terminator
 //! (`strcat(local_buff, com)` only) — so the port's output EOS puts the `\n` on
-//! the wire. This port has no `SyncIOHandle` EOS hook, so both are set in
-//! `st.cmd` (both `"\n"`) and [`PIC662Controller::send`] writes **bare** bytes.
+//! the wire. `PIC662Config` sets both to `"\n"` and [`PIC662Controller::send`]
+//! writes **bare** bytes.
 //! There is no protocol address (SCPI, single device) and, unlike the C-630,
 //! the device does **not** echo (`cmnd_response = false`): a command write is
 //! never followed by a read.

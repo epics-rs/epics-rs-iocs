@@ -9,7 +9,7 @@
 //!
 //! `motor_init` sets `setOutputEos("\n")` **and** `setInputEos("\n")` after
 //! connecting; `send_mess` never appends a terminator, so the port's output
-//! EOS puts the `\n` on the wire (both EOS set in `st.cmd`; this port's
+//! EOS puts the `\n` on the wire (both EOS set by `PIC844Config`; this port's
 //! [`PIC844Controller::send`] writes bare bytes, no echo — `cmnd_response =
 //! false`).
 //!

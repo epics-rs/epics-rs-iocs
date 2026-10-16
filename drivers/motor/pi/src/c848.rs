@@ -11,8 +11,8 @@
 //!
 //! `motor_init` sets `setOutputEos("\n")` **and** `setInputEos("\n")`;
 //! `send_mess` writes bare bytes (no terminator, no echo — `cmnd_response =
-//! false`), so the port's output EOS puts the `\n` on the wire (both set in
-//! `st.cmd`).
+//! false`), so the port's output EOS puts the `\n` on the wire (both set by
+//! `PIC848Config`).
 //!
 //! The axis selector is not a prefix (C-844) but a **single byte at index 5**
 //! of a fixed-width command: `send_mess` does `local_buff[5] = *name` where
