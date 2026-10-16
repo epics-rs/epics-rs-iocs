@@ -22,9 +22,7 @@ use std::sync::atomic::AtomicBool;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -711,7 +709,6 @@ pub struct SpecsAnalyserRuntime {
     pub specs_params: SpecsParams,
     pool: Arc<NDArrayPool>,
     array_output: Arc<PlMutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     pub tasks: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -728,8 +725,7 @@ impl SpecsAnalyserRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -793,7 +789,6 @@ pub fn create_specs_analyser_detector(
     let scan_ranges = driver.scan_ranges.clone();
     let pool = driver.ad.pool.clone();
 
-    let queued_counter = driver.ad.queued_counter.clone();
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the SPECS analyser port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
@@ -812,6 +807,7 @@ pub fn create_specs_analyser_detector(
         lens_modes,
         scan_ranges,
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
         batch: Vec::new(),
         last_status_ok: true,
     };
@@ -823,7 +819,6 @@ pub fn create_specs_analyser_detector(
         specs_params,
         pool,
         array_output,
-        queued_counter,
         tasks,
     })
 }
