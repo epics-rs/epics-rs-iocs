@@ -50,6 +50,23 @@ impl ChannelError {
     }
 }
 
+/// What C's `mpxSet`/`mpxCommand` return to `writeInt32`/`writeFloat64`.
+impl From<ChannelError> for AsynError {
+    fn from(e: ChannelError) -> Self {
+        match e {
+            ChannelError::Transport(e) => e,
+            ChannelError::Timeout => AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "timeout".into(),
+            },
+            ChannelError::Protocol(e) => AsynError::Status {
+                status: AsynStatus::Error,
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
 impl From<MpxError> for ChannelError {
     fn from(e: MpxError) -> Self {
         Self::Protocol(e)

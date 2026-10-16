@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
@@ -467,13 +467,14 @@ impl MerlinDetector {
                 .images_remaining
                 .store(remaining, Ordering::Release);
 
+            // C keeps the status of these two commands only.
             match image_mode {
                 MerlinImageMode::ThresholdScan => {
-                    let _ = self.cmd.command(MPXCMD_THSCAN, timeout);
+                    self.cmd.command(MPXCMD_THSCAN, timeout)?;
                 }
                 MerlinImageMode::BackgroundCalibrate => {
                     self.try_set(MPXVAR_BACKGROUNDCOUNT, &images_to_acquire.to_string());
-                    let _ = self.cmd.command(MPXCMD_BACKGROUNDACQUIRE, timeout);
+                    self.cmd.command(MPXCMD_BACKGROUNDACQUIRE, timeout)?;
                 }
                 _ => {
                     self.try_set(MPXVAR_NUMFRAMESTOACQUIRE, &images_to_acquire.to_string());
@@ -519,8 +520,8 @@ impl PortDriver for MerlinDetector {
             .port_base
             .set_int32_param(reason, user.addr, value)?;
 
-        if reason == self.init_param {
-            self.initialise()?;
+        let status = if reason == self.init_param {
+            self.initialise()
         } else if reason == self.params.reset {
             let _ = self.cmd.command(MPXCMD_RESET, default_timeout());
             // The Labview server cannot be reconnected to after a reset, so C
@@ -529,11 +530,12 @@ impl PortDriver for MerlinDetector {
             self.ad.port_base.call_param_callbacks(0)?;
             std::process::exit(0);
         } else if reason == self.params.quad_merlin_mode {
-            self.set_quad_mode(value)?;
+            self.set_quad_mode(value)
         } else if reason == self.params.software_trigger {
             let _ = self.cmd.command(MPXCMD_SOFTWARETRIGGER, default_timeout());
+            Ok(())
         } else if reason == self.ad.params.acquire {
-            self.set_acquire(value)?;
+            self.set_acquire(value)
         } else if reason == self.ad.params.trigger_mode
             || reason == self.ad.params.num_images
             || reason == self.ad.params.num_exposures
@@ -541,55 +543,74 @@ impl PortDriver for MerlinDetector {
             || reason == self.params.enable_background_corr
             || reason == self.params.enable_image_sum
         {
-            self.set_acquire_params()?;
+            self.set_acquire_params()
         } else if reason == self.ad.params.size_x
             || reason == self.ad.params.size_y
             || reason == self.ad.params.min_x
             || reason == self.ad.params.min_y
         {
-            self.set_roi()?;
+            self.set_roi()
         } else if reason == self.params.enable_counter1 || reason == self.params.continuous_rw {
-            self.set_mode_commands(reason)?;
+            self.set_mode_commands(reason)
         } else if reason == self.params.threshold_apply {
-            self.get_threshold()?;
+            self.get_threshold()
         } else if reason == self.params.profile_control {
             self.try_set(MPXCMD_PROFILES, &value.to_string());
+            Ok(())
         } else if reason < self.params.first() {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
             if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0)?;
+                self.ad.set_shutter(value != 0)
             } else {
-                self.ad.write_int32_pool(reason, value)?;
+                self.ad.write_int32_pool(reason, value).map(|_| ())
             }
-        }
+        } else {
+            Ok(())
+        };
 
         self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
+        let old = self.ad.port_base.get_float64_param(reason, user.addr)?;
         self.ad
             .port_base
             .set_float64_param(reason, user.addr, value)?;
 
-        if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
-            self.try_set(MPXVAR_THRESHOLD[i], &format!("{value:.6}"));
-            self.get_threshold()?;
+        let name = if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
+            Some(MPXVAR_THRESHOLD[i])
         } else if reason == self.params.operating_energy {
-            self.try_set(MPXVAR_OPERATINGENERGY, &format!("{value:.6}"));
+            Some(MPXVAR_OPERATINGENERGY)
+        } else {
+            None
+        };
+        let status = if let Some(name) = name {
+            let set = self
+                .cmd
+                .set(name, &format!("{value:.6}"), default_timeout())
+                .map_err(AsynError::from);
             self.get_threshold()?;
+            set
         } else if reason == self.ad.params.acquire_time || reason == self.ad.params.acquire_period {
-            self.set_acquire_params()?;
+            self.set_acquire_params()
         } else if reason == self.params.start_threshold_scan
             || reason == self.params.stop_threshold_scan
             || reason == self.params.step_threshold_scan
         {
-            self.update_threshold_scan_params()?;
-        }
+            self.update_threshold_scan_params()
+        } else {
+            Ok(())
+        };
 
+        if status.is_err() {
+            self.ad
+                .port_base
+                .set_float64_param(reason, user.addr, old)?;
+        }
         self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        status
     }
 }
 
@@ -748,6 +769,25 @@ mod tests {
                 .unwrap(),
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    #[test]
+    fn a_refused_threshold_write_fails_and_keeps_the_old_value() {
+        let mut det = detector("MERLIN_THRESHOLD_WRITE");
+        let threshold = det.params.thresholds[0];
+        det.ad
+            .port_base
+            .set_float64_param(threshold, 0, 7.5)
+            .unwrap();
+        let mut user = AsynUser::new(threshold);
+        assert!(
+            det.write_float64(&mut user, 9.0).is_err(),
+            "a SET the device never answered reported success"
+        );
+        assert_eq!(
+            det.ad.port_base.get_float64_param(threshold, 0).unwrap(),
+            7.5
         );
     }
 }
