@@ -547,9 +547,6 @@ impl DeviceSupport for EtherIpDevice {
                             .map(|v| (EpicsValue::Long(v), false))
                             .ok_or(()),
                     },
-                    "longin" => cip::get_dint(raw, element)
-                        .map(|v| (EpicsValue::Long(v), true))
-                        .ok_or(()),
                     "int64in" => cip::get_lint(raw, element)
                         .map(|v| (EpicsValue::Int64(v), true))
                         .ok_or(()),
@@ -586,10 +583,9 @@ impl DeviceSupport for EtherIpDevice {
                     record.set_val(value)?;
                     // C parity: ai_read, si_read and lsi_read write
                     // udf = FALSE on a good read; int64in_read and wf_read
-                    // never touch udf. longin has no C dset and follows
-                    // its LINT twin int64in.
+                    // never touch udf.
                     let udf = match rtype {
-                        "longin" | "int64in" | "waveform" => DeviceUdf::Untouched,
+                        "int64in" | "waveform" => DeviceUdf::Untouched,
                         _ => DeviceUdf::Defined,
                     };
                     Ok(DeviceReadOutcome::computed(udf))
@@ -643,14 +639,6 @@ impl DeviceSupport for EtherIpDevice {
                     }
                 }
             },
-            "longout" => {
-                let val = i32_field(record, "VAL");
-                match cip::get_dint(&data.buf, element) {
-                    Some(cur) if cur == val => false,
-                    Some(_) => cip::put_dint(&mut data.buf, element, val),
-                    None => false,
-                }
-            }
             "int64out" => {
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::Int64(v)) => v,
@@ -756,22 +744,6 @@ impl EtherIpDevice {
                     }
                 }
             },
-            "longout" => {
-                let Some(plc) = cip::get_dint(&data.buf, element) else {
-                    drop(data);
-                    self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-                };
-                let val = i32_field(record, "VAL");
-                if plc != val {
-                    if force {
-                        cip::put_dint(&mut data.buf, element, val);
-                        tag.request_write(&mut data, &self.name);
-                    } else {
-                        record.set_val(EpicsValue::Long(plc))?;
-                    }
-                }
-            }
             "int64out" => {
                 let Some(plc) = cip::get_lint(&data.buf, element) else {
                     drop(data);
@@ -964,19 +936,38 @@ impl DeviceSupport for EtherIpResetDevice {
 /// The dynamic device-support factory: one DTYP for every record type, with the
 /// link text taken verbatim from INP or OUT.
 pub fn device_factory(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> {
-    match ctx.dtyp {
-        DTYP_RESET => Some(Box::new(EtherIpResetDevice::default())),
-        DTYP => {
-            let (text, is_output) = if !ctx.out.is_empty() {
-                (ctx.out, true)
-            } else {
-                (ctx.inp, false)
-            };
-            Some(Box::new(EtherIpDevice::new(text, is_output)))
+    match (ctx.dtyp, ctx.record_type) {
+        (DTYP_RESET, "bo") => Some(Box::new(EtherIpResetDevice::default())),
+        (DTYP, rtype) if INPUT_TYPES.contains(&rtype) => {
+            Some(Box::new(EtherIpDevice::new(ctx.inp, false)))
+        }
+        (DTYP, rtype) if OUTPUT_TYPES.contains(&rtype) => {
+            Some(Box::new(EtherIpDevice::new(ctx.out, true)))
         }
         _ => None,
     }
 }
+
+/// The record types `ether_ip.dbd` declares an "EtherIP" `device()` for.
+const INPUT_TYPES: &[&str] = &[
+    "ai",
+    "int64in",
+    "bi",
+    "lsi",
+    "mbbi",
+    "mbbiDirect",
+    "stringin",
+    "waveform",
+];
+const OUTPUT_TYPES: &[&str] = &[
+    "ao",
+    "int64out",
+    "bo",
+    "lso",
+    "mbbo",
+    "mbboDirect",
+    "stringout",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1095,6 +1086,23 @@ mod tests {
         assert_eq!(read_waveform(&raw, 2, &wf, "wf"), Ok(None));
         wf.put_field("FTVL", EpicsValue::Short(5)).unwrap();
         assert_eq!(read_waveform(&raw, 4, &wf, "wf"), Err(()));
+    }
+
+    /// ether_ip.dbd declares no longin/longout dset and EtherIPReset only on bo.
+    #[test]
+    fn factory_serves_only_the_dbd_declared_record_types() {
+        let ctx = |record_type, dtyp| DeviceSupportContext {
+            record_type,
+            dtyp,
+            inp: "@plc1 DINT",
+            out: "@plc1 DINT",
+        };
+        assert!(device_factory(&ctx("ai", DTYP)).is_some());
+        assert!(device_factory(&ctx("stringout", DTYP)).is_some());
+        assert!(device_factory(&ctx("bo", DTYP_RESET)).is_some());
+        assert!(device_factory(&ctx("longin", DTYP)).is_none());
+        assert!(device_factory(&ctx("longout", DTYP)).is_none());
+        assert!(device_factory(&ctx("ao", DTYP_RESET)).is_none());
     }
 
     // -- link parsing --------------------------------------------------------
