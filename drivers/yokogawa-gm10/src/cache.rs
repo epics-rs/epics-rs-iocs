@@ -4,7 +4,7 @@
 //! "not really needed, just run everything, no async here").
 
 pub const MAX_MODULES: usize = 10;
-pub const MAX_SIGNAL: usize = 999;
+pub const MAX_MEAS_CHAN: usize = 1000;
 pub const MAX_MATH: usize = 200;
 pub const MAX_COMM: usize = 500;
 pub const MAX_CONST: usize = 100;
@@ -159,9 +159,9 @@ pub struct Cache {
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            meas_type: vec![ChannelType::default(); MAX_SIGNAL],
-            meas_info: vec![ChannelInfo::default(); MAX_SIGNAL],
-            meas_data: vec![ChannelData::default(); MAX_SIGNAL],
+            meas_type: vec![ChannelType::default(); MAX_MEAS_CHAN],
+            meas_info: vec![ChannelInfo::default(); MAX_MEAS_CHAN],
+            meas_data: vec![ChannelData::default(); MAX_MEAS_CHAN],
             calc_info: vec![ChannelInfo::default(); MAX_MATH],
             calc_data: vec![ChannelData::default(); MAX_MATH],
             calc_expr: vec![ExprInfo::default(); MAX_MATH],

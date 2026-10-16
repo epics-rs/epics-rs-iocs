@@ -699,10 +699,9 @@ pub fn parse_const_lines(payload: &[u8]) -> Vec<ConstLine> {
     let mut out = Vec::new();
     let mut rest: &str = text.as_ref();
     while !rest.is_empty() && !rest.starts_with('E') {
-        if rest.len() < 8 {
+        let Some(after_prefix) = rest.get(8..) else {
             break;
-        }
-        let after_prefix = &rest[8..];
+        };
         let digits_end = after_prefix
             .find(|c: char| !c.is_ascii_digit())
             .unwrap_or(after_prefix.len());

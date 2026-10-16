@@ -566,7 +566,8 @@ impl Actor {
         let lines = parse_fsysconf(&payload)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed FSysConf body"))?;
 
-        let mut cache = self.cache.lock();
+        let mut guard = self.cache.lock();
+        let cache = &mut *guard;
         for t in cache.meas_type.iter_mut() {
             *t = ChannelType::None;
         }
@@ -575,55 +576,41 @@ impl Actor {
             m.module_string.clear();
         }
         for line in &lines {
+            // C indexes every wire-supplied slot unchecked (UB out of
+            // range); out-of-range slots are skipped here.
+            let Some(module) = cache.modules.get_mut(line.index) else {
+                continue;
+            };
             if !module_line_ok(line) {
                 continue;
             }
-            cache.modules[line.index].module_string = line.set_message.clone();
+            module.module_string = line.set_message.clone();
             let Some((mod_type, channel_number)) = classify_module(&line.set_message) else {
                 continue;
             };
             if mod_type == ModuleType::Pid {
                 continue;
             }
-            cache.modules[line.index].mod_type = mod_type;
-            cache.modules[line.index].channel_number = channel_number;
-            cache.modules[line.index].use_flag = true;
+            module.mod_type = mod_type;
+            module.channel_number = channel_number;
+            module.use_flag = true;
 
             let base = line.index * 100;
-            let [inputs, outputs] = channel_number;
+            let [inputs, outputs] = channel_number.map(|n| n.max(0) as usize);
+            let mut set = |start: usize, count: usize, t: ChannelType| {
+                for slot in cache.meas_type.iter_mut().skip(start).take(count) {
+                    *slot = t;
+                }
+            };
             match mod_type {
-                ModuleType::InputAnalog => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputAnalog;
-                    }
-                }
-                ModuleType::InputDigital => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputBinary;
-                    }
-                }
-                ModuleType::InputPulse => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputInteger;
-                    }
-                }
-                ModuleType::OutputAnalog => {
-                    for j in 0..outputs as usize {
-                        cache.meas_type[base + j] = ChannelType::OutputAnalog;
-                    }
-                }
-                ModuleType::OutputDigital => {
-                    for j in 0..outputs as usize {
-                        cache.meas_type[base + j] = ChannelType::OutputBinary;
-                    }
-                }
+                ModuleType::InputAnalog => set(base, inputs, ChannelType::InputAnalog),
+                ModuleType::InputDigital => set(base, inputs, ChannelType::InputBinary),
+                ModuleType::InputPulse => set(base, inputs, ChannelType::InputInteger),
+                ModuleType::OutputAnalog => set(base, outputs, ChannelType::OutputAnalog),
+                ModuleType::OutputDigital => set(base, outputs, ChannelType::OutputBinary),
                 ModuleType::InputOutputDigital => {
-                    for j in 0..inputs as usize {
-                        cache.meas_type[base + j] = ChannelType::InputBinary;
-                    }
-                    for j in 0..outputs as usize {
-                        cache.meas_type[base + inputs as usize + j] = ChannelType::OutputBinary;
-                    }
+                    set(base, inputs, ChannelType::InputBinary);
+                    set(base + inputs, outputs, ChannelType::OutputBinary);
                 }
                 ModuleType::Pid | ModuleType::Unknown => {}
             }
@@ -668,9 +655,15 @@ impl Actor {
         let fchinfo_payload = self.expect_ascii(&cmd_fchinfo())?;
         let info_lines = parse_fchinfo(&fchinfo_payload);
         {
-            let mut cache = self.cache.lock();
+            let mut guard = self.cache.lock();
+            let cache = &mut *guard;
             for line in &info_lines {
-                if line.family == InfoFamily::Signal && !cache.modules[line.index / 100].use_flag {
+                if line.family == InfoFamily::Signal
+                    && !cache
+                        .modules
+                        .get(line.index / 100)
+                        .is_some_and(|m| m.use_flag)
+                {
                     continue;
                 }
                 let ch_status = match line.status {
@@ -682,31 +675,20 @@ impl Actor {
                 // `drvGM10.c:733-742`: on SKIP, `cd->data_status = VL_SKIP`
                 // is set for whichever family `ci`/`cd` point at — not
                 // Signal-only ("since the input won't do this").
-                match line.family {
-                    InfoFamily::Signal => {
-                        cache.meas_info[line.index].ch_status = ch_status;
-                        cache.meas_info[line.index].unit = line.unit.clone();
-                        cache.meas_info[line.index].scale = line.scale;
-                        if line.status == CH_STATUS_SKIP {
-                            cache.meas_data[line.index].data_status = DataStatus::Skip;
-                        }
-                    }
-                    InfoFamily::Math => {
-                        cache.calc_info[line.index].ch_status = ch_status;
-                        cache.calc_info[line.index].unit = line.unit.clone();
-                        cache.calc_info[line.index].scale = line.scale;
-                        if line.status == CH_STATUS_SKIP {
-                            cache.calc_data[line.index].data_status = DataStatus::Skip;
-                        }
-                    }
-                    InfoFamily::Comm => {
-                        cache.comm_info[line.index].ch_status = ch_status;
-                        cache.comm_info[line.index].unit = line.unit.clone();
-                        cache.comm_info[line.index].scale = line.scale;
-                        if line.status == CH_STATUS_SKIP {
-                            cache.comm_data[line.index].data_status = DataStatus::Skip;
-                        }
-                    }
+                let (infos, datas) = match line.family {
+                    InfoFamily::Signal => (&mut cache.meas_info, &mut cache.meas_data),
+                    InfoFamily::Math => (&mut cache.calc_info, &mut cache.calc_data),
+                    InfoFamily::Comm => (&mut cache.comm_info, &mut cache.comm_data),
+                };
+                let (Some(ci), Some(cd)) = (infos.get_mut(line.index), datas.get_mut(line.index))
+                else {
+                    continue;
+                };
+                ci.ch_status = ch_status;
+                ci.unit = line.unit.clone();
+                ci.scale = line.scale;
+                if line.status == CH_STATUS_SKIP {
+                    cd.data_status = DataStatus::Skip;
                 }
             }
         }
@@ -719,10 +701,16 @@ impl Actor {
             let parsed = parse(&payload);
             let mut cache = self.cache.lock();
             for line in parsed.as_ref().unwrap_or_else(|lines| lines) {
-                if !cache.modules[line.index / 100].use_flag {
+                if !cache
+                    .modules
+                    .get(line.index / 100)
+                    .is_some_and(|m| m.use_flag)
+                {
                     continue;
                 }
-                cache.meas_info[line.index].ch_mode = line.mode;
+                if let Some(ci) = cache.meas_info.get_mut(line.index) {
+                    ci.ch_mode = line.mode;
+                }
             }
             if parsed.is_err() {
                 return Err(io::Error::new(
@@ -737,10 +725,12 @@ impl Actor {
         {
             let mut cache = self.cache.lock();
             for line in &math_lines {
-                cache.calc_expr[line.index] = ExprInfo {
-                    on_flag: line.on_flag,
-                    expr: line.expr.clone(),
-                };
+                if let Some(slot) = cache.calc_expr.get_mut(line.index) {
+                    *slot = ExprInfo {
+                        on_flag: line.on_flag,
+                        expr: line.expr.clone(),
+                    };
+                }
             }
         }
 
@@ -840,7 +830,9 @@ impl Actor {
             let lines = parse_const_lines(&payload);
             let mut cache = self.cache.lock();
             for line in &lines {
-                cache.constant[line.index] = line.value;
+                if let Some(slot) = cache.constant.get_mut(line.index) {
+                    *slot = line.value;
+                }
             }
         }
         if want_varconst {
@@ -852,7 +844,9 @@ impl Actor {
             let lines = parse_const_lines(&payload);
             let mut cache = self.cache.lock();
             for line in &lines {
-                cache.varconstant[line.index] = line.value;
+                if let Some(slot) = cache.varconstant.get_mut(line.index) {
+                    *slot = line.value;
+                }
             }
         }
         // `drvGM10.c:1147-1148`: only the all-channel read wakes I/O Intr.
@@ -1068,6 +1062,32 @@ pub(crate) mod test_support {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
+
+    #[test]
+    fn out_of_range_wire_indexes_are_skipped() {
+        let mut fsysconf = b"Unit:00  ".to_vec();
+        for (slot, module) in [("12", "GX90XA-06"), ("09", "GX90XA-100")] {
+            fsysconf.extend_from_slice(format!("{slot}:{module:<17}{module:<17}").as_bytes());
+            fsysconf.extend_from_slice(b"----------------\r\n");
+        }
+        fsysconf.push(b'E');
+        let mut responses = default_init_responses();
+        responses[0] = ascii_frame(&fsysconf);
+        responses[3] = ascii_frame(b"N 01000 X ,1\nN 09999 X ,1\nN A9999 X ,1\nE");
+        responses[4] = ascii_frame(b"SRangeAO,09999,X\nE");
+        responses[6] = ascii_frame(b"SRangeMath,9999,f\nE");
+        responses[8] = ascii_frame(b"aaaaaaaa999,1.5\nE");
+        responses[9] = ascii_frame(b"aaaaaaaa999,1.5\nE");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+        let cache = instrument.cache();
+        // C sizes meas_* at MAX_MEAS_CHAN = 1000, so address 1000 is stored.
+        assert_eq!(cache.meas_type[999], ChannelType::InputAnalog);
+        assert_eq!(cache.meas_info[999].scale, 1);
+    }
 
     #[test]
     fn channel_get_expr_cuts_on_char_boundary() {
