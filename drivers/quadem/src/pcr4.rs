@@ -22,7 +22,7 @@ use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QeTriggerMode, QeTriggerPolarity,
     QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
-use crate::octet::{OctetIo, connect_octet};
+use crate::octet::{OctetIo, connect_octet, reply_text};
 use crate::pcr4_proto::{self as proto, DataLine};
 use crate::{asyn_print, trace};
 
@@ -60,11 +60,11 @@ impl Pcr4Driver {
     fn new(
         port_name: &str,
         qe_port_name: &str,
+        io: OctetIo,
         max_memory: usize,
         shared: Arc<QuadEmShared>,
     ) -> AsynResult<Self> {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
-        let io = connect_octet(qe_port_name, proto::PCR4_TIMEOUT)?;
         // C++ sets the input EOS at the top of every setAcquire; it never
         // changes, so it is set once here. See `octet`.
         io.set_input_eos(b"\r\n")?;
@@ -500,15 +500,27 @@ impl PortDriver for Pcr4Driver {
         &mut self.base.port_base
     }
 
-    /// C++ `drvPCR4::report` at details 0. `numResync_` is never incremented
-    /// by C++ (drvPCR4.cpp:78 is its only store), so it prints 0.
+    /// C++ `drvPCR4::report`: above details 0 the meter is stopped, asked for
+    /// its NETCONFIG, and restarted after the base report. `numResync_` is
+    /// never incremented by C++ (drvPCR4.cpp:78 is its only store), so it
+    /// prints 0.
     fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
             "drvPCR4: port={}, IP port={}, firmware version={}, numResync=0",
             self.base.port_base.port_name, self.qe_port_name, self.firmware_version
         );
+        let mut prev_acquiring = false;
+        if level > 0 {
+            prev_acquiring = self.shared.is_acquiring();
+            let _ = self.set_acquire(0);
+            let reply = reply_text(self.write_read_meter(proto::CMD_NETCONFIG));
+            let _ = writeln!(out, "NETCONFIG response from meter:\n{reply}");
+        }
         self.asyn_port_driver_report(out, level);
+        if prev_acquiring {
+            let _ = self.set_acquire(1);
+        }
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -655,7 +667,8 @@ pub fn create_pcr4(
 ) -> AsynResult<Pcr4Runtime> {
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
-    let driver = Pcr4Driver::new(port_name, qe_port_name, max_memory, shared.clone())?;
+    let io = connect_octet(qe_port_name, proto::PCR4_TIMEOUT)?;
+    let driver = Pcr4Driver::new(port_name, qe_port_name, io, max_memory, shared.clone())?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
     let pool = driver.base.pool.clone();
@@ -696,4 +709,67 @@ pub fn create_pcr4(
         _read_thread: read_thread_handle,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::octet::create_ip_port;
+
+    /// A meter that answers every `\r`-terminated command with `ACK`.
+    fn ack_meter() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            while reader.read_until(b'\r', &mut line).unwrap_or(0) > 0 {
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&line).trim().to_string());
+                line.clear();
+                let _ = out.write_all(b"ACK\r\n");
+            }
+        });
+        (addr, log)
+    }
+
+    #[test]
+    fn a_detailed_report_stops_the_meter_and_asks_its_netconfig() {
+        let (addr, log) = ack_meter();
+        let (io, runtime) = create_ip_port(
+            "QE_PCR4_NET_IP",
+            &addr,
+            Duration::from_millis(200),
+            false,
+            true,
+        )
+        .unwrap();
+        std::mem::forget(runtime);
+        io.set_output_eos(b"\r").unwrap();
+        let mut drv =
+            Pcr4Driver::new("QE_PCR4_NET", "QE_PCR4_NET", io, 0, QuadEmShared::new(16).0).unwrap();
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains("NETCONFIG response from meter:\nACK\n"),
+            "{out}"
+        );
+        // The constructor's firmware query comes first.
+        let stop = [
+            proto::CMD_TRIGGER_STOP,
+            proto::CMD_ACQUIRE_STOP,
+            "NETCONFIG",
+        ];
+        assert!(
+            log.lock().unwrap().ends_with(&stop.map(String::from)),
+            "{:?}",
+            log.lock().unwrap()
+        );
+    }
 }
