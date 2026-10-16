@@ -163,6 +163,11 @@ async fn connection_poll(
                 continue;
             }
             Command::RefreshStatus => {
+                refresh_dashboard(&ctx).await;
+                refresh_detector(&ctx).await;
+                continue;
+            }
+            Command::RefreshDetector => {
                 refresh_detector(&ctx).await;
                 continue;
             }
@@ -179,6 +184,7 @@ async fn connection_poll(
         // memory. Here the edge starts from "down", so the first success
         // always refreshes.
         if up && !was_up {
+            refresh_dashboard(&ctx).await;
             refresh_detector(&ctx).await;
         }
         was_up = up;
@@ -308,10 +314,9 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
     }
 }
 
-/// C `getDetector` (serval_http.cpp:1162) + `getDashboard`'s int64 fields.
-async fn refresh_detector(ctx: &Arc<Ctx>) {
+/// `getDashboard`'s int64 fields.
+async fn refresh_dashboard(ctx: &Arc<Ctx>) {
     let p = ctx.p;
-
     if let Ok(dashboard) = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL) {
         let mut updates = Vec::new();
         serval_version(ctx, &dashboard, &mut updates);
@@ -325,7 +330,11 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
             }
         }
     }
+}
 
+/// C `getDetector` (serval_http.cpp:1293).
+async fn refresh_detector(ctx: &Arc<Ctx>) {
+    let p = ctx.p;
     let detector = match ctx.http.get_json(serval::DETECTOR, TIMEOUT_POLL) {
         Ok(d) => d,
         Err(_) => {

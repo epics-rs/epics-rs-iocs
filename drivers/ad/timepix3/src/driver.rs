@@ -1009,7 +1009,14 @@ impl PortDriver for TimePix3Driver {
             self.ad
                 .port_base
                 .set_int32_param(p.detector_orientation, 0, value)?;
-            self.rotate_layout(value)
+            self.rotate_layout(value)?;
+            // The rotation changes Layout.Rotated.Chips (ADTimePix.cpp:635-640).
+            self.cmd_tx
+                .try_send(Command::RefreshDetector)
+                .map_err(|_| AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: "timepix3: the connection task is not running".into(),
+                })
         } else if reason == p.bias_volt
             || reason == p.bias_enable
             || reason == p.trigger_in
@@ -1387,6 +1394,36 @@ impl PortDriver for TimePix3Driver {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).
+    #[test]
+    fn a_rotation_rereads_the_detector() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let (cmd_tx, mut cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_ROTATE",
+            Arc::new(ServalHttp::new(&url)),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.write_int32(&mut AsynUser::new(p.detector_orientation), 3)
+            .unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(Command::RefreshDetector)));
+    }
 
     /// A DAC other than the two thresholds is stored without a Serval
     /// round trip (ADTimePix.cpp:540-546).

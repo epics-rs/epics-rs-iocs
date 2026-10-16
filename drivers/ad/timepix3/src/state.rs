@@ -24,6 +24,8 @@ pub enum Command {
     /// C's `TPX3_HEALTH` write: re-read the dashboard, the detector and the
     /// measurement config.
     RefreshStatus,
+    /// C `getDetector(false)` after a layout rotation: re-read `/detector`.
+    RefreshDetector,
 }
 
 /// Where the three preview channels stream from, as Serval's `Base` PVs give
