@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -40,6 +40,22 @@ pub enum WireError {
     Frame(codec::FrameError),
     /// The device returned an `ERROR` response.
     Device(ErrorInfo),
+    /// The reply lacked the named field or it did not decode
+    /// (`readIntegerData`/`readDoubleData`, `specsAnalyser.cpp:1635-1661`).
+    Field(&'static str),
+}
+
+/// Every failure is C's `asynError` except the round trip's own status.
+impl From<WireError> for AsynError {
+    fn from(e: WireError) -> Self {
+        match e {
+            WireError::Io(e) => e,
+            e => AsynError::Status {
+                status: AsynStatus::Error,
+                message: e.status_message(),
+            },
+        }
+    }
 }
 
 impl WireError {
@@ -51,6 +67,7 @@ impl WireError {
             WireError::Io(e) => format!("SPECS communication error: {e}"),
             WireError::Frame(e) => format!("SPECS protocol framing error: {e:?}"),
             WireError::Device(info) => format!("{}: {}", info.code, info.message),
+            WireError::Field(name) => format!("SPECS reply has no valid {name}"),
         }
     }
 }
@@ -250,18 +267,19 @@ impl WireLink<'_> {
     pub fn get_analyser_parameter_int(&mut self, name: &str) -> Result<i32, WireError> {
         let data = self.command_response(&codec::get_value_command(name))?;
         let value = data.get("Value").map(String::as_str).unwrap_or("");
-        Ok(match value {
-            "\"false\"" => 0,
-            "\"true\"" => 1,
-            _ => parse_integer_field(value).unwrap_or(0),
-        })
+        match value {
+            "\"false\"" => Ok(0),
+            "\"true\"" => Ok(1),
+            _ => parse_integer_field(value).ok_or(WireError::Field("Value")),
+        }
     }
 
     /// `SpecsAnalyser::getAnalyserParameter(name, double&)`
     /// (`specsAnalyser.cpp:1539-1552`).
     pub fn get_analyser_parameter_double(&mut self, name: &str) -> Result<f64, WireError> {
         let data = self.command_response(&codec::get_value_command(name))?;
-        Ok(parse_double_field(data.get("Value").map(String::as_str).unwrap_or("")).unwrap_or(0.0))
+        parse_double_field(data.get("Value").map(String::as_str).unwrap_or(""))
+            .ok_or(WireError::Field("Value"))
     }
 
     /// `SpecsAnalyser::getAnalyserParameter(name, std::string&)`
@@ -351,20 +369,13 @@ impl WireLink<'_> {
     }
 
     /// `SpecsAnalyser::readSpectrumParameter` (`specsAnalyser.cpp:1663-1738`),
-    /// minus the `doCallbacksEnum` publish, which the caller does with
-    /// direct struct access. Always returns at least one entry — on any
-    /// failure that is the `"Not connected"` sentinel upstream pushes to
-    /// avoid an EDM/mbbi `SDEF`-field display problem — and reports whether
-    /// the read itself succeeded via the second tuple element.
-    pub fn read_spectrum_parameter(&mut self, param_name: &str) -> (Vec<String>, bool) {
-        let result = self.command_response(&codec::get_spectrum_command(param_name));
-        match result {
-            Ok(data) => match data.get("Values") {
-                Some(values) => (parse_values_list(values), true),
-                None => (vec!["Not connected".to_string()], false),
-            },
-            Err(_) => (vec!["Not connected".to_string()], false),
-        }
+    /// minus the `doCallbacksEnum` publish and the `"Not connected"` entry it
+    /// substitutes on failure, which the caller applies.
+    pub fn read_spectrum_parameter(&mut self, param_name: &str) -> Result<Vec<String>, WireError> {
+        let data = self.command_response(&codec::get_spectrum_command(param_name))?;
+        data.get("Values")
+            .map(|values| parse_values_list(values))
+            .ok_or(WireError::Field("Values"))
     }
 
     /// `SpecsAnalyser::readSpectrumDataInfo(SPECSOrdinateRange)`

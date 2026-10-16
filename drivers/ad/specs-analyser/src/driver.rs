@@ -73,13 +73,6 @@ pub struct SpecsAnalyserDriver {
     stop: Arc<Event>,
 }
 
-/// Everything a `write_int32`/`write_float64` branch needs from a
-/// `setAnalyserParameter` + re-confirm round trip.
-struct SetConfirmOutcome<T> {
-    ok: bool,
-    confirmed: T,
-}
-
 /// Shared handles threaded through both `SpecsAnalyserDriver` (`with_wire`,
 /// ADAcquire start/stop signalling) and the acquisition `task::Worker` —
 /// grouped into one bundle so `SpecsAnalyserDriver::new` takes one parameter
@@ -168,35 +161,35 @@ impl SpecsAnalyserDriver {
     /// C `SpecsAnalyser::makeConnection` + the always-run
     /// `readSpectrumParameter`/`readRunModes` calls that both the
     /// constructor and `writeInt32`'s `SPECSConnect_` case perform
-    /// (`specsAnalyser.cpp:153-169`, `798-814`).
-    fn reconnect(&mut self) -> bool {
+    /// (`specsAnalyser.cpp:153-169`, `798-814`). The status is the first
+    /// failing step's: C ORs the step statuses, which can only differ from
+    /// that by mixing two different failure codes into a third.
+    fn reconnect(&mut self) -> AsynResult<()> {
         let first_connect = self.first_connect;
         let outcome = self.with_wire(move |link| {
-            let mut ok = link.connect().is_ok();
+            let mut connection = link.connect().map(|_| ());
             let mut visible_name = None;
             let mut discovered = Vec::new();
             let mut non_energy_channels = None;
-            if ok && first_connect {
-                match link.read_device_visible_name() {
-                    Ok(name) => visible_name = Some(name),
-                    Err(_) => ok = false,
+            if connection.is_ok() && first_connect {
+                connection = link.read_device_visible_name().map(|name| {
+                    visible_name = Some(name);
+                });
+                if connection.is_ok() {
+                    connection = link.setup_epics_parameters().map(|params| {
+                        discovered = params;
+                    });
                 }
-                if ok {
-                    match link.setup_epics_parameters() {
-                        Ok(params) => discovered = params,
-                        Err(_) => ok = false,
-                    }
-                }
-                if ok {
+                if connection.is_ok() {
                     non_energy_channels =
                         link.get_analyser_parameter_int("NumNonEnergyChannels").ok();
                 }
             }
-            let (lens_modes, _) = link.read_spectrum_parameter("LensMode");
-            let (scan_ranges, _) = link.read_spectrum_parameter("ScanRange");
+            let lens_modes = link.read_spectrum_parameter("LensMode");
+            let scan_ranges = link.read_spectrum_parameter("ScanRange");
             let run_modes = wire::read_run_modes();
             ReconnectOutcome {
-                ok,
+                connection,
                 visible_name,
                 discovered,
                 non_energy_channels,
@@ -206,7 +199,7 @@ impl SpecsAnalyserDriver {
             }
         });
 
-        if outcome.ok {
+        if outcome.connection.is_ok() {
             if let Some(name) = outcome.visible_name {
                 let _ = self
                     .ad
@@ -253,37 +246,47 @@ impl SpecsAnalyserDriver {
             self.first_connect = false;
         }
 
-        *self.lens_modes.lock().unwrap() = outcome.lens_modes.clone();
-        *self.scan_ranges.lock().unwrap() = outcome.scan_ranges.clone();
+        // C keeps one entry on a failed read so the mbbi/mbbo SDEF is set.
+        let or_not_connected = |values: &Result<Vec<String>, wire::WireError>| match values {
+            Ok(values) => values.clone(),
+            Err(_) => vec!["Not connected".to_string()],
+        };
+        let lens_modes = or_not_connected(&outcome.lens_modes);
+        let scan_ranges = or_not_connected(&outcome.scan_ranges);
         let _ = self.ad.port_base.set_enum_choices_param(
             self.p.lens_mode,
             0,
-            enum_choices(&outcome.lens_modes),
+            enum_choices(&lens_modes),
         );
         let _ = self.ad.port_base.set_enum_choices_param(
             self.p.scan_range,
             0,
-            enum_choices(&outcome.scan_ranges),
+            enum_choices(&scan_ranges),
         );
+        *self.lens_modes.lock().unwrap() = lens_modes;
+        *self.scan_ranges.lock().unwrap() = scan_ranges;
         let _ = self.ad.port_base.set_enum_choices_param(
             self.p.run_mode,
             0,
             enum_choices(&outcome.run_modes),
         );
 
-        outcome.ok
+        outcome.connection?;
+        outcome.lens_modes?;
+        outcome.scan_ranges?;
+        Ok(())
     }
 
     /// `SpecsAnalyser::writeInt32`'s `SPECSDefine_` case
     /// (`specsAnalyser.cpp:815-832`).
-    fn dispatch_define(&mut self) {
+    fn dispatch_define(&mut self) -> AsynResult<()> {
         let Some(mode) = RunMode::from_i32(
             self.ad
                 .port_base
                 .get_int32_param(self.p.run_mode, 0)
                 .unwrap_or(0),
         ) else {
-            return;
+            return Ok(());
         };
         let start_energy = self
             .ad
@@ -350,7 +353,7 @@ impl SpecsAnalyserDriver {
             .cloned()
             .unwrap_or_default();
 
-        let _ = self.with_wire(move |link| match mode {
+        self.with_wire(move |link| match mode {
             RunMode::Fat => link
                 .define_fat(
                     DefineFatArgs {
@@ -393,14 +396,15 @@ impl SpecsAnalyserDriver {
                 &lens_mode,
                 &scan_range,
             ),
-        });
+        })?;
+        Ok(())
     }
 
     /// `SpecsAnalyser::writeInt32`'s `SPECSValidate_` case, i.e. a direct
     /// call to `validateSpectrum()` (`specsAnalyser.cpp:833-835`,
     /// `979-1073`) outside the acquisition loop — no `SPECSSamples_` total
     /// and no SFAT recompute, both of which are `specsAnalyserTask`-only.
-    fn dispatch_validate(&mut self) {
+    fn dispatch_validate(&mut self) -> AsynResult<()> {
         let run_mode = RunMode::from_i32(
             self.ad
                 .port_base
@@ -414,98 +418,73 @@ impl SpecsAnalyserDriver {
             .unwrap_or(0.0);
         let lens_modes = self.lens_modes.lock().unwrap().clone();
         let scan_ranges = self.scan_ranges.lock().unwrap().clone();
-        let result = self.with_wire(move |link| {
+        let r = self.with_wire(move |link| {
             link.validate_spectrum(run_mode, kinetic_energy, &lens_modes, &scan_ranges)
-        });
-        if let Ok(r) = result {
-            let _ = self
-                .ad
-                .port_base
-                .set_float64_param(self.p.start_energy, 0, r.start_energy);
-            let _ = self
-                .ad
-                .port_base
-                .set_float64_param(self.p.end_energy, 0, r.end_energy);
-            let _ = self
-                .ad
-                .port_base
-                .set_float64_param(self.p.step_width, 0, r.step_width);
-            let _ = self
-                .ad
-                .port_base
-                .set_int32_param(self.p.samples_iteration, 0, r.samples);
-            let _ =
-                self.ad
-                    .port_base
-                    .set_float64_param(self.ad.params.acquire_time, 0, r.dwell_time);
-            let _ = self
-                .ad
-                .port_base
-                .set_float64_param(self.p.pass_energy, 0, r.pass_energy);
-            let _ = self
-                .ad
-                .port_base
-                .set_int32_param(self.p.lens_mode, 0, r.lens_mode);
-            let _ = self
-                .ad
-                .port_base
-                .set_int32_param(self.p.scan_range, 0, r.scan_range);
-        }
+        })?;
+        let _ = self
+            .ad
+            .port_base
+            .set_float64_param(self.p.start_energy, 0, r.start_energy);
+        let _ = self
+            .ad
+            .port_base
+            .set_float64_param(self.p.end_energy, 0, r.end_energy);
+        let _ = self
+            .ad
+            .port_base
+            .set_float64_param(self.p.step_width, 0, r.step_width);
+        let _ = self
+            .ad
+            .port_base
+            .set_int32_param(self.p.samples_iteration, 0, r.samples);
+        let _ = self
+            .ad
+            .port_base
+            .set_float64_param(self.ad.params.acquire_time, 0, r.dwell_time);
+        let _ = self
+            .ad
+            .port_base
+            .set_float64_param(self.p.pass_energy, 0, r.pass_energy);
+        let _ = self
+            .ad
+            .port_base
+            .set_int32_param(self.p.lens_mode, 0, r.lens_mode);
+        let _ = self
+            .ad
+            .port_base
+            .set_int32_param(self.p.scan_range, 0, r.scan_range);
+        Ok(())
     }
 
-    /// The `setAnalyserParameter` + re-confirm-or-revert pattern shared by
+    /// The `setAnalyserParameter` + re-confirm pattern shared by
     /// `SPECSNonEnergyChannels_` (`specsAnalyser.cpp:865-875`) and the
-    /// dynamic `paramIndexes_` fallback (`specsAnalyser.cpp:886-902`).
-    fn set_confirm_int(&self, raw_name: String, value: i32) -> SetConfirmOutcome<i32> {
+    /// dynamic `paramIndexes_` fallback (`specsAnalyser.cpp:886-902`); the
+    /// caller reverts to the old value on `Err`.
+    fn set_confirm_int(&self, raw_name: String, value: i32) -> AsynResult<i32> {
         self.with_wire(move |link| {
-            let ok = link.set_analyser_parameter_int(&raw_name, value).is_ok();
-            let confirmed = if ok {
-                link.get_analyser_parameter_int(&raw_name).ok()
-            } else {
-                None
-            };
-            match confirmed {
-                Some(v) => SetConfirmOutcome {
-                    ok: true,
-                    confirmed: v,
-                },
-                None => SetConfirmOutcome {
-                    ok: false,
-                    confirmed: value,
-                },
-            }
+            link.set_analyser_parameter_int(&raw_name, value)?;
+            link.get_analyser_parameter_int(&raw_name)
         })
+        .map_err(AsynError::from)
     }
 
-    fn set_confirm_double(&self, raw_name: String, value: f64) -> SetConfirmOutcome<f64> {
+    fn set_confirm_double(&self, raw_name: String, value: f64) -> AsynResult<f64> {
         self.with_wire(move |link| {
-            let ok = link.set_analyser_parameter_double(&raw_name, value).is_ok();
-            let confirmed = if ok {
-                link.get_analyser_parameter_double(&raw_name).ok()
-            } else {
-                None
-            };
-            match confirmed {
-                Some(v) => SetConfirmOutcome {
-                    ok: true,
-                    confirmed: v,
-                },
-                None => SetConfirmOutcome {
-                    ok: false,
-                    confirmed: value,
-                },
-            }
+            link.set_analyser_parameter_double(&raw_name, value)?;
+            link.get_analyser_parameter_double(&raw_name)
         })
+        .map_err(AsynError::from)
     }
 }
 
 struct ReconnectOutcome {
-    ok: bool,
+    /// `makeConnection`'s status.
+    connection: Result<(), wire::WireError>,
     visible_name: Option<String>,
     discovered: Vec<wire::DiscoveredParam>,
     non_energy_channels: Option<i32>,
-    lens_modes: Vec<String>,
-    scan_ranges: Vec<String>,
+    lens_modes: Result<Vec<String>, wire::WireError>,
+    scan_ranges: Result<Vec<String>, wire::WireError>,
     run_modes: Vec<String>,
 }
 
@@ -570,12 +549,12 @@ impl PortDriver for SpecsAnalyserDriver {
                 .get_int32_param(self.p.connected, addr)
                 .unwrap_or(0);
             if connected == 0 {
-                self.reconnect();
+                result = self.reconnect();
             }
         } else if function == self.p.define {
-            self.dispatch_define();
+            result = self.dispatch_define();
         } else if function == self.p.validate {
-            self.dispatch_validate();
+            result = self.dispatch_validate();
         } else if function == self.p.pause_acq {
             let acquire = self
                 .ad
@@ -610,16 +589,13 @@ impl PortDriver for SpecsAnalyserDriver {
                 }
             }
         } else if function == self.p.non_energy_channels {
-            let outcome = self.set_confirm_int("NumNonEnergyChannels".to_string(), value);
+            let confirmed = self.set_confirm_int("NumNonEnergyChannels".to_string(), value);
             self.ad.port_base.set_int32_param(
                 function,
                 addr,
-                if outcome.ok {
-                    outcome.confirmed
-                } else {
-                    old_value
-                },
+                *confirmed.as_ref().unwrap_or(&old_value),
             )?;
+            result = confirmed.map(|_| ());
         } else if function == self.p.safe_state && value != 0 {
             if idle_like {
                 let _ = self.with_wire(|link| link.command_response("SetSafeState"));
@@ -639,16 +615,13 @@ impl PortDriver for SpecsAnalyserDriver {
             .and_then(|epics_name| self.param_map.get(epics_name))
             .cloned()
         {
-            let outcome = self.set_confirm_int(raw_name, value);
+            let confirmed = self.set_confirm_int(raw_name, value);
             self.ad.port_base.set_int32_param(
                 function,
                 addr,
-                if outcome.ok {
-                    outcome.confirmed
-                } else {
-                    old_value
-                },
+                *confirmed.as_ref().unwrap_or(&old_value),
             )?;
+            result = confirmed.map(|_| ());
         }
 
         self.ad.port_base.call_param_callbacks(addr)?;
@@ -664,6 +637,7 @@ impl PortDriver for SpecsAnalyserDriver {
             .get_float64_param(function, addr)
             .unwrap_or(0.0);
         self.ad.port_base.set_float64_param(function, addr, value)?;
+        let mut result: AsynResult<()> = Ok(());
 
         // C's writeFloat64 only ever dispatches to the dynamic
         // `paramIndexes_` fallback (specsAnalyser.cpp:927-971) — none of
@@ -674,20 +648,17 @@ impl PortDriver for SpecsAnalyserDriver {
             .and_then(|epics_name| self.param_map.get(epics_name))
             .cloned()
         {
-            let outcome = self.set_confirm_double(raw_name, value);
+            let confirmed = self.set_confirm_double(raw_name, value);
             self.ad.port_base.set_float64_param(
                 function,
                 addr,
-                if outcome.ok {
-                    outcome.confirmed
-                } else {
-                    old_value
-                },
+                *confirmed.as_ref().unwrap_or(&old_value),
             )?;
+            result = confirmed.map(|_| ());
         }
 
         self.ad.port_base.call_param_callbacks(addr)?;
-        Ok(())
+        result
     }
 }
 
@@ -778,7 +749,7 @@ pub fn create_specs_analyser_detector(
     // the acquisition task and the actor are even created
     // (specsAnalyser.cpp:153-169). Failure is not terminal (upstream's own
     // commented-out early-return, specsAnalyser.cpp:156-162).
-    if !driver.reconnect() {
+    if driver.reconnect().is_err() {
         let _ =
             driver
                 .ad

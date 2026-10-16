@@ -232,11 +232,11 @@ impl Worker {
             .command_response(&codec::get_value_command(name))
             .await?;
         let value = data.get("Value").map(String::as_str).unwrap_or("");
-        Ok(match value {
-            "\"false\"" => 0,
-            "\"true\"" => 1,
-            _ => codec::parse_integer_field(value).unwrap_or(0),
-        })
+        match value {
+            "\"false\"" => Ok(0),
+            "\"true\"" => Ok(1),
+            _ => codec::parse_integer_field(value).ok_or(WireError::Field("Value")),
+        }
     }
 
     async fn read_ordinate_range(&mut self) -> Result<OrdinateRange, WireError> {
