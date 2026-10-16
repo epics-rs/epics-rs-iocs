@@ -55,7 +55,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi};
@@ -150,6 +152,9 @@ fn fmt(v: f64) -> String {
 /// axis count, and the configuration-time homing method.
 pub struct SpiiPlusController {
     handle: SyncIOHandle,
+    /// C `SPiiPlusComm`'s port, `<ACSPortName>Comm`, whose `pasynUserSelf`
+    /// prints every exchange error.
+    comm_port: String,
     ident: String,
     num_axes: usize,
     homing_method: i32,
@@ -160,9 +165,15 @@ impl SpiiPlusController {
     /// constructor): probe `?VR` (retry up to 3 times) and read the firmware
     /// version. `num_axes` and `homing_method` come from the config command.
     /// Performs blocking octet I/O.
-    pub fn new(handle: SyncIOHandle, num_axes: usize, homing_method: i32) -> AsynResult<Self> {
+    pub fn new(
+        handle: SyncIOHandle,
+        port: &str,
+        num_axes: usize,
+        homing_method: i32,
+    ) -> AsynResult<Self> {
         let mut ctrl = Self {
             handle,
+            comm_port: format!("{port}Comm"),
             ident: String::new(),
             num_axes,
             homing_method,
@@ -170,7 +181,7 @@ impl SpiiPlusController {
 
         let mut probed = false;
         for _ in 0..3 {
-            if let Ok(v) = ctrl.command("?VR")
+            if let Ok(v) = ctrl.exchange("writeReadStr", "?VR")
                 && !v.is_empty()
             {
                 ctrl.ident = v;
@@ -194,17 +205,22 @@ impl SpiiPlusController {
         self.num_axes
     }
 
+    /// Send a set/motion command (C `writeReadAck`).
+    fn command(&self, cmd: &str) -> AsynResult<String> {
+        self.exchange("writeReadAck", cmd)
+    }
+
     /// Send a command and return its reply (trimmed of CR/LF/NUL/`:` prompt and
     /// spaces). A reply whose first character is `?` is a controller error
-    /// (`?<errno>`), returned as an [`AsynError`] (C `writeReadAck`). A
-    /// successful set/motion command replies with only the prompt (empty after
-    /// trimming); a query replies with the value.
-    fn command(&self, cmd: &str) -> AsynResult<String> {
+    /// (`?<errno>`): C prints it as `func` and asks the controller for its
+    /// text. A successful set/motion command replies with only the prompt
+    /// (empty after trimming); a query replies with the value.
+    fn exchange(&self, func: &str, cmd: &str) -> AsynResult<String> {
         // C SPiiPlusComm::writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        let text = String::from_utf8_lossy(&raw);
-        let text = text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string();
+        let text = self.write_read(cmd)?;
         if text.starts_with('?') {
+            self.print(format_args!("SPiiPlusComm:{func}: Command failed: {cmd}\n"));
+            self.error_message(&text);
             return Err(spiiplus_err(format!(
                 "SPiiPlus command failed: {cmd} -> {text}"
             )));
@@ -212,14 +228,49 @@ impl SpiiPlusController {
         Ok(text)
     }
 
+    fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let text = String::from_utf8_lossy(&raw);
+        Ok(text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string())
+    }
+
+    /// C `writeReadErrorMessage`: `?<reply>` (`??<errno>`) fetches the
+    /// error's text; its status never changes the caller's.
+    fn error_message(&self, reply: &str) {
+        let errno = atoi(&reply[1..]);
+        match self.write_read(&format!("?{reply}")) {
+            Ok(text) if !text.starts_with('?') => self.print(format_args!(
+                "SPiiPlusComm:writeReadErrorMessage: ERROR #{errno}: {text}\n"
+            )),
+            _ => self.print(format_args!(
+                "SPiiPlusComm:writeReadErrorMessage: ERROR #{errno}\n"
+            )),
+        }
+    }
+
+    fn print(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.comm_port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
+    }
+
     /// Read a single integer array element `?VAR(index)` (0 on empty reply).
     fn query_int(&self, var: &str, index: usize) -> AsynResult<i32> {
-        Ok(atoi(&self.command(&format!("?{var}({index})"))?))
+        Ok(atoi(
+            &self.exchange("writeReadInt", &format!("?{var}({index})"))?,
+        ))
     }
 
     /// Read a single double array element `?VAR(index)` (0.0 on empty reply).
     fn query_double(&self, var: &str, index: usize) -> AsynResult<f64> {
-        Ok(atof(&self.command(&format!("?{var}({index})"))?))
+        Ok(atof(&self.exchange(
+            "writeReadDouble",
+            &format!("?{var}({index})"),
+        )?))
     }
 }
 

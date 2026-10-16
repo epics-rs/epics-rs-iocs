@@ -92,8 +92,9 @@ pub fn acsmotion_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 OUTPUT_EOS,
                 EosRefusal::Ignored,
             )?;
-            let controller = SpiiPlusController::new(handle, num_axes, homing_method)
-                .map_err(|e| format!("AcsMotionConfig: {e}"))?;
+            let controller =
+                SpiiPlusController::new(handle, &card.to_string(), num_axes, homing_method)
+                    .map_err(|e| format!("AcsMotionConfig: {e}"))?;
             let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 
