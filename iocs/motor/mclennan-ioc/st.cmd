@@ -30,18 +30,17 @@ asynSetOption("$(SERIAL)", 0, "stop",   "1")
 asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- PM304 controller ----
-# PM304Setup(maxControllers, [scanRate]) is accepted for startup-script parity;
-# the asyn-rs port allocates per PM304Config call.
+# PM304Setup(num_cards, scan_rate in Hz)
 PM304Setup(1, 10)
 
-# PM304Config(card, asynPort, nAxes, [movingPollMs], [idlePollMs]) - the model
+# PM304Config(card, asyn port, n_axes) - the model
 # (PM304 vs PM600) is auto-detected from the 1ID reply.
-PM304Config(0, "$(SERIAL)", 2, 100, 1000)
+PM304Config(0, "$(SERIAL)", 2)
 
-# One motor record per axis (DTYP PM304_$(CARD)_0, _1, ...). The controller
+# One motor record per axis (DTYP "Mclennan PM304", OUT #C$(CARD) S0, S1, ...). The controller
 # works in motor steps, so MRES = 1 and EGU = steps.
-dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m1,C=$(CARD),S=0")
+dbLoadRecords("$(MCLENNAN_IOC)/db/pm304.template", "P=$(P),M=m2,C=$(CARD),S=1")
 
 iocInit()
 
