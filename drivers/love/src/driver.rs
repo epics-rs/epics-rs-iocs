@@ -372,7 +372,7 @@ impl LoveDriver {
         timeout: Duration,
         models: ModelTable,
     ) -> AsynResult<Self> {
-        let base = PortDriverBase::new(
+        let mut base = PortDriverBase::new(
             port_name,
             K_INSTRMAX + 1,
             PortFlags {
@@ -381,6 +381,10 @@ impl LoveDriver {
                 destructible: true,
             },
         );
+        // C registers a bare asynDriver port, which starts down
+        // (asynManager.c:523); only `connectIt` brings it up, and it refuses
+        // while the serial port is down.
+        base.init_connected(false);
 
         Ok(Self {
             base,
@@ -862,6 +866,48 @@ mod tests {
         ] {
             assert!(out.contains(line), "missing {line:?} in {out:?}");
         }
+    }
+
+    /// C `connectIt` refuses while the serial port is down, so the love port
+    /// never comes up and a request is refused at the queue without a
+    /// command reaching the serial line (drvLove.c:1003-1014).
+    #[test]
+    fn a_down_serial_port_keeps_the_love_port_down() {
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let mut base = PortDriverBase::new(
+            "LOVETESTDWN",
+            1,
+            PortFlags {
+                multi_device: false,
+                can_block: true,
+                destructible: true,
+            },
+        );
+        base.set_auto_connect(false);
+        base.init_connected(false);
+        let love = love_on(TimeoutSerial { base }, "LOVETESTDWNL");
+        let claim = claim_port("LOVETESTDWNL").expect("love port name");
+        let (runtime, _thread) =
+            create_port_runtime(&claim, love, RuntimeConfig::default()).expect("love port runtime");
+        let path = std::env::temp_dir().join(format!("love-down-{}.txt", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        runtime.port_handle().trace().set_trace_file(
+            Some("LOVETESTDWNL"),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        let user =
+            SyncIOHandle::from_handle(runtime.port_handle().clone(), 1, Duration::from_secs(5));
+        let err = user.read_int32(0).expect_err("love port is down");
+        assert_eq!(err.status(), AsynStatus::Disconnected, "{err:?}");
+        assert!(!runtime.port_handle().is_connected_blocking(-1).unwrap());
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!out.contains("drvLove::sendCommand"), "{out:?}");
     }
 
     /// C `reportIt` (drvLove.c:978-990): the port pair, then every address
