@@ -630,18 +630,21 @@ impl Actor {
 
     /// `load_status` (`drvGM10.c:625-656`).
     fn load_status(&mut self) -> io::Result<()> {
+        // A failed sscanf leaves the previous value (`drvGM10.c:632,638`).
         let orec_payload = self.expect_ascii(&cmd_orec_query())?;
-        let recording_mode = parse_orec(&String::from_utf8_lossy(&orec_payload)).unwrap_or(0) != 0;
+        if let Some(v) = parse_orec(&String::from_utf8_lossy(&orec_payload)) {
+            self.cache.lock().recording_mode = v != 0;
+        }
         let omath_payload = self.expect_ascii(&cmd_omath_query())?;
-        let compute_mode = parse_omath(&String::from_utf8_lossy(&omath_payload)).unwrap_or(0);
+        if let Some(v) = parse_omath(&String::from_utf8_lossy(&omath_payload)) {
+            self.cache.lock().compute_mode = v;
+        }
 
         let was_settings_mode;
         {
             let mut cache = self.cache.lock();
-            cache.recording_mode = recording_mode;
-            cache.compute_mode = compute_mode;
             was_settings_mode = cache.settings_mode;
-            cache.settings_mode = recording_mode && (compute_mode != 0);
+            cache.settings_mode = cache.recording_mode && (cache.compute_mode != 0);
         }
         self.interrupts.fire(InterruptCategory::Status);
 
@@ -1432,5 +1435,24 @@ mod tests {
         assert!(info.try_recv().is_err());
         let received = device.join().unwrap();
         assert_eq!(received.last().unwrap(), "SRangeAO?\r\n");
+    }
+
+    #[test]
+    fn load_status_keeps_the_previous_mode_on_a_malformed_reply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(ascii_frame(b"ORec,1\r\n"));
+        responses.push(ascii_frame(b"OMath,2\r\n"));
+        responses.push(ascii_frame(b"junk\r\n"));
+        responses.push(ascii_frame(b"OMath,x\r\n"));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ReadStatus);
+        instrument.submit(Command::ReadStatus);
+        assert!(instrument.get_recording_mode());
+        assert_eq!(instrument.get_compute_mode(), 2);
+        assert!(instrument.get_settings_mode());
+        device.join().unwrap();
     }
 }

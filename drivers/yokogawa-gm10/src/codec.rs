@@ -742,13 +742,9 @@ pub fn parse_omath(payload: &str) -> Option<i32> {
     parse_int_after(payload, "OMath,")
 }
 
+/// `sscanf(p, "<prefix>%d", ..)`: `None` leaves C's target unassigned.
 fn parse_int_after(payload: &str, prefix: &str) -> Option<i32> {
-    let idx = payload.find(prefix)?;
-    let rest = &payload[idx + prefix.len()..];
-    let end = rest
-        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
-        .unwrap_or(rest.len());
-    rest[..end].parse().ok()
+    scanf_int(payload.strip_prefix(prefix)?).map(|(v, _)| v)
 }
 
 #[cfg(test)]
