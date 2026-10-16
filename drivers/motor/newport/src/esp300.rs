@@ -27,10 +27,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, atoi, is_unsolicited_limit_error, leading_hex};
 
@@ -49,13 +50,6 @@ pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Maximum axes per controller (C `ESP300_MAX_AXIS`).
 pub(crate) const ESP300_MAX_AXES: usize = 6;
-
-fn esp_err(message: String) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message,
-    }
-}
 
 /// Controller communication state (C `cntrl->status`): one garbled status
 /// reply is retried silently; a second consecutive one is a comm error.
@@ -80,8 +74,9 @@ impl Esp300Controller {
     /// Connect and identify an ESP300: flush, read the identity (`VE?`, up to
     /// 3 tries), then discover the axis count by stopping each axis and
     /// checking `TB?` for error 9 ("axis number out of range") — C
-    /// `motor_init`. Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    /// `motor_init`. `None` is C dropping a card that never answers `VE?`,
+    /// which it does without a word. Performs blocking serial I/O.
+    pub fn new(handle: SyncIOHandle) -> Option<Self> {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
@@ -97,30 +92,29 @@ impl Esp300Controller {
             }
         }
         if ctrl.ident.is_empty() {
-            return Err(esp_err(
-                "ESP300: no response to VE? identity query".to_string(),
-            ));
+            return None;
         }
 
         // Stop each axis in turn; the first "axis number out of range" (9)
         // gives the axis count. Any other error aborts the scan there (a
-        // missing stage is not an error).
+        // missing stage is not an error). C ignores both statuses: a failed
+        // read is an empty reply, which atoi reads as no error.
         let mut num_axes = 0;
         for axis in 1..=ESP300_MAX_AXES {
-            ctrl.write(&format!("{axis:02}ST"))?;
-            let reply = ctrl.write_read("TB?")?;
+            let _ = ctrl.write(&format!("{axis:02}ST"));
+            let reply = ctrl.write_read("TB?").unwrap_or_default();
             let code = atoi(&reply);
             if code == 9 {
                 break;
             }
             if code != 0 {
-                eprintln!("ESP300: error accessing motor {axis}: {reply}");
+                errlog_vprintf(format_args!("Error accessing motor {axis}: {reply}\n"));
                 break;
             }
             num_axes = axis;
         }
         ctrl.num_axes = num_axes;
-        Ok(ctrl)
+        Some(ctrl)
     }
 
     /// Identity string from `VE?`.
@@ -191,36 +185,33 @@ impl Esp300Axis {
     /// / microstep (`QS?`); open loop (`00`) uses `FR?` alone; anything else
     /// has an encoder and uses its resolution (`SU?`). Performs blocking
     /// serial I/O under the controller lock.
-    pub fn new(controller: Arc<Mutex<Esp300Controller>>, axis: usize) -> AsynResult<Self> {
+    /// C ignores every reply status here: a failed read is an empty reply.
+    pub fn new(controller: Arc<Mutex<Esp300Controller>>, axis: usize) -> Self {
         let (drive_resolution, encoder_present) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let read = |cmd: String| ctrl.write_read(&cmd).unwrap_or_default();
             // C reads the controller's EGU (SN?) only for its report(); issue
             // the query for startup wire fidelity and discard the reply.
-            let _ = ctrl.write_read(&format!("{axis:02}SN?"))?;
-            let feedback = leading_hex(&ctrl.write_read(&format!("{axis:02}ZB?"))?).unwrap_or(0);
+            let _ = read(format!("{axis:02}SN?"));
+            let feedback = leading_hex(&read(format!("{axis:02}ZB?"))).unwrap_or(0);
             let resolution = match feedback & 0x300 {
                 0x200 => {
-                    let full_step = atof(&ctrl.write_read(&format!("{axis:02}FR?"))?);
-                    let micro_step = atoi(&ctrl.write_read(&format!("{axis:02}QS?"))?);
+                    let full_step = atof(&read(format!("{axis:02}FR?")));
+                    let micro_step = atoi(&read(format!("{axis:02}QS?")));
                     full_step / f64::from(micro_step)
                 }
-                0x0 => atof(&ctrl.write_read(&format!("{axis:02}FR?"))?),
-                _ => atof(&ctrl.write_read(&format!("{axis:02}SU?"))?),
+                0x0 => atof(&read(format!("{axis:02}FR?"))),
+                _ => atof(&read(format!("{axis:02}SU?"))),
             };
             (resolution, feedback & 0x300 != 0)
         };
-        if drive_resolution == 0.0 || !drive_resolution.is_finite() {
-            return Err(esp_err(format!(
-                "ESP300 axis {axis}: invalid drive resolution {drive_resolution}"
-            )));
-        }
-        Ok(Self {
+        Self {
             controller,
             axis,
             drive_resolution,
             encoder_present,
             last_status: MotorStatus::default(),
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Esp300Controller> {
@@ -371,7 +362,7 @@ impl AsynMotor for Esp300Axis {
 
         let tb = ctrl.write_read("TB?")?;
         if !tb.starts_with('0') {
-            eprintln!("ESP300 status error: {tb}.");
+            println!("ESP300 status error: {tb}.");
             self.last_status.problem = true;
             return Ok(self.last_status.clone());
         }
@@ -415,7 +406,7 @@ impl AsynMotor for Esp300Axis {
         let errcode = atoi(&te);
         let problem = errcode != 0;
         if problem {
-            eprintln!("ESP300 controller error = {errcode}.");
+            println!("ESP300 controller error = {errcode}.");
         }
         drop(ctrl);
 
@@ -443,6 +434,69 @@ impl AsynMotor for Esp300Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers `VE?` and fails every other read.
+    struct IdentOnly {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for IdentOnly {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.reply = if data == b"VE?" {
+                b"ESP300 Version 3.08 09/09/02".to_vec()
+            } else {
+                Vec::new()
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            if reply.is_empty() {
+                return Err(epics_rs::asyn::error::AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Timeout,
+                    message: "timeout".into(),
+                });
+            }
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// C reads a failed `TB?` as an empty buffer, which `atoi` takes as no
+    /// error, so every axis slot is counted and built.
+    #[test]
+    fn unanswered_axis_queries_count_every_axis_as_c_does() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = IdentOnly {
+            base: PortDriverBase::new("esp300IdentOnly", 1, PortFlags::default()),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("esp300IdentOnly").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Esp300Controller::new(io).unwrap();
+        assert_eq!(ctrl.num_axes(), ESP300_MAX_AXES);
+        let axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        assert!(!axis.encoder_present);
+    }
 
     #[test]
     fn preamble_matches_c_transaction() {

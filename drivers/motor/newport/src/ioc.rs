@@ -21,11 +21,13 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::{claim_port, get_port};
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
@@ -1880,26 +1882,37 @@ pub fn esp300_setup_command() -> CommandDef {
 /// finds (stop each axis until "axis number out of range").
 pub fn esp300_config_command() -> CommandDef {
     model1_config_command("ESP300Config", &ESP300, |ctx, card, port| {
-        let handle = connect_with_eos(
+        const ERRMSG: &str = "drvESP300.c:motor_init: ASYN";
+        let handle = match connect_with_eos(
             port,
             ESP300_TIMEOUT,
             esp300::INPUT_EOS,
             esp300::OUTPUT_EOS,
             EosRefusal::InputFatal,
-        )
-        .map_err(|e| match e {
-            EosConnectError::InputEos(_, e) => format!(
-                "drvESP300.c:motor_init: ASYN setInputEos error = {}",
-                e.status() as i32
-            ),
-            e => e.into(),
-        })?;
-        let controller = Esp300Controller::new(handle).map_err(|e| format!("ESP300Config: {e}"))?;
+        ) {
+            Ok(handle) => handle,
+            Err(EosConnectError::InputEos(_, e)) => {
+                errlog_vprintf(format_args!(
+                    "{ERRMSG} setInputEos error = {}\n",
+                    e.status() as i32
+                ));
+                return Ok(());
+            }
+            Err(_) => {
+                errlog_vprintf(format_args!(
+                    "{ERRMSG} connect error = {}\n",
+                    AsynStatus::Error as i32
+                ));
+                return Ok(());
+            }
+        };
+        let Some(controller) = Esp300Controller::new(handle) else {
+            return Ok(());
+        };
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let ax = Esp300Axis::new(controller.clone(), axis)
-                .map_err(|e| format!("ESP300Config: axis {axis}: {e}"))?;
+            let ax = Esp300Axis::new(controller.clone(), axis);
             ESP300.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
