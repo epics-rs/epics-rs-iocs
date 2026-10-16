@@ -8,6 +8,8 @@ use std::sync::mpsc;
 
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::error::AsynStatus;
+use epics_rs::asyn::interrupt::InterruptFilter;
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::registry::{claim_port, open_owner};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -102,6 +104,10 @@ impl Fake {
 
         let claim = claim_port(name).unwrap();
         let runtime = create_specs_analyser_detector(&claim, &ip, 0, 0).expect("detector");
+        // Open, as after iocInit, so the posts reach a subscriber.
+        claim
+            .publish(runtime.port_handle().clone(), &open_owner())
+            .unwrap();
         let fake = Fake {
             runtime,
             arm,
@@ -323,6 +329,32 @@ fn a_write_posts_the_message_counter() {
     let last = fake.last_heard();
     assert!(last > 0);
     assert_eq!(fake.msg_counter(), last as i32);
+}
+
+/// The post comes before each exchange, not once per write: a stored
+/// parameter's set and confirm read post two counters.
+#[test]
+fn a_write_posts_the_counter_for_each_exchange() {
+    let fake = Fake::start("SPECS_WS_EACH");
+    let turns = fake.reason("TURNS");
+    let filter = InterruptFilter {
+        reason: Some(fake.runtime.specs_params.msg_counter),
+        ..Default::default()
+    };
+    let mut posts = fake
+        .runtime
+        .port_handle()
+        .interrupts()
+        .subscribe_async_filtered(filter, 16, 0);
+    fake.write_int32(turns, 9).unwrap();
+    let mut posted = Vec::new();
+    while let Ok(v) = posts.try_recv() {
+        if let ParamValue::Int32(n) = v.value {
+            posted.push(n);
+        }
+    }
+    let last = fake.last_heard() as i32;
+    assert_eq!(posted, [last - 1, last]);
 }
 
 /// The acquisition task's exchanges post it too.

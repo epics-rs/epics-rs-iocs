@@ -3,21 +3,11 @@
 //! (`specsAnalyser.cpp:770-971`), and `specsAnalyserConfig`'s equivalent
 //! runtime wiring.
 //!
-//! `write_int32`/`write_float64` run inside the port actor's own
-//! `current_thread` runtime, which cannot block on a second port (the
-//! `driverPort_` connection). Every branch that needs a wire round trip
-//! therefore spawns a plain OS thread with no tokio runtime of its own (so
-//! `PortHandle::submit_blocking` inside `wire::WireLink` is safe to call
-//! from it), `.join()`s it synchronously (safe from a plain thread with no
-//! active runtime — the same reasoning that makes joining safe from the
-//! port actor's own dispatch thread), then applies the result via `&mut
-//! self` after the join returns. The persistent acquisition worker
-//! (`task::Worker`) is the only place wire I/O happens `.await`-based.
+//! Every exchange with `driverPort_` runs on the port actor through
+//! [`SpecsAnalyserDriver::with_wire`], the acquisition task's included.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -40,7 +30,7 @@ use crate::codec::{DefineFatArgs, DefineFrrArgs};
 use crate::params::SpecsParams;
 use crate::task::{Worker, start_task};
 use crate::types::{Event, RunMode, SOCKET_TIMEOUT, secs};
-use crate::wire::{self, DiscoveredValue, ExchangeTrail, WireLink};
+use crate::wire::{self, DiscoveredValue, WireLink};
 
 fn enum_choices(values: &[String]) -> Arc<[EnumEntry]> {
     values
@@ -61,27 +51,15 @@ pub struct SpecsAnalyserDriver {
     param_indexes: HashMap<usize, String>,
     /// C `paramMap_`: EPICS parameter name -> raw device parameter name.
     param_map: HashMap<String, String>,
-    lens_modes: Arc<Mutex<Vec<String>>>,
-    scan_ranges: Arc<Mutex<Vec<String>>>,
-    wire_state: Arc<Mutex<u32>>,
-    connected: Arc<AtomicBool>,
+    /// C `lensModes_`/`scanRanges_`.
+    lens_modes: Vec<String>,
+    scan_ranges: Vec<String>,
     driver_port: Arc<SyncIOHandle>,
     driver_addr: i32,
     /// C `firstConnect_`.
     first_connect: bool,
     start: Arc<Event>,
     stop: Arc<Event>,
-}
-
-/// Shared handles threaded through both `SpecsAnalyserDriver` (`with_wire`,
-/// ADAcquire start/stop signalling) and the acquisition `task::Worker` —
-/// grouped into one bundle so `SpecsAnalyserDriver::new` takes one parameter
-/// for them instead of four.
-pub struct SharedWireHandles {
-    pub wire_state: Arc<Mutex<u32>>,
-    pub connected: Arc<AtomicBool>,
-    pub start: Arc<Event>,
-    pub stop: Arc<Event>,
 }
 
 impl SpecsAnalyserDriver {
@@ -91,14 +69,9 @@ impl SpecsAnalyserDriver {
         driver_addr: i32,
         max_buffers: i32,
         max_memory: usize,
-        shared: SharedWireHandles,
+        start: Arc<Event>,
+        stop: Arc<Event>,
     ) -> AsynResult<Self> {
-        let SharedWireHandles {
-            wire_state,
-            connected,
-            start,
-            stop,
-        } = shared;
         let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let _ = max_buffers;
         let p = SpecsParams::create(&mut ad.port_base)?;
@@ -124,10 +97,8 @@ impl SpecsAnalyserDriver {
             p,
             param_indexes: HashMap::new(),
             param_map: HashMap::new(),
-            lens_modes: lens_modes_default(),
-            scan_ranges: lens_modes_default(),
-            wire_state,
-            connected,
+            lens_modes: Vec::new(),
+            scan_ranges: Vec::new(),
             driver_port,
             driver_addr,
             first_connect: true,
@@ -136,41 +107,61 @@ impl SpecsAnalyserDriver {
         })
     }
 
-    /// Runs `f`'s exchanges, then sets what they left in the parameter
-    /// library. The port is held meanwhile, so the counter C posts before
-    /// each exchange is posted once, with the write's own callbacks.
-    fn with_wire<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(&mut WireLink) -> R + Send + 'static,
-        R: Send + 'static,
-    {
-        let driver_port = self.driver_port.clone();
-        let addr = self.driver_addr;
-        let wire_state = self.wire_state.clone();
-        let connected = self.connected.clone();
-        let (result, trail) = std::thread::spawn(move || {
-            let mut link = WireLink {
-                driver_port: &driver_port,
-                addr,
-                wire_state: &wire_state,
-                connected: &connected,
-                trail: ExchangeTrail::default(),
-            };
-            let result = f(&mut link);
-            (result, link.trail)
+    /// `f`'s exchanges, on this driver.
+    pub(crate) fn with_wire<R>(&mut self, f: impl FnOnce(&mut WireLink) -> R) -> R {
+        f(&mut WireLink {
+            driver_port: &self.driver_port,
+            addr: self.driver_addr,
+            base: &mut self.ad.port_base,
+            p: &self.p,
+            status_message: self.ad.params.status_message,
         })
-        .join()
-        .expect("specs-analyser wire thread panicked");
+    }
+
+    /// The `createParam`/`set*Param` half of `setupEPICSParameters`
+    /// (`specsAnalyser.cpp:1420-1489`).
+    fn create_discovered(&mut self, discovered: Vec<wire::DiscoveredParam>) {
+        for param in discovered {
+            let kind = match &param.value {
+                DiscoveredValue::Int(_) => ParamType::Int32,
+                DiscoveredValue::Double(_) => ParamType::Float64,
+                DiscoveredValue::String(_) => ParamType::Octet,
+            };
+            let base = &mut self.ad.port_base;
+            let Ok(reason) = base.create_param(&param.epics_name, kind) else {
+                continue;
+            };
+            match param.value {
+                DiscoveredValue::Int(Some(v)) => {
+                    let _ = base.set_int32_param(reason, 0, v);
+                }
+                DiscoveredValue::Double(Some(v)) => {
+                    let _ = base.set_float64_param(reason, 0, v);
+                }
+                DiscoveredValue::String(Some(v)) => {
+                    let _ = base.set_string_param(reason, 0, v);
+                }
+                _ => {}
+            }
+            self.param_indexes.insert(reason, param.epics_name.clone());
+            self.param_map.insert(param.epics_name, param.raw_name);
+        }
+    }
+
+    /// `SpecsAnalyser::connect` (`specsAnalyser.cpp:220-241`).
+    fn connect(&mut self) -> Result<(), wire::WireError> {
+        let result = self.with_wire(|link| link.connect());
         let base = &mut self.ad.port_base;
-        // An ERROR 3 reply disconnects (specsAnalyser.cpp:2021-2024, 1882).
-        let connected = self.connected.load(Ordering::SeqCst) as i32;
-        let _ = base.set_int32_param(self.p.connected, 0, connected);
-        if let Some(counter) = trail.msg_counter {
-            let _ = base.set_int32_param(self.p.msg_counter, 0, counter as i32);
-        }
-        if let Some(message) = trail.status_message {
-            let _ = base.set_string_param(self.ad.params.status_message, 0, message);
-        }
+        let status = if result.is_ok() {
+            let _ = base.set_int32_param(self.p.connected, 0, 1);
+            let _ = base.set_string_param(self.ad.params.status_message, 0, "Connected to SPECS");
+            ADStatus::Idle
+        } else {
+            let _ = base.set_int32_param(self.p.connected, 0, 0);
+            ADStatus::Error
+        };
+        let _ = base.set_int32_param(self.ad.params.status, 0, status as i32);
+        let _ = base.call_param_callbacks(0);
         result
     }
 
@@ -180,138 +171,71 @@ impl SpecsAnalyserDriver {
     /// (`specsAnalyser.cpp:153-169`, `798-814`), with C's OR of the step
     /// statuses.
     fn reconnect(&mut self) -> AsynResult<()> {
-        let first_connect = self.first_connect;
-        let outcome = self.with_wire(move |link| {
-            let connect = link.connect();
-            let mut connection = Ok(());
-            let mut visible_name = None;
-            let mut discovered = Vec::new();
-            let mut non_energy_channels = None;
-            if connect.is_ok() && first_connect {
-                connection = link.read_device_visible_name().map(|name| {
-                    visible_name = Some(name);
+        // makeConnection (`specsAnalyser.cpp:180-218`).
+        let connect = self.connect();
+        let mut connection = Ok(());
+        if connect.is_ok() && self.first_connect {
+            connection = self
+                .with_wire(|link| link.read_device_visible_name())
+                .map(|name| {
+                    let _ = self
+                        .ad
+                        .port_base
+                        .set_string_param(self.ad.params.base.model, 0, name);
                 });
-                if connection.is_ok() {
-                    connection = link.setup_epics_parameters().map(|params| {
-                        discovered = params;
-                    });
-                }
-                if connection.is_ok() {
-                    non_energy_channels =
-                        link.get_analyser_parameter_int("NumNonEnergyChannels").ok();
-                }
+            if connection.is_ok() {
+                connection = self
+                    .with_wire(|link| link.setup_epics_parameters())
+                    .map(|discovered| self.create_discovered(discovered));
             }
-            let lens_modes = link.read_spectrum_parameter("LensMode");
-            let scan_ranges = link.read_spectrum_parameter("ScanRange");
-            let run_modes = wire::read_run_modes();
-            ReconnectOutcome {
-                connect,
-                connection,
-                visible_name,
-                discovered,
-                non_energy_channels,
-                lens_modes,
-                scan_ranges,
-                run_modes,
-            }
-        });
-
-        let base = &mut self.ad.port_base;
-        match &outcome.connect {
-            Ok(info) => {
-                let _ = base.set_string_param(self.p.server_name, 0, info.server_name.clone());
-                let _ = base.set_string_param(
-                    self.p.protocol_version,
+            if connection.is_ok() {
+                let non_energy_channels = self
+                    .with_wire(|link| link.get_analyser_parameter_int("NumNonEnergyChannels"))
+                    .unwrap_or(0);
+                let _ = self.ad.port_base.set_int32_param(
+                    self.p.non_energy_channels,
                     0,
-                    info.protocol_version.clone(),
+                    non_energy_channels,
                 );
-                let _ =
-                    base.set_string_param(self.ad.params.status_message, 0, "Connected to SPECS");
-                let _ = base.set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32);
             }
-            Err(_) => {
-                let _ = base.set_int32_param(self.ad.params.status, 0, ADStatus::Error as i32);
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            if connection.is_ok() {
+                self.first_connect = false;
             }
         }
-        let _ = base.call_param_callbacks(0);
-
-        if outcome.connect.is_ok() && outcome.connection.is_ok() {
-            if let Some(name) = outcome.visible_name {
-                let _ = self
-                    .ad
-                    .port_base
-                    .set_string_param(self.ad.params.base.model, 0, name);
-            }
-            for param in outcome.discovered {
-                let reason = match &param.value {
-                    DiscoveredValue::Int(_) => self
-                        .ad
-                        .port_base
-                        .create_param(&param.epics_name, ParamType::Int32),
-                    DiscoveredValue::Double(_) => self
-                        .ad
-                        .port_base
-                        .create_param(&param.epics_name, ParamType::Float64),
-                    DiscoveredValue::String(_) => self
-                        .ad
-                        .port_base
-                        .create_param(&param.epics_name, ParamType::Octet),
-                };
-                let Ok(reason) = reason else { continue };
-                match param.value {
-                    DiscoveredValue::Int(Some(v)) => {
-                        let _ = self.ad.port_base.set_int32_param(reason, 0, v);
-                    }
-                    DiscoveredValue::Double(Some(v)) => {
-                        let _ = self.ad.port_base.set_float64_param(reason, 0, v);
-                    }
-                    DiscoveredValue::String(Some(v)) => {
-                        let _ = self.ad.port_base.set_string_param(reason, 0, v);
-                    }
-                    _ => {}
-                }
-                self.param_indexes.insert(reason, param.epics_name.clone());
-                self.param_map.insert(param.epics_name, param.raw_name);
-            }
-            if let Some(v) = outcome.non_energy_channels {
-                let _ = self
-                    .ad
-                    .port_base
-                    .set_int32_param(self.p.non_energy_channels, 0, v);
-            }
-            self.first_connect = false;
-        }
+        let lens_modes = self.with_wire(|link| link.read_spectrum_parameter("LensMode"));
+        let scan_ranges = self.with_wire(|link| link.read_spectrum_parameter("ScanRange"));
+        let run_modes = wire::read_run_modes();
 
         // C keeps one entry on a failed read so the mbbi/mbbo SDEF is set.
         let or_not_connected = |values: &Result<Vec<String>, wire::WireError>| match values {
             Ok(values) => values.clone(),
             Err(_) => vec!["Not connected".to_string()],
         };
-        let lens_modes = or_not_connected(&outcome.lens_modes);
-        let scan_ranges = or_not_connected(&outcome.scan_ranges);
+        let lens_mode_values = or_not_connected(&lens_modes);
+        let scan_range_values = or_not_connected(&scan_ranges);
         let _ = self.ad.port_base.set_enum_choices_param(
             self.p.lens_mode,
             0,
-            enum_choices(&lens_modes),
+            enum_choices(&lens_mode_values),
         );
         let _ = self.ad.port_base.set_enum_choices_param(
             self.p.scan_range,
             0,
-            enum_choices(&scan_ranges),
+            enum_choices(&scan_range_values),
         );
-        *self.lens_modes.lock().unwrap() = lens_modes;
-        *self.scan_ranges.lock().unwrap() = scan_ranges;
-        let _ = self.ad.port_base.set_enum_choices_param(
-            self.p.run_mode,
-            0,
-            enum_choices(&outcome.run_modes),
-        );
+        self.lens_modes = lens_mode_values;
+        self.scan_ranges = scan_range_values;
+        let _ =
+            self.ad
+                .port_base
+                .set_enum_choices_param(self.p.run_mode, 0, enum_choices(&run_modes));
 
         let failures = [
-            outcome.connect.err(),
-            outcome.connection.err(),
-            outcome.lens_modes.err(),
-            outcome.scan_ranges.err(),
+            connect.err(),
+            connection.err(),
+            lens_modes.err(),
+            scan_ranges.err(),
         ];
         let code = failures
             .iter()
@@ -328,7 +252,7 @@ impl SpecsAnalyserDriver {
 
     /// `SpecsAnalyser::writeInt32`'s `SPECSDefine_` case
     /// (`specsAnalyser.cpp:815-832`).
-    fn dispatch_define(&mut self) -> AsynResult<()> {
+    pub(crate) fn dispatch_define(&mut self) -> AsynResult<()> {
         let Some(mode) = RunMode::from_i32(
             self.ad
                 .port_base
@@ -389,15 +313,11 @@ impl SpecsAnalyserDriver {
             .unwrap_or(0);
         let lens_mode = self
             .lens_modes
-            .lock()
-            .unwrap()
             .get(lens_mode_idx.max(0) as usize)
             .cloned()
             .unwrap_or_default();
         let scan_range = self
             .scan_ranges
-            .lock()
-            .unwrap()
             .get(scan_range_idx.max(0) as usize)
             .cloned()
             .unwrap_or_default();
@@ -465,11 +385,7 @@ impl SpecsAnalyserDriver {
             .port_base
             .get_float64_param(self.p.kinetic_energy, 0)
             .unwrap_or(0.0);
-        let lens_modes = self.lens_modes.lock().unwrap().clone();
-        let scan_ranges = self.scan_ranges.lock().unwrap().clone();
-        let r = self.with_wire(move |link| {
-            link.validate_spectrum(run_mode, kinetic_energy, &lens_modes, &scan_ranges)
-        })?;
+        let r = self.validate_spectrum(run_mode, kinetic_energy)?;
         let _ = self
             .ad
             .port_base
@@ -505,6 +421,28 @@ impl SpecsAnalyserDriver {
         Ok(())
     }
 
+    /// `SpecsAnalyser::validateSpectrum`'s exchange, against this driver's
+    /// lens modes and scan ranges.
+    pub(crate) fn validate_spectrum(
+        &mut self,
+        run_mode: Option<RunMode>,
+        kinetic_energy: f64,
+    ) -> Result<wire::ValidateResult, wire::WireError> {
+        let mut link = WireLink {
+            driver_port: &self.driver_port,
+            addr: self.driver_addr,
+            base: &mut self.ad.port_base,
+            p: &self.p,
+            status_message: self.ad.params.status_message,
+        };
+        link.validate_spectrum(
+            run_mode,
+            kinetic_energy,
+            &self.lens_modes,
+            &self.scan_ranges,
+        )
+    }
+
     /// The `setAnalyserParameter` + re-confirm pattern shared by
     /// `SPECSNonEnergyChannels_` (`specsAnalyser.cpp:865-875`) and the
     /// dynamic `paramIndexes_` fallback (`specsAnalyser.cpp:886-902`); the
@@ -526,19 +464,6 @@ impl SpecsAnalyserDriver {
     }
 }
 
-struct ReconnectOutcome {
-    /// `connect`'s status.
-    connect: Result<wire::ConnectInfo, wire::WireError>,
-    /// The status of `makeConnection`'s first-connect steps.
-    connection: Result<(), wire::WireError>,
-    visible_name: Option<String>,
-    discovered: Vec<wire::DiscoveredParam>,
-    non_energy_channels: Option<i32>,
-    lens_modes: Result<Vec<String>, wire::WireError>,
-    scan_ranges: Result<Vec<String>, wire::WireError>,
-    run_modes: Vec<String>,
-}
-
 /// An ORed asynStatus. 6 and 7 name no status; device support gives them
 /// asynError's alarm (asynEpicsUtils.c asynStatusToEpicsAlarm `default:`).
 fn status_from_c_code(code: i32) -> AsynStatus {
@@ -549,10 +474,6 @@ fn status_from_c_code(code: i32) -> AsynStatus {
         5 => AsynStatus::Disabled,
         _ => AsynStatus::Error,
     }
-}
-
-fn lens_modes_default() -> Arc<Mutex<Vec<String>>> {
-    Arc::new(Mutex::new(Vec::new()))
 }
 
 impl PortDriver for SpecsAnalyserDriver {
@@ -783,8 +704,6 @@ pub fn create_specs_analyser_detector(
     );
     let driver_port = Arc::new(driver_port);
 
-    let wire_state = Arc::new(Mutex::new(0u32));
-    let connected = Arc::new(AtomicBool::new(false));
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
 
@@ -794,12 +713,8 @@ pub fn create_specs_analyser_detector(
         0,
         max_buffers,
         max_memory,
-        SharedWireHandles {
-            wire_state: wire_state.clone(),
-            connected: connected.clone(),
-            start: start.clone(),
-            stop: stop.clone(),
-        },
+        start.clone(),
+        stop.clone(),
     )
     .map_err(|e| format!("failed to create specs-analyser driver: {e}"))?;
 
@@ -822,8 +737,6 @@ pub fn create_specs_analyser_detector(
 
     let ad_params = driver.ad.params;
     let specs_params = driver.p;
-    let lens_modes = driver.lens_modes.clone();
-    let scan_ranges = driver.scan_ranges.clone();
     let pool = driver.ad.pool.clone();
 
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
@@ -833,16 +746,10 @@ pub fn create_specs_analyser_detector(
 
     let worker = Worker {
         self_handle: handle.clone(),
-        driver_port,
-        addr: 0,
-        wire_state,
-        connected,
         p: specs_params,
         ad: ad_params,
         start,
         stop,
-        lens_modes,
-        scan_ranges,
         output: ArrayPublisher::new(array_output.clone()),
         pool: pool.clone(),
         batch: Vec::new(),
@@ -878,12 +785,8 @@ mod tests {
             0,
             0,
             1 << 20,
-            SharedWireHandles {
-                wire_state: Arc::new(Mutex::new(0)),
-                connected: Arc::new(AtomicBool::new(false)),
-                start: Arc::new(Event::new()),
-                stop: Arc::new(Event::new()),
-            },
+            Arc::new(Event::new()),
+            Arc::new(Event::new()),
         )
         .unwrap()
     }

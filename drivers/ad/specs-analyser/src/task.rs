@@ -1,19 +1,11 @@
 //! The persistent acquisition worker: `SpecsAnalyser::specsAnalyserTask`
-//! (`specsAnalyser.cpp:268-706`). Runs on its own dedicated Tokio runtime
-//! (`rt::run_thread_named`) because publishing an `NDArray`
-//! (`ArrayPublisher::publish`) is `async fn` with no blocking variant; every
-//! wire/param access here uses `.await`-based `PortHandle` methods, never the
-//! `_blocking` ones, so it carries no panic risk regardless of runtime
-//! flavor. `write_int32` (a different context — the port actor's own
-//! current-thread runtime) cannot join this loop's structure, so the split
-//! documented in `driver.rs` applies: `write_int32` only ever signals `start`
-//! or reads/writes params directly; every acquisition-loop wire round trip
-//! lives here.
+//! (`specsAnalyser.cpp:268-706`). Runs on its own runtime
+//! (`rt::run_thread_named`) because `ArrayPublisher::publish` is async; its
+//! exchanges run on the driver ([`SpecsAnalyserDriver::with_wire`]), the
+//! same owner as `write_int32`'s.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ADStatus;
@@ -25,38 +17,24 @@ use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp};
-use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::user::AsynUser;
+use epics_rs::asyn::request::ParamSetValue;
 
-use crate::codec::{self, BeginOutcome, ResponseAssembler};
+use crate::codec;
+use crate::driver::SpecsAnalyserDriver;
 use crate::params::SpecsParams;
-use crate::types::{
-    Event, MAX_MESSAGE_SIZE, MAX_VALUES, RunMode, SOCKET_TIMEOUT, UPDATE_RATE, secs,
-};
-use crate::wire::{OrdinateRange, ValidateResult, WireError};
+use crate::types::{Event, MAX_VALUES, RunMode, UPDATE_RATE, secs};
+use crate::wire::{ValidateResult, WireError, WireLink};
 
-/// Everything the acquisition worker needs. Shares `driver_port`/`wire_state`/
-/// `connected` with `write_int32`'s spawned threads (see `driver.rs`'s
-/// module doc comment) and `lens_modes`/`scan_ranges` with the driver (kept
-/// current by `SPECSConnect_` handling, read here to build `Define*`
-/// commands exactly as C's `lensModes_[ivalue]`/`scanRanges_[ivalue]` does).
+/// Everything the acquisition worker needs.
 pub struct Worker {
     /// This driver's own port (parameter library).
     pub self_handle: PortHandle,
-    /// `driverPort_`.
-    pub driver_port: Arc<SyncIOHandle>,
-    pub addr: i32,
-    pub wire_state: Arc<Mutex<u32>>,
-    pub connected: Arc<AtomicBool>,
     pub p: SpecsParams,
     pub ad: ADDriverParams,
     /// C `startEventId_`.
     pub start: Arc<Event>,
     /// C `stopEventId_`.
     pub stop: Arc<Event>,
-    pub lens_modes: Arc<Mutex<Vec<String>>>,
-    pub scan_ranges: Arc<Mutex<Vec<String>>>,
     pub output: ArrayPublisher,
     pub pool: DriverPool,
     /// Pending parameter writes, flushed at each C `callParamCallbacks()`.
@@ -149,237 +127,32 @@ impl Worker {
     }
 
     // -----------------------------------------------------------------------
-    // Wire transport — async twin of `crate::wire::WireLink`. Duplicates only
-    // the thin write/read loop (the parsing/framing logic all lives in
-    // `crate::codec`); see this module's top doc comment for why a shared
-    // sync/async abstraction was not worth the complexity here.
+    // Exchanges — run on the driver, so `SPECSMsgCounter_`/`SPECSConnected_`
+    // have one owner for both the write path and this task.
     // -----------------------------------------------------------------------
 
-    fn user(&self) -> AsynUser {
-        AsynUser::new(0)
-            .with_addr(self.addr)
-            .with_timeout(secs(SOCKET_TIMEOUT))
+    /// `f` on the driver, after this task's pending sets.
+    async fn driver<R: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut SpecsAnalyserDriver) -> R + Send + 'static,
+    ) -> Result<R, WireError> {
+        self.flush().await;
+        self.self_handle.with_driver(f).await.map_err(WireError::Io)
     }
 
-    /// `SpecsAnalyser::commandResponse` + `SpecsAnalyser::asynWriteRead`
-    /// (`specsAnalyser.cpp:1897-2118`); see [`crate::wire::WireLink::command_response`].
+    async fn wire<R: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut WireLink) -> Result<R, WireError> + Send + 'static,
+    ) -> Result<R, WireError> {
+        self.driver(move |d| d.with_wire(f)).await?
+    }
+
     async fn command_response(
         &mut self,
         command: &str,
     ) -> Result<HashMap<String, String>, WireError> {
-        let counter = {
-            let mut guard = self.wire_state.lock().unwrap();
-            let next = codec::next_counter(*guard);
-            *guard = next;
-            next
-        };
-        // asynWriteRead posts the counter before the exchange.
-        self.set_i32(self.p.msg_counter, counter as i32);
-        self.callbacks().await;
-        if !self.connected.load(Ordering::SeqCst) {
-            return Err(WireError::NotConnected);
-        }
-        let request = codec::format_request(counter, command);
-
-        let result = self
-            .driver_port
-            .port()
-            .map_err(WireError::Io)?
-            .submit_async(
-                RequestOp::OctetWriteRead {
-                    data: request.into_bytes(),
-                    buf_size: MAX_MESSAGE_SIZE,
-                    flush: true,
-                },
-                self.user(),
-            )
-            .await
-            .map_err(WireError::Io)?;
-        let raw = String::from_utf8_lossy(&result.data.unwrap_or_default()).into_owned();
-        let payload = codec::strip_response_frame(&raw, counter).map_err(WireError::Frame)?;
-
-        let mut assembler = ResponseAssembler::new();
-        match assembler.begin(payload) {
-            BeginOutcome::Ok => {}
-            BeginOutcome::NeedsMore => loop {
-                let more = self
-                    .driver_port
-                    .port()
-                    .map_err(WireError::Io)?
-                    .submit_async(
-                        RequestOp::OctetRead {
-                            buf_size: MAX_MESSAGE_SIZE,
-                        },
-                        self.user(),
-                    )
-                    .await
-                    .map_err(WireError::Io)?;
-                let chunk = String::from_utf8_lossy(&more.data.unwrap_or_default()).into_owned();
-                if !assembler.continue_with(&chunk) {
-                    break;
-                }
-            },
-            BeginOutcome::Error(info) => {
-                if info.code == "3" {
-                    self.connected.store(false, Ordering::SeqCst);
-                    self.set_i32(self.p.connected, 0);
-                }
-                self.set_str(self.ad.status_message, info.status_message());
-                return Err(WireError::Device(info));
-            }
-        }
-        Ok(assembler.finish())
-    }
-
-    async fn get_analyser_parameter_int(&mut self, name: &str) -> Result<i32, WireError> {
-        let data = self
-            .command_response(&codec::get_value_command(name))
-            .await?;
-        let value = data.get("Value").map(String::as_str).unwrap_or("");
-        match value {
-            "\"false\"" => Ok(0),
-            "\"true\"" => Ok(1),
-            _ => codec::parse_integer_field(value).ok_or(WireError::Field("Value")),
-        }
-    }
-
-    async fn read_ordinate_range(&mut self) -> Result<OrdinateRange, WireError> {
-        let data = self
-            .command_response(&codec::get_data_info_command("OrdinateRange"))
-            .await?;
-        let unit = match data.get("Unit").map(String::as_str) {
-            Some("\"\"") | None => String::new(),
-            Some(u) => codec::clean_string(u, "\""),
-        };
-        Ok(OrdinateRange {
-            unit,
-            min: data.get("Min").and_then(|s| codec::parse_double_field(s)),
-            max: data.get("Max").and_then(|s| codec::parse_double_field(s)),
-        })
-    }
-
-    async fn read_acquisition_data(
-        &mut self,
-        start_index: i32,
-        end_index: i32,
-    ) -> Result<Vec<f64>, WireError> {
-        let data = self
-            .command_response(&codec::get_data_command(start_index, end_index))
-            .await?;
-        Ok(codec::parse_data_array(
-            data.get("Data").map(String::as_str).unwrap_or(""),
-        ))
-    }
-
-    async fn define_fat(
-        &mut self,
-        args: codec::DefineFatArgs,
-        lens_mode: &str,
-        scan_range: &str,
-    ) -> Result<(), WireError> {
-        let cmd = codec::define_fat_command(args, lens_mode, scan_range);
-        self.command_response(&cmd).await.map(|_| ())
-    }
-
-    async fn define_sfat(
-        &mut self,
-        start_energy: f64,
-        end_energy: f64,
-        samples: i32,
-        dwell_time: f64,
-        lens_mode: &str,
-        scan_range: &str,
-    ) -> Result<(), WireError> {
-        let cmd = codec::define_sfat_command(
-            start_energy,
-            end_energy,
-            samples,
-            dwell_time,
-            lens_mode,
-            scan_range,
-        );
-        self.command_response(&cmd).await.map(|_| ())
-    }
-
-    async fn define_frr(
-        &mut self,
-        args: codec::DefineFrrArgs,
-        lens_mode: &str,
-        scan_range: &str,
-    ) -> Result<(), WireError> {
-        let cmd = codec::define_frr_command(args, lens_mode, scan_range);
-        self.command_response(&cmd).await.map(|_| ())
-    }
-
-    async fn define_fe(
-        &mut self,
-        kinetic_energy: f64,
-        samples: i32,
-        dwell_time: f64,
-        pass_energy: f64,
-        lens_mode: &str,
-        scan_range: &str,
-    ) -> Result<(), WireError> {
-        let cmd = codec::define_fe_command(
-            kinetic_energy,
-            samples,
-            dwell_time,
-            pass_energy,
-            lens_mode,
-            scan_range,
-        );
-        self.command_response(&cmd).await.map(|_| ())
-    }
-
-    async fn validate_spectrum(
-        &mut self,
-        run_mode: Option<RunMode>,
-        kinetic_energy: f64,
-    ) -> Result<ValidateResult, WireError> {
-        let data = self.command_response("ValidateSpectrum").await?;
-        let field_f64 = |name: &str| {
-            data.get(name)
-                .and_then(|s| codec::parse_double_field(s))
-                .unwrap_or(0.0)
-        };
-        let field_i32 = |name: &str| {
-            data.get(name)
-                .and_then(|s| codec::parse_integer_field(s))
-                .unwrap_or(0)
-        };
-
-        let mut start_energy = field_f64("StartEnergy");
-        let mut end_energy = field_f64("EndEnergy");
-        let pass_energy = field_f64("PassEnergy");
-
-        let lens_modes = self.lens_modes.lock().unwrap().clone();
-        let scan_ranges = self.scan_ranges.lock().unwrap().clone();
-        let lookup = |values: &[String], data_key: &str| -> i32 {
-            let raw = data.get(data_key).map(String::as_str).unwrap_or("");
-            let cleaned = codec::clean_string(raw, "\"");
-            values
-                .iter()
-                .position(|v| *v == cleaned)
-                .map(|i| i as i32)
-                .unwrap_or(-1)
-        };
-
-        if run_mode == Some(RunMode::Fe) {
-            // ***** WORKAROUND FOR FIXED ENERGY START AND END *****
-            start_energy = kinetic_energy - 0.1 * pass_energy;
-            end_energy = kinetic_energy + 0.1 * pass_energy;
-        }
-
-        Ok(ValidateResult {
-            start_energy,
-            end_energy,
-            step_width: field_f64("StepWidth"),
-            samples: field_i32("Samples"),
-            dwell_time: field_f64("DwellTime"),
-            pass_energy,
-            lens_mode: lookup(&lens_modes, "LensMode"),
-            scan_range: lookup(&scan_ranges, "ScanRange"),
-        })
+        let command = command.to_string();
+        self.wire(move |link| link.command_response(&command)).await
     }
 
     // -----------------------------------------------------------------------
@@ -414,7 +187,7 @@ impl Worker {
         let mut ok = true;
         let mut non_energy_channels = 0;
         match self
-            .get_analyser_parameter_int("NumNonEnergyChannels")
+            .wire(|link| link.get_analyser_parameter_int("NumNonEnergyChannels"))
             .await
         {
             Ok(v) => {
@@ -429,9 +202,8 @@ impl Worker {
             let _ = self.command_response("ClearSpectrum").await;
             let run_mode_val = self.get_i32(self.p.run_mode).await;
             let run_mode = RunMode::from_i32(run_mode_val);
-            if let Some(mode) = run_mode {
-                let define_ok = self.run_define(mode).await;
-                ok = define_ok;
+            if run_mode.is_some() {
+                ok = self.run_define().await;
             }
             run_mode
         } else {
@@ -444,7 +216,10 @@ impl Worker {
         let mut validated: Option<ValidateResult> = None;
         if ok {
             let kinetic_energy = self.get_f64(self.p.kinetic_energy).await;
-            match self.validate_spectrum(run_mode, kinetic_energy).await {
+            let validated_now = self
+                .driver(move |d| d.validate_spectrum(run_mode, kinetic_energy))
+                .await;
+            match validated_now.and_then(|r| r) {
                 Ok(result) => validated = Some(result),
                 Err(_) => ok = false,
             }
@@ -500,87 +275,10 @@ impl Worker {
         })
     }
 
-    /// Dispatch to the `DefineSpectrum*` command matching the current run
-    /// mode (`specsAnalyser.cpp:344-366`).
-    async fn run_define(&mut self, mode: RunMode) -> bool {
-        let start_energy = self.get_f64(self.p.start_energy).await;
-        let end_energy = self.get_f64(self.p.end_energy).await;
-        let step_width = self.get_f64(self.p.step_width).await;
-        let dwell_time = self.get_f64(self.ad.acquire_time).await;
-        let pass_energy = self.get_f64(self.p.pass_energy).await;
-        let retarding_ratio = self.get_f64(self.p.retarding_ratio).await;
-        let kinetic_energy = self.get_f64(self.p.kinetic_energy).await;
-        let snapshot_values = self.get_i32(self.p.snapshot_values).await;
-        let lens_mode_idx = self.get_i32(self.p.lens_mode).await;
-        let scan_range_idx = self.get_i32(self.p.scan_range).await;
-        let lens_mode = self
-            .lens_modes
-            .lock()
-            .unwrap()
-            .get(lens_mode_idx.max(0) as usize)
-            .cloned()
-            .unwrap_or_default();
-        let scan_range = self
-            .scan_ranges
-            .lock()
-            .unwrap()
-            .get(scan_range_idx.max(0) as usize)
-            .cloned()
-            .unwrap_or_default();
-
-        let result = match mode {
-            RunMode::Fat => {
-                self.define_fat(
-                    codec::DefineFatArgs {
-                        start_energy,
-                        end_energy,
-                        step_width,
-                        dwell_time,
-                        pass_energy,
-                    },
-                    &lens_mode,
-                    &scan_range,
-                )
-                .await
-            }
-            RunMode::Sfat => {
-                self.define_sfat(
-                    start_energy,
-                    end_energy,
-                    snapshot_values,
-                    dwell_time,
-                    &lens_mode,
-                    &scan_range,
-                )
-                .await
-            }
-            RunMode::Frr => {
-                self.define_frr(
-                    codec::DefineFrrArgs {
-                        start_energy,
-                        end_energy,
-                        step_width,
-                        dwell_time,
-                        retarding_ratio,
-                    },
-                    &lens_mode,
-                    &scan_range,
-                )
-                .await
-            }
-            RunMode::Fe => {
-                self.define_fe(
-                    kinetic_energy,
-                    snapshot_values,
-                    dwell_time,
-                    pass_energy,
-                    &lens_mode,
-                    &scan_range,
-                )
-                .await
-            }
-        };
-        result.is_ok()
+    /// The `DefineSpectrum*` command for the current run mode
+    /// (`specsAnalyser.cpp:344-366`), as `writeInt32` sends it.
+    async fn run_define(&mut self) -> bool {
+        matches!(self.driver(|d| d.dispatch_define().is_ok()).await, Ok(true))
     }
 
     /// The acquisition body (`specsAnalyser.cpp:441-704`).
@@ -690,7 +388,7 @@ impl Worker {
                         let data_delay_max = self.get_f64(self.p.data_delay_max).await;
                         let period = acquire_time.min(data_delay_max);
                         rt::sleep(secs(period)).await;
-                        if let Ok(range) = self.read_ordinate_range().await {
+                        if let Ok(range) = self.wire(|link| link.read_ordinate_range()).await {
                             self.set_str(self.p.non_energy_units, range.unit);
                             if let Some(min) = range.min {
                                 self.set_f64(self.p.non_energy_min, min);
@@ -709,8 +407,9 @@ impl Worker {
                         read_end_data_point =
                             current_data_point + MAX_VALUES / non_energy_channels.max(1);
                     }
+                    let (from, to) = (current_data_point, read_end_data_point - 1);
                     let values = self
-                        .read_acquisition_data(current_data_point, read_end_data_point - 1)
+                        .wire(move |link| link.read_acquisition_data(from, to))
                         .await
                         .unwrap_or_default();
 
