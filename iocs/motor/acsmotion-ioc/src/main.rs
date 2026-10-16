@@ -35,7 +35,11 @@ async fn main() -> CaResult<()> {
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
 
-    // asyn's devEpics, for SPiiPlusHoming.db.
+    // profileMoveController.template's busy records: opt-in in epics-rs, as
+    // a C IOC links busy's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+
+    // asyn's devEpics, for SPiiPlusHoming.db and the profile databases.
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // Standard asyn iocsh commands — provides the serial/IP port configure verbs.
