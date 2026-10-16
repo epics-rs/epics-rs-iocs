@@ -29,6 +29,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -286,11 +287,12 @@ impl DeviceWorker for MksWorker {
 
 /// `MKSConfig(port, octetPort, numGauges, [pollPeriod])`.
 pub fn create_mks(
-    port_name: &str,
+    claim: &PortClaim,
     octet_port: &str,
     gauges: u8,
     poll_period: Duration,
 ) -> AsynResult<IpPortRuntime> {
+    let port_name = claim.name();
     if gauges == 0 || usize::from(gauges) > MAX_GAUGES {
         return Err(crate::asyn_error(format!(
             "MKS: numGauges must be 1..{MAX_GAUGES}, got {gauges}"
@@ -302,7 +304,7 @@ pub fn create_mks(
     let driver = MksDriver::new(port_name, commands)?;
     let params = driver.params();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let worker = MksWorker {
         transport: io,
         handle: runtime_handle.port_handle().clone(),

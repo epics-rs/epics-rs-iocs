@@ -135,7 +135,7 @@ impl PortDriver for TpgDriver {
         let (reason, addr) = (user.reason, user.addr);
         let p = self.params;
         let gauge = self.gauge(addr)?;
-        self.base.params.set_int32(reason, addr, value)?;
+        self.base.set_int32_param(reason, addr, value)?;
 
         if reason == p.set_sensor {
             self.send(
@@ -156,7 +156,7 @@ impl PortDriver for TpgDriver {
         let (reason, addr) = (user.reason, user.addr);
         let p = self.params;
         let gauge = self.gauge(addr)?;
-        self.base.params.set_float64(reason, addr, value)?;
+        self.base.set_float64_param(reason, addr, value)?;
 
         if let Some(index) = p.set_setpoint.iter().position(|&r| r == reason) {
             return self.send(

@@ -15,6 +15,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -197,12 +198,13 @@ impl DeviceWorker for TelevacWorker {
 
 /// `TelevacConfig(port, octetPort, numStations, numRelays, [pollPeriod])`.
 pub fn create_televac(
-    port_name: &str,
+    claim: &PortClaim,
     octet_port: &str,
     stations: u8,
     relays: u8,
     poll_period: Duration,
 ) -> AsynResult<IpPortRuntime> {
+    let port_name = claim.name();
     if stations == 0 || usize::from(stations) > MAX_STATIONS {
         return Err(crate::asyn_error(format!(
             "Televac: numStations must be 1..{MAX_STATIONS}, got {stations}"
@@ -219,7 +221,7 @@ pub fn create_televac(
     let driver = TelevacDriver::new(port_name, commands)?;
     let params = driver.params();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let worker = TelevacWorker {
         transport: io,
         handle: runtime_handle.port_handle().clone(),

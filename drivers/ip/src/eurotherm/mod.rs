@@ -31,6 +31,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::user::AsynUser;
@@ -154,8 +155,7 @@ impl PortDriver for EurothermDriver {
         self.send(frame)?;
 
         self.base_mut()
-            .params
-            .set_float64(user.reason, user.addr, value)?;
+            .set_float64_param(user.reason, user.addr, value)?;
         self.base_mut().call_param_callbacks(user.addr)
     }
 
@@ -173,8 +173,7 @@ impl PortDriver for EurothermDriver {
         self.send(frame)?;
 
         self.base_mut()
-            .params
-            .set_string(user.reason, user.addr, mnemonic)?;
+            .set_string_param(user.reason, user.addr, mnemonic)?;
         self.base_mut().call_param_callbacks(user.addr)?;
         Ok(data.len())
     }
@@ -197,15 +196,16 @@ impl DeviceWorker for EurothermWorker {
 
 /// `EurothermConfig(port, octetPort, groupAddress)`.
 pub fn create_eurotherm(
-    port_name: &str,
+    claim: &PortClaim,
     octet_port: &str,
     group_address: u8,
 ) -> AsynResult<IpPortRuntime> {
+    let port_name = claim.name();
     let io = connect_octet(octet_port, EUROTHERM_TIMEOUT).map_err(crate::asyn_error)?;
     let (commands, rx) = channel::<EurothermCommand>();
     let driver = EurothermDriver::new(port_name, group_address, commands)?;
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let worker = EurothermWorker { transport: io };
     let thread = worker::spawn(port_name, worker, rx, IDLE_TICK);
     Ok(IpPortRuntime::new(runtime_handle, thread))

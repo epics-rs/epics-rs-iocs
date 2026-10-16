@@ -140,6 +140,7 @@ pub(crate) mod test_support {
 
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::port::PortDriver;
+    use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
     use epics_rs::asyn::trace::TraceFile;
@@ -190,7 +191,9 @@ pub(crate) mod test_support {
     ) -> (Transport, PathBuf, PortRuntimeHandle) {
         let mut driver = DrvAsynIPPort::new(port, host).unwrap();
         driver.base_mut().init_auto_connect(auto_connect);
-        let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim_port(port).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
         let handle = runtime.port_handle().clone();
         let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();

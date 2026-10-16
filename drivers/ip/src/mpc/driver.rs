@@ -194,7 +194,7 @@ impl PortDriver for MpcDriver {
         let (reason, addr) = (user.reason, user.addr);
         let p = self.params;
         let supply = self.supply(addr)?;
-        self.base.params.set_int32(reason, addr, value)?;
+        self.base.set_int32_param(reason, addr, value)?;
         let record = if [p.set_unit, p.set_display, p.tsp_filament].contains(&reason) {
             "writeMbbo"
         } else {
@@ -254,7 +254,7 @@ impl PortDriver for MpcDriver {
         let (reason, addr) = (user.reason, user.addr);
         let p = self.params;
         let supply = self.supply(addr)?;
-        self.base.params.set_float64(reason, addr, value)?;
+        self.base.set_float64_param(reason, addr, value)?;
         let who = self.who(reason, addr);
         let send = |command, data: &str| self.send(command, data, &who, "writeAo");
 
@@ -276,7 +276,7 @@ impl PortDriver for MpcDriver {
         self.supply(addr)?;
         let text = std::str::from_utf8(value)
             .map_err(|_| asyn_error("MPC: command strings must be ASCII"))?;
-        self.base.params.set_string(reason, addr, text)?;
+        self.base.set_string_param(reason, addr, text)?;
         let who = self.who(reason, addr);
         let send = |command, data: &str| self.send(command, data, &who, "writeSo");
 
