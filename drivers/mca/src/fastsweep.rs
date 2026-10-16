@@ -262,12 +262,13 @@ impl SweepState {
     /// capacity entirely and always `memcpy`s `numPoints_` ints, an
     /// overflow if `numPoints_ > maxChans`. `buf.len()` -- the caller's
     /// real capacity, carried directly in the trait signature here unlike
-    /// C's separate out-parameter -- clamps the copy. Returns `nactual`.
+    /// C's separate out-parameter -- clamps the copy. Returns `nactual`,
+    /// C's `numAcquired_` (`:354`), clamped only to the buffer.
     fn read_signal(&self, signal: usize, buf: &mut [i32]) -> usize {
         let copy_len = (self.num_points.max(0) as usize).min(buf.len());
         let row = signal * self.max_points;
         buf[..copy_len].copy_from_slice(&self.p_data[row..row + copy_len]);
-        (self.num_acquired.max(0) as usize).min(copy_len)
+        (self.num_acquired.max(0) as usize).min(buf.len())
     }
 }
 
@@ -835,6 +836,17 @@ mod tests {
                  numAcquired=0, elapsedTime=0.000000, acquring_=0"
             )
         );
+    }
+
+    /// C `*nactual = numAcquired_` (`drvFastSweep.cpp:354`) even when
+    /// `NumChannels` was lowered below it mid-sweep.
+    #[test]
+    fn read_int32_array_reports_num_acquired_past_num_points() {
+        let mut state = SweepState::new(1, 8);
+        state.num_points = 2;
+        state.num_acquired = 5;
+        let mut buf = [0i32; 8];
+        assert_eq!(state.read_signal(0, &mut buf), 5);
     }
 
     /// C `nextPoint`'s per-signal write + always-publish current channel /
