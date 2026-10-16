@@ -65,20 +65,23 @@ pub struct ChannelInfo {
     pub scale: u8,
 }
 
+/// Discriminants are C's `VL_*` values (`drvGM10.c:55-57`); `VAL_STATUS`
+/// writes them to RVAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum DataStatus {
     #[default]
-    Normal,
-    Skip,
-    PosOverrange,
-    NegOverrange,
-    PosBurnout,
-    NegBurnout,
-    AdError,
-    InvalidData,
-    MathNan,
-    CommError,
-    Unknown,
+    Normal = 0,
+    Skip = 1,
+    PosOverrange = 2,
+    NegOverrange = 3,
+    PosBurnout = 4,
+    NegBurnout = 5,
+    AdError = 6,
+    InvalidData = 7,
+    MathNan = 16,
+    CommError = 17,
+    Unknown = 32,
 }
 
 impl DataStatus {
@@ -194,5 +197,12 @@ mod tests {
         assert_eq!(DataStatus::from_wire(0x20 | 6), DataStatus::AdError);
         assert_eq!(DataStatus::from_wire(9), DataStatus::Unknown);
         assert_eq!(DataStatus::from_wire(16), DataStatus::MathNan);
+    }
+
+    #[test]
+    fn data_status_discriminants_are_c_vl_values() {
+        for (wire, rval) in [(0, 0), (7, 7), (16, 16), (17, 17), (9, 32)] {
+            assert_eq!(DataStatus::from_wire(wire) as u32, rval);
+        }
     }
 }
