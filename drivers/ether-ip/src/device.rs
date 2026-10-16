@@ -691,9 +691,12 @@ impl EtherIpDevice {
     /// The output half of the driver callback: a new PLC value arrived, so the
     /// record follows it (C `check_ao_callback` & friends). With `FORCE` the
     /// record wins instead -- its value is staged for the next scan.
+    ///
+    /// C's callback processes the record whatever it found, so a failure here
+    /// is the one `ao_write` & co. raise: WRITE_ALARM (devEtherIP.c:1949,1993).
     fn readback(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some((tag, link)) = self.bound() else {
-            self.read_alarm();
+            self.write_alarm();
             return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         };
         let (element, mask, forced) = (link.element, link.mask, link.forced());
@@ -703,7 +706,7 @@ impl EtherIpDevice {
         let elements = *tag.elements.lock();
         if !data.has_value() || elements <= element {
             drop(data);
-            self.read_alarm();
+            self.write_alarm();
             return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         }
 
@@ -714,7 +717,7 @@ impl EtherIpDevice {
                 Some(CipType::Real) | Some(CipType::Lreal) => {
                     let Some(plc) = cip::get_double(&data.buf, element) else {
                         drop(data);
-                        self.read_alarm();
+                        self.write_alarm();
                         return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                     };
                     let val = f64_field(record, "VAL");
@@ -730,7 +733,7 @@ impl EtherIpDevice {
                 _ => {
                     let Some(plc) = cip::get_dint(&data.buf, element) else {
                         drop(data);
-                        self.read_alarm();
+                        self.write_alarm();
                         return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                     };
                     let rval = i32_field(record, "RVAL");
@@ -747,7 +750,7 @@ impl EtherIpDevice {
             "int64out" => {
                 let Some(plc) = cip::get_lint(&data.buf, element) else {
                     drop(data);
-                    self.read_alarm();
+                    self.write_alarm();
                     return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let val = match record.get_field("VAL") {
@@ -767,7 +770,7 @@ impl EtherIpDevice {
                 let bits = if rtype == "bo" { 1 } else { nobt(record) };
                 let Some(plc) = get_bits(&data.buf, element, mask, bits) else {
                     drop(data);
-                    self.read_alarm();
+                    self.write_alarm();
                     return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let rval = i32_field(record, "RVAL") as u32;
@@ -784,7 +787,7 @@ impl EtherIpDevice {
                 let max = data.buf.len();
                 let Some(plc) = cip::get_string(&data.buf, element, max) else {
                     drop(data);
-                    self.read_alarm();
+                    self.write_alarm();
                     return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let val = match record.get_field("VAL") {
@@ -802,7 +805,7 @@ impl EtherIpDevice {
             }
             _ => {
                 drop(data);
-                self.read_alarm();
+                self.write_alarm();
                 return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
             }
         }
@@ -1103,6 +1106,19 @@ mod tests {
         assert!(device_factory(&ctx("longin", DTYP)).is_none());
         assert!(device_factory(&ctx("longout", DTYP)).is_none());
         assert!(device_factory(&ctx("ao", DTYP_RESET)).is_none());
+    }
+
+    /// A disconnected tag leaves an output in WRITE_ALARM, as C's ao_write.
+    #[test]
+    fn an_output_without_data_raises_write_alarm() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        driver::define_plc("nodata", "127.0.0.1", 0);
+        let mut record = AoRecord::default();
+        let mut dev = EtherIpDevice::new("@nodata REAL S 1", true);
+        dev.init(&mut record).unwrap();
+        dev.read(&mut record).unwrap();
+        let alarm = dev.last_alarm().unwrap();
+        assert_eq!(alarm.stat, alarm_status::WRITE_ALARM);
     }
 
     // -- link parsing --------------------------------------------------------
