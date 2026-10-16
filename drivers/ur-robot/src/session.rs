@@ -69,14 +69,13 @@ impl Session {
     pub fn connect(&mut self) -> UrResult<()> {
         self.buffer.clear(); // rtde.cpp:63 — reconnect must not reuse stale bytes.
         // rtde.cpp:85 prints the asio error to cerr before throwing its own.
-        let sock =
-            crate::net::connect_tcp(&self.hostname, self.port, self.timeout).map_err(|e| {
-                eprintln!("{e}");
-                UrError::Connect(format!(
-                    "Error: Could not connect to: {} at {}, verify the IP",
-                    self.hostname, self.port
-                ))
-            })?;
+        let sock = crate::net::connect_tcp(&self.hostname, self.port, None).map_err(|e| {
+            eprintln!("{e}");
+            UrError::Connect(format!(
+                "Error: Could not connect to: {} at {}, verify the IP",
+                self.hostname, self.port
+            ))
+        })?;
         sock.set_nodelay(true).ok();
         sock.set_read_timeout(Some(self.timeout)).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();

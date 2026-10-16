@@ -102,8 +102,12 @@ impl DashboardClient {
     }
 
     pub fn connect(&mut self) -> UrResult<()> {
-        let sock = crate::net::connect_tcp(&self.hostname, self.port, self.timeout)
-            .map_err(|_| UrError::Connect("Timeout connecting to UR dashboard server.".into()))?;
+        let sock = crate::net::connect_tcp(
+            &self.hostname,
+            self.port,
+            Some(crate::net::CONNECT_TIMEOUT),
+        )
+        .map_err(|_| UrError::Connect("Timeout connecting to UR dashboard server.".into()))?;
         sock.set_nodelay(true).ok();
         sock.set_read_timeout(Some(self.timeout)).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();

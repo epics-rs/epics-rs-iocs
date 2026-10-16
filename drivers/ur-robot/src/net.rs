@@ -2,13 +2,39 @@
 
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Resolve `host:port` and connect to the first address within `timeout`.
-pub(crate) fn connect_tcp(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
-    let addr = (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Host not found"))?;
-    TcpStream::connect_timeout(&addr, timeout)
+/// The deadline of ur_rtde's timed connects: `DashboardClient::connect` and
+/// `RobotiqGripper::connect` default `timeout_ms = 2000`
+/// (dashboard_client.h:37, robotiq_gripper.h:165).
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Connect to `host:port` as `boost::asio::connect` does over the resolver
+/// results: each address in turn, failing with the last error.
+///
+/// `Some(deadline)` bounds the whole attempt, as the timed `async_connect`
+/// loop does. `None` is the plain blocking connect of `RTDE::connect` and
+/// `ScriptClient::connect` (rtde.cpp:75, script_client.cpp:42), which waits
+/// for the kernel's verdict — "No route to host", not a timeout.
+pub(crate) fn connect_tcp(
+    host: &str,
+    port: u16,
+    deadline: Option<Duration>,
+) -> io::Result<TcpStream> {
+    let Some(deadline) = deadline else {
+        return TcpStream::connect((host, port));
+    };
+    let until = Instant::now() + deadline;
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "Host not found");
+    for addr in (host, port).to_socket_addrs()? {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        match TcpStream::connect_timeout(&addr, left) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
