@@ -6,15 +6,16 @@
 //! the corresponding [`Cmd`] for `PilatusCmdTask`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -462,8 +463,9 @@ impl PilatusRuntime {
 
 /// C `pilatusDetectorConfig`.
 ///
-/// `camserver_port` must already exist (`drvAsynIPPortConfigure`), because C
-/// connects to it with `pasynOctetSyncIO->connect` in the constructor.
+/// C connects to `camserver_port` with `pasynOctetSyncIO->connect` in the
+/// constructor and ignores the status (pilatusDetector.cpp:1731): a port that
+/// does not exist leaves a user whose every camserver exchange fails.
 pub fn create_pilatus_detector(
     claim: &PortClaim,
     camserver_port: &str,
@@ -472,10 +474,8 @@ pub fn create_pilatus_detector(
     max_memory: usize,
 ) -> Result<PilatusRuntime, String> {
     let port_name = claim.name();
-    let cam_entry = get_port(camserver_port).ok_or_else(|| {
-        format!("camserver port '{camserver_port}' not found (call drvAsynIPPortConfigure first)")
-    })?;
-    let cam_handle = cam_entry.handle.clone();
+    let (cam_handle, _) = SyncIOHandle::connect_port(camserver_port, 0, Duration::ZERO);
+    let cam_handle = Arc::new(cam_handle);
 
     let (cmd_tx, cmd_rx) = rt::command_channel::<Cmd>(64);
     let start = Arc::new(Event::new());
@@ -658,5 +658,25 @@ mod tests {
                 .unwrap_or_else(|| panic!("{line}: {text:?}"))
         };
         assert!(at(&base) < at(&own));
+    }
+
+    /// C ignores the camserver `pasynOctetSyncIO->connect` status
+    /// (pilatusDetector.cpp:1731): with no camserver port configured the
+    /// detector port still exists.
+    #[test]
+    fn a_detector_whose_camserver_port_is_missing_still_boots() {
+        use epics_rs::asyn::registry::claim_port;
+
+        let rt = create_pilatus_detector(
+            &claim_port("PILATUS_NONE").unwrap(),
+            "PILATUS_NONE_CAM",
+            8,
+            8,
+            0,
+        )
+        .expect("the detector port");
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        sync.write_int32(rt.ad_params.num_images, 3).unwrap();
+        assert_eq!(sync.read_int32(rt.ad_params.num_images).unwrap(), 3);
     }
 }

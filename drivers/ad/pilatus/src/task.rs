@@ -1123,7 +1123,17 @@ mod tests {
         enc.write_image::<tiff::encoder::colortype::Gray32>(3, 1, &[7, 8, 9])
             .unwrap();
         let mut w = Worker {
-            ctx: Ctx::new(h.clone(), h.clone(), ad, p, stop),
+            ctx: Ctx::new(
+                h.clone(),
+                Arc::new(epics_rs::asyn::sync_io::SyncIOHandle::from_handle(
+                    h.clone(),
+                    0,
+                    std::time::Duration::ZERO,
+                )),
+                ad,
+                p,
+                stop,
+            ),
             shared: shared.clone(),
             output: ArrayPublisher::new(Arc::new(Mutex::new(NDArrayOutput::new()))),
             pool,
