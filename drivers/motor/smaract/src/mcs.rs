@@ -3,8 +3,7 @@
 //! Ported from `motorSmarAct/smarActApp/src/smarActMCSMotorDriver.cpp` (a
 //! model-1-style `asynMotorController`/`asynMotorAxis` pair, configured with a
 //! separate controller + per-axis create command). Communication is `\n`
-//! terminated (the startup script sets the input EOS; the driver owns output
-//! framing).
+//! terminated by the port EOS, set both ways at connect as C does.
 //!
 //! ## Protocol
 //!

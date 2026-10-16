@@ -4,8 +4,8 @@
 //! (a model-1 dev/drv pair). Commands are `{axis:02}CC[value]` with a 1-based
 //! zero-padded axis prefix; several record transactions join commands with
 //! `;` into one write (a move is `VB;VA;AC;AG;PA`). Replies end in CR/LF
-//! (C sets input EOS `\n` and strips the `\r`; this driver owns framing like
-//! its siblings and trims both).
+//! (the port EOS is set at connect as C does, input `\n` / output `\r`; the
+//! leftover `\r` is trimmed).
 //!
 //! ## Shared-serial concurrency
 //!
@@ -133,7 +133,7 @@ impl Esp300Controller {
         self.num_axes
     }
 
-    /// Write a command (C `send_mess`); the terminator is appended here.
+    /// Write a command (C `send_mess`); the port output EOS terminates it.
     fn write(&self, cmd: &str) -> AsynResult<()> {
         self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())

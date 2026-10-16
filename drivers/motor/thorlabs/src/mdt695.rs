@@ -4,8 +4,7 @@
 //! (the model-1 dev/drv pair). The MDT695/693 drives three piezo channels
 //! (`X`/`Y`/`Z`) and the MDT694 a single channel, all over one serial line.
 //! Each command is prefixed with the axis letter; commands and replies are
-//! CR-terminated (`\r` — the driver owns output framing, the startup script
-//! sets the input EOS).
+//! CR-terminated (`\r`, the port EOS set both ways at connect as C does).
 //!
 //! ## Open-loop voltage control
 //!

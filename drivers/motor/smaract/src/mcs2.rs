@@ -3,8 +3,8 @@
 //! Ported from `motorSmarAct/smarActApp/src/smarActMCS2MotorDriver.cpp` (a
 //! model-3 `asynMotorController`/`asynMotorAxis` pair). Commands are SCPI-style
 //! ASCII addressed by channel (`:CHAN<n>:...`, `:MOVE<n>`, `:REF<n>`,
-//! `:STOP<n>`, 0-based). Replies terminate with `\r\n` (the startup script sets
-//! the input EOS); commands are LF-terminated (the driver owns output framing).
+//! `:STOP<n>`, 0-based). Commands and replies are
+//! `\r\n`-terminated by the port EOS, set both ways at connect as C does.
 //!
 //! ## Closed- vs open-loop motion
 //!

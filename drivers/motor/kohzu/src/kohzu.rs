@@ -3,7 +3,7 @@
 //! Ported from `motorKohzu/kohzuApp/src/drvSC800.cc` + `devSC800.cc`. The SC-800
 //! (and its 4-axis SC-400 / 2-axis SC-200 siblings) is a stepper controller.
 //! Every command is prefixed with STX (0x02) and terminated by CR+LF (the
-//! driver owns this framing); the startup script configures only the input EOS.
+//! port EOS, set both ways at connect as C does).
 //! The controller answers **every** command with a tab-separated `C\t…` reply,
 //! so each command is written and its reply consumed to keep the stream
 //! synchronized. Queries used here:

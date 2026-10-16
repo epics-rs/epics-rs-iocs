@@ -2,8 +2,7 @@
 //!
 //! Ported from `motorAcsTech80/acsTech80App/src/drvSPiiPlus.cc` +
 //! `devSPiiPlus.cc` (the model-1 dev/drv pair). Commands are ACSPL+ text
-//! terminated by CR (`\r`, the driver owns output framing; the startup script
-//! sets only the input EOS). Query commands begin with `?` and return a value;
+//! terminated by CR (`\r`, the port EOS set both ways at connect as C does). Query commands begin with `?` and return a value;
 //! a reply containing `?` signals a controller error. Set/motion commands do
 //! not return a value, but the framework reads an acknowledgment after every
 //! command, so this port reads (and discards) a reply after each command to
