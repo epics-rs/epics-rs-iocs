@@ -25,7 +25,7 @@
 use std::time::Instant;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, StatusWrite};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::route::{Demand, Reroute, Route};
@@ -337,6 +337,118 @@ impl AsynMotor for MotorSimAxis {
     }
 }
 
+/// An axis of drvMotorSim.c, the model-2 simulator `motorSimCreate` builds
+/// for `DTYP "Motor Simulation"`: the same trajectory as [`MotorSimAxis`],
+/// reported through its motorAxis status bits, where the home sensor is
+/// `motorAxisHomeSignal` (MSTA RA_HOME) and nothing tracks homed.
+pub struct DrvMotorSimAxis {
+    axis: MotorSimAxis,
+    writes: Vec<StatusWrite>,
+}
+
+impl DrvMotorSimAxis {
+    /// `motorSimCreateAxis(..., lowLimit, hiLimit, home, start)`, which
+    /// overwrites `start` with 0 before using it.
+    pub fn new(low_hard_limit: f64, hi_hard_limit: f64, home: f64) -> Self {
+        Self {
+            axis: MotorSimAxis::new(low_hard_limit, hi_hard_limit, home, DEFAULT_START),
+            writes: Vec::new(),
+        }
+    }
+
+    /// `motorParam->setInteger(motorAxisDone, 0)` + `callCallback`, which
+    /// drvMotorSim.c's move, home and velocity move post before returning.
+    fn started(&mut self) {
+        self.writes.push(StatusWrite::Done(false));
+    }
+}
+
+impl AsynMotor for DrvMotorSimAxis {
+    /// drvMotorSim.c's `query_axis` has no failure path.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
+    fn move_absolute(
+        &mut self,
+        user: &AsynUser,
+        position: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.axis
+            .move_absolute(user, position, min_velocity, velocity, acceleration)?;
+        self.started();
+        Ok(())
+    }
+
+    fn move_relative(
+        &mut self,
+        user: &AsynUser,
+        distance: f64,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.axis
+            .move_relative(user, distance, min_velocity, velocity, acceleration)?;
+        self.started();
+        Ok(())
+    }
+
+    fn move_velocity(
+        &mut self,
+        user: &AsynUser,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        let status = self
+            .axis
+            .move_velocity(user, min_velocity, velocity, acceleration);
+        self.started();
+        status
+    }
+
+    fn home(
+        &mut self,
+        user: &AsynUser,
+        min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+        forward: bool,
+    ) -> AsynResult<()> {
+        let status = self
+            .axis
+            .home(user, min_velocity, velocity, acceleration, forward);
+        self.started();
+        status
+    }
+
+    fn stop(&mut self, user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.axis.stop(user, acceleration)
+    }
+
+    fn set_position(&mut self, user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.axis.set_position(user, position)
+    }
+
+    fn poll(&mut self, user: &AsynUser) -> AsynResult<MotorStatus> {
+        let status = self.axis.poll(user)?;
+        Ok(MotorStatus {
+            home: status.encoder_home,
+            encoder_home: false,
+            homed: false,
+            ..status
+        })
+    }
+
+    fn take_status_writes(&mut self) -> Vec<StatusWrite> {
+        std::mem::take(&mut self.writes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +533,24 @@ mod tests {
             "offset position {}",
             axis.last_status.position
         );
+    }
+
+    #[test]
+    fn drv_motor_sim_reports_home_signal_as_at_home() {
+        let mut axis = DrvMotorSimAxis::new(DEFAULT_LOW_LIMIT, DEFAULT_HI_LIMIT, 0.0);
+        axis.axis.process(0.05);
+        let status = axis.poll(&user()).unwrap();
+        assert!(status.home, "RA_HOME not set at the home position");
+        assert!(!status.encoder_home && !status.homed);
+    }
+
+    #[test]
+    fn drv_motor_sim_posts_not_done_when_motion_starts() {
+        let mut axis = DrvMotorSimAxis::new(DEFAULT_LOW_LIMIT, DEFAULT_HI_LIMIT, 0.0);
+        axis.move_velocity(&user(), 0.0, 1.0, 1.0).unwrap();
+        assert_eq!(axis.take_status_writes(), vec![StatusWrite::Done(false)]);
+        axis.stop(&user(), 1.0).unwrap();
+        assert!(axis.take_status_writes().is_empty());
     }
 
     #[test]
