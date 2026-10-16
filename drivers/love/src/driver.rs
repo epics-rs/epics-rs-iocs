@@ -22,7 +22,7 @@
 //! `SyncIOHandle` does not expose an accessor back to).
 //!
 //! # Command table
-//! [`COMMANDS`] transcribes `CmdTable[]` (`drvLove.c:255-270`) verbatim: 12
+//! `COMMANDS` transcribes `CmdTable[]` (`drvLove.c:255-270`) verbatim: 12
 //! commands, each with a read conversion, an optional model-dependent write
 //! command, and per-model (1600 / 16A) read/write strings.
 //!
@@ -31,7 +31,7 @@
 //!   uses `"%2X"` (no `0` flag) for the trailing checksum byte, so a
 //!   checksum `< 0x10` is sent as e.g. `" 3"` (space, digit) rather than
 //!   `"03"`. Rust's default numeric fill is also space for `{:2X}`, so
-//!   [`build_frame`] reproduces this without special-casing it.
+//!   `build_frame` reproduces this without special-casing it.
 //! - **A read/write timeout resends the *same* frame and re-reads**, up to
 //!   3 total attempts, sleeping `K_TUNE` (0.1s) before each — including
 //!   re-sending after a *read* timeout, not just a write timeout (C
@@ -53,7 +53,7 @@
 //! - **`getSignedValue`'s sign field is parsed differently per model**
 //!   (`drvLove.c:906-931`): decimal (`%2d`, nonzero -> negate) for model
 //!   1600, hex (`%2x`, bit 0 -> negate) for model 16A. Both this AND the
-//!   read/write *command strings* are model-dependent -- see [`COMMANDS`].
+//!   read/write *command strings* are model-dependent -- see `COMMANDS`.
 //! - **A negative write value is negated via `wrapping_neg`**, not plain
 //!   `-value` (`putData`, `drvLove.c:949-968`: `*value *= -1`) -- C's
 //!   negation of `INT32_MIN` is signed-integer-overflow UB; on every real
@@ -72,7 +72,7 @@
 //!   for equivalent latent-UB addr paths in `delaygen::coherent_sdg`.
 //! - **The model used to pick a command's read/write string is resolved
 //!   fresh on every read/write call** (via `user.addr` and the shared
-//!   [`registry`] table), not cached once at `drvUserCreate`/bind time
+//!   [`registry`](crate::registry) table), not cached once at `drvUserCreate`/bind time
 //!   the way C caches `pinst->pcmd` in the created `Inst`. asyn-rs
 //!   0.22.1's `DrvUserInfo` has no field to carry that kind of per-record
 //!   extra state (only `reason`/`max_octet_len`) -- see the `registry`
