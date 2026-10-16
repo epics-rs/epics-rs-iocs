@@ -196,7 +196,7 @@ fn connect_with_default_eos(
 mod tests {
     use super::*;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-    use epics_rs::asyn::registry::{open_owner, register_port};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
     /// A port with no EOS support of its own: both sets are refused.
@@ -215,13 +215,15 @@ mod tests {
     fn a_port_refusing_the_default_eos_still_connects() {
         let name = "omsEosRefused";
         let base = PortDriverBase::new(name, 1, PortFlags::default());
-        let (rt, _actor) = create_port_runtime(Bare(base), RuntimeConfig::default()).unwrap();
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
         let port = rt.port_handle().clone();
         assert!(
             port.set_input_eos_blocking(AsynUser::new(0), b"\n\r")
                 .is_err()
         );
-        register_port(name, port, &open_owner()).unwrap();
+        claim.publish(port, &open_owner()).unwrap();
         assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
     }
 }
