@@ -1,15 +1,8 @@
 # MW100 per-instrument system records (module presence/model/code/speed/
-# number, error/alarm summary, poll triggers, settings/measurement/compute
+# number, error/alarm summary, poll triggers, settings/compute
 # mode). Load once per $(HANDLE).
 # Macros: P, DAU, HANDLE.
 # Port of yokogawaDasApp/Db/MW100_system.db.
-#
-# Upstream-defect fix #2 (devMW100_bi.c:166 vs MW100_system.db): the C bi
-# device support recognizes a "MEASURE_MODE" command (dq->measurement_mode,
-# drvMW100.c:716-718, an independent status[4] bit alongside settings_mode
-# and compute_mode) but MW100_system.db never wires a record to it either —
-# OpMode/Computation exist for the other two bits, this one has no PV at all.
-# Added MeasureMode below, matching the same bi shape as OpMode/Computation.
 
 record(stringin, "$(P)$(DAU):IPAddress")
 {
@@ -410,16 +403,6 @@ record(bo,"$(P)$(DAU):OpModeSet")
     field(OUT,  "@$(HANDLE) OPMODE")
     field(ZNAM, "Measurement")
     field(ONAM, "Settings")
-}
-
-record(bi,"$(P)$(DAU):MeasureMode")
-{
-    field(DTYP, "Yokogawa MW100")
-    field(INP,  "@$(HANDLE) MEASURE_MODE")
-    field(ZNAM, "Not Measuring")
-    field(ONAM, "Measuring")
-    field(SCAN, "I/O Intr")
-    field(PINI, "YES")
 }
 
 record(bi,"$(P)$(DAU):Computation")
