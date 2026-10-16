@@ -14,15 +14,11 @@
 # MCA_RONTEC_IOC is set by main.rs (epics_rs::base::runtime::env::set_default)
 # to this IOC crate's CARGO_MANIFEST_DIR.
 
-# ---- serial port to the Rontec detector ----
-# C RontecConfig never sets an EOS itself, only reads whatever was already
-# configured (pasynOctetSyncIO->getInputEos, drvMcaRontec.c:197) -- the real
-# device's EOS is not specified anywhere in the C source, so "\r\n" here is
-# this IOC's own placeholder default, not a value derived from the Rontec
-# protocol spec.
+# ---- serial port to the Rontec detector, 38400 baud ----
 drvAsynSerialPortConfigure("S0", "$(RONTEC_TTY=/dev/ttyS0)", 0, 0, 0)
-asynOctetSetInputEos("S0", 0, "\r\n")
-asynOctetSetOutputEos("S0", 0, "\r\n")
+asynSetOption("S0", 0, "baud", "38400")
+asynOctetSetInputEos("S0", 0, "\r")
+asynOctetSetOutputEos("S0", 0, "\r")
 
 # ---- Rontec asyn MCA driver ----
 # RontecConfig(portName,serialPort,serialPortAddress)
