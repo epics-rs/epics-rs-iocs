@@ -1,10 +1,10 @@
 //! iocsh commands for the Phytron driver.
 //!
-//! Mirrors the C two-step configuration: `phytronCreatePhymotion` /
-//! `phytronCreateMCC` connect the asyn octet port and register a controller
-//! under a logical name, then `phytronCreateAxis(controllerName, module, index)`
-//! attaches each axis to a `DTYP`-keyed motor device support
-//! (`PHYTRON_{controllerName}_{module}_{index}`). The controller is looked up by
+//! Mirrors the C two-step configuration: `phytronCreateController` (phyMOTION)
+//! / `phytronCreateMCC` connect the asyn octet port and create controller port
+//! `controllerName`, then `phytronCreateAxis(controllerName, module, index)`
+//! adds axis `module*10 + index`, which records address as
+//! `@asyn(controllerName,module*10+index)`. The controller is looked up by
 //! name from a registry shared by the three commands (the C `controllers_`
 //! list). Both port kinds (`drvAsynIPPort` / `drvAsynSerialPort`) work, so
 //! `connect_ip` is used (the lookup is transport-agnostic).
@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
-use motor_common::{MotorHolder, asyn_user};
+use motor_common::{PortDriver, asyn_user, install, register_port};
 
 use crate::phytron::{CtrlType, PhytronAxis, PhytronController};
 
@@ -42,38 +42,43 @@ fn registry_lock(reg: &Registry) -> std::sync::MutexGuard<'_, HashMap<String, Co
     reg.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// C `phytronController` creates its port with 0xFF axes, room for every
+/// `module*10 + index` address.
+const PHYTRON_PORT_AXES: i32 = 0xFF;
+
 /// Build all three Phytron iocsh commands, sharing one controller registry.
-pub fn phytron_commands(holder: &Arc<MotorHolder>) -> Vec<CommandDef> {
+pub fn phytron_commands() -> Vec<CommandDef> {
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
     vec![
         phytron_create_phymotion_command(&registry),
         phytron_create_mcc_command(&registry),
-        phytron_create_axis_command(&registry, holder),
+        phytron_create_axis_command(&registry),
     ]
 }
 
-/// `phytronCreatePhymotion(controllerName, asynPort, [movingPollMs],
-/// [idlePollMs], [timeoutMs], [noResetAtBoot])`.
+/// `phytronCreateController(controllerName, asynPort, movingPollPeriod,
+/// idlePollPeriod, timeout, noResetAtBoot)`, C's `phytronCreatePhymotion`;
+/// periods and timeout in ms.
 fn phytron_create_phymotion_command(registry: &Registry) -> CommandDef {
     let registry = registry.clone();
     CommandDef::new(
-        "phytronCreatePhymotion",
+        "phytronCreateController",
         vec![
-            arg_str_req("controllerName"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
-            arg_int_opt("noResetAtBoot"),
+            arg_str_req("Controller name"),
+            arg_str_req("Phytron communication port name"),
+            arg_int_opt("Moving poll period (ms)"),
+            arg_int_opt("Idle poll period (ms)"),
+            arg_double_opt("Timeout (ms)"),
+            arg_int_opt("Do not restart controller with IOC"),
         ],
-        "phytronCreatePhymotion(controllerName, asynPort, [movingPollMs], [idlePollMs], \
-         [timeoutMs], [noResetAtBoot]) - Register a Phytron phyMOTION controller by name",
+        "phytronCreateController(controllerName, asynPort, movingPollPeriod, idlePollPeriod, \
+         timeout, noResetAtBoot)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
+            let name = req_string(args, 0, "Controller name")?;
+            let asyn_port = req_string(args, 1, "Phytron communication port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
-            let timeout_ms = opt_double(args, 4, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
-            let no_reset = opt_int(args, 5, 0, "noResetAtBoot")?;
+            let timeout_ms = opt_double(args, 4, DEFAULT_TIMEOUT_MS, "Timeout (ms)")?;
+            let no_reset = opt_int(args, 5, 0, "Do not restart controller with IOC")?;
 
             register_controller(
                 &registry,
@@ -85,39 +90,39 @@ fn phytron_create_phymotion_command(registry: &Registry) -> CommandDef {
                 idle_poll_ms,
                 timeout_ms,
                 no_reset != 1,
-                "phytronCreatePhymotion",
+                "phytronCreateController",
             )
         },
     )
 }
 
-/// `phytronCreateMCC(controllerName, asynPort, address, [movingPollMs],
-/// [idlePollMs], [timeoutMs], [noResetAtBoot])`.
+/// `phytronCreateMCC(controllerName, asynPort, address, movingPollPeriod,
+/// idlePollPeriod, timeout, noResetAtBoot)`, periods and timeout in ms.
 fn phytron_create_mcc_command(registry: &Registry) -> CommandDef {
     let registry = registry.clone();
     CommandDef::new(
         "phytronCreateMCC",
         vec![
-            arg_str_req("controllerName"),
-            arg_str_req("asynPort"),
-            arg_int_req("address"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
-            arg_int_opt("noResetAtBoot"),
+            arg_str_req("Controller name"),
+            arg_str_req("Phytron communication port name"),
+            arg_int_req("Controller address (0..15)"),
+            arg_int_opt("Moving poll period (ms)"),
+            arg_int_opt("Idle poll period (ms)"),
+            arg_double_opt("Timeout (ms)"),
+            arg_int_opt("Do not restart controller with IOC"),
         ],
-        "phytronCreateMCC(controllerName, asynPort, address, [movingPollMs], [idlePollMs], \
-         [timeoutMs], [noResetAtBoot]) - Register a Phytron MCC-1/MCC-2 controller by name",
+        "phytronCreateMCC(controllerName, asynPort, address, movingPollPeriod, idlePollPeriod, \
+         timeout, noResetAtBoot)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let address = req_int(args, 2, "address")?;
+            let name = req_string(args, 0, "Controller name")?;
+            let asyn_port = req_string(args, 1, "Phytron communication port name")?;
+            let address = req_int(args, 2, "Controller address (0..15)")?;
             if !(0..=15).contains(&address) {
                 return Err("phytronCreateMCC: address must be 0..=15".into());
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
-            let no_reset = opt_int(args, 6, 0, "noResetAtBoot")?;
+            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "Timeout (ms)")?;
+            let no_reset = opt_int(args, 6, 0, "Do not restart controller with IOC")?;
 
             register_controller(
                 &registry,
@@ -163,6 +168,7 @@ fn register_controller(
         controller.reset_at_boot();
     }
     let controller = Arc::new(Mutex::new(controller));
+    register_port(&name, PortDriver::Controller, PHYTRON_PORT_AXES)?;
     registry_lock(registry).insert(
         name.clone(),
         ControllerReg {
@@ -171,35 +177,34 @@ fn register_controller(
             idle_poll_ms,
         },
     );
-    println!(
-        "{cmd_name}: controller='{name}' asynPort={asyn_port} poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-         (attach axes with phytronCreateAxis)"
-    );
     Ok(CommandOutcome::Continue)
 }
 
-/// `phytronCreateAxis(controllerName, module, index)`.
-fn phytron_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> CommandDef {
+/// `phytronCreateAxis(controllerName, module, index)`, printing C's error lines.
+fn phytron_create_axis_command(registry: &Registry) -> CommandDef {
     let registry = registry.clone();
-    let holder = holder.clone();
     CommandDef::new(
         "phytronCreateAxis",
         vec![
-            arg_str_req("controllerName"),
-            arg_int_req("module"),
-            arg_int_req("index"),
+            arg_str_req("Controller Name"),
+            arg_int_req("Module index"),
+            arg_int_req("Axis index"),
         ],
-        "phytronCreateAxis(controllerName, module, index) - Attach one Phytron axis \
-         (DTYP PHYTRON_{controllerName}_{module}_{index})",
+        "phytronCreateAxis(controllerName, module, index)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let module = req_int(args, 1, "module")?;
-            let index = req_int(args, 2, "index")?;
+            let name = req_string(args, 0, "Controller Name")?;
+            let module = req_int(args, 1, "Module index")?;
+            let index = req_int(args, 2, "Axis index")?;
+            if index <= 0 {
+                println!("ERROR: invalid axis specified");
+                return Ok(CommandOutcome::Continue);
+            }
 
             let reg = registry_lock(&registry);
-            let entry = reg
-                .get(&name)
-                .ok_or_else(|| format!("phytronCreateAxis: controller '{name}' not registered"))?;
+            let Some(entry) = reg.get(&name) else {
+                println!("ERROR: phytronCreateAxis: Controller {name} is not registered");
+                return Ok(CommandOutcome::Continue);
+            };
             let controller = entry.controller.clone();
             let moving_poll_ms = entry.moving_poll_ms;
             let idle_poll_ms = entry.idle_poll_ms;
@@ -207,17 +212,14 @@ fn phytron_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -
 
             let axis = PhytronAxis::new(controller, module as i32, index as i32)
                 .map_err(|e| format!("phytronCreateAxis: {e}"))?;
-            let dtyp_key = format!("PHYTRON_{name}_{module}_{index}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(
+            install(
                 ctx,
                 asyn_user(&name, (module * 10 + index) as i32),
-                dtyp_key.clone(),
                 motor,
                 moving_poll_ms,
                 idle_poll_ms,
-            );
-            println!("phytronCreateAxis: {dtyp_key} (module={module} index={index})");
+            )?;
             Ok(CommandOutcome::Continue)
         },
     )

@@ -2,7 +2,7 @@
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
 //! `drvAsynSerialPortConfigure`), the Phytron iocsh commands
-//! (`phytronCreatePhymotion`, `phytronCreateMCC`, `phytronCreateAxis`), the
+//! (`phytronCreateController`, `phytronCreateMCC`, `phytronCreateAxis`), the
 //! motor record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
@@ -14,7 +14,6 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_common::MotorHolder;
 use motor_phytron::ioc::phytron_commands;
 
 #[epics_rs::base::epics_main]
@@ -39,13 +38,15 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // Phytron create-controller / create-axis commands share one motor device
-    // support and a controller-name registry.
-    let holder = MotorHolder::new();
-    for cmd in phytron_commands(&holder) {
+    // Phytron create-controller / create-axis commands share a controller-name
+    // registry.
+    for cmd in phytron_commands() {
         app = app.register_startup_command(cmd);
     }
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

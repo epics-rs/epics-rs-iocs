@@ -23,14 +23,14 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\x03")
 
 # ---- MCC controller ----
-# phytronCreateMCC(controllerName, asynPort, address, [movingPollMs],
-#                  [idlePollMs], [timeoutMs], [noResetAtBoot]).
+# phytronCreateMCC(controllerName, asynPort, address, movingPollPeriod,
+#                  idlePollPeriod, timeout, noResetAtBoot), all in ms.
 phytronCreateMCC("$(CTRL)", "$(IPPORT)", $(ADDR), 100, 1000, 1000, 1)
 
 # MCC axes are single-digit 1..8: phytronCreateAxis(controllerName, module=0,
 # index). The axis command prefix is the index digit.
 phytronCreateAxis("$(CTRL)", 0, 1)
-dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,CTRL=$(CTRL),MODULE=0,INDEX=1")
+dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=1")
 
 iocInit()
 
