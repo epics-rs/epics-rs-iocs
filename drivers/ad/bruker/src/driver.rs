@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -70,7 +71,7 @@ impl BrukerDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, MAX_SIZE, MAX_SIZE, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, MAX_SIZE, MAX_SIZE, max_memory, ASYN_CANBLOCK)?;
         let params = BrukerParams::create(&mut ad.port_base)?;
         let p = ad.params;
 
