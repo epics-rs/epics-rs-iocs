@@ -225,11 +225,6 @@ impl PortDriver for CtrDriver {
             if let Err(e) = dev.counter_load(addr, uldaq_sys::CRT_LOAD, 0) {
                 status = e.code;
             }
-        } else if reason == self.params.digital_output {
-            let dev = self.device.lock().unwrap();
-            if let Err(e) = dev.digital_out(uldaq_sys::AUXPORT, value as u64) {
-                status = e.code;
-            }
         } else if reason == self.params.trigger_mode {
             // C maps the Windows UL trigger values onto uldaq's, defaulting
             // to TRIG_LOW, and still sets the trigger after the error line.
