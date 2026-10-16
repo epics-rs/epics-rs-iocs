@@ -158,7 +158,6 @@ name = "ad-std-arrays-driver"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]

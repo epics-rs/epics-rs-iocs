@@ -13,6 +13,7 @@ use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
@@ -189,7 +190,13 @@ impl NdStdArraysDriver {
         let dims: Vec<NDDimension> = (0..ndims)
             .map(|i| NDDimension::new(self.array_dimensions[i]))
             .collect();
-        let mut array = self.pool.alloc(dims, data_type).map_err(pool_err)?;
+        let mut array = self.pool.alloc(dims, data_type).map_err(|e| {
+            self.port_base.trace_print(
+                TraceMask::ERROR,
+                "NDDriverStdArrays:writeXXXArray: error allocating raw buffer",
+            );
+            pool_err(e)
+        })?;
         // pArray->pAttributeList->add("ColorMode", ...) (NDDriverStdArrays.cpp:167).
         array.attributes.add(NDAttribute::new_static(
             "ColorMode",
@@ -260,7 +267,6 @@ impl NdStdArraysDriver {
                 // C's `switch (dataType)` has no default; there is no Rust
                 // equivalent of allocating an array of an unknown type, so the
                 // write is dropped.
-                log::error!("NDDriverStdArrays: invalid NDDataType {data_type_code}");
                 return Ok(());
             }
         };
@@ -378,9 +384,7 @@ impl NdStdArraysDriver {
         // NDAttributesFile machinery is not wired for this driver, so only the
         // ColorMode attribute added at allocation is attached.
 
-        if self.publish_tx.try_send(Arc::new(snapshot)).is_err() {
-            log::warn!("NDDriverStdArrays: publish queue full or closed; frame dropped");
-        }
+        let _ = self.publish_tx.try_send(Arc::new(snapshot));
         Ok(())
     }
 
