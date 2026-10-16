@@ -1,6 +1,6 @@
 //! C quadEM drivers report every fault they cannot return — a read thread has
 //! no caller — with `asynPrint(pasynUserSelf, ...)` on the driver's own port.
-//! [`asyn_print!`] is that call: the line goes through the port's asyn trace,
+//! [`asyn_print!`](crate::asyn_print) is that call: the line goes through the port's asyn trace,
 //! so `ASYN_TRACE_ERROR` prints by default and `asynSetTraceMask` governs the
 //! rest, exactly as in C.
 
