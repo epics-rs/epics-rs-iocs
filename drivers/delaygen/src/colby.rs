@@ -262,6 +262,46 @@ impl PortDriver for ColbyDriver {
     }
 
     fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        self.do_read_float64(user)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        self.do_write_float64(user, value)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+        self.do_read_uint32_digital(user, mask)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    fn write_uint32_digital(
+        &mut self,
+        user: &mut AsynUser,
+        value: u32,
+        mask: u32,
+    ) -> AsynResult<()> {
+        self.do_write_uint32_digital(user, value, mask)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        self.do_read_octet(user, buf)
+            .map_err(|_| wire::record_error(AsynStatus::Error))
+    }
+
+    /// C `writeItRaw`: always a no-op, `*nbytes=0` unconditionally — no
+    /// `getAddr`/switch at all, unlike every other interface method here.
+    fn write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+        Ok(0)
+    }
+}
+
+/// The C transfers; [`PortDriver`] hands their errors to the record as
+/// [`wire::record_error`].
+impl ColbyDriver {
+    fn do_read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
         let cmd = match user.addr {
             0 | 1 => "DEL?",
             4 | 5 => "STEP?",
@@ -272,7 +312,7 @@ impl PortDriver for ColbyDriver {
         Ok(scale_seconds_to_units(readback, &self.units))
     }
 
-    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+    fn do_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let pcmd = match user.addr {
             0 => "DEL",
             4 => "STEP",
@@ -282,7 +322,7 @@ impl PortDriver for ColbyDriver {
         device_write_only(&self.handle, self.iface, &cmd)
     }
 
-    fn read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
+    fn do_read_uint32_digital(&mut self, user: &AsynUser, mask: u32) -> AsynResult<u32> {
         match user.addr {
             // C: `*value = 0;` unconditionally — the device's actual
             // increment/decrement state is never queried back.
@@ -292,7 +332,7 @@ impl PortDriver for ColbyDriver {
         }
     }
 
-    fn write_uint32_digital(
+    fn do_write_uint32_digital(
         &mut self,
         user: &mut AsynUser,
         value: u32,
@@ -312,16 +352,16 @@ impl PortDriver for ColbyDriver {
         device_write_only(&self.handle, self.iface, cmd)
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn do_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         let text = match user.addr {
             8..=12 => {
                 let reply = device_write_read(&self.handle, self.iface, "NET?")?;
                 let tokens = split_net_reply(&reply);
                 let idx = (user.addr - 8) as usize;
-                tokens.get(idx).cloned().ok_or_else(|| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("NET? reply missing field {idx}: {reply:?}"),
-                })?
+                tokens
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| wire::record_error(AsynStatus::Error))?
             }
             13 => device_write_read(&self.handle, self.iface, "NETM?")?,
             other => return Err(AsynError::AddressOutOfRange(other)),
@@ -330,12 +370,6 @@ impl PortDriver for ColbyDriver {
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
-    }
-
-    /// C `writeItRaw`: always a no-op, `*nbytes=0` unconditionally — no
-    /// `getAddr`/switch at all, unlike every other interface method here.
-    fn write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
-        Ok(0)
     }
 }
 
@@ -415,5 +449,23 @@ mod init_tests {
         assert_eq!(colby.ident, "");
         let units = colby.read_uint32_digital(&AsynUser::default().with_addr(6), 1);
         assert_eq!(units.unwrap(), 0);
+    }
+
+    /// C returns a bare asynError and never writes the record's errorMessage.
+    #[test]
+    fn a_failed_transfer_reaches_the_record_as_bare_asyn_error() {
+        let mut colby = ColbyDriver::new(
+            "COLBY_MUTE2",
+            mute_link("COLBY_MUTE2_IO"),
+            "ns",
+            Iface::Ether,
+        );
+        for addr in [0, 7] {
+            let e = colby
+                .read_float64(&AsynUser::default().with_addr(addr))
+                .unwrap_err();
+            assert_eq!(e.message(), "");
+            assert_eq!(e.status(), AsynStatus::Error);
+        }
     }
 }
