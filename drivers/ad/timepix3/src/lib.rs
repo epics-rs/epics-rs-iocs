@@ -43,7 +43,7 @@ use crate::state::{Command, Shared};
 pub struct TimePix3Runtime {
     pub runtime_handle: PortRuntimeHandle,
     pub pool: DriverPool,
-    pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pub outputs: tasks::Outputs,
     pub shared: Arc<Shared>,
     _threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -53,8 +53,9 @@ impl TimePix3Runtime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn array_output(&self) -> &Arc<parking_lot::Mutex<NDArrayOutput>> {
-        &self.output
+    /// The NDArray output plugins on asyn address `addr` connect to.
+    pub fn array_output(&self, addr: usize) -> &Arc<parking_lot::Mutex<NDArrayOutput>> {
+        &self.outputs[addr]
     }
 }
 
@@ -79,14 +80,14 @@ pub fn create_timepix3_detector(
 
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
 
-    let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
+    let outputs = tasks::new_outputs();
     let ctx = Arc::new(tasks::Ctx {
         handle: runtime_handle.port_handle().clone(),
         http,
         shared: shared.clone(),
         p,
         ad: ad_params,
-        output: output.clone(),
+        outputs: outputs.clone(),
         pool: pool.clone(),
     });
     let threads = tasks::start(ctx, cmd_rx);
@@ -94,7 +95,7 @@ pub fn create_timepix3_detector(
     Ok(TimePix3Runtime {
         runtime_handle,
         pool,
-        output,
+        outputs,
         shared,
         _threads: threads,
     })

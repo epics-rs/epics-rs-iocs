@@ -27,6 +27,8 @@ pub enum Command {
     RefreshStatus,
     /// C `getDetector(false)` after a layout rotation: re-read `/detector`.
     RefreshDetector,
+    /// C `pushProcessedHstToPlugins` on a `TPX3_HST_WRITE_PROCESSED` write of 1.
+    PushProcessedHst,
 }
 
 /// Where the three preview channels stream from, as Serval's `Base` PVs give

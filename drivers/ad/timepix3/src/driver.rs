@@ -12,6 +12,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use serde_json::json;
 
+use crate::accum::RangeState;
 use crate::adlog;
 use crate::calibration::PathPolicy;
 use crate::coordinator::{Phase, Resource};
@@ -425,6 +426,15 @@ impl TimePix3Driver {
 
     fn int(&self, index: usize, addr: i32) -> i32 {
         self.ad.port_base.get_int32_param(index, addr).unwrap_or(0)
+    }
+
+    /// The parameter half of C `updatePrvHstRangeState` /
+    /// `updateImgRangeState` (ADTimePix.cpp:1329-1332, :1344-1347).
+    fn set_range(&mut self, saturated: usize, status: usize, range: RangeState) -> AsynResult<()> {
+        self.ad
+            .port_base
+            .set_int32_param(saturated, 0, i32::from(range != RangeState::Ok))?;
+        self.ad.port_base.set_string_param(status, 0, range.name())
     }
 
     fn dbl(&self, index: usize, addr: i32) -> f64 {
@@ -1671,9 +1681,27 @@ impl PortDriver for TimePix3Driver {
                     .set_int32_param(p.img_image_data_reset, 0, 0)?;
             }
             Ok(())
+        } else if reason == p.write_processed_hst {
+            // ADTimePix.cpp:598-604; the task stores 0 once the arrays are out.
+            if value == 1 {
+                self.cmd_tx
+                    .try_send(Command::PushProcessedHst)
+                    .map_err(|_| AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "timepix3: the connection task is not running".into(),
+                    })?;
+            }
+            Ok(())
         } else if reason == p.prv_hst_data_reset {
             if value == 1 {
-                self.shared.hst.lock().reset();
+                let range = {
+                    let mut hst = self.shared.hst.lock();
+                    hst.reset();
+                    hst.report_range(RangeState::Ok)
+                };
+                if let Some(range) = range {
+                    self.set_range(p.prv_hst_range_saturated, p.prv_hst_range_status, range)?;
+                }
                 self.ad
                     .port_base
                     .set_int32_param(p.prv_hst_data_reset, 0, 0)?;

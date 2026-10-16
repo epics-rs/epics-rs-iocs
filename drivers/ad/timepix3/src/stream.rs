@@ -74,14 +74,17 @@ impl HistogramFrame {
     /// The bin's left edge, in milliseconds (C `calculate_bin_edges` scaled by
     /// 1e3, histogram_io.cpp:567).
     pub fn time_axis_ms(&self) -> Vec<f64> {
-        (0..self.counts.len())
-            .map(|i| {
-                (f64::from(self.bin_offset) + i as f64 * f64::from(self.bin_width))
-                    * TDC_CLOCK_PERIOD_SEC
-                    * 1e3
-            })
-            .collect()
+        time_axis_ms(self.bin_offset, self.bin_width, self.counts.len())
     }
+}
+
+/// `bins` left edges in milliseconds from a histogram's offset and width.
+pub fn time_axis_ms(bin_offset: i32, bin_width: i32, bins: usize) -> Vec<f64> {
+    (0..bins)
+        .map(|i| {
+            (f64::from(bin_offset) + i as f64 * f64::from(bin_width)) * TDC_CLOCK_PERIOD_SEC * 1e3
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]

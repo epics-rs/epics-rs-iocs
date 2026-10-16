@@ -30,6 +30,39 @@ pub struct Update {
     pub reset: bool,
 }
 
+/// C `ADTimePix3Numeric::RangeState` (numeric_range.h:17), ordered as C
+/// promotes it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RangeState {
+    #[default]
+    Ok,
+    OutputClamped,
+    AccumulatorSaturated,
+}
+
+impl RangeState {
+    /// C `rangeStateName` (numeric_range.cpp:78).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "OK",
+            Self::OutputClamped => "Published output clamped",
+            Self::AccumulatorSaturated => "Accumulator saturated",
+        }
+    }
+}
+
+/// C `clampAverageToUInt32` (numeric_range.cpp:38): `sum / divisor`, capped at
+/// `u32::MAX`, and whether it was capped.
+pub fn clamp_average_to_u32(sum: u64, divisor: u64) -> (u32, bool) {
+    if divisor == 0 {
+        return (0, false);
+    }
+    match u32::try_from(sum / divisor) {
+        Ok(v) => (v, false),
+        Err(_) => (u32::MAX, true),
+    }
+}
+
 #[derive(Debug)]
 pub struct Accumulator {
     len: usize,
@@ -40,6 +73,7 @@ pub struct Accumulator {
     since_update: usize,
     frame_count: u64,
     total_counts: u64,
+    range: RangeState,
 }
 
 impl Default for Accumulator {
@@ -60,7 +94,46 @@ impl Accumulator {
             since_update: 0,
             frame_count: 0,
             total_counts: 0,
+            range: RangeState::Ok,
         }
+    }
+
+    /// C `imgRangeState_` / `prvHstRangeState_`.
+    pub fn range(&self) -> RangeState {
+        self.range
+    }
+
+    /// C `updateImgRangeState` / `updatePrvHstRangeState` (ADTimePix.cpp:1322,
+    /// :1337): promote the latch, and return the state when C would post its
+    /// RangeSaturated/RangeStatus pair.
+    pub fn report_range(&mut self, state: RangeState) -> Option<RangeState> {
+        let promoted = if state == RangeState::Ok {
+            RangeState::Ok
+        } else {
+            state.max(self.range)
+        };
+        if promoted == self.range && state != RangeState::Ok {
+            return None;
+        }
+        self.range = promoted;
+        Some(promoted)
+    }
+
+    /// The running sum, one element per pixel or bin.
+    pub fn running(&self) -> &[u64] {
+        &self.running
+    }
+
+    /// The sum of the buffered frames (C `imgWindowSum_.sum()` /
+    /// `prvHstWindowSum_.sum()`).
+    pub fn window_sum(&self) -> Vec<u64> {
+        let mut sum = vec![0u64; self.len];
+        for f in &self.buffer {
+            for (s, &v) in sum.iter_mut().zip(f) {
+                *s = s.saturating_add(u64::from(v));
+            }
+        }
+        sum
     }
 
     pub fn frames_to_sum(&self) -> usize {
@@ -138,14 +211,7 @@ impl Accumulator {
         self.since_update += 1;
         let (sum_n, frames_summed) = if self.since_update >= self.update_interval {
             self.since_update = 0;
-            let mut sum = vec![0u64; self.len];
-            for f in &self.buffer {
-                for (s, &v) in sum.iter_mut().zip(f) {
-                    *s = s.saturating_add(u64::from(v));
-                }
-            }
-            let n = self.buffer.len();
-            (Some(sum), n)
+            (Some(self.window_sum()), self.buffer.len())
         } else {
             (None, 0)
         };

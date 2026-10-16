@@ -7,9 +7,10 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::DriverPool;
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -22,7 +23,7 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 use serde_json::Value;
 
-use crate::accum::Update;
+use crate::accum::{RangeState, Update, clamp_average_to_u32};
 use crate::adlog;
 use crate::coordinator::Phase;
 use crate::driver::TimePix3Driver;
@@ -58,8 +59,19 @@ pub struct Ctx {
     pub shared: Arc<Shared>,
     pub p: TimePixParams,
     pub ad: ADDriverParams,
-    pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    /// One NDArray output per asyn address (C `doCallbacksGenericPointer(...,
+    /// addr)`), index = address.
+    pub outputs: Outputs,
     pub pool: DriverPool,
+}
+
+pub type Outputs = Arc<[Arc<parking_lot::Mutex<NDArrayOutput>>]>;
+
+/// A fresh output for each of the port's `MAX_ADDR` addresses.
+pub fn new_outputs() -> Outputs {
+    (0..crate::driver::MAX_ADDR)
+        .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
+        .collect()
 }
 
 impl Ctx {
@@ -86,6 +98,39 @@ impl Ctx {
         self.set(
             addr,
             vec![ParamSetValue::new(reason, addr, ParamValue::Int64(value))],
+        )
+        .await;
+    }
+
+    /// C `doCallbacksGenericPointer(pArray, NDArrayData, addr)`: stamp the
+    /// array's epicsTS (`updateTimeStamp`), then hand it to the plugins on
+    /// `addr`.
+    async fn publish_at(&self, addr: usize, mut array: DriverArray, time_stamp: f64) {
+        array.time_stamp = time_stamp;
+        array.timestamp = EpicsTimestamp::now();
+        ArrayPublisher::new(self.outputs[addr].clone())
+            .publish(array)
+            .await;
+    }
+
+    /// The parameter half of C `updatePrvHstRangeState` /
+    /// `updateImgRangeState` (ADTimePix.cpp:1329-1334, :1344-1349).
+    async fn post_range(&self, saturated: usize, status: usize, range: Option<RangeState>) {
+        let Some(range) = range else { return };
+        self.set(
+            ADDR,
+            vec![
+                ParamSetValue::new(
+                    saturated,
+                    ADDR,
+                    ParamValue::Int32(i32::from(range != RangeState::Ok)),
+                ),
+                ParamSetValue::new(
+                    status,
+                    ADDR,
+                    ParamValue::Octet(range.name().as_bytes().into()),
+                ),
+            ],
         )
         .await;
     }
@@ -165,6 +210,11 @@ async fn connection_poll(
             }
             Command::RefreshDetector => {
                 refresh_detector(&ctx).await;
+                continue;
+            }
+            Command::PushProcessedHst => {
+                push_processed_hst(&ctx).await;
+                ctx.set_int(ctx.p.write_processed_hst, ADDR, 0).await;
                 continue;
             }
             Command::RefreshConnection => {}
@@ -1282,6 +1332,216 @@ async fn publish_accumulation(
     }
 }
 
+/// What the PrvHst NDArrays on addresses 4-7 are built from, copied out of
+/// the accumulator under its lock (C holds `prvHstMutex_` throughout).
+struct HstArrays {
+    running: Vec<u64>,
+    frame_count: u64,
+    /// The window sum and its frame count, when address 4 is published.
+    window: Option<(Vec<u64>, u64)>,
+    current: Option<Vec<u32>>,
+    time_ms: Vec<f64>,
+}
+
+/// C `processedHstOutputType`: 0 publishes sums as NDUInt64, 1 per-frame
+/// averages as NDUInt32.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HstOutput {
+    Sum,
+    Average,
+}
+
+/// C `addNumericRangeAttributes` (ADTimePix.cpp:1352).
+fn add_range_attributes(array: &mut DriverArray, range: &str, units: &str, saturated: bool) {
+    for (name, desc, value) in [
+        (
+            "ADTimePixNumericRange",
+            "Published numeric range",
+            NDAttrValue::String(range.into()),
+        ),
+        (
+            "ADTimePixCountUnits",
+            "Count value units",
+            NDAttrValue::String(units.into()),
+        ),
+        (
+            "ADTimePixRangeSaturated",
+            "Range saturation occurred",
+            NDAttrValue::Int32(i32::from(saturated)),
+        ),
+    ] {
+        array.attributes.add(NDAttribute::new_static(
+            name,
+            desc,
+            NDAttrSource::Driver,
+            value,
+        ));
+    }
+}
+
+/// C's `PrvHstTimeBin0Ms`/`PrvHstTimeBinStepMs`/`PrvHstNumBins` trio.
+fn add_time_attributes(array: &mut DriverArray, time_ms: &[f64]) {
+    let t0 = time_ms.first().copied().unwrap_or(0.0);
+    let step = if time_ms.len() > 1 {
+        time_ms[1] - time_ms[0]
+    } else {
+        0.0
+    };
+    for (name, desc, value) in [
+        (
+            "PrvHstTimeBin0Ms",
+            "First bin center (ms)",
+            NDAttrValue::Float64(t0),
+        ),
+        (
+            "PrvHstTimeBinStepMs",
+            "Bin center spacing (ms)",
+            NDAttrValue::Float64(step),
+        ),
+        (
+            "PrvHstNumBins",
+            "Number of bins",
+            NDAttrValue::Int32(i32::try_from(time_ms.len()).unwrap_or(i32::MAX)),
+        ),
+    ] {
+        array.attributes.add(NDAttribute::new_static(
+            name,
+            desc,
+            NDAttrSource::Driver,
+            value,
+        ));
+    }
+}
+
+/// A sum as published on address 4 or 5: the sum itself, or its per-frame
+/// average clamped to u32 with any clamp latched as `OutputClamped`.
+async fn hst_sum_buffer(ctx: &Ctx, sum: &[u64], frames: u64, output: HstOutput) -> NDDataBuffer {
+    match output {
+        HstOutput::Sum => NDDataBuffer::U64(sum.to_vec()),
+        HstOutput::Average => {
+            let mut clamped = false;
+            let avg = sum
+                .iter()
+                .map(|&v| {
+                    let (a, c) = clamp_average_to_u32(v, frames);
+                    clamped |= c;
+                    a
+                })
+                .collect();
+            if clamped {
+                let posted = ctx
+                    .shared
+                    .hst
+                    .lock()
+                    .report_range(RangeState::OutputClamped);
+                ctx.post_range(
+                    ctx.p.prv_hst_range_saturated,
+                    ctx.p.prv_hst_range_status,
+                    posted,
+                )
+                .await;
+            }
+            NDDataBuffer::U32(avg)
+        }
+    }
+}
+
+/// The PrvHst NDArrays in C's order: running sum on 5, bin times on 7, the
+/// current frame on 6 and the window sum on 4 (ADTimePix.cpp:1209-1305,
+/// histogram_io.cpp:765-830). Every array carries one `time_stamp`, taken
+/// before the first is built.
+async fn publish_hst_arrays(ctx: &Ctx, a: HstArrays, output: HstOutput) {
+    let bins = a.running.len();
+    if bins == 0 {
+        return;
+    }
+    let time_stamp = EpicsTimestamp::now().as_f64();
+    let dims = || vec![NDDimension::new(bins)];
+    let (range, units) = match output {
+        HstOutput::Sum => ("uint64", "counts"),
+        HstOutput::Average => ("uint32", "counts/frame"),
+    };
+
+    let data = hst_sum_buffer(ctx, &a.running, a.frame_count.max(1), output).await;
+    if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
+        let _ = ctx.pool.owner().get_attributes(&mut array).await;
+        add_time_attributes(&mut array, &a.time_ms);
+        let saturated = ctx.shared.hst.lock().range() != RangeState::Ok;
+        add_range_attributes(&mut array, range, units, saturated);
+        ctx.publish_at(5, array, time_stamp).await;
+    }
+
+    if let Ok(mut array) = ctx.pool.wrap(dims(), NDDataBuffer::F64(a.time_ms.clone())) {
+        let _ = ctx.pool.owner().get_attributes(&mut array).await;
+        ctx.publish_at(7, array, time_stamp).await;
+    }
+
+    if let Some(current) = a.current.filter(|c| c.len() == bins)
+        && let Ok(mut array) = ctx.pool.wrap(dims(), NDDataBuffer::U32(current))
+    {
+        let _ = ctx.pool.owner().get_attributes(&mut array).await;
+        add_range_attributes(&mut array, "uint32", "counts", false);
+        ctx.publish_at(6, array, time_stamp).await;
+    }
+
+    if let Some((window, frames)) = a.window.filter(|(w, _)| w.len() >= bins) {
+        let data = hst_sum_buffer(ctx, &window[..bins], frames.max(1), output).await;
+        if let Ok(mut array) = ctx.pool.wrap(dims(), data) {
+            let _ = ctx.pool.owner().get_attributes(&mut array).await;
+            add_time_attributes(&mut array, &a.time_ms);
+            let saturated = ctx.shared.hst.lock().range() != RangeState::Ok;
+            add_range_attributes(&mut array, range, units, saturated);
+            ctx.publish_at(4, array, time_stamp).await;
+        }
+    }
+}
+
+/// C `pushProcessedHstToPlugins` (ADTimePix.cpp:1150): the accumulated
+/// PrvHst state on addresses 4-7 on demand, as sums or per-frame averages.
+/// The time axis is rebuilt from the last frame's bin offset and width.
+async fn push_processed_hst(ctx: &Ctx) {
+    let output = match ctx
+        .handle
+        .read_int32(ctx.p.processed_hst_output_type, 0)
+        .await
+        .unwrap_or(0)
+    {
+        1 => HstOutput::Average,
+        _ => HstOutput::Sum,
+    };
+    if ctx
+        .handle
+        .read_int32(ctx.ad.base.array_callbacks, 0)
+        .await
+        .unwrap_or(0)
+        == 0
+    {
+        return;
+    }
+    let offset = ctx
+        .handle
+        .read_int32(ctx.p.prv_hst_frame_bin_offset, 0)
+        .await
+        .unwrap_or(0);
+    let width = ctx
+        .handle
+        .read_int32(ctx.p.prv_hst_frame_bin_width, 0)
+        .await
+        .unwrap_or(0);
+    let arrays = {
+        let hst = ctx.shared.hst.lock();
+        let buffered = hst.buffered_frames() as u64;
+        HstArrays {
+            running: hst.running().to_vec(),
+            frame_count: hst.frame_count(),
+            window: (buffered > 0).then(|| (hst.window_sum(), buffered)),
+            current: hst.current_frame().map(<[u32]>::to_vec),
+            time_ms: crate::stream::time_axis_ms(offset, width, hst.running().len()),
+        }
+    };
+    publish_hst_arrays(ctx, arrays, output).await;
+}
+
 /// Push a preview frame down the plugin chain as an NDArray. C stamps it with
 /// Serval's `frameNumber`, not NDArrayCounter (serval_stream.cpp:604, :1467).
 async fn publish_image(
@@ -1325,7 +1585,9 @@ async fn publish_image(
     // (serval_stream.cpp:292, :943); C ignores the status.
     let _ = ctx.pool.owner().get_attributes(&mut array).await;
 
-    ArrayPublisher::new(ctx.output.clone()).publish(array).await;
+    ArrayPublisher::new(ctx.outputs[0].clone())
+        .publish(array)
+        .await;
 }
 
 #[cfg(test)]
@@ -1395,7 +1657,7 @@ mod tests {
             shared,
             p,
             ad,
-            output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+            outputs: new_outputs(),
             pool: DriverPool::standalone(0),
         }
     }
@@ -1515,7 +1777,7 @@ mod tests {
             shared,
             p,
             ad,
-            output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+            outputs: new_outputs(),
             pool: DriverPool::standalone(0),
         };
 
@@ -1565,16 +1827,16 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let mut output = NDArrayOutput::new();
+        let outputs = new_outputs();
         let (tx, mut rx) = ndarray_channel("TPXUID_SINK", 4);
-        output.add(tx);
+        outputs[0].lock().add(tx);
         let ctx = Arc::new(Ctx {
             handle: runtime.port_handle().clone(),
             http,
             shared,
             p,
             ad,
-            output: Arc::new(parking_lot::Mutex::new(output)),
+            outputs,
             pool: DriverPool::standalone(0),
         });
         ctx.set_int(ad.base.array_callbacks, 0, 1).await;
@@ -1630,16 +1892,16 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let mut output = NDArrayOutput::new();
+        let outputs = new_outputs();
         let (tx, mut rx) = ndarray_channel("TPXATTR_SINK", 4);
-        output.add(tx);
+        outputs[0].lock().add(tx);
         let ctx = Arc::new(Ctx {
             handle: runtime.port_handle().clone(),
             http,
             shared,
             p,
             ad,
-            output: Arc::new(parking_lot::Mutex::new(output)),
+            outputs,
             pool,
         });
         ctx.set_int(ad.base.array_callbacks, 0, 1).await;
@@ -1674,5 +1936,69 @@ mod tests {
             assert_eq!(array.attributes.len(), 1);
         }
         std::mem::forget(runtime);
+    }
+
+    /// C `pushProcessedHstToPlugins` hands the accumulated PrvHst state to the
+    /// plugins on addresses 4-7: sums as NDUInt64 for output type 0, averages
+    /// as NDUInt32 for type 1 (ADTimePix.cpp:1150-1305).
+    #[tokio::test]
+    async fn processed_hst_push_arrives_on_addresses_4_to_7() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+
+        let ctx = Arc::new(idle_ctx("TPX_HST_PUSH"));
+        let mut sinks = Vec::new();
+        for addr in 4..=7 {
+            let (tx, rx) = ndarray_channel(&format!("TPX_HST_PUSH_{addr}"), 4);
+            ctx.outputs[addr].lock().add(tx);
+            sinks.push(rx);
+        }
+        ctx.set_int(ctx.ad.base.array_callbacks, 0, 1).await;
+        ctx.set_int(ctx.p.prv_hst_frame_bin_offset, 0, 0).await;
+        ctx.set_int(ctx.p.prv_hst_frame_bin_width, 0, 2).await;
+        {
+            let mut hst = ctx.shared.hst.lock();
+            hst.add(&[1, u32::MAX]);
+            hst.add(&[3, u32::MAX]);
+        }
+
+        let mut recv = async |i: usize| {
+            tokio::time::timeout(Duration::from_secs(5), sinks[i].recv())
+                .await
+                .expect("no array")
+                .unwrap()
+        };
+
+        push_processed_hst(&ctx).await;
+        let sum4 = recv(0).await;
+        let sum5 = recv(1).await;
+        let frame6 = recv(2).await;
+        let time7 = recv(3).await;
+        let both = 2 * u64::from(u32::MAX);
+        assert!(matches!(&sum4.data, NDDataBuffer::U64(v) if *v == vec![4, both]));
+        assert!(matches!(&sum5.data, NDDataBuffer::U64(v) if *v == vec![4, both]));
+        assert!(matches!(&frame6.data, NDDataBuffer::U32(v) if *v == vec![3, u32::MAX]));
+        let step = 2.0 * crate::stream::TDC_CLOCK_PERIOD_SEC * 1e3;
+        assert!(matches!(&time7.data, NDDataBuffer::F64(v) if *v == vec![0.0, step]));
+        assert_eq!(
+            sum5.attributes
+                .get("ADTimePixNumericRange")
+                .map(|a| &a.value),
+            Some(&NDAttrValue::String("uint64".into()))
+        );
+        assert_eq!(
+            sum5.attributes.get("PrvHstNumBins").map(|a| &a.value),
+            Some(&NDAttrValue::Int32(2))
+        );
+
+        ctx.set_int(ctx.p.processed_hst_output_type, 0, 1).await;
+        push_processed_hst(&ctx).await;
+        let avg4 = recv(0).await;
+        let avg5 = recv(1).await;
+        assert!(matches!(&avg4.data, NDDataBuffer::U32(v) if *v == vec![2, u32::MAX]));
+        assert!(matches!(&avg5.data, NDDataBuffer::U32(v) if *v == vec![2, u32::MAX]));
+        assert_eq!(
+            avg5.attributes.get("ADTimePixCountUnits").map(|a| &a.value),
+            Some(&NDAttrValue::String("counts/frame".into()))
+        );
     }
 }
