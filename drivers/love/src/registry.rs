@@ -15,7 +15,6 @@
 //! constructed by `drvLoveInit` *before* `create_port_runtime`, with one clone
 //! held by the driver and another registered here for `drvLoveConfig` to find.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// C `#define K_INSTRMAX (256)` — controller addresses are 1..=256, indexed
@@ -49,9 +48,10 @@ impl Model {
 
 pub type ModelTable = Arc<Mutex<[Model; K_INSTRMAX]>>;
 
-fn registry() -> &'static Mutex<HashMap<String, ModelTable>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, ModelTable>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+/// C `pports`, newest port first.
+fn registry() -> &'static Mutex<Vec<(String, ModelTable)>> {
+    static REGISTRY: OnceLock<Mutex<Vec<(String, ModelTable)>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Register `table` under `port_name`, called once by `drvLoveInit`.
@@ -59,13 +59,31 @@ pub fn register(port_name: &str, table: ModelTable) {
     registry()
         .lock()
         .unwrap()
-        .insert(port_name.to_string(), table);
+        .insert(0, (port_name.to_string(), table));
 }
 
 /// Look up the model table for an already-`drvLoveInit`-ed port, called by
 /// `drvLoveConfig`. C: the `pports` linked-list walk in `drvLoveConfig` that
 /// fails with `"drvLoveConfig::failure to locate port %s\n"` when no match
-/// is found.
+/// is found. The name compare is C's `epicsStrCaseCmp`.
 pub fn lookup(port_name: &str) -> Option<ModelTable> {
-    registry().lock().unwrap().get(port_name).cloned()
+    registry()
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(port_name))
+        .map(|(_, table)| table.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookup_ignores_case_like_epics_str_case_cmp() {
+        let table: ModelTable = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
+        register("loveCaseL0", table.clone());
+        let found = lookup("LOVECASEL0").expect("case-insensitive match");
+        assert!(Arc::ptr_eq(&found, &table));
+    }
 }
