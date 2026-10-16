@@ -91,8 +91,7 @@ impl Mdt695Controller {
                 break;
             }
             // Reply corrupted (likely echo on): toggle echo and retry.
-            ctrl.write_only("E")?;
-            let _ = ctrl.read_line();
+            let _ = ctrl.query("E");
         }
         if !found {
             return Err(thorlabs_err(
@@ -103,15 +102,16 @@ impl Mdt695Controller {
         ctrl.num_axes = if model.contains("694") { 1 } else { 3 };
 
         // Multi-line identification (Model / Version lines).
-        ctrl.write_only("I")?;
         let mut ident_parts = Vec::new();
-        while let Ok(line) = ctrl.read_line() {
+        let mut next = ctrl.query("I");
+        while let Ok(line) = next {
             if line.is_empty() {
                 break;
             }
             if line.contains("Model") || line.contains("Version") {
                 ident_parts.push(line);
             }
+            next = ctrl.read_line();
         }
         ctrl.ident = if ident_parts.is_empty() {
             model
@@ -148,14 +148,19 @@ impl Mdt695Controller {
     /// Read one CR-terminated reply line (trimmed).
     fn read_line(&self) -> AsynResult<String> {
         let raw = self.handle.read_octet(0, READ_BUF)?;
-        let text = String::from_utf8_lossy(&raw);
-        Ok(text.trim_matches(['\r', '\n', '\0']).to_string())
+        Ok(Self::trimmed(&raw))
+    }
+
+    fn trimmed(raw: &[u8]) -> String {
+        String::from_utf8_lossy(raw)
+            .trim_matches(['\r', '\n', '\0'])
+            .to_string()
     }
 
     /// Write a query and return its reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write_only(cmd)?;
-        self.read_line()
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        Ok(Self::trimmed(&raw))
     }
 }
 
