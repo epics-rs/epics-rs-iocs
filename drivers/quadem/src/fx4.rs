@@ -585,7 +585,7 @@ fn data_thread(ctx: DataContext) {
                             .compute_positions(&ctx.handle, &ctx.params, &values);
                     }
                     Fx4Action::BulbTrigger => {
-                        ctx.shared.trigger_callbacks(&ctx.handle);
+                        let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                     }
                 }
             }

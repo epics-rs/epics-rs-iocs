@@ -633,7 +633,7 @@ fn read_thread(ctx: ReadContext) {
                                 IO_DRIVER,
                                 "drvAHxxx::readThread timeout with nRead=5, triggering callbacks"
                             );
-                            ctx.shared.trigger_callbacks(&ctx.handle);
+                            let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                         }
                         continue;
                     }
@@ -652,7 +652,7 @@ fn read_thread(ctx: ReadContext) {
                         IO_DRIVER,
                         "drvAHxxx::readThread found ACK\\r\\n at start of data, triggering callbacks"
                     );
-                    ctx.shared.trigger_callbacks(&ctx.handle);
+                    let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                     let preamble_len = proto::ACK_PREAMBLE.len();
                     outcome.data.drain(0..preamble_len);
                     let extra = ctx.io.locked_read_binary(preamble_len);
@@ -885,10 +885,12 @@ mod tests {
                 epics_rs::asyn::user::AsynUser::new(rt.params.range),
             )
             .unwrap_err();
-        assert!(
-            err.message()
-                .contains("asynManager::queueLockPort not connected"),
-            "{err}"
+        assert_eq!(
+            err.message(),
+            format!(
+                "drvQuadEM:writeInt32: status=3, function={}, name=QE_RANGE, value=1",
+                rt.params.range
+            )
         );
     }
 
@@ -958,7 +960,13 @@ mod tests {
             .write_int32_blocking(rt.nd_params.acquire, 0, 1)
             .unwrap_err();
         assert_eq!(err.status(), epics_rs::asyn::error::AsynStatus::Error);
-        assert_eq!(err.message(), "no input EOS");
+        assert_eq!(
+            err.message(),
+            format!(
+                "drvQuadEM:writeInt32: status=3, function={}, name=ACQUIRE, value=1",
+                rt.nd_params.acquire
+            )
+        );
     }
 
     #[test]

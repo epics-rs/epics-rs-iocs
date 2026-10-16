@@ -822,6 +822,12 @@ mod tests {
             .write_int32_blocking(rt.nd_params.acquire, 0, 1)
             .unwrap_err();
         assert_eq!(err.status(), epics_rs::asyn::error::AsynStatus::Error);
-        assert_eq!(err.message(), "no input EOS");
+        assert_eq!(
+            err.message(),
+            format!(
+                "drvQuadEM:writeInt32: status=3, function={}, name=ACQUIRE, value=1",
+                rt.nd_params.acquire
+            )
+        );
     }
 }
