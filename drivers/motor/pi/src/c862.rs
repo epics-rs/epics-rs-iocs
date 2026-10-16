@@ -28,7 +28,7 @@
 //! Mclennan PM304 port (which appends its own terminator and leaves the
 //! port's output EOS unset) — see the `motor-port-eos-ownership` convention:
 //! which one applies is a per-C-driver fact, not a template to copy.
-//! `PIC862Config` sets both the same way, and [`PIC862Controller::send`]
+//! `PIC862Config` sets both the same way, and `PIC862Controller::send`
 //! therefore writes **bare** command bytes with no manual terminator.
 //!
 //! Input terminator: `"\n\x03"` (LF then ASCII ETX, 2 bytes).
@@ -37,7 +37,7 @@
 //! (`com[nread - 1] = '\0'; /* Strip trailing CR. */`) after the port's own
 //! EOS strip already removed the `\n\x03` — i.e. every reply carries one
 //! extra CR ahead of the terminator that the port's EOS layer doesn't know
-//! about. [`PIC862Controller::recv`] reproduces this unconditional
+//! about. `PIC862Controller::reply` reproduces this unconditional
 //! single-byte drop (not a `trim_end_matches`, which would strip a variable
 //! count) and folds any transport error into an empty reply, matching
 //! `recv_mess`'s swallow of `status != asynSuccess` into `""`.
@@ -78,7 +78,7 @@
 //! active-low in that configuration).
 //!
 //! A comm failure on `TS` runs the C `NORMAL`/`RETRY`/`COMM_ERR` two-strike
-//! debounce ([`CommState`]): the first bad `TS` in a row is silently retried
+//! debounce (`CommState`): the first bad `TS` in a row is silently retried
 //! (cached status returned unchanged); a second consecutive one sets
 //! `comms_error`/`problem`. `TS` succeeding unconditionally proceeds to `TP`
 //! with **no further debounce tied to `TP`** — a genuine C asymmetry (`TP`'s
@@ -114,7 +114,7 @@
 //!   handling beyond the shared SV/SA preamble).
 //! - `JOG` (`move_velocity`) — **the C-862 has no jog command**: `SV{|v|}`
 //!   then `MA` to whichever record soft limit (`DHLM`/`DLLM`, cached from
-//!   [`AsynMotor::set_high_limit`]/[`set_low_limit`]) the velocity sign
+//!   [`AsynMotor::set_high_limit`]/[`set_low_limit`](AsynMotor::set_low_limit)) the velocity sign
 //!   selects, exactly like MM3000's jog simulation. `SET_HIGH_LIMIT`/
 //!   `SET_LOW_LIMIT` themselves send no wire command (`trans->state =
 //!   IDLE_STATE`) — record-side caching only.

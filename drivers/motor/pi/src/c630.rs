@@ -24,7 +24,7 @@
 //! after connecting, and `send_mess` never appends a terminator itself
 //! (`strcpy(buff, com)` only) — so the port's configured output EOS is what
 //! puts the trailing `\n` on the wire. `PIC630Config` sets both to `"\n"` and
-//! [`PIC630Controller::send`] writes **bare** command bytes.
+//! `PIC630Controller::send` writes **bare** command bytes.
 //!
 //! The reference `PI_C630.iocsh` sets the port EOS to `"\r"` *before* iocInit,
 //! but `motor_init` (which runs at iocInit) overwrites both to `"\n"`; the
@@ -34,10 +34,10 @@
 //! Critically, the C-630 **echoes every command it receives**: `send_mess`
 //! writes the command and then immediately `recv_mess`'s that echo and
 //! discards it ("This thing always echos everything sent to it. Read this
-//! response."). [`PIC630Controller::send`] reproduces this: every write is
+//! response."). `PIC630Controller::send` reproduces this: every write is
 //! followed by one discarded read. A *query* (`TS`/`TP`) therefore reads
 //! twice — the echo (in `send`) then the data reply (in
-//! [`PIC630Controller::query`]).
+//! `PIC630Controller::query`).
 //!
 //! ## Status (`{addr}TS` — "Tell Status")
 //!

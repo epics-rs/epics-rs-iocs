@@ -12,9 +12,9 @@
 //! The XPS driver opens several TCP connections to the same controller
 //! (`XPSController.cpp` / `XPSAxis.cpp`):
 //!
-//! - a shared **poll socket** (positive timeout, [`XpsSocket::query`]) used by
+//! - a shared **poll socket** (positive timeout, `XpsSocket::query`) used by
 //!   the controller poll and every axis for reads;
-//! - one **move socket per axis** (negative timeout, [`XpsSocket::fire`]) used
+//! - one **move socket per axis** (negative timeout, `XpsSocket::fire`) used
 //!   for the actual `GroupMove*` / `GroupHomeSearch` commands. The controller
 //!   does not wait for the move to finish; completion is observed by polling
 //!   `GroupStatusGet` on the poll socket.
@@ -22,7 +22,7 @@
 //! # Framing
 //!
 //! Like `asynOctetSocket.cpp` (which configures the port with `noProcessEos`),
-//! [`XpsSocket::query`] accumulates reads until the reply ends with
+//! `XpsSocket::query` accumulates reads until the reply ends with
 //! [`XPS_TERMINATOR`] and strips it. Framing is therefore self-contained — the
 //! port needs no input-EOS configuration, so the IOC `st.cmd` only has to
 //! register a plain `drvAsynIPPort` per socket.

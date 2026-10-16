@@ -31,7 +31,7 @@
 //! the terminator (the `motor-port-eos-ownership` convention; here the C picks
 //! port-owned framing, same class as the C-862 but with `"\n"` both ways).
 //! `PIE516Config` sets both through `connect_with_eos` and
-//! [`PIE516Controller::send`] writes **bare** command bytes.
+//! `PIE516Controller::send` writes **bare** command bytes.
 //!
 //! **Documented deviation — the redundant trailing terminator.** C
 //! `devPIE516_build_trans` appends `EOL_E516` (`"\n"`) to every *motion*

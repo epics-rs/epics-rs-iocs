@@ -20,7 +20,7 @@
 //! 3. **Replies are `=`-delimited.** C `recv_mess` runs `pos = strchr(com,
 //!    '='); if (pos) strcpy(com, &pos[1])` on every read — the controller
 //!    echoes the query and returns `…=value`, so everything up to and including
-//!    the first `'='` is stripped before parsing. [`strip_eq`] reproduces this.
+//!    the first `'='` is stripped before parsing. `strip_eq` reproduces this.
 //!
 //! ## Connect handshake (C `motor_init`, mostly commented out)
 //! The E-517 `motor_init` has the ONLINE loop, `GET_IDENT`, and `VCO`

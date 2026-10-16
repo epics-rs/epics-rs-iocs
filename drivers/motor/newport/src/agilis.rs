@@ -16,7 +16,7 @@
 //! axis cannot change the channel in between.
 //!
 //! The Agilis needs a short delay between serial writes (C `WRITE_DELAY`); this
-//! driver sleeps [`WRITE_DELAY`] after every exchange, matching the C driver.
+//! driver sleeps `WRITE_DELAY` after every exchange, matching the C driver.
 //!
 //! ## Open-loop stepper positioning
 //!
@@ -29,9 +29,9 @@
 //!
 //! Two C bugs are ported faithfully and flagged at their sites:
 //! - `AG_UC.cpp:242`: the reverse-amplitude default clobbers the *forward*
-//!   amplitude (see [`setup_amplitudes`]).
+//!   amplitude (see `setup_amplitudes`).
 //! - `AG_UC.cpp:383`: axis-2 limit test is `(lim == 3 || lim == 3)` — a
-//!   duplicated condition (see [`ph_limit`]).
+//!   duplicated condition (see `ph_limit`).
 
 use std::sync::{Arc, Mutex};
 use std::thread;

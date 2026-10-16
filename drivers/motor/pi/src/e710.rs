@@ -11,7 +11,7 @@
 //! ## Addressing — digit axes, first-char substitution
 //! `PIE710_axis[] = {"1".."6"}`, `MAX_AXES = 6`. C `send_mess` overwrites only
 //! `local_buff[0]` with `*name`, so the leading `#` placeholder of a command
-//! becomes the axis digit (`#GI8` → `1GI8`, `#TP` → `1TP`). [`substitute_axis`]
+//! becomes the axis digit (`#GI8` → `1GI8`, `#TP` → `1TP`). `substitute_axis`
 //! reproduces this exactly — including the consequence that when the record
 //! concatenates two commands into one transaction (velocity + move), **only the
 //! first command's `#` is replaced; an inner `#` stays literal** (see Motion).
@@ -42,7 +42,7 @@
 //! But upstream writes the shift as `mstat.All = statusInt * (2^8)`, and in C
 //! `2^8` is the bitwise-XOR `2 ^ 8 == 10`, **not** `256` — so C multiplies a
 //! "shifted" status by ten and its bits never reach the high byte where the
-//! meaningful bits live. [`decode_status`] implements the intended `* 256`
+//! meaningful bits live. `decode_status` implements the intended `* 256`
 //! (`<< 8`) instead (upstream defect register `doc/upstream-c-defects.md`
 //! #45, retro-fixed per the fix-at-source policy).
 //!

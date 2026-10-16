@@ -12,7 +12,7 @@
 //! `motor_init` sets `setOutputEos("\n")` **and** `setInputEos("\n")` after
 //! connecting, and `send_mess`'s `local_buff` never appends a terminator
 //! (`strcat(local_buff, com)` only) — so the port's output EOS puts the `\n` on
-//! the wire. `PIC662Config` sets both to `"\n"` and [`PIC662Controller::send`]
+//! the wire. `PIC662Config` sets both to `"\n"` and `PIC662Controller::send`
 //! writes **bare** bytes.
 //! There is no protocol address (SCPI, single device) and, unlike the C-630,
 //! the device does **not** echo (`cmnd_response = false`): a command write is
@@ -35,7 +35,7 @@
 //! `*ESR?`.
 //!
 //! A failed `*ESR?` runs the same NORMAL/RETRY/COMM_ERR two-strike debounce as
-//! the C-862 ([`CommState`]): the first empty reply is silently retried (cached
+//! the C-862 (`CommState`): the first empty reply is silently retried (cached
 //! status kept), the second consecutive one sets `comms_error`/`problem`.
 //!
 //! ## Position (`POS?`)

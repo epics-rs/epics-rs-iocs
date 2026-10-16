@@ -10,7 +10,7 @@
 //! `motor_init` sets `setOutputEos("\n")` **and** `setInputEos("\n")` after
 //! connecting; `send_mess` never appends a terminator, so the port's output
 //! EOS puts the `\n` on the wire (both EOS set by `PIC844Config`; this port's
-//! [`PIC844Controller::send`] writes bare bytes, no echo — `cmnd_response =
+//! `PIC844Controller::send` writes bare bytes, no echo — `cmnd_response =
 //! false`).
 //!
 //! The C-844 is single-device but multi-axis: the axis is chosen by an
@@ -32,7 +32,7 @@
 //! Per axis, under one lock (C `set_status`):
 //! 1. `AXIS {n};AXIS:STAT?` → `"ON"` / `"OFF"` → torque/powered
 //!    (`EA_POSITION`). Any other reply drives the NORMAL/RETRY/COMM_ERR
-//!    two-strike debounce ([`CommState`]) — shared across all axes, as
+//!    two-strike debounce (`CommState`) — shared across all axes, as
 //!    `cntrl->status` is per-controller in C.
 //! 2. `MOT:COND?` → `atoi` → 16-bit motion-condition register (`C844_Cond_Reg`,
 //!    `#else`/LSB layout): axis-in-motion `= bit signal`, +limit `= bit

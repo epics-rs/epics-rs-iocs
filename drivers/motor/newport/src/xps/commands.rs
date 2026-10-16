@@ -2,7 +2,7 @@
 //!
 //! Each method marshals the exact `FuncName (args)` string the vendor
 //! `XPS_C8_drivers.cpp` builds (note the space before `(`, and `%.13g` for
-//! doubles via [`format_g`]) and parses the reply's out-parameters. Action
+//! doubles via `format_g`) and parses the reply's out-parameters. Action
 //! functions return `Ok(())` on error code `0`; getters return the parsed
 //! values. The socket's [`SocketMode`] decides whether the call waits for the
 //! reply (poll socket) or fires without waiting (per-axis move socket), so the

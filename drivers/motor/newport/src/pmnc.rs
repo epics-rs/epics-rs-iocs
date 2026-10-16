@@ -13,7 +13,7 @@
 //! Commands are terminated with CR (`\r`); the controller answers with the
 //! reply text followed by a `>` prompt. [`PmncController::new`] sets the port
 //! output EOS to CR and input EOS to the prompt, as C `motor_init` does, so
-//! each [`PmncController::command`] reads exactly one reply. On firmware
+//! each `PmncController::command` reads exactly one reply. On firmware
 //! 1.5.3/1.5.4, whose `STA` reply ends in `\n` instead, the input EOS is
 //! switched to `\n` around that one read (C `changeEOS`).
 //! Every command yields a prompt (C `cmnd_response = true`), so motion

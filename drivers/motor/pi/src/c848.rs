@@ -33,14 +33,14 @@
 //! `*IDN?` (retry up to 3× until a non-empty reply → `brdptr->ident`). Then the
 //! axis count is discovered: `CST? {A..D}` until a reply whose body (`&buff[2]`)
 //! is `"NOSTAGE"`. For each present axis, `REF? {letter}` sets the
-//! [reference](PIC848Axis::reference) flag (`&buff[2] == "0"` → `false`, else
+//! `reference` flag (`&buff[2] == "0"` → `false`, else
 //! `true`), which governs `LOAD_POS`. Every axis has encoder + gain support.
 //!
 //! ## Status
 //! Per axis, under one lock (C `set_status`):
 //! 1. `STA? {letter}` → reply parsed as `%c=%d` (`"A=1024"`). A reply with
 //!    fewer than 3 bytes, no `'='` at index 1, or no integer body drives the
-//!    NORMAL/RETRY/COMM_ERR two-strike debounce ([`CommState`], shared across
+//!    NORMAL/RETRY/COMM_ERR two-strike debounce (`CommState`, shared across
 //!    axes as `cntrl->status` is per-controller). The integer is a
 //!    `C848_Status_Reg` (`epicsUInt16`, `#else`/LSB layout): `Done = bit 0`
 //!    (→ `RA_DONE`), `plus_ls = bit 5`, `minus_ls = bit 6`, `torque = bit 8`
@@ -72,7 +72,7 @@
 //!   `SET_VELOCITY`.
 //! - `STOP_AXIS` (`stop`): `HLT  L`.
 //! - `LOAD_POS` (`set_position`): if the axis has a reference switch
-//!   ([`reference`](PIC848Axis::reference) `true`), only `0.0` is allowed →
+//!   (`reference` `true`), only `0.0` is allowed →
 //!   `DFH  L` (define home); a non-zero request is an error. Otherwise
 //!   `POS  L{+p}`.
 //! - `ENABLE_TORQUE`/`DISABL_TORQUE` (`set_closed_loop`): enabling while torque
