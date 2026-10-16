@@ -195,7 +195,7 @@ impl AhxxxDriver {
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
         let read_format =
-            QeReadFormat::from_i32(self.base.port_base.get_int32_param(p.read_format, 0)?);
+            QeReadFormat::from_i32(qe::int_param(&self.base.port_base, p.read_format, 0));
         let mut sample_time;
         if self.is_ah401() {
             let resp = last.query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)?;
@@ -248,7 +248,7 @@ impl AhxxxDriver {
             .port_base
             .set_float64_param(p.sample_time, 0, sample_time)?;
 
-        let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
+        let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
         let num_average = num_average_from(averaging_time, sample_time);
         self.base
             .port_base
@@ -275,12 +275,12 @@ impl QuadEmDevice for AhxxxDriver {
     fn set_acquire(&mut self, value: i32) -> AsynResult<()> {
         let p = self.params();
         let trigger_mode =
-            QeTriggerMode::from_i32(self.base.port_base.get_int32_param(p.trigger_mode, 0)?);
+            QeTriggerMode::from_i32(qe::int_param(&self.base.port_base, p.trigger_mode, 0));
         let acquire_mode =
-            QeAcquireMode::from_i32(self.base.port_base.get_int32_param(p.acquire_mode, 0)?);
-        let num_average = self.base.port_base.get_int32_param(p.num_average, 0)?;
+            QeAcquireMode::from_i32(qe::int_param(&self.base.port_base, p.acquire_mode, 0));
+        let num_average = qe::int_param(&self.base.port_base, p.num_average, 0);
         let read_format =
-            QeReadFormat::from_i32(self.base.port_base.get_int32_param(p.read_format, 0)?);
+            QeReadFormat::from_i32(qe::int_param(&self.base.port_base, p.read_format, 0));
         trace::ensure_input_eos(&self.io, &self.base.port_base, "drvAHxxx:setAcquire")?;
 
         if value == 0 {

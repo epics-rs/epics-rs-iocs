@@ -177,14 +177,13 @@ impl Pcr4Driver {
         let p = self.params();
         let prev_acquiring = self.shared.is_acquiring();
 
-        let range = self.base.port_base.get_int32_param(p.range, 0)?;
-        let num_channels = self.base.port_base.get_int32_param(p.num_channels, 0)?;
-        let trigger_mode = self.base.port_base.get_int32_param(p.trigger_mode, 0)?;
-        let trigger_polarity = QeTriggerPolarity::from_i32(
-            self.base.port_base.get_int32_param(p.trigger_polarity, 0)?,
-        );
-        let values_per_read = self.base.port_base.get_int32_param(p.values_per_read, 0)?;
-        let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
+        let range = qe::int_param(&self.base.port_base, p.range, 0);
+        let num_channels = qe::int_param(&self.base.port_base, p.num_channels, 0);
+        let trigger_mode = qe::int_param(&self.base.port_base, p.trigger_mode, 0);
+        let trigger_polarity =
+            QeTriggerPolarity::from_i32(qe::int_param(&self.base.port_base, p.trigger_polarity, 0));
+        let values_per_read = qe::int_param(&self.base.port_base, p.values_per_read, 0);
+        let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
 
         if prev_acquiring || trigger_mode != 0 {
             let _ = self.set_acquire(0);
@@ -268,8 +267,8 @@ impl Pcr4Driver {
         // In external-bulb mode the meter delivers one sample per trigger, so
         // the ring buffer averages whatever arrives rather than a fixed count.
         let trigger_mode =
-            QeTriggerMode::from_i32(self.base.port_base.get_int32_param(p.trigger_mode, 0)?);
-        let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
+            QeTriggerMode::from_i32(qe::int_param(&self.base.port_base, p.trigger_mode, 0));
+        let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
         let num_average = if trigger_mode == QeTriggerMode::ExtBulb {
             0
         } else {
@@ -359,10 +358,7 @@ impl QuadEmDevice for Pcr4Driver {
         // Pushing the settings also flushes any stale input.
         let _ = self.set_acquire_params();
 
-        let trigger_mode = self
-            .base
-            .port_base
-            .get_int32_param(self.params().trigger_mode, 0)?;
+        let trigger_mode = qe::int_param(&self.base.port_base, self.params().trigger_mode, 0);
         // A triggered acquisition was already started by TRIGGER:START in
         // setAcquireParams; free-run needs the explicit start.
         let status = if trigger_mode == 0 {
@@ -416,10 +412,7 @@ impl QuadEmDevice for Pcr4Driver {
     fn set_bias_state(&mut self, value: i32) -> AsynResult<()> {
         let mut status = self.send_command(proto::cmd_bias_state(value != 0));
         if value != 0 {
-            let volts = self
-                .base
-                .port_base
-                .get_float64_param(self.params().bias_voltage, 0)?;
+            let volts = qe::double_param(&self.base.port_base, self.params().bias_voltage, 0);
             status = self.set_bias_voltage(volts);
         }
         status
@@ -428,10 +421,7 @@ impl QuadEmDevice for Pcr4Driver {
     /// C++ `drvPCR4::setBiasVoltage`: `"SETBIAS:%f"`, skipped while the bias
     /// is off because the meter answers with an error.
     fn set_bias_voltage(&mut self, value: f64) -> AsynResult<()> {
-        let bias_state = self
-            .base
-            .port_base
-            .get_int32_param(self.params().bias_state, 0)?;
+        let bias_state = qe::int_param(&self.base.port_base, self.params().bias_state, 0);
         if bias_state == 0 {
             return Ok(());
         }
@@ -440,10 +430,7 @@ impl QuadEmDevice for Pcr4Driver {
 
     /// C++ `drvPCR4::readStatus`.
     fn read_status(&mut self) -> AsynResult<()> {
-        let trigger_mode = self
-            .base
-            .port_base
-            .get_int32_param(self.params().trigger_mode, 0)?;
+        let trigger_mode = qe::int_param(&self.base.port_base, self.params().trigger_mode, 0);
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring || trigger_mode != 0 {
             let _ = self.set_acquire(0);

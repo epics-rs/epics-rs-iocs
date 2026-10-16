@@ -305,8 +305,8 @@ impl NslsEmDriver {
     /// C++ `setMode`.
     fn set_mode(&mut self) -> AsynResult<()> {
         let p = self.params();
-        let ping_pong = PingPong::from_i32(self.base.port_base.get_int32_param(p.ping_pong, 0)?);
-        let values_per_read = self.base.port_base.get_int32_param(p.values_per_read, 0)?;
+        let ping_pong = PingPong::from_i32(qe::int_param(&self.base.port_base, p.ping_pong, 0));
+        let values_per_read = qe::int_param(&self.base.port_base, p.values_per_read, 0);
 
         let ping_pong = proto::effective_ping_pong(ping_pong, values_per_read);
         // C++ writes the forced value back to the parameter library.
@@ -324,12 +324,9 @@ impl NslsEmDriver {
     /// C++ `computeScaleFactor`.
     fn compute_scale_factor(&mut self) -> AsynResult<()> {
         let p = self.params();
-        let range = self.base.port_base.get_int32_param(p.range, 0)?;
-        let values_per_read = self.base.port_base.get_int32_param(p.values_per_read, 0)?;
-        let integration_time = self
-            .base
-            .port_base
-            .get_float64_param(p.integration_time, 0)?;
+        let range = qe::int_param(&self.base.port_base, p.range, 0);
+        let values_per_read = qe::int_param(&self.base.port_base, p.values_per_read, 0);
+        let integration_time = qe::double_param(&self.base.port_base, p.integration_time, 0);
         self.state.lock().scale_factor =
             proto::scale_factor(range, integration_time, values_per_read);
         Ok(())
@@ -376,12 +373,12 @@ impl NslsEmDriver {
         let period = status.period_us / 1e6;
         base.set_float64_param(p.integration_time, 0, period)?;
 
-        let ping_pong = PingPong::from_i32(base.get_int32_param(p.ping_pong, 0)?);
+        let ping_pong = PingPong::from_i32(qe::int_param(base, p.ping_pong, 0));
         let sample_time = proto::sample_time(period, status.values_per_read, ping_pong);
         base.set_float64_param(p.sample_time, 0, sample_time)?;
         base.set_string_param(p.firmware, 0, status.firmware)?;
 
-        let averaging_time = base.get_float64_param(p.averaging_time, 0)?;
+        let averaging_time = qe::double_param(base, p.averaging_time, 0);
         let num_average = num_average_from(averaging_time, sample_time);
         base.set_int32_param(p.num_average, 0, num_average)?;
 

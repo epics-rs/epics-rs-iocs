@@ -227,10 +227,7 @@ impl QuadEmDevice for TetrAmmDriver {
             // also flushes any stale input.
             let _ = self.set_acquire_params();
             let written = self.io.write("ACQ:ON").map(drop);
-            let read_format = self
-                .base
-                .port_base
-                .get_int32_param(self.params().read_format, 0)?;
+            let read_format = qe::int_param(&self.base.port_base, self.params().read_format, 0);
             let status = match QeReadFormat::from_i32(read_format) {
                 QeReadFormat::Binary => Ok(()),
                 _ => written,
@@ -280,20 +277,14 @@ impl QuadEmDevice for TetrAmmDriver {
         let _ = self.send_command("STATUS:RESET");
         let mut status = self.send_command(proto::cmd_bias_state(value != 0));
         if value != 0 {
-            let bv = self
-                .base
-                .port_base
-                .get_float64_param(self.params().bias_voltage, 0)?;
+            let bv = qe::double_param(&self.base.port_base, self.params().bias_voltage, 0);
             status = self.set_bias_voltage(bv);
         }
         status
     }
 
     fn set_bias_voltage(&mut self, value: f64) -> AsynResult<()> {
-        let bias_state = self
-            .base
-            .port_base
-            .get_int32_param(self.params().bias_state, 0)?;
+        let bias_state = qe::int_param(&self.base.port_base, self.params().bias_state, 0);
         if bias_state == 0 {
             return Ok(());
         }
@@ -376,19 +367,19 @@ impl TetrAmmDriver {
 
         let p = self.params();
         let base = &mut self.base.port_base;
-        let num_channels = base.get_int32_param(p.num_channels, 0)?;
+        let num_channels = qe::int_param(base, p.num_channels, 0);
         let mut range = [0i32; QE_MAX_INPUTS];
         for (i, r) in range.iter_mut().enumerate() {
-            *r = base.get_int32_param(p.range, i as i32 + 1)?;
+            *r = qe::int_param(base, p.range, i as i32 + 1);
         }
-        let trigger_mode = QeTriggerMode::from_i32(base.get_int32_param(p.trigger_mode, 0)?);
+        let trigger_mode = QeTriggerMode::from_i32(qe::int_param(base, p.trigger_mode, 0));
         let trigger_polarity =
-            QeTriggerPolarity::from_i32(base.get_int32_param(p.trigger_polarity, 0)?);
-        let acquire_mode = QeAcquireMode::from_i32(base.get_int32_param(p.acquire_mode, 0)?);
-        let values_per_read = base.get_int32_param(p.values_per_read, 0)?;
-        let read_format = QeReadFormat::from_i32(base.get_int32_param(p.read_format, 0)?);
-        let averaging_time = base.get_float64_param(p.averaging_time, 0)?;
-        let num_acquire = base.get_int32_param(p.num_acquire, 0)?;
+            QeTriggerPolarity::from_i32(qe::int_param(base, p.trigger_polarity, 0));
+        let acquire_mode = QeAcquireMode::from_i32(qe::int_param(base, p.acquire_mode, 0));
+        let values_per_read = qe::int_param(base, p.values_per_read, 0);
+        let read_format = QeReadFormat::from_i32(qe::int_param(base, p.read_format, 0));
+        let averaging_time = qe::double_param(base, p.averaging_time, 0);
+        let num_acquire = qe::int_param(base, p.num_acquire, 0);
 
         // C++ computes sampleTime from the *unclamped* valuesPerRead; only the
         // NRSAMP argument gets clamped below.
@@ -499,9 +490,9 @@ impl TetrAmmDriver {
             .port_base
             .set_int32_param(self.p_interlock_status, 0, interlock)?;
 
-        let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
+        let averaging_time = qe::double_param(&self.base.port_base, p.averaging_time, 0);
         let trigger_mode =
-            QeTriggerMode::from_i32(self.base.port_base.get_int32_param(p.trigger_mode, 0)?);
+            QeTriggerMode::from_i32(qe::int_param(&self.base.port_base, p.trigger_mode, 0));
         let num_average = proto::num_average(trigger_mode, averaging_time, sample_time);
         self.base
             .port_base

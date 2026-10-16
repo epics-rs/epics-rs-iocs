@@ -173,11 +173,11 @@ impl Fx4Driver {
         let p = self.params();
         let base = &mut self.base.port_base;
 
-        let trigger_mode = base.get_int32_param(p.trigger_mode, 0)?;
-        let trigger_polarity = base.get_int32_param(p.trigger_polarity, 0)?;
-        let acquire_mode = base.get_int32_param(p.acquire_mode, 0)?;
-        let values_per_read = base.get_int32_param(p.values_per_read, 0)?;
-        let averaging_time = base.get_float64_param(p.averaging_time, 0)?;
+        let trigger_mode = qe::int_param(base, p.trigger_mode, 0);
+        let trigger_polarity = qe::int_param(base, p.trigger_polarity, 0);
+        let acquire_mode = qe::int_param(base, p.acquire_mode, 0);
+        let values_per_read = qe::int_param(base, p.values_per_read, 0);
+        let averaging_time = qe::double_param(base, p.averaging_time, 0);
 
         let sample_time = proto::sample_time(values_per_read);
         base.set_float64_param(p.sample_time, 0, sample_time)?;
