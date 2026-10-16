@@ -535,31 +535,37 @@ impl PortDriver for MythenDriver {
         status.into_result()
     }
 
-    /// `mythen::writeOctet` (mythen.cpp:1062-1097) handles no octet of its
-    /// own and calls `ADDriver::writeOctet`.
+    /// `mythen::writeOctet` (mythen.cpp:1062-1097): the list-0 set's status
+    /// stands unless a base-class param replaces it with ADDriver::writeOctet's.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
-        let status = self.ad.write_octet(user, data);
         // C prints the value as the `char *` it was handed: up to the NUL.
         let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-        let value = String::from_utf8_lossy(&data[..end]);
-        match &status {
-            Err(e) => user.print(
+        let value = String::from_utf8_lossy(&data[..end]).into_owned();
+        let mut status = StatusOr::default();
+        status.or(self.ad.port_base.set_string_param(reason, 0, value.clone()));
+        if reason < self.p.setting {
+            status.set_base(self.ad.write_octet(user, data).map(|_| ()));
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        if status.bits != 0 {
+            user.print(
                 TraceMask::ERROR,
                 file!(),
                 line!(),
                 format_args!(
                     "mythen:writeOctet: error, status={} function={reason}, value={value}",
-                    e.status() as i32
+                    status.bits
                 ),
-            ),
-            Ok(_) => user.print(
+            );
+        } else {
+            user.print(
                 TraceMask::IO_DRIVER,
                 file!(),
                 line!(),
                 format_args!("mythen:writeOctet: function={reason}, value={value}"),
-            ),
+            );
         }
-        status
+        status.into_result().map(|()| data.len())
     }
 }

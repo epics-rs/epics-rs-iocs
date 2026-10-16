@@ -298,3 +298,37 @@ fn a_write_returns_the_or_of_its_steps() {
     assert_eq!(e.c_status_code(), 8);
     assert_eq!(e.message(), "");
 }
+
+/// mythen.cpp:1076-1080: an octet written to a mythen param is only the
+/// list-0 setStringParam, so an Int32 param returns its asynParamWrongType.
+#[test]
+fn an_octet_written_to_a_mythen_int_param_is_wrong_type() {
+    use epics_rs::asyn::services::PortServices;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::asyn::user::UserTrace;
+    let port = "MYTHEN_WS_OCTET";
+    let (mut driver, _received) = driver(port);
+    let manager = PortServices::global().trace().clone();
+    let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    let reason = driver.p.setting;
+    let mut user = AsynUser::new(reason);
+    user.trace = Some(UserTrace {
+        manager,
+        port: port.into(),
+    });
+    let e = driver.write_octet(&mut user, b"x\0").unwrap_err();
+    let text = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    assert_eq!(e.c_status_code(), 8);
+    assert!(
+        text.contains(&format!(
+            "mythen:writeOctet: error, status=8 function={reason}, value=x"
+        )),
+        "{text}"
+    );
+}
