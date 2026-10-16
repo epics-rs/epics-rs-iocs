@@ -130,39 +130,6 @@ impl NdStdArraysDriver {
         self.port_base.get_int32_param(reason, 0).unwrap_or(0)
     }
 
-    /// `asynNDArrayDriver::setIntegerParam` (asynNDArrayDriver.cpp:636-663):
-    /// writes to `ADAcquire`/`NDNumQueuedArrays` are intercepted to drive
-    /// `ADAcquireBusy`.
-    fn set_integer_param(&mut self, addr: i32, reason: usize, value: i32) -> AsynResult<()> {
-        if reason == self.params.acquire {
-            if value == 0 {
-                let wait_for_plugins = self
-                    .port_base
-                    .get_int32_param(self.params.wait_for_plugins, addr)
-                    .unwrap_or(0)
-                    != 0;
-                if !wait_for_plugins || self.queued_counter.get() == 0 {
-                    self.port_base
-                        .set_int32_param(self.params.acquire_busy, addr, 0)?;
-                }
-            } else {
-                self.port_base
-                    .set_int32_param(self.params.acquire_busy, addr, 1)?;
-            }
-        } else if reason == self.params.base.num_queued_arrays
-            && value == 0
-            && self
-                .port_base
-                .get_int32_param(self.params.acquire, addr)
-                .unwrap_or(0)
-                == 0
-        {
-            self.port_base
-                .set_int32_param(self.params.acquire_busy, addr, 0)?;
-        }
-        self.port_base.set_int32_param(reason, addr, value)
-    }
-
     /// The allocation half of `writeXXXArray` (NDDriverStdArrays.cpp:153-218):
     /// release the previous array, allocate a fresh one sized by
     /// `arrayDimensions_`, publish its size parameters, recompute `dimProd_`,
@@ -342,9 +309,7 @@ impl NdStdArraysDriver {
         if image_mode == ImageMode::Single as i32
             || (image_mode == ImageMode::Multiple as i32 && num_images_counter >= num_images)
         {
-            // setIntegerParam(ADAcquire, 0) routes through the intercept so
-            // ADAcquireBusy is cleared.
-            self.set_integer_param(0, self.params.acquire, 0)?;
+            self.port_base.set_int32_param(self.params.acquire, 0, 0)?;
             self.port_base
                 .set_int32_param(self.params.status, 0, ADStatus::Idle as i32)?;
         }
@@ -444,7 +409,7 @@ impl PortDriver for NdStdArraysDriver {
 
         // setIntegerParam(function, value) (NDDriverStdArrays.cpp:346) — the
         // ADAcquire/NDNumQueuedArrays intercept lives here.
-        self.set_integer_param(addr, reason, value)?;
+        self.port_base.set_int32_param(reason, addr, value)?;
 
         // C overwrites every status here with callParamCallbacks'
         // (NDDriverStdArrays.cpp:373), so none of these fail the write.
