@@ -112,7 +112,11 @@ async fn acquire_one_image(
         .read_octet(ctx.url.url_name, 0, MAX_FILENAME_LEN)
         .await
         .unwrap_or_default();
-    let url_string = String::from_utf8_lossy(&url_bytes).into_owned();
+    let end = url_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(url_bytes.len());
+    let url_string = String::from_utf8_lossy(&url_bytes[..end]).into_owned();
 
     // readImage's own lines (URLDriver.cpp:105,126,152); an empty URL returns
     // asynError without one.
