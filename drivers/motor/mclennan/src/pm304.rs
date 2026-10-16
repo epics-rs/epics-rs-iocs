@@ -478,9 +478,9 @@ impl AsynMotor for Pm304Axis {
             low_limit: bits.minus_ls,
             problem: bits.problem,
             direction,
-            has_encoder: use_encoder,
-            // No GAIN_SUPPORT: C set_status keeps the status word zeroed at
-            // init, so the record never sends torque (RS/AB) or gain commands.
+            // No GAIN_SUPPORT or EA_PRESENT: C set_status keeps the status
+            // word zeroed at init, so the record never sends torque (RS/AB)
+            // or gain commands and never offers UEIP.
             ..MotorStatus::default()
         };
         self.last_status = status.clone();
