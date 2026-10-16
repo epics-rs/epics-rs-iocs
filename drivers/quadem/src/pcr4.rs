@@ -60,11 +60,29 @@ impl Pcr4Driver {
     fn new(
         port_name: &str,
         qe_port_name: &str,
-        io: OctetIo,
+        (io, status): (OctetIo, AsynResult<()>),
         max_memory: usize,
         shared: Arc<QuadEmShared>,
     ) -> AsynResult<Self> {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
+        let unlinked = |base, io| Self {
+            base,
+            io,
+            shared: shared.clone(),
+            firmware_version: String::new(),
+            qe_port_name: qe_port_name.to_string(),
+            version_number: 0,
+        };
+        // C++ returns from its constructor here and keeps the port, with no
+        // meter link and no read thread.
+        if let Err(e) = status {
+            println!(
+                "drvPCR4::drvPCR4: error calling pasynOctetSyncIO->connect, status={}, error={}",
+                trace::status_code(&e),
+                e.message_display()
+            );
+            return Ok(unlinked(base, io));
+        }
         // C++ sets the input EOS at the top of every setAcquire; it never
         // changes, so it is set once here. See `octet`.
         io.set_input_eos(b"\r\n")?;
@@ -83,14 +101,7 @@ impl Pcr4Driver {
             acq.num_channels = QE_MAX_INPUTS as i32;
         }
 
-        let mut this = Self {
-            base,
-            io,
-            shared,
-            firmware_version: String::new(),
-            qe_port_name: qe_port_name.to_string(),
-            version_number: 0,
-        };
+        let mut this = unlinked(base, io);
 
         // C++ constructor calls getFirmwareVersion() under the port lock and
         // ignores its status: the meter may be offline at IOC start.
@@ -645,7 +656,8 @@ pub struct Pcr4Runtime {
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    _read_thread: thread::JoinHandle<()>,
+    /// `None` when the constructor found no QE port.
+    _read_thread: Option<thread::JoinHandle<()>>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -667,9 +679,13 @@ pub fn create_pcr4(
 ) -> AsynResult<Pcr4Runtime> {
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
-    let (io, status) = connect_octet(qe_port_name, proto::PCR4_TIMEOUT);
-    status?;
-    let driver = Pcr4Driver::new(port_name, qe_port_name, io, max_memory, shared.clone())?;
+    let driver = Pcr4Driver::new(
+        port_name,
+        qe_port_name,
+        connect_octet(qe_port_name, proto::PCR4_TIMEOUT),
+        max_memory,
+        shared.clone(),
+    )?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
     let pool = driver.base.pool.clone();
@@ -686,10 +702,12 @@ pub fn create_pcr4(
         params,
         shared: shared.clone(),
     };
-    let read_thread_handle = thread::Builder::new()
-        .name("drvPCR4Task".into())
-        .spawn(move || read_thread(read_ctx))
-        .expect("failed to spawn drvPCR4Task");
+    let read_thread_handle = read_ctx.io.handle().is_some().then(|| {
+        thread::Builder::new()
+            .name("drvPCR4Task".into())
+            .spawn(move || read_thread(read_ctx))
+            .expect("failed to spawn drvPCR4Task")
+    });
 
     let callback_thread = qe::start_callback_task(CallbackContext {
         trigger_rx,
@@ -753,8 +771,14 @@ mod tests {
         .unwrap();
         std::mem::forget(runtime);
         io.set_output_eos(b"\r").unwrap();
-        let mut drv =
-            Pcr4Driver::new("QE_PCR4_NET", "QE_PCR4_NET", io, 0, QuadEmShared::new(16).0).unwrap();
+        let mut drv = Pcr4Driver::new(
+            "QE_PCR4_NET",
+            "QE_PCR4_NET",
+            (io, Ok(())),
+            0,
+            QuadEmShared::new(16).0,
+        )
+        .unwrap();
         let mut out = String::new();
         drv.report(&mut out, 1);
         assert!(
@@ -772,5 +796,13 @@ mod tests {
             "{:?}",
             log.lock().unwrap()
         );
+    }
+
+    /// C++ prints the connect failure and returns from its constructor: the
+    /// port stays, with no read thread.
+    #[test]
+    fn a_missing_qe_port_keeps_the_port_without_a_link() {
+        let rt = create_pcr4("QE_PCR4_NOQE", "QE_PCR4_NOQE_IP", 4, 0).unwrap();
+        assert!(rt._read_thread.is_none());
     }
 }
