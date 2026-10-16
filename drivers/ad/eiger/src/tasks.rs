@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -1179,24 +1179,15 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 // C's addresses 0 and 1. It also carries no ThresholdNumber /
                 // ThresholdEnergy attributes; only the HDF5 and stream2 paths add
                 // those.
-                let data = if signed_data && frame.codec.is_none() {
-                    reinterpret_signed(frame.data)
-                } else {
-                    frame.data
+                let image = Image {
+                    dims: frame.dims,
+                    data: frame.data,
+                    codec: frame.codec,
+                    attributes: NDAttributeList::new(),
+                    threshold_index: 0,
+                    timestamp: None,
                 };
-                publish(
-                    s,
-                    Image {
-                        dims: frame.dims,
-                        data,
-                        codec: frame.codec,
-                        attributes: NDAttributeList::new(),
-                        threshold_index: 0,
-                        timestamp: None,
-                    },
-                    array_callbacks,
-                )
-                .await;
+                publish(s, image.signed_if(signed_data), array_callbacks).await;
             }
         }
     }
@@ -1260,44 +1251,21 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
             };
             let signed_data = s.get_int(s.p.signed_data).await != 0;
             let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
-            let data = if signed_data && frame.codec.is_none() {
-                reinterpret_signed(frame.data)
-            } else {
-                frame.data
-            };
             let mut attributes = NDAttributeList::new();
             if let Some((number, energy)) = frame.threshold {
                 attributes.add(threshold_number_attr(number));
                 attributes.add(threshold_energy_attr(energy));
             }
-            publish(
-                s,
-                Image {
-                    dims: frame.dims,
-                    data,
-                    codec: frame.codec,
-                    attributes,
-                    threshold_index: thresh,
-                    timestamp: frame.timestamp,
-                },
-                array_callbacks,
-            )
-            .await;
+            let image = Image {
+                dims: frame.dims,
+                data: frame.data,
+                codec: frame.codec,
+                attributes,
+                threshold_index: thresh,
+                timestamp: frame.timestamp,
+            };
+            publish(s, image.signed_if(signed_data), array_callbacks).await;
         }
-    }
-}
-
-/// Relabel unsigned pixels as signed (C's `SignedData`, eigerDetector.cpp:1519).
-///
-/// The detector's counts are unsigned, but bad pixels and gaps are very large
-/// positive numbers that wreck autoscaling; re-tagging the same bits as signed
-/// turns them into small negatives at the cost of half the count range.
-fn reinterpret_signed(data: NDDataBuffer) -> NDDataBuffer {
-    match data {
-        NDDataBuffer::U8(v) => NDDataBuffer::I8(v.into_iter().map(|x| x as i8).collect()),
-        NDDataBuffer::U16(v) => NDDataBuffer::I16(v.into_iter().map(|x| x as i16).collect()),
-        NDDataBuffer::U32(v) => NDDataBuffer::I32(v.into_iter().map(|x| x as i32).collect()),
-        other => other,
     }
 }
 
@@ -1350,6 +1318,39 @@ struct Image {
     /// The stream2 frame time when STREAM_AS_TIMESTAMP_SOURCE is set; `None`
     /// stamps the array now.
     timestamp: Option<EpicsTimestamp>,
+}
+
+impl Image {
+    /// Relabel unsigned pixels as signed (C's `SignedData`,
+    /// eigerDetector.cpp:1519) when `signed` is set.
+    ///
+    /// The detector's counts are unsigned, but bad pixels and gaps are very
+    /// large positive numbers that wreck autoscaling; re-tagging the same bits
+    /// as signed turns them into small negatives at the cost of half the count
+    /// range. C changes `pArray->dataType`, which on a still-compressed frame
+    /// is the type the codec plugin decompresses to, so a codec's
+    /// `original_data_type` is relabelled instead of its bytes.
+    fn signed_if(mut self, signed: bool) -> Self {
+        if !signed {
+            return self;
+        }
+        if let Some(codec) = &mut self.codec {
+            codec.original_data_type = match codec.original_data_type {
+                NDDataType::UInt8 => NDDataType::Int8,
+                NDDataType::UInt16 => NDDataType::Int16,
+                NDDataType::UInt32 => NDDataType::Int32,
+                other => other,
+            };
+            return self;
+        }
+        self.data = match self.data {
+            NDDataBuffer::U8(v) => NDDataBuffer::I8(v.into_iter().map(|x| x as i8).collect()),
+            NDDataBuffer::U16(v) => NDDataBuffer::I16(v.into_iter().map(|x| x as i16).collect()),
+            NDDataBuffer::U32(v) => NDDataBuffer::I32(v.into_iter().map(|x| x as i32).collect()),
+            other => other,
+        };
+        self
+    }
 }
 
 async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
@@ -1489,5 +1490,43 @@ mod tests {
         // Signals coalesce: the task rereads the flags on one wake.
         assert!(rx.stream_apis.try_recv().is_ok());
         assert!(rx.stream_apis.try_recv().is_err());
+    }
+
+    fn image(data: NDDataBuffer, codec: Option<epics_rs::ad_core::codec::Codec>) -> Image {
+        Image {
+            dims: [2, 1],
+            data,
+            codec,
+            attributes: NDAttributeList::new(),
+            threshold_index: 0,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn signed_data_relabels_pixels_or_the_codec_type() {
+        let im = image(NDDataBuffer::U16(vec![1, 0xffff]), None).signed_if(true);
+        let NDDataBuffer::I16(v) = im.data else {
+            panic!("expected I16");
+        };
+        assert_eq!(v, [1, -1]);
+
+        let codec = epics_rs::ad_core::codec::Codec {
+            name: epics_rs::ad_core::codec::CodecName::BSLZ4,
+            compressed_size: 3,
+            level: 0,
+            shuffle: 0,
+            compressor: 0,
+            original_data_type: NDDataType::UInt32,
+        };
+        let im = image(NDDataBuffer::U8(vec![1, 2, 3]), Some(codec)).signed_if(true);
+        assert_eq!(im.codec.unwrap().original_data_type, NDDataType::Int32);
+        let NDDataBuffer::U8(v) = im.data else {
+            panic!("compressed bytes stay bytes");
+        };
+        assert_eq!(v, [1, 2, 3]);
+
+        let im = image(NDDataBuffer::U16(vec![1]), None).signed_if(false);
+        assert!(matches!(im.data, NDDataBuffer::U16(_)));
     }
 }
