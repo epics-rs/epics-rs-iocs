@@ -12,13 +12,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use parking_lot::Mutex;
 
 use crate::accum::Accumulator;
+use crate::coordinator::Coordinator;
 use crate::family::DetectorFamily;
 
 /// What the port driver asks the background threads to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    /// Wake the measurement monitor (C creates `timePixCallback`).
     AcquisitionStarted,
-    AcquisitionStopped,
     /// C `checkConnection` on demand (`TPX3_REFRESH_CONNECTION`).
     RefreshConnection,
     /// C's `TPX3_HEALTH` write: re-read the dashboard, the detector and the
@@ -48,7 +49,8 @@ pub struct Shared {
     pub mask: Mutex<Vec<i32>>,
     pub streams: Mutex<StreamPaths>,
     orientation: AtomicI32,
-    acquiring: AtomicBool,
+    /// C `acquisitionCoordinator_`: the one owner of the acquisition phase.
+    pub acquisition: Coordinator,
     /// C `detectorFamily_`, as its `DetectorFamily` discriminant.
     family: AtomicI32,
     /// C `detectorFamilyApplied_`.
@@ -69,7 +71,7 @@ impl Shared {
             mask: Mutex::new(Vec::new()),
             streams: Mutex::new(StreamPaths::default()),
             orientation: AtomicI32::new(0),
-            acquiring: AtomicBool::new(false),
+            acquisition: Coordinator::default(),
             family: AtomicI32::new(DetectorFamily::Unknown as i32),
             family_applied: AtomicBool::new(false),
         }
@@ -98,14 +100,6 @@ impl Shared {
 
     pub fn orientation(&self) -> i32 {
         self.orientation.load(Ordering::Acquire)
-    }
-
-    pub fn set_acquiring(&self, on: bool) {
-        self.acquiring.store(on, Ordering::Release);
-    }
-
-    pub fn acquiring(&self) -> bool {
-        self.acquiring.load(Ordering::Acquire)
     }
 
     pub fn family(&self) -> DetectorFamily {

@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::accum::Update;
 use crate::adlog;
+use crate::driver::TimePix3Driver;
 use crate::family::DetectorFamily;
 use crate::http::{ServalHttp, TIMEOUT_POLL};
 use crate::params::TimePixParams;
@@ -154,12 +155,7 @@ async fn connection_poll(
 
         match command {
             Command::AcquisitionStarted => {
-                ctx.shared.set_acquiring(true);
                 let _ = acq_tx.try_send(());
-                continue;
-            }
-            Command::AcquisitionStopped => {
-                ctx.shared.set_acquiring(false);
                 continue;
             }
             Command::RefreshStatus => {
@@ -248,7 +244,7 @@ fn connection_status(
     updates: &mut Vec<ParamSetValue>,
 ) {
     let (message, status) = match (serval_ok, det_ok) {
-        (true, true) if ctx.shared.acquiring() => ("OK", ADStatus::Acquire),
+        (true, true) if ctx.shared.acquisition.monitoring() => ("OK", ADStatus::Acquire),
         (true, true) => ("OK", ADStatus::Idle),
         (false, false) => ("SERVAL and detector disconnected", ADStatus::Disconnected),
         (false, true) => ("SERVAL disconnected", ADStatus::Disconnected),
@@ -752,108 +748,109 @@ fn health(ctx: &Arc<Ctx>, detector: &Value, updates: &mut Vec<ParamSetValue>) {
 }
 
 // ---------------------------------------------------------------------------
-// Acquisition poll (C `timePixCallback`, acquire.cpp:416)
+// Acquisition poll (C `timePixCallback`, acquire.cpp:538-686)
 // ---------------------------------------------------------------------------
 
 async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) {
     while start_rx.recv().await.is_some() {
-        let p = ctx.p;
-        ctx.set(
-            0,
-            vec![
-                ParamSetValue::new(
-                    ctx.ad.status,
-                    0,
-                    ParamValue::Int32(ADStatus::Acquire as i32),
-                ),
-                ParamSetValue::new(ctx.ad.acquire, 0, ParamValue::Int32(1)),
-            ],
-        )
-        .await;
+        // The start transaction commits, or rolls back, after it wakes this
+        // monitor; this thread has nothing else to run while it waits.
+        if !ctx
+            .shared
+            .acquisition
+            .wait_for_running_for(Duration::from_millis(5000))
+        {
+            continue;
+        }
 
         // C's first GET and its in-loop polls print different lines.
         let mut first = true;
-        while ctx.shared.acquiring() {
-            // A failed poll is retried after the sleep. UPSTREAM DEFECT
-            // (acquire.cpp:514-518): C `continue`s on an HTTP error without
-            // sleeping, so a Serval that goes away mid-acquisition leaves this
-            // thread spinning at 100% CPU.
-            let polled = poll_measurement(&ctx, first);
+        let stop = loop {
+            let m = match poll_measurement(&ctx, first) {
+                Ok(m) => m,
+                Err(reason) => break Some((true, reason)),
+            };
             first = false;
-            if let Some(m) = polled {
-                let mut updates = Vec::new();
-                if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
-                    updates.push(ParamSetValue::new(
-                        p.status,
-                        0,
-                        ParamValue::Octet(v.as_bytes().into()),
-                    ));
-                }
-                for (ptr, reason) in [
-                    ("/Info/ElapsedTime", p.elapsed_time),
-                    ("/Info/TimeLeft", p.time_left),
-                    ("/Info/PixelEventRate", p.pel_rate),
-                    ("/Info/TdcEventRate", p.tdc1_rate),
-                ] {
-                    if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
-                        updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
-                    }
-                }
-                for (ptr, reason) in [
-                    ("/Info/FrameCount", p.frame_count),
-                    ("/Info/DroppedFrames", p.dropped_frames),
-                ] {
-                    if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
-                        updates.push(ParamSetValue::new(
-                            reason,
-                            0,
-                            ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
-                        ));
-                    }
-                }
-                if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
-                    updates.push(ParamSetValue::new(
-                        p.start_time,
-                        0,
-                        ParamValue::Octet(v.as_bytes().into()),
-                    ));
-                }
-                ctx.set(0, updates).await;
+            let updates = measurement_updates(&ctx.p, &m)
+                .into_iter()
+                .map(|(reason, value)| ParamSetValue::new(reason, 0, value))
+                .collect();
+            ctx.set(0, updates).await;
 
-                if !serval::measurement_is_running(&m) {
-                    break;
-                }
+            if !serval::measurement_is_running(&m) {
+                break Some((false, ""));
+            }
+            if !ctx.shared.acquisition.monitoring() {
+                break None;
             }
             tokio::time::sleep(ACQUISITION_POLL).await;
-        }
+        };
 
-        ctx.shared.set_acquiring(false);
-        ctx.set(
-            0,
-            vec![
-                ParamSetValue::new(ctx.ad.acquire, 0, ParamValue::Int32(0)),
-                ParamSetValue::new(ctx.ad.status, 0, ParamValue::Int32(ADStatus::Idle as i32)),
-            ],
-        )
-        .await;
+        // C `stopAcquisition` from the monitor thread (acquire.cpp:582-683);
+        // the driver owns the transition, so it runs there.
+        if let Some((fault, reason)) = stop {
+            let _ = ctx
+                .handle
+                .with_driver::<TimePix3Driver, _>(move |d| {
+                    let _ = d.stop_acquisition(fault, reason);
+                })
+                .await;
+        }
     }
 }
 
-/// One `GET /measurement`, printing C `timePixCallback`'s line for a failure.
-fn poll_measurement(ctx: &Ctx, first: bool) -> Option<Value> {
+/// C `publishMeasurementSnapshot` (acquire.cpp:40-60).
+pub(crate) fn measurement_updates(p: &TimePixParams, m: &Value) -> Vec<(usize, ParamValue)> {
+    let mut updates = Vec::new();
+    if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
+        updates.push((p.status, ParamValue::Octet(v.as_bytes().into())));
+    }
+    for (ptr, reason) in [
+        ("/Info/ElapsedTime", p.elapsed_time),
+        ("/Info/TimeLeft", p.time_left),
+        ("/Info/PixelEventRate", p.pel_rate),
+        ("/Info/TdcEventRate", p.tdc1_rate),
+    ] {
+        if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
+            updates.push((reason, ParamValue::Float64(v)));
+        }
+    }
+    for (ptr, reason) in [
+        ("/Info/FrameCount", p.frame_count),
+        ("/Info/DroppedFrames", p.dropped_frames),
+    ] {
+        if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
+            updates.push((
+                reason,
+                ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
+            ));
+        }
+    }
+    if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
+        updates.push((p.start_time, ParamValue::Octet(v.as_bytes().into())));
+    }
+    updates
+}
+
+/// One `GET /measurement`, printing C `timePixCallback`'s line for a failure;
+/// the error is the reason the acquisition rolls back with.
+fn poll_measurement(ctx: &Ctx, first: bool) -> Result<Value, &'static str> {
     match ctx.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
-        Ok(body) => serde_json::from_str(&body)
-            .inspect_err(|e| {
-                let what = if first { "measurement" } else { "poll" };
-                ctx.trace(
-                    TraceMask::ERROR,
-                    &adlog::err(
-                        adlog::TIME_PIX_CALLBACK,
-                        &format!("timePixCallback: {what} JSON parse failed: {e}"),
-                    ),
-                );
-            })
-            .ok(),
+        Ok(body) => serde_json::from_str(&body).map_err(|e| {
+            let what = if first { "measurement" } else { "poll" };
+            ctx.trace(
+                TraceMask::ERROR,
+                &adlog::err(
+                    adlog::TIME_PIX_CALLBACK,
+                    &format!("timePixCallback: {what} JSON parse failed: {e}"),
+                ),
+            );
+            if first {
+                "Invalid measurement response; acquisition rolled back"
+            } else {
+                "Invalid measurement JSON; acquisition rolled back"
+            }
+        }),
         Err(e) => {
             let url = format!("{}{}", ctx.http.base_url(), serval::MEASUREMENT);
             let line = if first {
@@ -866,7 +863,11 @@ fn poll_measurement(ctx: &Ctx, first: bool) -> Option<Value> {
             if let Some((mask, line)) = line {
                 ctx.trace(mask, &line);
             }
-            None
+            Err(if first {
+                "Measurement HTTP error; acquisition rolled back"
+            } else {
+                "Measurement poll HTTP error; acquisition rolled back"
+            })
         }
     }
 }
@@ -937,7 +938,7 @@ impl StreamKind {
 /// acquisitions.
 async fn stream_worker(ctx: Arc<Ctx>, kind: StreamKind) {
     loop {
-        if !ctx.shared.acquiring() {
+        if !ctx.shared.acquisition.monitoring() {
             tokio::time::sleep(RECONNECT_WAIT).await;
             continue;
         }
@@ -990,7 +991,7 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
     let mut decoder = FrameDecoder::new(kind.channel());
     let mut buf = vec![0u8; 256 * 1024];
 
-    while ctx.shared.acquiring() {
+    while ctx.shared.acquisition.monitoring() {
         match stream.read(&mut buf) {
             Ok(0) => {
                 println!("{} TCP connection closed by peer", kind.name());

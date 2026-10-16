@@ -23,6 +23,7 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 pub mod accum;
 mod adlog;
 pub mod calibration;
+pub mod coordinator;
 pub mod destination;
 pub mod driver;
 pub mod family;

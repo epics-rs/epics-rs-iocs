@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::driver::{ADDriver, ADDriverBase};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::EnumEntry;
@@ -14,6 +14,7 @@ use serde_json::json;
 
 use crate::adlog;
 use crate::calibration::PathPolicy;
+use crate::coordinator::{Phase, Resource};
 use crate::destination;
 use crate::family::DetectorFamily;
 use crate::http::{HttpError, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
@@ -21,6 +22,7 @@ use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Shared};
+use crate::tasks;
 
 /// The line C prints when a Serval request fails: `logHttpFailure` or
 /// `logHttpWarning` with its context, method and path, or nothing.
@@ -1116,73 +1118,234 @@ impl TimePix3Driver {
 
     // -- Acquisition ---------------------------------------------------------
 
-    /// C `acquireStart` (acquire.cpp:62).
+    /// C `publishAcquisitionPhase` (acquisition_runtime.cpp:35-64).
+    fn publish_phase(&mut self, phase: Phase, message: &str) {
+        let (acquire, status) = match phase {
+            Phase::Starting | Phase::Running => (1, ADStatus::Acquire),
+            Phase::Stopping => (0, ADStatus::Acquire),
+            Phase::Fault => (0, ADStatus::Error),
+            Phase::Idle => (0, ADStatus::Idle),
+        };
+        let ad = self.ad.params;
+        let _ = self.ad.port_base.set_int32_param(ad.acquire, 0, acquire);
+        let _ = self
+            .ad
+            .port_base
+            .set_int32_param(ad.status, 0, status as i32);
+        if !message.is_empty() {
+            let _ = self.set_text(ad.status_message, message);
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+    }
+
+    /// C `acquireStart` (acquire.cpp:313-535): every failure after the
+    /// coordinator admits the start rolls back through [`Self::stop_acquisition`].
     fn acquire_start(&mut self) -> AsynResult<()> {
-        let measurement = self
-            .http
-            .get_json(serval::MEASUREMENT, TIMEOUT_POLL)
-            .map_err(|e| self.http_failed("GET /measurement", &e, HttpPrint::None))?;
-        if serval::measurement_is_running(&measurement) {
-            self.http
-                .get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
-                .map_err(|e| {
+        let coordinator = &self.shared.acquisition;
+        if !coordinator.begin_start() {
+            let phase = coordinator.snapshot().phase;
+            let message = format!("Acquisition start rejected while state is {}", phase.name());
+            self.publish_phase(phase, &message);
+            return Err(acquisition_error(message));
+        }
+        self.publish_phase(Phase::Starting, "Starting acquisition...");
+        match self.start_measurement() {
+            Ok(()) => {
+                self.publish_phase(Phase::Running, "Acquisition running");
+                Ok(())
+            }
+            Err(message) => {
+                let _ = self.stop_acquisition(true, message);
+                Err(acquisition_error(message))
+            }
+        }
+    }
+
+    /// The part of `acquireStart` that can fail; the error is the rollback
+    /// reason.
+    fn start_measurement(&mut self) -> Result<(), &'static str> {
+        const FAILED: &str = "Failed to start acquisition";
+        if self.mpx3_trigger_conflict(self.int(self.ad.params.trigger_mode, 0)) {
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!("{}", adlog::err(adlog::ACQUIRE_START, MPX3_TRIGGER_MSG)),
+            );
+            return Err(MPX3_TRIGGER_MSG);
+        }
+
+        if let Ok(measurement) = self.http.get_json(serval::MEASUREMENT, TIMEOUT_POLL)
+            && serval::measurement_is_running(&measurement)
+            && let Err(e) = self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
+        {
+            self.http_failed(
+                "GET /measurement/stop",
+                &e,
+                HttpPrint::Warning(
+                    "acquireStart stop prior measurement",
+                    "GET",
+                    serval::MEASUREMENT_STOP,
+                ),
+            );
+        }
+
+        self.init_acquisition().map_err(|_| FAILED)?;
+        self.file_writer().map_err(|_| FAILED)?;
+        self.get_server().map_err(|_| FAILED)?;
+
+        if !self
+            .shared
+            .acquisition
+            .note_resource(Resource::RemoteMeasurement)
+        {
+            return Err("Acquisition start was cancelled");
+        }
+        if let Err(e) = self.http.get(serval::MEASUREMENT_START, TIMEOUT_CONFIG) {
+            self.http_failed(
+                "GET /measurement/start",
+                &e,
+                HttpPrint::Failure(
+                    "acquireStart GET /measurement/start",
+                    "GET",
+                    serval::MEASUREMENT_START,
+                ),
+            );
+            return Err(FAILED);
+        }
+        self.http_ok();
+
+        if self.cmd_tx.try_send(Command::AcquisitionStarted).is_err() {
+            return Err("Failed to create measurement monitor thread");
+        }
+        let coordinator = &self.shared.acquisition;
+        if !coordinator.note_resource(Resource::MonitorThread) || !coordinator.commit_start() {
+            return Err("Acquisition start was cancelled before commit");
+        }
+        Ok(())
+    }
+
+    /// C `acquireStop` (acquire.cpp:696-698).
+    fn acquire_stop(&mut self) -> AsynResult<()> {
+        self.stop_acquisition(false, "")
+    }
+
+    /// C `stopAcquisition` (acquisition_runtime.cpp:155-265): only the
+    /// caller the coordinator hands the cleanup to talks to Serval.
+    pub(crate) fn stop_acquisition(&mut self, fault: bool, reason: &str) -> AsynResult<()> {
+        let claim = self.shared.acquisition.begin_stop(fault);
+        if !claim.owner {
+            return match self.shared.acquisition.snapshot().phase {
+                Phase::Idle => {
+                    self.publish_phase(Phase::Idle, "Acquisition stopped");
+                    Ok(())
+                }
+                Phase::Stopping => Ok(()),
+                phase => {
+                    if phase == Phase::Fault && !reason.is_empty() {
+                        self.publish_phase(Phase::Fault, reason);
+                    }
+                    Err(acquisition_error(format!(
+                        "acquisition is {}",
+                        phase.name()
+                    )))
+                }
+            };
+        }
+
+        self.publish_phase(
+            Phase::Stopping,
+            if fault {
+                "Rolling back acquisition..."
+            } else {
+                "Stopping acquisition..."
+            },
+        );
+
+        // The monitor and the stream workers leave on the phase change.
+        let had_remote = claim.snapshot.has(Resource::RemoteMeasurement);
+        let mut stop_succeeded = !had_remote;
+        let mut remote_stopped = !had_remote;
+        let mut measurement_valid = false;
+        if had_remote {
+            match self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL) {
+                Ok(_) => stop_succeeded = true,
+                Err(e) => {
                     self.http_failed(
                         "GET /measurement/stop",
                         &e,
-                        HttpPrint::Warning(
-                            "acquireStart stop prior measurement",
+                        HttpPrint::Failure(
+                            "transactional stop GET /measurement/stop",
                             "GET",
                             serval::MEASUREMENT_STOP,
                         ),
-                    )
-                })?;
+                    );
+                }
+            }
+            match self.http.get_json(serval::MEASUREMENT, TIMEOUT_POLL) {
+                Ok(m) => {
+                    measurement_valid = true;
+                    remote_stopped = !serval::measurement_is_running(&m);
+                    for (reason, value) in tasks::measurement_updates(&self.p, &m) {
+                        let _ = self.ad.port_base.set_param_value(reason, 0, value);
+                    }
+                }
+                Err(e) => {
+                    self.http_failed(
+                        "GET /measurement",
+                        &e,
+                        HttpPrint::Failure(
+                            "transactional stop GET /measurement",
+                            "GET",
+                            serval::MEASUREMENT,
+                        ),
+                    );
+                }
+            }
         }
 
-        self.init_acquisition()?;
-        self.file_writer()?;
-        self.get_server()?;
+        if self.shared.acquisition.finish_stop(remote_stopped, fault) == Phase::Fault {
+            let mut message = if reason.is_empty() {
+                "Acquisition cleanup failed".to_string()
+            } else {
+                reason.to_string()
+            };
+            if had_remote && !remote_stopped {
+                message.push_str("; Serval measurement state not confirmed stopped");
+            }
+            self.publish_phase(Phase::Fault, &message);
+            return Err(acquisition_error(message));
+        }
 
-        self.http
-            .get(serval::MEASUREMENT_START, TIMEOUT_CONFIG)
-            .map_err(|e| {
-                self.http_failed(
-                    "GET /measurement/start",
-                    &e,
-                    HttpPrint::Failure(
-                        "acquireStart GET /measurement/start",
-                        "GET",
-                        serval::MEASUREMENT_START,
-                    ),
-                )
-            })?;
-        self.http_ok();
-
-        self.cmd_tx
-            .try_send(Command::AcquisitionStarted)
-            .map_err(|_| AsynError::Status {
-                status: AsynStatus::Error,
-                message: "timepix3: the acquisition task is not running".into(),
-            })
-    }
-
-    /// C `acquireStop` (acquire.cpp:619).
-    fn acquire_stop(&mut self) -> AsynResult<()> {
-        self.http
-            .get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
-            .map_err(|e| {
-                self.http_failed(
-                    "GET /measurement/stop",
-                    &e,
-                    HttpPrint::Failure(
-                        "acquireStop GET /measurement/stop",
-                        "GET",
-                        serval::MEASUREMENT_STOP,
-                    ),
-                )
-            })?;
-        self.http_ok();
-        let _ = self.cmd_tx.try_send(Command::AcquisitionStopped);
+        if !measurement_valid {
+            // C `updateMeasurementStatusFromJson("DA_IDLE")`.
+            let _ = self.set_text(self.p.status, "DA_IDLE");
+            let _ = self
+                .ad
+                .port_base
+                .set_int32_param(self.p.pipeline_state, 0, 3);
+        }
+        self.publish_phase(
+            Phase::Idle,
+            if stop_succeeded {
+                "Acquisition stopped"
+            } else {
+                "Acquisition stopped (remote state reconciled)"
+            },
+        );
+        self.ad.port_base.trace_print(
+            TraceMask::FLOW,
+            format_args!(
+                "{}",
+                adlog::log(adlog::STOP_ACQUISITION, "Stopping Image Acquisition")
+            ),
+        );
         Ok(())
+    }
+}
+
+fn acquisition_error(message: impl Into<String>) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: message.into(),
     }
 }
 
@@ -1216,13 +1379,19 @@ impl PortDriver for TimePix3Driver {
                 message: format!("BiasEnabled must be 0 or 1 (received {value})"),
             });
         }
-        self.ad.port_base.set_int32_param(reason, addr, value)?;
+        // Acquire is published once the coordinator accepts the transition.
+        if reason != self.ad.params.acquire {
+            self.ad.port_base.set_int32_param(reason, addr, value)?;
+        }
 
         let p = self.p;
         let result = if reason == self.ad.params.acquire {
-            if value != 0 && !acquiring {
+            let snapshot = self.shared.acquisition.snapshot();
+            let active = self.shared.acquisition.monitoring();
+            let needs_stop = active || snapshot.resources != 0 || snapshot.phase == Phase::Stopping;
+            if value != 0 && !active {
                 self.acquire_start()
-            } else if value == 0 && acquiring {
+            } else if value == 0 && needs_stop {
                 self.acquire_stop()
             } else {
                 Ok(())
@@ -2015,6 +2184,90 @@ mod tests {
         det.write_int32(&mut AsynUser::new(ad.image_mode), 0)
             .unwrap();
         assert_eq!(det.int(ad.num_images, 0), 1);
+    }
+
+    fn status_of(det: &TimePix3Driver) -> (i32, i32, String) {
+        let ad = det.ad.params;
+        (
+            det.int(ad.acquire, 0),
+            det.int(ad.status, 0),
+            det.text(ad.status_message, 0),
+        )
+    }
+
+    /// A start Serval refuses rolls back to Fault with Acquire=0, and a stop
+    /// returns to Idle (acquire.cpp:402-410, acquisition_runtime.cpp:35-64,
+    /// :245-262).
+    #[test]
+    fn a_refused_start_rolls_back_and_a_stop_settles_idle() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_START_FAIL",
+            Arc::new(ServalHttp::new(&fake_serval("/measurement/start"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let acquire = det.ad.params.acquire;
+        assert!(det.write_int32(&mut AsynUser::new(acquire), 1).is_err());
+        assert_eq!(
+            status_of(&det),
+            (
+                0,
+                ADStatus::Error as i32,
+                "Failed to start acquisition".into()
+            )
+        );
+
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_START_OK",
+            Arc::new(ServalHttp::new(&fake_serval("\0"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        det.write_int32(&mut AsynUser::new(acquire), 1).unwrap();
+        assert_eq!(
+            status_of(&det),
+            (1, ADStatus::Acquire as i32, "Acquisition running".into())
+        );
+        det.write_int32(&mut AsynUser::new(acquire), 0).unwrap();
+        assert_eq!(
+            status_of(&det),
+            (0, ADStatus::Idle as i32, "Acquisition stopped".into())
+        );
+    }
+
+    /// The monitor stops an acquisition Serval reports idle through the
+    /// driver's stop transaction (acquire.cpp:680-683).
+    #[test]
+    fn the_monitor_stops_an_idle_measurement() {
+        let runtime = crate::create_timepix3_detector(
+            &epics_rs::asyn::registry::claim_port("TPX_MONITOR").unwrap(),
+            &fake_serval("\0"),
+            0,
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        let acquire = handle
+            .with_driver_blocking::<TimePix3Driver, _>(|d| d.ad.params.acquire)
+            .unwrap();
+        handle.write_int32_blocking(acquire, 0, 1).unwrap();
+        let idle = (0, ADStatus::Idle as i32, "Acquisition stopped".to_string());
+        let mut seen = None;
+        for _ in 0..500 {
+            seen = handle
+                .with_driver_blocking::<TimePix3Driver, _>(|d| status_of(d))
+                .ok();
+            if seen.as_ref() == Some(&idle) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(seen, Some(idle));
     }
 
     /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).
