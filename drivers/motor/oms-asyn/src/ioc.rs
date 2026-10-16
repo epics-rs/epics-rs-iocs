@@ -1,19 +1,6 @@
-//! iocsh commands for the OMS MAXnet / MXA driver.
-//!
-//! Mirrors the C two-step configuration: `omsMAXnetConfig` / `omsMXAConfig`
-//! connect the asyn octet port, run the init preamble, and register a
-//! controller under a logical name; then `omsCreateAxis(controllerName, axis)`
-//! probes and attaches each axis to a `DTYP`-keyed motor device support
-//! (`OMS_{controllerName}_{axis}`). The controller is looked up by name from a
-//! registry shared by the commands. Both port kinds (`drvAsynIPPort` /
-//! `drvAsynSerialPort`) work.
-//!
-//! `omsMAXnetConfig` and `omsMXAConfig` differ only in the controller label
-//! (and, in the C driver, a minimum-firmware value used to select command
-//! forms — this port assumes the modern forms both controllers use when their
-//! firmware meets its minimum), so both route through one shared body.
+//! `omsMAXnetConfig` / `omsMXAConfig`: the controller and its axes, which
+//! records reach through `DTYP "asynMotor"` and `@asyn(portName,axis)`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,145 +10,102 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::iocsh::{
-    arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, poll_intervals,
-    req_int, req_string,
-};
-use motor_common::{MotorHolder, asyn_user};
+use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
+use motor_common::model1::c_int;
+use motor_common::{PortDriver, asyn_user, install, register_port};
 
 use crate::oms::{OmsAxis, OmsController};
 
-/// Default communication timeout when the `timeoutMs` arg is omitted.
-const DEFAULT_TIMEOUT_MS: f64 = 2000.0;
+/// C `OMS_MAX_AXES`.
+const OMS_MAX_AXES: usize = 10;
 
-/// A registered controller plus the poll periods to install its axes with.
-struct ControllerReg {
-    controller: Arc<Mutex<OmsController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
-}
+/// The constructor's `timeout = 2.0`.
+const TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Shared name -> controller registry for the commands.
-type Registry = Arc<Mutex<HashMap<String, ControllerReg>>>;
-
-fn registry_lock(reg: &Registry) -> std::sync::MutexGuard<'_, HashMap<String, ControllerReg>> {
-    reg.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Build all OMS iocsh commands, sharing one controller registry.
-pub fn oms_commands(holder: &Arc<MotorHolder>) -> Vec<CommandDef> {
-    let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+/// `omsMAXnetConfig` and `omsMXAConfig`.
+pub fn oms_commands() -> Vec<CommandDef> {
     vec![
-        oms_config_command(&registry, "omsMAXnetConfig", "MAXnet"),
-        oms_config_command(&registry, "omsMXAConfig", "MXA"),
-        oms_create_axis_command(&registry, holder),
+        oms_config_command("omsMAXnetConfig", "MAXnet"),
+        oms_config_command("omsMXAConfig", "MXA"),
     ]
 }
 
-/// `omsMAXnetConfig` / `omsMXAConfig`
-/// `(controllerName, asynPort, [initString], [movingPollMs], [idlePollMs],
-/// [timeoutMs])`.
-fn oms_config_command(
-    registry: &Registry,
-    cmd_name: &'static str,
-    controller_type: &'static str,
-) -> CommandDef {
-    let registry = registry.clone();
+/// `<cmd_name>(portName, numAxes, serialPortName, movingPollPeriod,
+/// idlePollPeriod, initString)`. As C's constructor, a failure past the
+/// port's creation is printed and leaves the port without axes.
+fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> CommandDef {
     CommandDef::new(
         cmd_name,
         vec![
-            arg_str_req("controllerName"),
-            arg_str_req("asynPort"),
-            arg_str_opt("initString"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
-            arg_double_opt("timeoutMs"),
+            arg_str_req("asyn motor port name"),
+            arg_int_req("number of axes"),
+            arg_str_req("asyn serial/tcp port name"),
+            arg_int_req("moving poll rate"),
+            arg_int_req("idle poll rate"),
+            arg_str_req("initstring"),
         ],
         format!(
-            "{cmd_name}(controllerName, asynPort, [initString], [movingPollMs], \
-             [idlePollMs], [timeoutMs]) - Register a Pro-Dex OMS {controller_type} \
-             controller by name"
+            "{cmd_name}(portName, numAxes, serialPortName, movingPollPeriod, \
+             idlePollPeriod, initString)"
         ),
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let init_string = req_string(args, 2, "initString").unwrap_or_default();
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "asyn motor port name")?;
+            let num_axes = c_int(args, 1);
+            let serial_port = req_string(args, 2, "asyn serial/tcp port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-            let timeout_ms = opt_double(args, 5, DEFAULT_TIMEOUT_MS, "timeoutMs")?;
+            let init_string = req_string(args, 5, "initstring").unwrap_or_default();
+            let who = format!("{controller_type}Config");
 
-            if registry_lock(&registry).contains_key(&name) {
-                return Err(format!(
-                    "{cmd_name}: controller '{name}' already registered"
-                ));
-            }
-            let handle = connect_with_default_eos(
-                &asyn_port,
-                Duration::from_millis(timeout_ms.max(0.0) as u64),
-                &format!("{controller_type}Config"),
-            )?;
-            let controller = OmsController::new(handle, &asyn_port, controller_type);
-            match controller.firmware_version() {
-                Ok(fw) => println!("{cmd_name}: {controller_type} firmware: {fw}"),
-                Err(e) => println!("{cmd_name}: warning: firmware read failed: {e}"),
+            register_port(&port_name, PortDriver::Controller, num_axes)?;
+            let Some(handle) = connect_with_default_eos(&serial_port, TIMEOUT, &who) else {
+                println!(
+                    "{who}: can't connect to port {serial_port}: port {serial_port} not found"
+                );
+                return Ok(CommandOutcome::Continue);
+            };
+            let controller = OmsController::new(handle, &serial_port, controller_type);
+            if let Err(e) = controller.firmware_version() {
+                println!("{who}: unable to talk to controller at {serial_port}: {e}");
+                return Ok(CommandOutcome::Continue);
             }
             controller.init(&init_string);
 
-            let controller = Arc::new(Mutex::new(controller));
-            registry_lock(&registry).insert(
-                name.clone(),
-                ControllerReg {
-                    controller,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                },
-            );
-            println!(
-                "{cmd_name}: controller='{name}' asynPort={asyn_port} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (attach axes with omsCreateAxis)"
-            );
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// `omsCreateAxis(controllerName, axis)`.
-fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> CommandDef {
-    let registry = registry.clone();
-    let holder = holder.clone();
-    CommandDef::new(
-        "omsCreateAxis",
-        vec![arg_str_req("controllerName"), arg_int_req("axis")],
-        "omsCreateAxis(controllerName, axis) - Attach one OMS axis \
-         (DTYP OMS_{controllerName}_{axis}); axis is 0-based",
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let name = req_string(args, 0, "controllerName")?;
-            let axis = req_int(args, 1, "axis")?;
-            if !(0..=9).contains(&axis) {
-                return Err("omsCreateAxis: axis must be 0..=9".into());
+            // omsBaseController::Init: the axes are the fields of `AA RP;`.
+            let total_axes = match controller.axis_count() {
+                Ok(n) => n,
+                Err(e) => {
+                    println!("{who}: unable to talk to controller at {serial_port}: {e}");
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+            if num_axes as usize > OMS_MAX_AXES {
+                eprintln!(
+                    "omsBaseController:Init: number of axes={num_axes} exceeds allowed maximum"
+                );
+                println!("{who}: unable to talk to controller at {serial_port}");
+                return Ok(CommandOutcome::Continue);
+            }
+            if total_axes > num_axes.max(0) as usize {
+                eprintln!(
+                    "omsBaseController:Init: actual number of axes={total_axes} > MIN(numAxes={num_axes}, OMS_MAX_AXES)"
+                );
+                println!("{who}: unable to talk to controller at {serial_port}");
+                return Ok(CommandOutcome::Continue);
             }
 
-            let reg = registry_lock(&registry);
-            let entry = reg
-                .get(&name)
-                .ok_or_else(|| format!("omsCreateAxis: controller '{name}' not registered"))?;
-            let controller = entry.controller.clone();
-            let moving_poll_ms = entry.moving_poll_ms;
-            let idle_poll_ms = entry.idle_poll_ms;
-            drop(reg);
-
-            let axis_dev = OmsAxis::new(controller, axis as usize)
-                .map_err(|e| format!("omsCreateAxis: {e}"))?;
-            let dtyp_key = format!("OMS_{name}_{axis}");
-            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
-            holder.install(
-                ctx,
-                asyn_user(&name, axis as i32),
-                dtyp_key.clone(),
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-            );
-            println!("omsCreateAxis: {dtyp_key} (axis={axis})");
+            let controller = Arc::new(Mutex::new(controller));
+            for axis in 0..total_axes {
+                let axis_dev = OmsAxis::new(controller.clone(), axis)
+                    .map_err(|e| format!("{cmd_name}: axis {axis}: {e}"))?;
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
+                install(
+                    ctx,
+                    asyn_user(&port_name, axis as i32),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                )?;
+            }
             Ok(CommandOutcome::Continue)
         },
     )
@@ -172,12 +116,8 @@ fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> Co
 /// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`. As there, a
 /// refused get skips that direction and a refused set is printed, never fatal
 /// (omsMAXnet.cpp:134-142, omsMXA.cpp:129-137).
-fn connect_with_default_eos(
-    port_name: &str,
-    timeout: Duration,
-    who: &str,
-) -> Result<SyncIOHandle, String> {
-    let port = get_port(port_name).ok_or_else(|| format!("asyn port '{port_name}' not found"))?;
+fn connect_with_default_eos(port_name: &str, timeout: Duration, who: &str) -> Option<SyncIOHandle> {
+    let port = get_port(port_name)?;
     let user = || AsynUser::new(0).with_addr(0);
     let handle = &port.handle;
     if handle
@@ -194,7 +134,7 @@ fn connect_with_default_eos(
     {
         println!("{who}: unable to set OutputEOS {port_name}: {e}");
     }
-    Ok(SyncIOHandle::from_handle(handle.clone(), 0, timeout))
+    Some(SyncIOHandle::from_handle(handle.clone(), 0, timeout))
 }
 
 #[cfg(test)]
@@ -229,6 +169,6 @@ mod tests {
                 .is_err()
         );
         claim.publish(port, &open_owner()).unwrap();
-        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_some());
     }
 }

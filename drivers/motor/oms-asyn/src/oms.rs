@@ -45,12 +45,12 @@
 //!   `writeFloat64` overrides, closed-loop gain status (`CL?`), the following-
 //!   error / encoder-status word (`EA`). These are not motor-record motion
 //!   fields.
-//! - The init-time firmware-version gate and axis-count auto-detection: the
-//!   driver reads the firmware string once for logging, assumes the modern
-//!   (>= 1.30) command forms MAXnet mandates, and trusts the configured axis
-//!   count.
+//! - The init-time firmware-version gate: the driver reads the firmware
+//!   string once as a comms check and assumes the modern (>= 1.30) command
+//!   forms MAXnet mandates.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
@@ -163,9 +163,19 @@ impl OmsController {
     pub fn init(&self, init_string: &str) {
         let _ = self.send_only("IC;");
         let _ = self.send_only("AM SA;");
+        std::thread::sleep(Duration::from_millis(500));
         if !init_string.is_empty() {
             let _ = self.send_only(init_string);
         }
+        // Some init commands (like "LT") need time to process.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    /// The axis count: the fields of the `AA RP;` reply, empty ones skipped
+    /// as `epicsStrtok_r` does.
+    pub fn axis_count(&self) -> AsynResult<usize> {
+        let reply = self.send_receive("AA RP;")?;
+        Ok(reply.split(',').filter(|f| !f.is_empty()).count())
     }
 }
 
@@ -511,6 +521,8 @@ mod tests {
                 b"=h".to_vec()
             } else if cmd.ends_with("RE;") {
                 b"1000".to_vec()
+            } else if cmd == "AA RP;" {
+                b"100,,-5,0,".to_vec()
             } else {
                 Vec::new()
             };
@@ -557,6 +569,28 @@ mod tests {
         axis.set_encoder_ratio(&user, 4.0).unwrap();
         axis.move_absolute(&user, 10.0, 1.0, 100.0, 1000.0).unwrap();
         assert!(written.lock().unwrap().iter().any(|c| c == "AX;LO250;"));
+    }
+
+    #[test]
+    fn the_axis_count_skips_empty_fields_as_strtok_does() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = EncoderAxis {
+            base: PortDriverBase::new("omsAxisCount", 1, PortFlags::default()),
+            written: Arc::new(Mutex::new(Vec::new())),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("omsAxisCount").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = OmsController::new(io, "omsAxisCount", "MAXnet");
+        assert_eq!(controller.axis_count().unwrap(), 3);
     }
 
     /// A line that refuses every write; records what was offered.

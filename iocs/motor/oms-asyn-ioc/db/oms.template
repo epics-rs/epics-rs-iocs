@@ -1,5 +1,5 @@
-# OMS MAXnet / MXA: one motor record per axis. Load once per axis, matching the
-# omsCreateAxis(controllerName, AXIS) call. DTYP is OMS_$(CTRL)_$(AXIS).
+# OMS MAXnet / MXA: one motor record per axis, ADDR the 0-based axis index on
+# the omsMAXnetConfig / omsMXAConfig port PORT.
 #
 # The driver reports motor and encoder positions in controller-native steps
 # (there is no resolution factor to cancel), so MRES = 1 and EGU = steps.
@@ -8,7 +8,8 @@
 # <= 67000000).
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "OMS_$(CTRL)_$(AXIS)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10000.0)")
     field(ACCL, "$(ACCL=0.2)")
