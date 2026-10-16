@@ -315,10 +315,14 @@ async fn publish_frame(
     // buffer. The array is the size of the frame that was actually read.
     let ts = EpicsTimestamp::now();
     let data_size = image.data.len() * 4;
-    let mut array = ctx.pool.wrap(
+    // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.wrap(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
         NDDataBuffer::U32(image.data),
-    );
+    ) else {
+        return Ok(());
+    };
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
