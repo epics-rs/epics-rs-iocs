@@ -380,7 +380,7 @@ impl DeviceSupport for VacSen {
             .handle
             .queue_request(&live.cell, &user(job.addr, IO_TIMEOUT))
         {
-            Ok(()) => {
+            Ok(_) => {
                 live.pass = Pass::Queued;
                 Ok(ReadStart::Pending)
             }
