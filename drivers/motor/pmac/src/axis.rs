@@ -350,6 +350,9 @@ impl AsynMotor for PmacAxis {
         let axis = self.axis;
         let mut controller = lock(&self.controller);
         let config = controller.axis_config(axis);
+        // C `pmacController::poll` reads the global status before any axis, and
+        // whether or not the axis reply then parses.
+        let controller_problem = controller.controller_problem();
 
         // One round trip for the two status words, the following error and the
         // position. With an open-loop axis the encoder position comes back from
@@ -387,10 +390,7 @@ impl AsynMotor for PmacAxis {
         self.amp_enabled = flags.amp_enabled;
         self.fatal_following = flags.following_error;
 
-        let mut problem = flags.general_problem;
-        if controller.controller_problem() {
-            problem = true;
-        }
+        let mut problem = flags.general_problem || controller_problem;
         // If the hardware limits are off and *we* did not turn them off to home,
         // something else did: that is a problem the operator must see.
         if !config.limits_check_disabled

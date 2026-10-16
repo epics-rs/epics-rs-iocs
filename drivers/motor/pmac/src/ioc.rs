@@ -505,6 +505,7 @@ fn pmac_set_coord_poll_period_command(name: &'static str, period: &'static str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::error::AsynResult;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
@@ -536,6 +537,67 @@ mod tests {
             .publish(rt.port_handle().clone(), &open_owner())
             .unwrap();
         assert!(controller_on(name).write_read("I100").is_err());
+        drop(rt);
+    }
+
+    /// A PMAC that answers the global-status query and nothing else.
+    struct GlobalOnly {
+        base: PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+        reply: Vec<u8>,
+    }
+
+    impl PortDriver for GlobalOnly {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn set_input_eos(&mut self, _: &AsynUser, _: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn set_output_eos(&mut self, _: &AsynUser, _: &[u8]) -> AsynResult<()> {
+            Ok(())
+        }
+        fn io_write_octet(&mut self, _: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = if cmd == "???" {
+                b"000000000000".to_vec()
+            } else {
+                Vec::new()
+            };
+            self.written.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    #[test]
+    fn an_axis_reply_that_does_not_parse_still_reads_the_global_status() {
+        let name = "pmacGlobalFirst";
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let driver = GlobalOnly {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            written: written.clone(),
+            reply: Vec::new(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        let controller = Arc::new(Mutex::new(controller_on(name)));
+        assert!(
+            PmacAxis::new(controller, 1)
+                .poll(&AsynUser::new(0).with_addr(1))
+                .is_err()
+        );
+        assert_eq!(written.lock().unwrap()[0], "???");
         drop(rt);
     }
 
