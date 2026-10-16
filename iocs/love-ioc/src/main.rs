@@ -168,6 +168,15 @@ async fn main() -> CaResult<()> {
                 let handle =
                     connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT, INPUT_EOS, OUTPUT_EOS)
                         .map_err(|e| format!("LoveInit: {e}"))?;
+                // C `setDefaultEos` (drvLove.c:647-657).
+                ctx.println(&format!(
+                    "drvLove::setDefaultEos Input EOS set to \\0{}",
+                    INPUT_EOS[0]
+                ));
+                ctx.println(&format!(
+                    "drvLove::setDefaultEos Output EOS set to \\0{}",
+                    OUTPUT_EOS[0]
+                ));
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
                 let driver = LoveDriver::new(&lov_port, handle, models.clone())
