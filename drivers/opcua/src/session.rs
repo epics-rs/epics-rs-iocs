@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
     AttributeId, DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
     MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, Variant, WriteValue,
@@ -233,16 +234,42 @@ impl SessionConfig {
         Ok(())
     }
 
-    /// The endpoint to ask the server for.
-    pub fn endpoint_description(&self) -> EndpointDescription {
-        let policy = self
-            .security_policy
-            .clone()
-            .unwrap_or_else(|| security_policy_uri(self.security_mode).to_string());
+    /// `SessionOpen62541::setupSecurity` (`SessionOpen62541.cpp:1060-1086`):
+    /// of the server's opc.tcp endpoints whose mode and policy the session
+    /// accepts and whose policy the client supports, the one with the highest
+    /// security level. The session still connects to its own URL.
+    pub fn select_endpoint(
+        &self,
+        endpoints: &[EndpointDescription],
+    ) -> Option<EndpointDescription> {
+        let mode = self.security_mode.as_message_security_mode();
+        let mut selected: Option<&EndpointDescription> = None;
+        for e in endpoints {
+            let policy = e.security_policy_uri.as_ref();
+            if e.endpoint_url.as_ref().starts_with("opc.tcp")
+                && (self.security_mode == SecurityMode::Best || e.security_mode == mode)
+                && self
+                    .security_policy
+                    .as_deref()
+                    .is_none_or(|p| p.contains("#None") || p == policy)
+                && selected.is_none_or(|s| e.security_level > s.security_level)
+                && SecurityPolicy::from_uri(policy) != SecurityPolicy::Unknown
+            {
+                selected = Some(e);
+            }
+        }
+        selected.map(|e| EndpointDescription {
+            endpoint_url: self.url.as_str().into(),
+            ..e.clone()
+        })
+    }
+
+    /// The endpoint a `sec-mode=None` session connects to without discovery.
+    pub fn unsecured_endpoint(&self) -> EndpointDescription {
         EndpointDescription {
             endpoint_url: self.url.as_str().into(),
-            security_policy_uri: policy.as_str().into(),
-            security_mode: self.security_mode.as_message_security_mode(),
+            security_policy_uri: SecurityPolicy::None.to_uri().into(),
+            security_mode: MessageSecurityMode::None,
             ..Default::default()
         }
     }
@@ -281,15 +308,6 @@ fn batch_size(server_limit: u32, session_limit: u32) -> usize {
         (0, 0) => usize::MAX,
         (m, 0) | (0, m) => m as usize,
         (a, b) => a.min(b) as usize,
-    }
-}
-
-fn security_policy_uri(mode: SecurityMode) -> &'static str {
-    match mode {
-        SecurityMode::None => "http://opcfoundation.org/UA/SecurityPolicy#None",
-        // The strongest policy the OPC UA specification currently requires a
-        // server to support (Part 7 profile "Basic256Sha256").
-        _ => "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
     }
 }
 

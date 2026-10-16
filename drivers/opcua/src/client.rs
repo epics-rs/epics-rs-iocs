@@ -201,17 +201,25 @@ impl UaConnector for AsyncOpcuaConnector {
             )
         })?;
 
-        let endpoint = config.endpoint_description();
         let identity = identity.token()?;
-        let (session, event_loop) = client
-            .connect_to_matching_endpoint(endpoint, identity)
-            .await
-            .map_err(|e| {
-                format!(
-                    "connect service failed with status {}",
-                    status_name(e.status())
-                )
-            })?;
+        let connected = if config.security_mode == SecurityMode::None {
+            client.connect_to_endpoint_directly(config.unsecured_endpoint(), identity)
+        } else {
+            let endpoints = client
+                .get_server_endpoints_from_url(config.url.as_str())
+                .await
+                .map_err(|_| "security discovery and setup failed with status cantConnect")?;
+            let endpoint = config
+                .select_endpoint(&endpoints)
+                .ok_or("security discovery and setup failed with status noMatchingEndpoint")?;
+            client.connect_to_endpoint_directly(endpoint, identity)
+        };
+        let (session, event_loop) = connected.map_err(|e| {
+            format!(
+                "connect service failed with status {}",
+                status_name(e.status())
+            )
+        })?;
 
         let handle = event_loop.spawn();
         session
