@@ -6,6 +6,7 @@ use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::param::{AsynType, ParamOps, ParamRegistry, ParamUpdate};
@@ -382,83 +383,9 @@ impl EigerDriver {
             None => Ok(()),
         }
     }
-}
 
-fn rest_err(e: RestError) -> AsynError {
-    asyn_err(e.to_string())
-}
-
-/// An asyn error carrying a driver-level message.
-pub(crate) fn asyn_err(message: String) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message,
-    }
-}
-
-impl PortDriver for EigerDriver {
-    fn base(&self) -> &PortDriverBase {
-        &self.ad.port_base
-    }
-
-    fn base_mut(&mut self) -> &mut PortDriverBase {
-        &mut self.ad.port_base
-    }
-
-    /// Create an `EIG_XYZ_name` parameter on demand (C `drvUserCreate`,
-    /// eigerDetector.cpp:2074).
-    ///
-    /// ```text
-    /// EIG_XYZ_name
-    ///     X  D detector | F filewriter | M monitor | S stream
-    ///     Y  C config   | S status
-    ///     Z  I int32    | D float64    | S octet
-    /// ```
-    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
-        let drv_info = req.drv_info.as_str();
-        if let Some(reason) = self.ad.port_base.params.find_param(drv_info) {
-            return Ok(DrvUserInfo::from_reason(reason));
-        }
-        if !drv_info.starts_with("EIG_") || drv_info.len() <= 8 {
-            return Err(AsynError::ParamNotFound(drv_info.to_string()));
-        }
-
-        let sys = Sys::from_drv_info_code(&drv_info[4..6]).ok_or_else(|| {
-            asyn_err(format!(
-                "[{drv_info}] couldn't match {} to any subsystem",
-                &drv_info[4..6]
-            ))
-        })?;
-        let asyn_type = match drv_info.as_bytes()[6] {
-            b'I' => AsynType::Int32,
-            b'D' => AsynType::Float64,
-            b'S' => AsynType::Octet,
-            c => {
-                return Err(asyn_err(format!(
-                    "[{drv_info}] couldn't match {} to an asyn type",
-                    c as char
-                )));
-            }
-        };
-        let remote_name = drv_info[8..].to_string();
-
-        let param_type = match asyn_type {
-            AsynType::Int32 => epics_rs::asyn::param::ParamType::Int32,
-            AsynType::Float64 => epics_rs::asyn::param::ParamType::Float64,
-            AsynType::Octet => epics_rs::asyn::param::ParamType::Octet,
-        };
-        let index = self.ad.port_base.create_param(drv_info, param_type)?;
-        self.ops
-            .reg
-            .lock()
-            .add(index, drv_info, asyn_type, sys, &remote_name);
-
-        // C `p->fetch()`: its failure lines are the parameter layer's.
-        let _ = self.fetch(index);
-        Ok(DrvUserInfo::from_reason(index))
-    }
-
-    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+    /// `writeInt32` up to its closing lines.
+    fn write_int32_status(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
         let acquire = self.ad.params.acquire;
@@ -545,10 +472,11 @@ impl PortDriver for EigerDriver {
             self.ad.port_base.set_int32_param(reason, addr, value)?;
         }
 
-        self.ad.port_base.call_param_callbacks(addr)
+        Ok(())
     }
 
-    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+    /// `writeFloat64` up to its closing lines.
+    fn write_float64_status(&mut self, user: &AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
 
@@ -583,13 +511,13 @@ impl PortDriver for EigerDriver {
             self.ad.port_base.set_float64_param(reason, addr, value)?;
         }
 
-        self.ad.port_base.call_param_callbacks(addr)
+        Ok(())
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    /// `writeOctet` up to its closing lines.
+    fn write_octet_status(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
-        let value = String::from_utf8_lossy(data).into_owned();
+        let value = String::from_utf8_lossy(data);
 
         // The C driver resolves FILE_OWNER / FILE_OWNER_GROUP to a uid/gid with
         // getpwnam/getgrnam and then setfsuid()s to it around every write.
@@ -600,12 +528,163 @@ impl PortDriver for EigerDriver {
             && reason != self.p.file_owner
             && reason != self.p.file_owner_group
         {
-            self.put_str(reason, &value)?;
+            self.put_str(reason, &value)
         } else {
-            return self.ad.write_octet(user, data);
+            self.ad.write_octet(user, data).map(drop)
+        }
+    }
+}
+
+fn rest_err(e: RestError) -> AsynError {
+    asyn_err(e.to_string())
+}
+
+/// An asyn error carrying a driver-level message.
+pub(crate) fn asyn_err(message: String) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message,
+    }
+}
+
+impl PortDriver for EigerDriver {
+    fn base(&self) -> &PortDriverBase {
+        &self.ad.port_base
+    }
+
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.ad.port_base
+    }
+
+    /// Create an `EIG_XYZ_name` parameter on demand (C `drvUserCreate`,
+    /// eigerDetector.cpp:2074).
+    ///
+    /// ```text
+    /// EIG_XYZ_name
+    ///     X  D detector | F filewriter | M monitor | S stream
+    ///     Y  C config   | S status
+    ///     Z  I int32    | D float64    | S octet
+    /// ```
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        let drv_info = req.drv_info.as_str();
+        if let Some(reason) = self.ad.port_base.params.find_param(drv_info) {
+            return Ok(DrvUserInfo::from_reason(reason));
+        }
+        if !drv_info.starts_with("EIG_") || drv_info.len() <= 8 {
+            return Err(AsynError::ParamNotFound(drv_info.to_string()));
         }
 
-        self.ad.port_base.call_param_callbacks(addr)?;
-        Ok(data.len())
+        let sys = Sys::from_drv_info_code(&drv_info[4..6]).ok_or_else(|| {
+            asyn_err(format!(
+                "[{drv_info}] couldn't match {} to any subsystem",
+                &drv_info[4..6]
+            ))
+        })?;
+        let asyn_type = match drv_info.as_bytes()[6] {
+            b'I' => AsynType::Int32,
+            b'D' => AsynType::Float64,
+            b'S' => AsynType::Octet,
+            c => {
+                return Err(asyn_err(format!(
+                    "[{drv_info}] couldn't match {} to an asyn type",
+                    c as char
+                )));
+            }
+        };
+        let remote_name = drv_info[8..].to_string();
+
+        let param_type = match asyn_type {
+            AsynType::Int32 => epics_rs::asyn::param::ParamType::Int32,
+            AsynType::Float64 => epics_rs::asyn::param::ParamType::Float64,
+            AsynType::Octet => epics_rs::asyn::param::ParamType::Octet,
+        };
+        let index = self.ad.port_base.create_param(drv_info, param_type)?;
+        self.ops
+            .reg
+            .lock()
+            .add(index, drv_info, asyn_type, sys, &remote_name);
+
+        // C `p->fetch()`: its failure lines are the parameter layer's.
+        let _ = self.fetch(index);
+        Ok(DrvUserInfo::from_reason(index))
+    }
+
+    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        let function = user.reason;
+        if let Err(e) = self.write_int32_status(user, value) {
+            // C's ERR_ARGS, on pasynUserSelf (eigerDetector.cpp:590-594).
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                &format!(
+                    "eigerDetector::writeInt32: error status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            );
+            return Err(e);
+        }
+        let _ = self.ad.port_base.call_param_callbacks(user.addr);
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("eigerDetector:writeInt32: function={function}, value={value}"),
+        );
+        Ok(())
+    }
+
+    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        let function = user.reason;
+        let status = self.write_float64_status(user, value);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => {
+                user.print(
+                    TraceMask::IO_DRIVER,
+                    file!(),
+                    line!(),
+                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}"),
+                );
+                let _ = self.ad.port_base.call_param_callbacks(user.addr);
+            }
+        }
+        status
+    }
+
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        let function = user.reason;
+        let status = self.write_octet_status(user, data);
+        // C prints the value as the `char *` it was handed: up to the NUL.
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let value = String::from_utf8_lossy(&data[..end]);
+        match &status {
+            // C's error line has no newline (eigerDetector.cpp:763-766).
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "eigerDetector:writeOctet: status={}, function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => {
+                user.print(
+                    TraceMask::IO_DRIVER,
+                    file!(),
+                    line!(),
+                    format_args!("eigerDetector:writeOctet: function={function}, value={value}"),
+                );
+                let _ = self.ad.port_base.call_param_callbacks(user.addr);
+            }
+        }
+        status.map(|()| data.len())
     }
 }
