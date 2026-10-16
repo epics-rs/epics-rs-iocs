@@ -9,6 +9,7 @@ use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::detector::{Detector, Settings};
@@ -69,36 +70,29 @@ impl MythenParams {
 /// The outcome of the constructor's detector queries.
 ///
 /// The single gate that keeps a constructor-time detector query from failing
-/// port creation: it logs the failure, records which query it was, and hands
-/// the caller a `None` to fall back from. C gets the same property from
+/// port creation: it records that a query failed, and hands the caller a `None` to fall back from. C gets the same property from
 /// `status |= ...` over a C++ constructor, which cannot fail — an unreachable
 /// detector must never stop the IOC from reaching `iocInit`.
 #[derive(Default)]
 struct BootQueries {
-    failed: Vec<String>,
+    failed: bool,
 }
 
 impl BootQueries {
-    /// Run one constructor-time query, logging and recording a failure.
-    fn run<T>(&mut self, what: &str, result: AsynResult<T>) -> Option<T> {
+    /// Run one constructor-time query, recording a failure.
+    fn run<T>(&mut self, result: AsynResult<T>) -> Option<T> {
         match result {
             Ok(value) => Some(value),
-            Err(e) => {
-                self.fail(what, &e.to_string());
+            Err(_) => {
+                self.fail();
                 None
             }
         }
     }
 
     /// Record a query that answered, but answered something unusable.
-    fn fail(&mut self, what: &str, why: &str) {
-        log::error!("mythen: cannot read {what} at startup: {why}");
-        self.failed.push(what.to_string());
-    }
-
-    /// The queries that failed, or `None` when every one of them worked.
-    fn failure_summary(&self) -> Option<String> {
-        (!self.failed.is_empty()).then(|| self.failed.join(", "))
+    fn fail(&mut self) {
+        self.failed = true;
     }
 }
 
@@ -140,8 +134,7 @@ impl MythenDriver {
     /// every readout after that would be sized from a count that was never
     /// read. Re-running the constructor's queries here is what closes that.
     pub fn reconnect(&mut self) -> AsynResult<()> {
-        let version = self.det.probe()?;
-        log::warn!("mythen: the detector answered again (firmware {version}); re-reading it");
+        self.det.probe()?;
         self.init_params()
     }
 
@@ -155,10 +148,10 @@ impl MythenDriver {
     fn init_params(&mut self) -> AsynResult<()> {
         let mut q = BootQueries::default();
 
-        let firmware = q.run("the firmware version", self.det.get_firmware());
-        if let Some(firmware) = &firmware {
-            log::info!("mythen: firmware {firmware}");
-        }
+        let firmware = q.run(self.det.get_firmware());
+        // C ORs only these two into the constructor's `status`
+        // (mythen.cpp:1329, :1364).
+        let mut camera_params_failed = firmware.is_none();
 
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.base.manufacturer, 0, "Dectris")?;
@@ -175,27 +168,37 @@ impl MythenDriver {
         base.set_int32_param(self.ad.params.base.data_type, 0, NDDataType::UInt32 as i32)?;
         base.set_int32_param(self.ad.params.image_mode, 0, ImageMode::Single as i32)?;
 
-        let status = q.run("the detector status", self.det.get_status());
+        let status = q.run(self.det.get_status());
         self.ad.port_base.set_int32_param(
             self.ad.params.status,
             0,
             status.unwrap_or(ADStatus::Disconnected) as i32,
         )?;
 
-        if let Some(settings) = q.run("the detector settings", self.det.get_settings()) {
+        if let Some(settings) = q.run(self.det.get_settings()) {
             self.apply_settings(&settings)?;
         }
 
-        let nmodules = match q.run("the module count", self.det.read_nmodules()) {
+        let nmodules = match q.run(self.det.read_nmodules()) {
             Some(n) if n >= 0 => Some(n),
             // C prints the same message and abandons the rest of the
             // constructor (mythen.cpp:1367-1372); the port survives either way.
             Some(n) => {
-                q.fail("the module count", &format!("unexpected reply: {n}"));
+                self.det.trace_error(&format!(
+                    "mythen:mythen: error, outString=-get nmodules, inString={n}"
+                ));
+                q.fail();
+                camera_params_failed = false;
                 None
             }
-            None => None,
+            None => {
+                camera_params_failed = true;
+                None
+            }
         };
+        if camera_params_failed {
+            println!("mythen: unable to read camera parameters");
+        }
         if let Some(nmodules) = nmodules {
             self.ad
                 .port_base
@@ -212,20 +215,15 @@ impl MythenDriver {
         // The message is set and cleared here because this runs again on every
         // reconnect: a detector that came back must not leave the operator
         // reading "FAILED TO CONNECT" off a working port.
-        let message = match q.failure_summary() {
-            Some(failed) => {
-                log::error!(
-                    "mythen: the detector did not answer ({failed}); the port keeps its default \
-                     parameters and reports ADStatus=Disconnected"
-                );
-                self.ad.port_base.set_int32_param(
-                    self.ad.params.status,
-                    0,
-                    ADStatus::Disconnected as i32,
-                )?;
-                "Mythen FAILED TO CONNECT"
-            }
-            None => "",
+        let message = if q.failed {
+            self.ad.port_base.set_int32_param(
+                self.ad.params.status,
+                0,
+                ADStatus::Disconnected as i32,
+            )?;
+            "Mythen FAILED TO CONNECT"
+        } else {
+            ""
         };
         self.ad
             .port_base
@@ -294,8 +292,8 @@ impl MythenDriver {
         if !self.det.is_connected() {
             self.reconnect()?;
         }
-        if self.det.start()? && self.start_tx.try_send(()).is_err() {
-            log::error!("mythen: the acquisition task is not running");
+        if self.det.start()? {
+            let _ = self.start_tx.try_send(());
         }
         Ok(())
     }
@@ -318,6 +316,9 @@ impl PortDriver for MythenDriver {
         // C refuses every write except ADAcquire while an acquisition runs
         // (mythen.cpp:1111).
         if reason != acquire && self.det.state.acquiring.load(Ordering::Acquire) {
+            self.ad
+                .port_base
+                .trace_print(TraceMask::ERROR, "mythen:writeInt32: detector is busy");
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "mythen: detector is busy".into(),
@@ -373,6 +374,9 @@ impl PortDriver for MythenDriver {
         let addr = user.addr;
 
         if self.det.state.acquiring.load(Ordering::Acquire) {
+            self.ad
+                .port_base
+                .trace_print(TraceMask::ERROR, "mythen:writeFloat64: detector is busy");
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "mythen: detector is busy".into(),

@@ -59,7 +59,7 @@ pub fn create_mythen_detector(
         status: AsynStatus::Error,
         message: format!("mythen: no asyn port named {ip_port_name}"),
     })?;
-    let det = Arc::new(Detector::new(Transport::new(ip_port.handle)));
+    let det = Arc::new(Detector::new(Transport::new(ip_port.handle), port_name));
 
     let (start_tx, start_rx) = rt::command_channel::<()>(1);
     let driver = MythenDriver::new(port_name, det.clone(), max_memory, start_tx)?;

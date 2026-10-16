@@ -6,11 +6,13 @@
 //! asyn's per-port request queue.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::trace::{TraceManager, TraceMask};
 use parking_lot::Mutex;
 
 use crate::protocol::{self, READ_MODE_RAW};
@@ -62,16 +64,42 @@ pub struct Detector {
     /// outcome of a real command is the only thing that may change it.
     connected: AtomicBool,
     pub state: DetState,
+    /// The mythen port C's `pasynUserSelf` prints on.
+    port_name: String,
+    trace: Arc<TraceManager>,
 }
 
 impl Detector {
-    pub fn new(transport: Transport) -> Self {
+    pub fn new(transport: Transport, port_name: &str) -> Self {
         Self {
+            trace: transport.trace(),
             transport: Mutex::new(transport),
             // Optimistic: the first command is what finds out.
             connected: AtomicBool::new(true),
             state: DetState::default(),
+            port_name: port_name.to_string(),
         }
+    }
+
+    /// An `ASYN_TRACE_ERROR` line on the mythen port.
+    pub fn trace_error(&self, message: &str) {
+        self.trace
+            .output(&self.port_name, TraceMask::ERROR, message);
+    }
+
+    /// C `writeReadMeter`, mythen.cpp:239, which prints on every failed
+    /// exchange — including one the gate refused, where C would have sent it
+    /// and failed.
+    fn meter<T>(
+        &self,
+        what: &str,
+        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
+    ) -> AsynResult<T> {
+        let result = self.io(what, exchange);
+        if result.is_err() {
+            self.trace_error("mythen:writeReadMeter: error!");
+        }
+        result
     }
 
     /// Whether the detector is currently believed to be answering.
@@ -97,7 +125,7 @@ impl Detector {
         if !self.is_connected() {
             return Err(disconnected(what));
         }
-        self.exchange(what, exchange)
+        self.exchange(exchange)
     }
 
     /// Run one command and let its outcome own the connection state.
@@ -108,28 +136,9 @@ impl Detector {
     /// them means disconnected. Replies the detector *did* send and the driver
     /// rejects (`-get tau` out of range, a negative module count) are checked by
     /// the callers, above this line, and leave the state alone.
-    fn exchange<T>(
-        &self,
-        what: &str,
-        exchange: impl FnOnce(&Transport) -> AsynResult<T>,
-    ) -> AsynResult<T> {
+    fn exchange<T>(&self, exchange: impl FnOnce(&Transport) -> AsynResult<T>) -> AsynResult<T> {
         let result = exchange(&self.transport.lock());
-        match &result {
-            Ok(_) => {
-                if !self.connected.swap(true, Ordering::AcqRel) {
-                    log::warn!("mythen: [{what}] answered; the detector is connected again");
-                }
-            }
-            Err(e) => {
-                if self.connected.swap(false, Ordering::AcqRel) {
-                    log::error!(
-                        "mythen: [{what}] got no answer ({e}); the detector is marked \
-                         disconnected and no further command will be sent until an acquisition \
-                         probes it"
-                    );
-                }
-            }
-        }
+        self.connected.store(result.is_ok(), Ordering::Release);
         result
     }
 
@@ -140,7 +149,9 @@ impl Detector {
     /// unusable until the IOC is restarted, because C's constructor is the only
     /// place that reads the module count (mythen.cpp:1363).
     pub fn probe(&self) -> AsynResult<String> {
-        let version = self.exchange("-get version", Transport::get_version)?;
+        let version = self
+            .exchange(Transport::get_version)
+            .inspect_err(|_| self.trace_error("mythen:writeReadMeter: error!"))?;
         self.store_firmware(&version);
         Ok(version)
     }
@@ -163,23 +174,30 @@ impl Detector {
         self.state.firmware_major.load(Ordering::Acquire)
     }
 
-    /// Send a command and check the status integer it replies with.
+    /// Send a command and check the status integer it replies with
+    /// (C `sendCommand`, mythen.cpp:221, which reports a negative one and
+    /// carries on).
     pub fn send(&self, command: &str) -> AsynResult<()> {
-        self.io(command, |t| t.send_command(command))?;
+        let value = self.meter(command, |t| t.send_command(command))?;
+        if value < 0 {
+            self.trace_error(&format!(
+                "mythen:sendCommand: error, expected 0, received {value}"
+            ));
+        }
         Ok(())
     }
 
     fn get_int(&self, command: &str) -> AsynResult<i32> {
-        self.io(command, |t| t.get_int(command))
+        self.meter(command, |t| t.get_int(command))
     }
 
     fn get_float(&self, command: &str) -> AsynResult<f32> {
-        self.io(command, |t| t.get_float(command))
+        self.meter(command, |t| t.get_float(command))
     }
 
     /// C `getFirmware`, mythen.cpp:497.
     pub fn get_firmware(&self) -> AsynResult<String> {
-        let version = self.io("-get version", Transport::get_version)?;
+        let version = self.meter("-get version", Transport::get_version)?;
         self.store_firmware(&version);
         Ok(version)
     }
@@ -243,7 +261,10 @@ impl Detector {
     /// the command carries its own length.
     pub fn stop(&self) -> AsynResult<()> {
         self.state.acquiring.store(false, Ordering::Release);
-        self.io("-stop", |t| t.send_command("-stop"))?;
+        // C sends `-stop` straight through pasynOctetSyncIO, not
+        // writeReadMeter, and prints its own line.
+        self.io("-stop", |t| t.send_command("-stop"))
+            .inspect_err(|_| self.trace_error("mythen:setAcquire: error!"))?;
         Ok(())
     }
 
@@ -362,13 +383,13 @@ impl Detector {
 
         let nbits = self.get_int("-get nbits")?;
         if nbits < 0 {
-            return Err(settings_error("-get nbits", nbits.to_string()));
+            return Err(self.settings_error("-get nbits", nbits.to_string()));
         }
         self.state.nbits.store(nbits, Ordering::Release);
 
         let time = self.get_int("-get time")?;
         if time < 0 {
-            return Err(settings_error("-get time", time.to_string()));
+            return Err(self.settings_error("-get time", time.to_string()));
         }
         let acquire_time = protocol::from_hundred_ns(time);
 
@@ -377,12 +398,12 @@ impl Detector {
 
         let tau = self.get_float("-get tau")?;
         if !(tau == -1.0 || tau > 0.0) {
-            return Err(settings_error("-get tau", tau.to_string()));
+            return Err(self.settings_error("-get tau", tau.to_string()));
         }
 
         let threshold = self.get_float("-get kthresh")?;
         if threshold < 0.0 {
-            return Err(settings_error("-get kthresh", threshold.to_string()));
+            return Err(self.settings_error("-get kthresh", threshold.to_string()));
         }
 
         let mut settings = Settings {
@@ -402,7 +423,7 @@ impl Detector {
         if self.firmware_major() >= 3 {
             let energy = self.get_float("-get energy")?;
             if energy < 0.0 {
-                return Err(settings_error("-get energy", energy.to_string()));
+                return Err(self.settings_error("-get energy", energy.to_string()));
             }
             settings.energy = Some(f64::from(energy));
 
@@ -415,20 +436,20 @@ impl Detector {
             // and `-get version`: the reply is four bytes by construction.
             let delay = self.get_int("-get delafter")?;
             if delay < 0 {
-                return Err(settings_error("-get delafter", delay.to_string()));
+                return Err(self.settings_error("-get delafter", delay.to_string()));
             }
             settings.delay_time = Some(protocol::from_hundred_ns(delay));
 
             let cont = self.get_int("-get conttrig")?;
             if cont < 0 {
-                return Err(settings_error("-get conttrig", cont.to_string()));
+                return Err(self.settings_error("-get conttrig", cont.to_string()));
             }
             settings.trigger = Some(if cont == 1 {
                 protocol::TRIGGER_CONTINUOUS
             } else {
                 let single = self.get_int("-get trig")?;
                 if single < 0 {
-                    return Err(settings_error("-get trig", single.to_string()));
+                    return Err(self.settings_error("-get trig", single.to_string()));
                 }
                 if single == 1 {
                     protocol::TRIGGER_SINGLE
@@ -445,7 +466,7 @@ impl Detector {
     fn get_bool(&self, command: &str) -> AsynResult<i32> {
         let value = self.get_int(command)?;
         if value != 0 && value != 1 {
-            return Err(settings_error(command, value.to_string()));
+            return Err(self.settings_error(command, value.to_string()));
         }
         Ok(value)
     }
@@ -500,9 +521,15 @@ pub fn unknown_nmodules(what: &str) -> AsynError {
     }
 }
 
-fn settings_error(command: &str, got: String) -> epics_rs::asyn::error::AsynError {
-    epics_rs::asyn::error::AsynError::Status {
-        status: epics_rs::asyn::error::AsynStatus::Error,
-        message: format!("mythen: [{command}] unexpected reply: {got}"),
+impl Detector {
+    /// C `getSettings`' `goto error`, mythen.cpp:791.
+    fn settings_error(&self, command: &str, got: String) -> AsynError {
+        self.trace_error(&format!(
+            "mythen:getSettings: error, outString={command}, inString={got}"
+        ));
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("mythen: [{command}] unexpected reply: {got}"),
+        }
     }
 }

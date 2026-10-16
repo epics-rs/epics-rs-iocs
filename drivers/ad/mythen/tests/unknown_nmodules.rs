@@ -62,7 +62,7 @@ fn fake_detector() -> (PortHandle, mpsc::Receiver<String>) {
 #[test]
 fn a_readout_is_refused_while_the_module_count_is_unknown() {
     let (handle, received) = fake_detector();
-    let det = Arc::new(Detector::new(Transport::new(handle)));
+    let det = Arc::new(Detector::new(Transport::new(handle), "MYTHEN_NMODULES"));
 
     // Never asked: unknown, and unknown is not zero.
     assert_eq!(det.nmodules(), None);

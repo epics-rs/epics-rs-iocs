@@ -37,9 +37,10 @@ fn dead_ip_port(name: &str) -> PortHandle {
 
 #[test]
 fn the_driver_is_created_when_the_detector_does_not_answer() {
-    let det = Arc::new(Detector::new(Transport::new(dead_ip_port(
-        "MYTHEN_OFFLINE_IP",
-    ))));
+    let det = Arc::new(Detector::new(
+        Transport::new(dead_ip_port("MYTHEN_OFFLINE_IP")),
+        "MYTHEN_OFFLINE",
+    ));
     let (start_tx, _start_rx) = rt::command_channel::<()>(1);
 
     let driver = MythenDriver::new("MYTHEN_OFFLINE", det, 0, start_tx)

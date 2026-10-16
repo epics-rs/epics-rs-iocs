@@ -97,7 +97,7 @@ fn reply_to(command: &str) -> Vec<u8> {
 fn no_command_is_sent_while_the_detector_is_disconnected_and_an_acquisition_brings_it_back() {
     let answering = Arc::new(AtomicBool::new(false));
     let (handle, received) = switchable_detector(answering.clone());
-    let det = Arc::new(Detector::new(Transport::new(handle)));
+    let det = Arc::new(Detector::new(Transport::new(handle), "MYTHEN_RECONNECT"));
     let (start_tx, _start_rx) = rt::command_channel::<()>(1);
 
     // --- Boot against a silent detector ------------------------------------

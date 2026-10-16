@@ -6,11 +6,13 @@
 //! `asynOctetSetOutputEos` — the driver sends the bare command text.
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceManager;
 
 use crate::protocol::{INT_REPLY_LEN, VERSION_REPLY_LEN, decode_f32, decode_i32, decode_version};
 
@@ -33,6 +35,10 @@ pub struct Transport {
 impl Transport {
     pub fn new(handle: PortHandle) -> Self {
         Self { handle }
+    }
+
+    pub fn trace(&self) -> Arc<TraceManager> {
+        self.handle.trace().clone()
     }
 
     /// Send `command` and read up to `expect` bytes back.
@@ -76,15 +82,11 @@ impl Transport {
         Ok(reply)
     }
 
-    /// Send a command whose reply is a status integer, and check it
+    /// Send a command whose reply is a status integer
     /// (C `sendCommand`, mythen.cpp:221).
     pub fn send_command(&self, command: &str) -> AsynResult<i32> {
         let reply = self.write_read(command.as_bytes(), INT_REPLY_LEN, M1K_TIMEOUT)?;
-        let value = decode_i32(&reply).ok_or_else(|| short_reply(command, reply.len()))?;
-        if value < 0 {
-            log::error!("mythen: [{command}] error, expected 0, received {value}");
-        }
-        Ok(value)
+        decode_i32(&reply).ok_or_else(|| short_reply(command, reply.len()))
     }
 
     /// `-get <name>` returning a 4-byte integer.
