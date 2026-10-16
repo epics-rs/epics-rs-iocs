@@ -4,6 +4,7 @@ use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -446,13 +447,15 @@ impl D435iDepthRuntime {
 
 /// Create both Color and Depth drivers, start the shared acquisition task.
 pub fn create_d435i_detector(
-    port_name: &str,
+    color_claim: &PortClaim,
+    depth_claim: &PortClaim,
     serial: &str,
     max_size_x: i32,
     max_size_y: i32,
     max_memory: usize,
 ) -> AsynResult<(D435iColorRuntime, D435iDepthRuntime)> {
-    let depth_port_name = format!("{port_name}_DEPTH");
+    let port_name = color_claim.name();
+    let depth_port_name = depth_claim.name();
 
     // Shared state
     let (acq_tx, acq_rx) = rt::command_channel::<AcqCommand>(16);
@@ -486,17 +489,19 @@ pub fn create_d435i_detector(
     let color_ad_params = color_det.ad.params;
     let color_rs_params = color_det.rs_params;
     let color_pool = color_det.ad.pool.clone();
-    let (color_runtime_handle, _) = create_port_runtime(color_det, RuntimeConfig::default())?;
+    let (color_runtime_handle, _) =
+        create_port_runtime(color_claim, color_det, RuntimeConfig::default())?;
     let color_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let color_queued = Arc::new(QueuedArrayCounter::new());
     let pc_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let pc_queued = Arc::new(QueuedArrayCounter::new());
 
     // --- Depth port ---
-    let depth_det = D435iDepthDriver::new(&depth_port_name, max_size_x, max_size_y, max_memory)?;
+    let depth_det = D435iDepthDriver::new(depth_port_name, max_size_x, max_size_y, max_memory)?;
     let depth_ad_params = depth_det.ad.params;
     let depth_pool = depth_det.ad.pool.clone();
-    let (depth_runtime_handle, _) = create_port_runtime(depth_det, RuntimeConfig::default())?;
+    let (depth_runtime_handle, _) =
+        create_port_runtime(depth_claim, depth_det, RuntimeConfig::default())?;
     let depth_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let depth_queued = Arc::new(QueuedArrayCounter::new());
 
