@@ -872,12 +872,18 @@ impl XpsAxis {
             )
         };
 
+        // C prints the GroupStatusGet line for a failed GroupStatusStringGet too.
         let axis_status = sock
             .group_status_get(&self.group_name)
             .inspect(|&code| self.axis_status = code)
+            .and_then(|code| sock.group_status_string_get(code).map(|_| code))
             .inspect_err(|e| poll_error("GroupStatusGet", e))?;
         let flags = StatusFlags::from_status(axis_status);
         status.done = !flags.group_moving;
+
+        // A TCL script may change the soft limits; C re-reads them each poll
+        // and ignores a failure.
+        let _ = sock.positioner_user_travel_limits_get(&self.positioner_name);
 
         // In referencing (move-to-home) mode C reports the axis as not homed /
         // not at home regardless of status (XPSAxis::poll 636/648).
@@ -1021,6 +1027,22 @@ mod tests {
         *fail.lock().unwrap() = "GroupStatusGet";
         let s = axis.poll(&user).unwrap();
         assert!(s.comms_error && s.homed && !s.problem);
+        assert_eq!(s.position, 1.25);
+    }
+
+    /// XPSAxis.cpp:566-575 fails the poll on GroupStatusStringGet; :628 ignores
+    /// a failed PositionerUserTravelLimitsGet.
+    #[test]
+    fn poll_status_string_fails_and_travel_limits_do_not() {
+        let (mut axis, fail) = fake_axis("xps_poll_string");
+        let user = AsynUser::new(0);
+
+        *fail.lock().unwrap() = "GroupStatusStringGet";
+        assert!(axis.poll(&user).unwrap().comms_error);
+
+        *fail.lock().unwrap() = "PositionerUserTravelLimitsGet";
+        let s = axis.poll(&user).unwrap();
+        assert!(!s.comms_error);
         assert_eq!(s.position, 1.25);
     }
 
