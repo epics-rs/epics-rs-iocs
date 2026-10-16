@@ -529,6 +529,23 @@ impl PortDriver for PslDetector {
 
         let _ = self.get_config();
         let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "PSL:writeInt32: error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("PSL:writeInt32: function={reason}, value={value}"),
+            ),
+        }
         status
     }
 
@@ -551,6 +568,23 @@ impl PortDriver for PslDetector {
 
         let _ = self.get_config();
         let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "PSL:writeFloat64: error, status={} function={reason}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("PSL:writeFloat64: function={reason}, value={value:.6}"),
+            ),
+        }
         status
     }
 
@@ -578,7 +612,25 @@ impl PortDriver for PslDetector {
 
         let _ = self.get_config();
         let _ = self.ad.port_base.call_param_callbacks(0);
-        status.map(|()| value.len())
+        // A failure only fills errorMessage; success is a TRACEIO line.
+        match status {
+            Err(e) => Err(AsynError::Status {
+                status: e.status(),
+                message: format!(
+                    "PSL:writeOctet: status={}, function={reason}, value={text}",
+                    e.status() as i32
+                ),
+            }),
+            Ok(()) => {
+                user.print(
+                    TraceMask::IO_DRIVER,
+                    file!(),
+                    line!(),
+                    format_args!("PSL:writeOctet: function={reason}, value={text}"),
+                );
+                Ok(value.len())
+            }
+        }
     }
 
     fn read_enum(&mut self, user: &AsynUser) -> AsynResult<(usize, Arc<[EnumEntry]>)> {
