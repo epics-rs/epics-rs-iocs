@@ -30,6 +30,7 @@ pub mod family;
 pub mod http;
 pub mod mask;
 pub mod params;
+pub mod rate;
 pub mod serval;
 pub mod state;
 pub mod stream;

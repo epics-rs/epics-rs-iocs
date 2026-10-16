@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use crate::accum::Accumulator;
 use crate::coordinator::Coordinator;
 use crate::family::DetectorFamily;
+use crate::rate::Rates;
 
 /// What the port driver asks the background threads to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,8 @@ pub struct Shared {
     pub img: Mutex<Accumulator>,
     /// The PrvHst channel's accumulation (asyn addresses 4-7).
     pub hst: Mutex<Accumulator>,
+    /// The three streams' acquisition rates.
+    pub rates: Mutex<Rates>,
     /// The mask waveform the driver draws into (C mutates the *record's*
     /// buffer; the driver owns it here).
     pub mask: Mutex<Vec<i32>>,
@@ -72,6 +75,7 @@ impl Shared {
         Self {
             img: Mutex::new(Accumulator::new()),
             hst: Mutex::new(Accumulator::new()),
+            rates: Mutex::new(Rates::default()),
             mask: Mutex::new(Vec::new()),
             streams: Mutex::new(StreamPaths::default()),
             orientation: AtomicI32::new(0),

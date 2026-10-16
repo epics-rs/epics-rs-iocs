@@ -1172,9 +1172,16 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
     match (kind, frame) {
         (StreamKind::PrvImg, Frame::Image(f)) => {
             let p = ctx.p;
+            let rate = frame_rate(
+                ctx,
+                f.frame_number,
+                |r| &mut r.prv_img,
+                adlog::PROCESS_PREVIEW_JSONIMAGE_LINE,
+                "PrvImg ",
+            );
             ctx.set(
                 ADDR,
-                vec![
+                [
                     ParamSetValue::new(
                         p.prv_img_frame_number,
                         ADDR,
@@ -1195,7 +1202,14 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                         ADDR,
                         ParamValue::Int32(f.integration_size),
                     ),
-                ],
+                ]
+                .into_iter()
+                .chain(
+                    rate.map(|r| {
+                        ParamSetValue::new(p.prv_img_acq_rate, ADDR, ParamValue::Float64(r))
+                    }),
+                )
+                .collect(),
             )
             .await;
             publish_image(
@@ -1220,6 +1234,24 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 let img = ctx.shared.img.lock();
                 (img.total_counts(), img.frame_count())
             };
+            let rate = frame_rate(
+                ctx,
+                f.frame_number,
+                |r| &mut r.img,
+                adlog::PROCESS_IMG_DATA_LINE,
+                "Img ",
+            );
+            if let Some(rate) = rate {
+                ctx.set(
+                    ADDR,
+                    vec![ParamSetValue::new(
+                        p.img_acq_rate,
+                        ADDR,
+                        ParamValue::Float64(rate),
+                    )],
+                )
+                .await;
+            }
 
             ctx.set(
                 ADDR,
@@ -1282,6 +1314,14 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             let p = ctx.p;
+            // histogram_io.cpp:251-292 tracks the rate; :574 posts it every frame.
+            let hst_rate = ctx
+                .shared
+                .rates
+                .lock()
+                .prv_hst
+                .frame(h.frame_number, EpicsTimestamp::now().as_f64())
+                .rate;
             let update = ctx.shared.hst.lock().add(&h.counts);
             let (frames, counts) = {
                 let hst = ctx.shared.hst.lock();
@@ -1316,6 +1356,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                         ADDR,
                         ParamValue::Int32(i32::try_from(frames).unwrap_or(i32::MAX)),
                     ),
+                    ParamSetValue::new(p.prv_hst_acq_rate, ADDR, ParamValue::Float64(hst_rate)),
                     ParamSetValue::new(
                         p.prv_hst_histogram_frame,
                         ADDR,
@@ -1379,6 +1420,33 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
         // The decoder is created for the channel, so this cannot happen.
         _ => {}
     }
+}
+
+/// C's PrvImg/Img rate block (serval_stream.cpp:248-283, :899-936): the
+/// rate to post, when a second has passed since the last post, after the
+/// frame-loss line.
+fn frame_rate(
+    ctx: &Ctx,
+    frame_number: i32,
+    tracker: fn(&mut crate::rate::Rates) -> &mut crate::rate::RateTracker,
+    func: &str,
+    tag: &str,
+) -> Option<f64> {
+    let o =
+        tracker(&mut ctx.shared.rates.lock()).frame(frame_number, EpicsTimestamp::now().as_f64());
+    if let Some((expected, got)) = o.lost {
+        ctx.trace(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                func,
+                &format!(
+                    "{tag}frame loss detected! Expected frame {expected}, got frame {got} (lost {} frames)",
+                    got.wrapping_sub(expected)
+                ),
+            ),
+        );
+    }
+    o.due.then_some(o.rate)
 }
 
 async fn publish_accumulation(
@@ -2241,6 +2309,46 @@ mod tests {
             avg5.attributes.get("ADTimePixCountUnits").map(|a| &a.value),
             Some(&NDAttrValue::String("counts/frame".into()))
         );
+    }
+
+    /// Every stream posts its acquisition rate from the frame numbers it
+    /// receives (serval_stream.cpp:248-283, :899-936, histogram_io.cpp:574).
+    #[tokio::test]
+    async fn each_stream_posts_its_acquisition_rate() {
+        let ctx = Arc::new(idle_ctx("TPX_ACQ_RATE"));
+        let p = ctx.p;
+        for frame_number in [1, 2] {
+            for kind in [StreamKind::PrvImg, StreamKind::Img] {
+                let frame = Frame::Image(crate::stream::ImageFrame {
+                    width: 2,
+                    height: 1,
+                    format: crate::stream::PixelFormat::UInt16,
+                    frame_number,
+                    time_at_frame: 0.0,
+                    threshold_id: 0,
+                    integration_size: 0,
+                    pixels: vec![1, 2],
+                });
+                handle_frame(&ctx, kind, frame).await;
+            }
+            let frame = Frame::Histogram(crate::stream::HistogramFrame {
+                bin_width: 2,
+                bin_offset: 1,
+                frame_number,
+                time_at_frame: 0.0,
+                counts: vec![1, 2],
+            });
+            handle_frame(&ctx, StreamKind::PrvHst, frame).await;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for reason in [p.prv_img_acq_rate, p.img_acq_rate, p.prv_hst_acq_rate] {
+            let rate = ctx.handle.read_float64(reason, 0).await.unwrap();
+            assert!(rate > 0.0, "{reason}: {rate}");
+        }
+        // A stop clears the trackers, so the next first frame starts over.
+        ctx.shared.rates.lock().reset();
+        let o = ctx.shared.rates.lock().prv_hst.frame(9, 1.0);
+        assert_eq!(o.rate, 0.0);
     }
 
     /// C `processPrvHstFrame` hands every PrvHst frame to the plugins on

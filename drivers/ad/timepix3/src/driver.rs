@@ -1377,6 +1377,8 @@ impl TimePix3Driver {
             );
             return Err(FAILED);
         }
+        // acquire.cpp:416.
+        self.shared.rates.lock().prv_img.restart();
         self.sync_stream_endpoints();
 
         if self.cmd_tx.try_send(Command::AcquisitionStarted).is_err() {
@@ -1515,6 +1517,7 @@ impl TimePix3Driver {
             let _ = self.ad.port_base.set_float64_param(rate, 0, 0.0);
         }
         self.shared.img.lock().reset();
+        self.shared.rates.lock().reset();
 
         if self.shared.acquisition.finish_stop(remote_stopped, fault) == Phase::Fault {
             let mut message = if reason.is_empty() {
