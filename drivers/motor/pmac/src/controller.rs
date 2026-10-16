@@ -9,7 +9,7 @@
 //! C stores each pending deferred move on the *axis* (`pmacAxis::deferredMove_`
 //! and friends) and has the controller reach into every axis object to build
 //! the combined move. Here the pending moves live in the controller
-//! ([`PmacController::deferred`]) — the same object that executes them — so
+//! (`PmacController::deferred`) — the same object that executes them — so
 //! there is exactly one owner of the deferred state and no cross-axis locking.
 //! The axis asks the controller whether moves are deferred and, if so, hands it
 //! the demand instead of sending one.

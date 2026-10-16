@@ -252,7 +252,7 @@ impl PmacIpInterpose {
 }
 
 impl OctetInterpose for PmacIpInterpose {
-    /// C `readIt`: drain [`Self::in_buf`] a byte at a time, terminating the
+    /// C `readIt`: drain `in_buf` a byte at a time, terminating the
     /// message on ACK/LF, or on the CR that closes a `<BELL>`/`<STX>` reply —
     /// appending an ACK in the latter case so the EOS layer above sees the one
     /// terminator it can be configured with.
