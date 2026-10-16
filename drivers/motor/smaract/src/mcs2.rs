@@ -325,7 +325,6 @@ impl AsynMotor for Mcs2Axis {
             velocity: 0.0,
             done,
             moving: !done,
-            direction: true,
             has_encoder: sensor_present,
             gain_support: (state & CLOSED_LOOP_ACTIVE) != 0,
             homed: (state & IS_REFERENCED) != 0,
