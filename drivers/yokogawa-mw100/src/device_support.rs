@@ -537,6 +537,20 @@ fn seed_initial_value(
     Ok(())
 }
 
+fn resolve_link(registry: &Registry, link_text: &str, record: &mut dyn Record) -> Option<Resolved> {
+    let parsed = link::parse_link(link_text)?;
+    let instrument = registry.get(parsed.device)?;
+    let op = resolve_operation(
+        record.record_type(),
+        parsed.command,
+        parsed.arg,
+        &instrument,
+    )
+    .ok()?;
+    seed_initial_value(&instrument, op, record).ok()?;
+    Some(Resolved { instrument, op })
+}
+
 struct Resolved {
     instrument: Arc<Instrument>,
     op: Operation,
@@ -561,12 +575,6 @@ impl MwDevice {
             resolved: None,
         }
     }
-
-    fn resolved(&self) -> CaResult<&Resolved> {
-        self.resolved
-            .as_ref()
-            .ok_or_else(|| CaError::LinkError("MW100 device support not initialized".into()))
-    }
 }
 
 impl DeviceSupport for MwDevice {
@@ -574,25 +582,17 @@ impl DeviceSupport for MwDevice {
         DTYP
     }
 
-    // Every C init_record failure here is a bare `return 1` — no pact,
-    // no alarm (`devMW100_ai.c`) — so the record scans on: that is the
-    // `Err` shape, and every `?` below keeps it.
+    // C init_record failures are a silent `return 1` that leave
+    // `invalid_flag` set (devMW100_ai.c:94-160): read/write then return 0
+    // and get_ioint_info hands out a dummy IOSCANPVT. `resolved == None` is
+    // that flag; `Err` would print and alarm.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
-        let parsed = link::parse_link(&self.link_text).ok_or_else(|| {
-            CaError::LinkError(format!("malformed MW100 link: '{}'", self.link_text))
-        })?;
-        let instrument = self.registry.get(parsed.device).ok_or_else(|| {
-            CaError::LinkError(format!("unknown MW100 device '{}'", parsed.device))
-        })?;
-        let op = resolve_operation(
-            record.record_type(),
-            parsed.command,
-            parsed.arg,
-            &instrument,
-        )?;
-        seed_initial_value(&instrument, op, record)?;
-        self.resolved = Some(Resolved { instrument, op });
-        // devMW100_ao.c:84-91 returns 2 and defines the VAL it seeded.
+        self.resolved = resolve_link(&self.registry, &self.link_text, record);
+        let Some(Resolved { op, .. }) = self.resolved else {
+            // C's status 1 converts nothing (boRecord.c:159, mbboRecord.c:143).
+            return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        };
+        // devMW100_ao.c:146-152 returns 2 and defines the VAL it seeded.
         if record.record_type() == "ao" {
             let udf = match op {
                 Operation::AnalogSet(_) => DeviceUdf::Defined,
@@ -614,7 +614,9 @@ impl DeviceSupport for MwDevice {
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let Resolved { instrument, op } = self.resolved()?;
+        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
+            return Ok(DeviceReadOutcome::ok());
+        };
         let is_io_intr = self.is_io_intr;
         match *op {
             Operation::AnalogVal(addr) => {
@@ -759,7 +761,9 @@ impl DeviceSupport for MwDevice {
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        let Resolved { instrument, op } = self.resolved()?;
+        let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
+            return Ok(());
+        };
         match *op {
             Operation::AnalogSet(addr) => {
                 let val = match record.get_field("VAL") {
@@ -1246,6 +1250,36 @@ mod tests {
         let mut device = f(&ctx).unwrap();
         let mut record = FakeRecord::new("ai");
         device.init(&mut record).unwrap();
+    }
+
+    #[test]
+    fn failed_init_is_silent_and_record_is_a_no_op() {
+        let registry = registry_with("mw100dev", connect_default_fixture());
+        let f = factory(registry);
+        for (record_type, inp, out) in [
+            ("ai", "nosuchdev VAL:1", ""),
+            ("ai", "mw100dev VAL:7", ""),
+            ("bo", "", "mw100dev INP_TRIG:1"),
+            ("ai", "", ""),
+        ] {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp: DTYP,
+                inp,
+                out,
+            };
+            let mut device = f(&ctx).unwrap();
+            let mut record = FakeRecord::new(record_type);
+            assert!(matches!(
+                device.init(&mut record),
+                Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched))
+            ));
+            assert!(device.io_intr_receiver().is_none());
+            let outcome = device.read(&mut record).unwrap();
+            assert!(!outcome.did_compute());
+            device.write(&mut record).unwrap();
+            assert!(record.fields.is_empty());
+        }
     }
 
     // -- end-to-end: read (cache-only, I/O Intr scan) --
