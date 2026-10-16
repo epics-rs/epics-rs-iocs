@@ -7,7 +7,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::base::error::CaResult;
@@ -43,94 +42,7 @@ async fn main() -> CaResult<()> {
     // Standard asyn iocsh commands — provides drvAsynSerialPortConfigure /
     // drvAsynIPPortConfigure / asynOctetSetInputEos / asynOctetSetOutputEos.
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
-    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager.clone());
-
-    // Same asyn-rs 0.22.1 startup-command / dual-registry framework gap
-    // already worked around in delaygen-ioc (see its main.rs for the full
-    // explanation): register_asyn_commands's set is startup-command-visible
-    // only via this rebuild, and drvAsynSerialPortConfigure needs shadowing
-    // so PortManager-resolved commands (asynSetOption etc.) can find a port
-    // it created.
-    for def in epics_rs::asyn::iocsh::build_asyn_commands(port_manager.clone()) {
-        app = app.register_startup_command(def);
-    }
-
-    {
-        let mgr_c = port_manager.clone();
-        app = app.register_startup_command(CommandDef::new(
-            "drvAsynSerialPortConfigure",
-            vec![
-                ArgDesc {
-                    name: "portName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "ttyName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "priority",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "noAutoConnect",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "noProcessEos",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "drvAsynSerialPortConfigure portName ttyName [priority] [noAutoConnect] [noProcessEos] \
-             - create a serial octet port",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let port = match args.first() {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
-                    _ => return Err("portName required".into()),
-                };
-                let tty = match args.get(1) {
-                    Some(ArgValue::String(s)) if !s.is_empty() => s.to_str()?.to_owned(),
-                    _ => return Err("ttyName required".into()),
-                };
-                let no_auto_connect = matches!(args.get(3), Some(ArgValue::Int(n)) if *n != 0);
-                let no_process_eos = matches!(args.get(4), Some(ArgValue::Int(n)) if *n != 0);
-
-                let driver = match DrvAsynSerialPort::configure(
-                    &port,
-                    &tty,
-                    no_auto_connect,
-                    no_process_eos,
-                ) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                        return Ok(CommandOutcome::Continue);
-                    }
-                };
-
-                // `register_port_with_config` is the sole registration owner:
-                // it publishes the port into both the PortManager's own map
-                // (so PortManager-resolved commands like asynSetOption find
-                // it directly) and the process-wide asyn_record registry
-                // (asyn-rs 0.24.0 manager.rs) in one atomic call. A second
-                // manual `asyn_record::register_port` on the same name used
-                // to be required (asyn-rs 0.22.1: register_port_with_config
-                // did not touch asyn_record and PortManager::find_port_handle
-                // had no registry fallback) but is now a duplicate that the
-                // registry rejects with "port already registered", failing
-                // this command's very first invocation.
-                if let Err(e) = mgr_c.register_port_with_config(
-                    driver,
-                    RuntimeConfig::default(),
-                    ctx.db().scan_control().interrupt_gate(),
-                ) {
-                    ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
-                    return Ok(CommandOutcome::Continue);
-                }
-                Ok(CommandOutcome::Continue)
-            },
-        ));
-    }
+    app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // C drvLoveInit(lovPort,serPort,serAddr)
     {
