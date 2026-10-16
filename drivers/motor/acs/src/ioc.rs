@@ -1,4 +1,5 @@
-//! `MCB4BCreateController` iocsh command for the ACS MCB-4B.
+//! `MCB4BCreateController` (MCB4BDriver.cpp) and `MCB4BSetup` /
+//! `MCB4BConfig` (drvMCB4B.cc) iocsh commands for the ACS MCB-4B.
 //!
 //! C `MCB4BCreateController(portName, MCB4BPortName, numAxes,
 //! movingPollPeriod, idlePollPeriod)` from `MCB4BDriver.cpp`: connect the serial
@@ -14,13 +15,16 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::connect_serial;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::{asyn_user, install, model1_device, register_port};
 
+use crate::drv_mcb4b::{DrvMcb4bAxis, MCB4B_NUM_AXES, MCB4B_NUM_CARDS, motor_init};
 use crate::mcb4b::{Mcb4bAxis, Mcb4bController};
 
 /// Serial command timeout (C `MCB4BDriver` uses the asyn port default; the other
@@ -68,6 +72,52 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
                     moving_poll_ms,
                     idle_poll_ms,
                 )?;
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// drvMCB4B.cc's `TIMEOUT`.
+const DRV_MCB4B_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `device(motor,VME_IO,devMCB4B,"ACS MCB-4B")` (devAcsMotor.dbd:4).
+static DEV_MCB4B: DevSup = model1_device("devMCB4B", "ACS MCB-4B");
+
+static MCB4B: Model1 = Model1::new(&DEV_MCB4B, MCB4B_NUM_CARDS, SCAN_RATE);
+
+/// `MCB4BSetup(num_cards, scan_rate)`.
+pub fn mcb4b_setup_command() -> CommandDef {
+    MCB4B.setup_command("MCB4BSetup")
+}
+
+/// `MCB4BConfig(card, name)`. Connects and probes the card at once, where
+/// C's `motor_init` does so at iocInit; a card that never answers is left
+/// unconfigured, as there.
+pub fn mcb4b_config_command() -> CommandDef {
+    CommandDef::new(
+        "MCB4BConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+        ],
+        "MCB4BConfig(card, name)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !MCB4B.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let handle = connect_serial(&asyn_port, DRV_MCB4B_TIMEOUT)?;
+            let controller = Mcb4bController::new(handle, MCB4B_NUM_AXES);
+            if !motor_init(&controller) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let controller = Arc::new(Mutex::new(controller));
+            for index in 0..MCB4B_NUM_AXES {
+                let motor: Arc<Mutex<dyn AsynMotor>> =
+                    Arc::new(Mutex::new(DrvMcb4bAxis::new(controller.clone(), index)));
+                MCB4B.install(ctx, card, index as i32, motor)?;
             }
             Ok(CommandOutcome::Continue)
         },
