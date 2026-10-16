@@ -681,17 +681,31 @@ impl PIGCS2Axis {
 
     /// C `PIGCSMotorController::initAxis`: stops at the first failure.
     fn init_axis(&mut self, port_name: &str) -> AsynResult<()> {
+        let addr = self.axis_no as i32;
+        let flow = |args: std::fmt::Arguments<'_>| {
+            PortManager::global().trace_manager().print(
+                Some(port_name),
+                Some(addr),
+                0,
+                TraceMask::FLOW,
+                args,
+            )
+        };
         let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
         self.has_limit_switches = ctrl.has_limit_switches(&self.axis_name)?;
+        flow(format_args!(
+            "PIGCSController::hasLimitSwitches() axis has {}limit switches\n",
+            if self.has_limit_switches { "" } else { "no " }
+        ));
         self.has_reference = ctrl.has_reference_sensor(&self.axis_name)?;
+        flow(format_args!(
+            "PIGCSController::hasReferenceSwitch() axis has {}reference sensor\n",
+            if self.has_reference { "" } else { "no " }
+        ));
         let stage_id = ctrl.stage_id(&self.axis_name)?;
-        PortManager::global().trace_manager().print(
-            Some(port_name),
-            Some(self.axis_no as i32),
-            0,
-            TraceMask::FLOW,
-            format_args!("PIGCSController::initAxis() stage configuration: {stage_id}\n"),
-        );
+        flow(format_args!(
+            "PIGCSController::initAxis() stage configuration: {stage_id}\n"
+        ));
         ctrl.set_servo(&self.axis_name, true)?;
         self.servo_on = true;
         Ok(())
