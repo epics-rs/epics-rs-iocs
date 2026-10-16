@@ -20,6 +20,7 @@
 ##################################################################
 
 record(bo, "$(P)$(R)WriteData"){
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
   field(DTYP, "asynInt32")
   field(OUT, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_WRITE_DATA")
   field(ZNAM, "No")
@@ -163,6 +164,7 @@ record(bi, "$(P)$(R)WritePrvHst_RBV")
 # Raw file path.
 record(waveform, "$(P)$(R)RawFilePath")
 {
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
     field(PINI, "YES")
     field(DTYP, "asynOctetWrite")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_RAW_BASE")
@@ -251,6 +253,7 @@ record(longin, "$(P)$(R)RawQueueSize_RBV")
 # Raw1 file path. Serval 3.3.0
 record(waveform, "$(P)$(R)Raw1FilePath")
 {
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
     field(PINI, "YES")
     field(DTYP, "asynOctetWrite")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_RAW1_BASE")
@@ -353,6 +356,7 @@ record(longin, "$(P)$(R)Raw1QueueSize_RBV")
 # Image Channels[0] file path.
 record(waveform, "$(P)$(R)ImgFilePath")
 {
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
     field(PINI, "YES")
     field(DTYP, "asynOctetWrite")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMGBASE")
@@ -543,12 +547,40 @@ record(longin, "$(P)$(R)ImgQueueSize_RBV")
    field(SCAN, "I/O Intr")
 }
 
+# Image[0] Thresholds[] (comma-separated, MPX3 BothCounters — same socket, demux by thresholdID)
+record(waveform, "$(P)$(R)ImgThs")
+{
+    field(DESC, "Img Thresholds list")
+    field(PINI, "YES")
+    field(DTYP, "asynOctetWrite")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMGTHS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    info(autosaveFields, "VAL")
+}
+record(waveform, "$(P)$(R)ImgThs_RBV")
+{
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMGTHS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+
 # Img TCP streaming metadata (from jsonimage header)
 record(longin, "$(P)$(R)ImgFrameNumber_RBV")
 {
     field(DESC, "Frame number from jsonimage")
     field(DTYP, "asynInt32")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_FRAME_NUMBER")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)ImgThresholdID_RBV")
+{
+    field(DESC, "thresholdID from Image jsonimage")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_THRESHOLD_ID")
     field(SCAN, "I/O Intr")
 }
 
@@ -579,7 +611,7 @@ record(waveform, "$(P)$(R)ImgImageData")
     field(DESC, "Accumulated image data (64-bit)")
     field(DTYP, "asynInt64ArrayIn")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMAGE_DATA")
-    field(FTVL, "INT64")
+    field(FTVL, "UINT64")
     field(NELM, "$(MAX_PIXELS=262144)")
     field(SCAN, "I/O Intr")
 }
@@ -589,7 +621,7 @@ record(waveform, "$(P)$(R)ImgImageFrame")
     field(DESC, "Current frame data (32-bit)")
     field(DTYP, "asynInt32ArrayIn")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMAGE_FRAME")
-    field(FTVL, "LONG")
+    field(FTVL, "ULONG")
     field(NELM, "$(MAX_PIXELS=262144)")
     field(SCAN, "I/O Intr")
 }
@@ -599,7 +631,7 @@ record(waveform, "$(P)$(R)ImgImageSumNFrames")
     field(DESC, "Sum of last N frames (64-bit)")
     field(DTYP, "asynInt64ArrayIn")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMAGE_SUM_N_FRAMES")
-    field(FTVL, "INT64")
+    field(FTVL, "UINT64")
     field(NELM, "$(MAX_PIXELS=262144)")
     field(SCAN, "I/O Intr")
 }
@@ -644,9 +676,64 @@ record(longout, "$(P)$(R)ImgFramesToSum")
     field(VAL, "10")
 }
 
+record(longout, "$(P)$(R)ImgRetentionLimitMB")
+{
+    field(DESC, "Rolling-window memory budget")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_RETENTION_LIMIT_MB")
+    field(DRVL, "1")
+    field(DRVH, "4096")
+    field(EGU, "MiB")
+    field(VAL, "512")
+    info(autosaveFields, "VAL")
+}
+
+record(longin, "$(P)$(R)ImgEffectiveFrames_RBV")
+{
+    field(DESC, "Effective retained frame count")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_EFFECTIVE_FRAMES")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)ImgFramesSummed_RBV")
+{
+    field(DESC, "Frames currently in rolling sum")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_FRAMES_SUMMED")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)ImgRetentionStatus_RBV")
+{
+    field(DESC, "Rolling-window budget status")
+    field(DTYP, "asynOctetRead")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_RETENTION_STATUS")
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)$(R)ImgRangeSaturated_RBV")
+{
+    field(DESC, "Numeric range saturation latched")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_RANGE_SATURATED")
+    field(ZNAM, "OK")
+    field(ONAM, "Saturated")
+    field(OSV, "MAJOR")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)ImgRangeStatus_RBV")
+{
+    field(DESC, "Numeric range status")
+    field(DTYP, "asynOctetRead")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_RANGE_STATUS")
+    field(SCAN, "I/O Intr")
+}
+
 record(longout, "$(P)$(R)ImgSumUpdateInterval")
 {
-    field(DESC, "Sum update interval (frames)")
+    field(DESC, "Sum publication interval (frames)")
     field(DTYP, "asynInt32")
     field(OUT, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_SUM_UPDATE_INTERVAL")
     field(DRVL, "1")
@@ -660,6 +747,7 @@ record(int64in, "$(P)$(R)ImgTotalCounts")
     field(DTYP, "asynInt64")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_TOTAL_COUNTS")
     field(SCAN, "I/O Intr")
+    field(EGU, "counts")
 }
 
 record(ai, "$(P)$(R)ImgProcessingTime")
@@ -729,6 +817,7 @@ record(mbbo, "$(P)$(R)ProcessedHstOutputType")
 # Image Channels[1] file path.
 record(waveform, "$(P)$(R)Img1FilePath")
 {
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
     field(PINI, "YES")
     field(DTYP, "asynOctetWrite")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMG1BASE")
@@ -919,6 +1008,26 @@ record(longin, "$(P)$(R)Img1QueueSize_RBV")
    field(SCAN, "I/O Intr")
 }
 
+# Image[1] Thresholds[] (comma-separated, MPX3)
+record(waveform, "$(P)$(R)Img1Ths")
+{
+    field(DESC, "Img1 Thresholds list")
+    field(PINI, "YES")
+    field(DTYP, "asynOctetWrite")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMG1THS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    info(autosaveFields, "VAL")
+}
+record(waveform, "$(P)$(R)Img1Ths_RBV")
+{
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_IMG_IMG1THS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+
 ###################################################################
 #  Preview                                                        #
 #  These records control the preview period                       #
@@ -928,17 +1037,28 @@ record(ao, "$(P)$(R)PrvPeriod")
    field(PINI, "YES")
    field(DTYP, "asynFloat64")
    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_PERIOD")
-   field(PREC, "3")
+   field(PREC, "6")
    field(VAL,  "0.2")
    info(autosaveFields, "VAL")
 }
 
 record(ai, "$(P)$(R)PrvPeriod_RBV")
 {
+   field(DESC, "Preview product period")
    field(DTYP, "asynFloat64")
    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_PERIOD")
-   field(PREC, "3")
+   field(PREC, "6")
+   field(EGU,  "s")
    field(SCAN, "I/O Intr")
+}
+
+record(calc, "$(P)$(R)PrvNominalRate_RBV")
+{
+   field(DESC, "Nominal preview product rate")
+   field(INPA, "$(P)$(R)PrvPeriod_RBV CP")
+   field(CALC, "A>0?1/A:0")
+   field(PREC, "3")
+   field(EGU,  "Hz")
 }
 
 record(mbbo, "$(P)$(R)PrvSmplgMode")
@@ -967,6 +1087,7 @@ record(mbbi, "$(P)$(R)PrvSmplgMode_RBV")
 # Preview Image Channels[0] file path.
 record(waveform, "$(P)$(R)PrvImgFilePath")
 {
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
     field(PINI, "YES")
     field(DTYP, "asynOctetWrite")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_IMGBASE")
@@ -1160,6 +1281,26 @@ record(longin, "$(P)$(R)PrvImgQueueSize_RBV")
    field(SCAN, "I/O Intr")
 }
 
+# Preview ImageChannels[0] Thresholds[] (comma-separated, MPX3)
+record(waveform, "$(P)$(R)PrvImgThs")
+{
+    field(DESC, "PrvImg Thresholds list")
+    field(PINI, "YES")
+    field(DTYP, "asynOctetWrite")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_IMGTHS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    info(autosaveFields, "VAL")
+}
+record(waveform, "$(P)$(R)PrvImgThs_RBV")
+{
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_IMGTHS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+
 # PrvImg TCP streaming metadata (from jsonimage header)
 record(longin, "$(P)$(R)PrvImgFrameNumber_RBV")
 {
@@ -1181,7 +1322,7 @@ record(ai, "$(P)$(R)PrvImgTimeAtFrame_RBV")
 
 record(ai, "$(P)$(R)PrvImgAcqRate_RBV")
 {
-    field(DESC, "Calculated acquisition rate (fps)")
+    field(DESC, "Preview detector frame rate")
     field(DTYP, "asynFloat64")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRVIMG_ACQ_RATE")
     field(PREC, "3")
@@ -1189,9 +1330,57 @@ record(ai, "$(P)$(R)PrvImgAcqRate_RBV")
     field(SCAN, "I/O Intr")
 }
 
+record(longin, "$(P)$(R)PrvImgThresholdID_RBV")
+{
+    field(DESC, "thresholdID from jsonimage header")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRVIMG_THRESHOLD_ID")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)PrvImgIntegrationSize_RBV")
+{
+    field(DESC, "integrationSize from jsonimage header")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRVIMG_INTEGRATION_SIZE")
+    field(SCAN, "I/O Intr")
+}
+
+record(longout, "$(P)$(R)PrvImgLogHeaders")
+{
+    field(DESC, "Jsonimage headers logged per acquire")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRVIMG_LOG_HEADERS")
+    field(PINI, "YES")
+    field(VAL,  "3")
+    info(autosaveFields, "VAL")
+}
+
+record(bo, "$(P)$(R)PrvImgThreshDiffClip")
+{
+    field(DESC, "Clip T0-T1 band addr 9/12")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRVIMG_THRESH_DIFF_CLIP")
+    field(ZNAM, "Signed")
+    field(ONAM, "Clip")
+    field(PINI, "YES")
+    field(VAL,  "1")
+    info(autosaveFields, "VAL")
+}
+record(bi, "$(P)$(R)PrvImgThreshDiffClip_RBV")
+{
+    field(DESC, "T0-T1 band clip mode addr 9/12")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRVIMG_THRESH_DIFF_CLIP")
+    field(ZNAM, "Signed")
+    field(ONAM, "Clip")
+    field(SCAN, "I/O Intr")
+}
+
 # Preview Image Channel[1], measurement/image file path.
 record(waveform, "$(P)$(R)PrvImg1FilePath")
 {
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
     field(PINI, "YES")
     field(DTYP, "asynOctetWrite")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_IMG1BASE")
@@ -1385,9 +1574,30 @@ record(longin, "$(P)$(R)PrvImg1QueueSize_RBV")
    field(SCAN, "I/O Intr")
 }
 
+# Preview ImageChannels[1] Thresholds[] (comma-separated, MPX3 integrated 8089)
+record(waveform, "$(P)$(R)PrvImg1Ths")
+{
+    field(DESC, "PrvImg1 Thresholds list")
+    field(PINI, "YES")
+    field(DTYP, "asynOctetWrite")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_IMG1THS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    info(autosaveFields, "VAL")
+}
+record(waveform, "$(P)$(R)PrvImg1Ths_RBV")
+{
+    field(DTYP, "asynOctetRead")
+    field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_IMG1THS")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+    field(SCAN, "I/O Intr")
+}
+
 # Preview Histogram Channels[0] file path.
 record(waveform, "$(P)$(R)PrvHstFilePath")
 {
+    field(ASG,  "$(DESTINATION_ASG=DEFAULT)")
     field(PINI, "YES")
     field(DTYP, "asynOctetWrite")
     field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HSTBASE")
@@ -1639,7 +1849,7 @@ record(waveform, "$(P)$(R)PrvHstHistogramData")
     field(DESC, "Accumulated histogram data (64-bit)")
     field(DTYP, "asynInt64ArrayIn")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_HISTOGRAM_DATA")
-    field(FTVL, "INT64")
+    field(FTVL, "UINT64")
     field(NELM, "100000")
     field(SCAN, "I/O Intr")
 }
@@ -1649,7 +1859,7 @@ record(waveform, "$(P)$(R)PrvHstHistogramFrame")
     field(DESC, "Current frame histogram data (32-bit)")
     field(DTYP, "asynInt32ArrayIn")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_HISTOGRAM_FRAME")
-    field(FTVL, "LONG")
+    field(FTVL, "ULONG")
     field(NELM, "100000")
     field(SCAN, "I/O Intr")
 }
@@ -1659,7 +1869,7 @@ record(waveform, "$(P)$(R)PrvHstHistogramSumNFrames")
     field(DESC, "Sum of last N frames histogram (64-bit)")
     field(DTYP, "asynInt64ArrayIn")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_HISTOGRAM_SUM_N_FRAMES")
-    field(FTVL, "INT64")
+    field(FTVL, "UINT64")
     field(NELM, "100000")
     field(SCAN, "I/O Intr")
 }
@@ -1749,20 +1959,22 @@ record(ai, "$(P)$(R)PrvHstFrameCount_RBV")
     field(SCAN, "I/O Intr")
 }
 
-record(ai, "$(P)$(R)PrvHstTotalCounts_RBV")
+record(int64in, "$(P)$(R)PrvHstTotalCounts_RBV")
 {
     field(DESC, "Total counts across all frames")
     field(DTYP, "asynInt64")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_TOTAL_COUNTS")
     field(SCAN, "I/O Intr")
+    field(EGU, "counts")
 }
 
 record(ai, "$(P)$(R)PrvHstAcqRate_RBV")
 {
-    field(DESC, "Calculated acquisition rate (fps)")
+    field(DESC, "Preview detector frame rate")
     field(DTYP, "asynFloat64")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_ACQ_RATE")
     field(PREC, "2")
+    field(EGU, "Hz")
     field(SCAN, "I/O Intr")
 }
 
@@ -1800,9 +2012,74 @@ record(ai, "$(P)$(R)PrvHstFramesToSum_RBV")
     field(SCAN, "I/O Intr")
 }
 
+record(ao, "$(P)$(R)PrvHstRetentionLimitMB")
+{
+    field(DESC, "Rolling-window memory budget")
+    field(DTYP, "asynInt32")
+    field(OUT, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_RETENTION_LIMIT_MB")
+    field(DRVL, "1")
+    field(DRVH, "4096")
+    field(EGU, "MiB")
+    field(VAL, "512")
+    info(autosaveFields, "VAL")
+}
+
+record(longin, "$(P)$(R)PrvHstEffectiveFrames_RBV")
+{
+    field(DESC, "Effective retained frame count")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_EFFECTIVE_FRAMES")
+    field(SCAN, "I/O Intr")
+}
+
+record(longin, "$(P)$(R)PrvHstFramesSummed_RBV")
+{
+    field(DESC, "Frames currently in rolling sum")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_FRAMES_SUMMED")
+    field(SCAN, "I/O Intr")
+}
+
+record(calc, "$(P)$(R)PrvHstWindowSpan_RBV")
+{
+    field(DESC, "Nominal rolling-window span")
+    field(INPA, "$(P)$(R)PrvHstFramesSummed_RBV CP")
+    field(INPB, "$(P)$(R)PrvPeriod_RBV CP")
+    field(CALC, "A*B")
+    field(PREC, "3")
+    field(EGU, "s")
+}
+
+record(stringin, "$(P)$(R)PrvHstRetentionStatus_RBV")
+{
+    field(DESC, "Rolling-window budget status")
+    field(DTYP, "asynOctetRead")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_RETENTION_STATUS")
+    field(SCAN, "I/O Intr")
+}
+
+record(bi, "$(P)$(R)PrvHstRangeSaturated_RBV")
+{
+    field(DESC, "Numeric range saturation latched")
+    field(DTYP, "asynInt32")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_RANGE_SATURATED")
+    field(ZNAM, "OK")
+    field(ONAM, "Saturated")
+    field(OSV, "MAJOR")
+    field(SCAN, "I/O Intr")
+}
+
+record(stringin, "$(P)$(R)PrvHstRangeStatus_RBV")
+{
+    field(DESC, "Numeric range status")
+    field(DTYP, "asynOctetRead")
+    field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_RANGE_STATUS")
+    field(SCAN, "I/O Intr")
+}
+
 record(ao, "$(P)$(R)PrvHstSumUpdateInterval")
 {
-    field(DESC, "Update interval for sum (frames)")
+    field(DESC, "Sum publication interval (frames)")
     field(DTYP, "asynInt32")
     field(OUT, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_SUM_UPDATE_INTERVAL")
     field(VAL, "1")
@@ -1810,7 +2087,7 @@ record(ao, "$(P)$(R)PrvHstSumUpdateInterval")
 }
 record(ai, "$(P)$(R)PrvHstSumUpdateInterval_RBV")
 {
-    field(DESC, "Sum update interval (frames)")
+    field(DESC, "Sum publication interval (frames)")
     field(DTYP, "asynInt32")
     field(INP, "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_PRV_HST_SUM_UPDATE_INTERVAL")
     field(SCAN, "I/O Intr")

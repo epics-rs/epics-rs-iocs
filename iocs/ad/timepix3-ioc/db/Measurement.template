@@ -60,6 +60,15 @@ record(stringin, "$(P)$(R)Status_RBV"){
   field(DTYP, "asynOctetRead")
   field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_MSMT_STATUS")
   field(SCAN, "I/O Intr")
+  field(DESC, "Serval PipelineState string")
+}
+# PipelineState_RBV mbbi: enum from driver readEnum() — ADTimePix.cpp kPipelineStates[].
+# Includes -1 (Unknown). No ZRST/ONST/... here.
+record(mbbi, "$(P)$(R)PipelineState_RBV"){
+  field(DTYP, "asynInt32")
+  field(INP, "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_MSMT_PIPELINE_STATE")
+  field(SCAN, "I/O Intr")
+  field(DESC, "Serval PipelineState enum")
 }
 
 ##################################################################
@@ -69,6 +78,7 @@ record(longout, "$(P)$(R)StemScanWidth"){
   field(DTYP, "asynInt32")
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_SCAN_WIDTH")
   field(DESC, "Stem scan width")
+  info(asyn:READBACK, "1")
 }
 record(longin, "$(P)$(R)StemScanWidth_RBV"){
   field(DTYP, "asynInt32")
@@ -80,6 +90,7 @@ record(longout, "$(P)$(R)StemScanHeight"){
   field(DTYP, "asynInt32")
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_SCAN_HEIGHT")
   field(DESC, "Stem scan height")
+  info(asyn:READBACK, "1")
 }
 record(longin, "$(P)$(R)StemScanHeight_RBV"){
   field(DTYP, "asynInt32")
@@ -92,6 +103,7 @@ record(ao, "$(P)$(R)StemDwellTime"){
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_DWELL_TIME")
   field(PREC, "6")
   field(DESC, "Stem dwell time [s]")
+  info(asyn:READBACK, "1")
 }
 record(ai, "$(P)$(R)StemDwellTime_RBV"){
   field(DTYP, "asynFloat64")
@@ -104,6 +116,7 @@ record(longout, "$(P)$(R)StemRadiusOuter"){
   field(DTYP, "asynInt32")
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_RADIUS_OUTER")
   field(DESC, "Stem virtual detector outer radius")
+  info(asyn:READBACK, "1")
 }
 record(longin, "$(P)$(R)StemRadiusOuter_RBV"){
   field(DTYP, "asynInt32")
@@ -115,6 +128,7 @@ record(longout, "$(P)$(R)StemRadiusInner"){
   field(DTYP, "asynInt32")
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_STEM_RADIUS_INNER")
   field(DESC, "Stem virtual detector inner radius")
+  info(asyn:READBACK, "1")
 }
 record(longin, "$(P)$(R)StemRadiusInner_RBV"){
   field(DTYP, "asynInt32")
@@ -126,6 +140,7 @@ record(stringout, "$(P)$(R)TofTdcReference"){
   field(DTYP, "asynOctetWrite")
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_TDC_REFERENCE")
   field(DESC, "ToF TDC reference (comma-sep)")
+  info(asyn:READBACK, "1")
 }
 record(stringin, "$(P)$(R)TofTdcReference_RBV"){
   field(DTYP, "asynOctetRead")
@@ -138,6 +153,7 @@ record(ao, "$(P)$(R)TofMin"){
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_MIN")
   field(PREC, "6")
   field(DESC, "ToF min")
+  info(asyn:READBACK, "1")
 }
 record(ai, "$(P)$(R)TofMin_RBV"){
   field(DTYP, "asynFloat64")
@@ -151,6 +167,7 @@ record(ao, "$(P)$(R)TofMax"){
   field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))TPX3_TOF_MAX")
   field(PREC, "6")
   field(DESC, "ToF max")
+  info(asyn:READBACK, "1")
 }
 record(ai, "$(P)$(R)TofMax_RBV"){
   field(DTYP, "asynFloat64")
@@ -159,14 +176,3 @@ record(ai, "$(P)$(R)TofMax_RBV"){
   field(PREC, "6")
   field(DESC, "ToF max RBV")
 }
-
-#record(mbbi, "$(P)$(R)Status_RBV")
-#{
-#   field(DTYP, "asynInt32")
-#   field(INP,  "@asyn($(PORT),$(ADDR=0),$(TIMEOUT=1))TPX3_MSMT_STATUS") 
-#   field(ZRST, "DA_IDLE") 
-#   field(ZRVL, "0")
-#   field(ONST, "DA_RECORDING") 
-#   field(ONVL, "1")
-#   field(SCAN, "I/O Intr")
-#}
