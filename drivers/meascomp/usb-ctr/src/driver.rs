@@ -573,15 +573,19 @@ impl PortDriver for CtrDriver {
         let addr = user.addr;
 
         if reason == self.params.digital_output {
+            // C writes only the masked bits configured as outputs.
+            let direction = self
+                .base
+                .get_uint32_param(self.params.digital_direction, 0)?;
             let dev = self.device.lock().unwrap();
             for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
+                if mask & direction & (1 << bit) != 0 {
                     let bit_val = (value >> bit) & 1;
-                    if let Err(e) =
-                        dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0)
-                    {
-                        status = e.code;
-                    }
+                    status = status_of(&dev.digital_bit_out(
+                        uldaq_sys::AUXPORT,
+                        bit as i32,
+                        bit_val != 0,
+                    ));
                 }
             }
         } else if reason == self.params.digital_direction && self.dio_configurable {

@@ -747,14 +747,25 @@ impl PortDriver for MultiFunctionDriver {
                 .base
                 .get_uint32_param(self.params.digital_direction, 0)?;
             let dev = self.device.lock().unwrap();
-            for bit in 0..NUM_IO_BITS {
-                if mask & (1 << bit) != 0 {
-                    let bit_val = (value >> bit) & 1;
-                    status = trace.report(
-                        &dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0),
-                        FUNCTION,
-                        "Calling DBitOut",
-                    );
+            let io_mask = (1u32 << NUM_IO_BITS) - 1;
+            if mask & direction == io_mask {
+                // Every bit is an output and being written: one word write.
+                status = trace.report(
+                    &dev.digital_out(uldaq_sys::AUXPORT, (value & mask) as u64),
+                    FUNCTION,
+                    "Calling DOut",
+                );
+            } else {
+                // Otherwise only the masked bits configured as outputs.
+                for bit in 0..NUM_IO_BITS {
+                    if mask & direction & (1 << bit) != 0 {
+                        let bit_val = (value >> bit) & 1;
+                        status = trace.report(
+                            &dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0),
+                            FUNCTION,
+                            "Calling DBitOut",
+                        );
+                    }
                 }
             }
         } else if reason == self.params.digital_direction && self.dio_configurable {
