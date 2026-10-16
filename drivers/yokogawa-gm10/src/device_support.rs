@@ -682,8 +682,20 @@ impl DeviceSupport for GmDevice {
 
 impl GmDevice {
     /// The command an output record's write queues.
-    fn output_command(&self, record: &dyn Record) -> CaResult<Command> {
+    fn output_command(&self, record: &mut dyn Record) -> CaResult<Command> {
         let Resolved { op, .. } = self.resolved()?;
+        // devGM10_bo.c:194-197 zeroes VAL of a trigger or ERROR_CLEAR bo on
+        // the completing pass.
+        if matches!(
+            op,
+            Operation::ChanTrig
+                | Operation::MiscTrig
+                | Operation::InfoTrig
+                | Operation::StatTrig
+                | Operation::ErrorClearSet
+        ) {
+            record.put_field("VAL", EpicsValue::Enum(0))?;
+        }
         Ok(match *op {
             Operation::AnalogSet(addr) => {
                 let val = match record.get_field("VAL") {
@@ -1274,12 +1286,14 @@ mod tests {
         let mut device = f(&ctx).unwrap();
         let mut record = FakeRecord::new("bo");
         device.init(&mut record).unwrap();
+        record.fields.insert("VAL", EpicsValue::Enum(1));
         let db = PvDatabase::new();
         let done = WriteDone::new(&db, "GM10:TRIG".into(), 0);
         let start = device
             .write_begin(&mut record, &WriteDoneSource::new(&done))
             .unwrap();
         assert!(matches!(start, WriteStart::Pending));
+        assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "FData,1\r\n");
     }
