@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -57,7 +57,7 @@ pub struct Ctx {
     pub p: TimePixParams,
     pub ad: ADDriverParams,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
 }
 
 impl Ctx {
@@ -1230,9 +1230,7 @@ async fn publish_image(
     array.time_stamp = array.timestamp.as_f64();
     array.attributes = attributes;
 
-    ArrayPublisher::new(ctx.output.clone())
-        .publish(Arc::new(array))
-        .await;
+    ArrayPublisher::new(ctx.output.clone()).publish(array).await;
 }
 
 #[cfg(test)]
@@ -1306,7 +1304,7 @@ mod tests {
             p,
             ad,
             output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
-            pool: NDArrayPool::new(0),
+            pool: DriverPool::standalone(0),
         };
 
         let (_sub, mut rx) = handle.interrupts().register_interrupt_user(
@@ -1365,7 +1363,7 @@ mod tests {
             p,
             ad,
             output: Arc::new(parking_lot::Mutex::new(output)),
-            pool: NDArrayPool::new(0),
+            pool: DriverPool::standalone(0),
         });
         ctx.set_int(ad.base.array_callbacks, 0, 1).await;
 

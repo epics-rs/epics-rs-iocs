@@ -17,8 +17,8 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -36,7 +36,7 @@ pub(crate) struct AcquisitionContext {
     pub data: MpxConnection,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: MerlinParams,
     pub init_param: usize,
@@ -408,7 +408,7 @@ async fn publish_profiles(
 }
 
 /// Update the NDArray metadata parameters and hand the array to the plugins.
-async fn publish(ctx: &AcquisitionContext, array: NDArray) {
+async fn publish(ctx: &AcquisitionContext, array: DriverArray) {
     let base = &ctx.ad_params.base;
     let ts = array.timestamp;
     let size_x = array.dims[0].size as i32;
@@ -442,5 +442,5 @@ async fn publish(ctx: &AcquisitionContext, array: NDArray) {
         )
         .await;
 
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
 }

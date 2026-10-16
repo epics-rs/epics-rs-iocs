@@ -17,8 +17,8 @@
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 
 use crate::rng::Rng;
 use crate::types::{SimMode, SineOperation};
@@ -742,9 +742,9 @@ impl SimEngine {
     pub fn compute_image(
         &mut self,
         cfg: &SimConfig,
-        pool: &NDArrayPool,
+        pool: &DriverPool,
         reset_requested: bool,
-    ) -> Result<NDArray, &'static str> {
+    ) -> Result<DriverArray, &'static str> {
         let layout = Layout::for_color_mode(cfg.color_mode);
         let sx = cfg.geometry.max_size_x as usize;
         let sy = cfg.geometry.max_size_y as usize;
@@ -819,9 +819,10 @@ impl SimEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::ad_core::ndarray::NDArray;
 
-    fn pool() -> std::sync::Arc<NDArrayPool> {
-        NDArrayPool::new(0)
+    fn pool() -> DriverPool {
+        DriverPool::standalone(0)
     }
 
     fn engine() -> SimEngine {

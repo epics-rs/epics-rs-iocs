@@ -22,7 +22,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -37,7 +37,7 @@ use crate::types::*;
 pub(crate) struct AcquisitionContext {
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: BrukerParams,
     pub shared: Arc<SharedState>,
@@ -365,7 +365,7 @@ async fn publish_frame(
     )
     .await;
 
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
     Ok(())
 }
 

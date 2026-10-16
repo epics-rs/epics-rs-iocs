@@ -18,7 +18,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -57,7 +57,7 @@ pub struct Worker {
     pub lens_modes: Arc<Mutex<Vec<String>>>,
     pub scan_ranges: Arc<Mutex<Vec<String>>>,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     /// Pending parameter writes, flushed at each C `callParamCallbacks()`.
     /// Always constructed empty.
     pub batch: Vec<ParamSetValue>,
@@ -829,7 +829,7 @@ impl Worker {
             array.unique_id = array_counter;
             array.time_stamp = acq_start_epoch;
             array.timestamp = EpicsTimestamp::now();
-            self.output.publish(Arc::new(array)).await;
+            self.output.publish(array).await;
         }
 
         self.last_status_ok = ok;

@@ -15,7 +15,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -102,7 +102,7 @@ pub(crate) fn start_udp_listener(
 pub(crate) struct DataContext {
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: PixiradParams,
     pub sensor: Sensor,
@@ -344,7 +344,7 @@ async fn publish(
         )
         .await;
 
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
 }
 
 // ────────────────────────────────── status ───────────────────────────────────

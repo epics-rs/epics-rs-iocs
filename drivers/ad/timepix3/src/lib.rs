@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::AsynResult;
@@ -38,7 +38,7 @@ use crate::state::{Command, Shared};
 /// Everything an IOC has to keep alive and wire plugins to.
 pub struct TimePix3Runtime {
     pub runtime_handle: PortRuntimeHandle,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     pub shared: Arc<Shared>,
     _threads: Vec<std::thread::JoinHandle<()>>,

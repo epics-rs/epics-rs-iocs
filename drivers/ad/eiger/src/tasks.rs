@@ -15,8 +15,8 @@ use std::time::Duration;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -168,7 +168,7 @@ pub struct Shared {
     pub api: ApiVersion,
     pub hostname: String,
     pub outputs: Outputs,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
 
     /// Files downloaded but not yet reaped (mirrored into `PENDING_FILES`).
     pending_files: AtomicI32,
@@ -1067,7 +1067,7 @@ async fn monitor_task(s: Arc<Shared>) {
                         };
                         unique_id += 1;
                         ArrayPublisher::new(s.outputs.monitor.clone())
-                            .publish(Arc::new(array))
+                            .publish(array)
                             .await;
                     }
                     Err(e) => {
@@ -1314,14 +1314,14 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
 // ---------------------------------------------------------------------------
 
 fn build_array(
-    pool: &NDArrayPool,
+    pool: &DriverPool,
     dims: [usize; 2],
     data: NDDataBuffer,
     codec: Option<epics_rs::ad_core::codec::Codec>,
     attributes: NDAttributeList,
     unique_id: i32,
     timestamp: Option<EpicsTimestamp>,
-) -> ADResult<NDArray> {
+) -> ADResult<DriverArray> {
     let mut array = pool.wrap(
         vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
         data,
@@ -1409,9 +1409,7 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResu
     // :1878), so the first array of an IOC's life is uniqueId 0.
     let unique_id = s.get_int(s.ad.base.array_counter).await;
     let counter = unique_id + 1;
-    let array = Arc::new(build_array(
-        &s.pool, dims, data, codec, attributes, unique_id, timestamp,
-    )?);
+    let array = build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share();
 
     if array_callbacks {
         ArrayPublisher::new(s.outputs.main.clone())
@@ -1474,7 +1472,7 @@ pub fn shared(
     api: ApiVersion,
     hostname: String,
     outputs: Outputs,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     signals: &Signals,
 ) -> Arc<Shared> {
     Arc::new(Shared {
@@ -1658,7 +1656,7 @@ mod tests {
             ApiVersion::V1_6_0,
             "127.0.0.1".to_string(),
             outputs,
-            NDArrayPool::new(0),
+            DriverPool::standalone(0),
             &signals,
         );
 

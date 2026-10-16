@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
@@ -17,7 +15,7 @@ use epics_rs::pva::{PvField, PvaResult};
 use crate::convert::{ConvertError, decode_nt_nd_array};
 use crate::params::PvaParams;
 use crate::types::PvaCommand;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 
 /// Bridges the PVA client's synchronous callbacks (`pvmonitor_handle`'s data
 /// callback and `connect().on_connect`/`on_disconnect`, none of which are
@@ -35,7 +33,7 @@ pub(crate) struct MonitorContext {
     pub cmd_rx: rt::CommandReceiver<PvaCommand>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad: ADBaseParams,
     pub pva: PvaParams,
     pub initial_pv_name: String,
@@ -372,7 +370,7 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
         .unwrap_or(0)
         != 0;
     if array_callbacks {
-        ctx.publisher.publish(Arc::new(array)).await;
+        ctx.publisher.publish(array).await;
     }
 
     // Counters are updated after the plugin callback, matching C++'s own

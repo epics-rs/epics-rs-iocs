@@ -14,7 +14,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -289,7 +289,7 @@ pub struct SimDetectorRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub sim_params: SimParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     /// Owns the `SimDetTask` thread for the lifetime of the IOC.
     pub task_handle: std::thread::JoinHandle<()>,
@@ -300,7 +300,7 @@ impl SimDetectorRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -741,7 +741,7 @@ mod tests {
             read(ad.base.wait_for_plugins),
             read(ad.status),
             read(ad.base.array_counter),
-            rt.pool().owner().map(|o| o.queued().get())
+            rt.pool().owner().queued().get()
         );
         assert_eq!(read(ad.acquire_busy), 1, "busy cleared with a frame queued");
         drop(rx.blocking_recv().expect("frame"));

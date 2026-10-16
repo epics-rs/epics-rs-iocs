@@ -9,7 +9,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAt
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -33,7 +33,7 @@ pub struct Shared {
     pub ad: ADDriverParams,
     pub det: Arc<Detector>,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
 }
 
 impl Shared {
@@ -206,9 +206,7 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
     array.attributes = attributes;
 
     if s.get_int(s.ad.base.array_callbacks).await != 0 {
-        ArrayPublisher::new(s.output.clone())
-            .publish(Arc::new(array))
-            .await;
+        ArrayPublisher::new(s.output.clone()).publish(array).await;
     }
     true
 }

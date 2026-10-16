@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::param::ParamValue;
@@ -8,7 +7,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -27,7 +26,7 @@ pub(crate) struct AcquisitionContext {
     pub acq_rx: rt::CommandReceiver<AcqCommand>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad: ADBaseParams,
     pub url: URLParams,
 }
@@ -214,7 +213,7 @@ async fn acquire_one_image(
         .await;
 
     if array_callbacks {
-        ctx.publisher.publish(Arc::new(array)).await;
+        ctx.publisher.publish(array).await;
     }
 
     Ok(())

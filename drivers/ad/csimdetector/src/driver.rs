@@ -17,7 +17,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, NDArrayDriverBase};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataType};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -42,7 +42,7 @@ pub struct CSimDetector {
     pub port_base: PortDriverBase,
     pub nd: NDArrayDriverParams,
     pub sim: CSimParams,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub owner: Arc<ArrayOwner>,
     last_array: LastArray,
     /// C `acquiring_`, written by the simulation task and read by `setAcquire`.
@@ -238,7 +238,7 @@ pub struct CSimDetectorRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub nd_params: NDArrayDriverParams,
     pub sim_params: CSimParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     /// Index 0 is the 2-D array output; `1..=MAX_SIGNALS` the per-signal ones.
     outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
     /// Owns the `SimDetTask` thread for the lifetime of the IOC.
@@ -250,7 +250,7 @@ impl CSimDetectorRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 

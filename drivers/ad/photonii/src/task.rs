@@ -19,7 +19,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDimension;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -36,7 +36,7 @@ pub(crate) struct AcquisitionContext {
     pub p2: P2Util,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: PhotonIIParams,
     pub shared: Arc<SharedState>,
@@ -445,7 +445,7 @@ async fn publish_frame(
     )
     .await;
 
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
     Ok(())
 }
 

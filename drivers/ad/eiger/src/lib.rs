@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -40,7 +40,7 @@ const REST_PORT: u16 = 80;
 /// Everything an IOC needs to keep alive and to wire plugins to.
 pub struct EigerRuntime {
     pub runtime_handle: PortRuntimeHandle,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub outputs: Outputs,
     pub signals: Signals,
     task_handles: Vec<std::thread::JoinHandle<()>>,

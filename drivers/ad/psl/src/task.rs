@@ -18,7 +18,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDimension;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -34,7 +34,7 @@ pub(crate) struct AcquisitionContext {
     pub server: PslServer,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub shared: Arc<SharedState>,
     pub commands: rt::CommandReceiver<TaskCommand>,
@@ -332,7 +332,7 @@ async fn publish_frame(
     )
     .await;
 
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
 }
 
 /// The one exit path of an acquisition: Acquire cleared, whatever went wrong

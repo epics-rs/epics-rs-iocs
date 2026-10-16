@@ -1,6 +1,5 @@
 //! Port of `simDetector::simTask` (simDetector.cpp:729-883).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::param::ParamValue;
@@ -9,8 +8,7 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::NDArray;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -30,7 +28,7 @@ pub(crate) struct SimTaskContext {
     pub stop_rx: rt::CommandReceiver<Signal>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad: ADBaseParams,
     pub sim: SimParams,
 }
@@ -121,7 +119,7 @@ impl SimTaskContext {
 
     /// `simDetector::computeImage` (simDetector.cpp:505-718).
     /// The error is the text of `computeImage`'s own asynPrint.
-    async fn compute_image(&self, engine: &mut SimEngine) -> Result<NDArray, &'static str> {
+    async fn compute_image(&self, engine: &mut SimEngine) -> Result<DriverArray, &'static str> {
         let (mut cfg, read_ok) = self.sim.read_config(&self.handle, &self.ad).await;
         if !read_ok {
             self.handle.trace().output(
@@ -296,7 +294,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
         image.update_time_stamps_now();
 
         if array_callbacks {
-            ctx.publisher.publish(Arc::new(image)).await;
+            ctx.publisher.publish(image).await;
         }
 
         // See if acquisition is done.

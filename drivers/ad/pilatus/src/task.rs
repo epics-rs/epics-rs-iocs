@@ -16,8 +16,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::error::ADResult;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
@@ -92,7 +92,7 @@ pub(crate) struct Worker {
     pub ctx: Ctx,
     pub shared: Arc<Mutex<Shared>>,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +443,7 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
     // A refused flat field is not published; the pool printed the
     // reached-limit line.
     if let Ok(array) = build_array(&w.pool, 0, nx, ny, data, None) {
-        w.output.publish(Arc::new(array)).await;
+        w.output.publish(array).await;
     }
 
     w.ctx.set_i32(valid, 1);
@@ -669,13 +669,13 @@ async fn read_image_file(
 }
 
 fn build_array(
-    pool: &NDArrayPool,
+    pool: &DriverPool,
     unique_id: i32,
     nx: usize,
     ny: usize,
     data: Vec<i32>,
     description: Option<String>,
-) -> ADResult<NDArray> {
+) -> ADResult<DriverArray> {
     let ts = EpicsTimestamp::now();
     let buffer = NDDataBuffer::I32(data);
     let mut attributes = NDAttributeList::new();
@@ -909,7 +909,7 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                 // C dereferences a refused alloc (pilatusDetector.cpp:1190);
                 // the frame is dropped after the pool's reached-limit line.
                 if let Ok(array) = build_array(&w.pool, image_counter, nx, ny, data, description) {
-                    w.output.publish(Arc::new(array)).await;
+                    w.output.publish(array).await;
                 }
             }
 
@@ -994,7 +994,7 @@ mod tests {
     #[test]
     fn build_array_carries_tiff_description() {
         let a = build_array(
-            &NDArrayPool::new(0),
+            &DriverPool::standalone(0),
             7,
             2,
             2,

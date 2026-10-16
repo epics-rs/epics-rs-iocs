@@ -6,7 +6,7 @@
 //! item each (4 currents, 2 sums, sum-all, 2 diffs, 2 positions) and address
 //! 11 carries the full 2-D array. This module reproduces that layout on top of
 //! `asyn_rs::PortDriverBase` plus `ad_core_rs`'s `NDArrayDriverParams` and
-//! `NDArrayPool`, because `NDArrayDriverBase::new` hard-codes `maxAddr = 1`.
+//! `DriverPool`, because `NDArrayDriverBase::new` hard-codes `maxAddr = 1`.
 //!
 //! Sample flow, unchanged from C++:
 //!
@@ -28,7 +28,7 @@ use crate::asyn_print;
 use crate::trace::AsynPrint;
 use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -995,7 +995,7 @@ pub struct QuadEmBase {
     pub port_base: PortDriverBase,
     pub nd_params: NDArrayDriverParams,
     pub params: QuadEmParams,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     /// One output per asyn address: 0-10 single-value streams, 11 the full
     /// 2-D array.
     pub outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
@@ -1043,7 +1043,7 @@ impl QuadEmBase {
             port_base.set_float64_param(params.double_data, addr as i32, 0.0)?;
         }
 
-        let pool = NDArrayPool::for_driver(max_memory, &owner);
+        let pool = DriverPool::for_driver(max_memory, &owner);
 
         let outputs = (0..=QE_MAX_DATA)
             .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
@@ -1135,7 +1135,7 @@ pub struct CallbackContext {
     pub params: QuadEmParams,
     pub nd_params: NDArrayDriverParams,
     pub outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub shared: Arc<QuadEmShared>,
     /// Index of `ADAcquire` on this port, written to stop a finished
     /// multiple/single acquisition.
@@ -1181,7 +1181,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         all.timestamp = ts;
         all.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
-            .publish(Arc::new(all))
+            .publish(all)
             .await;
     }
 
@@ -1198,7 +1198,7 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
         single.timestamp = ts;
         single.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[item].clone())
-            .publish(Arc::new(single))
+            .publish(single)
             .await;
     }
 

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::asyn_record;
@@ -32,7 +32,7 @@ use crate::transport::Transport;
 /// Everything an IOC needs to keep alive and to wire plugins to.
 pub struct MythenRuntime {
     pub runtime_handle: PortRuntimeHandle,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     pub detector: Arc<Detector>,
     _task: std::thread::JoinHandle<()>,

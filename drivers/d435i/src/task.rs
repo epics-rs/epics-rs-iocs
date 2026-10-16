@@ -7,8 +7,8 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -59,11 +59,11 @@ pub(crate) struct AcquisitionContext {
     // Color port
     pub color_handle: PortHandle,
     pub color_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    pub color_pool: Arc<NDArrayPool>,
+    pub color_pool: DriverPool,
     // Depth port
     pub depth_handle: PortHandle,
     pub depth_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    pub depth_pool: Arc<NDArrayPool>,
+    pub depth_pool: DriverPool,
     // Pointcloud output
     /// Point clouds are the colour port's arrays.
     pub pc_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
@@ -414,7 +414,7 @@ async fn publish_array(
     handle: &PortHandle,
     output: &Arc<parking_lot::Mutex<NDArrayOutput>>,
     base_params: &epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    mut array: NDArray,
+    mut array: DriverArray,
     color_mode: NDColorMode,
 ) {
     // Tag the array itself, not just the parameter. `NDArray::info()` resolves
@@ -502,9 +502,7 @@ async fn publish_array(
     // list under the lock, releases it, then fans out. Holding a parking_lot
     // guard across the await would block the whole executor thread the moment
     // a downstream queue applies back-pressure.
-    ArrayPublisher::new(output.clone())
-        .publish(Arc::new(array))
-        .await;
+    ArrayPublisher::new(output.clone()).publish(array).await;
 }
 
 async fn process_color_frame(

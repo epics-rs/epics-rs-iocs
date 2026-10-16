@@ -12,14 +12,12 @@
 //! Publishing in FIFO order on a single consumer preserves the driver's
 //! callback ordering.
 
-use std::sync::Arc;
-
-use epics_rs::ad_core::ndarray::NDArray;
+use epics_rs::ad_core::ndarray_pool::PublishedArray;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 
 pub(crate) struct PublisherContext {
-    pub rx: rt::CommandReceiver<Arc<NDArray>>,
+    pub rx: rt::CommandReceiver<PublishedArray>,
     pub publisher: ArrayPublisher,
 }
 

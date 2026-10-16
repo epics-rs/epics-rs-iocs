@@ -20,7 +20,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
@@ -80,7 +80,7 @@ pub(crate) struct Worker {
     /// C `acqStartTime` as an f64 epoch second count (bits).
     pub acq_start: Arc<AtomicU64>,
     pub output: ArrayPublisher,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
 }
 
 /// Current time as an f64 epoch second count (C `secPastEpoch + nsec/1e9`).
@@ -392,7 +392,7 @@ impl Worker {
             // C uses `acqStartTime` for the double timestamp, and
             // `updateTimeStamp` (current time) for the epicsTS.
             array.time_stamp = self.load_acq_start();
-            self.output.publish(Arc::new(array)).await;
+            self.output.publish(array).await;
         }
         CamStatus::Success
     }

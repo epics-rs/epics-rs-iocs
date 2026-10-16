@@ -30,8 +30,8 @@
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::codec::{Codec, CodecName};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::timestamp::{EPICS_EPOCH_OFFSET, EpicsTimestamp};
 use epics_rs::pva::pvdata::TypedScalarArray;
 use epics_rs::pva::{PvField, PvStructure, ScalarValue};
@@ -254,8 +254,8 @@ fn convert_attribute(wire: &PvStructure) -> Result<Option<NDAttribute>, ConvertE
 }
 
 /// Decode a wire `epics:nt/NTNDArray:1.0` structure (as delivered by
-/// `PvaClient::pvmonitor_handle`'s callback) into an `NDArray`.
-pub fn decode_nt_nd_array(pool: &NDArrayPool, value: &PvField) -> Result<NDArray, ConvertError> {
+/// `PvaClient::pvmonitor_handle`'s callback) into a pool-owned `NDArray`.
+pub fn decode_nt_nd_array(pool: &DriverPool, value: &PvField) -> Result<DriverArray, ConvertError> {
     let s = match value {
         PvField::Structure(s) => s,
         _ => return Err(ConvertError::WrongFieldType("<top>")),
@@ -376,9 +376,9 @@ mod tests {
         }
     }
 
-    fn decode(nt: &NtNdArray) -> NDArray {
+    fn decode(nt: &NtNdArray) -> DriverArray {
         let value = nt_nd_array_value(nt);
-        decode_nt_nd_array(&NDArrayPool::new(0), &value)
+        decode_nt_nd_array(&DriverPool::standalone(0), &value)
             .unwrap_or_else(|e| panic!("decode failed: {e}"))
     }
 
@@ -460,7 +460,9 @@ mod tests {
     fn rejects_boolean_value_variant() {
         let nt = base_nt(NdArrayBuffer::Boolean(vec![true, false].into()), vec![]);
         let value = nt_nd_array_value(&nt);
-        let err = decode_nt_nd_array(&NDArrayPool::new(0), &value).unwrap_err();
+        let err = decode_nt_nd_array(&DriverPool::standalone(0), &value)
+            .err()
+            .expect("decode error");
         assert!(matches!(err, ConvertError::UnsupportedValueType(_)));
     }
 
@@ -509,7 +511,9 @@ mod tests {
             )),
         };
         let value = nt_nd_array_value(&nt);
-        let err = decode_nt_nd_array(&NDArrayPool::new(0), &value).unwrap_err();
+        let err = decode_nt_nd_array(&DriverPool::standalone(0), &value)
+            .err()
+            .expect("decode error");
         assert!(matches!(err, ConvertError::UnrecognizedCodec(_)));
     }
 
@@ -639,7 +643,9 @@ mod tests {
                 value: Box::new(PvField::Null),
             };
         }
-        let err = decode_nt_nd_array(&NDArrayPool::new(0), &value).unwrap_err();
+        let err = decode_nt_nd_array(&DriverPool::standalone(0), &value)
+            .err()
+            .expect("decode error");
         assert_eq!(err, ConvertError::NoUnionFieldSelected);
     }
 }

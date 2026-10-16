@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
@@ -707,7 +707,7 @@ pub struct SpecsAnalyserRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub specs_params: SpecsParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<PlMutex<NDArrayOutput>>,
     pub tasks: Vec<std::thread::JoinHandle<()>>,
 }
@@ -717,7 +717,7 @@ impl SpecsAnalyserRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 

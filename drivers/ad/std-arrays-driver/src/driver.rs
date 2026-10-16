@@ -20,8 +20,8 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataType, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -54,12 +54,12 @@ pub struct NdStdArraysDriver {
     pub port_base: PortDriverBase,
     pub params: ADDriverParams,
     pub ndsa: NdsaParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     /// Keeps the pool's owner alive; the pool holds it weakly.
     _owner: Arc<ArrayOwner>,
-    publish_tx: rt::CommandSender<Arc<NDArray>>,
+    publish_tx: rt::CommandSender<PublishedArray>,
     /// C `pArrays[0]` — the working buffer that waveform writes append into.
-    current: Option<NDArray>,
+    current: Option<DriverArray>,
     /// C `arrayDimensions_` — the requested dimensions, written via the
     /// `NDDimensions` (`ARRAY_DIMENSIONS`) waveform.
     array_dimensions: [usize; ND_ARRAY_MAX_DIMS],
@@ -71,7 +71,7 @@ impl NdStdArraysDriver {
     fn new(
         port_name: &str,
         max_memory: usize,
-        publish_tx: rt::CommandSender<Arc<NDArray>>,
+        publish_tx: rt::CommandSender<PublishedArray>,
     ) -> AsynResult<Self> {
         // ASYN_CANBLOCK = 0, ASYN_MULTIDEVICE = 0, maxAddr = 1
         // (NDDriverStdArrays.cpp:47-52).
@@ -346,7 +346,7 @@ impl NdStdArraysDriver {
         // NDAttributesFile machinery is not wired for this driver, so only the
         // ColorMode attribute added at allocation is attached.
 
-        let _ = self.publish_tx.try_send(Arc::new(snapshot));
+        let _ = self.publish_tx.try_send(snapshot.share());
         Ok(())
     }
 
@@ -362,12 +362,13 @@ impl NdStdArraysDriver {
             self.refresh_pool_stats()?;
             Ok(true)
         } else if reason == self.params.base.pool_pre_alloc {
-            if let Some(template) = self.current.clone() {
+            if self.current.is_some() {
                 let count = self
                     .get_i32(self.params.base.pool_num_pre_alloc_buffers)
                     .max(0) as usize;
+                let template = self.current.as_ref().unwrap();
                 self.pool
-                    .pre_allocate_buffers(&template, count)
+                    .pre_allocate_buffers(template, count)
                     .map_err(pool_err)?;
                 self.refresh_pool_stats()?;
             }
@@ -492,7 +493,7 @@ pub struct NdStdArraysRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: ADDriverParams,
     pub ndsa: NdsaParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     /// Owns the publisher thread for the lifetime of the IOC.
     pub task_handle: std::thread::JoinHandle<()>,
@@ -503,7 +504,7 @@ impl NdStdArraysRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -528,7 +529,7 @@ pub fn create_nd_std_arrays(
     max_memory: usize,
 ) -> AsynResult<NdStdArraysRuntime> {
     let port_name = claim.name();
-    let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
+    let (publish_tx, publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
 
     let driver = NdStdArraysDriver::new(port_name, max_memory, publish_tx)?;
     let pool = driver.pool.clone();
@@ -557,16 +558,16 @@ pub fn create_nd_std_arrays(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use epics_rs::ad_core::ndarray::NDDataBuffer;
+    use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer};
 
     struct Fixture {
         det: NdStdArraysDriver,
-        publish_rx: rt::CommandReceiver<Arc<NDArray>>,
+        publish_rx: rt::CommandReceiver<PublishedArray>,
     }
 
     impl Fixture {
         fn new() -> Self {
-            let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
+            let (publish_tx, publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
             let det = NdStdArraysDriver::new("NDSATEST", 0, publish_tx).unwrap();
             Self { det, publish_rx }
         }
@@ -597,7 +598,7 @@ mod tests {
             self.det.write_float64_array(&user, data).unwrap();
         }
 
-        fn drain_publish(&mut self) -> Vec<Arc<NDArray>> {
+        fn drain_publish(&mut self) -> Vec<PublishedArray> {
             let mut out = Vec::new();
             while let Ok(a) = self.publish_rx.try_recv() {
                 out.push(a);
@@ -615,7 +616,7 @@ mod tests {
 
     #[test]
     fn a_failed_pool_pre_alloc_does_not_fail_the_write() {
-        let (publish_tx, _publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
+        let (publish_tx, _publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
         // Room for one 6-element Float64 array and no more.
         let mut det = NdStdArraysDriver::new("NDSAPREALLOC", 64, publish_tx).unwrap();
         let p = det.params;
