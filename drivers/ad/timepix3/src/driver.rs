@@ -973,12 +973,24 @@ impl PortDriver for TimePix3Driver {
             || reason == p.periph_clk80
             || reason == p.tdc0
             || reason == p.tdc1
-            || reason == self.ad.params.trigger_mode
+            || reason == p.gain_mode
+            || reason == p.charge_summing
+            || reason == p.colour
+            || reason == p.pixel_depth
+            || reason == p.counter_select_in
+            || reason == p.counter_select_out
+            || reason == p.i_delay0
+            || reason == p.i_delay1
+            || reason == p.i_delay2
+            || reason == p.i_delay3
         {
             self.init_acquisition()
-        } else if reason == self.ad.params.num_images {
+        } else if reason == self.ad.params.num_images || reason == self.ad.params.trigger_mode {
             // Single image mode carries exactly one image (C ADTimePix.cpp:519).
-            if self.int(self.ad.params.image_mode, 0) == 0 && value != 1 {
+            if reason == self.ad.params.num_images
+                && self.int(self.ad.params.image_mode, 0) == 0
+                && value != 1
+            {
                 self.ad
                     .port_base
                     .set_int32_param(self.ad.params.num_images, 0, 1)?;
@@ -1270,6 +1282,26 @@ mod tests {
             .read_int32_array(&AsynUser::new(p.pixel_config_diff), &mut buf)
             .unwrap();
         assert_eq!((n, buf), (4, [5, 6, 0, 0]));
+    }
+
+    /// The Medipix3 detector settings go to Serval like the Timepix3 ones
+    /// (ADTimePix.cpp:643-673); with no Serval behind the driver the write
+    /// fails.
+    #[test]
+    fn a_medipix3_setting_reaches_init_acquisition() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_MPX3_SETTING",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for reason in [p.gain_mode, p.pixel_depth, p.colour, p.i_delay3] {
+            assert!(det.write_int32(&mut AsynUser::new(reason), 1).is_err());
+        }
     }
 
     /// The one-shot actions run on 1 only and read back 0 whatever was
