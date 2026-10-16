@@ -270,6 +270,9 @@ pub struct PhytronAxis {
     /// Limit-home state machine (C `homeState_`): 0 = idle, else bit0 = homing
     /// direction (1 = forward/high), bits>>1 = phase.
     home_state: i32,
+    /// C's `motorEncoderRatio_` (1 at phytronAxisMotor.cpp:1353): the poll
+    /// reports `P22R` times it (:2005-2006).
+    encoder_ratio: f64,
 }
 
 impl PhytronAxis {
@@ -305,6 +308,7 @@ impl PhytronAxis {
             axis_module_no,
             motor_enabled: false,
             home_state: 0,
+            encoder_ratio: 1.0,
         })
     }
 
@@ -359,6 +363,9 @@ impl AsynMotor for PhytronAxis {
     /// read the encoder (`P22R`), then set the conversion factor `P39` to
     /// `1/ratio`.
     fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
+        // asynMotorController::writeFloat64 stores the ratio before
+        // dispatching, so a refused command still scales the poll (:289).
+        self.encoder_ratio = ratio;
         let ctrl = self.lock();
         let set = ctrl.set_char();
         let m = self.axis_module_no.as_str();
@@ -529,7 +536,7 @@ impl AsynMotor for PhytronAxis {
 
         Ok(MotorStatus {
             position: pos,
-            encoder_position: enc,
+            encoder_position: enc * self.encoder_ratio,
             done: !moving,
             moving,
             high_limit: high,
@@ -662,8 +669,9 @@ fn mcc_status_word(axis_digit: u8, perr: &str, sui: &str, moving: bool) -> AsynR
 mod tests {
     use super::*;
 
-    /// An MCC that ACKs every command, answering `P22R` with 1000; records
-    /// each command payload.
+    /// An MCC that ACKs every command, answering `P22R` with 1000 and the
+    /// rest of a poll with an idle, fault-free axis; records each command
+    /// payload.
     struct Mcc {
         base: epics_rs::asyn::port::PortDriverBase,
         written: Arc<Mutex<Vec<String>>>,
@@ -679,7 +687,13 @@ mod tests {
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(&data[2..data.len() - 1]).into_owned();
-            let payload: &[u8] = if cmd.ends_with("P22R") { b"1000" } else { b"" };
+            let payload: &[u8] = match cmd.as_str() {
+                c if c.ends_with("P22R") => b"1000",
+                c if c.ends_with("P20R") || c.ends_with("=E") => b"0",
+                c if c.ends_with("=H") => b"E",
+                "SUI" => b"I=00000000",
+                _ => b"",
+            };
             self.reply = [&[STX, ACK][..], payload, &[ETX]].concat();
             self.written.lock().unwrap().push(cmd);
             Ok(data.len())
@@ -714,6 +728,32 @@ mod tests {
         let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
         axis.set_encoder_ratio(&AsynUser::new(0), 0.5).unwrap();
         assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39S2.000000"]);
+    }
+
+    #[test]
+    fn the_poll_reports_the_encoder_times_the_encoder_ratio() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = Mcc {
+            base: PortDriverBase::new("phytronEncoderPoll", 1, PortFlags::default()),
+            written: Arc::new(Mutex::new(Vec::new())),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("phytronEncoderPoll").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
+        let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
+        let user = AsynUser::new(0);
+        assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
+        axis.set_encoder_ratio(&user, 0.5).unwrap();
+        assert_eq!(axis.poll(&user).unwrap().encoder_position, 500.0);
     }
 
     #[test]
