@@ -1,5 +1,5 @@
 # MW100 MX110 (voltage/thermocouple analog input) channel.
-# Macros: P, DAU, HANDLE, ADDRESS (Signal channel address, e.g. 101).
+# Macros: P, DAU, HANDLE, ADDRESS (Signal channel address, e.g. 1).
 # Port of yokogawaDasApp/Db/MW100_MX110_channel.db.
 
 record(ai, "$(P)$(DAU):$(ADDRESS):ADC")
