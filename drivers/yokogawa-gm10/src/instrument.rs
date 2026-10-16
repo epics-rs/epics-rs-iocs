@@ -751,6 +751,7 @@ impl Actor {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed FData frame"))?;
 
         let mut alarm_flag = false;
+        let alarm_flag_changed;
         {
             let mut cache = self.cache.lock();
             for record in &records {
@@ -796,9 +797,14 @@ impl Actor {
                     alarm_flag = true;
                 }
             }
+            alarm_flag_changed = cache.alarm_flag != alarm_flag;
             cache.alarm_flag = alarm_flag;
         }
-        self.interrupts.fire(InterruptCategory::Channel);
+        // `drvGM10.c:1071-1075`: a single-channel read wakes I/O Intr only
+        // when the alarm summary flips.
+        if scope.is_none() || alarm_flag_changed {
+            self.interrupts.fire(InterruptCategory::Channel);
+        }
         Ok(())
     }
 
@@ -833,7 +839,10 @@ impl Actor {
                 cache.varconstant[line.index] = line.value;
             }
         }
-        self.interrupts.fire(InterruptCategory::Misc);
+        // `drvGM10.c:1147-1148`: only the all-channel read wakes I/O Intr.
+        if single_channel.is_none() {
+            self.interrupts.fire(InterruptCategory::Misc);
+        }
         Ok(())
     }
 
@@ -1359,5 +1368,30 @@ mod tests {
         ));
         assert_eq!(level1.matches("        #6: empty\n").count(), 2);
         assert!(!level1.contains("#7:"));
+    }
+
+    #[test]
+    fn single_channel_reads_fire_io_intr_only_on_alarm_flag_change() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(one_record_fdata_binary());
+        responses.push(fdata_binary(&[(1, 1, 0, [1, 0, 0, 0], 5)]));
+        responses.push(ascii_frame(b"aaaaaaaa001,1.5\nE"));
+        responses.push(ascii_frame(b"aaaaaaaa001,1.5\nE"));
+        responses.push(ascii_frame(b"aaaaaaaa001,1.5\nE"));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        let mut channel = instrument.register_interrupt(InterruptCategory::Channel);
+        let mut misc = instrument.register_interrupt(InterruptCategory::Misc);
+        instrument.submit(Command::ReadSignal(1));
+        assert!(channel.try_recv().is_err());
+        instrument.submit(Command::ReadSignal(1));
+        assert!(channel.try_recv().is_ok());
+        instrument.submit(Command::ReadConst(1));
+        assert!(misc.try_recv().is_err());
+        instrument.submit(Command::ReadAllMisc);
+        assert!(misc.try_recv().is_ok());
+        device.join().unwrap();
     }
 }
