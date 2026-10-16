@@ -74,6 +74,70 @@ pub fn dac_params(p: &TimePixParams) -> Vec<(&'static str, usize)> {
     DAC_NAMES.iter().map(|(name, f)| (*name, f(p))).collect()
 }
 
+/// One channel's `Base` PV check (C `checkRawPath` .. `checkPrvHstPath`,
+/// ADTimePix.cpp:282-398).
+struct ChannelPath {
+    base: fn(&TimePixParams) -> usize,
+    stream: Option<fn(&TimePixParams) -> usize>,
+    exists: fn(&TimePixParams) -> usize,
+    error_message: &'static str,
+    /// The channels whose `tcp://` path C parses into the stream target, and
+    /// the function name its lines carry.
+    tcp: Option<(&'static str, &'static str)>,
+}
+
+const CHANNEL_PATHS: [ChannelPath; 7] = [
+    ChannelPath {
+        base: |p| p.raw_base,
+        stream: Some(|p| p.raw_stream),
+        exists: |p| p.raw_file_path_exists,
+        error_message: "Raw file path must be file:/path_to_raw_folder, http://localhost:8081, or tcp://localhost:8085",
+        tcp: None,
+    },
+    ChannelPath {
+        base: |p| p.raw1_base,
+        stream: Some(|p| p.raw1_stream),
+        exists: |p| p.raw1_file_path_exists,
+        error_message: "Raw1 file path must be file:/path_to_raw_folder, http://localhost:8081, or tcp://localhost:8085",
+        tcp: None,
+    },
+    ChannelPath {
+        base: |p| p.img_base,
+        stream: None,
+        exists: |p| p.img_file_path_exists,
+        error_message: "Img file path must be file:/path_to_img_folder, http://localhost:8081, or tcp://listen@hostname:port",
+        tcp: Some(("Img", adlog::CHECK_IMG_PATH)),
+    },
+    ChannelPath {
+        base: |p| p.img1_base,
+        stream: None,
+        exists: |p| p.img1_file_path_exists,
+        error_message: "Img1 file path must be file:/path_to_img_folder, http://localhost:8081, or tcp://localhost:8085",
+        tcp: None,
+    },
+    ChannelPath {
+        base: |p| p.prv_img_base,
+        stream: None,
+        exists: |p| p.prv_img_file_path_exists,
+        error_message: "PrvImg file path must be file:/path_to_img_folder, http://localhost:8081, or tcp://listen@hostname:port",
+        tcp: Some(("PrvImg", adlog::CHECK_PRV_IMG_PATH)),
+    },
+    ChannelPath {
+        base: |p| p.prv_img1_base,
+        stream: None,
+        exists: |p| p.prv_img1_file_path_exists,
+        error_message: "PrvImg1 file path must be file:/path_to_img_folder, http://localhost:8081, or tcp://listen@hostname:port",
+        tcp: Some(("PrvImg1", adlog::CHECK_PRV_IMG1_PATH)),
+    },
+    ChannelPath {
+        base: |p| p.prv_hst_base,
+        stream: Some(|p| p.prv_hst_stream),
+        exists: |p| p.prv_hst_file_path_exists,
+        error_message: "Prv Histogram path must be file:/path_to_folder, http://localhost:8081, or tcp://localhost:8085",
+        tcp: None,
+    },
+];
+
 /// C `checkPath` (ADTimePix.cpp:115): one trailing '/' is dropped for the
 /// directory test and the path always comes back ending in '/'.
 fn check_path(path: &str) -> (String, bool) {
@@ -146,6 +210,80 @@ impl TimePix3Driver {
             &std::env::var("ADTIMEPIX_CALIBRATION_ROOT").unwrap_or_default(),
         )?;
         Ok(driver)
+    }
+
+    /// C `checkChannelPath` (ADTimePix.cpp:217-280), plus the `tcp://` parse
+    /// `checkImgPath` and the two PrvImg checks add.
+    fn check_channel_path(&mut self, channel: &ChannelPath) -> AsynResult<()> {
+        let p = self.p;
+        let path = self.text((channel.base)(&p), 0);
+        if path.is_empty() {
+            return Ok(());
+        }
+        let bytes = path.as_bytes();
+        let (stream, found) = if bytes.len() <= 6 {
+            (None, false)
+        } else if let Some(dir) = path.strip_prefix("file:") {
+            if bytes[5] == b'/' && bytes[6] != b'/' {
+                (Some(0), check_path(dir).1)
+            } else {
+                println!("Invalid file path format: '{path}'. Expected format: 'file:/path'.");
+                println!(
+                    "Debug: length={}, char[5]='{}', char[6]='{}'",
+                    bytes.len(),
+                    char::from(bytes[5]),
+                    char::from(bytes[6])
+                );
+                (Some(3), false)
+            }
+        } else if path.starts_with("http://") {
+            (Some(1), true)
+        } else if path.starts_with("tcp://") {
+            (Some(2), true)
+        } else {
+            println!("{}", channel.error_message);
+            (Some(3), false)
+        };
+        if let (Some(param), Some(value)) = (channel.stream, stream) {
+            self.ad.port_base.set_int32_param(param(&p), 0, value)?;
+        }
+        let exists = (channel.exists)(&p);
+        self.ad
+            .port_base
+            .set_int32_param(exists, 0, i32::from(found))?;
+        let refused = || AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("timepix3: {}", channel.error_message),
+        };
+        if !found {
+            return Err(refused());
+        }
+        let Some((name, func)) = channel.tcp.filter(|_| path.starts_with("tcp://")) else {
+            return Ok(());
+        };
+        let (mask, line) = match crate::stream::parse_tcp_path(&path) {
+            Some((host, port)) => (
+                TraceMask::IO_DRIVER,
+                adlog::log(
+                    func,
+                    &format!("Parsed {name} TCP path: host={host}, port={port}"),
+                ),
+            ),
+            None => {
+                self.ad.port_base.set_int32_param(exists, 0, 0)?;
+                (
+                    TraceMask::ERROR,
+                    adlog::err(func, &format!("Failed to parse {name} TCP path: {path}")),
+                )
+            }
+        };
+        self.ad
+            .port_base
+            .trace_print(mask, format_args!("{}", line));
+        if mask == TraceMask::ERROR {
+            return Err(refused());
+        }
+        Ok(())
     }
 
     /// C `checkBPCPath` (mask_io.cpp:502) and `checkDACSPath`
@@ -1406,6 +1544,8 @@ impl PortDriver for TimePix3Driver {
                 p.da_cs_file_path_exists,
                 adlog::CHECK_DACS_PATH,
             )
+        } else if let Some(channel) = CHANNEL_PATHS.iter().find(|c| (c.base)(&p) == reason) {
+            self.check_channel_path(channel)
         } else if reason == p.tof_tdc_reference {
             self.send_measurement_config()
         } else {
@@ -1533,6 +1673,51 @@ mod tests {
             det.text(p.calibration_policy, 0),
             "Blocked: calibration root is not absolute"
         );
+    }
+
+    /// A channel Base PV reads back whether it names a reachable folder or
+    /// a stream, and which (ADTimePix.cpp:217-398).
+    #[test]
+    fn a_channel_base_is_classified_and_checked() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_CHANNEL_PATH",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        let mut write = |reason, value: String| {
+            det.write_octet(&mut AsynUser::new(reason), value.as_bytes())
+                .is_ok()
+        };
+        assert!(write(p.raw_base, format!("file:{}", tmp.display())));
+        assert!(!write(p.raw1_base, "file://tmp".into()));
+        assert!(write(p.prv_hst_base, "tcp://localhost:8085".into()));
+        assert!(!write(p.img1_base, "ftp://somewhere".into()));
+        assert!(!write(p.prv_img_base, "tcp://listen@host".into()));
+        assert!(write(p.img_base, "http://localhost:8081".into()));
+        assert_eq!(
+            [
+                (det.int(p.raw_stream, 0), det.int(p.raw_file_path_exists, 0)),
+                (
+                    det.int(p.raw1_stream, 0),
+                    det.int(p.raw1_file_path_exists, 0)
+                ),
+                (
+                    det.int(p.prv_hst_stream, 0),
+                    det.int(p.prv_hst_file_path_exists, 0)
+                ),
+            ],
+            [(0, 1), (3, 0), (2, 1)]
+        );
+        assert_eq!(det.int(p.img1_file_path_exists, 0), 0);
+        assert_eq!(det.int(p.prv_img_file_path_exists, 0), 0);
+        assert_eq!(det.int(p.img_file_path_exists, 0), 1);
+        assert_eq!(det.text(p.raw_base, 0), format!("file:{}", tmp.display()));
     }
 
     /// A calibration directory gains its trailing '/' and is refused outside
