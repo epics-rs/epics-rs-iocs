@@ -807,11 +807,8 @@ impl DeviceSupport for MwDevice {
         ) {
             record.put_field("VAL", EpicsValue::Enum(0))?;
         }
-        if instrument.submit_write(command, done.write_done()) {
-            Ok(WriteStart::Pending)
-        } else {
-            Ok(WriteStart::Completed)
-        }
+        instrument.submit_write(command, done.write_done());
+        Ok(WriteStart::Pending)
     }
 }
 

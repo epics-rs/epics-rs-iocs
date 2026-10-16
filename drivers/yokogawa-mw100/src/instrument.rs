@@ -17,9 +17,9 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
-use std::sync::Arc;
+use std::net::{SocketAddrV4, TcpStream};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 
 const PORT: u16 = 34318;
 
@@ -108,40 +108,46 @@ struct Job {
     done: Done,
 }
 
-/// Handle to a connected MW100 unit. Cheap to clone (`Arc`-backed); one
-/// instance per `mw100Init` handle, looked up by name from the
+/// One `mw100Init` handle (C `struct devqueue`), looked up by name from the
 /// [`Registry`].
 pub struct Instrument {
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
-    tx: mpsc::Sender<Job>,
+    /// The `queue_func` thread's queue; unset when the connect or load
+    /// failed, which leaves C's `dq` listed with no thread to drain it.
+    tx: OnceLock<mpsc::Sender<Job>>,
     /// `mw100_system_info(which=0, ...)` (`drvMW100.c:1731-1742`): the
-    /// address this handle connected to, formatted once at connect time.
+    /// configured address, as `inet_ntop` prints it.
     pub peer_address: String,
 }
 
 impl Instrument {
-    /// The connect half of `init_mw100` (`drvMW100.c:1523-1556`): connect,
-    /// read the unsolicited post-connect `E0` greeting, negotiate binary
-    /// byte order, then run the fixed load sequence into `cache`, which
-    /// keeps whatever loaded if a step fails.
-    fn connect(address: SocketAddr, cache: Arc<Mutex<Cache>>) -> io::Result<Arc<Self>> {
-        Self::connect_stream(TcpStream::connect(address)?, cache)
+    fn new(peer_address: String) -> Arc<Self> {
+        Arc::new(Self {
+            cache: Arc::default(),
+            interrupts: Arc::default(),
+            tx: OnceLock::new(),
+            peer_address,
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn connect_to(addr: SocketAddr) -> io::Result<Arc<Self>> {
-        Self::connect(addr, Arc::default())
+    pub(crate) fn connect_to(addr: std::net::SocketAddr) -> io::Result<Arc<Self>> {
+        let instrument = Self::new(addr.ip().to_string());
+        instrument.start(TcpStream::connect(addr)?)?;
+        Ok(instrument)
     }
 
-    fn connect_stream(stream: TcpStream, cache: Arc<Mutex<Cache>>) -> io::Result<Arc<Self>> {
-        let peer_address = stream.peer_addr()?.ip().to_string();
-        let interrupts = Arc::new(Interrupts::default());
+    /// The tail of `init_mw100` (`drvMW100.c:1531-1556`): read the
+    /// unsolicited post-connect `E0` greeting, negotiate binary byte order,
+    /// run the fixed load sequence (the cache keeps whatever loaded if a
+    /// step fails), then start the queue thread.
+    fn start(&self, stream: TcpStream) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<Job>();
         let mut actor = Actor {
             stream,
-            cache: cache.clone(),
-            interrupts: interrupts.clone(),
+            cache: self.cache.clone(),
+            interrupts: self.interrupts.clone(),
             rx,
             backlog: VecDeque::new(),
         };
@@ -168,15 +174,9 @@ impl Instrument {
 
         std::thread::Builder::new()
             .name("mw100-instrument".to_string())
-            .spawn(move || actor.run())
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        Ok(Arc::new(Self {
-            cache,
-            interrupts,
-            tx,
-            peer_address,
-        }))
+            .spawn(move || actor.run())?;
+        let _ = self.tx.set(tx);
+        Ok(())
     }
 
     pub fn register_interrupt(
@@ -197,13 +197,17 @@ impl Instrument {
     }
 
     /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
-    /// actor completes `done` when it has run. `false` if the actor is gone.
-    pub fn submit_write(&self, command: Command, done: WriteDone) -> bool {
-        self.send(command, Done::Process(done))
+    /// actor completes `done` when it has run. On a device with no queue
+    /// thread `done` is dropped un-run and the record stays in PACT, as C's
+    /// packet sits on a list nobody drains.
+    pub fn submit_write(&self, command: Command, done: WriteDone) {
+        self.send(command, Done::Process(done));
     }
 
     fn send(&self, command: Command, done: Done) -> bool {
-        self.tx.send(Job { command, done }).is_ok()
+        self.tx
+            .get()
+            .is_some_and(|tx| tx.send(Job { command, done }).is_ok())
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -1016,10 +1020,7 @@ fn ch_status_to_wire(status: ChStatus) -> u8 {
 /// One `mw100Init` entry (C `struct queue_link` plus its `devqueue`).
 struct Device {
     name: String,
-    address: Ipv4Addr,
-    cache: Arc<Mutex<Cache>>,
-    /// `None` when the connect or load sequence failed.
-    instrument: Option<Arc<Instrument>>,
+    instrument: Arc<Instrument>,
 }
 
 /// `mw100_queue_list` (`drvMW100.c:449`): every `mw100Init` device,
@@ -1036,10 +1037,9 @@ impl Registry {
 
     /// `init_mw100` (`drvMW100.c:1465-1561`), which reports nothing; `false`
     /// is its `return 1`. A device whose connect or load fails stays listed
-    /// (it blocks the name and shows in the report, as in C) but resolves
-    /// no records: C binds them to a queue no thread serves, so they would
-    /// hang in PACT. A bad address registers nothing, where C leaves a
-    /// freed `devqueue` in the list (`drvMW100.c:1525-1529`).
+    /// and resolves records, which park on a queue no thread serves, as in
+    /// C. A bad address registers nothing, where C leaves a freed
+    /// `devqueue` in the list (`drvMW100.c:1525-1529`).
     pub fn init_mw100(&self, device: Option<&[u8]>, address: Option<&[u8]>) -> bool {
         let Some(name) = device.filter(|d| valid_device_name(d)) else {
             return false;
@@ -1051,25 +1051,17 @@ impl Registry {
         let Some(address) = address.and_then(inet_aton) else {
             return false;
         };
-        let cache = Arc::<Mutex<Cache>>::default();
+        let instrument = Instrument::new(address.to_string());
         self.devices.lock().insert(
             0,
             Device {
-                name: name.clone(),
-                address,
-                cache: cache.clone(),
-                instrument: None,
+                name,
+                instrument: instrument.clone(),
             },
         );
-        let Ok(instrument) = Instrument::connect(SocketAddrV4::new(address, PORT).into(), cache)
-        else {
-            return false;
-        };
-        let mut devices = self.devices.lock();
-        if let Some(entry) = devices.iter_mut().find(|d| d.name == name) {
-            entry.instrument = Some(instrument);
-        }
-        true
+        TcpStream::connect(SocketAddrV4::new(address, PORT))
+            .and_then(|stream| instrument.start(stream))
+            .is_ok()
     }
 
     /// `mw100_connect` (`drvMW100.c:1628-1641`).
@@ -1078,7 +1070,7 @@ impl Registry {
             .lock()
             .iter()
             .find(|d| d.name == name)
-            .and_then(|d| d.instrument.clone())
+            .map(|d| d.instrument.clone())
     }
 
     #[cfg(test)]
@@ -1087,9 +1079,7 @@ impl Registry {
             0,
             Device {
                 name: name.to_string(),
-                address: Ipv4Addr::LOCALHOST,
-                cache: instrument.cache.clone(),
-                instrument: Some(instrument),
+                instrument,
             },
         );
     }
@@ -1117,11 +1107,11 @@ impl DriverSupport for Registry {
                 "    Yokogawa MW100 #{}: {} @ {}",
                 cnt + 1,
                 device.name,
-                device.address
+                device.instrument.peer_address
             );
             if level != 0 {
                 out.push_str("        Modules:\n");
-                for (i, module) in device.cache.lock().modules.iter().take(6).enumerate() {
+                for (i, module) in device.instrument.cache().modules.iter().take(6).enumerate() {
                     if module.use_flag {
                         let _ = writeln!(out, "        #{}: {}", i + 1, module.module_string);
                     } else {
@@ -1482,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_init_stays_listed_but_resolves_nothing() {
+    fn failed_init_stays_listed_and_resolves_with_no_queue_thread() {
         // 127.0.0.2 so the fixed MW100 port does not clash with a real
         // listener on 127.0.0.1.
         let listener = TcpListener::bind(("127.0.0.2", PORT)).unwrap();
@@ -1496,7 +1486,9 @@ mod tests {
         assert!(!registry.init_mw100(Some(b"dau2"), Some(b"127.0.0.2")));
         device.join().unwrap();
 
-        assert!(registry.get("dau2").is_none());
+        let dau2 = registry.get("dau2").unwrap();
+        assert!(dau2.tx.get().is_none());
+        assert_eq!(dau2.module_string(0), "MX110-UNV-M06");
         assert!(!registry.init_mw100(Some(b"dau2"), Some(b"192.0.2.1")));
         assert_eq!(
             registry.report(1).unwrap(),
