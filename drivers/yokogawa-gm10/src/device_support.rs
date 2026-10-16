@@ -424,8 +424,7 @@ fn resolve_operation(
 
 /// Records whose C `init_record` seeds an initial value directly
 /// (`devGM10_ao.c`: VAL via `gm10_analog_get`; `devGM10_bo.c`: RVAL via
-/// `gm10_binary_get`, asymmetrically — VAL is left at the record's
-/// default since C's `init_record` never calls `process()`).
+/// `gm10_binary_get`).
 fn seed_initial_value(
     instrument: &Instrument,
     op: Operation,
@@ -441,6 +440,15 @@ fn seed_initial_value(
             record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
         }
         _ => {}
+    }
+    // boRecord.c:159-162 derives VAL from RVAL after a 0 dset status, which
+    // every successful devGM10_bo init_record returns; the framework does not.
+    if record.record_type() == "bo" {
+        let rval = match record.get_field("RVAL") {
+            Some(EpicsValue::ULong(v)) => v,
+            _ => 0,
+        };
+        record.put_field("VAL", EpicsValue::Enum((rval != 0) as u16))?;
     }
     Ok(())
 }
@@ -1174,5 +1182,26 @@ mod tests {
             DeviceInitOutcome::DoNotConvert(DeviceUdf::Defined)
         );
         assert_eq!(init("bo", "gm10dev CHAN_TRIG"), DeviceInitOutcome::ok());
+    }
+
+    #[test]
+    fn bo_val_init_derives_val_from_seeded_rval() {
+        use crate::cache::ChannelType;
+        use epics_rs::base::server::records::bo::BoRecord;
+        let instrument = connect_default_fixture();
+        crate::instrument::test_support::set_signal(&instrument, 2, ChannelType::OutputBinary, 1);
+        let f = factory(registry_with("gm10dev", instrument));
+        let ctx = DeviceSupportContext {
+            record_type: "bo",
+            dtyp: DTYP,
+            inp: "",
+            out: "gm10dev VAL:2",
+        };
+        let mut device = f(&ctx).unwrap();
+        let mut record = BoRecord::default();
+        device.init(&mut record).unwrap();
+        record.init_record_tail();
+        assert_eq!(record.get_field("VAL"), Some(EpicsValue::Enum(1)));
+        assert_eq!(record.get_field("RVAL"), Some(EpicsValue::ULong(1)));
     }
 }

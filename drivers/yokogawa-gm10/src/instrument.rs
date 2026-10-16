@@ -946,6 +946,14 @@ pub(crate) mod test_support {
         ascii_frame(&body)
     }
 
+    /// Overwrites signal channel `channel`'s cached type and value.
+    pub(crate) fn set_signal(instrument: &Instrument, channel: u32, ty: ChannelType, value: i32) {
+        let mut cache = instrument.cache();
+        let idx = (channel - 1) as usize;
+        cache.meas_type[idx] = ty;
+        cache.meas_data[idx].value = value;
+    }
+
     /// Plays the device side of one connection: an unsolicited `E0`
     /// greeting (matching `init_gm10`'s post-connect read), then one
     /// canned reply per entry in `responses`, in order. Returns every
