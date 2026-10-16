@@ -80,8 +80,9 @@ impl TetrAmmDriver {
             return Ok(unlinked(base, io));
         }
 
-        // C++ `drvTetrAMM::drvTetrAMM`: setInputEos(pasynUserMeter_, "\r\n", 2).
-        io.set_input_eos(b"\r\n")?;
+        // C++ sets the input EOS only in setAcquire, where a refusal fails the
+        // acquire; it is set here too so the firmware query frames on it.
+        let _ = io.set_input_eos(b"\r\n");
 
         // C++ constructor: resolution_ = 24, model = TetrAMM, valuesPerRead = 5.
         base.port_base
@@ -175,6 +176,7 @@ impl QuadEmDevice for TetrAmmDriver {
         if value == 1 && self.shared.is_acquiring() {
             return Ok(());
         }
+        trace::ensure_input_eos(&self.io, &self.base.port_base, "drvTetrAMM::setAcquire")?;
 
         if value == 0 {
             // Tell the read thread to stop, then wait for it to leave the loop.
@@ -1001,5 +1003,19 @@ mod tests {
     fn a_missing_qe_port_keeps_the_port_without_a_link() {
         let rt = create_tetramm("QE_TETRA_NOQE", "QE_TETRA_NOQE_IP", 4, 0).unwrap();
         assert!(rt._read_thread.is_none());
+    }
+
+    /// C++ sets the input EOS only in setAcquire (drvTetrAMM.cpp:464-471): a
+    /// port that refuses it keeps the driver and fails the acquire instead.
+    #[test]
+    fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
+        let (_meter, _runtime) = crate::octet::tests::eos_refusing_port("QE_TETRA_NOEOS_IP");
+        let rt = create_tetramm("QE_TETRA_NOEOS", "QE_TETRA_NOEOS_IP", 4, 0).unwrap();
+        let err = rt
+            .port_handle()
+            .write_int32_blocking(rt.nd_params.acquire, 0, 1)
+            .unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error);
+        assert_eq!(err.message(), "no input EOS");
     }
 }
