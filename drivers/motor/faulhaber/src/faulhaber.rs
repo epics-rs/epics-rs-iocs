@@ -45,9 +45,6 @@ use motor_common::util::{atof, nint};
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 128;
 
-/// Command terminator: CR, matching the startup-script output EOS.
-const TERMINATOR: &[u8] = b"\r";
-
 /// Maximum modules per serial line (C `MCDC2805_NUM_CARDS` axis table width).
 const MAX_MOTORS: usize = 8;
 
@@ -128,10 +125,9 @@ impl FaulhaberController {
 
     fn framed(node: usize, cmd: &str) -> Vec<u8> {
         let prefix = node.to_string();
-        let mut out = Vec::with_capacity(prefix.len() + cmd.len() + TERMINATOR.len());
+        let mut out = Vec::with_capacity(prefix.len() + cmd.len());
         out.extend_from_slice(prefix.as_bytes());
         out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
         out
     }
 
@@ -429,9 +425,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn framed_prefixes_node_and_terminator() {
-        assert_eq!(FaulhaberController::framed(0, "GST"), b"0GST\r");
-        assert_eq!(FaulhaberController::framed(3, "LA 1000"), b"3LA 1000\r");
+    fn framed_prefixes_node() {
+        assert_eq!(FaulhaberController::framed(0, "GST"), b"0GST");
+        assert_eq!(FaulhaberController::framed(3, "LA 1000"), b"3LA 1000");
     }
 
     #[test]
