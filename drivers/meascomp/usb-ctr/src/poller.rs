@@ -40,9 +40,6 @@ pub fn start_poller(
 #[derive(Default)]
 struct PollSnapshot {
     digital_input: Option<u64>,
-    /// rs-only: C never sets COUNTER_VALUE, so its Counts records stay dark.
-    counters: [Option<i64>; MAX_COUNTERS],
-    scaler_done_snapshot: Option<[u64; MAX_COUNTERS]>,
     mcs: Option<McsPass>,
     num_counters: usize,
 }
@@ -84,18 +81,9 @@ fn poller_loop(
                     if st.scaler.running {
                         let num_counters = st.num_counters;
                         scaler::read_scaler(&dev, &mut st.scaler, num_counters, &trace);
-                        if st.scaler.done.get() != 0 {
-                            snap.scaler_done_snapshot = Some(st.scaler.counts);
-                        }
                     } else if st.mcs.running {
                         snap.mcs = Some(mcs::read_mcs(&dev, &mut st.mcs, &trace));
                         snap.num_counters = st.num_counters;
-                    } else {
-                        for counter in 0..st.num_counters {
-                            if let Ok(value) = dev.counter_in(counter as i32) {
-                                snap.counters[counter] = Some(value as i64);
-                            }
-                        }
                     }
                 }
             }
@@ -122,16 +110,6 @@ fn poller_loop(
                 ));
             }
         }
-        if let Some(counts) = snapshot.scaler_done_snapshot {
-            updates.extend(counts.iter().enumerate().map(|(i, c)| {
-                ParamSetValue::new(params.counter_value, i as i32, ParamValue::Int32(*c as i32))
-            }));
-        }
-        updates.extend(snapshot.counters.iter().enumerate().filter_map(|(i, v)| {
-            v.map(|v| {
-                ParamSetValue::new(params.counter_value, i as i32, ParamValue::Int32(v as i32))
-            })
-        }));
         if let Some(pass) = snapshot.mcs {
             updates.extend(
                 pass.updates(&params, snapshot.num_counters)
