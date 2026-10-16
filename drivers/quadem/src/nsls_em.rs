@@ -35,6 +35,7 @@ use crate::drv_quad_em::{
 use crate::nsls_em_proto::{self as proto, PingPong};
 use crate::octet::{OctetIo, create_ip_port};
 use crate::{asyn_print, trace};
+use epics_rs::base::calc::engine::cvt::fmt_e;
 
 /// C++ `epicsThreadSleep(0.01)` handshake poll.
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
@@ -80,6 +81,8 @@ struct Transport {
     /// The UDP, command and data sub-ports; dropping them closes the sockets,
     /// so [`NslsEmRuntime`] keeps them for the life of the port.
     runtimes: Vec<PortRuntimeHandle>,
+    /// C++ `moduleInfo_`: every module that answered the broadcast.
+    modules: Vec<proto::ModuleInfo>,
 }
 
 /// Build an IP port the way `drvAsynIPPortConfigure` does, with the EOS
@@ -170,6 +173,7 @@ fn find_module(port_name: &str, broadcast_address: &str, module_id: i32) -> Asyn
         command,
         data,
         runtimes: vec![udp_runtime, command_runtime, data_runtime],
+        modules,
     })
 }
 
@@ -182,6 +186,12 @@ pub struct NslsEmDriver {
     command: OctetIo,
     shared: Arc<QuadEmShared>,
     state: SharedState,
+    /// C++ `ipAddress_`, `moduleID_`, `firmwareVersion_` and `moduleInfo_`,
+    /// printed by [`PortDriver::report`].
+    ip_address: String,
+    module_id: i32,
+    firmware_version: String,
+    modules: Vec<proto::ModuleInfo>,
 }
 
 impl NslsEmDriver {
@@ -271,7 +281,18 @@ impl NslsEmDriver {
     /// C++ `readStatus`.
     fn read_status_inner(&mut self) -> AsynResult<()> {
         let reply = self.write_read_meter(proto::CMD_STATUS)?;
-        let status = match proto::scan_status(&reply) {
+        let (items, s) = proto::scan_status(&reply);
+        // C++'s sscanf stores each item it assigns, on failure too.
+        if items >= 1 {
+            self.ip_address.clone_from(&s.ip);
+        }
+        if items >= 2 {
+            self.module_id = s.module_id;
+        }
+        if items >= 3 {
+            self.firmware_version.clone_from(&s.firmware);
+        }
+        let status = match (items, s) {
             (7, status) => status,
             (items, s) => {
                 asyn_print!(
@@ -408,6 +429,29 @@ impl PortDriver for NslsEmDriver {
         &mut self.base.port_base
     }
 
+    /// C++ `drvNSLS_EM::report`, which ends in the base report.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(out, "drvNSLS_EM: port={}", self.base.port_base.port_name);
+        if level > 0 {
+            let scale_factor = self.state.lock().scale_factor;
+            let _ = writeln!(out, "  IP address:       {}", self.ip_address);
+            let _ = writeln!(out, "  Module ID:        {}", self.module_id);
+            let _ = writeln!(out, "  Firmware version: {}", self.firmware_version);
+            let _ = writeln!(out, "  Scale factor:     {}", fmt_e(scale_factor, 6, false));
+        }
+        let _ = writeln!(
+            out,
+            "  Number of modules found on network={}",
+            self.modules.len()
+        );
+        for (i, m) in self.modules.iter().enumerate() {
+            let _ = writeln!(out, "    Module {i}");
+            let _ = writeln!(out, "      Module ID:  {}", m.module_id);
+            let _ = writeln!(out, "      IP address: {}", m.ip);
+        }
+        self.asyn_port_driver_report(out, level);
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.qe_write_int32(user.reason, user.addr, value)
     }
@@ -529,6 +573,10 @@ pub fn create_nsls_em(
         command: transport.command,
         shared: shared.clone(),
         state: state.clone(),
+        ip_address: String::new(),
+        module_id,
+        firmware_version: String::new(),
+        modules: std::mem::take(&mut transport.modules),
     };
     // C++ leaves the meter untouched at construction: it may be offline, and
     // reset() is what the user runs once it is up. The scale factor still needs
@@ -601,6 +649,53 @@ mod tests {
         assert_eq!(
             e.partial_read().map(|p| p.data.as_slice()),
             Some(&b"12.3"[..])
+        );
+    }
+
+    #[test]
+    fn report_prints_cs_block_then_the_base_report() {
+        let (command, runtime) = create_ip_port(
+            "QE_NSLS_REPORT_IP",
+            "127.0.0.1:1",
+            Duration::from_millis(50),
+            true,
+            true,
+        )
+        .unwrap();
+        std::mem::forget(runtime);
+        let drv = NslsEmDriver {
+            base: QuadEmBase::new("QE_NSLS_REPORT", 0).unwrap(),
+            command,
+            shared: QuadEmShared::new(16).0,
+            state: Arc::new(parking_lot::Mutex::new(NslsState {
+                scale_factor: 5.722e-15,
+                ping_pong: PingPong::Both,
+            })),
+            ip_address: "10.0.0.5".into(),
+            module_id: 3,
+            firmware_version: "1.23".into(),
+            modules: vec![proto::ModuleInfo {
+                module_id: 3,
+                ip: "10.0.0.5".into(),
+            }],
+        };
+        let block = "  Number of modules found on network=1\n    Module 0\n      \
+                     Module ID:  3\n      IP address: 10.0.0.5\n";
+        let mut out = String::new();
+        drv.report(&mut out, 0);
+        assert_eq!(
+            out,
+            format!("drvNSLS_EM: port=QE_NSLS_REPORT\n{block}Port: QE_NSLS_REPORT\n")
+        );
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.starts_with(&format!(
+                "drvNSLS_EM: port=QE_NSLS_REPORT\n  IP address:       10.0.0.5\n  \
+                 Module ID:        3\n  Firmware version: 1.23\n  \
+                 Scale factor:     5.722000e-15\n{block}Port: QE_NSLS_REPORT\n"
+            )),
+            "{out}"
         );
     }
 

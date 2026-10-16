@@ -3,6 +3,7 @@
 //! port.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -41,11 +42,16 @@ pub struct TetrAmmDriver {
     shared: Arc<QuadEmShared>,
     p_interlock_status: usize,
     firmware_version: String,
+    /// C++ `QEPortName_`, printed by [`PortDriver::report`].
+    qe_port_name: String,
+    /// C++ `numResync_`: the read thread counts, the report prints.
+    num_resync: Arc<AtomicU64>,
 }
 
 impl TetrAmmDriver {
     fn new(
         port_name: &str,
+        qe_port_name: &str,
         io: OctetIo,
         max_memory: usize,
         shared: Arc<QuadEmShared>,
@@ -78,6 +84,8 @@ impl TetrAmmDriver {
             shared,
             p_interlock_status,
             firmware_version: String::new(),
+            qe_port_name: qe_port_name.to_string(),
+            num_resync: Arc::new(AtomicU64::new(0)),
         };
 
         // C++ calls getFirmwareVersion() from the constructor, ignoring its
@@ -498,6 +506,19 @@ impl PortDriver for TetrAmmDriver {
         &mut self.base.port_base
     }
 
+    /// C++ `drvTetrAMM::report` at details 0.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "drvTetrAMM: port={}, IP port={}, firmware version={}, numResync={}",
+            self.base.port_base.port_name,
+            self.qe_port_name,
+            self.firmware_version,
+            self.num_resync.load(Ordering::Relaxed)
+        );
+        self.asyn_port_driver_report(out, level);
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.qe_write_int32(user.reason, user.addr, value)
     }
@@ -516,6 +537,7 @@ struct ReadContext {
     handle: PortHandle,
     params: QuadEmParams,
     shared: Arc<QuadEmShared>,
+    num_resync: Arc<AtomicU64>,
 }
 
 /// C++ `drvTetrAMM::readThread`.
@@ -525,7 +547,6 @@ fn read_thread(ctx: ReadContext) {
     let mut next_expected_edge = 0;
     let mut num_trig_starts = 0i64;
     let mut num_trig_ends = 0i64;
-    let mut num_resync = 0u64;
 
     loop {
         if !ctx.shared.is_acquiring() {
@@ -603,7 +624,7 @@ fn read_thread(ctx: ReadContext) {
                             WARNING,
                             "drvTetrAMM::readThread: warning, lost sync, no NaN where expected; resynchronizing"
                         );
-                        resync(&ctx, num_channels, &mut num_resync);
+                        resync(&ctx, num_channels);
                     }
                 }
             }
@@ -676,7 +697,7 @@ fn report_read_failure(handle: &PortHandle, read: &AsynResult<ReadOutcome>, bina
 /// bytes that follow it so the next read lands on a frame boundary. A failed
 /// read is scanned for what it did transfer, as C++ scans its buffer
 /// regardless of the read status.
-fn resync(ctx: &ReadContext, num_channels: usize, num_resync: &mut u64) {
+fn resync(ctx: &ReadContext, num_channels: usize) {
     let doubled = proto::binary_frame_len(num_channels) * 2;
     let data = match ctx.io.read_binary(doubled) {
         Ok(outcome) => outcome.data,
@@ -686,7 +707,7 @@ fn resync(ctx: &ReadContext, num_channels: usize, num_resync: &mut u64) {
         Some(offset) => {
             let remainder = proto::resync_remainder(num_channels, offset);
             let _ = ctx.io.read_binary(remainder);
-            *num_resync += 1;
+            ctx.num_resync.fetch_add(1, Ordering::Relaxed);
             asyn_print!(
                 ctx.handle,
                 WARNING,
@@ -743,12 +764,13 @@ pub fn create_tetramm(
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
     let io = connect_octet(qe_port_name, proto::TETRAMM_TIMEOUT)?;
-    let driver = TetrAmmDriver::new(port_name, io, max_memory, shared.clone())?;
+    let driver = TetrAmmDriver::new(port_name, qe_port_name, io, max_memory, shared.clone())?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
     let pool = driver.base.pool.clone();
     let outputs = driver.base.outputs.clone();
     let io = driver.io.clone();
+    let num_resync = driver.num_resync.clone();
     let acquire_param = nd_params.acquire;
 
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
@@ -759,6 +781,7 @@ pub fn create_tetramm(
         handle: handle.clone(),
         params,
         shared: shared.clone(),
+        num_resync,
     };
     let read_thread_handle = thread::Builder::new()
         .name("drvTetrAMMTask".into())
@@ -865,7 +888,20 @@ mod tests {
         std::mem::forget(runtime);
         // st.cmd's asynOctetSetOutputEos; the driver sets only the input EOS.
         io.set_output_eos(b"\r").unwrap();
-        TetrAmmDriver::new(name, io, 0, QuadEmShared::new(16).0).unwrap()
+        TetrAmmDriver::new(name, name, io, 0, QuadEmShared::new(16).0).unwrap()
+    }
+
+    #[test]
+    fn report_prints_cs_line_then_the_base_report() {
+        let drv = driver_on("QE_TETRA_REPORT", "127.0.0.1:1");
+        drv.num_resync.fetch_add(3, Ordering::Relaxed);
+        let mut out = String::new();
+        drv.report(&mut out, 0);
+        assert_eq!(
+            out,
+            "drvTetrAMM: port=QE_TETRA_REPORT, IP port=QE_TETRA_REPORT, \
+             firmware version=Unknown, numResync=3\nPort: QE_TETRA_REPORT\n"
+        );
     }
 
     #[test]

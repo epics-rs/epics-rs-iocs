@@ -49,6 +49,8 @@ pub struct Pcr4Driver {
     io: OctetIo,
     shared: Arc<QuadEmShared>,
     firmware_version: String,
+    /// C++ `QEPortName_`, printed by [`PortDriver::report`].
+    qe_port_name: String,
     /// C++ `versionNumber_`, parsed out of the `PCR4v<n>` firmware string and
     /// used only to pick the range enum.
     version_number: i32,
@@ -86,6 +88,7 @@ impl Pcr4Driver {
             io,
             shared,
             firmware_version: String::new(),
+            qe_port_name: qe_port_name.to_string(),
             version_number: 0,
         };
 
@@ -495,6 +498,17 @@ impl PortDriver for Pcr4Driver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base.port_base
+    }
+
+    /// C++ `drvPCR4::report` at details 0. `numResync_` is never incremented
+    /// by C++ (drvPCR4.cpp:78 is its only store), so it prints 0.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "drvPCR4: port={}, IP port={}, firmware version={}, numResync=0",
+            self.base.port_base.port_name, self.qe_port_name, self.firmware_version
+        );
+        self.asyn_port_driver_report(out, level);
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {

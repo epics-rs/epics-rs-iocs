@@ -285,6 +285,17 @@ impl PortDriver for Fx4Driver {
         &mut self.base.port_base
     }
 
+    /// C++ `drvFX4::report`, which ends in the base report.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "drvFX4: port={} connected={}",
+            self.base.port_base.port_name,
+            i32::from(self.link.is_connected())
+        );
+        self.asyn_port_driver_report(out, level);
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         self.qe_write_int32(user.reason, user.addr, value)
     }

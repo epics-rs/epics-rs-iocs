@@ -511,6 +511,10 @@ impl PortDriver for T4uDriver {
         &mut self.base.port_base
     }
 
+    /// C++ `drvT4U_EM::report` and `drvT4UDirect_EM::report` return without
+    /// printing, not even the base report.
+    fn report(&self, _out: &mut dyn std::fmt::Write, _level: i32) {}
+
     /// C++ `drvT4U_EM::writeInt32` / `drvT4UDirect_EM::writeInt32`.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;

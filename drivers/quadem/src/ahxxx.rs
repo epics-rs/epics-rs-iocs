@@ -79,6 +79,8 @@ pub struct AhxxxDriver {
     /// known. Shared with the read thread, which decodes accordingly.
     ah401_series: Arc<AtomicBool>,
     firmware_version: String,
+    /// C++ `QEPortName_`, printed by [`PortDriver::report`].
+    qe_port_name: String,
 }
 
 impl AhxxxDriver {
@@ -112,6 +114,7 @@ impl AhxxxDriver {
             model,
             ah401_series,
             firmware_version: String::new(),
+            qe_port_name: qe_port_name.to_string(),
         };
 
         // C++ constructor calls reset() under the port lock and ignores its
@@ -495,6 +498,16 @@ impl PortDriver for AhxxxDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base.port_base
+    }
+
+    /// C++ `drvAHxxx::report`, which ends in the base report.
+    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+        let _ = writeln!(
+            out,
+            "drvAHxxx: port={}, IP port={}, firmware version={}",
+            self.base.port_base.port_name, self.qe_port_name, self.firmware_version
+        );
+        self.asyn_port_driver_report(out, level);
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
