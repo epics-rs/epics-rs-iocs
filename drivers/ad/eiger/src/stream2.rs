@@ -1535,7 +1535,7 @@ mod tests {
             vec![NDDimension::new(64)],
             NDDataBuffer::U32(pixels.clone()),
         );
-        let lz4 = ad_plugins_rs::codec::compress_lz4hdf5(&src).unwrap();
+        let lz4 = ad_plugins_rs::codec::compress_lz4hdf5(&src, 0).unwrap();
         let blob = lz4.data.as_u8_slice().to_vec();
 
         let mut w = W::default();
