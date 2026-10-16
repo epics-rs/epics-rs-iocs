@@ -327,7 +327,7 @@ impl DeviceSupport for VacSen {
             cell,
             pass: Pass::Idle,
         });
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     /// C `readWrite_vs` with `pact == 0`.
@@ -517,7 +517,7 @@ mod tests {
             val: 1e-7,
             ..Default::default()
         };
-        assert!(matches!(dev.init(&mut rec), Ok(DeviceInitOutcome::Live)));
+        assert!(matches!(dev.init(&mut rec), Ok(o) if o == DeviceInitOutcome::ok()));
         let db = PvDatabase::new();
         let done = DeviceDone::new(&db, &RecordInstance::new("V:G1", VsRecord::default()));
 

@@ -352,7 +352,7 @@ impl DeviceSupport for DigitelPump {
             cell,
             pass: Pass::Idle,
         });
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     /// C `readWrite_dg` with `pact == 0`, and the record's `!pact` snapshot.
@@ -610,7 +610,7 @@ mod tests {
         });
         dev.set_record_info("V:IP1", ScanType::Passive);
         let mut rec = d500();
-        assert!(matches!(dev.init(&mut rec), Ok(DeviceInitOutcome::Live)));
+        assert!(matches!(dev.init(&mut rec), Ok(o) if o == DeviceInitOutcome::ok()));
         (dev, path, runtime)
     }
 
