@@ -429,6 +429,20 @@ mod tests {
         assert_eq!(AgUcModel::from_version("mystery"), None);
     }
 
+    /// AG_UC.cpp:52-81: a missing serial port still builds the controller and
+    /// its axes; VE fails, so the poller is never started.
+    #[test]
+    fn a_controller_of_a_missing_port_is_built_unpolled() {
+        let (handle, status) =
+            SyncIOHandle::connect_port("AG_UC_NONE", 0, Duration::from_millis(10));
+        assert!(status.is_err());
+        let controller = Arc::new(Mutex::new(AgUcController::new(handle)));
+        assert_eq!(controller.lock().unwrap().model(), None);
+        let mut axis = AgUcAxis::new(controller, 0, true, 50, -50);
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        assert!(!status.moving);
+    }
+
     #[test]
     fn uc8pc_detected_before_uc8_substring() {
         // "AG-UC8" is a substring of "AG-UC8PC"; the PC variant must win.

@@ -320,11 +320,10 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
 }
 
 /// A controller `AG_UCCreateController` made, for `AG_UCCreateAxis` to find
-/// by port name: `None` when its serial port could not be connected, as C's
-/// constructor then carries on without it.
+/// by port name.
 struct AgUcRegistration {
     port_name: String,
-    controller: Option<Arc<Mutex<AgUcController>>>,
+    controller: Arc<Mutex<AgUcController>>,
     moving_poll_ms: u64,
     idle_poll_ms: u64,
 }
@@ -351,15 +350,17 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             register_port(ctx, &port_name, c_int(args, 2))?;
-            let controller = match connect_serial(&serial_port, AG_UC_TIMEOUT) {
-                Ok(handle) => Some(Arc::new(Mutex::new(AgUcController::new(handle)))),
-                Err(_) => {
-                    eprintln!(
-                        "AG_UCController::AG_UCController: cannot connect to Agilis controller"
-                    );
-                    None
-                }
-            };
+            // C goes on to RS/MR/VE on the unconnected user; VE then fails and
+            // the controller is left without a poller.
+            let (handle, _) = connect_controller(
+                &serial_port,
+                AG_UC_TIMEOUT,
+                &port_name,
+                format_args!(
+                    "AG_UCController::AG_UCController: cannot connect to Agilis controller"
+                ),
+            );
+            let controller = Arc::new(Mutex::new(AgUcController::new(handle)));
             AG_UC_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -398,9 +399,6 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 };
                 (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
-            };
-            let Some(controller) = controller else {
-                return Ok(CommandOutcome::Continue);
             };
             let ax = AgUcAxis::new(
                 controller,
