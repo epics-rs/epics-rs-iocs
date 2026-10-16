@@ -198,8 +198,10 @@ impl PIC630Controller {
         if cmd.is_empty() {
             return Ok(());
         }
-        self.handle.write_octet(0, cmd.as_bytes())?;
-        let _ = self.recv(); // consume + discard the echo
+        // Consume + discard the echo. The exchange flushes stale input first,
+        // so a stray line cannot be taken for the echo; C ignores the echo
+        // read's outcome, and so does this.
+        let _ = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
         Ok(())
     }
 

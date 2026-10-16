@@ -140,13 +140,9 @@
 //!   `AsynMotor` counterpart either and are not ported.
 //!
 //! ## Not modeled (documented deviations)
-//! - **`recv_mess(..., FLUSH)`**: before retrying after a non-`NORMAL` comm
-//!   state, C discards any buffered input via a non-blocking port-level
-//!   flush. [`epics_rs::asyn::sync_io::SyncIOHandle`] exposes no synchronous
-//!   flush primitive (only `read_octet`/`write_octet`); emulating it with a
-//!   blocking read would stall `poll()` for a full timeout when nothing is
-//!   buffered, which is worse than the omission. Skipped — a minor hygiene
-//!   gap on an already-degraded comm path, not a wire-command difference.
+//! - **`recv_mess(..., FLUSH)`**: C flushes buffered input only before
+//!   retrying after a non-`NORMAL` comm state; this port flushes before every
+//!   query (`exchange`), a superset that also covers that retry.
 //! - **PREM/POST** (record pre/post-move command strings): handled generically
 //!   by this workspace's motor-rs record layer, not per-driver, matching
 //!   every other port here.
@@ -283,8 +279,7 @@ impl PIC862Controller {
 
         let select_cmd = format!("\u{1}{addr:X}VE");
         for _ in 0..3 {
-            ctrl.send(&select_cmd)?;
-            let (reply, raw_len) = ctrl.recv();
+            let (reply, raw_len) = ctrl.exchange(&select_cmd);
             if raw_len > 0 {
                 ctrl.ident = reply;
                 break;
@@ -311,14 +306,21 @@ impl PIC862Controller {
         Ok(())
     }
 
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> (String, usize) {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
     /// Read one reply, unconditionally dropping the last byte (C
     /// `recv_mess`'s "Strip trailing CR" — always removes the last byte,
     /// not just an actual CR). Returns `(reply, raw_len)`; `raw_len` is the
     /// pre-strip byte count (C's `charcnt`), needed by callers that gate on
     /// it directly. Any transport failure or empty read folds into `("", 0)`,
     /// matching `recv_mess`'s swallow of a bad read into an empty string.
-    fn recv(&self) -> (String, usize) {
-        match self.handle.read_octet(0, READ_BUF) {
+    fn reply(read: AsynResult<Vec<u8>>) -> (String, usize) {
+        match read {
             Ok(raw) if !raw.is_empty() => {
                 let stripped = &raw[..raw.len() - 1];
                 (String::from_utf8_lossy(stripped).into_owned(), raw.len())
@@ -334,8 +336,7 @@ impl PIC862Controller {
     /// cached status (debounced retry) or flag a hard comm error, decided by
     /// [`Self::comm_state`] after the call.
     fn poll_status(&mut self) -> Option<PolledStatus> {
-        let _ = self.send("TS");
-        let (ts_reply, ts_raw_len) = self.recv();
+        let (ts_reply, ts_raw_len) = self.exchange("TS");
         let regs = if ts_raw_len > 18 {
             parse_ts_reply(&ts_reply)
         } else {
@@ -359,8 +360,7 @@ impl PIC862Controller {
             (!bits.plus_ls_raw, !bits.minus_ls_raw)
         };
 
-        let _ = self.send("TP");
-        let (tp_reply, _) = self.recv();
+        let (tp_reply, _) = self.exchange("TP");
         let position = parse_value_at(&tp_reply, 2).map_or(0.0, |v| nint(v) as f64);
 
         Some(PolledStatus {
