@@ -287,12 +287,18 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             register_port(ctx, &port_name, agap::NUM_AXES as i32)?;
-            let Ok(handle) = connect_serial(&serial_port, AGAP_TIMEOUT) else {
-                eprintln!(
+            // C returns from the constructor here: the port has no axes.
+            let (handle, connected) = connect_controller(
+                &serial_port,
+                AGAP_TIMEOUT,
+                &port_name,
+                format_args!(
                     "AGAP_CONEXController::AGAP_CONEXController: cannot connect to CONEX controller"
-                );
+                ),
+            );
+            if connected.is_err() {
                 return Ok(CommandOutcome::Continue);
-            };
+            }
             let Some(controller) = AgapController::new(handle, controller_id) else {
                 return Ok(CommandOutcome::Continue);
             };
