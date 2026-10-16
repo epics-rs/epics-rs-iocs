@@ -16,7 +16,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::connect_serial;
+use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -64,13 +64,21 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, MVP2001_TIMEOUT)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
+
+            let (handle, _) = connect_controller(
+                &asyn_port,
+                MVP2001_TIMEOUT,
+                &port_name,
+                format_args!(
+                    "MVP2001Controller::MVP2001Controller: cannot connect to MVP 2001 controller"
+                ),
+            );
             let controller = Arc::new(Mutex::new(Mvp2001Controller::new(
                 handle,
                 num_axes as usize,
             )));
 
-            register_port(ctx, &port_name, num_axes as i32)?;
             registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 port_name,
                 Registered {
@@ -126,8 +134,7 @@ pub fn mvp2001_create_axis_command() -> CommandDef {
                 enc_lpr as i32,
                 max_curr as i32,
                 lim_pol as i32,
-            )
-            .map_err(|e| format!("MVP2001CreateAxis: {e}"))?;
+            );
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
             install(
                 ctx,

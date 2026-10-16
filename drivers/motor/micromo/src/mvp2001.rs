@@ -169,7 +169,7 @@ impl Mvp2001Axis {
         encoder_lines_per_rev: i32,
         max_current_ma: i32,
         limit_polarity: i32,
-    ) -> AsynResult<Self> {
+    ) -> Self {
         let axis_index = axis_no as i32 + 1;
         let max_current_ma = if !(100..=2300).contains(&max_current_ma) {
             100
@@ -180,9 +180,10 @@ impl Mvp2001Axis {
 
         let sample_period = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            // Set limit/estop polarity, then home (zeroes position).
-            ctrl.write_only(&format!("{axis_index} LP {limit_polarity}"))?;
-            ctrl.write_only(&format!("{axis_index} HO"))?;
+            // Set limit/estop polarity, then home (zeroes position). C
+            // ignores both statuses (MVP2001Driver.cpp:183-188).
+            let _ = ctrl.write_only(&format!("{axis_index} LP {limit_polarity}"));
+            let _ = ctrl.write_only(&format!("{axis_index} HO"));
             // Query loop sample period (4 hex chars); fall back to the default.
             ctrl.query(&format!("{axis_index} SR"))
                 .ok()
@@ -190,13 +191,13 @@ impl Mvp2001Axis {
                 .unwrap_or(DEFAULT_SAMPLE_PERIOD)
         };
 
-        Ok(Self {
+        Self {
             controller,
             axis_index,
             encoder_lines_per_rev,
             max_current_ma,
             sample_period,
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Mvp2001Controller> {
@@ -361,6 +362,14 @@ impl AsynMotor for Mvp2001Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_axis_of_an_unanswering_controller_is_still_built() {
+        let (handle, _) = SyncIOHandle::connect_port("MVP2001_NONE", 0, Duration::ZERO);
+        let controller = Arc::new(Mutex::new(Mvp2001Controller::new(handle, 1)));
+        let axis = Mvp2001Axis::new(controller, 0, 512, 500, 1);
+        assert_eq!(axis.sample_period, DEFAULT_SAMPLE_PERIOD);
+    }
 
     #[test]
     fn parse_hex_reply_offset_and_width() {
