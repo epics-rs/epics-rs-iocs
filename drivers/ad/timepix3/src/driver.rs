@@ -737,15 +737,6 @@ impl TimePix3Driver {
                 )
             })?;
         self.http_ok();
-
-        // The stream workers follow the Base PVs.
-        self.shared.set_stream_paths(
-            dest.preview_image.first().map(|c| c.base.clone()),
-            dest.image.first().map(|c| c.base.clone()),
-            dest.preview_histogram
-                .as_ref()
-                .map(|h| h.image.base.clone()),
-        );
         Ok(())
     }
 
@@ -1213,10 +1204,6 @@ impl TimePix3Driver {
             }
         }
 
-        self.init_acquisition().map_err(|_| FAILED)?;
-        self.file_writer().map_err(|_| FAILED)?;
-        self.get_server().map_err(|_| FAILED)?;
-
         if !self
             .shared
             .acquisition
@@ -1235,6 +1222,7 @@ impl TimePix3Driver {
             );
             return Err(FAILED);
         }
+        self.sync_stream_endpoints();
 
         if self.cmd_tx.try_send(Command::AcquisitionStarted).is_err() {
             return Err("Failed to create measurement monitor thread");
@@ -1244,6 +1232,34 @@ impl TimePix3Driver {
             return Err("Acquisition start was cancelled before commit");
         }
         Ok(())
+    }
+
+    /// C `syncTcpStreamEndpoints` (acquire.cpp:201-223): the workers stream
+    /// from the enabled channels' Base PVs as they stand at the start.
+    fn sync_stream_endpoints(&mut self) {
+        let p = self.p;
+        let enabled = |this: &Self, write: usize, base: usize| {
+            (this.int(write, 0) != 0).then(|| this.text(base, 0))
+        };
+        let prv_img = enabled(self, p.write_prv_img, p.prv_img_base);
+        let img = enabled(self, p.write_img, p.img_base);
+        let prv_hst = enabled(self, p.write_prv_hst, p.prv_hst_base);
+        let mut checked = vec![];
+        if prv_img.is_some() {
+            checked.push(p.prv_img_base);
+        }
+        if self.int(p.write_prv_img1, 0) != 0 {
+            checked.push(p.prv_img1_base);
+        }
+        if img.as_deref().is_some_and(|b| b.starts_with("tcp://")) {
+            checked.push(p.img_base);
+        }
+        for base in checked {
+            if let Some(channel) = CHANNEL_PATHS.iter().find(|c| (c.base)(&p) == base) {
+                let _ = self.check_channel_path(channel);
+            }
+        }
+        self.shared.set_stream_paths(prv_img, img, prv_hst);
     }
 
     /// C `acquireStop` (acquire.cpp:696-698).
@@ -2528,6 +2544,37 @@ mod tests {
             det.text(det.ad.params.status_message, 0),
             "Acquisition stopped (remote state reconciled)"
         );
+    }
+
+    /// A start sends no configuration; the workers take the enabled
+    /// channels' Base PVs (acquire.cpp:313-535, :201-223).
+    #[test]
+    fn a_start_sends_no_configuration_and_syncs_the_streams() {
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_START_SYNC",
+            Arc::new(ServalHttp::new(&fake_serval("/server/destination"))),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.ad
+            .port_base
+            .set_int32_param(p.write_prv_img, 0, 1)
+            .unwrap();
+        det.set_text(p.prv_img_base, "tcp://listen@localhost:8089")
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(det.ad.params.acquire), 1)
+            .unwrap();
+        let paths = shared.stream_paths();
+        assert_eq!(
+            paths.prv_img.as_deref(),
+            Some("tcp://listen@localhost:8089")
+        );
+        assert_eq!(paths.img, None);
     }
 
     /// An accumulation setting reads back clamped to C's range
