@@ -192,7 +192,7 @@ impl PortDriver for SimDetector {
                 line!(),
                 format_args!(
                     "simDetector:writeInt32 error, status={} function={reason}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -230,7 +230,7 @@ impl PortDriver for SimDetector {
                 line!(),
                 format_args!(
                     "simDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -408,6 +408,44 @@ mod tests {
         let mut user = AsynUser::new(reason).with_addr(1);
         f.det.write_int32(&mut user, 1).unwrap();
         assert_eq!(f.get_i32(reason), 1);
+    }
+
+    /// simDetector.cpp:948-951 prints setIntegerParam's asynParamWrongType
+    /// for an int written to a simulation double.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "SIM_STATUS_CODE";
+        let mut det = {
+            let (start_tx, _) = rt::command_channel::<Signal>(1);
+            let (stop_tx, _) = rt::command_channel::<Signal>(1);
+            SimDetector::new(port, 64, 48, NDDataType::UInt8, 0, start_tx, stop_tx).unwrap()
+        };
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            epics_rs::asyn::trace::TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(
+                file,
+            ))),
+        );
+        let reason = det.sim.gain_x;
+        let mut user = AsynUser::new(reason);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(det.write_int32(&mut user, 1).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "simDetector:writeInt32 error, status=8 function={reason}, value=1"
+            )),
+            "{text}"
+        );
     }
 
     /// simDetector inherits `asynNDArrayDriver::writeOctet`, so an
