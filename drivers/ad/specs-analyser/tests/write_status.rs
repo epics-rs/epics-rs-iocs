@@ -36,12 +36,15 @@ fn healthy(command: &str) -> String {
     }
 }
 
-/// A detector on a fake server that answers `ERROR <code> refused` to every
-/// command starting with one of the prefixes last passed to `refuse`; `heard`
+/// Commands starting with a prefix get `ERROR <code> refused`, or no reply at
+/// all for code 0.
+type Rules = Vec<(&'static str, u32)>;
+
+/// A detector on a fake server that answers by the rules last armed; `heard`
 /// gets each request's counter.
 struct Fake {
     runtime: SpecsAnalyserRuntime,
-    arm: mpsc::Sender<(u32, Vec<&'static str>)>,
+    arm: mpsc::Sender<Rules>,
     heard: mpsc::Receiver<u32>,
 }
 
@@ -54,29 +57,30 @@ impl Fake {
     fn start_refusing(name: &str, code: u32, refuse: &[&'static str]) -> Fake {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let (arm, armed) = mpsc::channel::<(u32, Vec<&'static str>)>();
-        arm.send((code, refuse.to_vec())).unwrap();
+        let (arm, armed) = mpsc::channel::<Rules>();
+        arm.send(refuse.iter().map(|&p| (p, code)).collect())
+            .unwrap();
         let (tell, heard) = mpsc::channel();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("connection");
-            let mut refuse = (0, Vec::new());
+            let mut rules = Rules::new();
             let mut buf = [0u8; 4096];
             // No EOS on the port: one read is one request.
             while let Ok(n) = stream.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
-                refuse = armed.try_iter().last().unwrap_or(refuse);
+                rules = armed.try_iter().last().unwrap_or(rules);
                 let line = String::from_utf8_lossy(&buf[..n]).trim().to_string();
                 let (counter, command) = line.trim_start_matches('?').split_at(4);
                 let command = command.trim().to_string();
-                let reply = if refuse.1.iter().any(|r| command.starts_with(r)) {
-                    format!("ERROR {} refused", refuse.0)
-                } else {
-                    healthy(&command)
-                };
                 let counter: u32 = counter.parse().unwrap();
                 let _ = tell.send(counter);
+                let reply = match rules.iter().find(|(p, _)| command.starts_with(p)) {
+                    Some((_, 0)) => continue,
+                    Some((_, code)) => format!("ERROR {code} refused"),
+                    None => healthy(&command),
+                };
                 // One write, so one read takes the whole reply.
                 let frame = format!("!{counter:04} {reply}");
                 if stream.write_all(frame.as_bytes()).is_err() {
@@ -117,7 +121,11 @@ impl Fake {
     }
 
     fn refuse(&self, code: u32, commands: &[&'static str]) {
-        self.arm.send((code, commands.to_vec())).unwrap();
+        self.answer(&commands.iter().map(|&p| (p, code)).collect::<Rules>());
+    }
+
+    fn answer(&self, rules: &[(&'static str, u32)]) {
+        self.arm.send(rules.to_vec()).unwrap();
     }
 
     fn reason(&self, name: &str) -> usize {
@@ -179,6 +187,19 @@ fn a_refused_spectrum_parameter_read_fails_the_connect() {
     // Connect write below is not skipped.
     let fake = Fake::start_refusing("SPECS_WS_CONNECT", 3, &["Connect"]);
     fake.refuse(7, &["GetSpectrumParameterInfo"]);
+    let connect = fake.runtime.specs_params.connect;
+    assert_eq!(fake.write_int32(connect, 1), Err(AsynStatus::Error));
+}
+
+/// writeInt32 ORs the Connect step statuses (specsAnalyser.cpp:803-813): a
+/// timeout (1) then a refusal (3) is asynError, not the first step's timeout.
+#[test]
+fn connect_returns_the_or_of_the_step_statuses() {
+    let fake = Fake::start_refusing("SPECS_WS_CONNOR", 3, &["Connect"]);
+    fake.answer(&[
+        ("GetSpectrumParameterInfo ParameterName:\"LensMode\"", 0),
+        ("GetSpectrumParameterInfo", 7),
+    ]);
     let connect = fake.runtime.specs_params.connect;
     assert_eq!(fake.write_int32(connect, 1), Err(AsynStatus::Error));
 }

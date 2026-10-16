@@ -59,6 +59,14 @@ impl From<WireError> for AsynError {
 }
 
 impl WireError {
+    /// The asynStatus C's exchange returns for it.
+    pub fn status(&self) -> AsynStatus {
+        match self {
+            WireError::Io(e) => e.status(),
+            _ => AsynStatus::Error,
+        }
+    }
+
     /// The error's text.
     pub fn status_message(&self) -> String {
         match self {

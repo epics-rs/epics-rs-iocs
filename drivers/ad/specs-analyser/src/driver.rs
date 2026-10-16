@@ -174,9 +174,8 @@ impl SpecsAnalyserDriver {
     /// C `SpecsAnalyser::makeConnection` + the always-run
     /// `readSpectrumParameter`/`readRunModes` calls that both the
     /// constructor and `writeInt32`'s `SPECSConnect_` case perform
-    /// (`specsAnalyser.cpp:153-169`, `798-814`). The status is the first
-    /// failing step's: C ORs the step statuses, which can only differ from
-    /// that by mixing two different failure codes into a third.
+    /// (`specsAnalyser.cpp:153-169`, `798-814`), with C's OR of the step
+    /// statuses.
     fn reconnect(&mut self) -> AsynResult<()> {
         let first_connect = self.first_connect;
         let outcome = self.with_wire(move |link| {
@@ -284,10 +283,22 @@ impl SpecsAnalyserDriver {
             enum_choices(&outcome.run_modes),
         );
 
-        outcome.connection?;
-        outcome.lens_modes?;
-        outcome.scan_ranges?;
-        Ok(())
+        let failures = [
+            outcome.connection.err(),
+            outcome.lens_modes.err(),
+            outcome.scan_ranges.err(),
+        ];
+        let code = failures
+            .iter()
+            .flatten()
+            .fold(0, |code, e| code | e.status() as i32);
+        match failures.into_iter().flatten().next() {
+            None => Ok(()),
+            Some(first) => Err(AsynError::Status {
+                status: status_from_c_code(code),
+                message: first.status_message(),
+            }),
+        }
     }
 
     /// `SpecsAnalyser::writeInt32`'s `SPECSDefine_` case
@@ -499,6 +510,18 @@ struct ReconnectOutcome {
     lens_modes: Result<Vec<String>, wire::WireError>,
     scan_ranges: Result<Vec<String>, wire::WireError>,
     run_modes: Vec<String>,
+}
+
+/// An ORed asynStatus. 6 and 7 name no status; device support gives them
+/// asynError's alarm (asynEpicsUtils.c asynStatusToEpicsAlarm `default:`).
+fn status_from_c_code(code: i32) -> AsynStatus {
+    match code {
+        1 => AsynStatus::Timeout,
+        2 => AsynStatus::Overflow,
+        4 => AsynStatus::Disconnected,
+        5 => AsynStatus::Disabled,
+        _ => AsynStatus::Error,
+    }
 }
 
 fn lens_modes_default() -> Arc<Mutex<Vec<String>>> {
