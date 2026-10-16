@@ -85,7 +85,8 @@ pub struct XpsAxis {
 impl XpsAxis {
     /// Build an axis for `positioner_name` (`group.positioner`) over its own
     /// `Fire`-mode move socket, registering it with the controller and reading
-    /// its S-gamma jerk times (C `XPSAxis` constructor).
+    /// its S-gamma jerk times and corrector (C `XPSAxis` constructor, which
+    /// cannot fail).
     pub fn new(
         controller: Arc<Mutex<XpsController>>,
         move_sock: XpsSocket,
@@ -93,7 +94,7 @@ impl XpsAxis {
         axis_no: i32,
         positioner_name: &str,
         step_size: f64,
-    ) -> AsynResult<Self> {
+    ) -> Self {
         let trace = MotorTrace::new(motor_port, axis_no);
         if !positioner_name.contains('.') {
             trace_error(
@@ -103,15 +104,19 @@ impl XpsAxis {
             );
         }
         let group_name = group_of(positioner_name).to_string();
-        let (min_jerk, max_jerk) = {
+        let (min_jerk, max_jerk, pid) = {
             let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            // C ignores a failed read; its jerk times are then whatever the
+            // uninitialised locals held, here 0.
             let (_vel, _accel, min_jerk, max_jerk) = ctrl
                 .poll_socket()
-                .positioner_sgamma_parameters_get(positioner_name)?;
+                .positioner_sgamma_parameters_get(positioner_name)
+                .unwrap_or_default();
+            let pid = corrector::get_pid(ctrl.poll_socket(), positioner_name);
             ctrl.register_axis(positioner_name, &group_name);
-            (min_jerk, max_jerk)
+            (min_jerk, max_jerk, pid)
         };
-        Ok(Self {
+        let axis = Self {
             controller,
             move_sock,
             positioner_name: positioner_name.to_string(),
@@ -128,7 +133,13 @@ impl XpsAxis {
                 ..Default::default()
             },
             trace,
-        })
+        };
+        // C reads the corrector into `xpsCorrectorInfo_`, which nothing here
+        // keeps: setPID re-reads it.
+        if let Err(failure) = pid {
+            axis.report_get_pid_failure(&failure);
+        }
+        axis
     }
 
     /// `asynPrint(pasynUser_, ASYN_TRACE_ERROR, "%s:%s: ...", driverName,
@@ -259,13 +270,7 @@ impl XpsAxis {
     /// C `setPID`'s line for the step that failed.
     fn report_pid_failure(&self, failure: &PidFailure) {
         let (port, axis) = (self.port(), self.axis_no());
-        let name = |ct: &CorrectorType| match ct {
-            CorrectorType::PiPosition => "PIPosition",
-            CorrectorType::PidFfVelocity => "PIDFFVelocity",
-            CorrectorType::PidFfAcceleration => "PIDFFAcceleration",
-            CorrectorType::PidDualFfVoltage => "PIDDualFFVoltage",
-            CorrectorType::NoCorrector | CorrectorType::Other => "",
-        };
+        let name = |ct: &CorrectorType| ct.short_name();
         match failure {
             PidFailure::TypeGet(code) => self.error(
                 "setPID",
@@ -307,6 +312,39 @@ impl XpsAxis {
             ),
             PidFailure::Unsupported(_, type_name) => self.error(
                 "setPID",
+                format_args!(
+                    ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID."
+                ),
+            ),
+        }
+    }
+
+    /// C `getPID`'s line for the step that failed; its wording differs from
+    /// `setPID`'s.
+    fn report_get_pid_failure(&self, failure: &PidFailure) {
+        let (port, axis) = (self.port(), self.axis_no());
+        match failure {
+            PidFailure::TypeGet(code) => self.error(
+                "getPID",
+                format_args!(
+                    "Error with PositionerCorrectorTypeGet. XPS: {port}, Axis: {axis}, XPS API Error: {code}"
+                ),
+            ),
+            PidFailure::Get(ct, code) | PidFailure::Set(ct, code) => self.error(
+                "getPID",
+                format_args!(
+                    "XPS {port}, Axis: {axis}, Error with PositionerCorrector{}Get. XPS API Error: {code}",
+                    ct.short_name()
+                ),
+            ),
+            PidFailure::Unsupported(CorrectorType::NoCorrector, type_name) => self.error(
+                "getPID",
+                format_args!(
+                    ". XPS {port} axis {axis} corrector type is {type_name}. Cannot get PID."
+                ),
+            ),
+            PidFailure::Unsupported(_, type_name) => self.error(
+                "getPID",
                 format_args!(
                     ". XPS {port} axis {axis} not a valid corrector type: {type_name}. Cannot set PID."
                 ),
@@ -979,8 +1017,8 @@ mod tests {
         }
     }
 
-    fn fake_axis(port: &str) -> (XpsAxis, Arc<Mutex<&'static str>>) {
-        let fail = Arc::new(Mutex::new(""));
+    fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Arc<Mutex<&'static str>>) {
+        let fail = Arc::new(Mutex::new(fail));
         let line = FakeXps {
             base: PortDriverBase::new(port, 1, PortFlags::default()),
             reply: None,
@@ -1002,8 +1040,7 @@ mod tests {
             0,
             "G1.P1",
             1.0,
-        )
-        .unwrap();
+        );
         (axis, fail)
     }
 
@@ -1011,7 +1048,7 @@ mod tests {
     /// only COMM_ERR, keeps what this poll already wrote and every older value.
     #[test]
     fn a_failed_poll_raises_only_comms_error() {
-        let (mut axis, fail) = fake_axis("xps_poll_fail");
+        let (mut axis, fail) = fake_axis("xps_poll_fail", "");
         let user = AsynUser::new(0);
 
         *fail.lock().unwrap() = "PositionerErrorGet";
@@ -1030,11 +1067,24 @@ mod tests {
         assert_eq!(s.position, 1.25);
     }
 
+    /// The C constructor ignores a failed PositionerSGammaParametersGet and a
+    /// failed getPID (XPSAxis.cpp:185-197).
+    #[test]
+    fn a_failed_constructor_read_still_creates_the_axis() {
+        for (port, call) in [
+            ("xps_new_sgamma", "PositionerSGammaParametersGet"),
+            ("xps_new_pid", "PositionerCorrectorTypeGet"),
+        ] {
+            let (axis, _) = fake_axis(port, call);
+            assert_eq!(axis.positioner_name, "G1.P1", "{call}");
+        }
+    }
+
     /// XPSAxis.cpp:566-575 fails the poll on GroupStatusStringGet; :628 ignores
     /// a failed PositionerUserTravelLimitsGet.
     #[test]
     fn poll_status_string_fails_and_travel_limits_do_not() {
-        let (mut axis, fail) = fake_axis("xps_poll_string");
+        let (mut axis, fail) = fake_axis("xps_poll_string", "");
         let user = AsynUser::new(0);
 
         *fail.lock().unwrap() = "GroupStatusStringGet";

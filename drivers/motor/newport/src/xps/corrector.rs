@@ -39,6 +39,17 @@ pub enum CorrectorType {
 }
 
 impl CorrectorType {
+    /// The `<T>` of C's `PositionerCorrector<T>Get`/`Set` error lines.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            CorrectorType::PiPosition => "PIPosition",
+            CorrectorType::PidFfVelocity => "PIDFFVelocity",
+            CorrectorType::PidFfAcceleration => "PIDFFAcceleration",
+            CorrectorType::PidDualFfVoltage => "PIDDualFFVoltage",
+            CorrectorType::NoCorrector | CorrectorType::Other => "",
+        }
+    }
+
     fn parse(s: &str) -> Self {
         match s {
             "PositionerCorrectorPIPosition" => CorrectorType::PiPosition,
@@ -84,20 +95,20 @@ pub fn corrector_type(sock: &XpsSocket, positioner: &str) -> XpsResult<Corrector
 }
 
 /// Read the full PID/corrector parameter set for `positioner`, dispatching on
-/// its corrector type (`XPSAxis::getPID`). Returns an error for `NoCorrector`
-/// or an unrecognized type, matching C.
-pub fn get_pid(sock: &XpsSocket, positioner: &str) -> XpsResult<XpsCorrectorInfo> {
+/// its corrector type (`XPSAxis::getPID`). `NoCorrector` or an unrecognized
+/// type is a failure, matching C.
+pub fn get_pid(sock: &XpsSocket, positioner: &str) -> Result<XpsCorrectorInfo, PidFailure> {
+    let name = corrector_type_name(sock, positioner).map_err(|e| PidFailure::TypeGet(e.code()))?;
+    let ct = CorrectorType::parse(&name);
+    if matches!(ct, CorrectorType::NoCorrector | CorrectorType::Other) {
+        return Err(PidFailure::Unsupported(ct, name));
+    }
     let mut info = XpsCorrectorInfo::default();
-    read_into(
-        sock,
-        positioner,
-        corrector_type(sock, positioner)?,
-        &mut info,
-    )?;
+    read_into(sock, positioner, ct, &mut info).map_err(|e| PidFailure::Get(ct, e.code()))?;
     Ok(info)
 }
 
-/// The `XPSAxis::setPID` step that failed, for the caller to print C's line.
+/// The `XPSAxis::getPID`/`setPID` step that failed, for the caller to print C's line.
 #[derive(Debug)]
 pub enum PidFailure {
     /// `PositionerCorrectorTypeGet` failed with this code.

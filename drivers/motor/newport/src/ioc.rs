@@ -631,8 +631,7 @@ impl NewportHolder {
     /// pass 1 in the normal configuration where the record EGU is the
     /// positioner's native unit — NOT the C steps-per-unit value (the asyn-rs
     /// record boundary is EGU, not raw steps). [`XpsAxis::new`]
-    /// performs blocking RPC (reads the S-gamma jerk times), so the controller
-    /// must be reachable when this command runs.
+    /// performs blocking RPC (the S-gamma jerk times and the corrector).
     pub fn xps_create_axis_command(self: &Arc<Self>) -> CommandDef {
         let holder = self.clone();
         CommandDef::new(
@@ -690,8 +689,7 @@ impl NewportHolder {
                     axis,
                     &positioner_name,
                     step_size,
-                )
-                .map_err(|e| format!("XPSCreateAxis: {e}"))?;
+                );
                 let dtyp_key = format!("XPS_{motor_port}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
 

@@ -8,8 +8,8 @@
 # The XPS speaks a text RPC protocol: each socket is one TCP connection.
 # This driver uses one shared POLL socket (all reads) plus one MOVE socket
 # per axis (fire-and-forget motion). XPSCreateAxis reads the positioner's
-# S-gamma jerk times at startup, so the controller must be reachable when it
-# runs. This example configures a single axis (GROUP1.POSITIONER).
+# S-gamma jerk times and corrector at startup and, as C does, ignores a failed
+# read. This example configures a single axis (GROUP1.POSITIONER).
 #============================================================
 
 epicsEnvSet("P",     "XPS:")
