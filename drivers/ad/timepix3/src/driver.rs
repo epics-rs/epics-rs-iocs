@@ -71,6 +71,12 @@ pub fn dac_params(p: &TimePixParams) -> Vec<(&'static str, usize)> {
     DAC_NAMES.iter().map(|(name, f)| (*name, f(p))).collect()
 }
 
+/// C `ADTimePix3Action::oneShotDecision` (one_shot_action.h): an action
+/// parameter runs on 1 only and always reads back 0.
+fn one_shot(value: i32) -> bool {
+    value == 1
+}
+
 pub struct TimePix3Driver {
     pub ad: ADDriverBase,
     pub p: TimePixParams,
@@ -913,33 +919,47 @@ impl PortDriver for TimePix3Driver {
             || reason == p.write_prv_hst
         {
             self.get_server()
-        } else if reason == p.apply_config || reason == p.write_data {
-            let r = self.file_writer().and_then(|()| self.get_server());
-            self.ad.port_base.set_int32_param(p.apply_config, 0, 0)?;
-            r
         } else if reason == p.refresh_connection {
             self.ad
                 .port_base
                 .set_int32_param(p.refresh_connection, 0, 0)?;
-            self.cmd_tx
-                .try_send(Command::RefreshConnection)
-                .map_err(|_| AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: "timepix3: the connection task is not running".into(),
-                })
+            if one_shot(value) {
+                self.cmd_tx
+                    .try_send(Command::RefreshConnection)
+                    .map_err(|_| AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "timepix3: the connection task is not running".into(),
+                    })
+            } else {
+                Ok(())
+            }
         } else if reason == p.refresh_pixel_config {
-            if addr == 0 && value == 1 {
-                self.ad
-                    .port_base
-                    .set_int32_param(p.refresh_pixel_config, 0, 0)?;
+            self.ad
+                .port_base
+                .set_int32_param(p.refresh_pixel_config, 0, 0)?;
+            if addr == 0 && one_shot(value) {
                 self.refresh_pixel_config()
             } else {
                 Ok(())
             }
-        } else if reason == p.write_bp_c_file {
-            self.config_load("pixelconfig", p.bp_c_file_path, p.bp_c_file_name)
-        } else if reason == p.write_da_cs_file {
-            self.config_load("dacs", p.da_cs_file_path, p.da_cs_file_name)
+        } else if reason == p.apply_config {
+            self.ad.port_base.set_int32_param(p.apply_config, 0, 0)?;
+            if one_shot(value) {
+                self.file_writer().and_then(|()| self.get_server())
+            } else {
+                Ok(())
+            }
+        } else if reason == p.write_bp_c_file || reason == p.write_da_cs_file {
+            self.ad.port_base.set_int32_param(reason, addr, 0)?;
+            if !one_shot(value) {
+                Ok(())
+            } else if reason == p.write_bp_c_file {
+                self.config_load("pixelconfig", p.bp_c_file_path, p.bp_c_file_name)
+            } else {
+                self.config_load("dacs", p.da_cs_file_path, p.da_cs_file_name)
+            }
+        } else if reason == p.write_data {
+            self.file_writer().and_then(|()| self.get_server())
         } else if reason == p.detector_orientation {
             self.rotate_layout(value)
         } else if reason == p.bias_volt
@@ -1250,6 +1270,42 @@ mod tests {
             .read_int32_array(&AsynUser::new(p.pixel_config_diff), &mut buf)
             .unwrap();
         assert_eq!((n, buf), (4, [5, 6, 0, 0]));
+    }
+
+    /// The one-shot actions run on 1 only and read back 0 whatever was
+    /// written (one_shot_action.h, ADTimePix.cpp:563-584, :614-621); with no
+    /// Serval behind the driver, running one fails the write.
+    #[test]
+    fn a_one_shot_action_runs_on_one_only() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_ONE_SHOT",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for reason in [
+            p.apply_config,
+            p.write_bp_c_file,
+            p.write_da_cs_file,
+            p.refresh_pixel_config,
+        ] {
+            det.write_int32(&mut AsynUser::new(reason), 2).unwrap();
+            assert_eq!(det.int(reason, 0), 0);
+        }
+        assert!(
+            det.write_int32(&mut AsynUser::new(p.apply_config), 1)
+                .is_err()
+        );
+        assert_eq!(det.int(p.apply_config, 0), 0);
+        assert!(
+            det.write_int32(&mut AsynUser::new(p.write_bp_c_file), 1)
+                .is_err()
+        );
+        assert_eq!(det.int(p.write_bp_c_file, 0), 0);
     }
 
     #[test]
