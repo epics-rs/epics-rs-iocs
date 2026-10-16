@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use crate::drivers::ioc_ready::IocReady;
 use crate::drivers::{asyn_error, refused};
 use crate::receive::ReceiveInterface;
-use crate::registry::{self, ReceiveHandle, ReceiveState};
+use crate::registry::{self, ReceiveHandle};
 use crate::stream::Snapshot;
 
 pub const NUM_JOINTS: usize = 6;
@@ -431,23 +431,20 @@ pub fn start_poller(
 
                 let mut updates = match &snapshot {
                     Some(snap) if !snap.is_empty() => {
-                        let state = ReceiveState {
-                            connected: true,
-                            safety_status_bits: snap
-                                .uint("safety_status_bits")
-                                .map(|b| (b & SAFETY_STATUS_BITS_MASK) as i32)
-                                .unwrap_or_default(),
-                            output_int_register_12: snap
-                                .output_int_register(12)
-                                .unwrap_or_default(),
-                        };
+                        // A param keeps its last value through an outage, as
+                        // C's does; only a received word replaces it.
+                        let mut state = shared.get();
+                        if let Some(bits) = snap.uint("safety_status_bits") {
+                            state.safety_status_bits =
+                                Some((bits & SAFETY_STATUS_BITS_MASK) as i32);
+                        }
+                        if let Some(count) = snap.output_int_register(12) {
+                            state.output_int_register_12 = count;
+                        }
                         shared.set(state);
                         publish(params, snap)
                     }
                     _ => {
-                        let mut state = shared.get();
-                        state.connected = false;
-                        shared.set(state);
                         vec![ParamSetValue::new(
                             params.is_connected,
                             0,

@@ -25,8 +25,6 @@ use crate::spdlog;
 
 pub const NUM_JOINTS: usize = 6;
 
-/// The safety word the control interface will act in: NORMAL only.
-const SAFETY_NORMAL: i32 = 1;
 /// `poll_custom_script()` blocks until the control script is running again,
 /// with this bound (rtde_control_driver.cpp:133).
 const REUPLOAD_TIMEOUT: Duration = Duration::from_secs(1);
@@ -370,17 +368,18 @@ impl ControlDriver {
     /// reconnect, so RECONNECT on a healthy link returns asynError).
     fn try_connect(&self) -> bool {
         let receive = self.receive.get();
-        if receive.safety_status_bits != SAFETY_NORMAL {
+        if !receive.safety_normal() {
             spdlog::error(format_args!(
                 "Cannot connect to control interface in current safety state. \
                  Clear safeguard stop, E-stop, etc. then try again.\n"
             ));
             return false;
         }
-        if !receive.connected {
+        // An undefined mode fails C's readOnce, which returns silently.
+        let Some(running) = self.dashboard.get().robot_running() else {
             return false;
-        }
-        if !self.dashboard.get().robot_running() {
+        };
+        if !running {
             spdlog::error(format_args!(
                 "Unable to connect to control interface in current mode. \
                  Ensure robot is on, in normal mode, and brakes released, then try again.\n"
@@ -914,7 +913,7 @@ pub fn poll_once(
     ));
 
     // A safety event aborts whatever motion is in flight.
-    if receive.get().safety_status_bits != SAFETY_NORMAL {
+    if !receive.get().safety_normal() {
         if inner.pending_motion.is_some() {
             spdlog::debug(format_args!("Motion stopped due to safety."));
             inner.motion_task_done(p, &mut updates);
@@ -1168,8 +1167,7 @@ mod tests {
     fn receive_with_counter(count: i32) -> ReceiveHandle {
         let receive = ReceiveHandle::new();
         receive.set(registry::ReceiveState {
-            connected: true,
-            safety_status_bits: 1,
+            safety_status_bits: Some(1),
             output_int_register_12: count,
         });
         receive

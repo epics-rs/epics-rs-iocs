@@ -181,7 +181,7 @@ impl DashboardDriver {
                 base.set_int32_param(params.is_connected, 0, 1)?;
                 shared.set(DashboardState {
                     connected: true,
-                    robot_mode: String::new(),
+                    robot_mode: None,
                     polyscope: version,
                 });
             }
@@ -381,7 +381,7 @@ pub fn start_poller(
                             Ok((u, mode)) => {
                                 updates = u;
                                 state.connected = true;
-                                state.robot_mode = mode;
+                                state.robot_mode = Some(mode);
                             }
                             Err(e) => {
                                 spdlog::error(format_args!(

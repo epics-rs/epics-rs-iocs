@@ -664,7 +664,7 @@ mod tests {
             .unwrap()
             .set(DashboardState {
                 connected: true,
-                robot_mode: "Robotmode: IDLE".into(),
+                robot_mode: Some("Robotmode: IDLE".into()),
                 ..Default::default()
             });
         drv.write_int32(&mut AsynUser::new(p.connect), 1).unwrap();
@@ -710,7 +710,7 @@ mod tests {
         drv.gripper().lock().set_port(port);
         dash.set(DashboardState {
             connected: true,
-            robot_mode: "Robotmode: IDLE".into(),
+            robot_mode: Some("Robotmode: IDLE".into()),
             ..Default::default()
         });
         drv.write_int32(&mut AsynUser::new(p.connect), 1).unwrap();
@@ -732,7 +732,7 @@ mod tests {
         drv.gripper().lock().set_port(port);
         dash.set(DashboardState {
             connected: true,
-            robot_mode: "Robotmode: IDLE".into(),
+            robot_mode: Some("Robotmode: IDLE".into()),
             ..Default::default()
         });
 

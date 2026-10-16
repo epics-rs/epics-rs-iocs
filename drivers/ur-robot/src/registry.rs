@@ -21,8 +21,9 @@ use crate::dashboard::PolyScopeVersion;
 #[derive(Debug, Clone, Default)]
 pub struct DashboardState {
     pub connected: bool,
-    /// Verbatim reply to `robotmode`, e.g. `"Robotmode: RUNNING"`.
-    pub robot_mode: String,
+    /// Verbatim reply to `robotmode`, e.g. `"Robotmode: RUNNING"`. `None`
+    /// until the first poll: C's `ROBOT_MODE` param is still undefined.
+    pub robot_mode: Option<String>,
     pub polyscope: PolyScopeVersion,
 }
 
@@ -30,12 +31,19 @@ impl DashboardState {
     /// `robot_ready()` in gripper_driver.cpp:9 — powered on and reachable.
     pub fn robot_on(&self) -> bool {
         self.connected
-            && (self.robot_mode == "Robotmode: IDLE" || self.robot_mode == "Robotmode: RUNNING")
+            && matches!(
+                self.robot_mode.as_deref(),
+                Some("Robotmode: IDLE" | "Robotmode: RUNNING")
+            )
     }
 
-    /// The control driver only connects when the robot is actually running.
-    pub fn robot_running(&self) -> bool {
-        self.connected && self.robot_mode == "Robotmode: RUNNING"
+    /// The control driver's `readOnce(ROBOT_MODE)` (rtde_control_driver.cpp:39):
+    /// `None` when the param is undefined, which C's readOnce reports as a
+    /// failure; a stale mode from a dropped dashboard still reads.
+    pub fn robot_running(&self) -> Option<bool> {
+        self.robot_mode
+            .as_deref()
+            .map(|mode| mode == "Robotmode: RUNNING")
     }
 }
 
@@ -66,12 +74,23 @@ impl DashboardHandle {
 /// What the receive driver publishes for the control driver.
 #[derive(Debug, Clone, Default)]
 pub struct ReceiveState {
-    pub connected: bool,
     /// `safety_status_bits & 0x7ff`. 1 (NORMAL) is the only value the control
-    /// driver will act in.
-    pub safety_status_bits: i32,
+    /// driver will act in. `None` until the first poll.
+    pub safety_status_bits: Option<i32>,
     /// `output_int_register_12`, bumped by a finished custom URScript.
     pub output_int_register_12: i32,
+}
+
+/// The safety word the control interface will act in: NORMAL only.
+const SAFETY_NORMAL: i32 = 1;
+
+impl ReceiveState {
+    /// The control driver's safety gate. An undefined param leaves C's
+    /// `int safety_bits = 1` untouched, so a never-polled word reads NORMAL.
+    pub fn safety_normal(&self) -> bool {
+        self.safety_status_bits
+            .is_none_or(|bits| bits == SAFETY_NORMAL)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -143,7 +162,7 @@ mod tests {
         let h = DashboardHandle::new("192.168.1.10");
         h.set(DashboardState {
             connected: true,
-            robot_mode: "Robotmode: RUNNING".into(),
+            robot_mode: Some("Robotmode: RUNNING".into()),
             polyscope: PolyScopeVersion {
                 major: 5,
                 minor: 11,
@@ -156,7 +175,7 @@ mod tests {
         let found = dashboard("UR_DASH_TEST").expect("registered dashboard");
         assert_eq!(found.ip, "192.168.1.10");
         assert!(found.get().robot_on());
-        assert!(found.get().robot_running());
+        assert_eq!(found.get().robot_running(), Some(true));
         assert_eq!(found.get().polyscope.major, 5);
         assert!(dashboard("NO_SUCH_PORT").is_none());
     }
@@ -184,34 +203,49 @@ mod tests {
     fn robot_on_requires_a_connected_dashboard_and_a_powered_mode() {
         let mut s = DashboardState {
             connected: true,
-            robot_mode: "Robotmode: IDLE".into(),
+            robot_mode: Some("Robotmode: IDLE".into()),
             polyscope: PolyScopeVersion::default(),
         };
         assert!(s.robot_on());
-        assert!(!s.robot_running());
+        assert_eq!(s.robot_running(), Some(false));
 
-        s.robot_mode = "Robotmode: POWER_OFF".into();
+        s.robot_mode = Some("Robotmode: POWER_OFF".into());
         assert!(!s.robot_on());
 
-        s.robot_mode = "Robotmode: RUNNING".into();
+        s.robot_mode = Some("Robotmode: RUNNING".into());
         assert!(s.robot_on());
         s.connected = false;
         assert!(!s.robot_on());
     }
 
     #[test]
+    fn a_never_polled_state_reads_as_c_reads_an_undefined_param() {
+        let mut r = ReceiveState::default();
+        assert!(r.safety_normal());
+        r.safety_status_bits = Some(1);
+        assert!(r.safety_normal());
+        r.safety_status_bits = Some(0x80);
+        assert!(!r.safety_normal());
+
+        let mut d = DashboardState::default();
+        assert_eq!(d.robot_running(), None);
+        assert!(!d.robot_on());
+        d.robot_mode = Some("Robotmode: RUNNING".into());
+        assert_eq!(d.robot_running(), Some(true));
+    }
+
+    #[test]
     fn a_receiver_publishes_safety_bits_and_the_script_counter() {
         let h = ReceiveHandle::new();
         h.set(ReceiveState {
-            connected: true,
-            safety_status_bits: 1,
+            safety_status_bits: Some(1),
             output_int_register_12: 7,
         });
         register_receive("UR_RECV_TEST", h).expect("fresh port name");
 
         let found = receive("UR_RECV_TEST").expect("registered receiver");
         let s = found.get();
-        assert_eq!(s.safety_status_bits, 1);
+        assert_eq!(s.safety_status_bits, Some(1));
         assert_eq!(s.output_int_register_12, 7);
         assert!(receive("NO_SUCH_PORT").is_none());
     }
