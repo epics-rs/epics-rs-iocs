@@ -110,6 +110,52 @@ fn the_port_has_cs_eleven_addresses() {
     ));
     assert!(matches!(
         base.get_int32_param(counter, MAX_ASYN_ADDRESS as i32),
-        Err(AsynError::AddressOutOfRange(_))
+        Err(AsynError::ParamInvalidList(_))
     ));
+}
+
+#[test]
+fn a_refused_write_prints_the_param_librarys_status() {
+    use std::sync::Arc;
+
+    use epics_rs::asyn::port::PortDriver;
+    use epics_rs::asyn::services::PortServices;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::asyn::user::{AsynUser, UserTrace};
+
+    let port = "EIGER_STATUS_CODE";
+    let rest = RestApi::new("127.0.0.1", dead_port());
+    let (signals, _receivers) = tasks::signals();
+    let cfg = EigerConfig {
+        port_name: port.to_string(),
+        api: ApiVersion::V1_6_0,
+        model: Model::Eiger1,
+        max_size_x: 0,
+        max_size_y: 0,
+        max_memory: 0,
+    };
+    let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");
+    let manager = PortServices::global().trace().clone();
+    let log = std::env::temp_dir().join(format!("eiger-status-{}.log", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    // ADDriver::writeFloat64 on an int param: setDoubleParam's asynParamWrongType.
+    let reason = driver.ad.params.base.array_counter;
+    let mut user = AsynUser::new(reason);
+    user.trace = Some(UserTrace {
+        manager,
+        port: port.into(),
+    });
+    assert!(driver.write_float64(&mut user, 1.0).is_err());
+    let text = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    assert!(
+        text.contains(&format!(
+            "eigerDetector:writeFloat64 error, status=8 function={reason}, value=1.000000"
+        )),
+        "{text}"
+    );
 }

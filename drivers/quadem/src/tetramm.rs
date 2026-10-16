@@ -75,7 +75,7 @@ impl TetrAmmDriver {
         if let Err(e) = status {
             println!(
                 "drvTetrAMM::drvTetrAMM: error calling pasynOctetSyncIO->connect, status={}, error={}",
-                trace::status_code(&e),
+                e.c_status_code(),
                 e.message_display()
             );
             return Ok(unlinked(base, io));
@@ -211,7 +211,7 @@ impl QuadEmDevice for TetrAmmDriver {
                                 self.base.port_base,
                                 ERROR,
                                 "drvTetrAMM::setAcquire error waiting for ACK response, status={}",
-                                trace::status_code(&e)
+                                e.c_status_code()
                             );
                             status = Err(e);
                             break;

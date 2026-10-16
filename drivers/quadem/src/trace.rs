@@ -44,11 +44,6 @@ macro_rules! asyn_print {
     };
 }
 
-/// The `status=%d` C prints: the `asynStatus` value.
-pub fn status_code(e: &AsynError) -> i32 {
-    e.status() as i32
-}
-
 /// The `status`, `nRead` and `eomReason` C prints for a read it rejected.
 pub fn read_result(r: &AsynResult<ReadOutcome>) -> (AsynStatus, usize, u32) {
     match r {
@@ -100,7 +95,7 @@ pub fn ensure_input_eos(io: &OctetIo, port: &PortDriverBase, origin: &str) -> As
             *port,
             ERROR,
             "{origin}: error calling pasynOctetSyncIO->setInputEos, status={}",
-            status_code(&e)
+            e.c_status_code()
         );
         AsynError::Status {
             status: AsynStatus::Error,

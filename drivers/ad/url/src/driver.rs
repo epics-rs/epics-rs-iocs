@@ -88,29 +88,26 @@ impl PortDriver for URLDriver {
     /// idle or not); every other Int32 param goes to `ADDriver::writeInt32`.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
-            .port_base
-            .set_int32_param(reason, user.addr, value)?;
+        // C keeps setIntegerParam's status unless ADDriver::writeInt32
+        // replaces it, and acts on the write either way.
+        let mut status = self.ad.port_base.set_int32_param(reason, user.addr, value);
 
-        let status = if reason == self.ad.params.acquire {
-            let status = self
+        if reason == self.ad.params.acquire {
+            let adstatus = self
                 .ad
                 .port_base
                 .get_int32_param(self.ad.params.status, 0)
                 .unwrap_or(ADStatus::Idle as i32);
-            if value != 0 && status == ADStatus::Idle as i32 {
+            if value != 0 && adstatus == ADStatus::Idle as i32 {
                 let _ = self.acq_tx.try_send(AcqCommand::Start);
-            } else if value == 0 && status != ADStatus::Idle as i32 {
+            } else if value == 0 && adstatus != ADStatus::Idle as i32 {
                 let _ = self.acq_tx.try_send(AcqCommand::Stop);
             }
-            Ok(())
         } else if reason < self.url_params.url_name {
-            ADDriver::ad_write_int32(self, user, value)
-        } else {
-            Ok(())
-        };
+            status = ADDriver::ad_write_int32(self, user, value);
+        }
 
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
         match &status {
             Err(e) => user.print(
                 TraceMask::ERROR,
@@ -118,7 +115,7 @@ impl PortDriver for URLDriver {
                 line!(),
                 format_args!(
                     "URLDriver:writeInt32 error, status={} function={reason}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -212,6 +209,7 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::asyn::error::AsynError;
 
     #[test]
     fn a_base_class_write_reaches_addriver() {
@@ -231,6 +229,53 @@ mod tests {
                 .unwrap(),
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    /// URLDriver.cpp:305-319: setIntegerParam's refusal is the write's
+    /// status, and the acquire event is still signalled.
+    #[test]
+    fn a_refused_acquire_set_still_starts_and_fails_the_write() {
+        let (acq_tx, mut acq_rx) = rt::command_channel(1);
+        let mut det = URLDriver::new("URL_REFUSED_SET", 1 << 20, acq_tx).unwrap();
+        let mut user = AsynUser::new(det.ad.params.acquire).with_addr(1);
+        assert!(matches!(
+            det.write_int32(&mut user, 1),
+            Err(AsynError::ParamInvalidList(1))
+        ));
+        assert!(matches!(acq_rx.try_recv(), Ok(AcqCommand::Start)));
+    }
+
+    /// URLDriver.cpp:327-330 prints setIntegerParam's asynParamInvalidList.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "URL_STATUS_CODE";
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let mut det = URLDriver::new(port, 1 << 20, acq_tx).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("url-status-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = det.ad.params.acquire;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(det.write_int32(&mut user, 1).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "URLDriver:writeInt32 error, status=11 function={reason}, value=1"
+            )),
+            "{text}"
         );
     }
 
