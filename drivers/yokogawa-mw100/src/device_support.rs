@@ -826,17 +826,17 @@ fn output_command(op: Operation, record: &dyn Record) -> CaResult<Command> {
         Operation::InfoTrig => Command::ReadAllInfos,
         Operation::StatTrig => Command::ReadStatus,
         Operation::OpModeSet => {
-            let on = match record.get_field("VAL") {
-                Some(EpicsValue::Enum(v)) => v != 0,
+            let v = match record.get_field("VAL") {
+                Some(EpicsValue::Enum(v)) => i32::from(v),
                 _ => return Err(CaError::FieldNotFound("VAL".into())),
             };
-            Command::SetOpMode(on)
+            Command::SetOpMode(v)
         }
         Operation::ErrorClearSet => Command::ClearError,
         Operation::AlarmAckSet => Command::AcknowledgeAlarms,
         Operation::ComputeCmdSet => {
             let v = match record.get_field("VAL") {
-                Some(EpicsValue::Enum(v)) => v as u8,
+                Some(EpicsValue::Enum(v)) => i32::from(v),
                 _ => return Err(CaError::FieldNotFound("VAL".into())),
             };
             Command::SetCompute(v)
@@ -911,6 +911,7 @@ mod tests {
     use epics_rs::base::server::recgbl::alarm_status;
     use epics_rs::base::server::record::{AlarmSeverity, FieldDesc};
     use epics_rs::base::server::records::bo::BoRecord;
+    use epics_rs::base::server::records::mbbo::MbboRecord;
     use std::collections::HashMap;
     use std::time::Duration;
 
@@ -1444,6 +1445,29 @@ mod tests {
                 let val = rec.read().record.get_field("VAL");
                 assert_eq!(val, Some(EpicsValue::Enum(expect)), "{link}");
             }
+        });
+    }
+
+    #[test]
+    fn compute_cmd_out_of_range_sends_nothing_and_completes() {
+        test_block_on(async {
+            // mw100_system.template's ComputationSet defines its states.
+            let mut record = MbboRecord::new(0);
+            record
+                .put_field("ZRST", EpicsValue::String("Start".into()))
+                .unwrap();
+            let (db, device_thread) = wired_output(
+                Box::new(record),
+                "mw100dev COMPUTE_CMD",
+                vec![b"E0\r\n".to_vec()],
+            )
+            .await;
+            let (_, sevr) = put_and_complete(&db, EpicsValue::Enum(4)).await;
+            assert_eq!(sevr, AlarmSeverity::NoAlarm);
+            put_and_complete(&db, EpicsValue::Enum(2)).await;
+            let received = device_thread.join().unwrap();
+            assert_eq!(received.last().unwrap(), "EX2\r\n");
+            assert!(!received.iter().any(|l| l.starts_with("EX4")));
         });
     }
 

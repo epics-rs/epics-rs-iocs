@@ -87,8 +87,8 @@ pub enum Command {
     SetComm(u32, f64),
     SetConst(u32, f64),
     SetBinaryOutput(u32, bool),
-    SetOpMode(bool),
-    SetCompute(u8),
+    SetOpMode(i32),
+    SetCompute(i32),
     ClearError,
     AcknowledgeAlarms,
 }
@@ -538,8 +538,8 @@ impl Actor {
             Command::SetComm(ch, value) => self.expect_ok(&cmd_cmc_set(ch, value)),
             Command::SetConst(ch, value) => self.expect_ok(&cmd_skk_set(ch, value)),
             Command::SetBinaryOutput(ch, on) => self.set_binary_value(ch, on),
-            Command::SetOpMode(on) => self.expect_ok(&cmd_ds_set(on)),
-            Command::SetCompute(mode) => self.expect_ok(&cmd_ex_set(mode)),
+            Command::SetOpMode(value) => self.expect_ok_if(cmd_ds_set(value)),
+            Command::SetCompute(value) => self.expect_ok_if(cmd_ex_set(value)),
             Command::ClearError => self.clear_error(),
             Command::AcknowledgeAlarms => self.acknowledge_alarms(),
         }
@@ -583,6 +583,14 @@ impl Actor {
             _ => {}
         }
         Ok(raw)
+    }
+
+    /// `set_mode`'s `return 1` before writing: no command, nothing sent.
+    fn expect_ok_if(&mut self, command: Option<String>) -> io::Result<()> {
+        match command {
+            Some(command) => self.expect_ok(&command),
+            None => Ok(()),
+        }
     }
 
     fn expect_ok(&mut self, command: &str) -> io::Result<()> {

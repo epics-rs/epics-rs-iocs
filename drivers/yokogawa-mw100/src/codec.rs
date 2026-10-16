@@ -74,13 +74,15 @@ pub fn cmd_skk_set(channel: u32, value: f64) -> String {
 pub fn cmd_vd_set(channel: u32, on: bool) -> String {
     format!("VD{channel:03},{}\r\n", if on { "ON" } else { "OFF" })
 }
-/// `set_mode(CMD_SET_OPMODE, ...)` (`drvMW100.c:1303`).
-pub fn cmd_ds_set(on: bool) -> String {
-    format!("DS{}\r\n", if on { '1' } else { '0' })
+/// `set_mode(CMD_SET_OPMODE, ...)` (`drvMW100.c:1298-1307`): `None`, and
+/// nothing sent, unless `value` is 0 or 1.
+pub fn cmd_ds_set(value: i32) -> Option<String> {
+    matches!(value, 0 | 1).then(|| format!("DS{value}\r\n"))
 }
-/// `set_mode(CMD_SET_COMPUTE, ...)` (`drvMW100.c:1312`): `mode` is 0-3.
-pub fn cmd_ex_set(mode: u8) -> String {
-    format!("EX{}\r\n", (b'0' + (mode & 0x3)) as char)
+/// `set_mode(CMD_SET_COMPUTE, ...)` (`drvMW100.c:1308-1316`): `None`, and
+/// nothing sent, outside 0-3.
+pub fn cmd_ex_set(value: i32) -> Option<String> {
+    (0..=3).contains(&value).then(|| format!("EX{value}\r\n"))
 }
 pub fn cmd_ce0() -> String {
     "CE0\r\n".to_string()
@@ -1565,9 +1567,13 @@ mod tests {
         assert_eq!(cmd_skk_set(1, -7.5), "SKK01,-7.5\r\n");
         assert_eq!(cmd_vd_set(5, true), "VD005,ON\r\n");
         assert_eq!(cmd_vd_set(5, false), "VD005,OFF\r\n");
-        assert_eq!(cmd_ds_set(true), "DS1\r\n");
-        assert_eq!(cmd_ds_set(false), "DS0\r\n");
-        assert_eq!(cmd_ex_set(3), "EX3\r\n");
+        assert_eq!(cmd_ds_set(1).unwrap(), "DS1\r\n");
+        assert_eq!(cmd_ds_set(0).unwrap(), "DS0\r\n");
+        assert_eq!(cmd_ds_set(2), None);
+        assert_eq!(cmd_ex_set(3).unwrap(), "EX3\r\n");
+        assert_eq!(cmd_ex_set(0).unwrap(), "EX0\r\n");
+        assert_eq!(cmd_ex_set(4), None);
+        assert_eq!(cmd_ex_set(-1), None);
     }
 
     #[test]
