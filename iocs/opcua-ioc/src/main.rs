@@ -60,7 +60,7 @@ fn options(args: &[ArgValue], from: usize) -> Result<Vec<(String, String)>, Stri
     for i in from..args.len() {
         tokens.extend(string(args, i)?);
     }
-    ioc::parse_options(tokens.iter().map(String::as_str))
+    Ok(ioc::parse_options(tokens.iter().map(String::as_str)))
 }
 
 fn arg(name: &'static str, arg_type: ArgType) -> ArgDesc {
