@@ -14,7 +14,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::{EosRefusal, connect_with_eos};
+use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_int,
     req_string,
@@ -73,15 +73,16 @@ pub fn acsmotion_config_command() -> CommandDef {
 
             let virtual_axes = parse_virtual_axes(&virtual_list, num_axes);
 
-            let handle = connect_with_eos(
+            // C's SPiiPlusComm port is the controller port name plus "Comm"; it
+            // prints and returns, and the controller carries on with its user.
+            let (handle, _) = connect_controller(
                 &asyn_port,
                 ACSMOTION_TIMEOUT,
-                INPUT_EOS,
-                OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )?;
-            let controller = SpiiPlusController::new(handle, &port_name, num_axes)
-                .map_err(|e| format!("AcsMotionConfig: {e}"))?;
+                &format!("{port_name}Comm"),
+                format_args!("SPiiPlusComm::SPiiPlusComm: cannot connect to SPii+ controller"),
+            );
+            set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
+            let controller = SpiiPlusController::new(handle, &port_name, num_axes);
             let controller = Arc::new(Mutex::new(controller));
 
             register_controller_port(
