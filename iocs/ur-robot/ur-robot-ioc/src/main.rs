@@ -16,6 +16,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::manager::claim_port_driver;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::base::error::CaResult;
@@ -259,8 +260,12 @@ async fn main() -> CaResult<()> {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
-                let port = create_control(&claim, &dash, &recv, poll)
-                    .map_err(|e| format!("RTDEControlConfig failed: {e}"))?;
+                let port = match create_control(&claim, &dash, &recv, poll) {
+                    Ok(port) => port,
+                    // The constructor throws (rtde_control_driver.cpp:96,227).
+                    Err(AsynError::Status { message, .. }) => return Ok(ctx.cxx_error(message)),
+                    Err(e) => return Err(format!("RTDEControlConfig failed: {e}")),
+                };
                 register(
                     &ports,
                     claim,

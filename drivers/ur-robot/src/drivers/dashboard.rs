@@ -182,7 +182,7 @@ impl DashboardDriver {
                 shared.set(DashboardState {
                     connected: true,
                     robot_mode: None,
-                    polyscope: version,
+                    polyscope: Some(version),
                 });
             }
         }
@@ -377,7 +377,7 @@ pub fn start_poller(
                 {
                     let mut c = client.lock();
                     if c.is_connected() {
-                        match poll_once(&mut c, params, state.polyscope) {
+                        match poll_once(&mut c, params, state.polyscope.unwrap_or_default()) {
                             Ok((u, mode)) => {
                                 updates = u;
                                 state.connected = true;

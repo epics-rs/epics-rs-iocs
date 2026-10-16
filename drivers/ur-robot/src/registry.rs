@@ -24,7 +24,10 @@ pub struct DashboardState {
     /// Verbatim reply to `robotmode`, e.g. `"Robotmode: RUNNING"`. `None`
     /// until the first poll: C's `ROBOT_MODE` param is still undefined.
     pub robot_mode: Option<String>,
-    pub polyscope: PolyScopeVersion,
+    /// `None` when the dashboard was down at construction: C sets
+    /// `POLYSCOPE_VERSION` only then (dashboard_driver.cpp:72-74), and
+    /// `RTDEControl`'s constructor throws on the undefined string.
+    pub polyscope: Option<PolyScopeVersion>,
 }
 
 impl DashboardState {
@@ -163,12 +166,12 @@ mod tests {
         h.set(DashboardState {
             connected: true,
             robot_mode: Some("Robotmode: RUNNING".into()),
-            polyscope: PolyScopeVersion {
+            polyscope: Some(PolyScopeVersion {
                 major: 5,
                 minor: 11,
                 patch: 3,
                 build: 108355,
-            },
+            }),
         });
         register_dashboard("UR_DASH_TEST", h).expect("fresh port name");
 
@@ -176,7 +179,7 @@ mod tests {
         assert_eq!(found.ip, "192.168.1.10");
         assert!(found.get().robot_on());
         assert_eq!(found.get().robot_running(), Some(true));
-        assert_eq!(found.get().polyscope.major, 5);
+        assert_eq!(found.get().polyscope.map(|v| v.major), Some(5));
         assert!(dashboard("NO_SUCH_PORT").is_none());
     }
 
@@ -204,7 +207,7 @@ mod tests {
         let mut s = DashboardState {
             connected: true,
             robot_mode: Some("Robotmode: IDLE".into()),
-            polyscope: PolyScopeVersion::default(),
+            polyscope: None,
         };
         assert!(s.robot_on());
         assert_eq!(s.robot_running(), Some(false));

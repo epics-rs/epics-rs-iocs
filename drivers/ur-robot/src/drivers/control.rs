@@ -21,6 +21,8 @@ use crate::drivers::ioc_ready::IocReady;
 use crate::drivers::{asyn_error, refused};
 use crate::error::{UrError, UrResult};
 use crate::registry::{self, DashboardHandle, ReceiveHandle};
+use crate::script::{SCRIPT_PORT, ScriptClient, wrap_custom_script};
+use crate::session::DEFAULT_TIMEOUT;
 use crate::spdlog;
 
 pub const NUM_JOINTS: usize = 6;
@@ -307,17 +309,37 @@ pub struct ControlDriver {
     robot_ip: String,
     dashboard: DashboardHandle,
     receive: ReceiveHandle,
+    /// C's `script_client_`, connected by the constructor and used only for
+    /// custom scripts (rtde_control_driver.cpp:226-227,536-552).
+    script: ScriptClient,
 }
 
 impl ControlDriver {
     /// `dashboard_port` supplies the robot IP and the RUNNING check;
     /// `receive_port` supplies the safety word and the custom-script counter.
+    ///
+    /// Fails, as C's constructor throws, when the dashboard never published a
+    /// PolyScope version or the script server refuses the connection.
     pub fn new(port_name: &str, dashboard_port: &str, receive_port: &str) -> AsynResult<Self> {
+        Self::with_script_port(port_name, dashboard_port, receive_port, SCRIPT_PORT)
+    }
+
+    fn with_script_port(
+        port_name: &str,
+        dashboard_port: &str,
+        receive_port: &str,
+        script_port: u16,
+    ) -> AsynResult<Self> {
         let dashboard = registry::dashboard(dashboard_port).ok_or_else(|| {
             asyn_error(format!(
                 "no URDashboard port named {dashboard_port}; configure it before the control port"
             ))
         })?;
+        if dashboard.get().polyscope.is_none() {
+            return Err(asyn_error("Failed to parse Polyscope version"));
+        }
+        let mut script = ScriptClient::new(&dashboard.ip, script_port, DEFAULT_TIMEOUT);
+        script.connect().map_err(|e| asyn_error(e.to_string()))?;
         let receive = registry::receive(receive_port).ok_or_else(|| {
             asyn_error(format!(
                 "no RTDEReceive port named {receive_port}; configure it before the control port"
@@ -342,6 +364,7 @@ impl ControlDriver {
             robot_ip: dashboard.ip.clone(),
             dashboard,
             receive,
+            script,
         };
         me.try_connect();
         Ok(me)
@@ -432,9 +455,10 @@ impl ControlDriver {
 
     /// Launch a custom URScript (from a file or inline) on the controller.
     ///
-    /// `body` is read only after the motion check, and a `None` (an
-    /// unopenable file) is skipped silently; both skips succeed, as C's
-    /// `goto skip` with `comm_ok` still true (rtde_control_driver.cpp:531-545).
+    /// `body` is read only after the motion and script-client checks, and a
+    /// `None` (an unopenable file) is skipped silently; every skip succeeds,
+    /// as C's `goto skip` with `comm_ok` still true
+    /// (rtde_control_driver.cpp:531-545).
     fn run_custom_script(
         &mut self,
         source: &str,
@@ -446,6 +470,10 @@ impl ControlDriver {
             spdlog::warn(format_args!("Motion task in progress. Cannot run script."));
             return Ok(());
         }
+        if !self.script.is_connected() {
+            spdlog::error(format_args!("ScriptClient not connected!"));
+            return Ok(());
+        }
         let Some(body) = body() else {
             return Ok(());
         };
@@ -453,18 +481,18 @@ impl ControlDriver {
         let start_count = self.receive.get().output_int_register_12;
         let timeout = inner.custom_script_timeout;
 
-        if !inner.connected() {
-            print_unusable(&inner);
-        }
-        let iface = inner.iface_mut().map_err(|_| refused())?;
         match source {
             "(inline)" => spdlog::debug(format_args!("Running inline URScript: {body}")),
             path => spdlog::debug(format_args!("Running custom URScript: {path}")),
         }
-        iface.send_custom_script(body).map_err(|e| {
-            spdlog::error(format_args!("{e}"));
-            refused()
-        })?;
+        let iface = inner.iface_mut().map_err(|_| refused())?;
+        iface
+            .stop_script()
+            .and_then(|()| self.script.send(&wrap_custom_script(body)))
+            .map_err(|e| {
+                spdlog::error(format_args!("{e}"));
+                refused()
+            })?;
 
         inner.custom_script = Some(CustomScript {
             started: Instant::now(),
@@ -1078,6 +1106,8 @@ fn wait_for_program(iface: &mut ControlInterface, timeout: Duration) -> UrResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dashboard::PolyScopeVersion;
+    use crate::registry::DashboardState;
 
     fn params() -> ControlParams {
         let mut n = 0usize;
@@ -1206,12 +1236,23 @@ mod tests {
     /// (rtde_control_driver.cpp:331-341,421-439,598-608).
     #[test]
     fn a_write_with_no_control_interface_is_refused_and_not_staged() {
-        registry::register_dashboard("CTRL_DOWN_DASH", DashboardHandle::new("127.0.0.1"))
-            .expect("fresh port name");
+        let dash = DashboardHandle::new("127.0.0.1");
+        dash.set(DashboardState {
+            polyscope: Some(PolyScopeVersion::default()),
+            ..Default::default()
+        });
+        registry::register_dashboard("CTRL_DOWN_DASH", dash).expect("fresh port name");
         registry::register_receive("CTRL_DOWN_RECV", ReceiveHandle::new())
             .expect("fresh port name");
-        let mut drv =
-            ControlDriver::new("CTRL_DOWN", "CTRL_DOWN_DASH", "CTRL_DOWN_RECV").expect("driver");
+        let script_server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let script_port = script_server.local_addr().expect("addr").port();
+        let mut drv = ControlDriver::with_script_port(
+            "CTRL_DOWN",
+            "CTRL_DOWN_DASH",
+            "CTRL_DOWN_RECV",
+            script_port,
+        )
+        .expect("driver");
         let p = drv.params();
 
         for (reason, addr, value) in [
@@ -1245,6 +1286,49 @@ mod tests {
         assert_eq!(inner.custom_script_timeout, fresh.custom_script_timeout);
         assert!(!inner.waypoint_move && !inner.new_jog);
         assert_eq!(inner.custom_script_path, fresh.custom_script_path);
+    }
+
+    /// C's constructor throws before the port is usable when the dashboard
+    /// never published a version or the script server refuses
+    /// (rtde_control_driver.cpp:96,227); the Config command prints `what()`.
+    #[test]
+    fn construction_fails_as_the_c_constructor_throws() {
+        let message = |r: AsynResult<ControlDriver>| match r {
+            Err(epics_rs::asyn::error::AsynError::Status { message, .. }) => message,
+            Err(e) => panic!("unexpected error {e}"),
+            Ok(_) => panic!("construction must fail"),
+        };
+        registry::register_receive("CTRL_THROW_RECV", ReceiveHandle::new())
+            .expect("fresh port name");
+
+        let unversioned = DashboardHandle::new("127.0.0.1");
+        registry::register_dashboard("CTRL_THROW_DASH0", unversioned).expect("fresh port name");
+        assert_eq!(
+            message(ControlDriver::new(
+                "CTRL_THROW0",
+                "CTRL_THROW_DASH0",
+                "CTRL_THROW_RECV"
+            )),
+            "Failed to parse Polyscope version"
+        );
+
+        let versioned = DashboardHandle::new("127.0.0.1");
+        versioned.set(DashboardState {
+            polyscope: Some(PolyScopeVersion::default()),
+            ..Default::default()
+        });
+        registry::register_dashboard("CTRL_THROW_DASH1", versioned).expect("fresh port name");
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let refused = message(ControlDriver::with_script_port(
+            "CTRL_THROW1",
+            "CTRL_THROW_DASH1",
+            "CTRL_THROW_RECV",
+            closed,
+        ));
+        assert!(refused.starts_with("connect: "), "{refused}");
     }
 
     /// A move whose start returns `Err` — a `CommandRefused` and a transport
