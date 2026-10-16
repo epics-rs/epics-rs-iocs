@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDArray;
@@ -61,9 +62,7 @@ async fn wait_for_stop(rx: &mut rt::CommandReceiver<Signal>, delay: f64) -> Wait
 }
 
 async fn notify(handle: &PortHandle, updates: Vec<ParamSetValue>) {
-    if let Err(e) = handle.set_params_and_notify(0, updates).await {
-        log::error!("simDetector: parameter update failed: {e}");
-    }
+    let _ = handle.set_params_and_notify(0, updates).await;
 }
 
 fn int32(reason: usize, value: i32) -> ParamSetValue {
@@ -134,12 +133,13 @@ impl SimTaskContext {
     }
 
     /// `simDetector::computeImage` (simDetector.cpp:505-718).
-    async fn compute_image(&self, engine: &mut SimEngine) -> Result<NDArray, String> {
+    /// The error is the text of `computeImage`'s own asynPrint.
+    async fn compute_image(&self, engine: &mut SimEngine) -> Result<NDArray, &'static str> {
         let mut cfg = self
             .sim
             .read_config(&self.handle, &self.ad)
             .await
-            .map_err(|e| format!("error getting parameters: {e}"))?;
+            .map_err(|_| "error getting parameters")?;
 
         // "Make sure parameters are consistent, fix them if they are not" — and
         // write the corrections back, as C does with setIntegerParam.
@@ -163,7 +163,7 @@ impl SimTaskContext {
         let reset = self.read_i32(self.sim.reset_image).await != 0;
         let image = engine
             .compute_image(&cfg, &self.pool, reset)
-            .map_err(|e| format!("error computing image: {e}"))?;
+            .map_err(|_| "error allocating buffer in convert()")?;
 
         let layout = Layout::for_color_mode(cfg.color_mode);
         let elements: usize = image.dims.iter().map(|d| d.size).product();
@@ -183,7 +183,10 @@ impl SimTaskContext {
             ),
             int32(self.sim.reset_image, 0),
         ]);
-        notify(&self.handle, updates).await;
+        self.handle
+            .set_params_and_notify(0, updates)
+            .await
+            .map_err(|_| "error setting parameters")?;
 
         Ok(image)
     }
@@ -239,7 +242,11 @@ async fn sim_task(mut ctx: SimTaskContext) {
                 // task hot, recomputing with no delay. Instead report the failure
                 // via ADStatusError and end the acquisition, so the task returns
                 // to waiting for the next start event rather than busy-looping.
-                log::error!("simDetector: {e}");
+                ctx.handle.trace().output(
+                    ctx.handle.port_name(),
+                    TraceMask::ERROR,
+                    &format!("simDetector:computeImage: {e}"),
+                );
                 notify(
                     &ctx.handle,
                     vec![
