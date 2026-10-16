@@ -26,19 +26,26 @@ pub enum UrError {
     #[error("RTDE data package: {0}")]
     Decode(#[from] crate::state::DecodeError),
 
-    /// The robot answered a dashboard command with something other than the
-    /// success line the command requires.
-    #[error("dashboard command '{command}' failed: {reply}")]
-    Dashboard { command: String, reply: String },
+    /// A dashboard call failed; carries ur_rtde's `what()` — for most
+    /// commands the server's reply itself (dashboard_client.cpp:95-135).
+    #[error("{0}")]
+    Dashboard(String),
 
-    /// A requested RTDE output variable is not known to this controller.
-    #[error("controller does not provide RTDE variable(s): {0}")]
+    /// Requested RTDE output variables the controller does not know, comma
+    /// separated (rtde.cpp:414-434).
+    #[error(
+        "The following variables was not found by the controller: [{0}],\n see which variables \
+         are supported by your PolyScope version here: \n\
+         https://www.universal-robots.com/articles/ur/interface-communication/real-time-data-exchange-rtde-guide/"
+    )]
     VariablesNotFound(String),
 
-    /// Another fieldbus already owns an RTDE input register we need.
+    /// Another fieldbus already owns an RTDE input register we need
+    /// (rtde.cpp:397).
     #[error(
-        "an RTDE input register is already in use; disable the EtherNet/IP adapter, \
-         PROFINET or any MODBUS unit configured on the robot"
+        "One of the RTDE input registers are already in use! Currently you must disable the \
+         EtherNet/IP adapter, PROFINET or any MODBUS unit configured on the robot. This might \
+         change in the future."
     )]
     InputRegistersInUse,
 

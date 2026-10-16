@@ -157,14 +157,12 @@ impl DashboardClient {
         self.receive()
     }
 
-    /// Send a command whose reply must equal `expect`, else the command failed.
+    /// Send a command whose reply must equal `expect`; otherwise the reply
+    /// is the error, as upstream throws it.
     fn command_expect(&mut self, command: &str, expect: &str) -> UrResult<()> {
         let reply = self.command(command)?;
         if reply != expect {
-            return Err(UrError::Dashboard {
-                command: command.to_string(),
-                reply,
-            });
+            return Err(UrError::Dashboard(reply));
         }
         Ok(())
     }
@@ -174,10 +172,7 @@ impl DashboardClient {
     pub fn load_urp(&mut self, name: &str) -> UrResult<()> {
         let reply = self.command(&format!("load {name}"))?;
         if !reply.contains("Loading program:") {
-            return Err(UrError::Dashboard {
-                command: format!("load {name}"),
-                reply,
-            });
+            return Err(UrError::Dashboard(reply));
         }
         Ok(())
     }
@@ -212,6 +207,12 @@ impl DashboardClient {
 
     pub fn unlock_protective_stop(&mut self) -> UrResult<()> {
         self.command_expect("unlock protective stop", "Protective stop releasing")
+            .map_err(|e| match e {
+                UrError::Dashboard(reply) => {
+                    UrError::Dashboard(format!("Unlock protective stop failure: {reply}"))
+                }
+                e => e,
+            })
     }
 
     pub fn close_popup(&mut self) -> UrResult<()> {
@@ -267,10 +268,8 @@ impl DashboardClient {
     /// `PolyscopeVersion`, reduced to the version numbers.
     pub fn polyscope_version(&mut self) -> UrResult<PolyScopeVersion> {
         let reply = self.command("PolyscopeVersion")?;
-        parse_polyscope_version(&reply).ok_or(UrError::Dashboard {
-            command: "PolyscopeVersion".into(),
-            reply,
-        })
+        parse_polyscope_version(&reply)
+            .ok_or_else(|| UrError::Dashboard("PolyScopeVersion::parse failed".into()))
     }
 
     /// `is in remote control` — only supported from PolyScope 5.6. Like
@@ -293,19 +292,20 @@ impl DashboardClient {
     /// version first, as upstream (dashboard_client.cpp:392).
     pub fn serial_number(&mut self) -> UrResult<String> {
         if !self.polyscope_version()?.supports_remote_control_query() {
-            return Err(UrError::Dashboard {
-                command: "get serial number".into(),
-                reply: "not supported before PolyScope 5.6".into(),
-            });
+            return Err(UrError::Dashboard(
+                "getSerialNumber() function is not supported on the dashboard server for \
+                 PolyScope versions less than 5.6.0"
+                    .into(),
+            ));
         }
         let reply = self.command("get serial number")?;
         if reply.chars().all(|c| c.is_ascii_digit()) && !reply.is_empty() {
             Ok(reply)
         } else {
-            Err(UrError::Dashboard {
-                command: "get serial number".into(),
-                reply,
-            })
+            Err(UrError::Dashboard(format!(
+                "getSerialNumber() function did not return a number. The following was \
+                 returned: {reply}"
+            )))
         }
     }
 }
@@ -410,8 +410,7 @@ mod tests {
         let mut c = client_on(port);
         let err = c.play().unwrap_err();
         assert!(
-            matches!(&err, UrError::Dashboard { command, reply }
-                if command == "play" && reply == "Failed to execute: play"),
+            matches!(&err, UrError::Dashboard(what) if what == "Failed to execute: play"),
             "got {err:?}"
         );
         jh.join().unwrap();
@@ -490,5 +489,13 @@ mod tests {
         let mut c = client_on(port);
         assert!(c.unlock_protective_stop().is_ok());
         assert_eq!(jh.join().unwrap(), vec!["unlock protective stop"]);
+
+        let (port, jh) = spawn_dashboard(vec!["Cannot unlock protective stop until 5s after"]);
+        let mut c = client_on(port);
+        assert_eq!(
+            c.unlock_protective_stop().unwrap_err().to_string(),
+            "Unlock protective stop failure: Cannot unlock protective stop until 5s after"
+        );
+        jh.join().unwrap();
     }
 }

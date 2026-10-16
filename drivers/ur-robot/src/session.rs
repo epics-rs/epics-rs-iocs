@@ -435,6 +435,12 @@ mod tests {
             matches!(&err, UrError::VariablesNotFound(v) if v == "payload_inertia"),
             "got {err:?}"
         );
+        assert!(
+            err.to_string().starts_with(
+                "The following variables was not found by the controller: [payload_inertia],\n"
+            ),
+            "{err}"
+        );
         jh.join().unwrap();
     }
 
