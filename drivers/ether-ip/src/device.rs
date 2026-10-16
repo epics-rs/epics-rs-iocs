@@ -359,20 +359,10 @@ impl EtherIpDevice {
 /// how many array elements it wants. Both come from the record, so this runs in
 /// `init()` where the record is available.
 fn record_shape(record: &dyn Record) -> (usize, usize) {
-    let nobt = || match record.get_field("NOBT") {
-        Some(EpicsValue::Short(n)) if n > 0 => n as usize,
-        _ => 1,
-    };
     match record.record_type() {
         "bi" | "bo" => (1, 1),
-        "mbbi" | "mbbo" | "mbbiDirect" | "mbboDirect" => (nobt(), 1),
-        "waveform" => {
-            let nelm = match record.get_field("NELM") {
-                Some(EpicsValue::Long(n)) if n > 0 => n as usize,
-                _ => 1,
-            };
-            (0, nelm)
-        }
+        "mbbi" | "mbbo" | "mbbiDirect" | "mbboDirect" => (count_field(record, "NOBT"), 1),
+        "waveform" => (0, count_field(record, "NELM")),
         _ => (0, 1),
     }
 }
@@ -537,15 +527,9 @@ impl DeviceSupport for EtherIpDevice {
                     "stringin" => cip::get_string(raw, element, MAX_STRING_SIZE)
                         .map(|s| (EpicsValue::String(s.into()), true))
                         .ok_or(()),
-                    "lsi" => {
-                        let sizv = match record.get_field("SIZV") {
-                            Some(EpicsValue::UShort(n)) if n > 0 => n as usize,
-                            _ => MAX_STRING_SIZE,
-                        };
-                        cip::get_string(raw, element, sizv)
-                            .map(|s| (EpicsValue::String(s.into()), true))
-                            .ok_or(())
-                    }
+                    "lsi" => cip::get_string(raw, element, count_field(record, "SIZV"))
+                        .map(|s| (EpicsValue::String(s.into()), true))
+                        .ok_or(()),
                     "waveform" => read_waveform(raw, element, record).map(|v| (v, true)),
                     _ => Err(()),
                 }
@@ -832,10 +816,7 @@ impl EtherIpDevice {
 /// the registration reserves. Identical behaviour for the (usual) unindexed
 /// link, where `element == 0`.
 fn read_waveform(raw: &[u8], element: usize, record: &dyn Record) -> Result<EpicsValue, ()> {
-    let nelm = match record.get_field("NELM") {
-        Some(EpicsValue::Long(n)) if n > 0 => n as usize,
-        _ => 1,
-    };
+    let nelm = count_field(record, "NELM");
     match cip::typecode(raw) {
         Some(CipType::Real) | Some(CipType::Lreal) => {
             let mut v = Vec::with_capacity(nelm);
@@ -863,30 +844,28 @@ fn read_waveform(raw: &[u8], element: usize, record: &dyn Record) -> Result<Epic
 }
 
 fn nobt(record: &dyn Record) -> usize {
-    match record.get_field("NOBT") {
-        Some(EpicsValue::Short(n)) if n > 0 => n as usize,
-        _ => 1,
-    }
+    count_field(record, "NOBT")
 }
 
+// Numeric fields are read through `to_f64`, never by matching one
+// `EpicsValue` variant: each record type picks its own (waveform NELM is
+// ULong, mbbi NOBT UShort, mbbiDirect NOBT Short).
 fn f64_field(record: &dyn Record, name: &str) -> f64 {
-    match record.get_field(name) {
-        Some(EpicsValue::Double(v)) => v,
-        Some(EpicsValue::Float(v)) => v as f64,
-        Some(EpicsValue::Long(v)) => v as f64,
-        _ => 0.0,
-    }
+    record
+        .get_field(name)
+        .and_then(|v| v.to_f64())
+        .unwrap_or(0.0)
 }
 
+/// An `epicsInt32`/`epicsUInt32` field as its 32 bits (RVAL is ULong on
+/// bo/mbbo).
 fn i32_field(record: &dyn Record, name: &str) -> i32 {
-    match record.get_field(name) {
-        Some(EpicsValue::Long(v)) => v,
-        Some(EpicsValue::ULong(v)) => v as i32,
-        Some(EpicsValue::Short(v)) => v as i32,
-        Some(EpicsValue::Enum(v)) => v as i32,
-        Some(EpicsValue::Double(v)) => v as i32,
-        _ => 0,
-    }
+    f64_field(record, name) as i64 as i32
+}
+
+/// NELM / NOBT / SIZV, used as C uses them: unclamped.
+fn count_field(record: &dyn Record, name: &str) -> usize {
+    f64_field(record, name) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +953,26 @@ mod tests {
                 "{}",
                 record.record_type()
             );
+        }
+    }
+
+    #[test]
+    fn record_shape_reads_each_record_types_own_field_variant() {
+        use epics_rs::base::server::records::{
+            mbbi::MbbiRecord, mbbi_direct::MbbiDirectRecord, mbbo::MbboRecord,
+            waveform::WaveformRecord,
+        };
+        let mut wf = WaveformRecord::default();
+        wf.put_field("NELM", EpicsValue::ULong(40)).unwrap();
+        assert_eq!(record_shape(&wf), (0, 40));
+        let multi: [Box<dyn Record>; 3] = [
+            Box::new(MbbiRecord::default()),
+            Box::new(MbboRecord::default()),
+            Box::new(MbbiDirectRecord::default()),
+        ];
+        for mut record in multi {
+            record.put_field("NOBT", EpicsValue::Short(2)).unwrap();
+            assert_eq!(record_shape(&*record), (2, 1), "{}", record.record_type());
         }
     }
 
