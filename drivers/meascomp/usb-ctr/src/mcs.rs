@@ -104,9 +104,11 @@ pub struct McsScan {
     pub dwell_time: f64,
     pub counter_enable: u32,
     pub ch_advance_source: i32,
-    /// Accepted but not implemented (matches C++ drvUSBCTR, which ignores
-    /// prescale for MCS).
+    /// C `mcaPrescale_`: with external channel advance, divide the advance
+    /// pulses by this on `prescale_counter`.
     pub prescale: i32,
+    /// C `MCSPrescaleCounter_`.
+    pub prescale_counter: i32,
     /// C `MCSPoint0Action_`.
     pub point0_action: i32,
 }
@@ -127,7 +129,8 @@ pub fn start_mcs(
         dwell_time,
         counter_enable,
         ch_advance_source,
-        prescale: _,
+        prescale,
+        prescale_counter,
         point0_action,
     } = *scan;
     state.dwell_time = dwell_time;
@@ -193,6 +196,36 @@ pub fn start_mcs(
                 e.code, e.message
             ),
         );
+    }
+
+    if ch_advance_source != 0 && prescale > 1 {
+        // C keeps only the configScan status.
+        let limit = (prescale - 1) as u64;
+        let _ = device.counter_clear(prescale_counter);
+        let _ = device.counter_load(prescale_counter, CRT_OUTPUT_VAL0, 0);
+        let _ = device.counter_load(prescale_counter, CRT_OUTPUT_VAL1, limit);
+        let _ = device.counter_load(prescale_counter, CRT_MAX_LIMIT, limit);
+        let mode = CMM_OUTPUT_ON | CMM_RANGE_LIMIT_ON;
+        if let Err(e) = device.counter_config_scan(
+            prescale_counter,
+            &CounterScanConfig {
+                measurement_type: CMT_COUNT,
+                measurement_mode: mode,
+                edge_detection: CED_RISING_EDGE,
+                tick_size: CTS_TICK_20PT83ns,
+                debounce_mode: CDM_NONE,
+                debounce_time: CDT_DEBOUNCE_0ns,
+                flags: CF_DEFAULT,
+            },
+        ) {
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::startMCS error calling cbCConfigScan, counter={prescale_counter}, mode=0x{mode:x}, status={}, error={}",
+                    e.code, e.message
+                ),
+            );
+        }
     }
 
     // A skipped point 0 is acquired, then dropped by read_mcs.

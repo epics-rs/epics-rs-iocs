@@ -258,6 +258,9 @@ impl PortDriver for CtrDriver {
                         counter_enable: enable,
                         ch_advance_source: ch_adv,
                         prescale,
+                        prescale_counter: self
+                            .base
+                            .get_int32_param(self.params.mcs_prescale_counter, 0)?,
                         point0_action,
                     },
                     &trace,
