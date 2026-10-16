@@ -17,6 +17,7 @@ use super::rpc::{XpsResult, XpsSocket};
 
 /// A registered axis's identity, kept by the controller for group enumeration.
 struct AxisRef {
+    axis_no: i32,
     positioner: String,
     group: String,
 }
@@ -55,8 +56,12 @@ pub struct ExecutionPlan {
 /// The [`XpsController::set_position`] step that failed, with its XPS code.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetPositionFailure {
-    /// `GroupKill`/`GroupInitialize`: the position was not set.
-    Initialize(i32),
+    /// The grouped branch's `GroupPositionCurrentGet` of the last axis: the
+    /// position was not set.
+    CurrentGet(i32),
+    /// `GroupKill`/`GroupInitialize`: the position was not set. `grouped`
+    /// picks C's line, which differs between the two branches.
+    Initialize { code: i32, grouped: bool },
     /// `GroupReferencingStop`: C reports it and returns success.
     ReferencingStop(i32),
 }
@@ -132,8 +137,9 @@ impl XpsController {
 
     /// Record an axis's positioner and group so group-membership counts and
     /// group positioner enumeration stay accurate.
-    pub fn register_axis(&mut self, positioner: &str, group: &str) {
+    pub fn register_axis(&mut self, axis_no: i32, positioner: &str, group: &str) {
         self.axes.push(AxisRef {
+            axis_no,
             positioner: positioner.to_string(),
             group: group.to_string(),
         });
@@ -170,38 +176,66 @@ impl XpsController {
     }
 
     /// Redefine the current position of `positioner` to `position` device
-    /// units, via the XPS referencing mode (C `XPSAxis::setPosition`, single-
-    /// positioner branch: `GroupKill` → `GroupInitialize` → settle →
-    /// `GroupReferencingStart` → `GroupReferencingActionExecute(SetPosition)` →
-    /// `GroupReferencingStop`). Requires `enableSetPosition`.
+    /// units, via the XPS referencing mode (C `XPSAxis::setPosition`):
+    /// `GroupKill` → `GroupInitialize` → settle → `GroupReferencingStart` →
+    /// `GroupReferencingActionExecute(SetPosition)` → `GroupReferencingStop`.
+    /// When the group holds more than one axis, every axis's current position
+    /// is read first and its siblings are set back to it.
     ///
-    /// The multi-positioner group branch (`isInGroup > 1`, coordinated XY/XYZ
-    /// referencing of siblings) is not modeled here; callers detect it via
-    /// [`axes_in_group`] and report it rather than issuing a partial sequence.
-    ///
-    /// [`axes_in_group`]: XpsController::axes_in_group
-    ///
-    /// C checks only `GroupInitialize`, which aborts the sequence, and
-    /// `GroupReferencingStop`, which it reports and then returns success
-    /// for; the caller prints either line.
+    /// C checks only the last `GroupPositionCurrentGet` and `GroupInitialize`,
+    /// which abort the sequence, and `GroupReferencingStop`, which it reports
+    /// and then returns success for; the caller prints each line.
     pub fn set_position(
         &self,
         positioner: &str,
         group: &str,
         position: f64,
     ) -> Result<(), SetPositionFailure> {
+        let grouped = self.axes_in_group(group) > 1;
+        let mut current = Vec::new();
+        if grouped {
+            let mut axes: Vec<&AxisRef> = self.axes.iter().collect();
+            axes.sort_by_key(|a| a.axis_no);
+            let mut last = Ok(());
+            for a in axes {
+                let read = self.poll.group_position_current_get(&a.positioner);
+                // C leaves a failed read's position unset; here it is 0.
+                current.push((a, *read.as_ref().unwrap_or(&0.0)));
+                last = read.map(|_| ());
+            }
+            last.map_err(|e| SetPositionFailure::CurrentGet(e.code()))?;
+        }
         let _ = self.poll.group_kill(group);
         self.poll
             .group_initialize(group)
-            .map_err(|e| SetPositionFailure::Initialize(e.code()))?;
+            .map_err(|e| SetPositionFailure::Initialize {
+                code: e.code(),
+                grouped,
+            })?;
 
         // Settle after initialization so the stage does not oscillate.
         std::thread::sleep(self.set_position_settling);
 
         let _ = self.poll.group_referencing_start(group);
+        // C indexes the cached positions by the in-group counter rather than
+        // by axis number; each sibling here gets the position read for it.
+        for (a, p) in &current {
+            if a.group == group && a.positioner != positioner {
+                let _ = self.poll.group_referencing_action_execute(
+                    &a.positioner,
+                    "SetPosition",
+                    "None",
+                    *p,
+                );
+            }
+        }
         let _ =
             self.poll
                 .group_referencing_action_execute(positioner, "SetPosition", "None", position);
+        if grouped {
+            // Some axis types (e.g. spindle) stay in referencing mode without it.
+            std::thread::sleep(Duration::from_millis(50));
+        }
         self.poll
             .group_referencing_stop(group)
             .map_err(|e| SetPositionFailure::ReferencingStop(e.code()))

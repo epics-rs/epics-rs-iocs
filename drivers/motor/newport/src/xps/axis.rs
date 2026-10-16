@@ -113,7 +113,7 @@ impl XpsAxis {
                 .positioner_sgamma_parameters_get(positioner_name)
                 .unwrap_or_default();
             let pid = corrector::get_pid(ctrl.poll_socket(), positioner_name);
-            ctrl.register_axis(positioner_name, &group_name);
+            ctrl.register_axis(axis_no, positioner_name, &group_name);
             (min_jerk, max_jerk, pid)
         };
         let axis = Self {
@@ -615,30 +615,43 @@ impl AsynMotor for XpsAxis {
                 message: "XPS set position is disabled (enableSetPosition=0)".into(),
             });
         }
-        if ctrl.axes_in_group(&self.group_name) > 1 {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!(
-                    "XPS set position for multi-axis group '{}' is not supported",
-                    self.group_name
-                ),
-            });
-        }
         match ctrl.set_position(
             &self.positioner_name,
             &self.group_name,
             position * self.step_size,
         ) {
             Ok(()) => Ok(()),
-            Err(SetPositionFailure::Initialize(code)) => {
+            Err(SetPositionFailure::CurrentGet(code)) => {
                 self.error(
                     "setPosition",
                     format_args!(
-                        "Error performing GroupKill/GroupInitialize({},{}). XPS API Error: {code}. Aborting set position.",
+                        "Error performing GroupPositionCurrentGet({},{}). Aborting set position. XPS API Error: {code}.",
                         self.port(),
                         self.axis_no()
                     ),
                 );
+                Err(XpsError::Api(code).into())
+            }
+            Err(SetPositionFailure::Initialize { code, grouped }) => {
+                if grouped {
+                    self.error(
+                        "setPosition",
+                        format_args!(
+                            "Error performing GroupKill/GroupInitialize({},{}). Aborting set position. XPS API Error: {code}.",
+                            self.port(),
+                            self.axis_no()
+                        ),
+                    );
+                } else {
+                    self.error(
+                        "setPosition",
+                        format_args!(
+                            "Error performing GroupKill/GroupInitialize({},{}). XPS API Error: {code}. Aborting set position.",
+                            self.port(),
+                            self.axis_no()
+                        ),
+                    );
+                }
                 Err(XpsError::Api(code).into())
             }
             Err(SetPositionFailure::ReferencingStop(code)) => {
@@ -1000,7 +1013,7 @@ mod tests {
         base: PortDriverBase,
         reply: Option<String>,
         fail: Arc<Mutex<&'static str>>,
-        /// Every call name, in order.
+        /// Every command, in order.
         log: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1014,10 +1027,11 @@ mod tests {
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
             let cmd = String::from_utf8_lossy(data);
             let name = cmd.split('(').next().unwrap_or("").trim();
-            self.log.lock().unwrap().push(name.to_string());
+            self.log.lock().unwrap().push(cmd.trim().to_string());
             let values = match name {
                 _ if name == *self.fail.lock().unwrap() => "-3",
                 "GroupStatusGet" => "0,12",
+                "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
                 "GroupPositionCurrentGet" => "0,1.5",
                 "GroupPositionSetpointGet" => "0,1.25",
                 "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
@@ -1039,6 +1053,17 @@ mod tests {
     type Log = Arc<Mutex<Vec<String>>>;
 
     fn fake_axis(port: &str, fail: &'static str) -> (XpsAxis, Arc<Mutex<&'static str>>, Log) {
+        let (mut axes, fail, log) = fake_axes(port, fail, false, &["G1.P1"]);
+        (axes.remove(0), fail, log)
+    }
+
+    /// One axis per positioner, numbered in order, on one controller.
+    fn fake_axes(
+        port: &str,
+        fail: &'static str,
+        enable_set_position: bool,
+        positioners: &[&str],
+    ) -> (Vec<XpsAxis>, Arc<Mutex<&'static str>>, Log) {
         let fail = Arc::new(Mutex::new(fail));
         let log = Log::default();
         let line = FakeXps {
@@ -1054,17 +1079,29 @@ mod tests {
             let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
             XpsSocket::new(io, port, mode)
         };
-        let controller =
-            XpsController::new(socket(SocketMode::Query), false, Duration::ZERO).unwrap();
-        let axis = XpsAxis::new(
-            Arc::new(Mutex::new(controller)),
-            socket(SocketMode::Fire),
-            "MOTOR_T",
-            0,
-            "G1.P1",
-            1.0,
-        );
-        (axis, fail, log)
+        let controller = Arc::new(Mutex::new(
+            XpsController::new(
+                socket(SocketMode::Query),
+                enable_set_position,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        ));
+        let axes = positioners
+            .iter()
+            .enumerate()
+            .map(|(n, p)| {
+                XpsAxis::new(
+                    controller.clone(),
+                    socket(SocketMode::Fire),
+                    "MOTOR_T",
+                    n as i32,
+                    p,
+                    1.0,
+                )
+            })
+            .collect();
+        (axes, fail, log)
     }
 
     /// C `XPSAxis::poll` (`done:`, XPSAxis.cpp:755-758): a failed call raises
@@ -1124,12 +1161,13 @@ mod tests {
                 "GroupReferencingStop",
             ] {
                 assert!(
-                    log.iter().any(|c| c == sent),
+                    log.iter().any(|c| c.starts_with(&format!("{sent} ("))),
                     "{call}: {sent} not sent in {log:?}"
                 );
             }
             assert!(
-                !log.iter().any(|c| c == "PositionerHardwareStatusGet"),
+                !log.iter()
+                    .any(|c| c.starts_with("PositionerHardwareStatusGet ")),
                 "{call}: status 12 is not referencing mode"
             );
         }
@@ -1235,5 +1273,47 @@ mod tests {
         assert_eq!(referencing_distance(5.0, 0x2), -5.0);
         // Sign is flipped, not forced: a negative distance reverses to positive.
         assert_eq!(referencing_distance(-5.0, 0), 5.0);
+    }
+
+    /// C `XPSAxis::setPosition` with more than one axis in the group
+    /// (XPSAxis.cpp:417-476): read every axis, re-initialise the group, set
+    /// each sibling back to its position, then this axis to the new one.
+    #[test]
+    fn grouped_set_position_resets_the_siblings() {
+        let (mut axes, fail, log) =
+            fake_axes("xps_setpos_grp", "", true, &["G1.P1", "G2.Q", "G1.P2"]);
+        let user = AsynUser::new(0);
+        log.lock().unwrap().clear();
+        axes[0].set_position(&user, 7.0).unwrap();
+        let sent: Vec<String> = log.lock().unwrap().drain(..).collect();
+        assert_eq!(
+            sent,
+            [
+                "GroupPositionCurrentGet (G1.P1,double *)",
+                "GroupPositionCurrentGet (G2.Q,double *)",
+                "GroupPositionCurrentGet (G1.P2,double *)",
+                "GroupKill (G1)",
+                "GroupInitialize (G1)",
+                "GroupReferencingStart (G1)",
+                "GroupReferencingActionExecute (G1.P2,SetPosition,None,2.5)",
+                "GroupReferencingActionExecute (G1.P1,SetPosition,None,7)",
+                "GroupReferencingStop (G1)",
+            ]
+        );
+
+        *fail.lock().unwrap() = "GroupPositionCurrentGet";
+        assert!(axes[2].set_position(&user, 7.0).is_err());
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("GroupKill "))
+        );
+
+        // A lone axis in its group skips the reads.
+        *fail.lock().unwrap() = "";
+        log.lock().unwrap().clear();
+        axes[1].set_position(&user, 3.0).unwrap();
+        assert_eq!(log.lock().unwrap()[0], "GroupKill (G2)");
     }
 }
