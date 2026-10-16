@@ -38,9 +38,9 @@ fn strip_prefix<'a>(s: &'a str, prefix: &str) -> Result<&'a str, ParseError> {
         .ok_or_else(|| err(format!("expected prefix {prefix:?}, got {s:?}")))
 }
 
-fn strip_suffix<'a>(s: &'a str, suffix: &str) -> Result<&'a str, ParseError> {
-    s.strip_suffix(suffix)
-        .ok_or_else(|| err(format!("expected suffix {suffix:?}, got {s:?}")))
+/// The format's last literal; whatever follows it is `ExtraInput = Ignore`'s.
+fn expect_end(s: &str, literal: &str) -> Result<(), ParseError> {
+    strip_prefix(s, literal).map(|_| ())
 }
 
 /// `%d` -- an optionally-signed decimal integer, stopping at the first
@@ -103,7 +103,8 @@ pub fn parse_query_ver(reply: &[u8]) -> Result<(String, String), ParseError> {
     let (v1, rest) = s
         .split_once(';')
         .ok_or_else(|| err(format!("expected ';' separator in {s:?}")))?;
-    let v2 = strip_suffix(rest, "OK")?;
+    let (v2, rest) = take_until_o_or_k(rest);
+    expect_end(rest, "OK")?;
     Ok((v1.to_string(), v2.to_string()))
 }
 
@@ -115,11 +116,8 @@ pub fn format_query_sample_time() -> String {
 
 pub fn parse_query_sample_time(reply: &[u8]) -> Result<i32, ParseError> {
     let s = strip_prefix(as_str(reply)?, "$STI?")?;
-    let s = strip_suffix(s, "OK")?;
     let (v, rest) = take_int(s)?;
-    if !rest.is_empty() {
-        return Err(err(format!("unexpected trailing bytes {rest:?}")));
-    }
+    expect_end(rest, "OK")?;
     Ok(v as i32)
 }
 
@@ -136,10 +134,7 @@ pub fn parse_set_sample_time_ack(reply: &[u8]) -> Result<(i32, i32), ParseError>
     let (a, rest) = take_int(s)?;
     let rest = strip_prefix(rest, ",")?;
     let (b, rest) = take_int(rest)?;
-    let rest = strip_suffix(rest, "OK")?;
-    if !rest.is_empty() {
-        return Err(err(format!("unexpected trailing bytes {rest:?}")));
-    }
+    expect_end(rest, "OK")?;
     Ok((a as i32, b as i32))
 }
 
@@ -149,11 +144,8 @@ pub fn parse_set_sample_time_ack(reply: &[u8]) -> Result<(i32, i32), ParseError>
 
 fn parse_prefixed_int(reply: &[u8], prefix: &str, suffix: &str) -> Result<i32, ParseError> {
     let s = strip_prefix(as_str(reply)?, prefix)?;
-    let s = strip_suffix(s, suffix)?;
     let (v, rest) = take_int(s)?;
-    if !rest.is_empty() {
-        return Err(err(format!("unexpected trailing bytes {rest:?}")));
-    }
+    expect_end(rest, suffix)?;
     Ok(v as i32)
 }
 
@@ -232,10 +224,7 @@ fn parse_four_ints(reply: &[u8], prefix: &str) -> Result<[i32; 4], ParseError> {
     let (c, rest) = take_int(rest)?;
     let rest = strip_prefix(rest, ",")?;
     let (d, rest) = take_int(rest)?;
-    let rest = strip_suffix(rest, "OK")?;
-    if !rest.is_empty() {
-        return Err(err(format!("unexpected trailing bytes {rest:?}")));
-    }
+    expect_end(rest, "OK")?;
     Ok([a as i32, b as i32, c as i32, d as i32])
 }
 
@@ -400,6 +389,24 @@ mod tests {
         let (v1, v2) = parse_query_ver(b"$VERApp1.2;Boot3.4OK").unwrap();
         assert_eq!(v1, "App1.2");
         assert_eq!(v2, "Boot3.4");
+    }
+
+    #[test]
+    fn input_past_the_formats_last_literal_is_ignored() {
+        assert_eq!(parse_query_sample_time(b"$STI?5OK extra").unwrap(), 5);
+        assert_eq!(parse_set_sample_time_ack(b"$STI3,7OKOK").unwrap(), (3, 7));
+        assert_eq!(parse_query_trig_mode(b"$TRG?1OK\x01").unwrap(), 1);
+        assert_eq!(parse_chan_status(b"$CHS1,0,1,0OK,").unwrap(), [1, 0, 1, 0]);
+        let (_, v2) = parse_query_ver(b"$VERa;bOKzz").unwrap();
+        assert_eq!(v2, "b");
+    }
+
+    #[test]
+    fn query_ver_second_field_stops_at_an_o_or_k() {
+        // `[^OK]` is a character class: the field ends at the first capital
+        // O or K, and the literal "OK" must start there.
+        assert_eq!(parse_query_ver(b"$VERa;BOKt").unwrap().1, "B");
+        assert!(parse_query_ver(b"$VERa;BOtOK").is_err());
     }
 
     #[test]
