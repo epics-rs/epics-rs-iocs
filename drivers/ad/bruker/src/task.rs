@@ -17,6 +17,7 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -48,7 +49,7 @@ pub(crate) struct AcquisitionContext {
 
 pub(crate) struct StatusContext {
     /// The `drvAsynIPPort` BIS broadcasts its status on.
-    pub status: PortHandle,
+    pub status: SyncIOHandle,
     pub handle: PortHandle,
     pub ad_params: ADBaseParams,
     pub params: BrukerParams,
@@ -510,7 +511,7 @@ async fn read_status_message(ctx: &StatusContext) -> AsynResult<String> {
     let op = RequestOp::OctetRead {
         buf_size: MAX_MESSAGE_SIZE,
     };
-    let result = ctx.status.submit_async(op, user).await?;
+    let result = ctx.status.port()?.submit_async(op, user).await?;
     let bytes = result.data.unwrap_or_default();
     Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
 }

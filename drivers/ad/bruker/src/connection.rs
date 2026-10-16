@@ -28,8 +28,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::types::MAX_MESSAGE_SIZE;
@@ -64,7 +64,7 @@ pub struct BisServer {
 }
 
 impl BisServer {
-    pub fn new(handle: PortHandle) -> Self {
+    pub fn new(handle: SyncIOHandle) -> Self {
         let (requests, rx) = channel::<Request>();
         let worker = std::thread::Builder::new()
             .name("BISCommand".into())
@@ -100,7 +100,16 @@ impl BisServer {
     }
 }
 
-fn exchange(handle: &PortHandle, command: &str, timeout: Duration) -> Exchange {
+fn exchange(io: &SyncIOHandle, command: &str, timeout: Duration) -> Exchange {
+    let handle = match io.port() {
+        Ok(handle) => handle,
+        Err(e) => {
+            return Exchange {
+                reply: String::new(),
+                result: Err(e),
+            };
+        }
+    };
     let user = AsynUser::new(0).with_addr(0).with_timeout(timeout);
     let op = RequestOp::OctetWriteRead {
         data: command.as_bytes().to_vec(),

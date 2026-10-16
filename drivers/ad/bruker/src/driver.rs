@@ -17,6 +17,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -355,12 +356,14 @@ impl BrukerRuntime {
 
 /// Create the detector port and start its two threads (C `BISDetectorConfig`).
 ///
-/// `command_handle` and `status_handle` are the two `drvAsynIPPort`s that reach
-/// BIS: one to send commands on and one BIS broadcasts its status on.
+/// `command_handle` and `status_handle` are the users of the two
+/// `drvAsynIPPort`s that reach BIS: one to send commands on and one BIS
+/// broadcasts its status on. C ignores both connect statuses
+/// (BISDetector.cpp:759-760), so either may be a user with no port.
 pub fn create_bruker_detector(
     claim: &PortClaim,
-    command_handle: PortHandle,
-    status_handle: PortHandle,
+    command_handle: SyncIOHandle,
+    status_handle: SyncIOHandle,
     max_memory: usize,
 ) -> AsynResult<BrukerRuntime> {
     let port_name = claim.name();
