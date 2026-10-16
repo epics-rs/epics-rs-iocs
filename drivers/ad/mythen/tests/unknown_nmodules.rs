@@ -14,6 +14,7 @@ use std::sync::mpsc;
 
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 
@@ -51,8 +52,12 @@ fn fake_detector() -> (PortHandle, mpsc::Receiver<String>) {
     });
 
     let driver = DrvAsynIPPort::new("MYTHEN_UNKNOWN_IP", &addr).expect("ip port");
-    let (runtime, _) =
-        create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
+    let (runtime, _) = create_port_runtime(
+        &claim_port("MYTHEN_UNKNOWN_IP").unwrap(),
+        driver,
+        RuntimeConfig::default(),
+    )
+    .expect("ip port runtime");
     let handle = runtime.port_handle().clone();
     // The port actor must outlive the test.
     std::mem::forget(runtime);

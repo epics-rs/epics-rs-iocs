@@ -12,6 +12,7 @@ use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 
@@ -28,7 +29,8 @@ fn dead_ip_port(name: &str) -> PortHandle {
 
     let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
     let (runtime, _) =
-        create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
+        create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+            .expect("ip port runtime");
     let handle = runtime.port_handle().clone();
     // The port actor must outlive the test.
     std::mem::forget(runtime);
