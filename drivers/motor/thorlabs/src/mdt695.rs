@@ -67,6 +67,16 @@ pub struct Mdt695Controller {
     handle: SyncIOHandle,
     ident: String,
     num_axes: usize,
+    comm_state: CommState,
+}
+
+/// Controller communication state (C `cntrl->status`, shared by the axes):
+/// one failed readback is retried silently, a second in a row is a comm error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
 }
 
 impl Mdt695Controller {
@@ -79,6 +89,7 @@ impl Mdt695Controller {
             handle,
             ident: String::new(),
             num_axes: 3,
+            comm_state: CommState::Normal,
         };
 
         let mut model = String::new();
@@ -169,7 +180,6 @@ pub struct Mdt695Axis {
     controller: Arc<Mutex<Mdt695Controller>>,
     letter: char,
     prev_position: f64,
-    comms_error: bool,
 }
 
 impl Mdt695Axis {
@@ -179,7 +189,6 @@ impl Mdt695Axis {
             controller,
             letter: axis_letter(index),
             prev_position: 0.0,
-            comms_error: false,
         }
     }
 
@@ -258,27 +267,30 @@ impl AsynMotor for Mdt695Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
-        let reply = ctrl.query(&format!("{}R?", self.letter))?;
-        drop(ctrl);
-
-        // C parses the voltage from reply offset 2 (skips the 2-char prefix).
-        let mut comms_error = true;
-        let mut position = self.prev_position;
-        if reply.len() > 2 {
-            let tail = &reply[2..];
-            let trimmed = tail.trim_start();
-            if trimmed
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == '.')
-            {
-                position = atof(trimmed);
-                comms_error = false;
+        let mut ctrl = self.lock();
+        let reading = ctrl
+            .query(&format!("{}R?", self.letter))
+            .ok()
+            .and_then(|reply| parse_reading(&reply));
+        match reading {
+            Some(_) => ctrl.comm_state = CommState::Normal,
+            None => {
+                // C drvMDT695.cc:254-257: flush, toggle echo with `E`, read its
+                // reply; a retry keeps the previous status.
+                let _ = ctrl.query("E");
+                ctrl.comm_state = if ctrl.comm_state == CommState::Normal {
+                    CommState::Retry
+                } else {
+                    CommState::CommErr
+                };
             }
         }
-        self.comms_error = comms_error;
-        self.prev_position = position;
+        let comms_error = ctrl.comm_state == CommState::CommErr;
+        drop(ctrl);
+        if let Some(volts) = reading {
+            self.prev_position = volts;
+        }
+        let position = self.prev_position;
 
         Ok(MotorStatus {
             position,
@@ -295,6 +307,16 @@ impl AsynMotor for Mdt695Axis {
     }
 }
 
+/// C parses the voltage from reply offset 2 (skips the 2-char prefix).
+fn parse_reading(reply: &str) -> Option<f64> {
+    let trimmed = reply.get(2..)?.trim_start();
+    trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '+' || c == '-' || c == '.')
+        .then(|| atof(trimmed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +328,12 @@ mod tests {
         assert_eq!(axis_letter(2), 'Z');
         // Out-of-range clamps to the last channel.
         assert_eq!(axis_letter(5), 'Z');
+    }
+
+    #[test]
+    fn reading_parses_after_the_two_char_prefix() {
+        assert_eq!(parse_reading("X 12.5"), Some(12.5));
+        assert_eq!(parse_reading("XR?"), None);
+        assert_eq!(parse_reading("X"), None);
     }
 }
