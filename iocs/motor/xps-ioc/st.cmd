@@ -6,8 +6,9 @@
 #
 # Requires a Newport XPS (C8/Q8/RL) reachable over TCP on port 5001.
 # The XPS speaks a text RPC protocol: each socket is one TCP connection.
-# This driver uses one shared POLL socket (all reads) plus one MOVE socket
-# per axis (fire-and-forget motion). XPSCreateAxis reads the positioner's
+# XPSCreateController opens the poll socket, XPSCreateAxis one move socket
+# per axis, each its own asyn IP port as C's ConnectToServer makes it.
+# XPSCreateAxis reads the positioner's
 # S-gamma jerk times and corrector at startup and, as C does, ignores a failed
 # read. This example configures a single axis (GROUP1.POSITIONER).
 #============================================================
@@ -15,28 +16,18 @@
 epicsEnvSet("P",     "XPS:")
 epicsEnvSet("M0",    "m0")
 epicsEnvSet("PORT",  "MOTOR1")
-epicsEnvSet("POLL",  "XPSPOLL")
-epicsEnvSet("MOVE0", "XPSMOVE0")
-epicsEnvSet("HOST",  "192.168.0.254:5001")
-
-# ---- TCP octet sockets to the XPS (one connection each) ----
-# drvAsynIPPortConfigure(portName, hostInfo, [priority], [noAutoConnect], [noProcessEos])
-# noProcessEos=1: the driver frames replies on ",EndOfAPI" itself, matching the
-# C asynOctetSocket which sets noProcessEos.
-drvAsynIPPortConfigure("$(POLL)",  "$(HOST)", 0, 0, 1)
-drvAsynIPPortConfigure("$(MOVE0)", "$(HOST)", 0, 0, 1)
+epicsEnvSet("IP",    "192.168.0.254")
 
 # ---- XPS controller + axes ----
-# XPSCreateController(motorPort, pollPort, numAxes, [movingPollMs], [idlePollMs],
-#                     [enableSetPosition], [setPositionSettlingMs])
-XPSCreateController("$(PORT)", "$(POLL)", 1, 100, 1000, 0, 0)
-# XPSCreateAxis(motorPort, movePort, axis, positionerName, stepsPerUnit)
-# stepsPerUnit: pass 1 in the normal configuration (record EGU == positioner
-# units); the record boundary is EGU, so the C steps-per-unit value does not
-# apply here.
-XPSCreateAxis("$(PORT)", "$(MOVE0)", 0, "GROUP1.POSITIONER", 1)
+# XPSCreateController(portName, IPAddress, IPPort, numAxes, movingPollPeriod,
+#                     idlePollPeriod, enableSetPosition, setPositionSettlingTime)
+XPSCreateController("$(PORT)", "$(IP)", 5001, 1, 100, 1000, 0, 0)
+# XPSCreateAxis(portName, axis, positionerName, stepsPerUnit)
+XPSCreateAxis("$(PORT)", 0, "GROUP1.POSITIONER", "1")
+# XPSCreateProfile(portName, maxPoints, ftpUsername, ftpPassword)
+XPSCreateProfile("$(PORT)", 2000, "Administrator", "Administrator")
 
-dbLoadRecords("$(XPS_IOC)/db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT)")
+dbLoadRecords("$(XPS_IOC)/db/xps.template", "P=$(P),M0=$(M0),PORT=$(PORT),ADDR=0")
 
 iocInit()
 
@@ -71,21 +62,18 @@ iocInit()
 #     0.5, 2.0
 #     0.5, 3.0
 #
-# Execution needs its own TCP socket (MultipleAxesPVTExecution blocks until the
-# trajectory finishes). Configure a dedicated exec port alongside the move port:
-#     drvAsynIPPortConfigure("XPSEXEC0", "$(HOST)", 0, 0, 1)
-#
-# Then, after iocInit:
+# Execution runs on the profile socket XPSCreateController opened
+# (MultipleAxesPVTExecution blocks until the trajectory finishes). After iocInit:
 #     XPSDefineProfileFromFile("$(PORT)", "GROUP1", "db/scan.csv", "absolute")
-#     XPSBuildProfile("$(PORT)", "TrajectoryScan.trj", "192.168.0.254")
-#     XPSExecuteProfile("$(PORT)", "XPSEXEC0", 1)
-# XPSBuildProfile FTP credentials/dir default to the XPS factory Administrator
-# account and /Admin/Public/Trajectories; override with extra args if changed.
+#     XPSBuildProfile("$(PORT)", "TrajectoryScan.trj", "$(IP)")
+#     XPSExecuteProfile("$(PORT)", 1)
+# XPSBuildProfile FTP credentials default to the XPSCreateProfile login and the
+# directory to /Admin/Public/Trajectories; override with extra args if changed.
 # Only plain FTP (XPS-C/Q) is supported; XPS-D SFTP is not implemented.
 #
 # Gathering: every execution samples SetpointPosition + CurrentPosition of all
 # registered positioners on each trajectory pulse. The optional trailing args
-#     XPSExecuteProfile(motorPort, execPort, [executions],
+#     XPSExecuteProfile(motorPort, [executions],
 #                       [startPulses], [endPulses], [numPulses])
 # window the pulse train over 1-based trajectory elements (defaults: the whole
 # profile with one pulse per element). After the run completes, read the

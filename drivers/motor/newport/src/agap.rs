@@ -59,8 +59,7 @@ fn parse_error(what: &str) -> AsynError {
     agap_err(format!("AGAP: could not parse {what} response"))
 }
 
-/// C `AGAP_CONEXAxis` constructor: axis 0 → `'U'`, otherwise `'V'`. Also used
-/// by the IOC create command to form the per-axis DTYP key.
+/// C `AGAP_CONEXAxis` constructor: axis 0 → `'U'`, otherwise `'V'`.
 pub(crate) fn axis_name(axis_index: u8) -> char {
     if axis_index == 0 { 'U' } else { 'V' }
 }

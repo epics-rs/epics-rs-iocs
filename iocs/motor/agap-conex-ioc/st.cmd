@@ -33,7 +33,7 @@ asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- CONEX-AGAP controller (creates both U and V axes) ----
-# AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])
+# AGAP_CONEXCreateController(portName, serialPort, controllerID, movingPollPeriod, idlePollPeriod)
 AGAP_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 100, 1000)
 
 dbLoadRecords("$(AGAP_CONEX_IOC)/db/agap.template", "P=$(P),MU=$(MU),MV=$(MV),PORT=$(PORT)")

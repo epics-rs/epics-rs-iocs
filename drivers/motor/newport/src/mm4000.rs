@@ -161,7 +161,8 @@ impl Mm4000Controller {
     /// Connect and identify an MM4000/4005/4006 (C `MM4000AsynConfig`):
     /// `VE;` up to 3 tries → firmware/model, then `TP;` — the number of
     /// comma-separated fields is the axis count on the wire, which must
-    /// cover `num_axes`. `None` is C's refused config: a failed `VE;` says
+    /// cover `num_axes`; a `num_axes` of 0 takes them all, as the model-1
+    /// driver does. `None` is C's refused config: a failed `VE;` says
     /// nothing, the other refusals print C's line. Performs blocking serial
     /// I/O.
     pub fn new(
@@ -197,7 +198,15 @@ impl Mm4000Controller {
             println!("MM4000AsynConfig: actual number of axes={total_axes} < numAxes={num_axes}");
             return None;
         }
+        if num_axes == 0 {
+            ctrl.num_axes = total_axes;
+        }
         Some(ctrl)
+    }
+
+    /// The axes this controller serves.
+    pub fn num_axes(&self) -> usize {
+        self.num_axes
     }
 
     /// Firmware version from `VE;` (the `VE` prefix stripped).

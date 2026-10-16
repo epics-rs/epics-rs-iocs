@@ -1,22 +1,21 @@
 //! Newport HXP hexapod controller IOC.
 //!
-//! Assembles: TCP octet ports (`drvAsynIPPortConfigure`) to the hexapod — one
-//! shared poll socket plus one shared move socket — an HXP controller with its
-//! six axes (`HXPCreateController`), the motor record type, and the CA + PVA
+//! Assembles: an HXP controller with its six axes (`HXPCreateController`,
+//! which opens its TCP sockets from an IP address and port), the motor record type, and the CA + PVA
 //! (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p hxp-ioc -- st.cmd
-//!
-//! The HXP RPC reply framing (`,EndOfAPI`) is handled inside the driver, so
-//! the `st.cmd` only needs plain `drvAsynIPPortConfigure` ports.
 
 use std::sync::Arc;
 
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_newport::NewportHolder;
+use motor_newport::ioc::{
+    hxp_coord_sys_read_command, hxp_coord_sys_set_command, hxp_create_controller_command,
+    hxp_move_all_command, hxp_set_move_coord_sys_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -42,13 +41,15 @@ async fn main() -> CaResult<()> {
 
     // HXP controller create command (creates all six axes), the
     // driver-private hexapod commands, and the motor device support.
-    let holder = NewportHolder::new();
-    app = app.register_startup_command(holder.hxp_create_controller_command());
-    app = app.register_startup_command(holder.hxp_move_all_command());
-    app = app.register_startup_command(holder.hxp_coord_sys_read_command());
-    app = app.register_startup_command(holder.hxp_coord_sys_set_command());
-    app = app.register_startup_command(holder.hxp_set_move_coord_sys_command());
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(hxp_create_controller_command());
+    app = app.register_startup_command(hxp_move_all_command());
+    app = app.register_startup_command(hxp_coord_sys_read_command());
+    app = app.register_startup_command(hxp_coord_sys_set_command());
+    app = app.register_startup_command(hxp_set_move_coord_sys_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

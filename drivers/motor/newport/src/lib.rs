@@ -26,7 +26,6 @@ pub use agilis::{AgUcAxis, AgUcController};
 pub use conex::ConexAxis;
 pub use esp300::{Esp300Axis, Esp300Controller};
 pub use hxp::{HxpAxis, HxpController};
-pub use ioc::NewportHolder;
 pub use mm3000::{Mm3000Axis, Mm3000Controller};
 pub use mm4000::{Mm4000Axis, Mm4000Controller};
 pub use pm500::{Pm500Axis, Pm500Controller};

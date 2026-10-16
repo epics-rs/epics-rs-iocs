@@ -5,13 +5,12 @@
 #   cargo run -p pm500-ioc -- st.cmd
 #
 # Requires a Newport PM500 controller on the serial line below.
-# PM500CreateController configures the controller (SCUM 1, SENAINT $AF),
-# identifies it (SVN?), and autodiscovers axes (STAT? scan) at startup,
-# so it must be connected when the command runs.
+# PM500Config configures the controller (SCUM 1, SENAINT $AF), identifies it
+# (SVN?), and autodiscovers axes (STAT? scan), so it must be connected when
+# the command runs.
 #============================================================
 
 epicsEnvSet("P",      "PM500:")
-epicsEnvSet("PORT",   "MOTOR1")
 epicsEnvSet("SERIAL", "SERIAL1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
@@ -30,14 +29,15 @@ asynOctetSetInputEos("$(SERIAL)", 0, "\r")
 asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- PM500 controller ----
-# PM500CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs])
-# Autodiscovers axes; one motor axis per channel (X Y Z A B C ...).
-PM500CreateController("$(PORT)", "$(SERIAL)", 100, 1000)
+# PM500Setup(num_cards, scan_rate in Hz)
+PM500Setup(1, 10)
+# PM500Config(card, asyn port, GPIB address): one axis per channel (X Y Z A ...).
+PM500Config(0, "$(SERIAL)")
 
-# One motor record per axis (DTYP PM500_$(PORT)_0, _1, ...).
+# One motor record per axis, signal S of card 0.
 # Positions travel the driver boundary in EGU (controller units: microns
 # or arc-sec) directly; MRES only sets the record's raw-count resolution.
-dbLoadRecords("$(PM500_IOC)/db/pm500.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=0.01,EGU=um")
+dbLoadRecords("$(PM500_IOC)/db/pm500.template", "P=$(P),M=m1,C=0,S=0,MRES=0.01,EGU=um")
 
 iocInit()
 

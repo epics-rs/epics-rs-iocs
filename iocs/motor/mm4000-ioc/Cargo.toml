@@ -9,5 +9,6 @@ edition = "2024"
 publish = false
 
 [dependencies]
+motor-common = { path = "../../../drivers/motor/common" }
 motor-newport = { path = "../../../drivers/motor/newport" }
 epics-rs = { workspace = true, features = ["asyn", "motor", "bridge"] }

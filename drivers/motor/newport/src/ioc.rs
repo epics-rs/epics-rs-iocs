@@ -1,41 +1,44 @@
-//! IOC integration for the Newport motor drivers.
+//! iocsh commands for the Newport drivers, under C's names and arguments
+//! (NewportRegister.cc, the model-3 `*Create*` files and NewFocusRegister.cc).
 //!
-//! Exposes the Newport family's `*CreateController` iocsh commands and the
-//! dynamic device-support factory that binds each created controller to its
-//! motor record. A single [`NewportHolder`] serves the whole family (the Rust
-//! analogue of `NewportRegister.cc`, which registers every Newport
-//! `CreateController` function): the IOC binary registers whichever create
-//! commands it needs, and all share one device-support store keyed by DTYP.
+//! - **Model 3** (SMC100, CONEX, CONEX-AGAP, Agilis, XPS, HXP): each
+//!   controller is asyn port `portName`, and records reach its axes as
+//!   `@asyn(portName,axis)`. XPS and HXP open their own TCP sockets from an IP
+//!   address and port, as asyn ports named `ip:port:N` (C `ConnectToServer`).
+//! - **Model 2** (`MM4000AsynSetup`/`MM4000AsynConfig`): `MM4000AsynConfig`
+//!   builds a card of [`MOTOR_MM4000`], which `drvAsynMotorConfigure` opens.
+//! - **Model 1** (MM3000, MM4000, PM500, ESP300, PMNC87xx): `<Drv>Setup` +
+//!   `<Drv>Config(card, port, addr)`; records reach the axes as
+//!   `DTYP "<Drv>"`, `OUT "#C card S signal"`.
 //!
-//! Wiring chain (assembled in the IOC binary + st.cmd), e.g. SMC100:
-//!
-//! ```text
-//! drvAsynSerialPortConfigure("SERIAL", "/dev/ttyUSB0", ...)   // built-in asyn
-//!   -> SMC100CreateController("MOTOR", "SERIAL", wireScale, ...)
-//!        get_port("SERIAL") -> SyncIOHandle -> Smc100Axis -> MotorBuilder
-//!        -> spawn poll loop, store device support under DTYP "SMC100_MOTOR"
-//!   -> dbLoadRecords(smc100.template, "P=..,M=..,PORT=MOTOR")   // DTYP match
-//! ```
-//!
-//! CONEX is identical except the axis is a [`ConexAxis`] (which self-identifies
-//! its model at construction) and the DTYP prefix is `CONEX_`.
+//! The XPS profile, position-compare and TCL commands and the HXP
+//! move-all/coordinate-system commands are driver-private: C drives them from
+//! controller-level records this port does not serve.
 
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::asyn_record::{claim_port, get_port};
+use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
-use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
-use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
-use epics_rs::motor::device_support::MotorDeviceSupport;
-use epics_rs::motor::poll_loop::PollCommand;
-use epics_rs::motor::trace::{MotorTrace, TraceUser};
-use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
+use epics_rs::base::server::record::DevSup;
+use epics_rs::motor::trace::MotorTrace;
+use motor_common::connect::{EosConnectError, EosRefusal, connect_serial, connect_with_eos};
+use motor_common::iocsh::{
+    arg_double_opt, arg_double_req, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int,
+    opt_string, poll_intervals, req_double, req_string,
+};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1_device;
+use motor_common::model2::{Model2, Model2Axis};
+use motor_common::util::atof;
+use motor_common::{PortDriver, asyn_user, install, register_port};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -52,16 +55,6 @@ use crate::xps::{
     XpsController, XpsError, XpsSocket, ftp, gathering, pco, profile,
 };
 
-/// Default moving/idle poll intervals (ms) when the iocsh args are omitted.
-const DEFAULT_MOVING_POLL_MS: u64 = 100;
-const DEFAULT_IDLE_POLL_MS: u64 = 1000;
-
-/// The 1-based axis number for the single-axis SMC100 (C `axisNo_ + 1`).
-const SMC100_AXIS: u8 = 1;
-
-/// Octet `addr` used on the serial transport port (single-device serial line).
-const SERIAL_ADDR: i32 = 0;
-
 /// Per-command serial I/O timeout: SMC100 (`from_handle` default) and CONEX /
 /// AGAP (`CONEX_TIMEOUT`).
 const SMC100_TIMEOUT: Duration = Duration::from_secs(1);
@@ -76,11 +69,9 @@ const XPS_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 /// not wait for the move to finish, so the read times out quickly.
 const XPS_MOVE_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// XPS PVT execution socket timeout. `MultipleAxesPVTExecution` — and the
-/// move-to-start moves that precede it on the same socket — block until the
-/// motion finishes, so this bounds a whole trajectory run rather than a single
-/// RPC. C runs this on a dedicated socket with no explicit cap; 1 h is a
-/// generous upper bound so a wedged run cannot hang the executor thread forever.
+/// The controller's own move socket, which runs profiles: the moves to the
+/// start and `MultipleAxesPVTExecution` block until the motion finishes, so
+/// this bounds a whole trajectory run rather than a single RPC.
 const XPS_PVT_EXEC_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// HXP hexapod poll-socket timeout (C `HXP_POLL_TIMEOUT` = 2 s).
@@ -98,7 +89,7 @@ const MM3000_TIMEOUT: Duration = Duration::from_secs(5);
 /// MM4000 serial command timeout (C drvMM4000Asyn `TIMEOUT` 2 s).
 const MM4000_TIMEOUT: Duration = Duration::from_secs(2);
 /// C drvMM4000Asyn `MM4000_MAX_AXES`.
-const MM4000_MAX_AXES: i64 = 8;
+const MM4000_MAX_AXES: i32 = 8;
 
 /// PM500 serial command timeout (C drvPM500 `SERIAL_TIMEOUT` 2 s).
 const PM500_TIMEOUT: Duration = Duration::from_secs(2);
@@ -107,1907 +98,1701 @@ const PM500_TIMEOUT: Duration = Duration::from_secs(2);
 /// `PMNC_TIMEOUT` 3 s).
 const PMNC_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Default XPS FTP account and trajectory directory. C uses the factory
-/// `Administrator`/`Administrator` login; `/Admin/Public/Trajectories` is the
-/// XPS-C/Q public trajectory folder. Both are overridable on `XPSBuildProfile`.
+/// Default XPS FTP account and trajectory directory: the factory
+/// `Administrator` login C's `XPSCreateProfile` is normally given, and the
+/// XPS-C/Q public trajectory folder.
 const XPS_FTP_USER: &str = "Administrator";
 const XPS_FTP_PASSWORD: &str = "Administrator";
 const XPS_TRAJECTORY_DIR: &str = "/Admin/Public/Trajectories";
 
-/// A shared Agilis controller registered by `AG_UCCreateController`, awaiting
-/// its axes to be added by `AG_UCCreateAxis`. Carries the poll intervals from
-/// the controller command so each later axis inherits them.
-struct AgUcRegistration {
-    controller: Arc<Mutex<AgUcController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
-}
+/// `MAX_SOCKETS` (asynOctetSocket.cpp:36).
+const MAX_SOCKETS: usize = 1000;
 
-/// A shared XPS controller registered by `XPSCreateController`, awaiting its
-/// axes to be added by `XPSCreateAxis`. Carries the poll intervals so each
-/// later axis inherits them.
-struct XpsRegistration {
-    controller: Arc<Mutex<XpsController>>,
-    moving_poll_ms: u64,
-    idle_poll_ms: u64,
-}
+/// `nextSocket` (asynOctetSocket.cpp).
+static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
 
-/// A shared HXP hexapod controller registered by `HXPCreateController` (its
-/// six axes are created with it). Keeps a dedicated `Fire`-mode move socket
-/// for the driver-private commands (`HXPMoveAll` blocks until the motion
-/// finishes on a `Query` socket, so it fires like the axis moves do).
-struct HxpRegistration {
-    controller: Arc<Mutex<HxpController>>,
-    move_sock: XpsSocket,
-}
-
-/// Holds Newport motor device-support instances created by the family's
-/// `*CreateController` commands. Each controller is stored under a
-/// `"{PREFIX}_{motor_port}"` DTYP key and consumed once by the dynamic
-/// device-support factory during iocInit.
-pub struct NewportHolder {
-    motors: Mutex<HashMap<String, Option<MotorDeviceSupport>>>,
-    /// Agilis controllers keyed by motor port, bridging the two-step
-    /// `AG_UCCreateController` / `AG_UCCreateAxis` iocsh API.
-    ag_uc_controllers: Mutex<HashMap<String, AgUcRegistration>>,
-    /// XPS controllers keyed by motor port, bridging the two-step
-    /// `XPSCreateController` / `XPSCreateAxis` iocsh API.
-    xps_controllers: Mutex<HashMap<String, XpsRegistration>>,
-    /// HXP hexapod controllers keyed by motor port, for the driver-private
-    /// commands (`HXPMoveAll`, coordinate-system read/set, move coord-sys).
-    hxp_controllers: Mutex<HashMap<String, HxpRegistration>>,
-}
-
-/// The trace user of an axis a C asyn driver serves: its port and address.
-fn asyn_user(port: &str, addr: i32) -> TraceUser {
-    TraceUser::Asyn {
-        port: port.into(),
-        addr,
+/// C `ConnectToServer` (asynOctetSocket.cpp:60): asyn IP port
+/// `ip:port:N` from `drvAsynIPPortConfigure(name, "ip:port TCP", 0, 0, 1)`.
+/// `None` is C's -1, printed as C prints it.
+fn connect_to_server(
+    ctx: &CommandContext,
+    ip: &str,
+    ip_port: i32,
+    timeout: Duration,
+) -> Option<SyncIOHandle> {
+    let socket = NEXT_SOCKET.load(Ordering::Relaxed);
+    if socket >= MAX_SOCKETS {
+        println!("ConnectToServer: too many open sockets, max={MAX_SOCKETS}");
+        return None;
     }
-}
-
-impl NewportHolder {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            motors: Mutex::new(HashMap::new()),
-            ag_uc_controllers: Mutex::new(HashMap::new()),
-            xps_controllers: Mutex::new(HashMap::new()),
-            hxp_controllers: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// Shared wiring for every `*CreateController` command: build the motor
-    /// record + poll loop for `motor`, spawn the poll loop (polling from iocRun), and
-    /// store the device support under `dtyp_key` for later `dbLoadRecords`
-    /// binding. `user` is the asyn user its trace lines print on:
-    /// [`asyn_user`] for a C asyn driver, [`TraceUser::Model1`] for a model-1
-    /// one (ESP300, MM3000, PM500, PMNC).
-    fn install(
-        &self,
-        ctx: &CommandContext,
-        user: TraceUser,
-        dtyp_key: String,
-        motor: Arc<Mutex<dyn AsynMotor>>,
-        moving_poll_ms: u64,
-        idle_poll_ms: u64,
-    ) {
-        let MotorSetup {
-            record: _,
-            device_support,
-            poll_loop,
-            poll_cmd_tx,
-        } = MotorBuilder::new(motor)
-            .trace_user(user)
-            .moving_poll_interval(Duration::from_millis(moving_poll_ms))
-            .idle_poll_interval(Duration::from_millis(idle_poll_ms))
-            .build();
-
-        let device_support = device_support.with_dtyp_name(dtyp_key.clone());
-
-        ctx.bridge().spawn(poll_loop.run());
-
-        // Released when the IOC runs, as C's poller starts delivering status
-        // after iocInit: owned here so no IOC binary can leave the axis unpolled.
-        init_hook_register(Arc::new(move |state| {
-            if state == InitHookState::AfterIocRunning {
-                let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
-            }
-        }));
-        self.motors
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(dtyp_key, Some(device_support));
-    }
-
-    /// Create the `SMC100CreateController` iocsh command.
-    ///
-    /// Usage:
-    /// `SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs])`
-    ///
-    /// `wireScale` is the controller-units-per-record-EGU factor — 1.0 in the
-    /// normal configuration where the record EGU is the controller's native
-    /// unit (mm). It fills C's `eguPerStep` argument slot but is NOT that
-    /// value: the asyn-rs record boundary is EGU, not raw steps (see
-    /// [`crate::smc100`] module Units note).
-    pub fn smc100_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "SMC100CreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                ArgDesc {
-                    name: "wireScale",
-                    arg_type: ArgType::Double,
-                },
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs]) - Create a Newport SMC100 controller (wireScale: controller units per record EGU, normally 1.0)",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                let wire_scale = match &args[2] {
-                    ArgValue::Double(v) => *v,
-                    _ => return Err("wireScale must be a number".into()),
-                };
-                if wire_scale == 0.0 {
-                    return Err("wireScale must be non-zero".into());
-                }
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-
-                let handle = connect_serial(&serial_port, SMC100_TIMEOUT)?;
-                let dtyp_key = format!("SMC100_{motor_port}");
-                let motor: Arc<Mutex<dyn AsynMotor>> =
-                    Arc::new(Mutex::new(Smc100Axis::new(handle, SMC100_AXIS, wire_scale)));
-
-                holder.install(
-                    ctx,
-                    asyn_user(&motor_port, 0),
-                    dtyp_key.clone(),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
-                println!(
-                    "SMC100CreateController: motorPort={motor_port} serialPort={serial_port} wireScale={wire_scale} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `AG_CONEXCreateController` iocsh command.
-    ///
-    /// Usage:
-    /// `AG_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])`
-    ///
-    /// [`ConexAxis::new`] performs blocking serial I/O to identify the CONEX
-    /// model and read its limits, so the controller must be reachable when
-    /// this command runs.
-    pub fn ag_conex_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "AG_CONEXCreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                ArgDesc {
-                    name: "controllerID",
-                    arg_type: ArgType::Int,
-                },
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "AG_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs]) - Create a Newport CONEX controller",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                let controller_id = match &args[2] {
-                    ArgValue::Int(v) => *v as i32,
-                    _ => return Err("controllerID must be an integer".into()),
-                };
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-
-                let handle = connect_serial(&serial_port, CONEX_TIMEOUT)?;
-                let Some(axis) = ConexAxis::new(handle, controller_id) else {
-                    return Ok(CommandOutcome::Continue);
-                };
-                let dtyp_key = format!("CONEX_{motor_port}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-
-                holder.install(
-                    ctx,
-                    asyn_user(&motor_port, 0),
-                    dtyp_key.clone(),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
-                println!(
-                    "AG_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `AGAP_CONEXCreateController` iocsh command.
-    ///
-    /// Usage:
-    /// `AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])`
-    ///
-    /// The AGAP is a two-axis (`U`/`V`) controller: this creates one shared
-    /// [`AgapController`] plus two [`AgapAxis`] device supports, registered
-    /// under DTYP keys `AGAP_{motorPort}_U` and `AGAP_{motorPort}_V`. Both
-    /// axes share one serial line; each axis operation locks the controller so
-    /// its write→read exchange stays atomic. [`AgapController::new`] and
-    /// [`AgapAxis::new`] perform blocking serial I/O, so the controller must be
-    /// reachable when this command runs.
-    pub fn agap_conex_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "AGAP_CONEXCreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                ArgDesc {
-                    name: "controllerID",
-                    arg_type: ArgType::Int,
-                },
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "AGAP_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs]) - Create a Newport CONEX-AGAP two-axis controller",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                let controller_id = match &args[2] {
-                    ArgValue::Int(v) => *v as i32,
-                    _ => return Err("controllerID must be an integer".into()),
-                };
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-
-                let handle = connect_serial(&serial_port, AGAP_TIMEOUT)?;
-                let Some(controller) = AgapController::new(handle, controller_id) else {
-                    return Ok(CommandOutcome::Continue);
-                };
-                let controller = Arc::new(Mutex::new(controller));
-
-                for axis_index in 0..agap::NUM_AXES {
-                    let axis = AgapAxis::new(controller.clone(), axis_index);
-                    let dtyp_key = format!("AGAP_{motor_port}_{}", agap::axis_name(axis_index));
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                    holder.install(
-                        ctx,
-                        asyn_user(&motor_port, axis_index as i32),
-                        dtyp_key,
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    );
-                }
-                println!(
-                    "AGAP_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=AGAP_{motor_port}_U, AGAP_{motor_port}_V)"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `AG_UCCreateController` iocsh command.
-    ///
-    /// Usage:
-    /// `AG_UCCreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs])`
-    ///
-    /// Registers a shared Agilis [`AgUcController`] under `motorPort`; the axes
-    /// are added afterward by [`Self::ag_uc_create_axis_command`]. `numAxes` is
-    /// accepted for C-parity but the axes are created individually.
-    /// [`AgUcController::new`] resets the controller and performs blocking
-    /// serial I/O, so it must be reachable when this command runs.
-    pub fn ag_uc_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "AG_UCCreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                ArgDesc {
-                    name: "numAxes",
-                    arg_type: ArgType::Int,
-                },
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "AG_UCCreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs]) - Create a Newport Agilis AG-UC controller (add axes with AG_UCCreateAxis)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                let num_axes = match &args[2] {
-                    ArgValue::Int(v) => *v,
-                    _ => return Err("numAxes must be an integer".into()),
-                };
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-
-                let handle = connect_serial(&serial_port, AG_UC_TIMEOUT)?;
-                let controller = AgUcController::new(handle);
-                let model = controller.model();
-                holder
-                    .ag_uc_controllers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        motor_port.clone(),
-                        AgUcRegistration {
-                            controller: Arc::new(Mutex::new(controller)),
-                            moving_poll_ms,
-                            idle_poll_ms,
-                        },
-                    );
-                println!(
-                    "AG_UCCreateController: motorPort={motor_port} serialPort={serial_port} model={model:?} numAxes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (add axes with AG_UCCreateAxis)"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `AG_UCCreateAxis` iocsh command.
-    ///
-    /// Usage:
-    /// `AG_UCCreateAxis(motorPort, axis, hasLimits, forwardAmplitude, reverseAmplitude)`
-    ///
-    /// Adds one [`AgUcAxis`] to the controller registered under `motorPort` by
-    /// `AG_UCCreateController`, registered under DTYP `AG_UC_{motorPort}_{axis}`.
-    /// [`AgUcAxis::new`] performs blocking serial I/O (step-amplitude setup).
-    pub fn ag_uc_create_axis_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "AG_UCCreateAxis",
-            vec![
-                arg_str_req("motorPort"),
-                ArgDesc {
-                    name: "axis",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "hasLimits",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "forwardAmplitude",
-                    arg_type: ArgType::Int,
-                },
-                ArgDesc {
-                    name: "reverseAmplitude",
-                    arg_type: ArgType::Int,
-                },
-            ],
-            "AG_UCCreateAxis(motorPort, axis, hasLimits, forwardAmplitude, reverseAmplitude) - Add an axis to a Newport Agilis AG-UC controller",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let axis = match &args[1] {
-                    ArgValue::Int(v) => *v as i32,
-                    _ => return Err("axis must be an integer".into()),
-                };
-                let has_limits = match &args[2] {
-                    ArgValue::Int(v) => *v != 0,
-                    _ => return Err("hasLimits must be an integer".into()),
-                };
-                let forward_amplitude = match &args[3] {
-                    ArgValue::Int(v) => *v as i32,
-                    _ => return Err("forwardAmplitude must be an integer".into()),
-                };
-                let reverse_amplitude = match &args[4] {
-                    ArgValue::Int(v) => *v as i32,
-                    _ => return Err("reverseAmplitude must be an integer".into()),
-                };
-
-                let controller = {
-                    let controllers = holder
-                        .ag_uc_controllers
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let reg = controllers.get(&motor_port).ok_or_else(|| {
-                        format!(
-                            "AG_UCCreateAxis: controller '{motor_port}' not found (call AG_UCCreateController first)"
-                        )
-                    })?;
-                    (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
-                };
-                let (controller, moving_poll_ms, idle_poll_ms) = controller;
-
-                let ax = AgUcAxis::new(
-                    controller,
-                    axis,
-                    has_limits,
-                    forward_amplitude,
-                    reverse_amplitude,
-                );
-                let dtyp_key = format!("AG_UC_{motor_port}_{axis}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-
-                holder.install(
-                    ctx,
-                    asyn_user(&motor_port, axis),
-                    dtyp_key.clone(),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
-                println!(
-                    "AG_UCCreateAxis: motorPort={motor_port} axis={axis} hasLimits={has_limits} fwdAmp={forward_amplitude} revAmp={reverse_amplitude} (DTYP={dtyp_key})"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `XPSCreateController` iocsh command.
-    ///
-    /// Usage:
-    /// `XPSCreateController(motorPort, pollPort, numAxes, [movingPollMs], [idlePollMs], [enableSetPosition], [setPositionSettlingMs])`
-    ///
-    /// `pollPort` is a `drvAsynIPPort` (TCP) to the XPS, shared by the
-    /// controller and all its axes for reads. Add axes with `XPSCreateAxis`.
-    /// Unlike the C `XPSCreateController` (which takes an IP/port and opens the
-    /// sockets itself), this looks up asyn ports registered in `st.cmd`, matching
-    /// the port-name convention of the other Newport Rust drivers.
-    pub fn xps_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSCreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("pollPort"),
-                ArgDesc {
-                    name: "numAxes",
-                    arg_type: ArgType::Int,
-                },
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-                arg_int_opt("enableSetPosition"),
-                arg_int_opt("setPositionSettlingMs"),
-            ],
-            "XPSCreateController(motorPort, pollPort, numAxes, [movingPollMs], [idlePollMs], [enableSetPosition], [setPositionSettlingMs]) - Create a Newport XPS controller (add axes with XPSCreateAxis)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let poll_port = req_string(args, 1, "pollPort")?;
-                let num_axes = match &args[2] {
-                    ArgValue::Int(v) => *v,
-                    _ => return Err("numAxes must be an integer".into()),
-                };
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-                let enable_set_position = match args.get(5) {
-                    Some(ArgValue::Int(v)) => *v != 0,
-                    None | Some(ArgValue::Missing) => false,
-                    _ => return Err("enableSetPosition must be an integer".into()),
-                };
-                let settling_ms = match args.get(6) {
-                    Some(ArgValue::Int(v)) if *v >= 0 => *v as u64,
-                    None | Some(ArgValue::Missing) => 0,
-                    _ => return Err("setPositionSettlingMs must be a non-negative integer".into()),
-                };
-
-                let handle = connect_ip(&poll_port, XPS_POLL_TIMEOUT)?;
-                let poll_sock = XpsSocket::new(handle, &poll_port, SocketMode::Query);
-                let controller = XpsController::new(
-                    poll_sock,
-                    enable_set_position,
-                    Duration::from_millis(settling_ms),
-                )
-                .map_err(|e| format!("XPSCreateController: {e}"))?;
-                let firmware = controller.firmware().to_string();
-                holder
-                    .xps_controllers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        motor_port.clone(),
-                        XpsRegistration {
-                            controller: Arc::new(Mutex::new(controller)),
-                            moving_poll_ms,
-                            idle_poll_ms,
-                        },
-                    );
-                println!(
-                    "XPSCreateController: motorPort={motor_port} pollPort={poll_port} firmware=\"{firmware}\" numAxes={num_axes} enableSetPosition={enable_set_position} settling={settling_ms}ms poll=[{moving_poll_ms}/{idle_poll_ms}]ms (add axes with XPSCreateAxis)"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `XPSCreateAxis` iocsh command.
-    ///
-    /// Usage:
-    /// `XPSCreateAxis(motorPort, movePort, axis, positionerName, stepsPerUnit)`
-    ///
-    /// Adds one [`XpsAxis`] to the controller registered under `motorPort` by
-    /// `XPSCreateController`, registered under DTYP `XPS_{motorPort}_{axis}`.
-    /// `movePort` is this axis's own `drvAsynIPPort` (TCP), used for the
-    /// fire-and-forget move socket. `positionerName` is `group.positioner` and
-    /// `stepsPerUnit` fills C's argument slot; the driver applies
-    /// `1 / stepsPerUnit` as a record-EGU → positioner-units wire scale, so
-    /// pass 1 in the normal configuration where the record EGU is the
-    /// positioner's native unit — NOT the C steps-per-unit value (the asyn-rs
-    /// record boundary is EGU, not raw steps). [`XpsAxis::new`]
-    /// performs blocking RPC (the S-gamma jerk times and the corrector).
-    pub fn xps_create_axis_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSCreateAxis",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("movePort"),
-                ArgDesc {
-                    name: "axis",
-                    arg_type: ArgType::Int,
-                },
-                arg_str_req("positionerName"),
-                ArgDesc {
-                    name: "stepsPerUnit",
-                    arg_type: ArgType::Double,
-                },
-            ],
-            "XPSCreateAxis(motorPort, movePort, axis, positionerName, stepsPerUnit) - Add an axis to a Newport XPS controller",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let move_port = req_string(args, 1, "movePort")?;
-                let axis = match &args[2] {
-                    ArgValue::Int(v) => *v as i32,
-                    _ => return Err("axis must be an integer".into()),
-                };
-                let positioner_name = req_string(args, 3, "positionerName")?;
-                let steps_per_unit = match &args[4] {
-                    ArgValue::Double(v) => *v,
-                    _ => return Err("stepsPerUnit must be a number".into()),
-                };
-                if steps_per_unit == 0.0 {
-                    return Err("stepsPerUnit must be non-zero".into());
-                }
-                let step_size = 1.0 / steps_per_unit;
-
-                let (controller, moving_poll_ms, idle_poll_ms) = {
-                    let controllers = holder
-                        .xps_controllers
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    // C prints and returns an error iocsh discards.
-                    let Some(reg) = controllers.get(&motor_port) else {
-                        println!("XPSController:XPSCreateAxis: Error port {motor_port} not found");
-                        return Ok(CommandOutcome::Continue);
-                    };
-                    (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
-                };
-
-                let handle = connect_ip(&move_port, XPS_MOVE_TIMEOUT)?;
-                let move_sock = XpsSocket::new(handle, &move_port, SocketMode::Fire);
-                let ax = XpsAxis::new(
-                    controller,
-                    move_sock,
-                    &motor_port,
-                    axis,
-                    &positioner_name,
-                    step_size,
-                );
-                let dtyp_key = format!("XPS_{motor_port}_{axis}");
-                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-
-                holder.install(
-                    ctx,
-                    asyn_user(&motor_port, axis),
-                    dtyp_key.clone(),
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
-                println!(
-                    "XPSCreateAxis: motorPort={motor_port} movePort={move_port} axis={axis} positioner={positioner_name} stepsPerUnit={steps_per_unit} (DTYP={dtyp_key})"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `XPSTclScriptExecute` iocsh command.
-    ///
-    /// Usage:
-    /// `XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters])`
-    ///
-    /// Runs a TCL script file on the XPS registered under `motorPort`, over its
-    /// shared poll socket. Ports `TCLScriptExecute`; `taskName`/`parameters`
-    /// default to `"0"` as the C driver does. DEVIATION from C's record-driven
-    /// trigger (`XPSTclScript_`/`XPSTclScriptExecute_` asyn params): this is an
-    /// imperative iocsh command, the natural interface for a one-shot script.
-    pub fn xps_tcl_script_execute_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSTclScriptExecute",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("tclFile"),
-                ArgDesc {
-                    name: "taskName",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "parameters",
-                    arg_type: ArgType::String,
-                },
-            ],
-            "XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters]) - Run a TCL script file on a Newport XPS controller",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let tcl_file = req_string(args, 1, "tclFile")?;
-                let task_name = opt_string(args, 2)?.unwrap_or_else(|| "0".to_string());
-                let parameters = opt_string(args, 3)?.unwrap_or_else(|| "0".to_string());
-
-                let controller = {
-                    let controllers = holder
-                        .xps_controllers
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    controllers
-                        .get(&motor_port)
-                        .map(|reg| reg.controller.clone())
-                        .ok_or_else(|| {
-                            format!(
-                                "XPSTclScriptExecute: controller '{motor_port}' not found (call XPSCreateController first)"
-                            )
-                        })?
-                };
-                let run = controller
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .poll_socket()
-                    .tcl_script_execute(&tcl_file, &task_name, &parameters);
-                if let Err(e) = run {
-                    MotorTrace::new(&motor_port, 0).print_self(
-                        TraceMask::ERROR,
-                        format_args!(
-                            "TCLScriptExecute returned error {}, on XPS: {motor_port}",
-                            e.code()
-                        ),
-                    );
-                    return Ok(CommandOutcome::Continue);
-                }
-                println!(
-                    "XPSTclScriptExecute: motorPort={motor_port} tclFile={tcl_file} task={task_name} params={parameters}"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Look up a registered XPS controller by motor port, or produce a
-    /// `"{cmd}: controller '...' not found"` error. Shared by the PVT commands.
-    fn xps_controller(
-        &self,
-        motor_port: &str,
-        cmd: &str,
-    ) -> Result<Arc<Mutex<XpsController>>, String> {
-        let controllers = self
-            .xps_controllers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        controllers
-            .get(motor_port)
-            .map(|reg| reg.controller.clone())
-            .ok_or_else(|| {
-                format!(
-                    "{cmd}: controller '{motor_port}' not found (call XPSCreateController first)"
-                )
-            })
-    }
-
-    /// Create the `XPSPositionCompare` iocsh command.
-    ///
-    /// `XPSPositionCompare(motorPort, positionerName, mode, [minPosition],
-    /// [maxPosition], [positionStep], [pulseWidth], [settlingTime])`
-    ///
-    /// Applies a position-compare-output configuration to one positioner
-    /// (C `XPSAxis::setPositionCompare`): mode 0=Disable, 1=Pulse,
-    /// 2=AquadB-windowed, 3=AquadB-always. Positions/step are device units;
-    /// `pulseWidth`/`settlingTime` are µs (valid widths {0.2,1,2.5,10}, valid
-    /// settling {0.075,1,4,12}), defaulting to the smallest table entries.
-    /// Driver-private: the C base-class PCO API (05b25c1d, motor PR #248) is an
-    /// open, unmerged PR, so PCO is not part of the motor framework.
-    pub fn xps_position_compare_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSPositionCompare",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("positionerName"),
-                ArgDesc {
-                    name: "mode",
-                    arg_type: ArgType::Int,
-                },
-                arg_double_opt("minPosition"),
-                arg_double_opt("maxPosition"),
-                arg_double_opt("positionStep"),
-                arg_double_opt("pulseWidth"),
-                arg_double_opt("settlingTime"),
-            ],
-            "XPSPositionCompare(motorPort, positionerName, mode, [minPosition], [maxPosition], [positionStep], [pulseWidth], [settlingTime]) - Configure position-compare output on an XPS positioner (mode 0=Disable 1=Pulse 2=AquadB-windowed 3=AquadB-always; positions in device units, widths/settling in us)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let positioner = req_string(args, 1, "positionerName")?;
-                let mode = match args.get(2) {
-                    Some(ArgValue::Int(v)) => *v as i32,
-                    _ => return Err("mode must be an integer".into()),
-                };
-                let params = PcoParams {
-                    mode,
-                    min_position: opt_double(args, 3, 0.0, "minPosition")?,
-                    max_position: opt_double(args, 4, 0.0, "maxPosition")?,
-                    position_step: opt_double(args, 5, 0.0, "positionStep")?,
-                    pulse_width_us: opt_double(
-                        args,
-                        6,
-                        pco::XPS_PCO_DEFAULT_PULSE_WIDTH,
-                        "pulseWidth",
-                    )?,
-                    settling_time_us: opt_double(
-                        args,
-                        7,
-                        pco::XPS_PCO_DEFAULT_SETTLING_TIME,
-                        "settlingTime",
-                    )?,
-                };
-
-                let controller = holder.xps_controller(&motor_port, "XPSPositionCompare")?;
-                {
-                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                    pco::set_position_compare(ctrl.poll_socket(), &positioner, &params)
-                        .map_err(|e| format!("XPSPositionCompare: {e}"))?;
-                }
-                println!(
-                    "XPSPositionCompare: motorPort={motor_port} positioner={positioner} mode={mode} min={} max={} step={} pw={}us settle={}us",
-                    params.min_position,
-                    params.max_position,
-                    params.position_step,
-                    params.pulse_width_us,
-                    params.settling_time_us,
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `XPSDefineProfileFromFile` iocsh command.
-    ///
-    /// `XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode])`
-    ///
-    /// Loads a PVT profile for `group` from a CSV points file: each row is
-    /// `time, pos_0, pos_1, ...` with one position column per positioner in the
-    /// group (controller registration order), in device units and seconds; `#`
-    /// comments and blank lines are skipped. `moveMode` is `absolute` (default)
-    /// or `relative`, selecting whether the execute-time move to the trajectory
-    /// start is absolute or relative. Driver-private: the epics-rs motor
-    /// framework has no profileMove record subsystem, so profiles are defined by
-    /// this command instead of by the C `profileMove` database.
-    pub fn xps_define_profile_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSDefineProfileFromFile",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("group"),
-                arg_str_req("csvFile"),
-                ArgDesc {
-                    name: "moveMode",
-                    arg_type: ArgType::String,
-                },
-            ],
-            "XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode]) - Load a PVT profile for an XPS group from a CSV points file (time + one position column per group positioner; moveMode absolute|relative, default absolute)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let group = req_string(args, 1, "group")?;
-                let csv_file = req_string(args, 2, "csvFile")?;
-                let move_mode = parse_move_mode(opt_string(args, 3)?)?;
-
-                let controller = holder.xps_controller(&motor_port, "XPSDefineProfileFromFile")?;
-                let csv = std::fs::read_to_string(&csv_file).map_err(|e| {
-                    format!("XPSDefineProfileFromFile: cannot read '{csv_file}': {e}")
-                })?;
-
-                let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                let positioners = ctrl.positioners_in_group(&group);
-                let num_axes = positioners.len();
-                let profile = Profile::from_csv(&group, move_mode, &positioners, &csv)
-                    .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
-                let num_points = profile.num_points();
-                ctrl.define_profile(profile)
-                    .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
-                drop(ctrl);
-                println!(
-                    "XPSDefineProfileFromFile: motorPort={motor_port} group={group} points={num_points} axes={num_axes} mode={move_mode:?}"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `XPSBuildProfile` iocsh command.
-    ///
-    /// `XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir])`
-    ///
-    /// Generates the defined profile's trajectory file, FTP-uploads it to the
-    /// XPS trajectory folder, then verifies it against the group dynamics and
-    /// each axis's soft limits (C `buildProfile`). `fileName` is the bare
-    /// trajectory file name the controller opens; `host` is the XPS IP/hostname
-    /// (no port). Credentials and directory default to the XPS factory
-    /// `Administrator` account and `/Admin/Public/Trajectories`; `ftpDir` must
-    /// name the controller's actual trajectory folder if overridden.
-    pub fn xps_build_profile_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSBuildProfile",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("fileName"),
-                arg_str_req("host"),
-                ArgDesc {
-                    name: "ftpUser",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "ftpPassword",
-                    arg_type: ArgType::String,
-                },
-                ArgDesc {
-                    name: "ftpDir",
-                    arg_type: ArgType::String,
-                },
-            ],
-            "XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir]) - Generate the defined profile's trajectory file, FTP it to the XPS, and verify it against dynamics + soft limits",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let file_name = req_string(args, 1, "fileName")?;
-                let host = req_string(args, 2, "host")?;
-                let ftp_user = opt_string(args, 3)?.unwrap_or_else(|| XPS_FTP_USER.to_string());
-                let ftp_pass = opt_string(args, 4)?.unwrap_or_else(|| XPS_FTP_PASSWORD.to_string());
-                let ftp_dir =
-                    opt_string(args, 5)?.unwrap_or_else(|| XPS_TRAJECTORY_DIR.to_string());
-
-                let controller = holder.xps_controller(&motor_port, "XPSBuildProfile")?;
-
-                // Generate and verify hold the controller lock (they use the
-                // poll socket); the FTP upload touches no controller state, so
-                // it runs between the two without the lock held.
-                let build = || {
-                    let built = controller
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .build_profile_text()?;
-                    ftp::upload_trajectory(
-                        &host,
-                        &ftp_dir,
-                        &file_name,
-                        &built.text,
-                        &ftp_user,
-                        &ftp_pass,
-                    )?;
-                    controller
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .verify_profile(&file_name, &built)
-                };
-                if let Err(message) = build() {
-                    xps_profile_failed(&motor_port, "buildProfile", &message);
-                    return Ok(CommandOutcome::Continue);
-                }
-                println!(
-                    "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{ftp_dir} and verified"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `XPSExecuteProfile` iocsh command.
-    ///
-    /// `XPSExecuteProfile(motorPort, execPort, [executions], [startPulses],
-    /// [endPulses], [numPulses])`
-    ///
-    /// Moves the group to the trajectory start, configures gathering (each
-    /// trajectory pulse samples every registered positioner's
-    /// `SetpointPosition`+`CurrentPosition` via a `GatheringOneData` event),
-    /// then runs the built PVT profile with `MultipleAxesPVTExecution` and
-    /// moves each axis to the profile's end (C `runProfile` flyback). The
-    /// moves and the execution block until the motion finishes, so everything
-    /// runs on a background thread over a dedicated socket (`execPort`, a
-    /// `drvAsynIPPort` to the XPS) — the shared poll socket keeps polling
-    /// meanwhile (C configures gathering on the poll socket; same RPCs, our
-    /// exec socket keeps the poll socket uncontended). `executions` (default 1)
-    /// repeats the trajectory. `startPulses`/`endPulses` (1-based trajectory
-    /// elements, defaults: the whole profile) window the pulse output and
-    /// `numPulses` (default one per element) spreads that many pulses over it,
-    /// exactly as C `executeProfile`. Read the samples back afterwards with
-    /// `XPSReadbackProfile`.
-    pub fn xps_execute_profile_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSExecuteProfile",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("execPort"),
-                arg_int_opt("executions"),
-                arg_int_opt("startPulses"),
-                arg_int_opt("endPulses"),
-                arg_int_opt("numPulses"),
-            ],
-            "XPSExecuteProfile(motorPort, execPort, [executions], [startPulses], [endPulses], [numPulses]) - Move the group to the trajectory start and run the built PVT profile with gathering on a background thread over its own socket (execPort: a drvAsynIPPort to the XPS; executions default 1; pulse window defaults to one pulse per trajectory element)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let exec_port = req_string(args, 1, "execPort")?;
-                let executions = match args.get(2) {
-                    Some(ArgValue::Int(v)) if *v >= 1 => *v as i32,
-                    None | Some(ArgValue::Missing) => 1,
-                    Some(ArgValue::Int(_)) => return Err("executions must be >= 1".into()),
-                    _ => return Err("executions must be an integer".into()),
-                };
-
-                let controller = holder.xps_controller(&motor_port, "XPSExecuteProfile")?;
-                let plan = controller
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .execution_plan();
-                let Some(plan) = plan else {
-                    xps_profile_failed(
-                        &motor_port,
-                        "runProfile",
-                        "no built profile (call XPSBuildProfile first)",
-                    );
-                    return Ok(CommandOutcome::Continue);
-                };
-
-                // Pulse window: default one pulse per trajectory element over
-                // the whole profile (C reads these from records).
-                let num_elements = plan.times.len().saturating_sub(1) as i64;
-                let start_pulses = opt_int(args, 3, 1, "startPulses")?;
-                let end_pulses = opt_int(args, 4, num_elements, "endPulses")?;
-                let num_pulses = opt_int(args, 5, num_elements, "numPulses")?;
-                // A dedicated blocking socket so the seconds-to-minutes-long
-                // execution never contends with the shared poll socket.
-                let handle = connect_ip(&exec_port, XPS_PVT_EXEC_TIMEOUT)?;
-                let exec_sock = XpsSocket::new(handle, &exec_port, SocketMode::Query);
-
-                println!(
-                    "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} pulses={num_pulses} over elements {start_pulses}..{end_pulses} (running on background thread)",
-                    plan.group, plan.file_name
-                );
-                // C's XPSProfile thread (XPSController.cpp:206-209).
-                spawn_dedicated_thread(
-                    "XPSProfile".into(),
-                    ThreadPriority::Low,
-                    StackSizeClass::Medium,
-                    move || {
-                        match Self::xps_run_profile(
-                            &exec_sock,
-                            &plan,
-                            executions,
-                            (start_pulses as i32, end_pulses as i32, num_pulses as i32),
-                        ) {
-                            None => println!(
-                                "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
-                                plan.file_name
-                            ),
-                            Some(message) => xps_profile_failed(&motor_port, "runProfile", &message),
-                        }
-                    },
-                )
-                .map_err(|e| format!("XPSExecuteProfile: cannot create XPSProfile thread: {e}"))?;
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Run a built trajectory: move to the start, configure gathering, execute,
-    /// remove the event, stop gathering and fly back to the end (C
-    /// `runProfile`, XPSController.cpp:862-1145). `pulses` is
-    /// `(startPulses, endPulses, numPulses)`. Returns C's message for the last
-    /// failed step, which C prints once at the end.
-    fn xps_run_profile(
-        sock: &XpsSocket,
-        plan: &ExecutionPlan,
-        executions: i32,
-        pulses: (i32, i32, i32),
-    ) -> Option<String> {
-        // C ignores both moves' status.
-        Self::xps_profile_moves(sock, plan.move_mode, &plan.start_moves);
-        let message = Self::xps_execute_gathered(sock, plan, executions, pulses);
-        Self::xps_profile_moves(sock, plan.move_mode, &plan.end_moves);
-        message
-    }
-
-    /// Move each axis in turn; a move on the blocking socket returns when the
-    /// motion is done, as C's `waitMotors` waits after it.
-    fn xps_profile_moves(sock: &XpsSocket, mode: MoveMode, moves: &[(String, f64)]) {
-        for (positioner, target) in moves {
-            let _ = match mode {
-                MoveMode::Absolute => sock.group_move_absolute(positioner, *target),
-                MoveMode::Relative => sock.group_move_relative(positioner, *target),
-            };
-        }
-    }
-
-    /// The part of C `runProfile` between the start move and `done:`.
-    fn xps_execute_gathered(
-        sock: &XpsSocket,
-        plan: &ExecutionPlan,
-        executions: i32,
-        pulses: (i32, i32, i32),
-    ) -> Option<String> {
-        let event_id = match Self::xps_start_gathering(sock, plan, pulses) {
-            Ok(id) => id,
-            Err(message) => return Some(message),
-        };
-
-        let mut message =
-            match sock.multiple_axes_pvt_execution(&plan.group, &plan.file_name, executions) {
-                Ok(()) => None,
-                // -27: the trajectory was aborted.
-                Err(XpsError::Api(-27)) => Some("MultipleAxesPVTExecution aborted".to_string()),
-                Err(e) => Some(format!(
-                    "Error performing MultipleAxesPVTExecution, status={}",
-                    e.code()
-                )),
-            };
-        // C removes the event and stops gathering whatever the run returned.
-        if let Err(e) = sock.event_extended_remove(event_id) {
-            message = Some(format!(
-                "Error performing ExtendedEventRemove, status={}",
-                e.code()
-            ));
-        }
-        match sock.gathering_stop() {
-            // -30: gathering never started (aborted before one element
-            // completed); C tolerates it.
-            Ok(()) | Err(XpsError::Api(-30)) => {}
-            Err(e) => {
-                message = Some(format!(
-                    "Error performing GatheringStop, status={}",
-                    e.code()
-                ))
-            }
-        }
-        message
-    }
-
-    /// Configure and start gathering for a trajectory run: reset the buffer,
-    /// declare `SetpointPosition`+`CurrentPosition` per registered positioner,
-    /// window the trajectory pulse train, and fire `GatheringOneData` on every
-    /// pulse (C `runProfile`, XPSController.cpp:935-1060). Returns the
-    /// extended-event ID to remove after the run, or C's message.
-    fn xps_start_gathering(
-        sock: &XpsSocket,
-        plan: &ExecutionPlan,
-        (start_pulses, end_pulses, num_pulses): (i32, i32, i32),
-    ) -> Result<i32, String> {
-        sock.gathering_reset()
-            .map_err(|e| format!("Error performing GatheringReset, status={}", e.code()))?;
-        let types: Vec<String> = plan
-            .gathering_positioners
-            .iter()
-            .flat_map(|p| {
-                [
-                    format!("{p}.SetpointPosition"),
-                    format!("{p}.CurrentPosition"),
-                ]
-            })
-            .collect();
-        sock.gathering_configuration_set(&types).map_err(|e| {
-            let buffer: String = types.iter().map(|t| format!("{t};")).collect();
-            format!(
-                "Error performing GatheringConfigurationSet, status={}, buffer={buffer}",
-                e.code()
-            )
-        })?;
-        let (pulse_start, pulse_end, pulse_period) =
-            profile::pulse_output_window(&plan.times, start_pulses, end_pulses, num_pulses)?;
-        // C ignores its status.
-        let _ = sock.multiple_axes_pvt_pulse_output_set(
-            &plan.group,
-            pulse_start,
-            pulse_end,
-            pulse_period,
+    let name = format!("{ip}:{ip_port}:{socket}");
+    let refused = |line: &str| {
+        println!("{line}");
+        println!(
+            "ConnectToServer, error calling pasynOctetSyncIO->connect asynManager:connectDevice port {name} not found"
         );
-        let triggers = vec![
-            "Always".to_string(),
-            format!("{}.PVT.TrajectoryPulse", plan.group),
-        ];
-        sock.event_extended_configuration_trigger_set(&triggers)
-            .map_err(|e| {
-                let buffer = triggers.join(";");
-                format!(
-                    "Error performing EventExtendedConfigurationTriggerSet, status={}, buffer={buffer}, strlen(buffer)={}",
-                    e.code(),
-                    buffer.len()
-                )
-            })?;
-        sock.event_extended_configuration_action_set(&["GatheringOneData".to_string()])
-            .map_err(|e| {
-                format!(
-                    "Error performing EventExtendedConfigurationActionSet, status={}",
-                    e.code()
-                )
-            })?;
-        sock.event_extended_start()
-            .map_err(|e| format!("Error performing EventExtendedStart, status={}", e.code()))
-    }
-
-    /// Create the `XPSReadbackProfile` iocsh command.
-    ///
-    /// `XPSReadbackProfile(motorPort, outputFile)`
-    ///
-    /// Reads the gathering samples collected during the last
-    /// `XPSExecuteProfile` run over the shared poll socket
-    /// (`GatheringCurrentNumberGet` + chunked `GatheringDataMultipleLinesGet`,
-    /// halving the request on a controller error exactly as C
-    /// `readbackProfile`) and writes them to `outputFile` as CSV — one row per
-    /// trajectory pulse with `actual, following_error` per registered
-    /// positioner, the file-based counterpart of C posting the readback
-    /// waveforms (positions are device units, like the profile CSV).
-    pub fn xps_readback_profile_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "XPSReadbackProfile",
-            vec![arg_str_req("motorPort"), arg_str_req("outputFile")],
-            "XPSReadbackProfile(motorPort, outputFile) - Read the gathering samples from the last XPSExecuteProfile run and write them to outputFile as CSV (actual position + following error per registered positioner, device units)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let output_file = req_string(args, 1, "outputFile")?;
-
-                let controller = holder.xps_controller(&motor_port, "XPSReadbackProfile")?;
-                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                let positioners = ctrl.registered_positioners();
-                if positioners.is_empty() {
-                    return Err("XPSReadbackProfile: no axes registered".into());
-                }
-                let sock = ctrl.poll_socket();
-
-                let (current_samples, _max_samples) = match sock.gathering_current_number_get() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        let message =
-                            format!("Error calling GatherCurrentNumberGet, status={}", e.code());
-                        xps_profile_failed(&motor_port, "readbackProfile", &message);
-                        return Ok(CommandOutcome::Continue);
-                    }
-                };
-
-                let mut readback = GatheringReadback::new(positioners.len());
-                let mut num_read = 0i32;
-                let mut read = || -> Result<(), String> {
-                    while num_read < current_samples {
-                        // Ask for everything left; on a controller error halve
-                        // the request until it fits (C readbackProfile).
-                        let mut lines = current_samples - num_read;
-                        let buffer = loop {
-                            match sock.gathering_data_multiple_lines_get(num_read, lines) {
-                                Ok(buf) => break buf,
-                                Err(_) if lines > 1 => lines /= 2,
-                                Err(_) => {
-                                    return Err(
-                                        "Error reading gathering data, numInBuffer = 0".into()
-                                    );
-                                }
-                            }
-                        };
-                        let parsed = gathering::parse_gathering_buffer(
-                            &buffer,
-                            positioners.len(),
-                            &mut readback,
-                        )?;
-                        if parsed == 0 {
-                            return Err("gathering returned no lines".into());
-                        }
-                        num_read += parsed as i32;
-                    }
-                    Ok(())
-                };
-                if let Err(message) = read() {
-                    xps_profile_failed(&motor_port, "readbackProfile", &message);
-                    return Ok(CommandOutcome::Continue);
-                }
-
-                let csv = gathering::readback_csv(&positioners, &readback);
-                std::fs::write(&output_file, csv)
-                    .map_err(|e| format!("XPSReadbackProfile: writing {output_file}: {e}"))?;
-                println!(
-                    "XPSReadbackProfile: wrote {num_read} samples x {} positioners to {output_file}",
-                    positioners.len()
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `HXPCreateController` iocsh command.
-    ///
-    /// `HXPCreateController(motorPort, pollPort, movePort, [movingPollMs],
-    /// [idlePollMs])`
-    ///
-    /// Creates a Newport HXP hexapod controller and all six axes
-    /// (X, Y, Z, U, V, W — DTYP `HXP_{motorPort}_{0..5}`) in one step, as the C
-    /// `HXPController` constructor does. `pollPort`/`movePort` are
-    /// `drvAsynIPPort`s to the hexapod (DEVIATION: C opens raw TCP itself from
-    /// an IP address, one move socket per axis; here the six axes share the
-    /// one `movePort` connection for their fire-and-forget moves — hexapod
-    /// moves are whole-group commands, so they never overlap meaningfully).
-    pub fn hxp_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "HXPCreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("pollPort"),
-                arg_str_req("movePort"),
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "HXPCreateController(motorPort, pollPort, movePort, [movingPollMs], [idlePollMs]) - Create a Newport HXP hexapod controller with its six axes X,Y,Z,U,V,W (DTYP HXP_{motorPort}_{0..5})",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let poll_port = req_string(args, 1, "pollPort")?;
-                let move_port = req_string(args, 2, "movePort")?;
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-
-                let handle = connect_ip(&poll_port, HXP_POLL_TIMEOUT)?;
-                let poll_sock = XpsSocket::new(handle, &poll_port, SocketMode::Query);
-                // One group poll serves all six axis polls per period: cache
-                // for half the fastest poll interval.
-                let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-                let controller = Arc::new(Mutex::new(HxpController::new(poll_sock, cache_ttl)));
-
-                for axis_no in 0..NUM_HXP_AXES {
-                    let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
-                    let move_sock = XpsSocket::new(handle, &move_port, SocketMode::Fire);
-                    let ax = HxpAxis::new(controller.clone(), move_sock, axis_no);
-                    let dtyp_key = format!("HXP_{motor_port}_{axis_no}");
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(
-                        ctx,
-                        asyn_user(&motor_port, axis_no as i32),
-                        dtyp_key,
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    );
-                }
-
-                let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
-                let move_sock = XpsSocket::new(handle, &move_port, SocketMode::Fire);
-                holder
-                    .hxp_controllers
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        motor_port.clone(),
-                        HxpRegistration {
-                            controller,
-                            move_sock,
-                        },
-                    );
-                println!(
-                    "HXPCreateController: motorPort={motor_port} pollPort={poll_port} movePort={move_port} axes=XYZUVW poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=HXP_{motor_port}_{{0..5}})"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Run `f` with the HXP registration for `motor_port` (the sockets are not
-    /// clonable, so callers borrow the registration under the map lock — every
-    /// hexapod command RPC is a single bounded exchange). Shared by the
-    /// driver-private hexapod commands.
-    fn with_hxp_registration<R>(
-        &self,
-        motor_port: &str,
-        cmd: &str,
-        f: impl FnOnce(&HxpRegistration) -> Result<R, String>,
-    ) -> Result<R, String> {
-        let controllers = self
-            .hxp_controllers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let reg = controllers.get(motor_port).ok_or_else(|| {
-            format!("{cmd}: controller '{motor_port}' not found (call HXPCreateController first)")
-        })?;
-        f(reg)
-    }
-
-    /// Create the `HXPMoveAll` iocsh command.
-    ///
-    /// `HXPMoveAll(motorPort, x, y, z, u, v, w)`
-    ///
-    /// Moves all six hexapod axes to absolute Work-coordinate targets with a
-    /// single `HexapodMoveAbsolute` (C `HXPController::moveAll`, which reads
-    /// the targets from the `HXP_MOVE_ALL_TARGET_*` records; here they are
-    /// arguments). Fire-and-forget on the move socket — poll the motor records
-    /// for completion.
-    pub fn hxp_move_all_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "HXPMoveAll",
-            vec![
-                arg_str_req("motorPort"),
-                arg_double_req("x"),
-                arg_double_req("y"),
-                arg_double_req("z"),
-                arg_double_req("u"),
-                arg_double_req("v"),
-                arg_double_req("w"),
-            ],
-            "HXPMoveAll(motorPort, x, y, z, u, v, w) - Move all six hexapod axes to absolute Work-coordinate targets in one motion (device units)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let mut targets = [0.0; 6];
-                for (i, t) in targets.iter_mut().enumerate() {
-                    *t = req_double(args, i + 1, ["x", "y", "z", "u", "v", "w"][i])?;
-                }
-                holder.with_hxp_registration(&motor_port, "HXPMoveAll", |reg| {
-                    reg.move_sock
-                        .hexapod_move_absolute(HXP_GROUP, "Work", &targets)
-                        .map_err(|e| format!("HXPMoveAll: {e}"))
-                })?;
-                println!(
-                    "HXPMoveAll: motorPort={motor_port} targets={targets:?} (Work coordinates, fire-and-forget)"
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `HXPCoordSysRead` iocsh command.
-    ///
-    /// `HXPCoordSysRead(motorPort)`
-    ///
-    /// Reads and prints the Tool, Work, and Base coordinate-system definitions
-    /// (C `HXPController::readAllCS`, which posts them to the
-    /// `HXP_COORD_SYS_*` records; here they are printed). Runs on the poll
-    /// socket (DEVIATION: C reads over the move socket's 0.1 s best-effort
-    /// read; the `Query` poll socket waits for the reply reliably).
-    pub fn hxp_coord_sys_read_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "HXPCoordSysRead",
-            vec![arg_str_req("motorPort")],
-            "HXPCoordSysRead(motorPort) - Read and print the hexapod Tool/Work/Base coordinate-system definitions",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let controller =
-                    holder.with_hxp_registration(&motor_port, "HXPCoordSysRead", |reg| {
-                        Ok(reg.controller.clone())
-                    })?;
-                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                let sock = ctrl.poll_socket();
-                for cs in ["Tool", "Work", "Base"] {
-                    let p = sock
-                        .hexapod_coordinate_system_get(HXP_GROUP, cs)
-                        .map_err(|e| format!("HXPCoordSysRead: {cs}: {e}"))?;
-                    println!(
-                        "HXPCoordSysRead: {cs:<4} X={:.6} Y={:.6} Z={:.6} U={:.6} V={:.6} W={:.6}",
-                        p[0], p[1], p[2], p[3], p[4], p[5]
-                    );
-                }
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `HXPCoordSysSet` iocsh command.
-    ///
-    /// `HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w)`
-    ///
-    /// Redefines the origin of one hexapod coordinate system
-    /// (`Work`/`Tool`/`Base`, or C's record encoding `1`/`2`/`3`) —
-    /// C `HXPController::setCS`. Runs on the poll socket (same DEVIATION as
-    /// `HXPCoordSysRead`).
-    pub fn hxp_coord_sys_set_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "HXPCoordSysSet",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("coordSystem"),
-                arg_double_req("x"),
-                arg_double_req("y"),
-                arg_double_req("z"),
-                arg_double_req("u"),
-                arg_double_req("v"),
-                arg_double_req("w"),
-            ],
-            "HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w) - Redefine the origin of a hexapod coordinate system (Work/Tool/Base)",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let cs_arg = req_string(args, 1, "coordSystem")?;
-                let cs = match cs_arg.to_ascii_lowercase().as_str() {
-                    "work" | "1" => "Work",
-                    "tool" | "2" => "Tool",
-                    "base" | "3" => "Base",
-                    other => {
-                        return Err(format!(
-                            "coordSystem must be Work, Tool or Base, got '{other}'"
-                        ));
-                    }
-                };
-                let mut origin = [0.0; 6];
-                for (i, t) in origin.iter_mut().enumerate() {
-                    *t = req_double(args, i + 2, ["x", "y", "z", "u", "v", "w"][i])?;
-                }
-                let controller =
-                    holder.with_hxp_registration(&motor_port, "HXPCoordSysSet", |reg| {
-                        Ok(reg.controller.clone())
-                    })?;
-                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                ctrl.poll_socket()
-                    .hexapod_coordinate_system_set(HXP_GROUP, cs, &origin)
-                    .map_err(|e| format!("HXPCoordSysSet: {e}"))?;
-                println!("HXPCoordSysSet: motorPort={motor_port} {cs} origin={origin:?}");
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `HXPSetMoveCoordSys` iocsh command.
-    ///
-    /// `HXPSetMoveCoordSys(motorPort, coordSystem)`
-    ///
-    /// Selects the coordinate system motor-record moves use: `Work`/`0`
-    /// (default) or `Tool`/`1` — the C `HXP_MOVE_COORD_SYS` record parameter
-    /// as a command.
-    pub fn hxp_set_move_coord_sys_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "HXPSetMoveCoordSys",
-            vec![arg_str_req("motorPort"), arg_str_req("coordSystem")],
-            "HXPSetMoveCoordSys(motorPort, coordSystem) - Select the coordinate system for motor-record moves: Work/0 (default) or Tool/1",
-            move |args: &[ArgValue], _ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let cs_arg = req_string(args, 1, "coordSystem")?;
-                let cs = match cs_arg.to_ascii_lowercase().as_str() {
-                    "work" | "0" => MoveCoordSys::Work,
-                    "tool" | "1" => MoveCoordSys::Tool,
-                    other => {
-                        return Err(format!("coordSystem must be Work or Tool, got '{other}'"));
-                    }
-                };
-                let controller =
-                    holder.with_hxp_registration(&motor_port, "HXPSetMoveCoordSys", |reg| {
-                        Ok(reg.controller.clone())
-                    })?;
-                controller
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .set_move_coord_sys(cs);
-                println!("HXPSetMoveCoordSys: motorPort={motor_port} coordSystem={cs:?}");
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `ESP300CreateController` iocsh command.
-    ///
-    /// `ESP300CreateController(motorPort, serialPort, [movingPollMs],
-    /// [idlePollMs])`
-    ///
-    /// Creates a Newport ESP100/ESP300/ESP301 controller on a pre-configured
-    /// serial (or GPIB octet) port, discovers its axis count (C `motor_init`:
-    /// stop each axis until "axis number out of range"), and creates one motor
-    /// axis per discovered stage (DTYP `ESP300_{motorPort}_{0..}`). Replaces
-    /// the C `ESP300Setup`/`ESP300Config` pair; the scan rate is the poll
-    /// intervals.
-    pub fn esp300_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "ESP300CreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "ESP300CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs]) - Create a Newport ESP100/300/301 controller, discovering its axes (DTYP ESP300_{motorPort}_{0..})",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
-
-                let handle = connect_with_eos(
-                    &serial_port,
-                    ESP300_TIMEOUT,
-                    esp300::INPUT_EOS,
-                    esp300::OUTPUT_EOS,
-                    EosRefusal::InputFatal,
-                )
-                .map_err(|e| match e {
-                    EosConnectError::InputEos(_, e) => format!(
-                        "drvESP300.c:motor_init: ASYN setInputEos error = {}",
-                        e.status() as i32
-                    ),
-                    e => e.into(),
-                })?;
-                let controller = Esp300Controller::new(handle)
-                    .map_err(|e| format!("ESP300CreateController: {e}"))?;
-                let ident = controller.ident().to_string();
-                let num_axes = controller.num_axes();
-                if num_axes == 0 {
-                    return Err(format!(
-                        "ESP300CreateController: no axes found on '{serial_port}' (ident \"{ident}\")"
-                    ));
-                }
-                let controller = Arc::new(Mutex::new(controller));
-
-                for axis in 1..=num_axes {
-                    let ax = Esp300Axis::new(controller.clone(), axis)
-                        .map_err(|e| format!("ESP300CreateController: axis {axis}: {e}"))?;
-                    let dtyp_key = format!("ESP300_{motor_port}_{}", axis - 1);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(
-                        ctx,
-                        TraceUser::Model1,
-                        dtyp_key,
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    );
-                }
-                println!(
-                    "ESP300CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=ESP300_{motor_port}_{{0..{}}})",
-                    num_axes - 1
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `MM3000CreateController` iocsh command.
-    ///
-    /// `MM3000CreateController(motorPort, serialPort, [movingPollMs],
-    /// [idlePollMs])`
-    ///
-    /// Creates a Newport MM3000 controller on a pre-configured serial (or
-    /// GPIB octet) port, reads its axis configuration (`RC`), and creates one
-    /// motor axis per configured slot (DTYP `MM3000_{motorPort}_{0..}`,
-    /// including a trailing `unused` slot exactly as C counts it). Replaces
-    /// the C `MM3000Setup`/`MM3000Config` pair; the scan rate is the poll
-    /// intervals. The MM3000 wire is step-native — use `MRES = 1` records
-    /// (see [`crate::mm3000`] module Units note).
-    pub fn mm3000_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "MM3000CreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "MM3000CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs]) - Create a Newport MM3000 controller, reading its axis configuration (DTYP MM3000_{motorPort}_{0..})",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
-
-                let handle = connect_serial(&serial_port, MM3000_TIMEOUT)?;
-                let controller = Mm3000Controller::new(handle)
-                    .map_err(|e| format!("MM3000CreateController: {e}"))?;
-                let ident = controller.ident().to_string();
-                let num_axes = controller.axis_types().len();
-                let controller = Arc::new(Mutex::new(controller));
-
-                for axis in 1..=num_axes {
-                    let ax = Mm3000Axis::new(controller.clone(), axis)
-                        .map_err(|e| format!("MM3000CreateController: axis {axis}: {e}"))?;
-                    let dtyp_key = format!("MM3000_{motor_port}_{}", axis - 1);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(
-                        ctx,
-                        TraceUser::Model1,
-                        dtyp_key,
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    );
-                }
-                println!(
-                    "MM3000CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM3000_{motor_port}_{{0..{}}})",
-                    num_axes - 1
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `MM4000CreateController` iocsh command.
-    ///
-    /// `MM4000CreateController(motorPort, serialPort, numAxes,
-    /// [movingPollMs], [idlePollMs])`
-    ///
-    /// Creates a Newport MM4000/4005/4006 controller on a pre-configured
-    /// serial (or GPIB octet) port and `numAxes` motor axes (DTYP
-    /// `MM4000_{motorPort}_{0..}`); the controller must report at least that
-    /// many axes on `TP;`. Replaces the C `MM4000AsynSetup`/`MM4000AsynConfig`
-    /// pair.
-    pub fn mm4000_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "MM4000CreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                ArgDesc {
-                    name: "numAxes",
-                    arg_type: ArgType::Int,
-                },
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "MM4000CreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs]) - Create a Newport MM4000/4005/4006 controller (DTYP MM4000_{motorPort}_{0..})",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                // C `MM4000AsynConfig` prints its refusals and returns an
-                // error iocsh discards (NewportRegister.cc:105), so none of
-                // them fails the command.
-                let num_axes = match &args[2] {
-                    ArgValue::Int(v) if (1..=MM4000_MAX_AXES).contains(v) => *v as usize,
-                    _ => {
-                        println!("MM4000Config: numAxes must in range 1 to {MM4000_MAX_AXES}");
-                        return Ok(CommandOutcome::Continue);
-                    }
-                };
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
-
-                let Ok(handle) = connect_serial(&serial_port, MM4000_TIMEOUT) else {
-                    println!("MM4000AsynConfig: cannot connect to asyn port {serial_port}");
-                    return Ok(CommandOutcome::Continue);
-                };
-                // Six per-axis polls share one controller-wide exchange (see
-                // the HXP driver for the TTL rationale).
-                let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-                let Some(controller) =
-                    Mm4000Controller::new(handle, &serial_port, &motor_port, num_axes, cache_ttl)
-                else {
-                    return Ok(CommandOutcome::Continue);
-                };
-                let firmware = controller.firmware().to_string();
-                let model = controller.model();
-                let controller = Arc::new(Mutex::new(controller));
-
-                for axis in 1..=num_axes {
-                    let ax = Mm4000Axis::new(controller.clone(), axis);
-                    let dtyp_key = format!("MM4000_{motor_port}_{}", axis - 1);
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(
-                        ctx,
-                        asyn_user(&motor_port, (axis - 1) as i32),
-                        dtyp_key,
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    );
-                }
-                println!(
-                    "MM4000CreateController: motorPort={motor_port} serialPort={serial_port} firmware=\"{firmware}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM4000_{motor_port}_{{0..{}}})",
-                    num_axes - 1
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `PM500CreateController` iocsh command.
-    ///
-    /// `PM500CreateController(motorPort, serialPort, [movingPollMs],
-    /// [idlePollMs])`
-    ///
-    /// Creates a Newport PM500 controller on a pre-configured serial (or
-    /// GPIB octet) port, autodiscovers its axes (`{letter}STAT?` scan over
-    /// X Y Z A..I), and creates one motor axis per discovered channel (DTYP
-    /// `PM500_{motorPort}_{0..}`). Replaces the C `PM500Setup`/`PM500Config`
-    /// pair.
-    pub fn pm500_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "PM500CreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("serialPort"),
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "PM500CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs]) - Create a Newport PM500 controller, autodiscovering axes (DTYP PM500_{motorPort}_{0..})",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let serial_port = req_string(args, 1, "serialPort")?;
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
-
-                // C `motor_init` drops a controller it cannot connect to or
-                // that leaves `SVN?` unanswered without a word
-                // (drvPM500.cc:577, :671-672); one with no axes has
-                // nothing to create.
-                let Ok(handle) = connect_serial(&serial_port, PM500_TIMEOUT) else {
-                    return Ok(CommandOutcome::Continue);
-                };
-                let Some(controller) = Pm500Controller::new(handle) else {
-                    return Ok(CommandOutcome::Continue);
-                };
-                let ident = controller.ident().to_string();
-                let num_axes = controller.num_axes();
-                if num_axes == 0 {
-                    return Ok(CommandOutcome::Continue);
-                }
-                let controller = Arc::new(Mutex::new(controller));
-
-                for index in 0..num_axes {
-                    let ax = Pm500Axis::new(controller.clone(), index)
-                        .map_err(|e| format!("PM500CreateController: axis {index}: {e}"))?;
-                    let dtyp_key = format!("PM500_{motor_port}_{index}");
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(
-                        ctx,
-                        TraceUser::Model1,
-                        dtyp_key,
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    );
-                }
-                println!(
-                    "PM500CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PM500_{motor_port}_{{0..{}}})",
-                    num_axes - 1
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Create the `PMNC87xxCreateController` iocsh command.
-    ///
-    /// `PMNC87xxCreateController(motorPort, asynPort, [movingPollMs],
-    /// [idlePollMs])`
-    ///
-    /// Creates a Newport New Focus PMNC 8750/8752 picomotor network
-    /// controller on a pre-configured octet port (typically a TCP port from
-    /// `drvAsynIPPortConfigure`), autodiscovers its driver modules and
-    /// channels (`MPV` for the 8750, `DRT` for the 8752), and creates one
-    /// motor axis per discovered channel (DTYP `PMNC_{motorPort}_{0..}`).
-    /// The controller sets the port EOS itself (CR out, `>` prompt in), as C
-    /// `motor_init` does. Replaces the C
-    /// `PMNC87xxSetup`/`PMNC87xxConfig` pair.
-    pub fn pmnc87xx_create_controller_command(self: &Arc<Self>) -> CommandDef {
-        let holder = self.clone();
-        CommandDef::new(
-            "PMNC87xxCreateController",
-            vec![
-                arg_str_req("motorPort"),
-                arg_str_req("asynPort"),
-                arg_int_opt("movingPollMs"),
-                arg_int_opt("idlePollMs"),
-            ],
-            "PMNC87xxCreateController(motorPort, asynPort, [movingPollMs], [idlePollMs]) - Create a Newport New Focus PMNC 8750/8752 picomotor controller, autodiscovering axes (DTYP PMNC_{motorPort}_{0..})",
-            move |args: &[ArgValue], ctx: &CommandContext| {
-                let motor_port = req_string(args, 0, "motorPort")?;
-                let asyn_port = req_string(args, 1, "asynPort")?;
-                let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
-
-                let port = get_port(&asyn_port).ok_or_else(|| {
-                    format!("IP port '{asyn_port}' not found (call drvAsynIPPortConfigure first)")
-                })?;
-                let controller = PmncController::new(port.handle.clone(), PMNC_TIMEOUT)
-                    .map_err(|e| format!("PMNC87xxCreateController: {e}"))?;
-                let ident = controller.ident().to_string();
-                let model = controller.model();
-                let num_axes = controller.num_axes();
-                let controller = Arc::new(Mutex::new(controller));
-
-                for index in 0..num_axes {
-                    let ax = PmncAxis::new(controller.clone(), index)
-                        .map_err(|e| format!("PMNC87xxCreateController: axis {index}: {e}"))?;
-                    let dtyp_key = format!("PMNC_{motor_port}_{index}");
-                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(
-                        ctx,
-                        TraceUser::Model1,
-                        dtyp_key,
-                        motor,
-                        moving_poll_ms,
-                        idle_poll_ms,
-                    );
-                }
-                println!(
-                    "PMNC87xxCreateController: motorPort={motor_port} asynPort={asyn_port} ident=\"{ident}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PMNC_{motor_port}_{{0..{}}})",
-                    num_axes.saturating_sub(1)
-                );
-                Ok(CommandOutcome::Continue)
-            },
-        )
-    }
-
-    /// Return a dynamic device support factory that dispatches by DTYP name.
-    /// Each device support is consumed once (take semantics).
-    pub fn device_support_factory(
-        self: &Arc<Self>,
-    ) -> impl Fn(
-        &epics_rs::ca::server::ioc_app::DeviceSupportContext,
-    ) -> Option<Box<dyn epics_rs::base::server::device_support::DeviceSupport>>
-    + Send
-    + Sync
-    + 'static {
-        let holder = self.clone();
-        move |ctx: &epics_rs::ca::server::ioc_app::DeviceSupportContext| {
-            let mut motors = holder.motors.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = motors.get_mut(ctx.dtyp)
-                && let Some(ds) = slot.take()
-            {
-                return Some(
-                    Box::new(ds) as Box<dyn epics_rs::base::server::device_support::DeviceSupport>
-                );
+    };
+    let driver =
+        match DrvAsynIPPort::new_configured(&name, &format!("{ip}:{ip_port} TCP"), false, true) {
+            Ok(driver) => driver,
+            Err(e) => {
+                refused(&format!("drvAsynIPPortConfigure: {e}"));
+                return None;
             }
+        };
+    let registered = claim_port(&name).ok().and_then(|claim| {
+        let (handle, _jh) = create_port_runtime(&claim, driver, RuntimeConfig::default()).ok()?;
+        match claim.publish(
+            handle.port_handle().clone(),
+            ctx.db().scan_control().interrupt_gate(),
+        ) {
+            Ok(()) => Some(handle),
+            Err(_) => {
+                handle.shutdown();
+                None
+            }
+        }
+    });
+    let Some(handle) = registered else {
+        refused("drvAsynIPPortConfigure: Can't register myself.");
+        return None;
+    };
+    NEXT_SOCKET.store(socket + 1, Ordering::Relaxed);
+    Some(SyncIOHandle::from_handle(
+        handle.port_handle().clone(),
+        0,
+        timeout,
+    ))
+}
+
+/// `SMC100CreateController(portName, SMC100PortName, numAxes,
+/// movingPollPeriod, idlePollPeriod, eguPerStep)`; axis N is controller
+/// address N+1 on the shared line.
+pub fn smc100_create_controller_command() -> CommandDef {
+    CommandDef::new(
+        "SMC100CreateController",
+        vec![
+            arg_str_req("Port name"),
+            arg_str_req("SMC100 port name"),
+            arg_int_req("Number of axes"),
+            arg_int_req("Moving poll period (ms)"),
+            arg_int_req("Idle poll period (ms)"),
+            arg_str_req("EGUs per step"),
+        ],
+        "SMC100CreateController(portName, SMC100PortName, numAxes, movingPollPeriod, \
+         idlePollPeriod, eguPerStep)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Port name")?;
+            let serial_port = req_string(args, 1, "SMC100 port name")?;
+            let num_axes = c_int(args, 2);
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let step_size = atof(&opt_string(args, 5)?.unwrap_or_default());
+            if step_size == 0.0 {
+                return Err("SMC100CreateController: EGUs per step must be non-zero".into());
+            }
+
+            register_port(&port_name, PortDriver::Controller, num_axes)?;
+            if get_port(&serial_port).is_none() {
+                eprintln!(
+                    "SMC100Controller::SMC100Controller: cannot connect to SMC100 controller"
+                );
+                return Ok(CommandOutcome::Continue);
+            }
+            for axis in 0..num_axes {
+                let handle = connect_serial(&serial_port, SMC100_TIMEOUT)?;
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Smc100Axis::new(
+                    handle,
+                    (axis + 1) as u8,
+                    step_size,
+                )));
+                install(
+                    ctx,
+                    asyn_user(&port_name, axis),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                )?;
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// The arguments AG_CONEX and AGAP_CONEX share.
+fn conex_args() -> Vec<ArgDesc> {
+    vec![
+        arg_str_req("Port name"),
+        arg_str_req("Serial port name"),
+        arg_int_req("Controller ID"),
+        arg_int_req("Moving poll period (ms)"),
+        arg_int_req("Idle poll period (ms)"),
+    ]
+}
+
+/// `AG_CONEXCreateController(portName, serialPortName, controllerID,
+/// movingPollPeriod, idlePollPeriod)`: one axis, 0.
+pub fn ag_conex_create_controller_command() -> CommandDef {
+    CommandDef::new(
+        "AG_CONEXCreateController",
+        conex_args(),
+        "AG_CONEXCreateController(portName, serialPortName, controllerID, movingPollPeriod, \
+         idlePollPeriod)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Port name")?;
+            let serial_port = req_string(args, 1, "Serial port name")?;
+            let controller_id = c_int(args, 2);
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            register_port(&port_name, PortDriver::Controller, 1)?;
+            let Ok(handle) = connect_serial(&serial_port, CONEX_TIMEOUT) else {
+                eprintln!(
+                    "AG_CONEXController::AG_CONEXController: cannot connect to CONEX controller"
+                );
+                return Ok(CommandOutcome::Continue);
+            };
+            let Some(axis) = ConexAxis::new(handle, controller_id) else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
+            install(
+                ctx,
+                asyn_user(&port_name, 0),
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            )?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `AGAP_CONEXCreateController(portName, serialPortName, controllerID,
+/// movingPollPeriod, idlePollPeriod)`: axes 0 (U) and 1 (V) on one line.
+pub fn agap_conex_create_controller_command() -> CommandDef {
+    CommandDef::new(
+        "AGAP_CONEXCreateController",
+        conex_args(),
+        "AGAP_CONEXCreateController(portName, serialPortName, controllerID, movingPollPeriod, \
+         idlePollPeriod)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Port name")?;
+            let serial_port = req_string(args, 1, "Serial port name")?;
+            let controller_id = c_int(args, 2);
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            register_port(&port_name, PortDriver::Controller, agap::NUM_AXES as i32)?;
+            let Ok(handle) = connect_serial(&serial_port, AGAP_TIMEOUT) else {
+                eprintln!(
+                    "AGAP_CONEXController::AGAP_CONEXController: cannot connect to CONEX controller"
+                );
+                return Ok(CommandOutcome::Continue);
+            };
+            let Some(controller) = AgapController::new(handle, controller_id) else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let controller = Arc::new(Mutex::new(controller));
+            for axis in 0..agap::NUM_AXES {
+                let motor: Arc<Mutex<dyn AsynMotor>> =
+                    Arc::new(Mutex::new(AgapAxis::new(controller.clone(), axis)));
+                install(
+                    ctx,
+                    asyn_user(&port_name, axis as i32),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                )?;
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// A controller `AG_UCCreateController` made, for `AG_UCCreateAxis` to find
+/// by port name: `None` when its serial port could not be connected, as C's
+/// constructor then carries on without it.
+struct AgUcRegistration {
+    port_name: String,
+    controller: Option<Arc<Mutex<AgUcController>>>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+}
+
+static AG_UC_CONTROLLERS: Mutex<Vec<AgUcRegistration>> = Mutex::new(Vec::new());
+
+/// `AG_UCCreateController(portName, serialPortName, numAxes,
+/// movingPollPeriod, idlePollPeriod)`; the axes come from `AG_UCCreateAxis`.
+pub fn ag_uc_create_controller_command() -> CommandDef {
+    CommandDef::new(
+        "AG_UCCreateController",
+        vec![
+            arg_str_req("Port name"),
+            arg_str_req("Serial port name"),
+            arg_int_req("Number of axes"),
+            arg_int_req("Moving poll period (ms)"),
+            arg_int_req("Idle poll period (ms)"),
+        ],
+        "AG_UCCreateController(portName, serialPortName, numAxes, movingPollPeriod, \
+         idlePollPeriod)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Port name")?;
+            let serial_port = req_string(args, 1, "Serial port name")?;
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            register_port(&port_name, PortDriver::Controller, c_int(args, 2))?;
+            let controller = match connect_serial(&serial_port, AG_UC_TIMEOUT) {
+                Ok(handle) => Some(Arc::new(Mutex::new(AgUcController::new(handle)))),
+                Err(_) => {
+                    eprintln!(
+                        "AG_UCController::AG_UCController: cannot connect to Agilis controller"
+                    );
+                    None
+                }
+            };
+            AG_UC_CONTROLLERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(AgUcRegistration {
+                    port_name,
+                    controller,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                });
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `AG_UCCreateAxis(controllerPortName, axis, hasLimits, forwardAmplitude,
+/// reverseAmplitude)`, printing what C's does.
+pub fn ag_uc_create_axis_command() -> CommandDef {
+    CommandDef::new(
+        "AG_UCCreateAxis",
+        vec![
+            arg_str_req("Controller port name"),
+            arg_int_req("Axis number"),
+            arg_int_req("Has Limits"),
+            arg_int_req("Forward amplitude"),
+            arg_int_req("Reverse amplitude"),
+        ],
+        "AG_UCCreateAxis(controllerPortName, axis, hasLimits, forwardAmplitude, \
+         reverseAmplitude)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Controller port name")?;
+            let axis = c_int(args, 1);
+            let (controller, moving_poll_ms, idle_poll_ms) = {
+                let controllers = AG_UC_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(reg) = controllers.iter().find(|r| r.port_name == port_name) else {
+                    println!("AG_UCCreateAxis: Error port {port_name} not found");
+                    return Ok(CommandOutcome::Continue);
+                };
+                (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
+            };
+            let Some(controller) = controller else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let ax = AgUcAxis::new(
+                controller,
+                axis,
+                c_int(args, 2) != 0,
+                c_int(args, 3),
+                c_int(args, 4),
+            );
+            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+            install(
+                ctx,
+                asyn_user(&port_name, axis),
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            )?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// A controller `XPSCreateController` made, found by port name by the
+/// commands after it.
+struct XpsRegistration {
+    port_name: String,
+    ip: String,
+    ip_port: i32,
+    /// `None` when the poll socket could not be opened.
+    controller: Option<Arc<Mutex<XpsController>>>,
+    /// The controller's `moveSocket_`, which runs profiles.
+    profile_sock: Option<Arc<XpsSocket>>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+    /// `XPSCreateProfile`'s FTP account.
+    ftp_login: Option<(String, String)>,
+}
+
+static XPS_CONTROLLERS: Mutex<Vec<XpsRegistration>> = Mutex::new(Vec::new());
+
+/// Run `f` on the XPS registered as `port_name`, or print C's
+/// `XPSController:<function>: Error port <name> not found`.
+fn with_xps<R>(
+    port_name: &str,
+    function: &str,
+    f: impl FnOnce(&mut XpsRegistration) -> R,
+) -> Option<R> {
+    let mut controllers = XPS_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
+    match controllers.iter_mut().find(|r| r.port_name == port_name) {
+        Some(reg) => Some(f(reg)),
+        None => {
+            println!("XPSController:{function}: Error port {port_name} not found");
             None
         }
     }
 }
 
-// --- iocsh arg helpers, shared by the family's create commands.
+/// `XPSCreateController(portName, IPAddress, IPPort, numAxes,
+/// movingPollPeriod, idlePollPeriod, enableSetPosition,
+/// setPositionSettlingTime)`; the axes come from `XPSCreateAxis`.
+pub fn xps_create_controller_command() -> CommandDef {
+    CommandDef::new(
+        "XPSCreateController",
+        vec![
+            arg_str_req("Controller port name"),
+            arg_str_req("IP address"),
+            arg_int_req("IP port"),
+            arg_int_req("Number of axes"),
+            arg_int_req("Moving poll rate (ms)"),
+            arg_int_req("Idle poll rate (ms)"),
+            arg_int_req("Enable set position"),
+            arg_int_req("Set position settling time (ms)"),
+        ],
+        "XPSCreateController(portName, IPAddress, IPPort, numAxes, movingPollPeriod, \
+         idlePollPeriod, enableSetPosition, setPositionSettlingTime)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Controller port name")?;
+            let ip = req_string(args, 1, "IP address")?;
+            let ip_port = c_int(args, 2);
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
+            let enable_set_position = c_int(args, 6) != 0;
+            let settling = Duration::from_millis(c_int(args, 7).max(0) as u64);
 
-fn arg_str_req(name: &'static str) -> ArgDesc {
-    ArgDesc {
+            register_port(&port_name, PortDriver::Controller, c_int(args, 3))?;
+            let poll = connect_to_server(ctx, &ip, ip_port, XPS_POLL_TIMEOUT);
+            if poll.is_none() {
+                println!(
+                    "XPSController:XPSController: error calling TCP_ConnectToServer for pollSocket"
+                );
+            }
+            let profile_sock = connect_to_server(ctx, &ip, ip_port, XPS_PVT_EXEC_TIMEOUT)
+                .map(|handle| Arc::new(XpsSocket::new(handle, &port_name, SocketMode::Query)));
+            if profile_sock.is_none() {
+                println!(
+                    "XPSController:XPSController: error calling TCP_ConnectToServer for moveSocket"
+                );
+            }
+            let controller = match poll {
+                Some(handle) => Some(Arc::new(Mutex::new(
+                    XpsController::new(
+                        XpsSocket::new(handle, &port_name, SocketMode::Query),
+                        enable_set_position,
+                        settling,
+                    )
+                    .map_err(|e| format!("XPSCreateController: {e}"))?,
+                ))),
+                None => None,
+            };
+            XPS_CONTROLLERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(XpsRegistration {
+                    port_name,
+                    ip,
+                    ip_port,
+                    controller,
+                    profile_sock,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                    ftp_login: None,
+                });
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `XPSCreateAxis(portName, axis, positionerName, stepsPerUnit)`, printing
+/// what C's does. Each axis opens its own move socket.
+pub fn xps_create_axis_command() -> CommandDef {
+    CommandDef::new(
+        "XPSCreateAxis",
+        vec![
+            arg_str_req("Controller port name"),
+            arg_int_req("Axis number"),
+            arg_str_req("Axis name"),
+            arg_str_req("Steps per unit"),
+        ],
+        "XPSCreateAxis(portName, axis, positionerName, stepsPerUnit)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Controller port name")?;
+            let axis = c_int(args, 1);
+            let positioner_name = req_string(args, 2, "Axis name")?;
+            let steps_per_unit = atof(&opt_string(args, 3)?.unwrap_or_default());
+            if steps_per_unit == 0.0 {
+                return Err("XPSCreateAxis: steps per unit must be non-zero".into());
+            }
+            let Some((controller, ip, ip_port, moving_poll_ms, idle_poll_ms)) =
+                with_xps(&port_name, "XPSCreateAxis", |reg| {
+                    (
+                        reg.controller.clone(),
+                        reg.ip.clone(),
+                        reg.ip_port,
+                        reg.moving_poll_ms,
+                        reg.idle_poll_ms,
+                    )
+                })
+            else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let Some(handle) = connect_to_server(ctx, &ip, ip_port, XPS_MOVE_TIMEOUT) else {
+                println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
+                return Ok(CommandOutcome::Continue);
+            };
+            let Some(controller) = controller else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let move_sock = XpsSocket::new(handle, &port_name, SocketMode::Fire);
+            let ax = XpsAxis::new(
+                controller,
+                move_sock,
+                &port_name,
+                axis,
+                &positioner_name,
+                1.0 / steps_per_unit,
+            );
+            let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
+            install(
+                ctx,
+                asyn_user(&port_name, axis),
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            )?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `XPSCreateProfile(portName, maxPoints, ftpUsername, ftpPassword)`: the
+/// FTP account `XPSBuildProfile` uploads with. Profiles here are not sized
+/// up front, so `maxPoints` has no use.
+pub fn xps_create_profile_command() -> CommandDef {
+    CommandDef::new(
+        "XPSCreateProfile",
+        vec![
+            arg_str_req("Controller port name"),
+            arg_int_req("Max points"),
+            arg_str_req("FTP username"),
+            arg_str_req("FTP password"),
+        ],
+        "XPSCreateProfile(portName, maxPoints, ftpUsername, ftpPassword)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Controller port name")?;
+            let login = (
+                opt_string(args, 2)?.unwrap_or_default(),
+                opt_string(args, 3)?.unwrap_or_default(),
+            );
+            with_xps(&port_name, "XPSCreateProfile", |reg| {
+                reg.ftp_login = Some(login)
+            });
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `XPSDisableAutoEnable(portName)`.
+pub fn xps_disable_auto_enable_command() -> CommandDef {
+    xps_controller_flag_command("XPSDisableAutoEnable", |c| c.set_auto_enable(false))
+}
+
+/// `XPSNoDisableError(portName)`: a disabled axis (state 20) no longer sets
+/// the MSTA problem bit.
+pub fn xps_no_disable_error_command() -> CommandDef {
+    xps_controller_flag_command("XPSNoDisableError", XpsController::set_no_disable_error)
+}
+
+/// A one-argument command that sets a flag on a registered XPS controller.
+fn xps_controller_flag_command(name: &'static str, set: fn(&mut XpsController)) -> CommandDef {
+    CommandDef::new(
         name,
-        arg_type: ArgType::String,
+        vec![arg_str_req("Controller port name")],
+        format!("{name}(portName)"),
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Controller port name")?;
+            with_xps(&port_name, name, |reg| {
+                if let Some(controller) = &reg.controller {
+                    set(&mut controller.lock().unwrap_or_else(|e| e.into_inner()));
+                }
+            });
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// The XPS registered as `motor_port`, for the driver-private commands.
+fn xps_controller(motor_port: &str, cmd: &str) -> Result<Arc<Mutex<XpsController>>, String> {
+    let controllers = XPS_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
+    controllers
+        .iter()
+        .find(|r| r.port_name == motor_port)
+        .and_then(|r| r.controller.clone())
+        .ok_or_else(|| {
+            format!("{cmd}: controller '{motor_port}' not found (call XPSCreateController first)")
+        })
+}
+
+/// Create the `XPSTclScriptExecute` iocsh command.
+///
+/// Usage:
+/// `XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters])`
+///
+/// Runs a TCL script file on the XPS registered under `motorPort`, over its
+/// shared poll socket. Ports `TCLScriptExecute`; `taskName`/`parameters`
+/// default to `"0"` as the C driver does. DEVIATION from C's record-driven
+/// trigger (`XPSTclScript_`/`XPSTclScriptExecute_` asyn params): this is an
+/// imperative iocsh command, the natural interface for a one-shot script.
+pub fn xps_tcl_script_execute_command() -> CommandDef {
+    CommandDef::new(
+        "XPSTclScriptExecute",
+        vec![
+            arg_str_req("motorPort"),
+            arg_str_req("tclFile"),
+            ArgDesc {
+                name: "taskName",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "parameters",
+                arg_type: ArgType::String,
+            },
+        ],
+        "XPSTclScriptExecute(motorPort, tclFile, [taskName], [parameters]) - Run a TCL script file on a Newport XPS controller",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let tcl_file = req_string(args, 1, "tclFile")?;
+            let task_name = opt_string(args, 2)?.unwrap_or_else(|| "0".to_string());
+            let parameters = opt_string(args, 3)?.unwrap_or_else(|| "0".to_string());
+
+            let controller = xps_controller(&motor_port, "XPSTclScriptExecute")?;
+            let run = controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poll_socket()
+                .tcl_script_execute(&tcl_file, &task_name, &parameters);
+            if let Err(e) = run {
+                MotorTrace::new(&motor_port, 0).print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "TCLScriptExecute returned error {}, on XPS: {motor_port}",
+                        e.code()
+                    ),
+                );
+                return Ok(CommandOutcome::Continue);
+            }
+            println!(
+                "XPSTclScriptExecute: motorPort={motor_port} tclFile={tcl_file} task={task_name} params={parameters}"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Create the `XPSPositionCompare` iocsh command.
+///
+/// `XPSPositionCompare(motorPort, positionerName, mode, [minPosition],
+/// [maxPosition], [positionStep], [pulseWidth], [settlingTime])`
+///
+/// Applies a position-compare-output configuration to one positioner
+/// (C `XPSAxis::setPositionCompare`): mode 0=Disable, 1=Pulse,
+/// 2=AquadB-windowed, 3=AquadB-always. Positions/step are device units;
+/// `pulseWidth`/`settlingTime` are µs (valid widths {0.2,1,2.5,10}, valid
+/// settling {0.075,1,4,12}), defaulting to the smallest table entries.
+/// Driver-private: the C base-class PCO API (05b25c1d, motor PR #248) is an
+/// open, unmerged PR, so PCO is not part of the motor framework.
+pub fn xps_position_compare_command() -> CommandDef {
+    CommandDef::new(
+        "XPSPositionCompare",
+        vec![
+            arg_str_req("motorPort"),
+            arg_str_req("positionerName"),
+            ArgDesc {
+                name: "mode",
+                arg_type: ArgType::Int,
+            },
+            arg_double_opt("minPosition"),
+            arg_double_opt("maxPosition"),
+            arg_double_opt("positionStep"),
+            arg_double_opt("pulseWidth"),
+            arg_double_opt("settlingTime"),
+        ],
+        "XPSPositionCompare(motorPort, positionerName, mode, [minPosition], [maxPosition], [positionStep], [pulseWidth], [settlingTime]) - Configure position-compare output on an XPS positioner (mode 0=Disable 1=Pulse 2=AquadB-windowed 3=AquadB-always; positions in device units, widths/settling in us)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let positioner = req_string(args, 1, "positionerName")?;
+            let mode = match args.get(2) {
+                Some(ArgValue::Int(v)) => *v as i32,
+                _ => return Err("mode must be an integer".into()),
+            };
+            let params = PcoParams {
+                mode,
+                min_position: opt_double(args, 3, 0.0, "minPosition")?,
+                max_position: opt_double(args, 4, 0.0, "maxPosition")?,
+                position_step: opt_double(args, 5, 0.0, "positionStep")?,
+                pulse_width_us: opt_double(
+                    args,
+                    6,
+                    pco::XPS_PCO_DEFAULT_PULSE_WIDTH,
+                    "pulseWidth",
+                )?,
+                settling_time_us: opt_double(
+                    args,
+                    7,
+                    pco::XPS_PCO_DEFAULT_SETTLING_TIME,
+                    "settlingTime",
+                )?,
+            };
+
+            let controller = xps_controller(&motor_port, "XPSPositionCompare")?;
+            {
+                let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+                pco::set_position_compare(ctrl.poll_socket(), &positioner, &params)
+                    .map_err(|e| format!("XPSPositionCompare: {e}"))?;
+            }
+            println!(
+                "XPSPositionCompare: motorPort={motor_port} positioner={positioner} mode={mode} min={} max={} step={} pw={}us settle={}us",
+                params.min_position,
+                params.max_position,
+                params.position_step,
+                params.pulse_width_us,
+                params.settling_time_us,
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Create the `XPSDefineProfileFromFile` iocsh command.
+///
+/// `XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode])`
+///
+/// Loads a PVT profile for `group` from a CSV points file: each row is
+/// `time, pos_0, pos_1, ...` with one position column per positioner in the
+/// group (controller registration order), in device units and seconds; `#`
+/// comments and blank lines are skipped. `moveMode` is `absolute` (default)
+/// or `relative`, selecting whether the execute-time move to the trajectory
+/// start is absolute or relative. Driver-private: the epics-rs motor
+/// framework has no profileMove record subsystem, so profiles are defined by
+/// this command instead of by the C `profileMove` database.
+pub fn xps_define_profile_command() -> CommandDef {
+    CommandDef::new(
+        "XPSDefineProfileFromFile",
+        vec![
+            arg_str_req("motorPort"),
+            arg_str_req("group"),
+            arg_str_req("csvFile"),
+            ArgDesc {
+                name: "moveMode",
+                arg_type: ArgType::String,
+            },
+        ],
+        "XPSDefineProfileFromFile(motorPort, group, csvFile, [moveMode]) - Load a PVT profile for an XPS group from a CSV points file (time + one position column per group positioner; moveMode absolute|relative, default absolute)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let group = req_string(args, 1, "group")?;
+            let csv_file = req_string(args, 2, "csvFile")?;
+            let move_mode = parse_move_mode(opt_string(args, 3)?)?;
+
+            let controller = xps_controller(&motor_port, "XPSDefineProfileFromFile")?;
+            let csv = std::fs::read_to_string(&csv_file)
+                .map_err(|e| format!("XPSDefineProfileFromFile: cannot read '{csv_file}': {e}"))?;
+
+            let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let positioners = ctrl.positioners_in_group(&group);
+            let num_axes = positioners.len();
+            let profile = Profile::from_csv(&group, move_mode, &positioners, &csv)
+                .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
+            let num_points = profile.num_points();
+            ctrl.define_profile(profile)
+                .map_err(|e| format!("XPSDefineProfileFromFile: {e}"))?;
+            drop(ctrl);
+            println!(
+                "XPSDefineProfileFromFile: motorPort={motor_port} group={group} points={num_points} axes={num_axes} mode={move_mode:?}"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Create the `XPSBuildProfile` iocsh command.
+///
+/// `XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir])`
+///
+/// Generates the defined profile's trajectory file, FTP-uploads it to the
+/// XPS trajectory folder, then verifies it against the group dynamics and
+/// each axis's soft limits (C `buildProfile`). `fileName` is the bare
+/// trajectory file name the controller opens; `host` is the XPS IP/hostname
+/// (no port). Credentials and directory default to the XPS factory
+/// `Administrator` account and `/Admin/Public/Trajectories`; `ftpDir` must
+/// name the controller's actual trajectory folder if overridden.
+pub fn xps_build_profile_command() -> CommandDef {
+    CommandDef::new(
+        "XPSBuildProfile",
+        vec![
+            arg_str_req("motorPort"),
+            arg_str_req("fileName"),
+            arg_str_req("host"),
+            ArgDesc {
+                name: "ftpUser",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "ftpPassword",
+                arg_type: ArgType::String,
+            },
+            ArgDesc {
+                name: "ftpDir",
+                arg_type: ArgType::String,
+            },
+        ],
+        "XPSBuildProfile(motorPort, fileName, host, [ftpUser], [ftpPassword], [ftpDir]) - Generate the defined profile's trajectory file, FTP it to the XPS, and verify it against dynamics + soft limits",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let file_name = req_string(args, 1, "fileName")?;
+            let host = req_string(args, 2, "host")?;
+            let (default_user, default_pass) =
+                with_xps(&motor_port, "XPSBuildProfile", |reg| reg.ftp_login.clone())
+                    .flatten()
+                    .unwrap_or_else(|| (XPS_FTP_USER.into(), XPS_FTP_PASSWORD.into()));
+            let ftp_user = opt_string(args, 3)?.unwrap_or(default_user);
+            let ftp_pass = opt_string(args, 4)?.unwrap_or(default_pass);
+            let ftp_dir = opt_string(args, 5)?.unwrap_or_else(|| XPS_TRAJECTORY_DIR.to_string());
+
+            let controller = xps_controller(&motor_port, "XPSBuildProfile")?;
+
+            // Generate and verify hold the controller lock (they use the
+            // poll socket); the FTP upload touches no controller state, so
+            // it runs between the two without the lock held.
+            let build = || {
+                let built = controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .build_profile_text()?;
+                ftp::upload_trajectory(
+                    &host,
+                    &ftp_dir,
+                    &file_name,
+                    &built.text,
+                    &ftp_user,
+                    &ftp_pass,
+                )?;
+                controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .verify_profile(&file_name, &built)
+            };
+            if let Err(message) = build() {
+                xps_profile_failed(&motor_port, "buildProfile", &message);
+                return Ok(CommandOutcome::Continue);
+            }
+            println!(
+                "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{ftp_dir} and verified"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Create the `XPSExecuteProfile` iocsh command.
+///
+/// `XPSExecuteProfile(motorPort, [executions], [startPulses], [endPulses],
+/// [numPulses])`
+///
+/// Moves the group to the trajectory start, configures gathering (each
+/// trajectory pulse samples every registered positioner's
+/// `SetpointPosition`+`CurrentPosition` via a `GatheringOneData` event),
+/// then runs the built PVT profile with `MultipleAxesPVTExecution` and
+/// moves each axis to the profile's end (C `runProfile` flyback). The
+/// moves and the execution block until the motion finishes, so everything
+/// runs on a background thread over the controller's move socket, as C's
+/// does — the shared poll socket keeps polling meanwhile (C configures
+/// gathering on the poll socket; same RPCs, the move socket keeps the poll
+/// socket uncontended). `executions` (default 1)
+/// repeats the trajectory. `startPulses`/`endPulses` (1-based trajectory
+/// elements, defaults: the whole profile) window the pulse output and
+/// `numPulses` (default one per element) spreads that many pulses over it,
+/// exactly as C `executeProfile`. Read the samples back afterwards with
+/// `XPSReadbackProfile`.
+pub fn xps_execute_profile_command() -> CommandDef {
+    CommandDef::new(
+        "XPSExecuteProfile",
+        vec![
+            arg_str_req("motorPort"),
+            arg_int_opt("executions"),
+            arg_int_opt("startPulses"),
+            arg_int_opt("endPulses"),
+            arg_int_opt("numPulses"),
+        ],
+        "XPSExecuteProfile(motorPort, [executions], [startPulses], [endPulses], [numPulses]) - Move the group to the trajectory start and run the built PVT profile with gathering on a background thread (executions default 1; pulse window defaults to one pulse per trajectory element)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let executions = match args.get(1) {
+                Some(ArgValue::Int(v)) if *v >= 1 => *v as i32,
+                None | Some(ArgValue::Missing) => 1,
+                Some(ArgValue::Int(_)) => return Err("executions must be >= 1".into()),
+                _ => return Err("executions must be an integer".into()),
+            };
+
+            let controller = xps_controller(&motor_port, "XPSExecuteProfile")?;
+            let plan = controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .execution_plan();
+            let Some(plan) = plan else {
+                xps_profile_failed(
+                    &motor_port,
+                    "runProfile",
+                    "no built profile (call XPSBuildProfile first)",
+                );
+                return Ok(CommandOutcome::Continue);
+            };
+
+            // Pulse window: default one pulse per trajectory element over
+            // the whole profile (C reads these from records).
+            let num_elements = plan.times.len().saturating_sub(1) as i64;
+            let start_pulses = opt_int(args, 2, 1, "startPulses")?;
+            let end_pulses = opt_int(args, 3, num_elements, "endPulses")?;
+            let num_pulses = opt_int(args, 4, num_elements, "numPulses")?;
+            let Some(exec_sock) = with_xps(&motor_port, "XPSExecuteProfile", |reg| {
+                reg.profile_sock.clone()
+            })
+            .flatten() else {
+                return Ok(CommandOutcome::Continue);
+            };
+
+            println!(
+                "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} pulses={num_pulses} over elements {start_pulses}..{end_pulses} (running on background thread)",
+                plan.group, plan.file_name
+            );
+            // C's XPSProfile thread (XPSController.cpp:206-209).
+            spawn_dedicated_thread(
+                "XPSProfile".into(),
+                ThreadPriority::Low,
+                StackSizeClass::Medium,
+                move || {
+                    match xps_run_profile(
+                        &exec_sock,
+                        &plan,
+                        executions,
+                        (start_pulses as i32, end_pulses as i32, num_pulses as i32),
+                    ) {
+                        None => println!(
+                            "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
+                            plan.file_name
+                        ),
+                        Some(message) => xps_profile_failed(&motor_port, "runProfile", &message),
+                    }
+                },
+            )
+            .map_err(|e| format!("XPSExecuteProfile: cannot create XPSProfile thread: {e}"))?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Run a built trajectory: move to the start, configure gathering, execute,
+/// remove the event, stop gathering and fly back to the end (C
+/// `runProfile`, XPSController.cpp:862-1145). `pulses` is
+/// `(startPulses, endPulses, numPulses)`. Returns C's message for the last
+/// failed step, which C prints once at the end.
+fn xps_run_profile(
+    sock: &XpsSocket,
+    plan: &ExecutionPlan,
+    executions: i32,
+    pulses: (i32, i32, i32),
+) -> Option<String> {
+    // C ignores both moves' status.
+    xps_profile_moves(sock, plan.move_mode, &plan.start_moves);
+    let message = xps_execute_gathered(sock, plan, executions, pulses);
+    xps_profile_moves(sock, plan.move_mode, &plan.end_moves);
+    message
+}
+
+/// Move each axis in turn; a move on the blocking socket returns when the
+/// motion is done, as C's `waitMotors` waits after it.
+fn xps_profile_moves(sock: &XpsSocket, mode: MoveMode, moves: &[(String, f64)]) {
+    for (positioner, target) in moves {
+        let _ = match mode {
+            MoveMode::Absolute => sock.group_move_absolute(positioner, *target),
+            MoveMode::Relative => sock.group_move_relative(positioner, *target),
+        };
     }
 }
 
-fn arg_int_opt(name: &'static str) -> ArgDesc {
-    ArgDesc {
+/// The part of C `runProfile` between the start move and `done:`.
+fn xps_execute_gathered(
+    sock: &XpsSocket,
+    plan: &ExecutionPlan,
+    executions: i32,
+    pulses: (i32, i32, i32),
+) -> Option<String> {
+    let event_id = match xps_start_gathering(sock, plan, pulses) {
+        Ok(id) => id,
+        Err(message) => return Some(message),
+    };
+
+    let mut message =
+        match sock.multiple_axes_pvt_execution(&plan.group, &plan.file_name, executions) {
+            Ok(()) => None,
+            // -27: the trajectory was aborted.
+            Err(XpsError::Api(-27)) => Some("MultipleAxesPVTExecution aborted".to_string()),
+            Err(e) => Some(format!(
+                "Error performing MultipleAxesPVTExecution, status={}",
+                e.code()
+            )),
+        };
+    // C removes the event and stops gathering whatever the run returned.
+    if let Err(e) = sock.event_extended_remove(event_id) {
+        message = Some(format!(
+            "Error performing ExtendedEventRemove, status={}",
+            e.code()
+        ));
+    }
+    match sock.gathering_stop() {
+        // -30: gathering never started (aborted before one element
+        // completed); C tolerates it.
+        Ok(()) | Err(XpsError::Api(-30)) => {}
+        Err(e) => {
+            message = Some(format!(
+                "Error performing GatheringStop, status={}",
+                e.code()
+            ))
+        }
+    }
+    message
+}
+
+/// Configure and start gathering for a trajectory run: reset the buffer,
+/// declare `SetpointPosition`+`CurrentPosition` per registered positioner,
+/// window the trajectory pulse train, and fire `GatheringOneData` on every
+/// pulse (C `runProfile`, XPSController.cpp:935-1060). Returns the
+/// extended-event ID to remove after the run, or C's message.
+fn xps_start_gathering(
+    sock: &XpsSocket,
+    plan: &ExecutionPlan,
+    (start_pulses, end_pulses, num_pulses): (i32, i32, i32),
+) -> Result<i32, String> {
+    sock.gathering_reset()
+        .map_err(|e| format!("Error performing GatheringReset, status={}", e.code()))?;
+    let types: Vec<String> = plan
+        .gathering_positioners
+        .iter()
+        .flat_map(|p| {
+            [
+                format!("{p}.SetpointPosition"),
+                format!("{p}.CurrentPosition"),
+            ]
+        })
+        .collect();
+    sock.gathering_configuration_set(&types).map_err(|e| {
+        let buffer: String = types.iter().map(|t| format!("{t};")).collect();
+        format!(
+            "Error performing GatheringConfigurationSet, status={}, buffer={buffer}",
+            e.code()
+        )
+    })?;
+    let (pulse_start, pulse_end, pulse_period) =
+        profile::pulse_output_window(&plan.times, start_pulses, end_pulses, num_pulses)?;
+    // C ignores its status.
+    let _ =
+        sock.multiple_axes_pvt_pulse_output_set(&plan.group, pulse_start, pulse_end, pulse_period);
+    let triggers = vec![
+        "Always".to_string(),
+        format!("{}.PVT.TrajectoryPulse", plan.group),
+    ];
+    sock.event_extended_configuration_trigger_set(&triggers)
+        .map_err(|e| {
+            let buffer = triggers.join(";");
+            format!(
+                "Error performing EventExtendedConfigurationTriggerSet, status={}, buffer={buffer}, strlen(buffer)={}",
+                e.code(),
+                buffer.len()
+            )
+        })?;
+    sock.event_extended_configuration_action_set(&["GatheringOneData".to_string()])
+        .map_err(|e| {
+            format!(
+                "Error performing EventExtendedConfigurationActionSet, status={}",
+                e.code()
+            )
+        })?;
+    sock.event_extended_start()
+        .map_err(|e| format!("Error performing EventExtendedStart, status={}", e.code()))
+}
+
+/// Create the `XPSReadbackProfile` iocsh command.
+///
+/// `XPSReadbackProfile(motorPort, outputFile)`
+///
+/// Reads the gathering samples collected during the last
+/// `XPSExecuteProfile` run over the shared poll socket
+/// (`GatheringCurrentNumberGet` + chunked `GatheringDataMultipleLinesGet`,
+/// halving the request on a controller error exactly as C
+/// `readbackProfile`) and writes them to `outputFile` as CSV — one row per
+/// trajectory pulse with `actual, following_error` per registered
+/// positioner, the file-based counterpart of C posting the readback
+/// waveforms (positions are device units, like the profile CSV).
+pub fn xps_readback_profile_command() -> CommandDef {
+    CommandDef::new(
+        "XPSReadbackProfile",
+        vec![arg_str_req("motorPort"), arg_str_req("outputFile")],
+        "XPSReadbackProfile(motorPort, outputFile) - Read the gathering samples from the last XPSExecuteProfile run and write them to outputFile as CSV (actual position + following error per registered positioner, device units)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let output_file = req_string(args, 1, "outputFile")?;
+
+            let controller = xps_controller(&motor_port, "XPSReadbackProfile")?;
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let positioners = ctrl.registered_positioners();
+            if positioners.is_empty() {
+                return Err("XPSReadbackProfile: no axes registered".into());
+            }
+            let sock = ctrl.poll_socket();
+
+            let (current_samples, _max_samples) = match sock.gathering_current_number_get() {
+                Ok(n) => n,
+                Err(e) => {
+                    let message =
+                        format!("Error calling GatherCurrentNumberGet, status={}", e.code());
+                    xps_profile_failed(&motor_port, "readbackProfile", &message);
+                    return Ok(CommandOutcome::Continue);
+                }
+            };
+
+            let mut readback = GatheringReadback::new(positioners.len());
+            let mut num_read = 0i32;
+            let mut read = || -> Result<(), String> {
+                while num_read < current_samples {
+                    // Ask for everything left; on a controller error halve
+                    // the request until it fits (C readbackProfile).
+                    let mut lines = current_samples - num_read;
+                    let buffer = loop {
+                        match sock.gathering_data_multiple_lines_get(num_read, lines) {
+                            Ok(buf) => break buf,
+                            Err(_) if lines > 1 => lines /= 2,
+                            Err(_) => {
+                                return Err("Error reading gathering data, numInBuffer = 0".into());
+                            }
+                        }
+                    };
+                    let parsed = gathering::parse_gathering_buffer(
+                        &buffer,
+                        positioners.len(),
+                        &mut readback,
+                    )?;
+                    if parsed == 0 {
+                        return Err("gathering returned no lines".into());
+                    }
+                    num_read += parsed as i32;
+                }
+                Ok(())
+            };
+            if let Err(message) = read() {
+                xps_profile_failed(&motor_port, "readbackProfile", &message);
+                return Ok(CommandOutcome::Continue);
+            }
+
+            let csv = gathering::readback_csv(&positioners, &readback);
+            std::fs::write(&output_file, csv)
+                .map_err(|e| format!("XPSReadbackProfile: writing {output_file}: {e}"))?;
+            println!(
+                "XPSReadbackProfile: wrote {num_read} samples x {} positioners to {output_file}",
+                positioners.len()
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// A hexapod `HXPCreateController` made. Keeps a `Fire`-mode move socket of
+/// its own for the driver-private commands.
+struct HxpRegistration {
+    port_name: String,
+    controller: Arc<Mutex<HxpController>>,
+    move_sock: XpsSocket,
+}
+
+static HXP_CONTROLLERS: Mutex<Vec<HxpRegistration>> = Mutex::new(Vec::new());
+
+/// `HXPCreateController(portName, IPAddress, IPPort, movingPollPeriod,
+/// idlePollPeriod)`: the controller and its six axes X, Y, Z, U, V, W
+/// (0..5), each axis on a move socket of its own.
+pub fn hxp_create_controller_command() -> CommandDef {
+    CommandDef::new(
+        "HXPCreateController",
+        vec![
+            arg_str_req("Port name"),
+            arg_str_req("IP address"),
+            arg_int_req("Port"),
+            arg_int_req("Moving poll period (ms)"),
+            arg_int_req("Idle poll period (ms)"),
+        ],
+        "HXPCreateController(portName, IPAddress, IPPort, movingPollPeriod, idlePollPeriod)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = req_string(args, 0, "Port name")?;
+            let ip = req_string(args, 1, "IP address")?;
+            let ip_port = c_int(args, 2);
+            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+
+            register_port(&port_name, PortDriver::Controller, NUM_HXP_AXES as i32)?;
+            let Some(handle) = connect_to_server(ctx, &ip, ip_port, HXP_POLL_TIMEOUT) else {
+                println!(
+                    "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
+                );
+                return Ok(CommandOutcome::Continue);
+            };
+            let poll_sock = XpsSocket::new(handle, &port_name, SocketMode::Query);
+            // One group poll serves all six axis polls per period: cache for
+            // half the fastest poll interval.
+            let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
+            let controller = Arc::new(Mutex::new(HxpController::new(poll_sock, cache_ttl)));
+
+            for axis_no in 0..NUM_HXP_AXES {
+                let Some(handle) = connect_to_server(ctx, &ip, ip_port, HXP_MOVE_TIMEOUT) else {
+                    continue;
+                };
+                let move_sock = XpsSocket::new(handle, &port_name, SocketMode::Fire);
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(HxpAxis::new(
+                    controller.clone(),
+                    move_sock,
+                    axis_no,
+                )));
+                install(
+                    ctx,
+                    asyn_user(&port_name, axis_no as i32),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                )?;
+            }
+
+            let Some(handle) = connect_to_server(ctx, &ip, ip_port, HXP_MOVE_TIMEOUT) else {
+                return Ok(CommandOutcome::Continue);
+            };
+            HXP_CONTROLLERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(HxpRegistration {
+                    port_name: port_name.clone(),
+                    controller,
+                    move_sock: XpsSocket::new(handle, &port_name, SocketMode::Fire),
+                });
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Run `f` with the HXP registration for `motor_port` (the sockets are not
+/// clonable, so callers borrow the registration under the lock — every
+/// hexapod command RPC is a single bounded exchange).
+fn with_hxp_registration<R>(
+    motor_port: &str,
+    cmd: &str,
+    f: impl FnOnce(&HxpRegistration) -> Result<R, String>,
+) -> Result<R, String> {
+    let controllers = HXP_CONTROLLERS.lock().unwrap_or_else(|e| e.into_inner());
+    let reg = controllers
+        .iter()
+        .find(|r| r.port_name == motor_port)
+        .ok_or_else(|| {
+            format!("{cmd}: controller '{motor_port}' not found (call HXPCreateController first)")
+        })?;
+    f(reg)
+}
+
+/// Create the `HXPMoveAll` iocsh command.
+///
+/// `HXPMoveAll(motorPort, x, y, z, u, v, w)`
+///
+/// Moves all six hexapod axes to absolute Work-coordinate targets with a
+/// single `HexapodMoveAbsolute` (C `HXPController::moveAll`, which reads
+/// the targets from the `HXP_MOVE_ALL_TARGET_*` records; here they are
+/// arguments). Fire-and-forget on the move socket — poll the motor records
+/// for completion.
+pub fn hxp_move_all_command() -> CommandDef {
+    CommandDef::new(
+        "HXPMoveAll",
+        vec![
+            arg_str_req("motorPort"),
+            arg_double_req("x"),
+            arg_double_req("y"),
+            arg_double_req("z"),
+            arg_double_req("u"),
+            arg_double_req("v"),
+            arg_double_req("w"),
+        ],
+        "HXPMoveAll(motorPort, x, y, z, u, v, w) - Move all six hexapod axes to absolute Work-coordinate targets in one motion (device units)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let mut targets = [0.0; 6];
+            for (i, t) in targets.iter_mut().enumerate() {
+                *t = req_double(args, i + 1, ["x", "y", "z", "u", "v", "w"][i])?;
+            }
+            with_hxp_registration(&motor_port, "HXPMoveAll", |reg| {
+                reg.move_sock
+                    .hexapod_move_absolute(HXP_GROUP, "Work", &targets)
+                    .map_err(|e| format!("HXPMoveAll: {e}"))
+            })?;
+            println!(
+                "HXPMoveAll: motorPort={motor_port} targets={targets:?} (Work coordinates, fire-and-forget)"
+            );
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Create the `HXPCoordSysRead` iocsh command.
+///
+/// `HXPCoordSysRead(motorPort)`
+///
+/// Reads and prints the Tool, Work, and Base coordinate-system definitions
+/// (C `HXPController::readAllCS`, which posts them to the
+/// `HXP_COORD_SYS_*` records; here they are printed). Runs on the poll
+/// socket (DEVIATION: C reads over the move socket's 0.1 s best-effort
+/// read; the `Query` poll socket waits for the reply reliably).
+pub fn hxp_coord_sys_read_command() -> CommandDef {
+    CommandDef::new(
+        "HXPCoordSysRead",
+        vec![arg_str_req("motorPort")],
+        "HXPCoordSysRead(motorPort) - Read and print the hexapod Tool/Work/Base coordinate-system definitions",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let controller = with_hxp_registration(&motor_port, "HXPCoordSysRead", |reg| {
+                Ok(reg.controller.clone())
+            })?;
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            let sock = ctrl.poll_socket();
+            for cs in ["Tool", "Work", "Base"] {
+                let p = sock
+                    .hexapod_coordinate_system_get(HXP_GROUP, cs)
+                    .map_err(|e| format!("HXPCoordSysRead: {cs}: {e}"))?;
+                println!(
+                    "HXPCoordSysRead: {cs:<4} X={:.6} Y={:.6} Z={:.6} U={:.6} V={:.6} W={:.6}",
+                    p[0], p[1], p[2], p[3], p[4], p[5]
+                );
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Create the `HXPCoordSysSet` iocsh command.
+///
+/// `HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w)`
+///
+/// Redefines the origin of one hexapod coordinate system
+/// (`Work`/`Tool`/`Base`, or C's record encoding `1`/`2`/`3`) —
+/// C `HXPController::setCS`. Runs on the poll socket (same DEVIATION as
+/// `HXPCoordSysRead`).
+pub fn hxp_coord_sys_set_command() -> CommandDef {
+    CommandDef::new(
+        "HXPCoordSysSet",
+        vec![
+            arg_str_req("motorPort"),
+            arg_str_req("coordSystem"),
+            arg_double_req("x"),
+            arg_double_req("y"),
+            arg_double_req("z"),
+            arg_double_req("u"),
+            arg_double_req("v"),
+            arg_double_req("w"),
+        ],
+        "HXPCoordSysSet(motorPort, coordSystem, x, y, z, u, v, w) - Redefine the origin of a hexapod coordinate system (Work/Tool/Base)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let cs_arg = req_string(args, 1, "coordSystem")?;
+            let cs = match cs_arg.to_ascii_lowercase().as_str() {
+                "work" | "1" => "Work",
+                "tool" | "2" => "Tool",
+                "base" | "3" => "Base",
+                other => {
+                    return Err(format!(
+                        "coordSystem must be Work, Tool or Base, got '{other}'"
+                    ));
+                }
+            };
+            let mut origin = [0.0; 6];
+            for (i, t) in origin.iter_mut().enumerate() {
+                *t = req_double(args, i + 2, ["x", "y", "z", "u", "v", "w"][i])?;
+            }
+            let controller = with_hxp_registration(&motor_port, "HXPCoordSysSet", |reg| {
+                Ok(reg.controller.clone())
+            })?;
+            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+            ctrl.poll_socket()
+                .hexapod_coordinate_system_set(HXP_GROUP, cs, &origin)
+                .map_err(|e| format!("HXPCoordSysSet: {e}"))?;
+            println!("HXPCoordSysSet: motorPort={motor_port} {cs} origin={origin:?}");
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// Create the `HXPSetMoveCoordSys` iocsh command.
+///
+/// `HXPSetMoveCoordSys(motorPort, coordSystem)`
+///
+/// Selects the coordinate system motor-record moves use: `Work`/`0`
+/// (default) or `Tool`/`1` — the C `HXP_MOVE_COORD_SYS` record parameter
+/// as a command.
+pub fn hxp_set_move_coord_sys_command() -> CommandDef {
+    CommandDef::new(
+        "HXPSetMoveCoordSys",
+        vec![arg_str_req("motorPort"), arg_str_req("coordSystem")],
+        "HXPSetMoveCoordSys(motorPort, coordSystem) - Select the coordinate system for motor-record moves: Work/0 (default) or Tool/1",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let motor_port = req_string(args, 0, "motorPort")?;
+            let cs_arg = req_string(args, 1, "coordSystem")?;
+            let cs = match cs_arg.to_ascii_lowercase().as_str() {
+                "work" | "0" => MoveCoordSys::Work,
+                "tool" | "1" => MoveCoordSys::Tool,
+                other => {
+                    return Err(format!("coordSystem must be Work or Tool, got '{other}'"));
+                }
+            };
+            let controller = with_hxp_registration(&motor_port, "HXPSetMoveCoordSys", |reg| {
+                Ok(reg.controller.clone())
+            })?;
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_move_coord_sys(cs);
+            println!("HXPSetMoveCoordSys: motorPort={motor_port} coordSystem={cs:?}");
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// The `Config(card, name, addr)` arguments every model-1 driver here takes
+/// (NewportRegister.cc:41-43).
+fn model1_config_args() -> Vec<ArgDesc> {
+    vec![
+        arg_int_req("Card being configured"),
+        arg_str_req("asyn port name"),
+        arg_int_req("asyn address (GPIB)"),
+    ]
+}
+
+/// A model-1 `<name>(card, port, addr)` whose card `build` fills, if the
+/// driver's `Setup` sized a table holding `card`. `addr` is the GPIB address,
+/// which an octet port at address 0 has no use for.
+fn model1_config_command(
+    name: &'static str,
+    driver: &'static Model1,
+    build: fn(&CommandContext, i64, &str) -> Result<(), String>,
+) -> CommandDef {
+    CommandDef::new(
         name,
-        arg_type: ArgType::Int,
-    }
+        model1_config_args(),
+        format!("{name}(card, name, addr)"),
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0) as i64;
+            if !driver.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let port = req_string(args, 1, "asyn port name")?;
+            build(ctx, card, &port)?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
 }
 
-fn arg_double_opt(name: &'static str) -> ArgDesc {
-    ArgDesc {
-        name,
-        arg_type: ArgType::Double,
-    }
+/// `device(motor,VME_IO,devMM3000,"MM3000")` (devNewport.dbd).
+static DEV_MM3000: DevSup = model1_device("devMM3000", "MM3000");
+/// `MM3000_NUM_CARDS` (drvMM3000.cc:97).
+static MM3000: Model1 = Model1::new(&DEV_MM3000, 4, SCAN_RATE);
+
+/// `MM300Setup(num_cards, scan_rate)` — C registers it under this name
+/// (NewportRegister.cc:56).
+pub fn mm3000_setup_command() -> CommandDef {
+    MM3000.setup_command("MM300Setup")
 }
 
-fn arg_double_req(name: &'static str) -> ArgDesc {
-    ArgDesc {
-        name,
-        arg_type: ArgType::Double,
-    }
+/// `MM3000Config(card, name, addr)`: one signal per axis slot the
+/// controller's `RC` reports, including the trailing `unused` slot C counts.
+pub fn mm3000_config_command() -> CommandDef {
+    model1_config_command("MM3000Config", &MM3000, |ctx, card, port| {
+        let handle = connect_serial(port, MM3000_TIMEOUT)?;
+        let controller = Mm3000Controller::new(handle).map_err(|e| format!("MM3000Config: {e}"))?;
+        let num_axes = controller.axis_types().len();
+        let controller = Arc::new(Mutex::new(controller));
+        for axis in 1..=num_axes {
+            let ax = Mm3000Axis::new(controller.clone(), axis)
+                .map_err(|e| format!("MM3000Config: axis {axis}: {e}"))?;
+            MM3000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+        }
+        Ok(())
+    })
 }
 
-/// Read a required double arg.
-fn req_double(args: &[ArgValue], i: usize, name: &str) -> Result<f64, String> {
-    match args.get(i) {
-        Some(ArgValue::Double(v)) => Ok(*v),
-        _ => Err(format!("{name} must be a number")),
-    }
+/// `device(motor,VME_IO,devMM4000,"MM4000")` (devNewport.dbd).
+static DEV_MM4000: DevSup = model1_device("devMM4000", "MM4000");
+/// `MM4000_NUM_CARDS` (drvMM4000.cc:111).
+const MM4000_NUM_CARDS: i32 = 10;
+static MM4000: Model1 = Model1::new(&DEV_MM4000, MM4000_NUM_CARDS, SCAN_RATE);
+
+/// `MM4000Setup(num_cards, scan_rate)`, which alone of these warns about a
+/// card count it clamps, between two 5 s sleeps (drvMM4000.cc:606-611).
+pub fn mm4000_setup_command() -> CommandDef {
+    MM4000.register_row();
+    CommandDef::new(
+        "MM4000Setup",
+        vec![
+            arg_int_req("Max. controller count"),
+            arg_int_req("Polling rate"),
+        ],
+        "MM4000Setup(num_cards, scan_rate)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let num_cards = c_int(args, 0);
+            if !(1..=MM4000_NUM_CARDS).contains(&num_cards) {
+                std::thread::sleep(Duration::from_secs(5));
+                eprintln!(
+                    "\n*** ERROR *** Number specified ({num_cards}) exceeds maximum allowed ({MM4000_NUM_CARDS}).\n"
+                );
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            MM4000.setup(num_cards, c_int(args, 1));
+            Ok(CommandOutcome::Continue)
+        },
+    )
 }
 
-/// Read an optional double arg, defaulting when absent.
-fn opt_double(args: &[ArgValue], i: usize, default: f64, name: &str) -> Result<f64, String> {
-    match args.get(i) {
-        Some(ArgValue::Double(v)) => Ok(*v),
-        None | Some(ArgValue::Missing) => Ok(default),
-        _ => Err(format!("{name} must be a number")),
-    }
+/// `MM4000Config(card, name, addr)`: one signal per axis the controller's
+/// `TP;` reports.
+pub fn mm4000_config_command() -> CommandDef {
+    model1_config_command("MM4000Config", &MM4000, |ctx, card, port| {
+        let handle = connect_serial(port, MM4000_TIMEOUT)?;
+        // Six per-axis polls share one controller-wide exchange: cache for
+        // half the default scan period.
+        let cache_ttl = Duration::from_millis(1000 / SCAN_RATE as u64 / 2);
+        let Some(controller) = Mm4000Controller::new(handle, port, port, 0, cache_ttl) else {
+            return Ok(());
+        };
+        let num_axes = controller.num_axes();
+        let controller = Arc::new(Mutex::new(controller));
+        for axis in 1..=num_axes {
+            let ax = Mm4000Axis::new(controller.clone(), axis);
+            MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+        }
+        Ok(())
+    })
 }
 
-/// Read an optional integer arg, defaulting when absent.
-fn opt_int(args: &[ArgValue], i: usize, default: i64, name: &str) -> Result<i64, String> {
-    match args.get(i) {
-        Some(ArgValue::Int(v)) => Ok(*v),
-        None | Some(ArgValue::Missing) => Ok(default),
-        _ => Err(format!("{name} must be an integer")),
-    }
+/// drvMM4000Asyn.c's `motorAxisDrvSET_t`.
+pub static MOTOR_MM4000: Model2 = Model2::new("motorMM4000");
+
+/// `numMM4000Controllers`, which `MM4000AsynSetup` sets.
+static NUM_MM4000_ASYN: Mutex<i32> = Mutex::new(0);
+
+/// `MM4000AsynSetup(num_controllers)`, printing what C's does.
+pub fn mm4000_asyn_setup_command() -> CommandDef {
+    CommandDef::new(
+        "MM4000AsynSetup",
+        vec![arg_int_req("Max. controller count")],
+        "MM4000AsynSetup(num_controllers)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let num_controllers = c_int(args, 0);
+            if num_controllers < 1 {
+                println!("MM4000Setup, num_controllers must be > 0");
+                return Ok(CommandOutcome::Continue);
+            }
+            *NUM_MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner()) = num_controllers;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `MM4000AsynConfig(card, portName, asynAddress, numAxes,
+/// movingPollPeriod, idlePollPeriod)`, printing what C's does; builds card
+/// `card` of [`MOTOR_MM4000`].
+pub fn mm4000_asyn_config_command() -> CommandDef {
+    CommandDef::new(
+        "MM4000AsynConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
+            arg_int_req("Number of Axes"),
+            arg_int_req("Moving poll rate"),
+            arg_int_req("Idle poll rate"),
+        ],
+        "MM4000AsynConfig(card, portName, asynAddress, numAxes, movingPollPeriod, \
+         idlePollPeriod)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            let port_name = req_string(args, 1, "asyn port name")?;
+            let num_axes = c_int(args, 3);
+            let moving_poll_ms = c_int(args, 4).max(0) as u64;
+            let idle_poll_ms = c_int(args, 5).max(0) as u64;
+
+            let num_controllers = *NUM_MM4000_ASYN.lock().unwrap_or_else(|e| e.into_inner());
+            if num_controllers < 1 {
+                println!("MM4000Config: no MM4000 controllers allocated, call MM4000Setup first");
+                return Ok(CommandOutcome::Continue);
+            }
+            if !(0..num_controllers).contains(&card) {
+                println!(
+                    "MM4000Config: card must in range 0 to {}",
+                    num_controllers - 1
+                );
+                return Ok(CommandOutcome::Continue);
+            }
+            if !(1..=MM4000_MAX_AXES).contains(&num_axes) {
+                println!("MM4000Config: numAxes must in range 1 to {MM4000_MAX_AXES}");
+                return Ok(CommandOutcome::Continue);
+            }
+            let Ok(handle) = connect_serial(&port_name, MM4000_TIMEOUT) else {
+                println!("MM4000AsynConfig: cannot connect to asyn port {port_name}");
+                return Ok(CommandOutcome::Continue);
+            };
+            let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
+            let Some(controller) =
+                Mm4000Controller::new(handle, &port_name, &port_name, num_axes as usize, cache_ttl)
+            else {
+                return Ok(CommandOutcome::Continue);
+            };
+            let controller = Arc::new(Mutex::new(controller));
+            let axes = (1..=num_axes as usize)
+                .map(|axis| Model2Axis {
+                    motor: Arc::new(Mutex::new(Mm4000Axis::new(controller.clone(), axis))),
+                    moving_poll_ms,
+                    idle_poll_ms,
+                })
+                .collect();
+            MOTOR_MM4000.set_card(card, axes);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devPM500,"PM500")` (devNewport.dbd).
+static DEV_PM500: DevSup = model1_device("devPM500", "PM500");
+/// `PM500_NUM_CARDS` (drvPM500.cc:80).
+static PM500: Model1 = Model1::new(&DEV_PM500, 4, SCAN_RATE);
+
+/// `PM500Setup(num_cards, scan_rate)`.
+pub fn pm500_setup_command() -> CommandDef {
+    PM500.setup_command("PM500Setup")
+}
+
+/// `PM500Config(card, name, addr)`: one signal per channel the `STAT?`
+/// scan finds. C `motor_init` drops a controller it cannot connect to or
+/// that leaves `SVN?` unanswered without a word (drvPM500.cc:577, :671-672).
+pub fn pm500_config_command() -> CommandDef {
+    model1_config_command("PM500Config", &PM500, |ctx, card, port| {
+        let Ok(handle) = connect_serial(port, PM500_TIMEOUT) else {
+            return Ok(());
+        };
+        let Some(controller) = Pm500Controller::new(handle) else {
+            return Ok(());
+        };
+        let num_axes = controller.num_axes();
+        let controller = Arc::new(Mutex::new(controller));
+        for index in 0..num_axes {
+            let ax = Pm500Axis::new(controller.clone(), index)
+                .map_err(|e| format!("PM500Config: axis {index}: {e}"))?;
+            PM500.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
+        }
+        Ok(())
+    })
+}
+
+/// `device(motor,VME_IO,devESP300,"ESP300")` (devNewport.dbd).
+static DEV_ESP300: DevSup = model1_device("devESP300", "ESP300");
+/// `ESP300_NUM_CARDS` (drvESP300.cc:71).
+static ESP300: Model1 = Model1::new(&DEV_ESP300, 4, SCAN_RATE);
+
+/// `ESP300Setup(num_cards, scan_rate)`.
+pub fn esp300_setup_command() -> CommandDef {
+    ESP300.setup_command("ESP300Setup")
+}
+
+/// `ESP300Config(card, name, addr)`: one signal per axis C `motor_init`
+/// finds (stop each axis until "axis number out of range").
+pub fn esp300_config_command() -> CommandDef {
+    model1_config_command("ESP300Config", &ESP300, |ctx, card, port| {
+        let handle = connect_with_eos(
+            port,
+            ESP300_TIMEOUT,
+            esp300::INPUT_EOS,
+            esp300::OUTPUT_EOS,
+            EosRefusal::InputFatal,
+        )
+        .map_err(|e| match e {
+            EosConnectError::InputEos(_, e) => format!(
+                "drvESP300.c:motor_init: ASYN setInputEos error = {}",
+                e.status() as i32
+            ),
+            e => e.into(),
+        })?;
+        let controller = Esp300Controller::new(handle).map_err(|e| format!("ESP300Config: {e}"))?;
+        let num_axes = controller.num_axes();
+        let controller = Arc::new(Mutex::new(controller));
+        for axis in 1..=num_axes {
+            let ax = Esp300Axis::new(controller.clone(), axis)
+                .map_err(|e| format!("ESP300Config: axis {axis}: {e}"))?;
+            ESP300.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
+        }
+        Ok(())
+    })
+}
+
+/// `device(motor,VME_IO,devPMNC87xx,"PMNC87xx")` (motorNewFocus
+/// devNewFocus.dbd).
+static DEV_PMNC87XX: DevSup = model1_device("devPMNC87xx", "PMNC87xx");
+/// `PMNC87xx_NUM_CARDS` (drvPMNCCom.h:87).
+static PMNC87XX: Model1 = Model1::new(&DEV_PMNC87XX, 10, SCAN_RATE);
+
+/// `PMNC87xxSetup(num_cards, num_drivers, scan_rate)`. The driver modules
+/// are discovered, so `num_drivers` has no use.
+pub fn pmnc87xx_setup_command() -> CommandDef {
+    PMNC87XX.register_row();
+    CommandDef::new(
+        "PMNC87xxSetup",
+        vec![
+            arg_int_req("Max. controller count"),
+            arg_int_req("Max. drivers per controller count"),
+            arg_int_req("Polling rate"),
+        ],
+        "PMNC87xxSetup(num_cards, num_drivers, scan_rate)",
+        move |args: &[ArgValue], _ctx: &CommandContext| {
+            PMNC87XX.setup(c_int(args, 0), c_int(args, 2));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `PMNC87xxConfig(card, name, addr)`: one signal per channel of the driver
+/// modules found (`MPV` for the 8750, `DRT` for the 8752). The controller
+/// sets the port EOS itself, as C `motor_init` does.
+pub fn pmnc87xx_config_command() -> CommandDef {
+    model1_config_command("PMNC87xxConfig", &PMNC87XX, |ctx, card, port| {
+        let asyn_port = get_port(port).ok_or_else(|| {
+            format!("IP port '{port}' not found (call drvAsynIPPortConfigure first)")
+        })?;
+        let controller = PmncController::new(asyn_port.handle.clone(), PMNC_TIMEOUT)
+            .map_err(|e| format!("PMNC87xxConfig: {e}"))?;
+        let num_axes = controller.num_axes();
+        let controller = Arc::new(Mutex::new(controller));
+        for index in 0..num_axes {
+            let ax = PmncAxis::new(controller.clone(), index)
+                .map_err(|e| format!("PMNC87xxConfig: axis {index}: {e}"))?;
+            PMNC87XX.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
+        }
+        Ok(())
+    })
 }
 
 /// Parse the optional `moveMode` arg for the PVT commands: `absolute`/`abs`/`0`
@@ -2020,67 +1805,6 @@ fn parse_move_mode(arg: Option<String>) -> Result<MoveMode, String> {
             "moveMode must be absolute or relative, got '{other}'"
         )),
     }
-}
-
-fn req_string(args: &[ArgValue], i: usize, name: &str) -> Result<String, String> {
-    match args.get(i) {
-        Some(ArgValue::String(s)) => Ok(s.to_str()?.to_owned()),
-        _ => Err(format!("{name} must be a string")),
-    }
-}
-
-/// Read an optional string arg: `Some` if a non-empty string was given, else
-/// `None` (absent or `Missing`).
-fn opt_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
-    match args.get(i) {
-        Some(ArgValue::String(s)) if !s.is_empty() => Ok(Some(s.to_str()?.to_owned())),
-        _ => Ok(None),
-    }
-}
-
-/// Parse the optional `movingPollMs`/`idlePollMs` trailing args, defaulting and
-/// rejecting negative values.
-fn poll_intervals(args: &[ArgValue], moving_i: usize, idle_i: usize) -> Result<(u64, u64), String> {
-    let moving = poll_ms(args.get(moving_i), DEFAULT_MOVING_POLL_MS, "movingPollMs")?;
-    let idle = poll_ms(args.get(idle_i), DEFAULT_IDLE_POLL_MS, "idlePollMs")?;
-    Ok((moving, idle))
-}
-
-fn poll_ms(arg: Option<&ArgValue>, default: u64, name: &str) -> Result<u64, String> {
-    match arg {
-        // 0 is C's "wait for a poll event only" (asynMotorController.cpp:633).
-        Some(ArgValue::Int(v)) if *v >= 0 => Ok(*v as u64),
-        Some(ArgValue::Int(_)) => Err(format!("{name} must not be negative")),
-        None | Some(ArgValue::Missing) => Ok(default),
-        _ => Err(format!("{name} must be an integer")),
-    }
-}
-
-/// Connect a [`SyncIOHandle`] to a pre-configured serial octet port by name
-/// (created by `drvAsynSerialPortConfigure`).
-fn connect_serial(serial_port: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
-    let port = get_port(serial_port).ok_or_else(|| {
-        format!("serial port '{serial_port}' not found (call drvAsynSerialPortConfigure first)")
-    })?;
-    Ok(SyncIOHandle::from_handle(
-        port.handle.clone(),
-        SERIAL_ADDR,
-        timeout,
-    ))
-}
-
-/// Connect a [`SyncIOHandle`] to a pre-configured TCP octet port by name
-/// (created by `drvAsynIPPortConfigure`). Same lookup as [`connect_serial`] —
-/// separate only for a TCP-appropriate error message.
-fn connect_ip(ip_port: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
-    let port = get_port(ip_port).ok_or_else(|| {
-        format!("IP port '{ip_port}' not found (call drvAsynIPPortConfigure first)")
-    })?;
-    Ok(SyncIOHandle::from_handle(
-        port.handle.clone(),
-        SERIAL_ADDR,
-        timeout,
-    ))
 }
 
 /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "%s:%s: %s\n", driverName,
@@ -2111,8 +1835,7 @@ mod tests {
 
     fn run(line: &FakeLine, fail: &'static str) -> (Option<String>, Vec<String>) {
         *line.fail.lock().unwrap() = fail;
-        let message =
-            NewportHolder::xps_run_profile(&line.socket(SocketMode::Query), &plan(), 1, (1, 2, 2));
+        let message = xps_run_profile(&line.socket(SocketMode::Query), &plan(), 1, (1, 2, 2));
         (message, line.take_log())
     }
 

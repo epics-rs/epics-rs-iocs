@@ -958,7 +958,7 @@ impl XpsAxis {
         status.encoder_home = flags.encoder_home && !referencing;
         status.homed = flags.homed && !referencing;
         status.powered = flags.powered;
-        status.problem = flags.problem;
+        status.problem = flags.problem && !(ctrl.no_disable_error() && axis_status == 20);
 
         let encoder = sock
             .group_position_current_get(&self.positioner_name)

@@ -91,6 +91,8 @@ pub struct XpsController {
     set_position_settling: Duration,
     /// `autoEnable` — re-enable a disabled axis on move (default on).
     auto_enable: bool,
+    /// `noDisableError` — a disabled axis (state 20) is no MSTA problem.
+    no_disable_error: bool,
     /// Each registered axis's `(positioner, group)`, in registration order —
     /// for group-membership counts (C `XPSAxis::isInGroup`) and for enumerating
     /// a group's positioners when building/executing a PVT profile.
@@ -123,6 +125,7 @@ impl XpsController {
             enable_set_position,
             set_position_settling,
             auto_enable: true,
+            no_disable_error: false,
             axes: Vec::new(),
             referencing_groups: HashSet::new(),
             profile: None,
@@ -148,6 +151,17 @@ impl XpsController {
     /// Set `autoEnable` (C `XPSDisableAutoEnable` clears it).
     pub fn set_auto_enable(&mut self, enable: bool) {
         self.auto_enable = enable;
+    }
+
+    /// Whether a disabled axis leaves the problem bit clear (C
+    /// `noDisableError_`).
+    pub fn no_disable_error(&self) -> bool {
+        self.no_disable_error
+    }
+
+    /// C `XPSNoDisableError`.
+    pub fn set_no_disable_error(&mut self) {
+        self.no_disable_error = true;
     }
 
     /// Record an axis's positioner and group so group-membership counts and
