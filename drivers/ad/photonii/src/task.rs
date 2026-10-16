@@ -383,10 +383,14 @@ async fn publish_frame(
 
     let ts = EpicsTimestamp::now();
     let data_type = data.data_type();
-    let mut array = ctx.pool.wrap(
+    // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.wrap(
         vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
         data,
-    );
+    ) else {
+        return Ok(());
+    };
     array.unique_id = array_counter;
     array.timestamp = ts;
     // C stamped every frame of an acquisition with the acquisition's start
