@@ -74,6 +74,22 @@ async fn main() -> CaResult<()> {
         },
     ));
 
+    let verbosity = CommandDef::new(
+        "EIP_verbosity",
+        vec![ArgDesc {
+            name: "value",
+            arg_type: ArgType::Int,
+        }],
+        "EIP_verbosity value",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            let value = int_arg(args, 0).unwrap_or(0) as i32;
+            ether_ip::EIP_VERBOSITY.store(value, Ordering::Relaxed);
+            Ok(CommandOutcome::Continue)
+        },
+    );
+    app = app.register_startup_command(verbosity.clone());
+    app = app.register_shell_command(verbosity);
+
     // EIP_timeout(<milliseconds>)
     app = app.register_startup_command(CommandDef::new(
         "EIP_timeout",

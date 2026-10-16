@@ -96,7 +96,7 @@ impl Connection {
         // The C treats a failed identity read as a warning, not a failure.
         match c.read_identity() {
             Ok(id) => c.identity = id,
-            Err(e) => log::warn!("EIP {host}: cannot determine target's identity: {e}"),
+            Err(_) => crate::eip_printf!(1, "EIP_startup: cannot determine target's identity\n"),
         }
         Ok(c)
     }
@@ -198,16 +198,25 @@ impl Connection {
         )?;
         let items =
             encap::decode_list_services(&reply[encap::HEADER_SIZE..]).ok_or(EipError::Malformed)?;
+        crate::eip_printf!(10, "ListServices reply\n");
+        crate::eip_printf!(10, "    UINT count     = {}\n", items.len());
+        for i in &items {
+            crate::eip_printf!(10, "    UINT type     = 0x{:04X}\n", i.item_type);
+            crate::eip_printf!(10, "    UINT length   = {}\n", i.length);
+            crate::eip_printf!(10, "    UINT version  = 0x{:04X}\n", i.version);
+            crate::eip_printf!(10, "    UINT flags    = 0x{:04X} ", i.flags);
+            if i.supports_cip() {
+                crate::eip_printf!(10, "(CIP PDU encap.)\n");
+            } else {
+                crate::eip_printf!(
+                    2,
+                    "\nEIP list_services: NO SUPPORT for CIP PDU encapsulation.!\n"
+                );
+            }
+            crate::eip_printf!(10, "    USINT name[16]= '{}'\n", i.name);
+        }
         if items.is_empty() || !items.iter().all(|i| i.supports_cip()) {
             return Err(EipError::NoCipSupport);
-        }
-        for i in &items {
-            log::debug!(
-                "EIP service '{}' type 0x{:04X} version 0x{:04X}",
-                i.name,
-                i.item_type,
-                i.version
-            );
         }
         Ok(())
     }

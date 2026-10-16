@@ -146,6 +146,7 @@ pub fn encode_list_services(trans_id: TransactionId) -> Vec<u8> {
 #[derive(Clone, Debug)]
 pub struct ServiceItem {
     pub item_type: u16,
+    pub length: u16,
     pub version: u16,
     pub flags: u16,
     pub name: String,
@@ -166,7 +167,7 @@ pub fn decode_list_services(body: &[u8]) -> Option<Vec<ServiceItem>> {
     let mut at = 2;
     for _ in 0..count {
         let item_type = rd_u16(body, at)?;
-        let length = rd_u16(body, at + 2)? as usize;
+        let length = rd_u16(body, at + 2)?;
         let version = rd_u16(body, at + 4)?;
         let flags = rd_u16(body, at + 6)?;
         let name_raw = body.get(at + 8..at + 24)?;
@@ -176,6 +177,7 @@ pub fn decode_list_services(body: &[u8]) -> Option<Vec<ServiceItem>> {
             .unwrap_or(name_raw.len());
         items.push(ServiceItem {
             item_type,
+            length,
             version,
             flags,
             name: String::from_utf8_lossy(&name_raw[..end]).into_owned(),
@@ -183,7 +185,7 @@ pub fn decode_list_services(body: &[u8]) -> Option<Vec<ServiceItem>> {
         // `length` counts the bytes after type+length; the C decodes a fixed
         // 20-byte body (version, flags, name[16]) but honouring `length` keeps
         // us in step with a target that appends vendor-specific trailer bytes.
-        at += 4 + length.max(20);
+        at += 4 + usize::from(length).max(20);
     }
     Some(items)
 }

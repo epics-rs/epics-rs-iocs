@@ -524,7 +524,16 @@ pub fn encode_write_string(
     let head = 2 + 2 * tag.path_words() + 2 + 2 + 2 + 2 + 2;
     if head + len + 1 > buf_limit {
         len = buf_limit.saturating_sub(head + 1);
-        log::warn!("EIP: string too long for request package, truncated to {len} bytes");
+        // C prints `raw_data` with %s: the struct head up to its first NUL.
+        let head_end = raw_data
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(raw_data.len());
+        crate::eip_printf!(
+            2,
+            "{} is too long to fit in request package.  Truncated to {len} bytes\n",
+            String::from_utf8_lossy(&raw_data[..head_end])
+        );
     }
 
     out.push(service::CIP_WRITE_DATA);
@@ -672,7 +681,10 @@ pub fn get_double(raw: &[u8], element: usize) -> Option<f64> {
         CipType::Ulint => rd_u64(raw, at).map(|v| v as f64),
         CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as f64),
         CipType::Lreal => rd_u64(raw, at).map(f64::from_bits),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_double: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -693,7 +705,10 @@ pub fn get_dint(raw: &[u8], element: usize) -> Option<i32> {
         CipType::Lint | CipType::Ulint => rd_u64(raw, at).map(|v| v as i64 as i32),
         CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as i32),
         CipType::Lreal => rd_u64(raw, at).map(|v| f64::from_bits(v) as i32),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_DINT: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -710,7 +725,10 @@ pub fn get_udint(raw: &[u8], element: usize) -> Option<u32> {
         CipType::Dint | CipType::Bits => rd_u32(raw, at),
         CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as u32),
         CipType::Lreal => rd_u64(raw, at).map(|v| f64::from_bits(v) as u32),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_UDINT: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -720,7 +738,10 @@ pub fn get_lint(raw: &[u8], element: usize) -> Option<i64> {
     let at = elem_off(t, element);
     match t {
         CipType::Lint | CipType::Ulint => rd_u64(raw, at).map(|v| v as i64),
-        _ => None,
+        _ => {
+            crate::eip_printf!(1, "EIP get_CIP_LINT: unknown type 0x{:04X}\n", t.code());
+            None
+        }
     }
 }
 
@@ -729,7 +750,14 @@ pub fn get_usint(raw: &[u8], element: usize) -> Option<u8> {
     let t = typecode(raw)?;
     match t {
         CipType::Bool | CipType::Sint => raw.get(elem_off(t, element)).copied(),
-        _ => None,
+        _ => {
+            crate::eip_printf!(
+                1,
+                "EIP get_CIP_USINT: cannot handle type 0x{:04X}\n",
+                t.code()
+            );
+            None
+        }
     }
 }
 
@@ -758,18 +786,28 @@ pub fn get_string(raw: &[u8], element: usize, max: usize) -> Option<String> {
         CipType::Struct => {
             let handle = rd_u16(raw, TYPECODE_SIZE)?;
             if handle != STRUCT_STRING_HANDLE {
-                log::warn!("EIP get_string: unknown struct handle 0x{handle:04X}");
+                crate::eip_printf!(1, "EIP get_CIP_STRING: unknown subtype 0x{handle:04X}\n");
                 return None;
             }
             let base = TYPECODE_SIZE + 2 + element * STRUCT_STRING_STRIDE;
             let len = rd_u16(raw, base)? as usize;
+            if len >= max {
+                crate::eip_printf!(
+                    5,
+                    "EIP get_CIP_STRING: Truncating from {len} to {cap} chars (plus terminator)\n"
+                );
+            }
             // base+2 is the "no idea what this is" pad word.
             let text = raw.get(base + STRUCT_STRING_LEN_BYTES..)?;
             let n = len.min(cap).min(text.len()).min(STRUCT_STRING_BUF);
             &text[..n]
         }
         other => {
-            log::warn!("EIP get_string: unhandled type {other:?}");
+            crate::eip_printf!(
+                1,
+                "EIP get_CIP_STRING: unknown type 0x{:04X}\n",
+                other.code()
+            );
             return None;
         }
     };
@@ -790,7 +828,10 @@ pub fn put_double(raw: &mut [u8], element: usize, value: f64) -> bool {
         CipType::Lint | CipType::Ulint => wr_slice(raw, at, &(value as i64).to_le_bytes()),
         CipType::Real => wr_slice(raw, at, &(value as f32).to_bits().to_le_bytes()),
         CipType::Lreal => wr_slice(raw, at, &value.to_bits().to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_double: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
@@ -805,7 +846,10 @@ pub fn put_dint(raw: &mut [u8], element: usize, value: i32) -> bool {
         CipType::Lint | CipType::Ulint => wr_slice(raw, at, &(value as i64).to_le_bytes()),
         CipType::Real => wr_slice(raw, at, &(value as f32).to_bits().to_le_bytes()),
         CipType::Lreal => wr_slice(raw, at, &(value as f64).to_bits().to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_DINT: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
@@ -819,7 +863,10 @@ pub fn put_udint(raw: &mut [u8], element: usize, value: u32) -> bool {
         CipType::Dint | CipType::Bits => wr_slice(raw, at, &value.to_le_bytes()),
         CipType::Real => wr_slice(raw, at, &(value as f32).to_bits().to_le_bytes()),
         CipType::Lreal => wr_slice(raw, at, &(value as f64).to_bits().to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_UDINT: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
@@ -829,20 +876,26 @@ pub fn put_lint(raw: &mut [u8], element: usize, value: i64) -> bool {
     let at = elem_off(t, element);
     match t {
         CipType::Lint | CipType::Ulint => wr_slice(raw, at, &value.to_le_bytes()),
-        _ => false,
+        _ => {
+            crate::eip_printf!(1, "EIP put_CIP_LINT: unknown type 0x{:04X}\n", t.code());
+            false
+        }
     }
 }
 
 /// Set the text of a Logix STRING struct in place, leaving the rest of the
 /// buffer alone. Returns false for a non-STRING buffer.
 pub fn put_string(raw: &mut [u8], value: &str) -> bool {
-    let Some(CipType::Struct) = typecode(raw) else {
+    let Some(t) = typecode(raw) else { return false };
+    if t != CipType::Struct {
+        crate::eip_printf!(1, "EIP put_CIP_STRING: unknown type 0x{:04X}\n", t.code());
         return false;
-    };
+    }
     let Some(handle) = rd_u16(raw, TYPECODE_SIZE) else {
         return false;
     };
     if handle != STRUCT_STRING_HANDLE {
+        crate::eip_printf!(1, "EIP put_CIP_STRING: unknown subtype 0x{handle:04X}\n");
         return false;
     }
     let len_at = TYPECODE_SIZE + 2;
