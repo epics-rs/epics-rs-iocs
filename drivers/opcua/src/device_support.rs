@@ -443,13 +443,6 @@ impl OpcuaDevice {
     /// One update the record popped.
     fn deliver(&mut self, update: Update, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.timestamp = Some(update.timestamp);
-        if update.overrides > 0 {
-            log::warn!(
-                "{}: {} update(s) lost, the record's queue overran",
-                self.record_name,
-                update.overrides
-            );
-        }
 
         match update.reason {
             ProcessReason::ReadFailure => {
@@ -470,11 +463,6 @@ impl OpcuaDevice {
             ProcessReason::WriteRequest => {
                 if self.is_output {
                     self.send(record)?;
-                } else {
-                    log::warn!(
-                        "{}: bini=write has nothing to write on an input record",
-                        self.record_name
-                    );
                 }
                 // The C's `reason == writeRequest` arm is the write branch of
                 // the write dset — it requests the write and pops nothing.

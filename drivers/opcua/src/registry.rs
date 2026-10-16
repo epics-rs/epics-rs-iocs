@@ -172,16 +172,13 @@ impl Registry {
             if item.is_adopted() {
                 continue;
             }
-            let records: Vec<String> = item
-                .leaves
-                .iter()
-                .map(|leaf| leaf.lock().record.clone())
-                .collect();
-            log::error!(
-                "no opcuaItem record '{name}' with OPCUA device support is loaded; \
-                 the records linked to it will never update: {}",
-                records.join(", ")
-            );
+            // C's `add_record` refuses each linking record (`devOpcua.cpp:107`).
+            for leaf in &item.leaves {
+                eprintln!(
+                    "{} Error in add_record : unknown subscription/session/opcuaItemRecord '{name}'",
+                    leaf.lock().record
+                );
+            }
         }
 
         let workers = std::mem::take(&mut inner.workers);
