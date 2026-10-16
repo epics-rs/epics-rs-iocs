@@ -336,11 +336,9 @@ pub fn create_sim_detector(
     let ad_params = det.ad.params;
     let sim_params = det.sim;
     let pool = det.ad.pool.clone();
-    // Share the driver's own counter so `ADDriverBase::set_acquire` sees the
-    // live queued-array count when ADWaitForPlugins is set. The `NDArrayOutput`
-    // must live outside the driver instead, because `create_port_runtime` takes
-    // ownership of it and the IOC still needs to attach plugin senders.
-    let queued = det.ad.owner.queued().clone();
+    // The `NDArrayOutput` must live outside the driver, because
+    // `create_port_runtime` takes ownership of it and the IOC still needs to
+    // attach plugin senders.
 
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
@@ -350,7 +348,6 @@ pub fn create_sim_detector(
         stop_rx,
         handle: runtime_handle.port_handle().clone(),
         publisher: ArrayPublisher::new(array_output.clone()),
-        queued,
         pool: pool.clone(),
         ad: ad_params,
         sim: sim_params,
@@ -636,5 +633,119 @@ mod tests {
         let p = f.det.ad.params;
         f.write_i32(p.shutter_control, 1);
         assert_eq!(f.get_i32(p.shutter_status), 0);
+    }
+
+    #[test]
+    fn wait_for_plugins_holds_acquire_busy_until_the_frame_is_released() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+        use std::time::{Duration, Instant};
+
+        let rt = create_sim_detector(
+            &claim_port("SIM_BUSY").unwrap(),
+            8,
+            8,
+            NDDataType::UInt8,
+            0,
+            0,
+        )
+        .unwrap();
+        let (tx, mut rx) = ndarray_channel("SIM_BUSY_SINK", 8);
+        rt.connect_downstream(tx);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(ad.base.wait_for_plugins, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Single as i32),
+                ),
+                ParamSetValue::new(ad.acquire_time, 0, ParamValue::Float64(0.001)),
+            ],
+        )
+        .unwrap();
+        // The IOC's PINI records seed these; read_config refuses them unset.
+        let sp = rt.sim_params;
+        let floats = [
+            ad.gain,
+            sp.gain_x,
+            sp.gain_y,
+            sp.gain_red,
+            sp.gain_green,
+            sp.gain_blue,
+            sp.offset,
+            sp.noise,
+            sp.peak_height_variation,
+            sp.x_sine1_amplitude,
+            sp.x_sine1_frequency,
+            sp.x_sine1_phase,
+            sp.x_sine2_amplitude,
+            sp.x_sine2_frequency,
+            sp.x_sine2_phase,
+            sp.y_sine1_amplitude,
+            sp.y_sine1_frequency,
+            sp.y_sine1_phase,
+            sp.y_sine2_amplitude,
+            sp.y_sine2_frequency,
+            sp.y_sine2_phase,
+        ];
+        let ints = [
+            sp.mode,
+            sp.peak_num_x,
+            sp.peak_num_y,
+            sp.peak_start_x,
+            sp.peak_start_y,
+            sp.peak_step_x,
+            sp.peak_step_y,
+            sp.peak_width_x,
+            sp.peak_width_y,
+            sp.x_sine_operation,
+            sp.y_sine_operation,
+        ];
+        let mut seeds = Vec::new();
+        for r in floats {
+            if h.read_float64_blocking(r, 0).is_err() {
+                seeds.push(ParamSetValue::new(r, 0, ParamValue::Float64(0.0)));
+            }
+        }
+        for r in ints {
+            if h.read_int32_blocking(r, 0).is_err() {
+                seeds.push(ParamSetValue::new(r, 0, ParamValue::Int32(0)));
+            }
+        }
+        h.set_params_and_notify_blocking(0, seeds).unwrap();
+
+        let read = |reason| h.read_int32_blocking(reason, 0).unwrap();
+        let wait_for = |reason, value| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while read(reason) != value {
+                assert!(
+                    Instant::now() < deadline,
+                    "param {reason} never became {value}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_for(ad.acquire, 0);
+        eprintln!(
+            "DBG queued={} busy={} wait={} status={} counter={} owner={:?}",
+            read(ad.base.num_queued_arrays),
+            read(ad.acquire_busy),
+            read(ad.base.wait_for_plugins),
+            read(ad.status),
+            read(ad.base.array_counter),
+            rt.pool().owner().map(|o| o.queued().get())
+        );
+        assert_eq!(read(ad.acquire_busy), 1, "busy cleared with a frame queued");
+        drop(rx.blocking_recv().expect("frame"));
+        wait_for(ad.acquire_busy, 0);
+        std::mem::forget(rt);
     }
 }
