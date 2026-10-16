@@ -10,7 +10,7 @@ use std::sync::Arc;
 use epics_rs::ad_plugins::ioc::AdIoc;
 use epics_rs::base::server::iocsh::registry::*;
 
-use quadem::iocsh::{octet_port_commands, register_quadem_port};
+use quadem::iocsh::register_quadem_port;
 use quadem::{TetrAmmRuntime, create_tetramm};
 
 fn tetramm_configure_command(
@@ -78,13 +78,9 @@ fn tetramm_configure_command(
     )
 }
 
-/// Register the TetrAMM configure command and the octet-port verbs it needs.
+/// Register the TetrAMM configure command.
 pub fn register(ioc: &mut AdIoc) {
     epics_rs::base::runtime::env::set_default("QUADEM", concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-
-    for cmd in octet_port_commands() {
-        ioc.register_startup_command(cmd);
-    }
 
     let runtime: Arc<std::sync::Mutex<Option<TetrAmmRuntime>>> =
         Arc::new(std::sync::Mutex::new(None));

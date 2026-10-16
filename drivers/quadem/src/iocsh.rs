@@ -1,11 +1,5 @@
-//! iocsh verbs every quadEM IOC needs to build the octet port its driver
-//! talks through.
-//!
-//! `drvAsynIPPortConfigure` and `drvAsynSerialPortConfigure` come from
-//! `asyn-rs`. `asynOctetSetInputEos` / `asynOctetSetOutputEos` are provided
-//! here instead: the `asyn-rs` versions resolve a port name through a
-//! `PortManager`, which the port-configure verbs do not populate — they
-//! register into the `asyn_record` registry, which is what these look in.
+//! iocsh `drv*Configure` verbs for the quadEM drivers. The octet port and
+//! EOS verbs an `st.cmd` uses first come from `AdIoc`'s asyn command set.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,104 +18,6 @@ use crate::fx4::{Fx4Runtime, create_fx4};
 use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
 use crate::t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};
-
-/// Rust port of EPICS `epicsStrnRawFromEscaped` (libcom `epicsString.c`),
-/// restricted to the escapes an octet EOS can carry.
-pub fn raw_from_escaped(src: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(src.len());
-    let mut chars = src.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            continue;
-        }
-        match chars.next() {
-            Some('r') => out.push(b'\r'),
-            Some('n') => out.push(b'\n'),
-            Some('t') => out.push(b'\t'),
-            Some('a') => out.push(0x07),
-            Some('b') => out.push(0x08),
-            Some('f') => out.push(0x0c),
-            Some('v') => out.push(0x0b),
-            Some('0') => out.push(0),
-            Some('\\') => out.push(b'\\'),
-            Some('\'') => out.push(b'\''),
-            Some('"') => out.push(b'"'),
-            Some(other) => {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(other.encode_utf8(&mut buf).as_bytes());
-            }
-            None => out.push(b'\\'),
-        }
-    }
-    out
-}
-
-fn eos_command(name: &'static str, input: bool) -> CommandDef {
-    CommandDef::new(
-        name,
-        vec![
-            ArgDesc {
-                name: "portName",
-                arg_type: ArgType::String,
-            },
-            ArgDesc {
-                name: "addr",
-                arg_type: ArgType::Int,
-            },
-            ArgDesc {
-                name: "eos",
-                arg_type: ArgType::String,
-            },
-        ],
-        format!("{name} portName addr eos"),
-        move |args: &[ArgValue], ctx: &CommandContext| {
-            let port = match args.first() {
-                Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
-                _ => return Err("portName required".into()),
-            };
-            let eos = match args.get(2) {
-                Some(ArgValue::String(s)) => raw_from_escaped(s.to_str()?),
-                _ => Vec::new(),
-            };
-            let Some(entry) = epics_rs::asyn::asyn_record::get_port(&port) else {
-                ctx.println(&format!("{name}: port '{port}' not found"));
-                return Ok(CommandOutcome::Continue);
-            };
-            // C `asynSetEos` queues at Connect priority with
-            // ASYN_REASON_QUEUE_EVEN_IF_NOT_CONNECTED: the EOS is set before
-            // the device is reachable.
-            let user = epics_rs::asyn::user::AsynUser::default()
-                .with_timeout(std::time::Duration::from_secs(2))
-                .queue_even_if_not_connected();
-            let res = if input {
-                entry.handle.set_input_eos_blocking(user, &eos)
-            } else {
-                entry.handle.set_output_eos_blocking(user, &eos)
-            };
-            if let Err(e) = res {
-                ctx.println(&format!("{name}: {e}"));
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
-}
-
-/// The four startup verbs a quadEM `st.cmd` uses before its `drv*Configure`
-/// call: create the octet port, then frame it.
-pub fn octet_port_commands() -> Vec<CommandDef> {
-    vec![
-        epics_rs::asyn::iocsh::drv_asyn_ip_port_configure_command(
-            epics_rs::asyn::services::PortServices::global(),
-        ),
-        epics_rs::asyn::iocsh::drv_asyn_serial_port_configure_command(
-            epics_rs::asyn::services::PortServices::global(),
-        ),
-        eos_command("asynOctetSetInputEos", true),
-        eos_command("asynOctetSetOutputEos", false),
-    ]
-}
 
 /// Publish a configured quadEM port: the asyn port itself, then its twelve
 /// NDArray fan-outs.
@@ -624,31 +520,5 @@ fn port_number(arg: Option<&ArgValue>, name: &str) -> Result<u16, String> {
             u16::try_from(*n).map_err(|_| format!("{name}: {n} is not a valid port number"))
         }
         _ => Err(format!("{name} required")),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::raw_from_escaped;
-
-    #[test]
-    fn decodes_crlf_input_eos() {
-        assert_eq!(raw_from_escaped("\\r\\n"), b"\r\n");
-    }
-
-    #[test]
-    fn decodes_cr_output_eos() {
-        assert_eq!(raw_from_escaped("\\r"), b"\r");
-    }
-
-    #[test]
-    fn passes_through_plain_text_and_backslash() {
-        assert_eq!(raw_from_escaped("ab"), b"ab");
-        assert_eq!(raw_from_escaped("\\\\"), b"\\");
-    }
-
-    #[test]
-    fn empty_eos_decodes_to_empty() {
-        assert_eq!(raw_from_escaped(""), b"");
     }
 }
