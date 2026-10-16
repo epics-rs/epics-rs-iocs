@@ -172,15 +172,15 @@ async fn data_loop(ctx: DataContext) {
             Err(_) => continue,
         };
 
-        let image = image.get_or_insert_with(|| Image {
+        let building = image.get_or_insert_with(|| Image {
             pixels: vec![0u16; pixels_per_color * num_colors],
             colors: num_colors,
             timestamp: EpicsTimestamp::now(),
         });
-        if image.colors != num_colors {
-            image.pixels = vec![0u16; pixels_per_color * num_colors];
-            image.colors = num_colors;
-            image.timestamp = EpicsTimestamp::now();
+        if building.colors != num_colors {
+            building.pixels = vec![0u16; pixels_per_color * num_colors];
+            building.colors = num_colors;
+            building.timestamp = EpicsTimestamp::now();
         }
 
         let offset = if num_colors == 1 {
@@ -188,7 +188,7 @@ async fn data_loop(ctx: DataContext) {
         } else {
             COLOR_OFFSET_MAP[colors_collected] * pixels_per_color
         };
-        image.pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
+        building.pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
         colors_collected += 1;
 
         let udp_updates = vec![
@@ -236,9 +236,13 @@ async fn data_loop(ctx: DataContext) {
             .unwrap_or(1)
             != 0;
 
-        let ts = image.timestamp;
-        let taken = image.pixels.clone();
-        let colors = image.colors;
+        // The next colour 0 starts a new image with its own start time
+        // (pixirad.cpp:1023-1025).
+        let Image {
+            pixels: taken,
+            colors,
+            timestamp: ts,
+        } = image.take().expect("an image is being built");
 
         let mut updates = vec![
             ParamSetValue::new(

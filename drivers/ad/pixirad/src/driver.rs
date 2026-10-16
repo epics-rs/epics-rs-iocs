@@ -622,6 +622,14 @@ mod tests {
     /// A box that answers `GOT:` to every command except those containing
     /// `reject`; `None` is a box that never accepts the connection.
     fn detector(name: &str, reject: Option<&'static str>) -> PixiradDetector {
+        detector_sized(name, reject, 1 << 20)
+    }
+
+    fn detector_sized(
+        name: &str,
+        reject: Option<&'static str>,
+        max_memory: usize,
+    ) -> PixiradDetector {
         let addr = match reject {
             None => "127.0.0.1:1".to_string(),
             Some(reject) => {
@@ -668,7 +676,7 @@ mod tests {
             sensor,
             476,
             512,
-            1 << 20,
+            max_memory,
             shared,
         )
         .expect("C builds the driver whatever the box answers")
@@ -713,5 +721,75 @@ mod tests {
         let mut det = detector("PIXI_THRESH_NAK", Some("SET_SENSOR_OPERATINGS"));
         det.write_int32(&mut AsynUser::new(q.auto_calibrate), 1)
             .unwrap();
+    }
+
+    /// The data task of a detector on a box that takes every command, fed
+    /// frames by the test instead of the UDP listener.
+    struct DataTask {
+        handle: PortHandle,
+        ad: ADBaseParams,
+        frames: std::sync::mpsc::SyncSender<Frame>,
+        arrays: epics_rs::ad_core::plugin::channel::NDArrayReceiver,
+        frame_bytes: usize,
+    }
+
+    impl DataTask {
+        fn start(name: &str, max_memory: usize) -> Self {
+            let det = detector_sized(name, Some("NEVER"), max_memory);
+            let (ad, params, pool, sensor) =
+                (det.ad.params, det.params, det.ad.pool.clone(), det.sensor);
+            let shared = det.shared.clone();
+            let (runtime, _) =
+                create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                    .unwrap();
+            let handle = runtime.port_handle().clone();
+            std::mem::forget(runtime);
+            let (sink, arrays) =
+                epics_rs::ad_core::plugin::channel::ndarray_channel("PIXI_SINK", 8);
+            let mut output = NDArrayOutput::new();
+            output.add(sink);
+            let (frames, frame_rx) = std::sync::mpsc::sync_channel(8);
+            task::start_data_task(DataContext {
+                handle: handle.clone(),
+                output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output))),
+                pool,
+                ad_params: ad,
+                params,
+                sensor,
+                shared,
+                frames: frame_rx,
+            });
+            Self {
+                handle,
+                ad,
+                frames,
+                arrays,
+                frame_bytes: crate::decode::Decoder::new(sensor).frame_bytes(false),
+            }
+        }
+
+        fn send_frame(&self) {
+            self.frames
+                .send(Frame {
+                    is_autocal: false,
+                    align_errors: false,
+                    payload: vec![0; self.frame_bytes],
+                })
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn every_image_carries_its_own_start_time() {
+        let mut t = DataTask::start("PIXI_TS", 1 << 20);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        t.send_frame();
+        let first = t.arrays.blocking_recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        t.send_frame();
+        let second = t.arrays.blocking_recv().unwrap();
+        assert!(second.timestamp.as_f64() > first.timestamp.as_f64());
     }
 }
