@@ -17,6 +17,8 @@ pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
 pub const PROCESS_PRV_IMG_DATA_LINE: &str =
     "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)";
 pub const PROCESS_IMG_DATA_LINE: &str = "bool ADTimePix::processImgDataLine(char*, char*, size_t)";
+pub const CHECK_BPC_PATH: &str = "asynStatus ADTimePix::checkBPCPath()";
+pub const CHECK_DACS_PATH: &str = "asynStatus ADTimePix::checkDACSPath()";
 pub const WRITE_INT32: &str = "virtual asynStatus ADTimePix::writeInt32(asynUser*, epicsInt32)";
 pub const WRITE_FLOAT64: &str =
     "virtual asynStatus ADTimePix::writeFloat64(asynUser*, epicsFloat64)";

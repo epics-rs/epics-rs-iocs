@@ -74,6 +74,19 @@ pub fn dac_params(p: &TimePixParams) -> Vec<(&'static str, usize)> {
     DAC_NAMES.iter().map(|(name, f)| (*name, f(p))).collect()
 }
 
+/// C `checkPath` (ADTimePix.cpp:115): one trailing '/' is dropped for the
+/// directory test and the path always comes back ending in '/'.
+fn check_path(path: &str) -> (String, bool) {
+    if path.is_empty() {
+        return (String::new(), false);
+    }
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    (
+        format!("{trimmed}/"),
+        std::path::Path::new(trimmed).is_dir(),
+    )
+}
+
 /// C `ADTimePix3Action::oneShotDecision` (one_shot_action.h): an action
 /// parameter runs on 1 only and always reads back 0.
 fn one_shot(value: i32) -> bool {
@@ -133,6 +146,43 @@ impl TimePix3Driver {
             &std::env::var("ADTIMEPIX_CALIBRATION_ROOT").unwrap_or_default(),
         )?;
         Ok(driver)
+    }
+
+    /// C `checkBPCPath` (mask_io.cpp:502) and `checkDACSPath`
+    /// (ADTimePix.cpp:185): the directory must exist inside the calibration
+    /// root, and is stored back with a trailing '/'.
+    fn check_calibration_dir(&mut self, path: usize, exists: usize, func: &str) -> AsynResult<()> {
+        let dir = self.text(path, 0);
+        if dir.is_empty() {
+            return Ok(());
+        }
+        let (normalized, found) = check_path(&dir);
+        let verdict = self.calibration.validate_directory(&normalized);
+        let permitted = found && verdict.is_ok();
+        self.set_text(path, &normalized)?;
+        self.ad
+            .port_base
+            .set_int32_param(exists, 0, i32::from(permitted))?;
+        if permitted {
+            return Ok(());
+        }
+        let message = format!(
+            "Calibration path blocked: {}",
+            verdict.err().map_or("ok", |e| e.message())
+        );
+        self.set_text(self.p.write_msg, &message)?;
+        self.ad.port_base.trace_print(
+            TraceMask::ERROR,
+            format_args!(
+                "{}",
+                adlog::err(func, &format!("{message} (directory=\"{normalized}\")"))
+            ),
+        );
+        self.ad.port_base.call_param_callbacks(0)?;
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        })
     }
 
     /// C `ADTimePixConfig`'s ADTIMEPIX_CALIBRATION_ROOT, "/" when unset
@@ -1344,21 +1394,19 @@ impl PortDriver for TimePix3Driver {
             .port_base
             .set_string_param(reason, addr, value.clone())?;
 
-        // A path PV's "does it exist" readback (C `checkBPCPath`,
-        // mask_io.cpp:320).
-        for (path, exists) in [
-            (p.bp_c_file_path, p.bp_c_file_path_exists),
-            (p.da_cs_file_path, p.da_cs_file_path_exists),
-        ] {
-            if reason == path {
-                let dir = self.text(path, 0);
-                let ok = !dir.is_empty() && std::path::Path::new(&dir).is_dir();
-                self.ad
-                    .port_base
-                    .set_int32_param(exists, 0, i32::from(ok))?;
-            }
-        }
-        let status = if reason == p.tof_tdc_reference {
+        let status = if reason == p.bp_c_file_path {
+            self.check_calibration_dir(
+                p.bp_c_file_path,
+                p.bp_c_file_path_exists,
+                adlog::CHECK_BPC_PATH,
+            )
+        } else if reason == p.da_cs_file_path {
+            self.check_calibration_dir(
+                p.da_cs_file_path,
+                p.da_cs_file_path_exists,
+                adlog::CHECK_DACS_PATH,
+            )
+        } else if reason == p.tof_tdc_reference {
             self.send_measurement_config()
         } else {
             Ok(())
@@ -1485,6 +1533,52 @@ mod tests {
             det.text(p.calibration_policy, 0),
             "Blocked: calibration root is not absolute"
         );
+    }
+
+    /// A calibration directory gains its trailing '/' and is refused outside
+    /// the calibration root (ADTimePix.cpp:185-212, mask_io.cpp:502-526).
+    #[test]
+    fn a_calibration_directory_is_checked_against_the_root() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_CALIB_DIR",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let tmp = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("tpx-calib-dir-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("root/sub")).unwrap();
+        std::fs::create_dir_all(tmp.join("outside")).unwrap();
+        let sub = tmp.join("root/sub");
+        for (path, exists) in [
+            (p.bp_c_file_path, p.bp_c_file_path_exists),
+            (p.da_cs_file_path, p.da_cs_file_path_exists),
+        ] {
+            det.write_octet(&mut AsynUser::new(path), sub.to_str().unwrap().as_bytes())
+                .unwrap();
+            assert_eq!(det.text(path, 0), format!("{}/", sub.display()));
+            assert_eq!(det.int(exists, 0), 1);
+        }
+        det.calibration
+            .configure(tmp.join("root").to_str().unwrap())
+            .unwrap();
+        let outside = format!("{}/", tmp.join("outside").display());
+        let e = det
+            .write_octet(&mut AsynUser::new(p.da_cs_file_path), outside.as_bytes())
+            .unwrap_err();
+        assert!(e.to_string().contains("status=3"), "{e}");
+        assert_eq!(det.int(p.da_cs_file_path_exists, 0), 0);
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            "Calibration path blocked: calibration directory is outside the approved root"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A failed writeOctet action reports C's errorMessage, not the
