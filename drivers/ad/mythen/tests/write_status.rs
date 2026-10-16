@@ -8,6 +8,7 @@ use std::sync::{Arc, mpsc};
 
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
@@ -112,4 +113,32 @@ fn an_illegal_tau_still_reads_the_settings_back() {
         ran_get_settings(&received),
         "getSettings did not run after the illegal tau"
     );
+}
+
+#[test]
+fn a_failed_get_settings_is_an_error_status() {
+    // Nothing listens, so the detector boots disconnected and getSettings is
+    // refused at the gate with Disconnected.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    drop(listener);
+    let ip = DrvAsynIPPort::new("MYTHEN_WS_DEAD_IP", &addr).expect("ip port");
+    let (runtime, _) = create_port_runtime(
+        &claim_port("MYTHEN_WS_DEAD_IP").unwrap(),
+        ip,
+        RuntimeConfig::default(),
+    )
+    .expect("ip port runtime");
+    let det = Arc::new(Detector::new(
+        Transport::new(runtime.port_handle().clone()),
+        "MYTHEN_WS_DEAD",
+    ));
+    std::mem::forget(runtime);
+    let (start_tx, _start_rx) = rt::command_channel::<()>(1);
+    let mut driver = MythenDriver::new("MYTHEN_WS_DEAD", det, 0, start_tx).expect("driver");
+
+    // A base parameter: getSettings is the only step that can fail.
+    let mut user = AsynUser::new(driver.ad.params.num_images);
+    let err = driver.write_int32(&mut user, 3).unwrap_err();
+    assert_eq!(err.status(), AsynStatus::Error);
 }

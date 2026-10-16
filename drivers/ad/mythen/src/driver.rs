@@ -279,7 +279,11 @@ impl MythenDriver {
             // C refuses to talk to a running detector (mythen.cpp:689).
             return Ok(());
         }
-        let settings = self.det.get_settings()?;
+        // C's getSettings returns asynError whatever failed (mythen.cpp:795).
+        let settings = self.det.get_settings().map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: e.to_string(),
+        })?;
         self.apply_settings(&settings)
     }
 
