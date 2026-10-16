@@ -1,32 +1,43 @@
 #============================================================
-# st.cmd -- Rontec MCA IOC
+# st.cmd -- Rontec MCA IOC, ported from iocBoot/iocRontec/st.cmd
 #
 # Usage:
 #   cargo run -p mca-rontec-ioc -- st.cmd
 #
-# Configures a serial octet port to the Rontec detector, sets the input/
-# output EOS the wire protocol expects (RontecConfig only *reads* the input
-# EOS via pasynOctetSyncIO->getInputEos -- it does not set one), then boots
-# the Rontec asyn MCA driver and loads one mca record bound to it via
-# devMcaAsyn (DTYP "asynMCA").
+# Not ported: asynOctetConnect (no epics-rs iocsh command), and from
+# save_restore.cmd the save_restoreSet_Debug/IncompleteSetsOk/
+# DatedBackupFiles/NumSeqFiles/SeqPeriodInSeconds settings and
+# save_restoreStatus.db, which epics-rs autosave does not provide.
 #============================================================
 
 # MCA_RONTEC_IOC is set by main.rs (epics_rs::base::runtime::env::set_default)
 # to this IOC crate's CARGO_MANIFEST_DIR.
 
 # ---- serial port to the Rontec detector, 38400 baud ----
-drvAsynSerialPortConfigure("S0", "$(RONTEC_TTY=/dev/ttyS0)", 0, 0, 0)
-asynSetOption("S0", 0, "baud", "38400")
-asynOctetSetInputEos("S0", 0, "\r")
-asynOctetSetOutputEos("S0", 0, "\r")
+drvAsynSerialPortConfigure("serial1", "$(RONTEC_TTY=/dev/ttyS0)", 0, 0, 0)
+asynSetOption("serial1", 0, "baud", "38400")
+asynOctetSetInputEos("serial1", 0, "\r")
+asynOctetSetOutputEos("serial1", 0, "\r")
 
 # ---- Rontec asyn MCA driver ----
 # RontecConfig(portName,serialPort,serialPortAddress)
-RontecConfig("RONTEC0", "S0", 0)
+RontecConfig("Rontec1", "serial1", 0)
 
 # ---- records ----
-dbLoadRecords("$(MCA_RONTEC_IOC)/db/mca.db", "P=mca:,R=rontec1,PORT=RONTEC0,ADDR=0,NCHAN=4096")
-dbLoadRecords("$(MCA_RONTEC_IOC)/db/RontecXFlash.db", "P=mcaTest:,R=Rontec1,PORT=S0")
+dbLoadRecords("$(MCA_RONTEC_IOC)/db/mca.db", "P=mca:,R=rontec1,PORT=Rontec1,ADDR=0,NCHAN=4096")
+dbLoadRecords("$(MCA_RONTEC_IOC)/db/RontecXFlash.db", "P=mcaTest:,R=Rontec1,PORT=serial1")
 
-#------------------------------------------------------------------------------
+dbLoadRecords("$(MCA_RONTEC_IOC)/db/asynRecord.db", "P=mcaTest:,R=serial1,PORT=serial1,ADDR=0,OMAX=256,IMAX=256")
+
+# ---- save_restore ----
+save_restoreSet_status_prefix("mcaTest:")
+set_savefile_path("$(MCA_RONTEC_IOC)", "autosave")
+set_pass0_restoreFile("auto_settings.sav")
+set_pass1_restoreFile("auto_settings.sav")
+set_requestfile_path("$(MCA_RONTEC_IOC)", "")
+set_requestfile_path("$(MCA_RONTEC_IOC)", "db")
+
 iocInit()
+
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=mcaTest:")

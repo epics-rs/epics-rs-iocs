@@ -66,6 +66,11 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(mca_name, move || mca_factory());
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
+    let autosave_config = Arc::new(Mutex::new(
+        epics_rs::base::server::autosave::startup::AutosaveStartupConfig::new(),
+    ));
+    app = app.autosave_startup(autosave_config);
+
     // Standard asyn iocsh commands, including drvAsynSerialPortConfigure --
     // provides asynOctetSetInputEos/asynOctetSetOutputEos/asynSetOption and
     // serial port creation for both the startup script and interactive
