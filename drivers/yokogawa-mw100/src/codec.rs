@@ -5,6 +5,7 @@
 //! consumer's own `ptr += 4`), or on a full raw binary frame (`FD1`/`FO1`,
 //! which indexes from the frame start).
 
+use epics_rs::base::calc::engine::cvt::fmt_g;
 use epics_rs::base::calc::engine::strtod::strtod;
 
 // ---------------------------------------------------------------------
@@ -101,34 +102,9 @@ pub fn cmd_bo1() -> String {
     "BO1\r\n".to_string()
 }
 
-/// C `sprintf("%G", value)` — default precision (6 significant digits),
-/// trailing zeros stripped (`drvMW100.c:1265,1268`).
+/// C `sprintf("%G", value)` (`drvMW100.c:1265,1268`).
 pub fn format_g(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    const PRECISION: i32 = 6;
-    let exponent = value.abs().log10().floor() as i32;
-    if !(-4..PRECISION).contains(&exponent) {
-        let digits = (PRECISION - 1).max(0) as usize;
-        let s = format!("{value:.digits$e}");
-        let (mantissa, exp) = s.split_once('e').expect("Rust {:e} always emits 'e'");
-        let mantissa = strip_trailing_zeros(mantissa);
-        let exp: i32 = exp
-            .parse()
-            .expect("Rust {:e} exponent is always an integer");
-        format!("{mantissa}E{exp:+03}")
-    } else {
-        let decimals = (PRECISION - 1 - exponent).max(0) as usize;
-        strip_trailing_zeros(&format!("{value:.decimals$}"))
-    }
-}
-
-fn strip_trailing_zeros(s: &str) -> String {
-    if !s.contains('.') {
-        return s.to_string();
-    }
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
+    fmt_g(value, 6, true, false)
 }
 
 // ---------------------------------------------------------------------
@@ -1587,6 +1563,12 @@ mod tests {
         assert_eq!(format_g(100.0), "100");
         assert_eq!(format_g(0.0), "0");
         assert_eq!(format_g(1234567.0), "1.23457E+06");
+        // The %e/%f choice uses the exponent after rounding to 6 digits.
+        assert_eq!(format_g(999999.5), "1E+06");
+        assert_eq!(format_g(0.00009999995), "0.0001");
+        assert_eq!(format_g(-0.0), "-0");
+        assert_eq!(format_g(f64::INFINITY), "INF");
+        assert_eq!(format_g(f64::NAN), "NAN");
     }
 
     #[test]
