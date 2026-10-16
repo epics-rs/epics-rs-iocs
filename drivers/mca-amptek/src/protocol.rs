@@ -276,7 +276,7 @@ pub enum ReceivedPacket {
     /// (`bDataReceived = true`) for an error ack too; distinguishing a real
     /// failure from a bare success is `ParseCmd`'s job
     /// (`ParsePacket.cpp:179-199`), which only `sendCommandString` bothers
-    /// to call -- see [`offending_command_text`]. `data` is `PIN->DATA`,
+    /// to call -- see [`parse_cmd`]. `data` is `PIN->DATA`,
     /// needed by that same check.
     Ack { status: AckStatus, data: Vec<u8> },
     /// A packet whose framing/checksum itself failed (`ParsePacketStatus`,
@@ -369,24 +369,58 @@ fn parse_packet_status(raw: &[u8]) -> Result<(u8, u8, Vec<u8>), AckStatus> {
     Ok((pid1, pid2, raw[6..6 + len].to_vec()))
 }
 
-/// `CParsePacket::ParseCmd` (`ParsePacket.cpp:179-199`): extract the
-/// offending command text C's firmware echoes back in `DATA` for
-/// `BadParam`/`Pc5NotPresent`/`Unrecognized` responses. Callable on any
-/// [`ReceivedPacket::Ack`], matching `sendCommandString`
-/// (`drvAmptek.cpp:437-477`), the only caller that checks this -- it is
-/// the sole way to tell a real error ack from a bare success, since
-/// [`ReceivedPacket::Ack`] itself makes no such distinction.
-pub fn offending_command_text(status: AckStatus, data: &[u8]) -> Option<String> {
-    if !data.is_empty()
-        && matches!(
-            status,
-            AckStatus::BadParam | AckStatus::Pc5NotPresent | AckStatus::Unrecognized
-        )
-    {
-        Some(String::from_utf8_lossy(data).into_owned())
-    } else {
-        None
+/// `CParsePacket::PID2_TextToString` (`ParsePacket.cpp:51-117`).
+pub fn pid2_text_to_string(source: &str, status: AckStatus) -> String {
+    let text = match status {
+        AckStatus::Ok => return String::new(),
+        AckStatus::SyncError => ": Sync Error\t",
+        AckStatus::PidError => ": PID Error\t",
+        AckStatus::LenError => ": Length Error\t",
+        AckStatus::ChecksumError => ": Checksum Error\t",
+        AckStatus::BadParam => ": Bad Parameter\t",
+        AckStatus::BadHexRec => ": Bad HEX Record\t",
+        AckStatus::FpgaError => ": FPGA not initialized\t",
+        AckStatus::Cp2201NotFound => ": CP2201 not found\t",
+        AckStatus::ScopeDataNotAvail => ": No scope data\t",
+        AckStatus::Pc5NotPresent => ": PC5 not present\t",
+        AckStatus::OkEthernetShareReq | AckStatus::EthernetBusy => ": Ethernet sharing request\t",
+        AckStatus::CalDataNotPresent => ": Calibration data not present\t",
+        AckStatus::Unrecognized => ": Unrecognized Command\t",
+        AckStatus::I2cError
+        | AckStatus::OkFpgaUploadAddr
+        | AckStatus::FeatureNotFpgaSupported
+        | AckStatus::Other(_) => ": Unrecognized Error\t",
+    };
+    format!("{source}{text}")
+}
+
+/// `CParsePacket::ParseCmd` (`ParsePacket.cpp:179-199`): the error text
+/// for a `BadParam`/`Pc5NotPresent`/`Unrecognized` ack, empty for any
+/// other. `source` is [`pid2_text_to_string`]'s result. The offending
+/// command is C's `snprintf(data, 255, "%.*s", LEN, DATA)`: at most 254
+/// bytes, cut at a NUL.
+///
+/// Called only on a [`ReceivedPacket::Ack`]; C switches on `PID2` alone,
+/// where a config readback's 0x07 would read as `PID2_ACK_UNRECOG`.
+pub fn parse_cmd(source: &str, status: AckStatus, data: &[u8]) -> String {
+    if !matches!(
+        status,
+        AckStatus::BadParam | AckStatus::Pc5NotPresent | AckStatus::Unrecognized
+    ) {
+        return String::new();
     }
+    if data.is_empty() {
+        return format!("{source}I2C packet");
+    }
+    let end = data
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(data.len())
+        .min(254);
+    format!(
+        "{source}(Last) Offending command: {}",
+        String::from_utf8_lossy(&data[..end])
+    )
 }
 
 /// `CParsePacket::ParsePacket` (`ParsePacket.cpp:119-168`): validate the
@@ -592,7 +626,7 @@ mod tests {
 
     /// An ACK carrying an error status still routes to `Ack`, not `Error`
     /// -- `ParsePacket` doesn't look at the ack code, only `PID1_ACK`
-    /// (`ParsePacket.cpp:154-155`); `offending_command_text` is the
+    /// (`ParsePacket.cpp:154-155`); `parse_cmd` is the
     /// separate, caller-invoked check that actually distinguishes it
     /// (`CParsePacket::ParseCmd`, `ParsePacket.cpp:179-199`).
     #[test]
@@ -604,12 +638,37 @@ mod tests {
                 data,
             } => {
                 assert_eq!(
-                    offending_command_text(AckStatus::BadParam, &data),
-                    Some("BADCMD=1;".to_string())
+                    parse_cmd("Send config: Bad Parameter\t", AckStatus::BadParam, &data),
+                    "Send config: Bad Parameter\t(Last) Offending command: BADCMD=1;"
                 );
             }
             other => panic!("expected BadParam Ack, got {other:?}"),
         }
+    }
+
+    /// `ParseCmd` with `LEN == 0` (`ParsePacket.cpp:194-195`).
+    #[test]
+    fn parse_cmd_empty_payload_is_i2c_packet() {
+        let source = pid2_text_to_string("Send config", AckStatus::Pc5NotPresent);
+        assert_eq!(source, "Send config: PC5 not present\t");
+        assert_eq!(
+            parse_cmd(&source, AckStatus::Pc5NotPresent, &[]),
+            "Send config: PC5 not present\tI2C packet"
+        );
+        assert_eq!(parse_cmd(&source, AckStatus::Ok, &[]), "");
+        assert_eq!(pid2_text_to_string("Send config", AckStatus::Ok), "");
+    }
+
+    /// `snprintf(data, 255, "%.*s", ...)` keeps at most 254 bytes, up to a NUL.
+    #[test]
+    fn parse_cmd_truncates_like_snprintf() {
+        let long = vec![b'A'; 300];
+        let text = parse_cmd("", AckStatus::Unrecognized, &long);
+        assert_eq!(text.len(), "(Last) Offending command: ".len() + 254);
+        assert_eq!(
+            parse_cmd("", AckStatus::Unrecognized, b"AB\0CD"),
+            "(Last) Offending command: AB"
+        );
     }
 
     /// An unmatched `(pid1, pid2)` combination C's `ParsePacket` falls

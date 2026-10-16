@@ -90,7 +90,7 @@
 //!   `XMTPT_SEND_CONFIG_PACKET_EX` send would be misread as an
 //!   "Unrecognized Command" ack error, with the config text itself reported
 //!   as the "offending command". `AmptekDriver::send_command_string`
-//!   instead only calls [`protocol::offending_command_text`] when
+//!   instead only calls [`protocol::parse_cmd`] when
 //!   [`protocol::parse_packet`] classified the response as
 //!   [`ReceivedPacket::Ack`] -- a classification that (unlike `ParseCmd`)
 //!   keys off `(pid1, pid2)` jointly, so the collision is structurally
@@ -107,6 +107,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::AlarmSeverity;
@@ -621,9 +622,14 @@ impl AmptekDriver {
                          {command_string})"
                     ))),
                     Some(ReceivedPacket::Ack { status, data }) => {
-                        match protocol::offending_command_text(status, &data) {
-                            Some(text) => Err(protocol_error(format!("ACK error {text}"))),
-                            None => Ok(()),
+                        let source = protocol::pid2_text_to_string("Send config", status);
+                        let error = protocol::parse_cmd(&source, status, &data);
+                        if error.is_empty() {
+                            Ok(())
+                        } else {
+                            let msg = format!("drvAmptek::sendCommandString ACK error {error}");
+                            self.base.trace_print(TraceMask::ERROR, &format!("{msg}\n"));
+                            Err(protocol_error(msg))
                         }
                     }
                     Some(_) => Ok(()),
@@ -1299,6 +1305,13 @@ mod tests {
         (driver, fake)
     }
 
+    fn err_message(err: &AsynError) -> &str {
+        match err {
+            AsynError::Status { message, .. } => message,
+            other => panic!("not a status error: {other:?}"),
+        }
+    }
+
     fn connect(driver: &mut AmptekDriver) -> AsynResult<()> {
         PortDriver::connect(driver, &AsynUser::new(0))
     }
@@ -1366,6 +1379,23 @@ mod tests {
             .unwrap();
         let counts = AsynUser::new(driver.mca[McaReason::ElapsedCounts as usize]);
         assert_eq!(driver.read_float64(&counts).unwrap(), 9.0);
+    }
+
+    /// An empty-payload error ack fails the write with C's text
+    /// (`drvAmptek.cpp:464-469`, `ParsePacket.cpp:194-195`).
+    #[test]
+    fn config_ack_error_without_payload_is_i2c_packet() {
+        let status = [0u8; 64];
+        let (mut driver, _fake) = driver_with_fake(move |req| match (req[2], req[3]) {
+            (0x20, 0x02) => Some(protocol::pack_out(0xFF, 0x05, &[])),
+            _ => default_reply(req, &status),
+        });
+        connect(&mut driver).unwrap();
+        let err = driver.send_command_string("GAIN=1;").unwrap_err();
+        assert_eq!(
+            err_message(&err),
+            "drvAmptek::sendCommandString ACK error Send config: Bad Parameter\tI2C packet"
+        );
     }
 
     #[test]
