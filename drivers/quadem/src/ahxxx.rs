@@ -31,6 +31,7 @@ use crate::drv_quad_em::{
     QeTriggerMode, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
 use crate::octet::{OctetIo, connect_octet};
+use crate::{asyn_print, trace};
 
 /// Poll interval of C++'s `epicsThreadSleep(0.01)` handshake loop.
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
@@ -113,11 +114,9 @@ impl AhxxxDriver {
             firmware_version: String::new(),
         };
 
-        // C++ constructor calls reset() under the port lock. The meter may be
-        // offline at IOC start, so a failure is logged, not fatal.
-        if let Err(e) = this.reset() {
-            log::warn!("drvAHxxx: reset at startup failed: {e}");
-        }
+        // C++ constructor calls reset() under the port lock and ignores its
+        // status: the meter may be offline at IOC start.
+        let _ = this.reset();
         Ok(this)
     }
 
@@ -152,7 +151,11 @@ impl AhxxxDriver {
         }
         let resp = self.write_read_meter(out)?;
         if resp != "ACK" && resp != "AK" {
-            log::error!("drvAHxxx: outString={out} expected ACK, received {resp}");
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvAHxxx:sendCommand: error, outString={out} expected ACK, received {resp}"
+            );
             return Err(error(format!("AHxxx: {out} -> {resp}, expected ACK")));
         }
         if prev_acquiring {
@@ -180,8 +183,10 @@ impl AhxxxDriver {
                     self.base.port_base.set_int32_param(p.model, 0, m as i32)?;
                 }
                 None => {
-                    log::error!(
-                        "drvAHxxx: unknown firmware version = {}",
+                    asyn_print!(
+                        self.base.port_base,
+                        ERROR,
+                        "drvAHxxx:reset: unknown firmware version = {}",
                         self.firmware_version
                     );
                     return Err(error(format!(
@@ -200,11 +205,11 @@ impl AhxxxDriver {
     ///
     /// As in `drvTetrAMM`, the `goto error` path skips the `setAcquire(1)`
     /// restore, so a status read that fails leaves the meter stopped.
-    fn read_status_inner(&mut self) -> AsynResult<()> {
+    fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
         let p = self.params();
         let bad = |what: &str, resp: &str| error(format!("AHxxx: bad {what} response: {resp}"));
 
-        let resp = self.write_read_meter("RNG ?")?;
+        let resp = last.query(&self.io, "RNG ?", proto::MAX_COMMAND_LEN)?;
         let range = proto::parse_range(&resp).ok_or_else(|| bad("RNG", &resp))?;
         self.base.port_base.set_int32_param(p.range, 0, range)?;
 
@@ -212,27 +217,27 @@ impl AhxxxDriver {
             QeReadFormat::from_i32(self.base.port_base.get_int32_param(p.read_format, 0)?);
         let mut sample_time;
         if self.is_ah401() {
-            let resp = self.write_read_meter("HLF ?")?;
+            let resp = last.query(&self.io, "HLF ?", proto::MAX_COMMAND_LEN)?;
             let ping_pong = proto::parse_hlf(&resp).ok_or_else(|| bad("HLF", &resp))?;
             self.base
                 .port_base
                 .set_int32_param(p.ping_pong, 0, ping_pong)?;
 
-            let resp = self.write_read_meter("ITM ?")?;
+            let resp = last.query(&self.io, "ITM ?", proto::MAX_COMMAND_LEN)?;
             let integration_time = proto::parse_itm(&resp).ok_or_else(|| bad("ITM", &resp))?;
             self.base
                 .port_base
                 .set_float64_param(p.integration_time, 0, integration_time)?;
             sample_time = proto::sample_time_ah401(ping_pong, integration_time);
         } else {
-            let resp = self.write_read_meter("CHN ?")?;
+            let resp = last.query(&self.io, "CHN ?", proto::MAX_COMMAND_LEN)?;
             let num_channels = proto::parse_chn(&resp).ok_or_else(|| bad("CHN", &resp))?;
             self.base
                 .port_base
                 .set_int32_param(p.num_channels, 0, num_channels)?;
             self.shared.acq.lock().num_channels = num_channels;
 
-            let resp = self.write_read_meter("RES ?")?;
+            let resp = last.query(&self.io, "RES ?", proto::MAX_COMMAND_LEN)?;
             let resolution = proto::parse_res(&resp).ok_or_else(|| bad("RES", &resp))?;
             self.base
                 .port_base
@@ -243,7 +248,7 @@ impl AhxxxDriver {
         }
 
         if proto::reads_bias_status(self.model) {
-            let resp = self.write_read_meter("HVS ?")?;
+            let resp = last.query(&self.io, "HVS ?", proto::MAX_COMMAND_LEN)?;
             match proto::parse_hvs(&resp).ok_or_else(|| bad("HVS", &resp))? {
                 None => self.base.port_base.set_int32_param(p.bias_state, 0, 0)?,
                 Some(volts) => {
@@ -319,18 +324,20 @@ impl QuadEmDevice for AhxxxDriver {
                 // C++ tests only this last command's status and gives up on
                 // any failure, a timeout included.
                 if let Err(e) = self.write_read_meter("TRG OFF") {
-                    log::error!("drvAHxxx: error calling writeRead: {e}");
+                    asyn_print!(
+                        self.base.port_base,
+                        ERROR,
+                        "drvAHxxx:setAcquire: error calling pasynOctetSyncIO->writeRead, status={}",
+                        trace::status_code(&e)
+                    );
                     break;
                 }
-                // Flush, then read with a short timeout to drain any responses.
+                // Flush, then read with a short timeout to drain any responses;
+                // only a timeout that read nothing ends the loop.
                 let _ = self.io.flush();
-                match self.io.read_line(proto::MAX_COMMAND_LEN) {
-                    Ok(_) => {}
-                    Err(e) if is_timeout(&e) => break,
-                    Err(e) => {
-                        log::error!("drvAHxxx: error draining meter responses: {e}");
-                        break;
-                    }
+                let drained = self.io.read_line(proto::MAX_COMMAND_LEN);
+                if let (AsynStatus::Timeout, 0, _) = trace::read_result(&drained) {
+                    break;
                 }
             }
             self.base_set_acquire(0)?;
@@ -459,8 +466,15 @@ impl QuadEmDevice for AhxxxDriver {
         if prev_acquiring {
             self.set_acquire(0)?;
         }
-        if let Err(e) = self.read_status_inner() {
-            log::error!("drvAHxxx: readStatus failed: {e}");
+        let mut last = trace::StatusExchange::default();
+        if let Err(e) = self.read_status_inner(&mut last) {
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvAHxxx:getStatus: error, outString={}, inString={}",
+                last.out,
+                last.inp
+            );
             return Err(e);
         }
         if prev_acquiring {
@@ -540,7 +554,7 @@ impl PortDriver for AhxxxDriver {
             }
             self.read_status()?;
         } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
+            self.shared.trigger_callbacks(&self.base.port_base);
         } else if reason == p.values_per_read {
             self.shared.acq.lock().values_per_read = value;
             self.read_status()?;
@@ -686,35 +700,35 @@ fn read_thread(ctx: ReadContext) {
                     && QeTriggerMode::from_i32(ctx.shared.acq.lock().trigger_mode)
                         == QeTriggerMode::ExtGate;
 
-                let mut outcome = match ctx.io.read_binary(n_requested) {
-                    Ok(o) => o,
-                    Err(e) => {
+                let read = ctx.io.read_binary(n_requested);
+                let mut outcome = match read {
+                    Ok(o) if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) => o,
+                    Ok(_) => {
+                        trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &read);
+                        thread::sleep(READ_ERROR_BACKOFF);
+                        continue;
+                    }
+                    Err(ref e) => {
                         // C++ `readThread` (drvAHxxx.cpp:252-259): in Ext.
                         // Gate mode the AH501BE answers its `ACK\r\n`
                         // preamble and then goes quiet waiting for the
                         // external gate pulse, so the binary read times out
                         // after exactly those 5 bytes. Only
                         // `AsynError::partial_read` still carries them.
-                        if is_ext_gate_ack_timeout(&e, ext_gate) {
-                            ctx.shared.trigger_callbacks();
-                        }
-                        if !is_timeout(&e) {
-                            log::error!("drvAHxxx: unexpected error reading meter: {e}");
+                        if !is_timeout(e) {
+                            trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &read);
                             thread::sleep(READ_ERROR_BACKOFF);
+                        } else if is_ext_gate_ack_timeout(e, ext_gate) {
+                            asyn_print!(
+                                ctx.handle,
+                                IO_DRIVER,
+                                "drvAHxxx::readThread timeout with nRead=5, triggering callbacks"
+                            );
+                            ctx.shared.trigger_callbacks(&ctx.handle);
                         }
                         continue;
                     }
                 };
-
-                if outcome.data.len() != n_requested || !outcome.eom.contains(EomReason::CNT) {
-                    log::error!(
-                        "drvAHxxx: unexpected error reading meter, nRead={} expected {n_requested}, eom={:?}",
-                        outcome.data.len(),
-                        outcome.eom
-                    );
-                    thread::sleep(READ_ERROR_BACKOFF);
-                    continue;
-                }
 
                 // C++ `readThread` (drvAHxxx.cpp:265-283): a full, correctly
                 // terminated read can still start with the ACK preamble if
@@ -724,16 +738,38 @@ fn read_thread(ctx: ReadContext) {
                 // below already rejects a too-short buffer, so a failed or
                 // short refill is caught there rather than re-checked here.
                 if ext_gate && proto::starts_with_ack_preamble(&outcome.data) {
-                    ctx.shared.trigger_callbacks();
+                    asyn_print!(
+                        ctx.handle,
+                        IO_DRIVER,
+                        "drvAHxxx::readThread found ACK\\r\\n at start of data, triggering callbacks"
+                    );
+                    ctx.shared.trigger_callbacks(&ctx.handle);
                     let preamble_len = proto::ACK_PREAMBLE.len();
                     outcome.data.drain(0..preamble_len);
-                    match ctx.io.read_binary(preamble_len) {
-                        Ok(extra) => outcome.data.extend_from_slice(&extra.data),
-                        Err(e) => log::error!(
-                            "drvAHxxx: unexpected error reading additional {preamble_len} bytes from meter: {e}"
-                        ),
+                    let extra = ctx.io.read_binary(preamble_len);
+                    match &extra {
+                        Ok(o) if o.data.len() == preamble_len && o.eom.contains(EomReason::CNT) => {
+                        }
+                        _ => {
+                            let (status, n_read, eom) = trace::read_result(&extra);
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvAHxxx:readThread: unexpected error reading additional {preamble_len} bytes from meter status={}, nRead={n_read}, eomReason={eom}",
+                                status as i32
+                            );
+                        }
+                    }
+                    if let Ok(o) = extra {
+                        outcome.data.extend_from_slice(&o.data);
                     }
                 }
+                trace::print_io(
+                    &ctx.handle,
+                    trace::TraceMask::IO_DRIVER,
+                    &outcome.data,
+                    format_args!("drvAHxxx::readThread buffer read"),
+                );
 
                 let decoded = if ah401_series {
                     proto::accumulate_binary_ah401(&outcome.data, values_per_read as usize)
@@ -752,19 +788,17 @@ fn read_thread(ctx: ReadContext) {
             }
             QeReadFormat::Ascii => {
                 for _ in 0..values_per_read {
-                    let outcome = match ctx.io.read_line(proto::ASCII_BUFFER_SIZE) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            if !is_timeout(&e) {
-                                log::error!("drvAHxxx: unexpected error reading meter: {e}");
+                    let read = ctx.io.read_line(proto::ASCII_BUFFER_SIZE);
+                    let outcome = match read {
+                        Ok(o) if o.eom.contains(EomReason::EOS) => o,
+                        _ => {
+                            if trace::read_result(&read).0 != AsynStatus::Timeout {
+                                trace::print_read_error(&ctx.handle, "drvAHxxx:readThread", &read);
                                 thread::sleep(READ_ERROR_BACKOFF);
                             }
                             continue;
                         }
                     };
-                    if !outcome.eom.contains(EomReason::EOS) {
-                        continue;
-                    }
                     let line = outcome.as_str();
                     let values = if ah401_series {
                         proto::parse_ascii_ah401(&line, proto::AH401_NUM_CHANNELS)
@@ -776,8 +810,10 @@ fn read_thread(ctx: ReadContext) {
                         }
                         let n_expected = proto::ah501_ascii_expected_len(resolution, num_channels);
                         if outcome.data.len() != n_expected {
-                            log::error!(
-                                "drvAHxxx: error reading meter nRead={}, expected {n_expected}, input={line}",
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvAHxxx:readThread: error reading meter nRead={}, expected {n_expected}, input={line}",
                                 outcome.data.len()
                             );
                             continue;

@@ -14,7 +14,6 @@ epics-rs = { workspace = true, features = ["asyn", "ad", "ioc"] }
 # `ioc` is needed for `ad_core::ioc::{PluginManager, GenericDriverContext}`, which
 # `iocsh::register_quadem_port` uses to publish a port's twelve NDArray fan-outs.
 parking_lot = "0.12"
-log = "0.4"
 # The FX4 speaks JSON over a WebSocket (`FX4Src/drvFX4.cpp` uses ixwebsocket +
 # nlohmann/json); tokio-tungstenite is the pure-Rust equivalent. Default
 # features only: the meter's URI is `ws://`, so no TLS stack is pulled in.

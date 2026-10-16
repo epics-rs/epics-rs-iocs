@@ -51,6 +51,7 @@ use crate::drv_quad_em::{
 };
 use crate::octet::{OctetIo, create_ip_port};
 use crate::t4u_proto::{self as proto, CalTable, Calibration, ChannelCal, CmdName, DirectFrame};
+use crate::trace::status_code;
 
 /// C++ `epicsThreadSleep(1.0)` after an unexpected socket error.
 const ERROR_BACKOFF: Duration = Duration::from_secs(1);
@@ -386,14 +387,12 @@ impl T4uDriver {
         self.base.nd_params.acquire
     }
 
-    /// C++ `writeReadMeter`. As upstream, a failed send is logged and the write
-    /// still succeeds: the parameter is already in the library and the meter
-    /// will be re-synchronised by the next register dump.
+    /// C++ `writeReadMeter`. As upstream, a failed send is ignored and the
+    /// write still succeeds: the parameter is already in the library and the
+    /// meter will be re-synchronised by the next register dump.
     fn send(&self, command: String) {
         let line = format!("{command}{}", self.variant.eol());
-        if let Err(e) = self.cmd.send(&line) {
-            log::error!("{}: sending {command:?} failed: {e}", self.variant.name());
-        }
+        let _ = self.cmd.send(&line);
     }
 
     /// C++ `P_Range` in `writeInt32`: clip, write register 3 and, in the direct
@@ -500,7 +499,7 @@ impl T4uDriver {
         } else if reason == p.geometry {
             self.shared.pos.lock().geometry = value;
         } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
+            self.shared.trigger_callbacks(&self.base.port_base);
         } else if reason == p.num_acquire {
             self.shared.acq.lock().num_acquire = value;
         } else if reason == p.values_per_read {
@@ -723,7 +722,6 @@ impl RegSink {
     fn apply(&self, reg_num: i32, reg_val: u32) {
         use proto::RegUpdate::*;
         let Some(update) = proto::decode_reg(reg_num, reg_val) else {
-            log::debug!("T4U: unhandled register {reg_num} = {reg_val:#x}");
             return;
         };
 
@@ -896,8 +894,7 @@ fn cmd_thread(ctx: CmdContext) {
     let mut reader = StreamReader::new(ctx.io.clone());
     let mut tick = 0i32;
     loop {
-        if let Err(e) = cmd_iteration(&ctx, &mut reader, &mut tick) {
-            log::error!("{}: command socket error: {e}", ctx.variant.name());
+        if cmd_iteration(&ctx, &mut reader, &mut tick).is_err() {
             reader.flush();
             thread::sleep(ERROR_BACKOFF);
         }
@@ -966,10 +963,6 @@ fn cmd_iteration(ctx: &CmdContext, reader: &mut StreamReader, tick: &mut i32) ->
             }
         }
         CmdName::Unknown => {
-            log::warn!(
-                "{}: unknown command {verb:?} on the command socket",
-                ctx.variant.name()
-            );
             reader.flush();
         }
     }
@@ -991,7 +984,6 @@ struct DataContext {
     shared: Arc<QuadEmShared>,
     state: SharedState,
     regs: RegSink,
-    variant: T4uVariant,
 }
 
 impl DataContext {
@@ -1013,8 +1005,7 @@ impl DataContext {
 fn middle_data_thread(ctx: DataContext) {
     let mut reader = StreamReader::new(ctx.io.clone());
     loop {
-        if let Err(e) = middle_data_iteration(&ctx, &mut reader) {
-            log::error!("{}: data socket error: {e}", ctx.variant.name());
+        if middle_data_iteration(&ctx, &mut reader).is_err() {
             reader.flush();
             thread::sleep(ERROR_BACKOFF);
         }
@@ -1028,17 +1019,13 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
     match kind {
         b'r' => {
             let Some(rest) = reader.read_line(proto::MAX_COMMAND_LEN)? else {
-                log::error!("drvT4U_EM: over-long text data line");
                 reader.flush();
                 return Ok(());
             };
             let line = format!("r{}", String::from_utf8_lossy(&rest));
             match proto::parse_read_line(&line) {
                 Some(sample) => ctx.publish(vec![sample]),
-                None => {
-                    log::error!("drvT4U_EM: malformed text data line: {line:?}");
-                    reader.flush();
-                }
+                None => reader.flush(),
             }
         }
         b'B' => {
@@ -1049,7 +1036,6 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
                 return Ok(());
             };
             if header[0] != 1 {
-                log::error!("drvT4U_EM: unknown binary frame type {}", header[0]);
                 reader.flush();
                 return Ok(());
             }
@@ -1059,21 +1045,21 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
             };
             // C++ checks only the read status here, not the byte count, so a
             // short read publishes whatever the uninitialised heap buffer held.
-            let Some(payload) = reader.take_exact(bc.payload_len)? else {
-                log::error!(
-                    "drvT4U_EM: short binary payload, expected {} bytes",
-                    bc.payload_len
-                );
-                reader.flush();
-                return Ok(());
+            let payload = match reader.take_exact(bc.payload_len) {
+                Ok(Some(payload)) => payload,
+                failed => {
+                    // No payload within the timeout is C's asynTimeout.
+                    let status =
+                        failed.map_or_else(|e| status_code(&e), |_| AsynStatus::Timeout as i32);
+                    println!("Error reading data payload: {status}.");
+                    reader.flush();
+                    return Ok(());
+                }
             };
             let (range, cal) = ctx.range_and_cal();
             ctx.publish(proto::decode_samples(&payload, bc.units, range, &cal));
         }
-        other => {
-            log::error!("drvT4U_EM: unknown data header byte {other:#x}");
-            reader.flush();
-        }
+        _ => reader.flush(),
     }
     Ok(())
 }
@@ -1085,8 +1071,7 @@ fn direct_data_thread(ctx: DataContext) {
             Ok(outcome) if outcome.data.is_empty() => continue,
             Ok(outcome) => outcome.data,
             Err(e) if is_timeout(&e) => continue,
-            Err(e) => {
-                log::error!("drvT4UDirect_EM: data socket error: {e}");
+            Err(_) => {
                 thread::sleep(ERROR_BACKOFF);
                 continue;
             }
@@ -1102,8 +1087,7 @@ fn direct_data_thread(ctx: DataContext) {
                     ctx.regs.apply(reg_num, reg_val);
                 }
             }
-            Err(e) => {
-                log::warn!("drvT4UDirect_EM: dropping a data frame: {e:?}");
+            Err(_) => {
                 let _ = ctx.io.flush();
             }
         }
@@ -1313,7 +1297,6 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
         shared: shared.clone(),
         state,
         regs,
-        variant,
     };
     let data_thread_handle = thread::Builder::new()
         .name(format!("{}_Data_Task", variant.name()))

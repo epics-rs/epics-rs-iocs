@@ -35,6 +35,7 @@ pub mod t4u;
 pub mod t4u_proto;
 pub mod tetramm;
 pub mod tetramm_proto;
+pub mod trace;
 
 pub use ahxxx::{AhxxxRuntime, create_ahxxx};
 pub use fx4::{Fx4Runtime, create_fx4};

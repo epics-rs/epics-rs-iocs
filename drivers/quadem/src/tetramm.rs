@@ -18,8 +18,9 @@ use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat,
     QeTriggerMode, QeTriggerPolarity, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared,
 };
-use crate::octet::{OctetIo, connect_octet};
+use crate::octet::{OctetIo, ReadOutcome, connect_octet};
 use crate::tetramm_proto as proto;
+use crate::{asyn_print, trace};
 
 /// C++ `MAX_COMMAND_LEN`.
 const MAX_COMMAND_LEN: usize = 256;
@@ -29,15 +30,6 @@ const P_INTERLOCK_STATUS: &str = "TETRAMM_INTERLOCK_STATUS";
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// C++ `reset()` waits this many one-second loops for the meter to reappear.
 const RESET_WAIT_LOOPS: u32 = 20;
-
-/// True for a timeout, including one `AsynError::PartialRead` wraps to carry
-/// the bytes transferred before it. A bare `AsynError::Status` variant match
-/// would miss that wrapper and misclassify every partial-transfer timeout —
-/// routine on this port, since it installs the EOS interpose — as an
-/// unexpected error.
-fn is_timeout(e: &AsynError) -> bool {
-    e.status() == AsynStatus::Timeout
-}
 
 // ===========================================================================
 // Driver
@@ -89,11 +81,10 @@ impl TetrAmmDriver {
             firmware_version: String::new(),
         };
 
-        // C++ calls getFirmwareVersion() from the constructor; reset() is left
-        // for later because the meter may be offline at IOC start.
-        if let Err(e) = this.get_firmware_version() {
-            log::warn!("drvTetrAMM: could not read firmware version: {e}");
-        }
+        // C++ calls getFirmwareVersion() from the constructor, ignoring its
+        // status; reset() is left for later because the meter may be offline
+        // at IOC start.
+        let _ = this.get_firmware_version();
         Ok(this)
     }
 
@@ -115,7 +106,11 @@ impl TetrAmmDriver {
         }
         let resp = self.write_read_meter(out)?;
         if resp != "ACK" {
-            log::error!("drvTetrAMM: outString={out} expected ACK, received {resp}");
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvTetrAMM::sendCommand: error, outString={out} expected ACK, received {resp}"
+            );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: format!("TetrAMM: {out} -> {resp}, expected ACK"),
@@ -181,15 +176,20 @@ impl QuadEmDevice for TetrAmmDriver {
                             if outcome.eom.contains(EomReason::EOS) && s.ends_with("ACK") {
                                 break;
                             }
-                            log::warn!(
-                                "drvTetrAMM: waiting for ACK response, nread={}",
+                            asyn_print!(
+                                self.base.port_base,
+                                WARNING,
+                                "drvTetrAMM::setAcquire waiting for ACK response, nread={}",
                                 outcome.data.len()
                             );
                         }
                         Err(e) => {
-                            if !is_timeout(&e) {
-                                log::error!("drvTetrAMM: error waiting for ACK response: {e}");
-                            }
+                            asyn_print!(
+                                self.base.port_base,
+                                ERROR,
+                                "drvTetrAMM::setAcquire error waiting for ACK response, status={}",
+                                trace::status_code(&e)
+                            );
                             break;
                         }
                     }
@@ -276,8 +276,15 @@ impl QuadEmDevice for TetrAmmDriver {
         if prev_acquiring {
             self.set_acquire(0)?;
         }
-        if let Err(e) = self.read_status_inner() {
-            log::error!("drvTetrAMM: readStatus failed: {e}");
+        let mut last = trace::StatusExchange::default();
+        if let Err(e) = self.read_status_inner(&mut last) {
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvTetrAMM::getStatus: error, outString={}, inString={}",
+                last.out,
+                last.inp
+            );
             return Err(e);
         }
         if prev_acquiring {
@@ -364,19 +371,23 @@ impl TetrAmmDriver {
             }
         }
         if !came_back {
-            log::error!("drvTetrAMM: no response from meter after {RESET_WAIT_LOOPS} seconds");
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvTetrAMM::reset: error, no response from meter after {RESET_WAIT_LOOPS} seconds"
+            );
         }
         self.base_reset()
     }
 
-    fn read_status_inner(&mut self) -> AsynResult<()> {
+    fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
         let p = self.params();
         let err = || AsynError::Status {
             status: AsynStatus::Error,
             message: "TetrAMM: unparseable status response".into(),
         };
 
-        let resp = self.write_read_meter("CHN:?")?;
+        let resp = last.query(&self.io, "CHN:?", MAX_COMMAND_LEN)?;
         let num_channels = proto::parse_chn(&resp).ok_or_else(err)?;
         self.base
             .port_base
@@ -384,7 +395,7 @@ impl TetrAmmDriver {
         self.shared.acq.lock().num_channels = num_channels;
 
         for i in 0..QE_MAX_INPUTS as i32 {
-            let resp = self.write_read_meter(&proto::cmd_range_query(i + 1))?;
+            let resp = last.query(&self.io, &proto::cmd_range_query(i + 1), MAX_COMMAND_LEN)?;
             let range = proto::parse_range(&resp).ok_or_else(err)?;
             self.base.port_base.set_int32_param(p.range, i + 1, range)?;
             if i == 0 {
@@ -392,7 +403,7 @@ impl TetrAmmDriver {
             }
         }
 
-        let resp = self.write_read_meter("NRSAMP:?")?;
+        let resp = last.query(&self.io, "NRSAMP:?", MAX_COMMAND_LEN)?;
         let values_per_read = proto::parse_nrsamp(&resp).ok_or_else(err)?;
         self.base
             .port_base
@@ -404,7 +415,7 @@ impl TetrAmmDriver {
             .port_base
             .set_float64_param(p.sample_time, 0, sample_time)?;
 
-        let resp = self.write_read_meter("HVS:?")?;
+        let resp = last.query(&self.io, "HVS:?", MAX_COMMAND_LEN)?;
         match proto::parse_hvs(&resp).ok_or_else(err)? {
             None => self.base.port_base.set_int32_param(p.hvs_readback, 0, 0)?,
             Some(volts) => {
@@ -415,23 +426,23 @@ impl TetrAmmDriver {
             }
         }
 
-        let resp = self.write_read_meter("HVV:?")?;
+        let resp = last.query(&self.io, "HVV:?", MAX_COMMAND_LEN)?;
         let v = proto::parse_hvv(&resp).ok_or_else(err)?;
         self.base
             .port_base
             .set_float64_param(p.hvv_readback, 0, v)?;
 
-        let resp = self.write_read_meter("HVI:?")?;
+        let resp = last.query(&self.io, "HVI:?", MAX_COMMAND_LEN)?;
         let v = proto::parse_hvi(&resp).ok_or_else(err)?;
         self.base
             .port_base
             .set_float64_param(p.hvi_readback, 0, v)?;
 
-        let resp = self.write_read_meter("TEMP:?")?;
+        let resp = last.query(&self.io, "TEMP:?", MAX_COMMAND_LEN)?;
         let v = proto::parse_temp(&resp).ok_or_else(err)?;
         self.base.port_base.set_float64_param(p.temperature, 0, v)?;
 
-        let resp = self.write_read_meter("STATUS:?")?;
+        let resp = last.query(&self.io, "STATUS:?", MAX_COMMAND_LEN)?;
         let unit_status = proto::parse_status(&resp).ok_or_else(err)?;
         let interlock = proto::interlock_status(unit_status);
         self.base
@@ -536,7 +547,7 @@ impl PortDriver for TetrAmmDriver {
             }
             self.read_status()?;
         } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
+            self.shared.trigger_callbacks(&self.base.port_base);
         } else if reason == p.resolution {
             // drvQuadEM::setResolution is a no-op on the TetrAMM.
             self.read_status()?;
@@ -638,27 +649,14 @@ fn read_thread(ctx: ReadContext) {
         match read_format {
             QeReadFormat::Binary => {
                 let n_requested = proto::binary_frame_len(num_channels);
-                let outcome = match ctx.io.read_binary(n_requested) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        if is_timeout(&e) {
-                            log::warn!("drvTetrAMM: timeout reading meter");
-                        } else {
-                            log::error!("drvTetrAMM: unexpected error reading meter: {e}");
-                            thread::sleep(Duration::from_secs(1));
-                        }
+                let read = ctx.io.read_binary(n_requested);
+                let outcome = match read {
+                    Ok(o) if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) => o,
+                    _ => {
+                        report_read_failure(&ctx.handle, &read, true);
                         continue;
                     }
                 };
-                if outcome.data.len() != n_requested || !outcome.eom.contains(EomReason::CNT) {
-                    log::error!(
-                        "drvTetrAMM: short read, nRead={} expected {n_requested}, eom={:?}",
-                        outcome.data.len(),
-                        outcome.eom
-                    );
-                    thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
 
                 let Some(frame) = proto::parse_binary_frame(&outcome.data, num_channels) else {
                     continue;
@@ -671,8 +669,10 @@ fn read_thread(ctx: ReadContext) {
                     proto::Trailer::TriggerStart => {
                         num_trig_starts += 1;
                         if next_expected_edge != 0 {
-                            log::error!(
-                                "drvTetrAMM: extra trigger start, numTrigStarts={num_trig_starts}, numTrigEnds={num_trig_ends}"
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvTetrAMM::readThread Extra trigger start, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
                             );
                         }
                         next_expected_edge = 1;
@@ -680,44 +680,51 @@ fn read_thread(ctx: ReadContext) {
                     proto::Trailer::TriggerEnd => {
                         num_trig_ends += 1;
                         if trigger_mode == QeTriggerMode::ExtBulb {
-                            ctx.shared.trigger_callbacks();
+                            ctx.shared.trigger_callbacks(&ctx.handle);
                         }
                         if next_expected_edge != 1 {
-                            log::error!(
-                                "drvTetrAMM: extra trigger end, numTrigStarts={num_trig_starts}, numTrigEnds={num_trig_ends}"
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvTetrAMM::readThread Extra trigger end, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
                             );
                         }
                         next_expected_edge = 0;
                     }
                     proto::Trailer::AcqDone => {
-                        log::debug!("drvTetrAMM: seen acq-done sNaN (0xfff40003ffffffff)");
+                        asyn_print!(
+                            ctx.handle,
+                            IO_DRIVER,
+                            "drvTetrAMM::readThread: seen acq done sNaN (0xfff40003ffffffffull)"
+                        );
                     }
                     proto::Trailer::LostSync => {
-                        log::warn!("drvTetrAMM: lost sync, no NaN where expected; resynchronizing");
+                        asyn_print!(
+                            ctx.handle,
+                            WARNING,
+                            "drvTetrAMM::readThread: warning, lost sync, no NaN where expected; resynchronizing"
+                        );
                         resync(&ctx, num_channels, &mut num_resync);
                     }
                 }
             }
             QeReadFormat::Ascii => {
-                let outcome = match ctx.io.read_line(proto::ASCII_BUFFER_SIZE) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        if !is_timeout(&e) {
-                            log::error!("drvTetrAMM: unexpected error reading meter: {e}");
-                            thread::sleep(Duration::from_secs(1));
-                        }
+                let read = ctx.io.read_line(proto::ASCII_BUFFER_SIZE);
+                let outcome = match read {
+                    Ok(o) if o.eom.contains(EomReason::EOS) => o,
+                    _ => {
+                        report_read_failure(&ctx.handle, &read, false);
                         continue;
                     }
                 };
-                if !outcome.eom.contains(EomReason::EOS) {
-                    continue;
-                }
                 match proto::parse_ascii_line(&outcome.as_str(), num_channels) {
                     proto::AsciiRecord::TriggerStart => {
                         num_trig_starts += 1;
                         if next_expected_edge != 0 {
-                            log::error!(
-                                "drvTetrAMM: extra trigger start, numTrigStarts={num_trig_starts}, numTrigEnds={num_trig_ends}"
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvTetrAMM::readThread Extra trigger start, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
                             );
                         }
                         next_expected_edge = 1;
@@ -725,11 +732,13 @@ fn read_thread(ctx: ReadContext) {
                     proto::AsciiRecord::TriggerEnd => {
                         num_trig_ends += 1;
                         if trigger_mode == QeTriggerMode::ExtBulb {
-                            ctx.shared.trigger_callbacks();
+                            ctx.shared.trigger_callbacks(&ctx.handle);
                         }
                         if next_expected_edge != 1 {
-                            log::error!(
-                                "drvTetrAMM: extra trigger end, numTrigStarts={num_trig_starts}, numTrigEnds={num_trig_ends}"
+                            asyn_print!(
+                                ctx.handle,
+                                ERROR,
+                                "drvTetrAMM::readThread Extra trigger end, numTrigStarts={num_trig_starts}, numTrigsEnds={num_trig_ends}"
                             );
                         }
                         next_expected_edge = 0;
@@ -746,22 +755,57 @@ fn read_thread(ctx: ReadContext) {
     }
 }
 
+/// C++ `readThread`'s rejected-read branch. A timeout is routine only on the
+/// binary path; C++ sleeps a second after anything else, the meter being
+/// probably offline.
+fn report_read_failure(handle: &PortHandle, read: &AsynResult<ReadOutcome>, binary: bool) {
+    if trace::read_result(read).0 == AsynStatus::Timeout {
+        if binary {
+            asyn_print!(
+                *handle,
+                WARNING,
+                "drvTetrAMM::readThread: timeout reading meter"
+            );
+        }
+        return;
+    }
+    trace::print_read_error(handle, "drvTetrAMM::readThread", read);
+    thread::sleep(Duration::from_secs(1));
+}
+
 /// C++ resync: read two frames' worth, find the data trailer, then consume the
-/// bytes that follow it so the next read lands on a frame boundary.
+/// bytes that follow it so the next read lands on a frame boundary. A failed
+/// read is scanned for what it did transfer, as C++ scans its buffer
+/// regardless of the read status.
 fn resync(ctx: &ReadContext, num_channels: usize, num_resync: &mut u64) {
     let doubled = proto::binary_frame_len(num_channels) * 2;
-    let Ok(outcome) = ctx.io.read_binary(doubled) else {
-        return;
+    let data = match ctx.io.read_binary(doubled) {
+        Ok(outcome) => outcome.data,
+        Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
     };
-    match proto::find_resync_offset(&outcome.data) {
+    match proto::find_resync_offset(&data) {
         Some(offset) => {
             let remainder = proto::resync_remainder(num_channels, offset);
             let _ = ctx.io.read_binary(remainder);
             *num_resync += 1;
-            log::warn!("drvTetrAMM: found NaN at position {offset}, read {remainder} bytes");
+            asyn_print!(
+                ctx.handle,
+                WARNING,
+                "drvTetrAMM::readThread: found NaN at position {offset}, read {remainder} bytes"
+            );
         }
         None => {
-            log::error!("drvTetrAMM: ERROR, did not find NaN while resynchronizing");
+            asyn_print!(
+                ctx.handle,
+                ERROR,
+                "drvTetrAMM::readThread: ERROR, did not find NaN"
+            );
+            trace::print_io(
+                &ctx.handle,
+                trace::TraceMask::ERROR,
+                &data,
+                format_args!("drvTetrAMM::readThread: buffer read when resynchronizing"),
+            );
         }
     }
 }
@@ -840,4 +884,46 @@ pub fn create_tetramm(
         _read_thread: read_thread_handle,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::octet::create_ip_port;
+    use epics_rs::asyn::trace::TraceFile;
+
+    /// A meter that went away is reported on the driver port's trace at
+    /// `ASYN_TRACE_ERROR`, which C prints by default.
+    #[test]
+    fn read_failure_prints_cs_error_line_on_the_port_trace() {
+        let (io, runtime) = create_ip_port(
+            "QE_TETRA_TRACE",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            true,
+            false,
+        )
+        .unwrap();
+        let handle = runtime.port_handle();
+        let path = std::env::temp_dir().join(format!("qe-tetra-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        handle.trace().set_trace_file(
+            Some(handle.port_name()),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+
+        let read = io.read_binary(proto::binary_frame_len(4));
+        assert!(read.is_err());
+        report_read_failure(handle, &read, true);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.ends_with(
+                "drvTetrAMM::readThread: unexpected error reading meter \
+                 status=4, nRead=0, eomReason=0\n"
+            ),
+            "{text:?}"
+        );
+    }
 }

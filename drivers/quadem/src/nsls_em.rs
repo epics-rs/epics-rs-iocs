@@ -35,6 +35,7 @@ use crate::drv_quad_em::{
 };
 use crate::nsls_em_proto::{self as proto, PingPong};
 use crate::octet::{OctetIo, create_ip_port};
+use crate::{asyn_print, trace};
 
 /// C++ `epicsThreadSleep(0.01)` handshake poll.
 const HANDSHAKE_POLL: Duration = Duration::from_millis(10);
@@ -202,14 +203,37 @@ impl NslsEmDriver {
     /// The connection is opened and closed around every transaction, as C++
     /// does with `pasynCommonSyncIO`.
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
-        self.command.handle().connect_addr_blocking(0)?;
+        // C++ discards the connect and first-write statuses; the writeRead
+        // that follows reports the failure.
+        let _ = self.command.handle().connect_addr_blocking(0);
         let result = (|| -> AsynResult<String> {
             if out.len() > 1 {
-                self.command.write(out)?;
+                let _ = self.command.write(out);
             }
-            let reply = self.command.write_read(out, proto::MAX_COMMAND_LEN)?;
+            let reply = match self.command.write_read(out, proto::MAX_COMMAND_LEN) {
+                Ok(reply) => reply,
+                Err(e) => {
+                    let partial = e.partial_read();
+                    let n_read = partial.map_or(0, |p| p.data.len());
+                    let eom = partial.map_or(0, |p| p.eom_reason.bits());
+                    let in_string = partial
+                        .map(|p| String::from_utf8_lossy(&p.data).into_owned())
+                        .unwrap_or_default();
+                    asyn_print!(
+                        self.base.port_base,
+                        ERROR,
+                        "drvNSLS_EM:writeReadMeter: error calling writeRead, outString={out} status={}, nread={n_read}, eomReason={eom}, inString={in_string}",
+                        trace::status_code(&e)
+                    );
+                    return Err(e);
+                }
+            };
             if !proto::is_ok(&reply) {
-                log::error!("drvNSLS_EM: outString={out} expected OK>, received {reply}");
+                asyn_print!(
+                    self.base.port_base,
+                    ERROR,
+                    "drvNSLS_EM:writeReadMeter: error, outString={out} expected OK>, received {reply}"
+                );
                 return Err(error(format!("NSLS_EM: {out} -> {reply}, expected OK>")));
             }
             Ok(reply)
@@ -254,10 +278,24 @@ impl NslsEmDriver {
     /// C++ `readStatus`.
     fn read_status_inner(&mut self) -> AsynResult<()> {
         let reply = self.write_read_meter(proto::CMD_STATUS)?;
-        let status = proto::parse_status(&reply).ok_or_else(|| {
-            log::error!("drvNSLS_EM: cannot decode the status reply: {reply}");
-            error(format!("NSLS_EM: bad status reply: {reply}"))
-        })?;
+        let status = match proto::scan_status(&reply) {
+            (7, status) => status,
+            (items, s) => {
+                asyn_print!(
+                    self.base.port_base,
+                    ERROR,
+                    "drvNSLS_EM::getStatus error, numItems={items}, ipAddress={}, moduleID={}, firmwareVersion={}, mode={}, valuesPerRead={}, range={}, period={:.6}",
+                    s.ip,
+                    s.module_id,
+                    s.firmware,
+                    s.mode,
+                    s.values_per_read,
+                    s.range,
+                    s.period_us
+                );
+                return Err(error(format!("NSLS_EM: bad status reply: {reply}")));
+            }
+        };
 
         let p = self.params();
         let base = &mut self.base.port_base;
@@ -416,7 +454,7 @@ impl PortDriver for NslsEmDriver {
             self.shared.acq.lock().num_acquire = value;
             self.read_status()?;
         } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
+            self.shared.trigger_callbacks(&self.base.port_base);
         } else if reason == p.read_status {
             if !self.shared.is_acquiring() {
                 self.read_status()?;
@@ -520,22 +558,20 @@ fn read_thread(ctx: ReadContext) {
             ping_pong = ctx.state.lock().ping_pong;
         }
 
-        let outcome = match ctx.data.read_line(proto::DATA_BUFFER_SIZE) {
-            Ok(o) => o,
-            Err(e) => {
-                if !is_timeout(&e) {
-                    log::error!("drvNSLS_EM: unexpected error reading meter: {e}");
+        let read = ctx.data.read_line(proto::DATA_BUFFER_SIZE);
+        let outcome = match read {
+            Ok(o) if o.eom.contains(EomReason::EOS) => o,
+            _ => {
+                if trace::read_result(&read).0 != AsynStatus::Timeout {
+                    trace::print_read_error(&ctx.handle, "drvNSLS_EM:readThread", &read);
                     thread::sleep(READ_ERROR_BACKOFF);
                 }
                 continue;
             }
         };
-        if !outcome.eom.contains(EomReason::EOS) {
-            continue;
-        }
 
+        // C++ prints nothing for a line it cannot scan.
         let Some(sample) = proto::parse_sample(&outcome.as_str()) else {
-            log::error!("drvNSLS_EM: cannot decode the sample: {}", outcome.as_str());
             continue;
         };
         if !proto::sample_wanted(&sample, ping_pong) {

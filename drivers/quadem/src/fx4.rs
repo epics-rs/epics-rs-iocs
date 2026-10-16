@@ -36,6 +36,7 @@ use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
+use crate::asyn_print;
 use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeTriggerMode,
     QeTriggerPolarity, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
@@ -105,7 +106,7 @@ impl Fx4Link {
             return;
         }
         if self.out_tx.send(message).is_err() {
-            log::error!("drvFX4: the WebSocket thread is gone, dropping a message");
+            eprintln!("drvFX4: send failed: ");
         }
     }
 
@@ -339,7 +340,7 @@ impl PortDriver for Fx4Driver {
         } else if reason == p.values_per_read {
             self.set_values_per_read(value)?;
         } else if reason == p.read_data {
-            self.shared.trigger_callbacks();
+            self.shared.trigger_callbacks(&self.base.port_base);
         } else if self.base.write_int32_pool(reason)? {
             // Handled by the NDArray pool controls.
         }
@@ -398,12 +399,15 @@ fn socket_thread(ctx: SocketContext) {
     {
         Ok(rt) => rt,
         Err(e) => {
-            log::error!("drvFX4: cannot start the WebSocket runtime: {e}");
+            eprintln!("drvFX4: connection setup error: {e}");
             return;
         }
     };
 
     runtime.block_on(async move {
+        // The constructor reports its own first-attempt timeout; only
+        // pollThread's later attempts print `reconnect timeout`.
+        let mut reconnect = false;
         loop {
             match tokio_tungstenite::connect_async(&uri).await {
                 Ok((stream, _)) => {
@@ -416,10 +420,15 @@ fn socket_thread(ctx: SocketContext) {
                     }
                     run_session(stream, &mut out_rx, &in_tx, &link, &shared).await;
                     link.set_connected(false);
-                    log::error!("drvFX4: the WebSocket to {uri} closed");
                 }
-                Err(e) => log::error!("drvFX4: cannot connect to {uri}: {e}"),
+                Err(e) => {
+                    eprintln!("drvFX4: WebSocket error: {e}");
+                    if reconnect {
+                        eprintln!("drvFX4: reconnect timeout to {uri}");
+                    }
+                }
             }
+            reconnect = true;
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     });
@@ -447,19 +456,35 @@ async fn run_session<S>(
                         return;
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => return,
+                // ixwebsocket's close codes: 1005 for a close frame with no
+                // status, 1006 for a stream that ended without one.
+                Some(Ok(Message::Close(frame))) => {
+                    match frame {
+                        Some(f) => eprintln!(
+                            "drvFX4: WebSocket closed code={} reason={}",
+                            u16::from(f.code),
+                            f.reason
+                        ),
+                        None => eprintln!("drvFX4: WebSocket closed code=1005 reason=No status code"),
+                    }
+                    return;
+                }
+                None => {
+                    eprintln!("drvFX4: WebSocket closed code=1006 reason=Abnormal closure");
+                    return;
+                }
                 // Ping/Pong are answered by tungstenite; the FX4 sends no
                 // binary frames.
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
-                    log::error!("drvFX4: WebSocket error: {e}");
+                    eprintln!("drvFX4: WebSocket error: {e}");
                     return;
                 }
             },
             outgoing = out_rx.recv() => match outgoing {
                 Some(message) => {
-                    if let Err(e) = sink.send(Message::Text(message.into())).await {
-                        log::error!("drvFX4: send failed: {e}");
+                    if sink.send(Message::Text(message.into())).await.is_err() {
+                        eprintln!("drvFX4: send failed: ");
                         return;
                     }
                 }
@@ -492,17 +517,29 @@ struct DataContext {
 /// handling: one received frame per iteration.
 fn data_thread(ctx: DataContext) {
     while let Ok(payload) = ctx.in_rx.recv() {
+        // C++ parses before onMessageEvent's acquiring check.
+        let (event, data) = match proto::parse_message(&payload) {
+            Ok(Some(message)) => message,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("drvFX4: JSON parse error: {e}");
+                continue;
+            }
+        };
         if !ctx.shared.is_acquiring() {
             continue;
         }
-        let Some((event, data)) = proto::parse_message(&payload) else {
-            log::error!("drvFX4: cannot parse the received frame");
-            continue;
-        };
 
         if event == "update" {
             let cfg = ctx.link.trigger_config();
-            let actions = ctx.link.cache.lock().ingest(&data, &cfg);
+            let (actions, errors) = {
+                let mut cache = ctx.link.cache.lock();
+                let actions = cache.ingest(&data, &cfg);
+                (actions, cache.take_errors())
+            };
+            for line in errors {
+                asyn_print!(ctx.handle, ERROR, "{line}");
+            }
             for action in actions {
                 match action {
                     Fx4Action::Sample(values) => {
@@ -510,7 +547,7 @@ fn data_thread(ctx: DataContext) {
                             .compute_positions(&ctx.handle, &ctx.params, &values);
                     }
                     Fx4Action::BulbTrigger => {
-                        ctx.shared.trigger_callbacks();
+                        ctx.shared.trigger_callbacks(&ctx.handle);
                     }
                 }
             }
@@ -613,7 +650,7 @@ pub fn create_fx4(
         thread::sleep(CONNECT_POLL);
     }
     if !link.is_connected() {
-        log::warn!("drvFX4: timeout connecting to the FX4 at {uri}");
+        eprintln!("drvFX4::drvFX4: timeout connecting to FX4 at {uri}");
     }
 
     Ok(Fx4Runtime {

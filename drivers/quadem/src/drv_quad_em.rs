@@ -24,6 +24,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
+use crate::asyn_print;
+use crate::trace::AsynPrint;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
 use epics_rs::ad_core::plugin::channel::{
@@ -433,6 +435,11 @@ impl RingState {
         overflowed
     }
 
+    /// C++ `epicsRingBytesUsedBytes / sampleSize`.
+    pub fn used(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Drain `n` samples, oldest first. `None` when fewer than `n` are
     /// buffered (C++ `doDataCallbacks` bails out with `asynError`).
     pub fn drain(&mut self, n: usize) -> Option<Vec<[f64; QE_MAX_DATA]>> {
@@ -590,13 +597,18 @@ impl QuadEmShared {
     }
 
     /// C++ `drvQuadEM::triggerCallbacks`. Returns `false` when nothing was
-    /// pending (`rawCount_ < 1`, e.g. a Read press while idle).
-    pub fn trigger_callbacks(&self) -> bool {
+    /// pending (`rawCount_ < 1`, e.g. a Read press while idle). `port` is the
+    /// driver port the failure is reported on.
+    pub fn trigger_callbacks(&self, port: &dyn AsynPrint) -> bool {
         let Some(n) = self.ring.lock().take_raw_count() else {
             return false;
         };
         if self.trigger_tx.try_send(n).is_err() {
-            log::error!("quadEM: trigger message queue full, dropping {n} samples");
+            asyn_print!(
+                *port,
+                ERROR,
+                "drvQuadEM::triggerCallbacks, error calling epicsMessageQueueSend"
+            );
             return false;
         }
         true
@@ -623,7 +635,11 @@ impl QuadEmShared {
             (overflowed, ring.ring_overflows)
         };
         if overflowed {
-            log::warn!("quadEM: ring buffer overflow");
+            asyn_print!(
+                *handle,
+                WARNING,
+                "drvQuadEM::computePositions warning ring buffer overflow"
+            );
             let _ = handle.set_params_and_notify_blocking(
                 0,
                 vec![ParamSetValue::new(
@@ -636,7 +652,7 @@ impl QuadEmShared {
 
         let num_average = self.acq.lock().num_average;
         if num_average > 0 && self.ring.lock().raw_count >= num_average {
-            self.trigger_callbacks();
+            self.trigger_callbacks(handle);
         }
 
         // C++ sets QE_DOUBLE_DATA and fires callbacks on each of the 11
@@ -903,7 +919,11 @@ impl QuadEmBase {
     /// Attach a downstream plugin to one asyn address' NDArray stream.
     pub fn connect_downstream(&self, addr: usize, mut sender: NDArraySender) {
         let Some(out) = self.outputs.get(addr) else {
-            log::error!("quadEM: connect_downstream: address {addr} out of range");
+            asyn_print!(
+                self.port_base,
+                ERROR,
+                "drvQuadEM::connect_downstream: address {addr} out of range"
+            );
             return;
         };
         sender.set_queued_counter(self.queued[addr].clone());
@@ -930,9 +950,21 @@ pub struct CallbackContext {
 
 /// C++ `drvQuadEM::doDataCallbacks`.
 async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
-    let Some(samples) = ctx.shared.ring.lock().drain(num_read) else {
-        log::error!("quadEM: not enough samples in ring buffer, expected {num_read}");
-        return false;
+    let drained = {
+        let mut ring = ctx.shared.ring.lock();
+        ring.drain(num_read)
+            .ok_or((ring.used(), ring.raw_count, ring.ring_count))
+    };
+    let samples = match drained {
+        Ok(samples) => samples,
+        Err((ring_size, raw_count, ring_count)) => {
+            asyn_print!(
+                ctx.handle,
+                ERROR,
+                "drvQuadEM::doDataCallbacks: not enough bytes in ring buffer, expecting {num_read} actually {ring_size}, rawCount_={raw_count}, ringCount_={ring_count}"
+            );
+            return false;
+        }
     };
 
     let counter = ctx.shared.array_counter.fetch_add(1, Ordering::SeqCst) + 1;

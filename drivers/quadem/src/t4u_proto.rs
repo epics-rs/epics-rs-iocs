@@ -604,8 +604,8 @@ pub fn parse_calibration(text: &str) -> Result<Calibration, String> {
     // A T4U without pulsed mode has no separate pulsed set; C++ falls back to
     // the CW one.
     let pulsed_name = get("config", "pulsed").cloned().unwrap_or_else(|| {
-        log::info!(
-            "drvT4UDirect_EM: no pulsed-mode calibration selected; using the CW set \"{cw_name}\""
+        println!(
+            "No separate pulsed mode calibration selected: key pulsed=<name> in section [config].  Using selected CW value \"{cw_name}\".  This is expected if your T4U does not support pulsed mode."
         );
         cw_name.clone()
     });
