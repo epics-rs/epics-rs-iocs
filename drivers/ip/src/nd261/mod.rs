@@ -121,8 +121,7 @@ impl DeviceWorker for Nd261Worker {
                     ParamValue::Int32(status::OK),
                 ));
             }
-            Err(e) => {
-                log::error!("ND261: read failed: {e}");
+            Err(_) => {
                 values.push(ParamSetValue::new(
                     p.position,
                     0,
@@ -135,9 +134,7 @@ impl DeviceWorker for Nd261Worker {
                 ));
             }
         }
-        if let Err(e) = self.handle.set_params_and_notify_blocking(0, values) {
-            log::error!("ND261: publishing failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify_blocking(0, values);
     }
 
     fn handle(&mut self, _command: Self::Command) {}
