@@ -31,6 +31,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{EnumEntry, ParamType};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -738,11 +739,12 @@ impl SpecsAnalyserRuntime {
 /// in `st.cmd`) — C connects to it with `pasynOctetSyncIO->connect` in the
 /// constructor; here the EOS is configured entirely by `st.cmd`.
 pub fn create_specs_analyser_detector(
-    port_name: &str,
+    claim: &PortClaim,
     driver_port_name: &str,
     max_buffers: i32,
     max_memory: usize,
 ) -> Result<SpecsAnalyserRuntime, String> {
+    let port_name = claim.name();
     let driver_port_entry = get_port(driver_port_name).ok_or_else(|| {
         format!("driver port '{driver_port_name}' not found (call drvAsynIPPortConfigure first)")
     })?;
@@ -791,7 +793,7 @@ pub fn create_specs_analyser_detector(
     let scan_ranges = driver.scan_ranges.clone();
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the SPECS analyser port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(PlMutex::new(NDArrayOutput::new()));
