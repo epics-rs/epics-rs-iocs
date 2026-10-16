@@ -19,7 +19,7 @@ epicsEnvSet("DATA_PORT", "10101")
 
 # $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
 # at IOC startup; every quadEM template lives in its db/ subdir.
-epicsEnvSet("CALFILE", "$(QUADEM)/DBPM_Settings.ini")
+epicsEnvSet("CALFILE", "$(QUADEM)/t4u-direct-em-ioc/DBPM_Settings.ini")
 
 # Commands go to the meter's telnet port (23); data arrives as UDP datagrams on
 # $(DATA_PORT), which the driver binds. The calibration file supplies the
