@@ -5,10 +5,11 @@ use std::sync::atomic::Ordering;
 
 use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase};
+use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -112,7 +113,16 @@ impl MythenDriver {
         max_memory: usize,
         start_tx: rt::CommandSender<()>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, SENSOR_SIZE_X, SENSOR_SIZE_Y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            SENSOR_SIZE_X,
+            SENSOR_SIZE_Y,
+            max_memory,
+            PortFlags {
+                multi_device: true,
+                ..ASYN_CANBLOCK
+            },
+        )?;
         let p = MythenParams::create(&mut ad.port_base)?;
 
         let mut driver = Self {
