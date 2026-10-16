@@ -44,6 +44,8 @@ const RECONNECT_WAIT: Duration = Duration::from_millis(200);
 /// network_client.cpp:157): C blocks in `recv` forever and relies on another
 /// thread closing the socket underneath it, which is a use-after-close race.
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// C's `accumulationDelay` (histogram_io.cpp:963).
+const PRV_HST_PAUSED_WAIT: Duration = Duration::from_millis(100);
 
 /// Every parameter of the streaming channels lives at address 0: C's
 /// `doCallbacks*Array(..., 0)` (serval_stream.cpp:975, histogram_io.cpp:541)
@@ -1085,6 +1087,12 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
     let mut buf = vec![0u8; 256 * 1024];
 
     while ctx.shared.acquisition.monitoring() {
+        // C leaves the histogram socket unread while accumulation is off
+        // (histogram_io.cpp:1018-1023).
+        if kind == StreamKind::PrvHst && !prv_hst_accumulating(ctx).await {
+            tokio::time::sleep(PRV_HST_PAUSED_WAIT).await;
+            continue;
+        }
         match stream.read(&mut buf) {
             Ok(0) => {
                 println!("{} TCP connection closed by peer", kind.name());
@@ -1121,6 +1129,16 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
             }
         }
     }
+}
+
+/// C `ADTimePixPrvHstAccumulationEnable`, which gates the PrvHst worker and
+/// both of its frame handlers.
+async fn prv_hst_accumulating(ctx: &Ctx) -> bool {
+    ctx.handle
+        .read_int32(ctx.p.prv_hst_accumulation_enable, 0)
+        .await
+        .unwrap_or(0)
+        != 0
 }
 
 /// C `detectorImageFrameLimits` from the detector params
@@ -1369,6 +1387,11 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             publish_image(ctx, IMG_ADDR, array).await;
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
+            // histogram_io.cpp:165-170, :425-433: a frame read before
+            // accumulation was turned off is dropped whole.
+            if !prv_hst_accumulating(ctx).await {
+                return;
+            }
             let p = ctx.p;
             // histogram_io.cpp:251-292 tracks the rate; :574 posts it every frame.
             let hst_rate = ctx
@@ -2727,6 +2750,43 @@ mod tests {
         ctx.shared.rates.lock().reset();
         let o = ctx.shared.rates.lock().prv_hst.frame(9, 1.0);
         assert_eq!(o.rate, 0.0);
+    }
+
+    /// C neither reads the histogram socket nor handles a frame while
+    /// PrvHstAccumulationEnable is 0 (histogram_io.cpp:165-170, :1018-1023):
+    /// a frame sent meanwhile waits in the socket and is taken on re-enable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prv_hst_accumulation_off_leaves_the_socket_unread() {
+        use std::io::Write;
+
+        let ctx = Arc::new(idle_ctx("TPX_HST_GATE"));
+        let enable = ctx.p.prv_hst_accumulation_enable;
+        ctx.set_int(enable, 0, 0).await;
+        assert!(ctx.shared.acquisition.begin_start());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _ = client.set_read_timeout(Some(Duration::from_millis(50)));
+        let (mut peer, _) = listener.accept().unwrap();
+        let reader = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { read_stream(&ctx, StreamKind::PrvHst, client).await }
+        });
+
+        let mut bytes = br#"{"binSize":2,"binWidth":1,"binOffset":0,"frameNumber":1}"#.to_vec();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2]);
+        peer.write_all(&bytes).unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(ctx.shared.hst.lock().frame_count(), 0);
+
+        ctx.set_int(enable, 0, 1).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while ctx.shared.hst.lock().frame_count() == 0 {
+            assert!(std::time::Instant::now() < deadline, "frame never taken");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(peer);
+        reader.await.unwrap();
     }
 
     /// C `processPrvHstFrame` hands every PrvHst frame to the plugins on
