@@ -21,6 +21,7 @@ use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
 use crate::error::{UrError, UrResult};
 use crate::registry::{self, DashboardHandle, ReceiveHandle};
+use crate::spdlog;
 
 pub const NUM_JOINTS: usize = 6;
 
@@ -280,9 +281,7 @@ impl ControlInner {
         let Some(offset) = self.tcp_offset else {
             return;
         };
-        if let Err(e) = self.iface_mut().and_then(|i| i.set_tcp(&offset)) {
-            log::error!("ur-robot: could not apply the staged TCP offset: {e}");
-        }
+        let _ = self.iface_mut().and_then(|i| i.set_tcp(&offset));
     }
 
     fn iface_mut(&mut self) -> UrResult<&mut ControlInterface> {
@@ -386,18 +385,21 @@ impl ControlDriver {
     /// reconnect, so RECONNECT on a healthy link returns asynError).
     fn try_connect(&self) -> bool {
         let receive = self.receive.get();
-        if !receive.connected || receive.safety_status_bits != SAFETY_NORMAL {
-            log::error!(
-                "ur-robot: cannot connect the control interface in the current safety state; \
-                 clear the safeguard stop / E-stop and try again"
-            );
+        if receive.safety_status_bits != SAFETY_NORMAL {
+            spdlog::error(format_args!(
+                "Cannot connect to control interface in current safety state. \
+                 Clear safeguard stop, E-stop, etc. then try again.\n"
+            ));
+            return false;
+        }
+        if !receive.connected {
             return false;
         }
         if !self.dashboard.get().robot_running() {
-            log::error!(
-                "ur-robot: cannot connect the control interface in the current robot mode; \
-                 power the robot on, release the brakes and try again"
-            );
+            spdlog::error(format_args!(
+                "Unable to connect to control interface in current mode. \
+                 Ensure robot is on, in normal mode, and brakes released, then try again.\n"
+            ));
             return false;
         }
 
@@ -407,27 +409,29 @@ impl ControlDriver {
                 if iface.is_connected() {
                     return true;
                 }
+                spdlog::debug(format_args!("Reconnecting to UR RTDE Control interface"));
                 match iface.reconnect() {
                     Ok(()) => {
-                        log::info!("ur-robot: reconnected to the RTDE control interface");
                         inner.apply_cached_settings();
                         true
                     }
                     Err(e) => {
-                        log::error!("ur-robot: RTDE control reconnect failed: {e}");
+                        spdlog::error(format_args!("Failed to reconnect: {e}"));
                         false
                     }
                 }
             }
             None => match ControlInterface::connect(&self.robot_ip, false) {
                 Ok(iface) => {
-                    log::info!("ur-robot: connected to the RTDE control interface");
+                    spdlog::info(format_args!("Connected to UR RTDE Control interface"));
                     inner.iface = Some(iface);
                     inner.apply_cached_settings();
                     true
                 }
                 Err(e) => {
-                    log::error!("ur-robot: RTDE control connect failed: {e}");
+                    spdlog::error(format_args!(
+                        "Failed to connected to UR RTDE Control interface\n{e}"
+                    ));
                     false
                 }
             },
@@ -439,6 +443,7 @@ impl ControlDriver {
         let p = self.params;
         let mut inner = self.inner.lock();
         if inner.pending_motion.is_some() && inner.motion_status != MotionStatus::WaitingAction {
+            spdlog::warn(format_args!("Motion task in progress. Cannot run script."));
             return Err(asyn_error(
                 "a motion task is in progress; the URScript was not run",
             ));
@@ -446,9 +451,16 @@ impl ControlDriver {
         let start_count = self.receive.get().output_int_register_12;
         let timeout = inner.custom_script_timeout;
 
+        if !inner.connected() {
+            print_unusable(&inner);
+        }
         let iface = inner
             .iface_mut()
             .map_err(|e| asyn_error(format!("cannot run the URScript: {e}")))?;
+        match source {
+            "(inline)" => spdlog::debug(format_args!("Running inline URScript: {body}")),
+            path => spdlog::debug(format_args!("Running custom URScript: {path}")),
+        }
         iface
             .send_custom_script(body)
             .map_err(|e| asyn_error(format!("failed to run the URScript {source}: {e}")))?;
@@ -521,12 +533,20 @@ impl PortDriver for ControlDriver {
             } else if reason == p.jog_speed {
                 // x,y,z arrive in mm/s; rx,ry,rz in rad/s.
                 inner.jog_speeds[index] = if index >= 3 { value } else { value / 1000.0 };
+                spdlog::debug(format_args!(
+                    "Setting jog speed[{index}] to {:.4}",
+                    inner.jog_speeds[index]
+                ));
                 inner.new_jog = true;
             } else if reason == p.tcp_offset {
                 // x,y,z arrive in mm; rx,ry,rz are already radians.
                 let offset = inner.tcp_offset.get_or_insert([0.0; NUM_JOINTS]);
                 offset[index] = if index >= 3 { value } else { value / 1000.0 };
                 let offset = *offset;
+                spdlog::debug(format_args!(
+                    "Setting TCP offset to [{}] m,rad",
+                    offset.map(|v| format!("{v:.4}")).join(",")
+                ));
                 if inner.connected() {
                     inner
                         .iface_mut()
@@ -535,16 +555,40 @@ impl PortDriver for ControlDriver {
                 }
             } else if reason == p.joint_speed {
                 inner.joint_speed = deg_to_rad(value);
+                spdlog::debug(format_args!(
+                    "Setting joint speed to {:.4}",
+                    inner.joint_speed
+                ));
             } else if reason == p.joint_acceleration {
                 inner.joint_accel = deg_to_rad(value);
+                spdlog::debug(format_args!(
+                    "Setting joint acceleration to {:.4}",
+                    inner.joint_accel
+                ));
             } else if reason == p.joint_blend {
                 inner.joint_blend = value / 1000.0;
+                spdlog::debug(format_args!(
+                    "Setting joint blend to {:.4}",
+                    inner.joint_blend
+                ));
             } else if reason == p.linear_speed {
                 inner.linear_speed = value / 1000.0;
+                spdlog::debug(format_args!(
+                    "Setting linear speed to {:.4}",
+                    inner.linear_speed
+                ));
             } else if reason == p.linear_acceleration {
                 inner.linear_accel = value / 1000.0;
+                spdlog::debug(format_args!(
+                    "Setting linear acceleration to {:.4}",
+                    inner.linear_accel
+                ));
             } else if reason == p.linear_blend {
                 inner.linear_blend = value / 1000.0;
+                spdlog::debug(format_args!(
+                    "Setting linear blend to {:.4}",
+                    inner.linear_blend
+                ));
             }
             Ok(())
         })();
@@ -591,10 +635,12 @@ impl PortDriver for ControlDriver {
             if reason == p.disconnect {
                 match inner.iface.as_mut() {
                     Some(iface) => {
+                        spdlog::debug(format_args!("Disconnecting from RTDE control interface"));
                         iface.disconnect();
                         return Ok(());
                     }
                     None => {
+                        spdlog::error(format_args!("RTDE Control interface not initialized"));
                         return Err(asyn_error("the RTDE control interface is not initialised"));
                     }
                 }
@@ -611,6 +657,7 @@ impl PortDriver for ControlDriver {
             }
 
             if !inner.connected() {
+                print_unusable(&inner);
                 return Err(asyn_error("the RTDE control interface is not connected"));
             }
 
@@ -626,7 +673,7 @@ impl PortDriver for ControlDriver {
                     // records: 1 on an accepted request, 0 on a refusal so the
                     // record releases immediately (upstream 558b98f).
                     if inner.pending_motion.is_some() {
-                        log::warn!("ur-robot: a motion is already in progress; please wait");
+                        spdlog::warn(format_args!("Motion already in progress...please wait"));
                         updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
                         return Ok(());
                     }
@@ -634,6 +681,13 @@ impl PortDriver for ControlDriver {
                         MotionType::Joint => inner.cmd_joints,
                         MotionType::Cartesian => inner.cmd_pose,
                     };
+                    let joined = target.map(|v| format!("{v:.4}")).join(",");
+                    match motion {
+                        MotionType::Joint => spdlog::debug(format_args!("moveJ({joined}) rad")),
+                        MotionType::Cartesian => {
+                            spdlog::debug(format_args!("moveL({joined}) m,rad"))
+                        }
+                    }
                     let iface = inner.iface_mut()?;
                     let within = match motion {
                         MotionType::Joint => iface.is_joints_within_safety_limits(&target),
@@ -650,10 +704,17 @@ impl PortDriver for ControlDriver {
                         Ok(w) => w,
                     };
                     if !within {
-                        log::warn!(
-                            "ur-robot: the requested target is not within the safety limits; \
-                         no action taken"
-                        );
+                        spdlog::warn(format_args!(
+                            "{}",
+                            match motion {
+                                MotionType::Joint => {
+                                    "Requested joint angles not within safety limits. No action taken."
+                                }
+                                MotionType::Cartesian => {
+                                    "Requested TCP pose not within safety limits. No action taken."
+                                }
+                            }
+                        ));
                         updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(0)));
                         return Ok(());
                     }
@@ -671,20 +732,32 @@ impl PortDriver for ControlDriver {
 
                 if reason == p.stop_j {
                     inner.motion_task_done(p, &mut updates);
+                    spdlog::debug(format_args!("Stopping (linear in joint space)"));
                     inner.iface_mut()?.stop_j(2.0, false)?;
                 } else if reason == p.stop_l {
                     inner.motion_task_done(p, &mut updates);
+                    spdlog::debug(format_args!("Stopping (linear in tool space)"));
                     inner.iface_mut()?.stop_l(10.0, false)?;
                 } else if reason == p.reupload_control_script {
-                    inner.iface_mut()?.reupload_script()?;
+                    // C catches, prints and succeeds (rtde_control_driver.cpp:497-504).
+                    spdlog::debug(format_args!("Reuploading control script"));
+                    if let Err(e) = inner.iface_mut()?.reupload_script() {
+                        spdlog::error(format_args!("Failed to reupload control script: {e}"));
+                    }
                 } else if reason == p.stop_control_script {
-                    inner.iface_mut()?.stop_script()?;
+                    spdlog::debug(format_args!("Stopping control script"));
+                    if let Err(e) = inner.iface_mut()?.stop_script() {
+                        spdlog::error(format_args!("Failed to stop control script: {e}"));
+                    }
                 } else if reason == p.trigger_prot_stop {
+                    spdlog::debug(format_args!("Triggering protective stop"));
                     inner.iface_mut()?.trigger_protective_stop()?;
                 } else if reason == p.teach_mode {
                     if value != 0 {
+                        spdlog::debug(format_args!("Enabling teach mode"));
                         inner.iface_mut()?.teach_mode()?;
                     } else {
+                        spdlog::debug(format_args!("Disabling teach mode"));
                         inner.iface_mut()?.end_teach_mode()?;
                     }
                 } else if reason == p.jog_start {
@@ -692,10 +765,15 @@ impl PortDriver for ControlDriver {
                         let speeds = inner.jog_speeds;
                         let accel = inner.jog_acceleration;
                         inner.iface_mut()?.speed_l(&speeds, accel, 0.01)?;
+                        spdlog::debug(format_args!(
+                            "Starting jog: accel={accel}, speeds=[{}]",
+                            speeds.map(|v| format!("{v:.2}")).join(",")
+                        ));
                         inner.new_jog = false;
                     }
                     updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(1)));
                 } else if reason == p.jog_stop {
+                    spdlog::debug(format_args!("Stopping jog"));
                     inner.iface_mut()?.speed_stop(10.0)?;
                     updates.push(ParamSetValue::new(p.jogging, 0, ParamValue::Int32(0)));
                 }
@@ -715,6 +793,11 @@ impl PortDriver for ControlDriver {
             }
             result.map_err(|e| asyn_error(format!("RTDE control command failed: {e}")))
         })();
+        if result.is_err() {
+            spdlog::debug(format_args!(
+                "RTDE communication error in RTDEControl::writeInt32"
+            ));
+        }
         crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 
@@ -729,15 +812,18 @@ impl PortDriver for ControlDriver {
                 .params
                 .set_string(reason, user.addr, text.clone())?;
 
+            // A missing file prints and succeeds, as C's writeOctet does
+            // (rtde_control_driver.cpp:611-619).
             if reason == p.custom_script_file {
-                return if std::path::Path::new(&text).is_file() {
+                if std::path::Path::new(&text).exists() {
+                    spdlog::debug(format_args!("Successfully read URScript file: {text}"));
                     self.inner.lock().custom_script_path = text;
                     self.base.params.set_int32(p.custom_script_error, 0, 0)?;
-                    Ok(data.len())
                 } else {
+                    spdlog::error(format_args!("Failed to read URScript file: {text}"));
                     self.base.params.set_int32(p.custom_script_error, 0, 1)?;
-                    Err(asyn_error(format!("no such URScript file: {text}")))
-                };
+                }
+                return Ok(data.len());
             }
 
             if reason == p.custom_inline_script {
@@ -747,6 +833,11 @@ impl PortDriver for ControlDriver {
 
             Ok(data.len())
         })();
+        if result.is_err() {
+            spdlog::debug(format_args!(
+                "RTDE communication error in RTDEControl::writeOctet"
+            ));
+        }
         crate::drivers::flush_after(&mut self.base, user.addr, result)
     }
 }
@@ -820,13 +911,10 @@ pub fn poll_once(
     let is_steady = if inner.custom_script.is_some() {
         false
     } else {
-        match inner.iface_mut().and_then(|i| i.is_steady()) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("ur-robot: isSteady failed: {e}");
-                false
-            }
-        }
+        inner
+            .iface_mut()
+            .and_then(|i| i.is_steady())
+            .unwrap_or(false)
     };
     updates.push(ParamSetValue::new(
         p.is_steady,
@@ -837,7 +925,7 @@ pub fn poll_once(
     // A safety event aborts whatever motion is in flight.
     if receive.get().safety_status_bits != SAFETY_NORMAL {
         if inner.pending_motion.is_some() {
-            log::info!("ur-robot: motion stopped by a safety event");
+            spdlog::debug(format_args!("Motion stopped due to safety."));
             inner.motion_task_done(p, &mut updates);
         }
         return updates;
@@ -875,25 +963,19 @@ fn drive_motion(
             });
             match started {
                 Ok(_) => inner.motion_status = MotionStatus::WaitingMotion,
-                Err(e) => {
-                    log::error!("ur-robot: could not start the motion: {e}");
-                    inner.motion_task_done(p, updates);
-                }
+                Err(_) => inner.motion_task_done(p, updates),
             }
         }
         MotionStatus::WaitingMotion => {
             let progress = inner.iface_mut().and_then(|i| i.async_operation_progress());
-            let status = match progress {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("ur-robot: could not read the async operation progress: {e}");
-                    return;
-                }
+            let Ok(status) = progress else {
+                return;
             };
             if status.is_running() {
                 return;
             }
             if task.action {
+                spdlog::debug(format_args!("Waypoint reached. Starting action..."));
                 // Toggle so the action record always processes.
                 inner.run_action_val ^= 1;
                 inner.waypoint_action_done = false;
@@ -909,6 +991,7 @@ fn drive_motion(
                 ));
                 inner.motion_status = MotionStatus::WaitingAction;
             } else {
+                spdlog::debug(format_args!("Motion complete."));
                 inner.motion_task_done(p, updates);
             }
         }
@@ -917,9 +1000,20 @@ fn drive_motion(
                 poll_custom_script(p, inner, receive, updates);
             }
             if inner.waypoint_action_done {
+                spdlog::debug(format_args!("Waypoint action complete."));
                 inner.motion_task_done(p, updates);
             }
         }
+    }
+}
+
+/// C's two refusals for a write with no usable control interface
+/// (rtde_control_driver.cpp:422-439).
+fn print_unusable(inner: &ControlInner) {
+    if inner.iface.is_none() {
+        spdlog::error(format_args!("RTDE Control interface not initialized"));
+    } else {
+        spdlog::error(format_args!("RTDE Control interface not connected"));
     }
 }
 
@@ -947,19 +1041,21 @@ fn poll_custom_script(
         ));
         // The custom script replaced the control script on the controller; put
         // the control script back.
-        if let Err(e) = inner
+        spdlog::debug(format_args!("URScript done"));
+        spdlog::debug(format_args!("Reuploading RTDE control script"));
+        if let Err(UrError::Timeout(..)) = inner
             .iface_mut()
             .and_then(|i| i.reupload_script().map(|()| i))
             .and_then(|i| wait_for_program(i, REUPLOAD_TIMEOUT))
         {
-            log::error!("ur-robot: could not reupload the control script: {e}");
+            spdlog::error(format_args!("Timed out trying to reupload control script"));
         }
     } else if timed_out {
         inner.custom_script = None;
-        log::error!(
-            "ur-robot: the URScript timed out after {:.1} s",
-            script.timeout.as_secs_f64()
-        );
+        spdlog::error(format_args!(
+            "URScript timed out: {}",
+            inner.custom_script_path
+        ));
         updates.push(ParamSetValue::new(
             p.custom_script_running,
             0,
