@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -55,7 +56,7 @@ impl MarccdDriver {
     fn new(port_name: &str, max_memory: usize, links: DriverLinks) -> AsynResult<Self> {
         // marCCDConfig passes no sensor size; C's ADDriver base leaves
         // ADMaxSizeX/Y at 0 and `getConfig` fills them from the server.
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
         let params = ad.params;
