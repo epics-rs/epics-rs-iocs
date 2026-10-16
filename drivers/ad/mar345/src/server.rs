@@ -1,19 +1,17 @@
-//! The mar345dtb server execution context: batched parameter access, the
-//! `writeServer` / `readServer` / `waitForCompletion` trio and the `setShutter`
-//! override.
+//! marServer I/O: the driver's `writeServer` and `setShutter`, and the
+//! `mar345Task` worker's batched parameter access, `readServer` and
+//! `waitForCompletion`.
 //!
-//! `mar345.cpp` runs server I/O from two contexts — the asyn port thread
-//! (`writeInt32`, which only sets `mode` and signals an event) and `mar345Task`
-//! (which does all the socket work) — serialised by the driver lock. Since a
-//! Rust `PortDriver` method cannot block on another port, all socket I/O lives
-//! on the single `mar345Task` worker thread, which owns this [`Server`]
-//! exclusively (no cross-thread lock is needed because it is the only writer).
+//! `mar345.cpp` writes to marServer under the driver lock, from `writeInt32`
+//! (`setShutter`) and from `mar345Task`, and drops the lock for each read
+//! (`readServer`, :260-263). Here the lock is the port actor: writes run on
+//! [`Mar345Driver`], inline or through `PortHandle::with_driver`, and the
+//! worker reads with no lock held.
 
 use std::time::Instant;
 
-use epics_rs::ad_core::driver::ShutterMode;
+use epics_rs::ad_core::driver::ADDriver;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -21,6 +19,7 @@ use epics_rs::asyn::request::{ParamSetValue, RequestOp};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use crate::driver::Mar345Driver;
 use crate::protocol::{CMD_SHUTTER_CLOSE, CMD_SHUTTER_OPEN, response_done};
 use crate::types::{CamStatus, MAR345_POLL_DELAY, MAR345_SOCKET_TIMEOUT, MAX_MESSAGE_SIZE, secs};
 
@@ -132,45 +131,47 @@ impl Server {
 
     // --- server ------------------------------------------------------------
 
-    /// C `writeServer`: flush stale input, write with `MAR345_SOCKET_TIMEOUT`,
-    /// then publish the command on `ADStringToServer`.
+    /// C `writeServer` from `mar345Task`, which holds the driver lock: the
+    /// pending parameter writes go with it, posted by its `callParamCallbacks`.
     pub async fn write_server(&mut self, output: &str) -> CamStatus {
-        let _ = self
-            .server_port
-            .submit_async(RequestOp::Flush, AsynUser::default().with_addr(SERVER_ADDR))
-            .await;
-
-        let user = AsynUser::default()
-            .with_addr(SERVER_ADDR)
-            .with_timeout(secs(MAR345_SOCKET_TIMEOUT));
-        let status = match self
-            .server_port
-            .submit_async(
-                RequestOp::OctetWrite {
-                    data: output.as_bytes().to_vec(),
-                },
-                user,
-            )
+        let output = output.to_string();
+        self.locked(move |d| d.write_server(&output))
             .await
-        {
-            Ok(_) => CamStatus::Success,
-            Err(e) => {
-                // On pasynUserServer, so the server port's trace mask gates it.
-                self.server_port.trace().output(
-                    self.server_port.port_name(),
-                    TraceMask::ERROR,
-                    &format!(
-                        "mar345:writeServer, status={}, sent\n{output}",
-                        e.status() as i32
-                    ),
-                );
-                classify(&e)
-            }
-        };
+            .unwrap_or(CamStatus::Error)
+    }
 
-        self.set_str(self.ad.string_to_server, output);
-        self.callbacks().await;
-        status
+    /// C `setShutter` from `mar345Task`.
+    pub async fn set_shutter(&mut self, open: bool) {
+        let _ = self
+            .locked(move |d| {
+                let _ = ADDriver::set_shutter(d, open);
+            })
+            .await;
+    }
+
+    /// Run `f` on the driver (C `lock()` … `unlock()`) after storing the
+    /// pending parameter writes, which `f`'s `callParamCallbacks` posts.
+    async fn locked<R: Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut Mar345Driver) -> R + Send + 'static,
+    ) -> Option<R> {
+        let batch = std::mem::take(&mut self.batch);
+        self.handle
+            .with_driver::<Mar345Driver, R>(move |d| {
+                for update in batch {
+                    if let ParamSetValue::Value {
+                        reason,
+                        addr,
+                        value,
+                    } = update
+                    {
+                        let _ = d.ad.port_base.set_param_value(reason, addr, value);
+                    }
+                }
+                f(d)
+            })
+            .await
+            .ok()
     }
 
     /// C `readServer`: a single read with the given timeout. Only a non-empty
@@ -227,46 +228,73 @@ impl Server {
             }
         }
     }
+}
 
-    /// C `mar345::setShutter` — overrides the base class for detector-controlled
-    /// shutters and delegates the EPICS-controlled case to the base behaviour.
-    pub async fn set_shutter(&mut self, open: bool) {
-        let mode = ShutterMode::from_i32(self.get_i32(self.ad.shutter_mode).await);
-        let shutter_open_delay = self.get_f64(self.ad.shutter_open_delay).await;
-        let shutter_close_delay = self.get_f64(self.ad.shutter_close_delay).await;
+impl Mar345Driver {
+    /// C `writeServer`: flush stale input, write with `MAR345_SOCKET_TIMEOUT`,
+    /// then publish the command on `ADStringToServer`.
+    pub fn write_server(&mut self, output: &str) -> CamStatus {
+        let _ = self
+            .server
+            .submit_blocking(RequestOp::Flush, AsynUser::default().with_addr(SERVER_ADDR));
 
-        match mode {
-            Some(ShutterMode::DetectorOnly) => {
-                if open {
-                    self.write_server(CMD_SHUTTER_OPEN).await;
-                    // Correct the exposure time: opening minus closing time,
-                    // floored at 1 ms so the delay is never negative and the
-                    // commands are not back-to-back.
-                    let mut delay = shutter_open_delay - shutter_close_delay;
-                    if delay < 0.001 {
-                        delay = 0.001;
-                    }
-                    rt::sleep(secs(delay)).await;
-                } else {
-                    self.write_server(CMD_SHUTTER_CLOSE).await;
-                    rt::sleep(secs(shutter_close_delay)).await;
-                }
-                // The mar345 does not report actual shutter status, so set it to
-                // agree with the control value.
-                self.set_i32(self.ad.shutter_status, i32::from(open));
-                self.callbacks().await;
+        let user = AsynUser::default()
+            .with_addr(SERVER_ADDR)
+            .with_timeout(secs(MAR345_SOCKET_TIMEOUT));
+        let status = match self.server.submit_blocking(
+            RequestOp::OctetWrite {
+                data: output.as_bytes().to_vec(),
+            },
+            user,
+        ) {
+            Ok(_) => CamStatus::Success,
+            Err(e) => {
+                // On pasynUserServer, so the server port's trace mask gates it.
+                self.server.trace().output(
+                    self.server.port_name(),
+                    TraceMask::ERROR,
+                    &format!(
+                        "mar345:writeServer, status={}, sent\n{output}",
+                        e.status() as i32
+                    ),
+                );
+                classify(&e)
             }
-            // Base ADDriver::setShutter: EPICS-controlled shutter.
-            Some(ShutterMode::EpicsOnly) => {
-                self.set_i32(self.ad.shutter_control_epics, i32::from(open));
-                self.callbacks().await;
-                let delay = shutter_open_delay - shutter_close_delay;
-                if delay > 0.0 {
-                    rt::sleep(secs(delay)).await;
-                }
-            }
-            // ADShutterModeNone or unknown: nothing to do.
-            Some(ShutterMode::None) | None => {}
-        }
+        };
+
+        let base = &mut self.ad.port_base;
+        let _ = base.set_string_param(self.ad.params.string_to_server, 0, output);
+        let _ = base.call_param_callbacks(0);
+        status
+    }
+
+    /// `mar345::setShutter`'s detector branch (mar345.cpp:372-396).
+    pub(crate) fn set_detector_shutter(&mut self, open: bool) {
+        let ad = self.ad.params;
+        let base = &self.ad.port_base;
+        let shutter_open_delay = base
+            .get_float64_param(ad.shutter_open_delay, 0)
+            .unwrap_or(0.0);
+        let shutter_close_delay = base
+            .get_float64_param(ad.shutter_close_delay, 0)
+            .unwrap_or(0.0);
+        let (command, delay) = if open {
+            // Correct the exposure time: opening minus closing time, floored
+            // at 1 ms so the delay is never negative and the commands are not
+            // back-to-back.
+            (
+                CMD_SHUTTER_OPEN,
+                (shutter_open_delay - shutter_close_delay).max(0.001),
+            )
+        } else {
+            (CMD_SHUTTER_CLOSE, shutter_close_delay)
+        };
+        self.write_server(command);
+        std::thread::sleep(secs(delay));
+        // The mar345 does not report actual shutter status, so set it to agree
+        // with the control value.
+        let base = &mut self.ad.port_base;
+        let _ = base.set_int32_param(ad.shutter_status, 0, i32::from(open));
+        let _ = base.call_param_callbacks(0);
     }
 }

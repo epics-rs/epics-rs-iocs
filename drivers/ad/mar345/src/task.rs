@@ -3,9 +3,9 @@
 //!
 //! `mar345.cpp` runs all of this on one `mar345Task` thread under the driver
 //! lock, woken by the start event and told what to do by the shared `mode`. This
-//! port keeps that structure: [`Worker`] owns the [`Server`] and does every
-//! socket round-trip and file read; the [`crate::driver::Mar345Driver`] running
-//! in the port actor only sets `mode` and signals the events.
+//! port keeps that structure: [`Worker`] owns the [`Server`], writes to
+//! marServer on the driver (the port actor, C's lock) and reads with no lock
+//! held, as C's `readServer` does.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -405,20 +405,6 @@ impl Worker {
             self.server.callbacks().await;
         }
     }
-}
-
-/// C runs `mar345::setShutter` (mar345.cpp:361-399) on the `writeInt32`
-/// caller; here it runs on a thread with its own marServer handle, so the
-/// port thread never waits on its own request queue.
-pub(crate) fn start_shutter_task(
-    mut server: Server,
-    mut rx: rt::CommandReceiver<bool>,
-) -> std::thread::JoinHandle<()> {
-    rt::run_thread_named("mar345Shutter", move || async move {
-        while let Some(open) = rx.recv().await {
-            server.set_shutter(open).await;
-        }
-    })
 }
 
 /// Spawn the `mar345Task` worker thread.
