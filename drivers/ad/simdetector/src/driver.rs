@@ -9,6 +9,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
@@ -185,6 +186,7 @@ impl PortDriver for SimDetector {
                 .set_int32_param(reason, user.addr, value)?;
         }
 
+        let mut status = Ok(());
         if reason == p.acquire {
             if value != 0 && !acquiring {
                 let _ = self.start_tx.try_send(Signal);
@@ -193,41 +195,77 @@ impl PortDriver for SimDetector {
                 let _ = self.stop_tx.try_send(Signal);
             }
         } else if sim.int32_write_dirties_image(reason, &p) {
-            self.ad.port_base.set_int32_param(sim.reset_image, 0, 1)?;
+            status = self.ad.port_base.set_int32_param(sim.reset_image, 0, 1);
         } else if !sim.owns(reason) {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            if reason == p.shutter_control {
-                self.set_shutter(value != 0)?;
+            status = if reason == p.shutter_control {
+                self.set_shutter(value != 0)
             } else {
-                self.ad.write_int32_pool(reason, value)?;
-            }
+                self.ad.write_int32_pool(reason, value).map(drop)
+            };
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "simDetector:writeInt32 error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("simDetector:writeInt32: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 
     /// `simDetector::writeFloat64` (simDetector.cpp:965-993).
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         if self
             .sim
             .float64_write_dirties_image(reason, self.ad.params.gain)
         {
-            self.ad
+            status = self
+                .ad
                 .port_base
-                .set_int32_param(self.sim.reset_image, 0, 1)?;
+                .set_int32_param(self.sim.reset_image, 0, 1);
         }
         // Otherwise C calls `ADDriver::writeFloat64`, which neither ADDriver nor
         // asynNDArrayDriver override: asynPortDriver::writeFloat64 only sets the
         // parameter (done above) and fires callbacks (done below).
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "simDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("simDetector:writeFloat64: function={reason}, value={value:.6}"),
+            ),
+        }
+        status
     }
 }
 
