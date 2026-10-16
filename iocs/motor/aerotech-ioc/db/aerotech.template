@@ -1,6 +1,5 @@
-# Aerotech Ensemble: one motor record per axis. Load once per axis, matching an
-# axis found by EnsembleAsynConfig. DTYP is ENSEMBLE_$(CTRL)_$(AXIS), where AXIS
-# is the controller axis number.
+# Aerotech Ensemble: one motor record per axis, ADDR the index of the axis in
+# the order EnsembleAsynConfig found it, on the drvAsynMotorConfigure port PORT.
 #
 # The driver works in the Ensemble's user units (the C stepSize = 1/CountsPerUnit
 # scaling cancels at the EGU boundary) and EGU is whatever the controller's
@@ -10,7 +9,8 @@
 # those user units per second / per second^2.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "ENSEMBLE_$(CTRL)_$(AXIS)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10.0)")
     field(ACCL, "$(ACCL=0.2)")

@@ -9,7 +9,7 @@
 #============================================================
 
 epicsEnvSet("P",      "oms:")
-epicsEnvSet("CTRL",   "mxaPort")
+epicsEnvSet("PORT",   "MXA1")
 epicsEnvSet("IPPORT", "mxaAsyn")
 epicsEnvSet("HOST",   "192.168.1.31:5001")
 
@@ -23,11 +23,10 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\n\r")
 
 # ---- MXA controller ----
-# omsMXAConfig(controllerName, asynPort, [initString], [movingPollMs],
-#              [idlePollMs], [timeoutMs]).
-omsMXAConfig("$(CTRL)", "$(IPPORT)", "", 100, 1000, 2000)
+# omsMXAConfig(portName, numAxes, serialPortName, movingPollPeriod,
+#              idlePollPeriod, initString).
+omsMXAConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "")
 
-omsCreateAxis("$(CTRL)", 0)
-dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,PORT=$(PORT),ADDR=0")
 
 iocInit()

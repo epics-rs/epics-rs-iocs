@@ -26,6 +26,7 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use opcua::client::AsyncOpcuaConnector;
 use opcua::defaults;
 use opcua::device_support;
@@ -33,6 +34,109 @@ use opcua::ioc::{self, SharedRegistry};
 use opcua::registry::Registry;
 use opcua::session::{Control, SessionConfig};
 use opcua::subscription::SubscriptionConfig;
+
+/// `devOpcuaSup/10_devOpcuaInt64.dbd` and `20_devOpcuaAll.dbd`'s `device()` lines.
+static DEVICES: &[(&str, &[DevSup])] = &[
+    (
+        "longin",
+        &[row("devLiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "longout",
+        &[row("devLoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "bi",
+        &[row("devBiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "bo",
+        &[row("devBoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "mbbi",
+        &[row("devMbbiOpcua", device_support::DTYP, 6, &[1, 2, 3, 4])],
+    ),
+    (
+        "mbbo",
+        &[row("devMbboOpcua", device_support::DTYP, 6, &[1, 2, 3, 4])],
+    ),
+    (
+        "mbbiDirect",
+        &[row(
+            "devMbbiDirectOpcua",
+            device_support::DTYP,
+            6,
+            &[1, 2, 3, 4],
+        )],
+    ),
+    (
+        "mbboDirect",
+        &[row(
+            "devMbboDirectOpcua",
+            device_support::DTYP,
+            6,
+            &[1, 2, 3, 4],
+        )],
+    ),
+    (
+        "ai",
+        &[row("devAiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "ao",
+        &[row("devAoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "stringin",
+        &[row("devSiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "stringout",
+        &[row("devSoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "lsi",
+        &[row("devLsiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "lso",
+        &[row("devLsoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "waveform",
+        &[row("devWfOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "aai",
+        &[row("devAaiOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "aao",
+        &[row("devAaoOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "int64in",
+        &[row("devInt64inOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "int64out",
+        &[row("devInt64outOpcua", device_support::DTYP, 6, &[1, 3, 4])],
+    ),
+    (
+        "opcuaItem",
+        &[row("devItemOpcua", device_support::DTYP, 6, &[3, 4])],
+    ),
+];
+
+const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
+    DevSup {
+        name,
+        choice,
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(number, funcs, false),
+    }
+}
 
 /// How many `key=value` option slots each option-taking command declares.
 ///
@@ -407,7 +511,7 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(name, factory);
 
     // Every record type's `@opcua(...)` link binds through this.
-    app = app.register_dynamic_device_support(device_support::factory(registry.clone()));
+    app = app.register_dynamic_device_support(DEVICES, device_support::factory(registry.clone()));
 
     app = commands(app, &registry, &connector);
 

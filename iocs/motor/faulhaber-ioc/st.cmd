@@ -15,7 +15,6 @@ epicsEnvSet("SERIAL", "SERIAL1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 # Encoder counts per revolution (matches the motor's encoder; also programs the
 # controller via ENCRES and scales velocity/acceleration).
-epicsEnvSet("CPR",    "3000")
 
 # ---- serial octet port ----
 drvAsynSerialPortConfigure("$(SERIAL)", "$(TTY)")
@@ -32,19 +31,19 @@ asynOctetSetInputEos("$(SERIAL)", 0, "\r")
 asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MCDC2805 controller ----
-# MCDC2805Setup(maxControllers, [scanRate]) is accepted for startup-script
-# parity; the asyn-rs port allocates per MCDC2805Config call.
+# MCDC2805Setup(num_cards, scan_rate in Hz)
 MCDC2805Setup(1, 10)
 
-# MCDC2805Config(card, numMotors, asynPort, countsPerRev, [movingPollMs], [idlePollMs])
-MCDC2805Config(0, 2, "$(SERIAL)", $(CPR), 100, 1000)
+# MCDC2805Config(card, # modules on the port, asyn port)
+MCDC2805Config(0, 2, "$(SERIAL)")
 
-# One motor record per node (DTYP MCDC2805_$(CARD)_0, _1, ...).
+# One motor record per node (DTYP "MCDC2805", OUT #C$(CARD) S0, S1, ...).
 # The MCDC2805 is a DC servo working in encoder counts: positions travel the
 # driver boundary in counts, so MRES = 1 and EGU = counts. VELO/ACCL are
-# converted to the controller's rev/min and rev/s^2 using countsPerRev.
-dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+# converted to the controller's rev/min and rev/s^2 using the record's
+# default SREV (200).
+dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m1,C=$(CARD),S=0")
+dbLoadRecords("$(FAULHABER_IOC)/db/mcdc2805.template", "P=$(P),M=m2,C=$(CARD),S=1")
 
 iocInit()
 

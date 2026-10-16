@@ -38,7 +38,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -222,6 +222,12 @@ impl Mvp2001Axis {
 }
 
 impl AsynMotor for Mvp2001Axis {
+    /// C `MVP2001Axis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (MVP2001Driver.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

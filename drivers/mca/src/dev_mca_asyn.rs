@@ -464,7 +464,7 @@ static MCA_DEVICES: [DevSup; 2] = [DEV_MCA_SOFT, DEV_MCA_ASYN];
 /// Put mca's `mcaSupport.dbd` devList in the DTYP menu and bind it.
 pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
     register_dbd_devices("mca", &MCA_DEVICES);
-    app.register_dynamic_device_support(mca_device_support)
+    app.register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
 }
 
 /// `"Soft Channel"` is every record type's choice, and a dynamic factory
@@ -714,7 +714,7 @@ record(mca, "MCASOFT") {
             let (name, factory) = mca_rs::mca_record_factory();
             let (db, _) = IocBuilder::new()
                 .register_record_type(name, factory)
-                .register_dynamic_device_support(mca_device_support)
+                .register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
                 .db_string(db, &HashMap::new())
                 .unwrap()
                 .build()

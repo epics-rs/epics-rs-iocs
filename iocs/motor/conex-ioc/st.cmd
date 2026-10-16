@@ -32,10 +32,10 @@ asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- CONEX controller ----
-# AG_CONEXCreateController(motorPort, serialPort, controllerID, [movingPollMs], [idlePollMs])
+# AG_CONEXCreateController(portName, serialPort, controllerID, movingPollPeriod, idlePollPeriod)
 AG_CONEXCreateController("$(PORT)", "$(SERIAL)", $(CID), 100, 1000)
 
-dbLoadRecords("$(CONEX_IOC)/db/conex.template", "P=$(P),M=$(M),PORT=$(PORT),EGU=mm")
+dbLoadRecords("$(CONEX_IOC)/db/conex.template", "P=$(P),M=$(M),PORT=$(PORT),ADDR=0,EGU=mm")
 
 iocInit()
 

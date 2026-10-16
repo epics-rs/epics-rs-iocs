@@ -10,7 +10,7 @@
 #============================================================
 
 epicsEnvSet("P",      "ANC150:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "ANC150")
 epicsEnvSet("SERIAL", "SERIAL1")
 epicsEnvSet("TTY",    "/dev/ttyUSB0")
 
@@ -24,20 +24,20 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- ANC150 controller ----
-# ANC150AsynSetup(maxControllers) is accepted for startup-script parity; the
-# asyn-rs port allocates per ANC150AsynConfig call.
 ANC150AsynSetup(1)
 
-# ANC150AsynConfig(card, asynPort, numAxes, [movingPollMs], [idlePollMs])
+# ANC150AsynConfig(card, portName, numAxes, movingPollPeriod, idlePollPeriod),
+# periods in ms; then the axes of card 0 become asyn port $(CTRL).
 ANC150AsynConfig(0, "$(SERIAL)", 3, 100, 1000)
+drvAsynMotorConfigure("$(CTRL)", "motorANC150", 0, 3)
 
-# One motor record per axis (DTYP ANC150_$(CARD)_0, _1, _2).
+# One motor record per axis, ADDR the 0-based axis index.
 # The ANC150 is an open-loop stepper: positions travel the driver boundary in
 # steps (EGU = steps), so MRES is 1. The record's velocity/acceleration have no
 # effect — the step rate is a controller setting read with 'getf'.
-dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
+dbLoadRecords("$(ATTOCUBE_IOC)/db/anc150.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
 
 iocInit()
 

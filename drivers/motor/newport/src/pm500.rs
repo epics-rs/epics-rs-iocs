@@ -10,9 +10,8 @@
 //! after *every* command message (`cmnd_response = true`) — this port does
 //! the same via `Pm500Controller::command`.
 //!
-//! The C example st.cmd sets no EOS (GPIB-era, EOI-terminated); for RS-232
-//! this driver owns framing like its siblings (appends `\r`) and expects
-//! `asynOctetSetInputEos("\r")` in st.cmd.
+//! Commands go out bare (the C driver sets no EOS); the port EOS `"\r"` both
+//! ways comes from the startup script, as in C's Newport_PM500.iocsh:22-23.
 //!
 //! ## Units
 //!
@@ -39,7 +38,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -47,9 +46,6 @@ use crate::util::{atof, max_digits};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
-
-/// Command line terminator (`ENAINT` bit 7: CR-only framing).
-const TERMINATOR: &[u8] = b"\r";
 
 /// Axis letters, in controller channel order (C `PM500_axis_names`,
 /// `PM500_NUM_CHANNELS` 12).
@@ -96,8 +92,9 @@ impl Pm500Controller {
     /// `SCUM 1` mode, configure `SENAINT $AF` framing, probe `SVN?` for the
     /// identity, then discover axes by querying `{letter}STAT?` for each of
     /// the 12 channel letters until one answers with an error (`E` at reply
-    /// byte 1). Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    /// byte 1). `None` is C's silently disabled controller: no `SVN?`
+    /// reply. Performs blocking serial I/O.
+    pub fn new(handle: SyncIOHandle) -> Option<Self> {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
@@ -109,11 +106,8 @@ impl Pm500Controller {
         let _ = ctrl.exchange("SENAINT $AF");
 
         // Identity probe (C sends SVN? twice: existence check, then read).
-        let probe = ctrl.command("SVN?").unwrap_or_default();
-        if probe.is_empty() {
-            return Err(pm_err(
-                "PM500: no response to SVN? identity query".to_string(),
-            ));
+        if ctrl.command("SVN?").unwrap_or_default().is_empty() {
+            return None;
         }
         let ident = ctrl.command("SVN?").unwrap_or_default();
         ctrl.ident = ident.get(2..).unwrap_or("").to_string(); // skip "XD"
@@ -129,7 +123,7 @@ impl Pm500Controller {
             }
         }
         ctrl.num_axes = num_axes;
-        Ok(ctrl)
+        Some(ctrl)
     }
 
     /// Identity string from `SVN?` (the 2-byte echo prefix stripped).
@@ -142,17 +136,10 @@ impl Pm500Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command message and read its reply (C `send_mess`, which
     /// flushes stale input first, + `recv_mess`).
     fn exchange(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
@@ -215,6 +202,13 @@ impl Pm500Axis {
 }
 
 impl AsynMotor for Pm500Axis {
+    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` (drvPM500.cc). Its first failure's silent RETRY is not modelled:
+    /// a transport error raises both at once.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -413,6 +407,44 @@ impl AsynMotor for Pm500Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line that never answers.
+    struct Silent(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for Silent {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
+            Err(pm_err("timeout".into()))
+        }
+    }
+
+    /// C `motor_init` drops a controller whose `SVN?` goes unanswered
+    /// (drvPM500.cc:577, :671-672).
+    #[test]
+    fn a_silent_ident_creates_no_controller() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+        use std::time::Duration;
+
+        let line = Silent(PortDriverBase::new("pm500_silent", 1, PortFlags::default()));
+        let (rt, _jh) = create_port_runtime(
+            &claim_port("pm500_silent").unwrap(),
+            line,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        assert!(Pm500Controller::new(io).is_none());
+    }
 
     #[test]
     fn firmware_lookup_matches_c_table() {

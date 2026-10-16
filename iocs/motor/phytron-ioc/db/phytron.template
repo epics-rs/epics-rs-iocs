@@ -1,6 +1,5 @@
-# Phytron: one motor record per axis. Load once per axis, matching the
-# phytronCreateAxis(controllerName, MODULE, INDEX) call. DTYP is
-# PHYTRON_$(CTRL)_$(MODULE)_$(INDEX).
+# Phytron: one motor record per axis. Load once per axis with PORT the
+# controllerName and ADDR = module*10 + index of its phytronCreateAxis call.
 #
 # The driver reports motor and encoder positions in controller-native steps
 # (there is no resolution factor to cancel), so MRES = 1 and EGU = steps.
@@ -8,7 +7,8 @@
 # ranges (velocity 1..500000, acceleration 4000..500000 steps/s^2).
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PHYTRON_$(CTRL)_$(MODULE)_$(INDEX)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000.0)")
     field(ACCL, "$(ACCL=0.2)")

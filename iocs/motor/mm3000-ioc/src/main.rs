@@ -1,7 +1,7 @@
 //! Newport MM3000 motor IOC.
 //!
 //! Assembles: a serial octet port (`drvAsynSerialPortConfigure`), the Newport
-//! MM3000 controller (`MM3000CreateController`, which reads the axis
+//! MM3000 controller (`MM300Setup`/`MM3000Config`, which reads the axis
 //! configuration), the motor record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_newport::NewportHolder;
+use motor_newport::ioc::{mm3000_config_command, mm3000_setup_command};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -36,10 +36,13 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // MM3000CreateController command + motor device support.
-    let holder = NewportHolder::new();
-    app = app.register_startup_command(holder.mm3000_create_controller_command());
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    // Newport iocsh commands + motor device support.
+    app = app.register_startup_command(mm3000_setup_command());
+    app = app.register_startup_command(mm3000_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

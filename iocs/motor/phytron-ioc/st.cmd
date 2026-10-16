@@ -23,16 +23,16 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\x03")
 
 # ---- phyMOTION controller ----
-# phytronCreatePhymotion(controllerName, asynPort, [movingPollMs], [idlePollMs],
-#                        [timeoutMs], [noResetAtBoot]).
+# phytronCreateController(controllerName, asynPort, movingPollPeriod,
+#                         idlePollPeriod, timeout, noResetAtBoot), all in ms.
 # noResetAtBoot=1 skips the boot reset (a reset waits ~5 s, then polls the
 # controller for up to 120 s). Pass 0 to reset the controller at boot like C.
-phytronCreatePhymotion("$(CTRL)", "$(IPPORT)", 100, 1000, 1000, 1)
+phytronCreateController("$(CTRL)", "$(IPPORT)", 100, 1000, 1000, 1)
 
 # One axis per I1AM01 module.index: phytronCreateAxis(controllerName, module,
-# index). Load one motor record per axis with matching MODULE/INDEX.
+# index). Load one motor record per axis with ADDR = module*10 + index.
 phytronCreateAxis("$(CTRL)", 1, 1)
-dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,CTRL=$(CTRL),MODULE=1,INDEX=1")
+dbLoadRecords("$(PHYTRON_IOC)/db/phytron.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=11")
 
 iocInit()
 

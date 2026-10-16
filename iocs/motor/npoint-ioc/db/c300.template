@@ -1,5 +1,5 @@
-# nPoint C300: one motor record per axis. Load once per axis with N = 0-based
-# axis index (DTYP C300_$(CARD)_$(N)); the driver maps index 0,1,2 to CHAN1,2,3.
+# nPoint C300: one motor record per axis. Load once per axis with ADDR = 0-based
+# axis index of port PORT; the driver maps index 0,1,2 to CHAN1,2,3.
 #
 # The C300 is a setpoint controller: a move writes the target position and done
 # is simulated from the theoretical-vs-encoder error (tolerance 256 native
@@ -7,7 +7,8 @@
 # so MRES = 1. There is no speed/acceleration, no limits and no home switch.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "C300_$(CARD)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.2)")

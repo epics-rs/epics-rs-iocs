@@ -45,7 +45,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -173,6 +173,12 @@ impl C300Axis {
 }
 
 impl AsynMotor for C300Axis {
+    /// C `C300Axis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (C300MotorDriver.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

@@ -10,7 +10,7 @@
 #============================================================
 
 epicsEnvSet("P",        "acs:")
-epicsEnvSet("CARD",     "0")
+epicsEnvSet("MCB4B",    "MCB4B1")
 epicsEnvSet("PORT",     "serial1")
 epicsEnvSet("TTY",      "/dev/ttyUSB0")
 epicsEnvSet("NUM_AXES", "4")
@@ -32,16 +32,16 @@ asynOctetSetInputEos( "$(PORT)", -1, "\r")
 asynOctetSetOutputEos("$(PORT)", -1, "\r")
 
 # ---- ACS MCB-4B controller ----
-# MCB4BCreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
-# card is the DTYP prefix (MCB4B_{card}_{index}); axes are 0-based, matching the
-# C "#%02d" wire prefix.
-MCB4BCreateController($(CARD), "$(PORT)", $(NUM_AXES), 100, 1000)
+# MCB4BCreateController(portName, MCB4BPortName, numAxes, movingPollPeriod,
+# idlePollPeriod), poll periods in ms. Axes are 0-based, matching the C "#%02d"
+# wire prefix.
+MCB4BCreateController("$(MCB4B)", "$(PORT)", $(NUM_AXES), 100, 1000)
 
 # One motor record per axis (the MCB-4B works in raw controller steps, MRES=1).
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m0,CARD=$(CARD),AXIS=0")
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m1,CARD=$(CARD),AXIS=1")
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m2,CARD=$(CARD),AXIS=2")
-dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m3,CARD=$(CARD),AXIS=3")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m0,PORT=$(MCB4B),ADDR=0")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m1,PORT=$(MCB4B),ADDR=1")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m2,PORT=$(MCB4B),ADDR=2")
+dbLoadRecords("$(MCB4B_IOC)/db/mcb4b.template", "P=$(P),M=m3,PORT=$(MCB4B),ADDR=3")
 
 iocInit()
 

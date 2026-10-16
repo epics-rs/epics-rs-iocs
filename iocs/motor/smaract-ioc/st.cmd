@@ -14,7 +14,7 @@
 #============================================================
 
 epicsEnvSet("P",      "MCS2:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "MCS2_1")
 epicsEnvSet("IPPORT", "MCS2")
 epicsEnvSet("HOST",   "192.168.1.200:55551")
 epicsEnvSet("NAXES",  "3")
@@ -23,15 +23,16 @@ epicsEnvSet("NAXES",  "3")
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
 # ---- MCS2 controller ----
-# MCS2CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
-MCS2CreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
+# MCS2CreateController(portName, MCS2PortName, numAxes, movingPollPeriod,
+#                      idlePollPeriod, unusedMask), periods in ms.
+MCS2CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000, 0)
 
-# One motor record per channel (DTYP MCS2_$(CARD)_0, _1, _2). The driver reports
+# One motor record per channel, ADDR the channel. The driver reports
 # positions in nanometres (linear) / micro-degrees (rotary), so MRES = 1 and
 # EGU = nm.
-dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
+dbLoadRecords("$(SMARACT_IOC)/db/mcs2.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
 
 iocInit()
 

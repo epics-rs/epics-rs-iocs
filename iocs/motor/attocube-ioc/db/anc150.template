@@ -1,6 +1,6 @@
-# attocube ANC150: one motor record per axis. Load once per axis with
-# N = 0-based axis index (DTYP ANC150_$(CARD)_$(N)); the driver maps index
-# 0,1,2,... to controller axes 1,2,3,...
+# attocube ANC150: one motor record per axis, ADDR the 0-based axis index on
+# the drvAsynMotorConfigure port PORT; the driver maps index 0,1,2,... to
+# controller axes 1,2,3,...
 #
 # The ANC150 is an OPEN-LOOP stepper with no position readback: the driver
 # tracks position in steps and estimates move completion from a timer. Positions
@@ -10,7 +10,8 @@
 # limit switches are not supported.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "ANC150_$(CARD)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000.0)")
     field(ACCL, "$(ACCL=0.5)")

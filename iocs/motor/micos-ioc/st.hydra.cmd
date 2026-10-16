@@ -9,7 +9,7 @@
 #============================================================
 
 epicsEnvSet("P",      "micos:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "MICOS1")
 epicsEnvSet("IPPORT", "hydraPort")
 epicsEnvSet("NAXES",  "2")
 
@@ -23,14 +23,14 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
 asynOctetSetOutputEos("$(IPPORT)", 0, "\r\n")
 
 # ---- hydra controller ----
-# SMChydraCreateController(card, hydraPort, numAxes, [movingPollMs], [idlePollMs]).
-SMChydraCreateController(0, "$(IPPORT)", $(NAXES), 100, 500)
+# SMChydraCreateController(portName, hydraPort, numAxes, movingPollPeriod, idlePollPeriod).
+SMChydraCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 500)
 
-# One motor record per axis (DTYP HYDRA_$(CARD)_0, _1). The driver reports
+# One motor record per axis (OUT @asyn($(CTRL),axis)). The driver reports
 # positions in controller-native engineering units; the template's MRES is the
 # record step.
-dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
 
 iocInit()
 

@@ -1,12 +1,13 @@
-# Simulated motor: one motor record per axis. Load once per axis with
-# N = 0-based axis index (DTYP motorSim_$(PORT)_$(N)). The simulator is
+# Simulated motor: one motor record per axis, ADDR the axis of controller
+# PORT as in C's basic_asyn_motor.db. The simulator is
 # unitless — positions and velocities are dimensionless record EGU, so EGU is
 # arbitrary. MRES is the record's step (RRBV is an integer count); the default
 # is the C example's (motorSim.substitutions). VELO/ACCL map straight onto the
 # trajectory's Vmax/Amax.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "motorSim_$(PORT)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=5.0)")
     field(ACCL, "$(ACCL=0.5)")

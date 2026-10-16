@@ -1,8 +1,8 @@
 //! Newport ESP100/ESP300/ESP301 motor IOC.
 //!
 //! Assembles: a serial octet port (`drvAsynSerialPortConfigure`), the Newport
-//! ESP300 controller (`ESP300CreateController`, which discovers the axis
-//! count), the motor record type, and the CA + PVA (QSRV) server.
+//! ESP300 controller (`ESP300Setup`/`ESP300Config`, which discovers the
+//! axes), the motor record type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p esp300-ioc -- st.cmd
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_newport::NewportHolder;
+use motor_newport::ioc::{esp300_config_command, esp300_setup_command};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -36,10 +36,13 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // ESP300CreateController command + motor device support.
-    let holder = NewportHolder::new();
-    app = app.register_startup_command(holder.esp300_create_controller_command());
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    // Newport iocsh commands + motor device support.
+    app = app.register_startup_command(esp300_setup_command());
+    app = app.register_startup_command(esp300_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

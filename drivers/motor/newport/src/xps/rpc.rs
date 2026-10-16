@@ -28,9 +28,13 @@
 //! register a plain `drvAsynIPPort` per socket.
 
 use std::fmt;
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use crate::util::{atof, atoi};
 
@@ -71,6 +75,17 @@ impl fmt::Display for XpsError {
 }
 
 impl std::error::Error for XpsError {}
+
+impl XpsError {
+    /// The `int` C's wrapper returns: the controller's code, or the `ret = -1`
+    /// it keeps when `SendAndReceive` left no reply to `sscanf`.
+    pub fn code(&self) -> i32 {
+        match self {
+            XpsError::Transport(_) => -1,
+            XpsError::Api(code) => *code,
+        }
+    }
+}
 
 impl From<AsynError> for XpsError {
     fn from(e: AsynError) -> Self {
@@ -177,13 +192,35 @@ pub enum SocketMode {
 /// [`Fire`]: SocketMode::Fire
 pub struct XpsSocket {
     handle: SyncIOHandle,
+    /// The same port at timeout 0, for [`read_pending`](Self::read_pending).
+    pending: SyncIOHandle,
+    /// The asyn port `handle` is connected to: C prints its `SendAndReceive`
+    /// errors on that port's user.
+    port: String,
     mode: SocketMode,
 }
 
 impl XpsSocket {
-    /// Wrap an already-connected octet handle with the given send mode.
-    pub fn new(handle: SyncIOHandle, mode: SocketMode) -> Self {
-        Self { handle, mode }
+    /// Wrap the connected octet port `handle`, named `port`, with the given
+    /// send mode and per-call timeout.
+    pub fn new(handle: PortHandle, port: &str, mode: SocketMode, timeout: Duration) -> Self {
+        Self {
+            pending: SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
+            handle: SyncIOHandle::from_handle(handle, 0, timeout),
+            port: port.to_string(),
+            mode,
+        }
+    }
+
+    /// `asynPrint(psock->pasynUser, ASYN_TRACE_ERROR, ...)`.
+    fn trace_error(&self, args: fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
     }
 
     /// Send a marshalled command and return its reply. The socket's [`mode`]
@@ -205,6 +242,22 @@ impl XpsSocket {
         }
     }
 
+    /// C `ReadXPSSocket(socket, ..., 0)`: whatever reply is already waiting,
+    /// read until the terminator or the first read that does not succeed.
+    /// Returns the byte count.
+    pub fn read_pending(&self) -> usize {
+        let mut buf = Vec::new();
+        while !buf.ends_with(XPS_TERMINATOR.as_bytes()) && buf.len() < MAX_REPLY {
+            match self.pending.read_octet(OCTET_REASON, READ_BUF) {
+                // A zero-byte success is the peer closing; C's next read
+                // fails on the closed socket.
+                Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        buf.len()
+    }
+
     /// This socket's send mode.
     pub fn mode(&self) -> SocketMode {
         self.mode
@@ -220,7 +273,14 @@ impl XpsSocket {
         // write; only the continuation chunks are plain reads.
         let mut buf = self
             .handle
-            .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)?;
+            .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+            .inspect_err(|e| {
+                self.trace_error(format_args!(
+                    "SendAndReceive error calling writeRead, output={cmd} status={}, error={}",
+                    e.status() as i32,
+                    e.message()
+                ))
+            })?;
         while !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
             let chunk = self.handle.read_octet(OCTET_REASON, READ_BUF)?;
             buf.extend_from_slice(&chunk);
@@ -255,17 +315,31 @@ impl XpsSocket {
                 .handle
                 .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
             {
-                Err(AsynError::Status {
-                    status: AsynStatus::Timeout,
-                    ..
-                }) => return Ok(()),
-                Err(e) => return Err(XpsError::Transport(e)),
+                // write_read wraps its failure in the step that failed, so
+                // the timeout is read through `status()`.
+                Err(e) if e.status() == AsynStatus::Timeout => return Ok(()),
+                Err(e) => {
+                    // C prints only for asynError (asynOctetSocket.cpp:197).
+                    if e.status() == AsynStatus::Error {
+                        self.trace_error(format_args!(
+                            "SendAndReceive error calling write, output={cmd} status={}, error={}",
+                            e.status() as i32,
+                            e.message()
+                        ));
+                    }
+                    return Err(XpsError::Transport(e));
+                }
                 Ok(raw) => {
                     let reply = XpsReply(String::from_utf8_lossy(&raw).into_owned());
                     // The retry test is C's `atoi(valueRtrn)`; the verdict is the
                     // caller's `sscanf` on the reply it was left with.
-                    if atoi(&reply.0) == -1 {
-                        continue;
+                    match atoi(&reply.0) {
+                        -1 => continue,
+                        0 => {}
+                        _ => self.trace_error(format_args!(
+                            "SendAndReceive unexpected response ={}",
+                            reply.0
+                        )),
                     }
                     return match reply.code() {
                         0 => Ok(()),
@@ -403,6 +477,59 @@ mod tests {
         // exp 20 >= 13 → scientific.
         assert_eq!(format_g(1e20, 13), "1e+20");
         assert_eq!(format_g(1.25, 13), "1.25");
+    }
+
+    /// An XPS that takes every command and never answers.
+    struct Silent(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for Silent {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(
+            &mut self,
+            _user: &mut epics_rs::asyn::user::AsynUser,
+            data: &[u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(
+            &mut self,
+            _user: &epics_rs::asyn::user::AsynUser,
+            _buf: &mut [u8],
+        ) -> epics_rs::asyn::error::AsynResult<usize> {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "no reply".into(),
+            })
+        }
+    }
+
+    /// C `SendAndReceive` with a negative timeout: a move whose reply has
+    /// not come back yet is sent, not failed.
+    #[test]
+    fn a_fire_command_with_no_reply_yet_succeeds() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = "xps_fire_silent";
+        let (rt, _jh) = create_port_runtime(
+            &claim_port(port).unwrap(),
+            Silent(PortDriverBase::new(port, 1, PortFlags::default())),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let sock = XpsSocket::new(
+            rt.port_handle().clone(),
+            port,
+            SocketMode::Fire,
+            Duration::from_millis(100),
+        );
+        sock.group_move_absolute("G1.P1", 1.0).unwrap();
     }
 
     #[test]

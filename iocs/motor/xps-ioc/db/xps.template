@@ -6,7 +6,8 @@
 # default is the C example's (motor.substitutions.xps, 1/20480 mm).
 
 record(motor, "$(P)$(M0)") {
-    field(DTYP, "XPS_$(PORT)_0")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10.0)")
     field(ACCL, "$(ACCL=0.5)")

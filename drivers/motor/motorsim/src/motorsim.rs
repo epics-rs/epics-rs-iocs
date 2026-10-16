@@ -25,7 +25,7 @@
 use std::time::Instant;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::route::{Demand, Reroute, Route};
@@ -246,6 +246,11 @@ impl MotorSimAxis {
 }
 
 impl AsynMotor for MotorSimAxis {
+    /// C `motorSimAxis::poll` has no failure path.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

@@ -1,12 +1,13 @@
-# Newport ESP100/ESP300/ESP301: one motor record per axis. Load once per
-# discovered axis with N = 0-based axis index (DTYP ESP300_$(PORT)_$(N)).
+# Newport ESP100/ESP300/ESP301: one motor record per axis, signal S of card C
+# as in C's basic_motor.db; signal 0,1,2,... is controller axis 1,2,3,...
 # Positions travel the driver boundary in EGU (controller units, mm/deg per
 # the stage SN configuration) directly; MRES only sets the record's raw-count
 # resolution (display/deadband granularity). The motorNewport README's "set
 # MRES to drive resolution" rule applied to the C raw-step boundary only.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "ESP300_$(PORT)_$(N)")
+    field(DTYP, "ESP300")
+    field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.5)")

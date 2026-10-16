@@ -1,22 +1,24 @@
 //! Newport XPS motion controller IOC.
 //!
-//! Assembles: TCP octet ports (`drvAsynIPPortConfigure`) to the XPS — one shared
-//! poll socket plus one move socket per axis — an XPS controller
-//! (`XPSCreateController`) with its axes (`XPSCreateAxis`), the motor record
+//! Assembles: an XPS controller (`XPSCreateController`, which opens its TCP
+//! sockets from an IP address and port) with its axes (`XPSCreateAxis`), the motor record
 //! type, and the CA + PVA (QSRV) server.
 //!
 //! Usage:
 //!   cargo run -p xps-ioc -- st.cmd
-//!
-//! The XPS RPC reply framing (`,EndOfAPI`) is handled inside the driver, so the
-//! `st.cmd` only needs plain `drvAsynIPPortConfigure` ports.
 
 use std::sync::Arc;
 
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_newport::NewportHolder;
+use motor_newport::ioc::{
+    tclcall_command, xps_aux_config_command, xps_build_profile_command, xps_create_axis_command,
+    xps_create_controller_command, xps_create_profile_command, xps_define_profile_command,
+    xps_disable_auto_enable_command, xps_enable_moving_mode_command, xps_execute_profile_command,
+    xps_no_disable_error_command, xps_position_compare_command, xps_readback_profile_command,
+    xps_tcl_script_execute_command,
+};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -41,16 +43,24 @@ async fn main() -> CaResult<()> {
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // XPS controller + per-axis create commands + motor device support.
-    let holder = NewportHolder::new();
-    app = app.register_startup_command(holder.xps_create_controller_command());
-    app = app.register_startup_command(holder.xps_create_axis_command());
-    app = app.register_startup_command(holder.xps_tcl_script_execute_command());
-    app = app.register_startup_command(holder.xps_position_compare_command());
-    app = app.register_startup_command(holder.xps_define_profile_command());
-    app = app.register_startup_command(holder.xps_build_profile_command());
-    app = app.register_startup_command(holder.xps_execute_profile_command());
-    app = app.register_startup_command(holder.xps_readback_profile_command());
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(xps_create_controller_command());
+    app = app.register_startup_command(xps_create_axis_command());
+    app = app.register_startup_command(xps_create_profile_command());
+    app = app.register_startup_command(xps_disable_auto_enable_command());
+    app = app.register_startup_command(xps_no_disable_error_command());
+    app = app.register_startup_command(xps_enable_moving_mode_command());
+    app = app.register_startup_command(tclcall_command());
+    app = app.register_startup_command(xps_aux_config_command());
+    app = app.register_startup_command(xps_tcl_script_execute_command());
+    app = app.register_startup_command(xps_position_compare_command());
+    app = app.register_startup_command(xps_define_profile_command());
+    app = app.register_startup_command(xps_build_profile_command());
+    app = app.register_startup_command(xps_execute_profile_command());
+    app = app.register_startup_command(xps_readback_profile_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

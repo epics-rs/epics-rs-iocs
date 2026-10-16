@@ -36,7 +36,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -65,6 +65,9 @@ pub enum ConexModel {
     Dl,
     /// FCL200 (positions in mm).
     Fcl200,
+    /// Firmware matched no model. C returns from the axis constructor with
+    /// `conexModel_` unset and keeps polling; here it matches no model gate.
+    Unknown,
 }
 
 /// Closed-loop gain maxima used to scale the 0..=1 motor-record gains onto the
@@ -106,7 +109,7 @@ impl ConexModel {
     /// CC/PP/FCL200/DL accept the `AC`/`VA` accel+velocity preamble on a move;
     /// AGP does not (C `AG_CONEXAxis::move`).
     fn supports_velocity(self) -> bool {
-        !matches!(self, Self::Agp)
+        !matches!(self, Self::Agp | Self::Unknown)
     }
 
     /// PID gain commands apply only to AGP/CC/DL (C `setPGain`/`setIGain`/
@@ -162,6 +165,8 @@ fn compute_step_size(
         ConexModel::Dl => 0.0001,
         // CONEX-PP.
         ConexModel::Pp => full_step_size / micro_steps_per_full_step as f64 / 1000.0,
+        // C never computes stepSize_ for an unknown model.
+        ConexModel::Unknown => 0.0,
     }
 }
 
@@ -306,29 +311,48 @@ impl ConexAxis {
     /// sequence (version → model → stage/encoder/limit queries → step size).
     ///
     /// Performs blocking serial I/O; call it where that is acceptable (the
-    /// iocsh create command, at IOC init).
-    pub fn new(handle: SyncIOHandle, controller_id: i32) -> AsynResult<Self> {
-        // Firmware version → model. C reads `&inString_[4]` for the VE reply.
-        let version_resp = write_read_raw(&handle, &query(controller_id, "VE"))?;
+    /// iocsh create command, at IOC init). `None` only when `VE` fails.
+    pub fn new(handle: SyncIOHandle, controller_id: i32) -> Option<Self> {
+        // C writeReadController status is ignored past VE, and a failed read
+        // leaves an empty reply that atof reads as 0.
+        let reply =
+            |cmd: &str| write_read_raw(&handle, &query(controller_id, cmd)).unwrap_or_default();
+        let value_at = |cmd: &str, at: usize| parse_value_at(&reply(cmd), at).unwrap_or(0.0);
+
+        // Firmware version → model. C reads `&inString_[4]` for the VE reply
+        // and creates neither the axis nor the poller when VE fails.
+        let Ok(version_resp) = write_read_raw(&handle, &query(controller_id, "VE")) else {
+            eprintln!(
+                "AG_CONEXController::AG_CONEXController: cannot read version information from AG_CONEX controller"
+            );
+            return None;
+        };
         let version = version_resp.get(4..).unwrap_or("");
-        let model = ConexModel::from_version(version)
-            .ok_or_else(|| conex_err(format!("CONEX: unknown model, firmware=\"{version}\"")))?;
+        let Some(model) = ConexModel::from_version(version) else {
+            eprintln!("AG_CONEXAxis::AG_CONEXAxis: unknown model, firmware string={version}");
+            return Some(Self {
+                handle,
+                controller_id,
+                model: ConexModel::Unknown,
+                step_size: 0.0,
+                low_limit: 0.0,
+                high_limit: 0.0,
+            });
+        };
 
         // Stage ID: issued for wire fidelity (C stores it for report only).
-        let _ = write_read_raw(&handle, &query(controller_id, "ID?"))?;
+        let _ = reply("ID?");
 
         // Encoder increment (CC/AGP only), else 1.0.
         let encoder_increment = if model.is_cc_or_agp() {
-            parse_value_at(&write_read_raw(&handle, &query(controller_id, "SU?"))?, 3)
-                .ok_or_else(|| parse_error("SU?"))?
+            value_at("SU?", 3)
         } else {
             1.0
         };
 
         // Interpolation factor (AGP only), else 1.0.
         let interpolation_factor = if model == ConexModel::Agp {
-            parse_value_at(&write_read_raw(&handle, &query(controller_id, "IF?"))?, 3)
-                .ok_or_else(|| parse_error("IF?"))?
+            value_at("IF?", 3)
         } else {
             1.0
         };
@@ -337,12 +361,8 @@ impl ConexAxis {
         // `&inString_[4]` for the FRM?/FRS? replies.
         let (mut full_step_size, mut micro_steps_per_full_step) = (0.0, 0);
         if matches!(model, ConexModel::Pp | ConexModel::Fcl200) {
-            micro_steps_per_full_step =
-                parse_int_at(&write_read_raw(&handle, &query(controller_id, "FRM?"))?, 4)
-                    .ok_or_else(|| parse_error("FRM?"))?;
-            full_step_size =
-                parse_value_at(&write_read_raw(&handle, &query(controller_id, "FRS?"))?, 4)
-                    .ok_or_else(|| parse_error("FRS?"))?;
+            micro_steps_per_full_step = parse_int_at(&reply("FRM?"), 4).unwrap_or(0);
+            full_step_size = value_at("FRS?", 4);
         }
 
         let step_size = compute_step_size(
@@ -354,12 +374,10 @@ impl ConexAxis {
         );
 
         // Soft travel limits (already controller EGU).
-        let low_limit = parse_value_at(&write_read_raw(&handle, &query(controller_id, "SL?"))?, 3)
-            .ok_or_else(|| parse_error("SL?"))?;
-        let high_limit = parse_value_at(&write_read_raw(&handle, &query(controller_id, "SR?"))?, 3)
-            .ok_or_else(|| parse_error("SR?"))?;
+        let low_limit = value_at("SL?", 3);
+        let high_limit = value_at("SR?", 3);
 
-        Ok(Self {
+        Some(Self {
             handle,
             controller_id,
             model,
@@ -395,6 +413,12 @@ impl ConexAxis {
 }
 
 impl AsynMotor for ConexAxis {
+    /// C `AG_CONEXAxis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (AG_CONEX.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -573,6 +597,22 @@ mod tests {
         assert_eq!(
             ConexModel::from_version("CONEX-AGP DL"),
             Some(ConexModel::Agp)
+        );
+    }
+
+    #[test]
+    fn unknown_model_matches_no_model_gate() {
+        let m = ConexModel::Unknown;
+        assert!(!m.is_cc_or_agp() && !m.supports_velocity() && !m.supports_pid());
+        assert_eq!(compute_step_size(m, 1.0, 1.0, 1.0, 1), 0.0);
+        // Non-DL TS layout, no limit bits.
+        assert_eq!(
+            parse_ts(m, "1TS000028"),
+            Some(TsStatus {
+                done: false,
+                low_limit: false,
+                high_limit: false,
+            })
         );
     }
 

@@ -50,8 +50,10 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi};
@@ -191,19 +193,33 @@ impl ScuController {
         Self { handle }
     }
 
-    /// Send a command and read back its reply (every SCU command replies).
-    fn transact(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw)
-            .trim_matches(['\r', '\n', '\0', ' '])
-            .to_string())
+    /// Send a command and read back its reply (C `sendCmd`; every SCU
+    /// command replies).
+    fn transact(&self, io: &mut AxisIo, cmd: &str) -> AsynResult<String> {
+        match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
+            Ok(raw) => {
+                io.from_controller = String::from_utf8_lossy(&raw)
+                    .trim_matches(['\r', '\n', '\0', ' '])
+                    .to_string();
+                Ok(io.from_controller.clone())
+            }
+            Err(e) => {
+                // A failed writeRead leaves fromController_ holding the last reply.
+                io.print(format_args!(
+                    "ERROR: sendCmd: status={}, sent: {cmd}, received: {}\n",
+                    e.status() as i32,
+                    io.from_controller
+                ));
+                Err(e)
+            }
+        }
     }
 
     /// Read an integer parameter (`:<parm><ch>` → `:<CMD><axis><PARAM><int>`).
-    fn query_int(&self, parm: &str, channel: i32) -> AsynResult<i32> {
-        let reply = self.transact(&format!(":{parm}{channel}"))?;
+    fn query_int(&self, io: &mut AxisIo, parm: &str, channel: i32) -> AsynResult<i32> {
+        let reply = self.transact(io, &format!(":{parm}{channel}"))?;
         let (cmd, value) =
-            parse_kv(&reply).ok_or_else(|| scu_err(format!("SCU: bad reply {reply:?}")))?;
+            parse_kv(&reply).ok_or_else(|| io.parse_error("getIntegerVal", &reply))?;
         if cmd.starts_with('E') {
             return Err(scu_err(format!("SCU: controller error {reply:?}")));
         }
@@ -211,10 +227,10 @@ impl ScuController {
     }
 
     /// Read a double parameter (`:<parm><ch>` → `:<CMD><axis><PARAM><float>`).
-    fn query_double(&self, parm: &str, channel: i32) -> AsynResult<f64> {
-        let reply = self.transact(&format!(":{parm}{channel}"))?;
+    fn query_double(&self, io: &mut AxisIo, parm: &str, channel: i32) -> AsynResult<f64> {
+        let reply = self.transact(io, &format!(":{parm}{channel}"))?;
         let (cmd, value) =
-            parse_kv(&reply).ok_or_else(|| scu_err(format!("SCU: bad reply {reply:?}")))?;
+            parse_kv(&reply).ok_or_else(|| io.parse_error("getDoubleVal", &reply))?;
         if cmd.starts_with('E') {
             return Err(scu_err(format!("SCU: controller error {reply:?}")));
         }
@@ -222,10 +238,10 @@ impl ScuController {
     }
 
     /// Read the single-character move status (`:M<ch>`).
-    fn query_char(&self, parm: &str, channel: i32) -> AsynResult<char> {
-        let reply = self.transact(&format!(":{parm}{channel}"))?;
+    fn query_char(&self, io: &mut AxisIo, parm: &str, channel: i32) -> AsynResult<char> {
+        let reply = self.transact(io, &format!(":{parm}{channel}"))?;
         let (cmd, value) =
-            parse_char_reply(&reply).ok_or_else(|| scu_err(format!("SCU: bad reply {reply:?}")))?;
+            parse_char_reply(&reply).ok_or_else(|| io.parse_error("getCharVal", &reply))?;
         if cmd.starts_with('E') {
             return Err(scu_err(format!("SCU: controller error {reply:?}")));
         }
@@ -233,10 +249,40 @@ impl ScuController {
     }
 
     /// Read the rotary angle (`:GA<ch>` → angle, revolutions).
-    fn query_angle(&self, channel: i32) -> AsynResult<(f64, i64)> {
-        let reply = self.transact(&format!(":GA{channel}"))?;
-        parse_angle(&reply).ok_or_else(|| scu_err(format!("SCU: bad angle reply {reply:?}")))
+    fn query_angle(&self, io: &mut AxisIo, channel: i32) -> AsynResult<(f64, i64)> {
+        let reply = self.transact(io, &format!(":GA{channel}"))?;
+        parse_angle(&reply).ok_or_else(|| io.parse_error("getAngle", &reply))
     }
+}
+
+/// An axis's side of C `sendCmd`: the axis `pasynUser_` it prints on and
+/// its own `fromController_`.
+struct AxisIo {
+    port: String,
+    addr: i32,
+    from_controller: String,
+}
+
+impl AxisIo {
+    fn print(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.port),
+            Some(self.addr),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
+    }
+
+    /// C `get*Val`'s unparsable reply: printed, then asynError.
+    fn parse_error(&self, getter: &str, reply: &str) -> AsynError {
+        self.print(format_args!("{getter}:ERROR parsing response {reply}\n"));
+        scu_err(format!("SCU: bad reply {reply:?}"))
+    }
+}
+
+fn lock(controller: &Mutex<ScuController>) -> MutexGuard<'_, ScuController> {
+    controller.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// One SCU channel sharing a controller. Implements [`AsynMotor`].
@@ -254,31 +300,43 @@ pub struct ScuAxis {
     closed_loop: bool,
     /// Sensor-present flag probed at construction.
     has_encoder: bool,
+    io: AxisIo,
 }
 
 impl ScuAxis {
     /// Construct channel `channel`, probing max frequency, initial move status
     /// (for inherited infinite hold), positioner type and position, matching the
     /// C `SmarActSCUAxis` constructor. Performs blocking I/O.
-    pub fn new(controller: Arc<Mutex<ScuController>>, channel: i32) -> AsynResult<Self> {
+    /// `port` and `axis` name the motor port's asyn user the axis prints on.
+    pub fn new(
+        controller: Arc<Mutex<ScuController>>,
+        channel: i32,
+        port: &str,
+        axis: i32,
+    ) -> AsynResult<Self> {
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        let mut io = AxisIo {
+            port: port.to_owned(),
+            addr: axis,
+            from_controller: String::new(),
+        };
 
         // Probe max closed-loop frequency (also the first comms check).
-        ctrl.query_int("GCLF", channel)?;
+        ctrl.query_int(&mut io, "GCLF", channel)?;
 
         // Inherit infinite hold if the controller is still holding from a prior
         // life; otherwise start from the (initially disabled) closed-loop state.
-        let move_status = ctrl.query_char("M", channel)?;
+        let move_status = ctrl.query_char(&mut io, "M", channel)?;
         let hold_time = if move_status == 'H' { HOLD_FOREVER } else { 0 };
 
-        let positioner_type = ctrl.query_int("GST", channel)?;
+        let positioner_type = ctrl.query_int(&mut io, "GST", channel)?;
         let is_rot = is_rotary_type(positioner_type);
 
         // A successful position read means the sensor knows the position.
         let has_encoder = if is_rot {
-            ctrl.query_angle(channel).is_ok()
+            ctrl.query_angle(&mut io, channel).is_ok()
         } else {
-            ctrl.query_double("GP", channel).is_ok()
+            ctrl.query_double(&mut io, "GP", channel).is_ok()
         };
 
         drop(ctrl);
@@ -290,11 +348,8 @@ impl ScuAxis {
             position_offset: 0.0,
             closed_loop: false,
             has_encoder,
+            io,
         })
-    }
-
-    fn lock(&self) -> MutexGuard<'_, ScuController> {
-        self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Shared move: cache the hold time, convert to controller units minus the
@@ -320,13 +375,18 @@ impl ScuAxis {
             format!(":{mnem}{ch}P{rpos:.3}H{hold}:GP{ch}")
         };
 
-        let ctrl = self.lock();
-        ctrl.transact(&cmd)?;
+        lock(&self.controller).transact(&mut self.io, &cmd)?;
         Ok(())
     }
 }
 
 impl AsynMotor for ScuAxis {
+    /// C `SCUAxis::poll`'s `bail` label sets `motorStatusProblem_` and
+    /// `motorStatusCommsError_`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -376,15 +436,13 @@ impl AsynMotor for ScuAxis {
         self.hold_time = if self.closed_loop { HOLD_FOREVER } else { 0 };
         let hold = self.hold_time;
         let ch = self.channel;
-        let ctrl = self.lock();
-        ctrl.transact(&format!(":MTR{ch}H{hold}Z0:GP{ch}"))?;
+        lock(&self.controller).transact(&mut self.io, &format!(":MTR{ch}H{hold}Z0:GP{ch}"))?;
         Ok(())
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
         let ch = self.channel;
-        let ctrl = self.lock();
-        ctrl.transact(&format!(":S{ch}:GP{ch}"))?;
+        lock(&self.controller).transact(&mut self.io, &format!(":S{ch}:GP{ch}"))?;
         Ok(())
     }
 
@@ -407,17 +465,18 @@ impl AsynMotor for ScuAxis {
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let ch = self.channel;
-        let ctrl = self.lock();
+        let ctrl = lock(&self.controller);
+        let io = &mut self.io;
 
         let raw = if self.is_rot {
-            let (angle, rev) = ctrl.query_angle(ch)?;
+            let (angle, rev) = ctrl.query_angle(io, ch)?;
             rev as f64 * UDEG_PER_REV as f64 + angle
         } else {
-            ctrl.query_double("GP", ch)?
+            ctrl.query_double(io, "GP", ch)?
         };
         let position = (raw + self.position_offset) * STEPS_PER_EGU;
 
-        let status = parse_moving_status(ctrl.query_char("M", ch)?);
+        let status = parse_moving_status(ctrl.query_char(io, "M", ch)?);
         let moving = match status {
             MovingStatus::Holding => self.hold_time != HOLD_FOREVER,
             MovingStatus::Targeting
@@ -427,7 +486,7 @@ impl AsynMotor for ScuAxis {
             MovingStatus::Stopped | MovingStatus::AmplSetting | MovingStatus::Unknown => false,
         };
 
-        let homed = ctrl.query_int("GPPK", ch)? != 0;
+        let homed = ctrl.query_int(io, "GPPK", ch)? != 0;
         drop(ctrl);
 
         Ok(MotorStatus {

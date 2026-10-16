@@ -146,17 +146,25 @@ async fn main() -> CaResult<()> {
     // Binds the USB-CTR08's counters to the scalerRecord scaler.db declares.
     {
         let scaler_slot = pending_scaler.clone();
-        app = app.register_dynamic_device_support(move |ctx: &DeviceSupportContext| {
-            if ctx.dtyp != "Asyn Scaler" {
-                return None;
-            }
-            let driver = scaler_slot.lock().unwrap().take()?;
-            Some(Box::new(
-                epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(
-                    Box::new(driver),
+        app = app.register_dynamic_device_support(
+            &[(
+                "scaler",
+                std::slice::from_ref(
+                    &epics_rs::scaler::device_support::scaler_asyn::ASYN_SCALER_DEVICE,
                 ),
-            ) as Box<dyn DeviceSupport>)
-        });
+            )],
+            move |ctx: &DeviceSupportContext| {
+                if ctx.dtyp != "Asyn Scaler" {
+                    return None;
+                }
+                let driver = scaler_slot.lock().unwrap().take()?;
+                Some(Box::new(
+                    epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(
+                        Box::new(driver),
+                    ),
+                ) as Box<dyn DeviceSupport>)
+            },
+        );
     }
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await

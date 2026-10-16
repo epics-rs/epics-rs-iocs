@@ -3,4 +3,4 @@
 pub mod ioc;
 pub mod spiiplus;
 
-pub use spiiplus::{SpiiPlusAxis, SpiiPlusController};
+pub use spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusController};

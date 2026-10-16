@@ -21,13 +21,13 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "9600")
 
 # ---- IMS controller ----
-# ImsMDrivePlusCreateController(motorPort, ioPort, [deviceName], [movingPollMs],
-#                              [idlePollMs], [timeoutMs]). One axis; DTYP is the
-#                              motorPort string. Empty deviceName = no party mode.
-ImsMDrivePlusCreateController("$(MPORT)", "$(IPPORT)", "$(DEVNAME)", 100, 1000, 2000)
+# ImsMDrivePlusCreateController(motorPortName, IOPortName, devName,
+#                              movingPollPeriod, idlePollPeriod), periods in ms.
+#                              One axis; empty devName = no party mode.
+ImsMDrivePlusCreateController("$(MPORT)", "$(IPPORT)", "$(DEVNAME)", 100, 1000)
 
-# The single motor record. DTYP matches the motorPort.
-dbLoadRecords("$(IMS_IOC)/db/ims.template", "P=$(P),M=m1,MPORT=$(MPORT)")
+# The single motor record, axis 0 of the motor port.
+dbLoadRecords("$(IMS_IOC)/db/ims.template", "P=$(P),M=m1,PORT=$(MPORT),ADDR=0")
 
 iocInit()
 

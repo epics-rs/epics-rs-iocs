@@ -8,10 +8,10 @@
 //! bus hardware.
 //!
 //! ```text
-//! motor record ──DTYP PMAC_{ctrl}_{axis}──▶ PmacAxis  ─┐
-//! motor record ──DTYP PMACCS_{cs}_{1..9}──▶ PmacCsAxis─┤
-//!                                                      ├─▶ octet port ─▶ PMAC
-//!                                    PmacIpInterpose ──┘   (framing, ethernet only)
+//! motor record ──@asyn(ctrl,1..)──▶ PmacAxis  ─┐
+//! motor record ──@asyn(cs,0..8)───▶ PmacCsAxis─┤
+//!                                              ├─▶ octet port ─▶ PMAC
+//!                            PmacIpInterpose ──┘   (framing, ethernet only)
 //! ```
 //!
 //! # What was ported, and what was not
@@ -42,12 +42,6 @@
 //!   record already does the division, so this port speaks controller counts
 //!   (real axes, `MRES = 1`) and PLC EGU (CS axes, `MRES` = the C 1e-4
 //!   `stepSize`, since raw counts are integers). See [`axis`].
-//! - **Controller-level PVs become configuration.** The C driver's
-//!   `PMAC_C_FEEDRATE_POLL` / `_LIMIT`, the deferred-move *mode* and the
-//!   coordinate-system group selection are asyn parameters on address 0, which
-//!   the asyn-rs motor boundary does not carry; they become arguments of
-//!   `pmacCreateController` and the `pmacCsGroupSwitch` command. Their effect on
-//!   the record (the PROBLEM bit) is unchanged. See [`controller`].
 //! - **Deferred moves live on the controller,** not on each axis. See
 //!   [`controller`].
 //!
@@ -83,6 +77,6 @@ pub mod ioc;
 pub mod protocol;
 
 pub use axis::PmacAxis;
-pub use controller::{DeferredMode, PmacController};
+pub use controller::PmacController;
 pub use coord::{PmacCoordSystem, PmacCsAxis};
 pub use ioc::pmac_commands;

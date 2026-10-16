@@ -5,7 +5,7 @@
 //! C-884/E-861/E-871/E-873 motor specialization) — the two classes the task
 //! scopes as "generic GCS2 stage-controller path". Commands are plain ASCII
 //! text terminated by `\n`; the driver owns output framing and
-//! `PIGCS2CreateController` sets input EOS `"\n"` and an empty output EOS, as
+//! `PI_GCS2_CreateController` sets input EOS `"\n"` and an empty output EOS, as
 //! the C `PIasynController` constructor does. Axes are addressed by the GCS *name
 //! string* returned by `SAI?` (e.g. `"1"`), not a bare index.
 //!
@@ -138,9 +138,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi, leading_hex};
@@ -189,13 +191,6 @@ fn pigcs2_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-fn framed(cmd: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-    out.extend_from_slice(cmd.as_bytes());
-    out.extend_from_slice(TERMINATOR);
-    out
-}
-
 /// `PIGCSController::getValue`: return the substring after the first `=`, or
 /// `None` if there is no `=` at all (an empty tail, e.g. `"1="`, is `Some("")`
 /// — `atof`/`atoi` on an empty string parse as `0`, matching C `atof("")`).
@@ -237,6 +232,8 @@ fn status_mask_at(reply: &str, axis_no: usize) -> Option<u32> {
 /// `VEL`-command support flag, and the discovered axis name list.
 pub struct PIGCS2Controller {
     handle: SyncIOHandle,
+    /// The octet port C's `m_pAsynInterface` (the default log sink) prints on.
+    serial_port: String,
     ident: String,
     knows_vel: bool,
     axis_names: Vec<String>,
@@ -247,9 +244,10 @@ impl PIGCS2Controller {
     /// constructor's probe sequence): read `*IDN?`, probe `VEL?` support, and
     /// auto-discover connected axis names via `SAI?`. Performs blocking octet
     /// I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    pub fn new(handle: SyncIOHandle, serial_port: &str) -> AsynResult<Self> {
         let mut ctrl = Self {
             handle,
+            serial_port: serial_port.to_owned(),
             ident: String::new(),
             knows_vel: false,
             axis_names: Vec::new(),
@@ -286,19 +284,68 @@ impl PIGCS2Controller {
         self.knows_vel
     }
 
-    /// Write a framed command with no reply expected (C `sendOnly`).
+    /// Write a command with no reply expected (C `sendOnly`): the command,
+    /// then its `\n` as a second write whose status alone decides.
     fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &framed(cmd))?;
-        Ok(())
+        let _ = self.handle.write_octet(0, cmd.as_bytes());
+        let e = match self.handle.write_octet(0, TERMINATOR) {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        self.print(format_args!(
+            "PIGCSController:sendOnly: error sending command {cmd}, sent={}, status={}\n",
+            e.partial_write().unwrap_or(0),
+            e.status() as i32
+        ));
+        Err(e)
     }
 
-    /// Write a framed command and read one reply line (C `sendAndReceive`),
+    /// Write a command and read one reply line (C `sendAndReceive`),
     /// trimmed of any stray CR/NUL.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &framed(cmd), READ_BUF)?;
+        let raw = self.send_and_receive(cmd)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
             .to_string())
+    }
+
+    /// C `sendAndReceive(const char*)`: the command, then a writeRead of its
+    /// `\n`. Either write falling short is asynError.
+    fn send_and_receive(&self, cmd: &str) -> AsynResult<Vec<u8>> {
+        let short_write = |status: i32, message: &str| {
+            self.print(format_args!(
+                "PIGCSController:sendAndReceive error calling write, output={cmd} status={status}, error={message}\n"
+            ));
+            pigcs2_err(message)
+        };
+        match self.handle.write_octet(0, cmd.as_bytes()) {
+            Ok(n) if n == cmd.len() => {}
+            Ok(_) => return Err(short_write(0, "")),
+            Err(e) => return Err(short_write(e.status() as i32, &e.message())),
+        }
+        self.handle
+            .write_read(0, TERMINATOR, READ_BUF)
+            .map_err(|e| match e.octet_step() {
+                Some(OctetStep::Read) => {
+                    self.print(format_args!(
+                        "PIGCSController:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                        e.status() as i32,
+                        e.message()
+                    ));
+                    e
+                }
+                _ => short_write(e.status() as i32, &e.message()),
+            })
+    }
+
+    fn print(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.serial_port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
     }
 
     /// `SAI?`: read every connected axis name. PI GCS marks a non-final reply
@@ -306,7 +353,7 @@ impl PIGCS2Controller {
     /// reads (no further write) while the previous line ended in a space,
     /// then trim that marker off each line (C `findConnectedAxes`).
     fn find_connected_axes(&self) -> AsynResult<Vec<String>> {
-        let mut raw = self.handle.write_read(0, &framed("SAI?"), READ_BUF)?;
+        let mut raw = self.send_and_receive("SAI?")?;
         let mut names = Vec::new();
         loop {
             let line = String::from_utf8_lossy(&raw)
@@ -490,7 +537,19 @@ impl PIGCS2Controller {
     /// `char(4)` -> `(homing, moving, negLimit, posLimit, servoControl)` for
     /// `axis_no` (C `PIGCSMotorController::getStatus`).
     fn get_status(&self, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
-        let raw = self.handle.write_read(0, &[0x04], READ_BUF)?;
+        // C sendAndReceive(char): a short write is asynError.
+        let raw = self.handle.write_read(0, &[0x04], READ_BUF).map_err(|e| {
+            let e = match e.octet_step() {
+                Some(OctetStep::Read) => e,
+                _ => pigcs2_err(e.message()),
+            };
+            self.print(format_args!(
+                "PIInterface::sendAndReceive error calling writeRead, output=4 status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ));
+            e
+        })?;
         let reply = String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
             .to_string();
@@ -517,6 +576,10 @@ pub struct PIGCS2Axis {
     is_homing: bool,
     servo_on: bool,
     problem: bool,
+    /// The `#4` moving and limit bits the last poll read.
+    moving: bool,
+    neg_limit: bool,
+    pos_limit: bool,
     last_position: f64,
     last_direction: bool,
     low_limit: f64,
@@ -558,6 +621,9 @@ impl PIGCS2Axis {
             is_homing: false,
             servo_on: true,
             problem: false,
+            moving: false,
+            neg_limit: false,
+            pos_limit: false,
             last_position,
             last_direction: true,
             low_limit,
@@ -596,6 +662,11 @@ impl PIGCS2Axis {
 }
 
 impl AsynMotor for PIGCS2Axis {
+    /// C `PIasynAxis::poll` ignores the controller's read status.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -693,20 +764,35 @@ impl AsynMotor for PIGCS2Axis {
         let old_homing = self.is_homing;
         let old_servo_on = self.servo_on;
 
+        // C `PIasynAxis::poll` ignores every read's status and goes on, so a
+        // failed read leaves what the last poll read. On a failed `#4`, C's
+        // moving, limit and servo bits are uninitialized locals; that C
+        // defect is not copied.
         let ctrl = self.lock();
         let (homing, raw_moving, neg_limit, pos_limit, servo_control) =
-            ctrl.get_status(self.axis_no)?;
+            ctrl.get_status(self.axis_no).unwrap_or((
+                old_homing,
+                self.moving,
+                self.neg_limit,
+                self.pos_limit,
+                old_servo_on,
+            ));
         // C only re-queries FRF? (the homed flag) right when homing just
         // finished (oldHoming true, new homing false) — not every cycle.
-        let refreshed_homed = if old_homing && !homing {
-            Some(ctrl.get_referenced_state(&self.axis_name)?)
-        } else {
-            None
-        };
-        let position = ctrl.get_axis_position(&self.axis_name)?;
-        let (low_limit, high_limit) = ctrl.get_travel_limits(&self.axis_name)?;
+        let refreshed_homed = (old_homing && !homing)
+            .then(|| ctrl.get_referenced_state(&self.axis_name).ok())
+            .flatten();
+        let position = ctrl
+            .get_axis_position(&self.axis_name)
+            .unwrap_or(self.last_position);
+        let (low_limit, high_limit) = ctrl
+            .get_travel_limits(&self.axis_name)
+            .unwrap_or((self.low_limit, self.high_limit));
         drop(ctrl);
 
+        self.moving = raw_moving;
+        self.neg_limit = neg_limit;
+        self.pos_limit = pos_limit;
         self.is_homing = homing;
         if let Some(homed) = refreshed_homed {
             self.homed = homed;
@@ -802,9 +888,144 @@ mod tests {
         assert_eq!(status_mask_at("01zzzz", 0), None);
     }
 
+    /// Refuses the first write offered; records every write.
+    struct FirstWriteRefused {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for FirstWriteRefused {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let mut written = self.written.lock().unwrap();
+            written.push(String::from_utf8_lossy(data).into_owned());
+            if written.len() == 1 {
+                Err(pigcs2_err("refused"))
+            } else {
+                Ok(data.len())
+            }
+        }
+    }
+
     #[test]
-    fn framed_appends_newline_terminator() {
-        assert_eq!(framed("MOV 1 10.000000"), b"MOV 1 10.000000\n".to_vec());
+    fn send_only_status_is_the_terminator_write() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = FirstWriteRefused {
+            base: PortDriverBase::new("gcs2SendOnly", 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2SendOnly").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl = PIGCS2Controller {
+            handle: SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                std::time::Duration::from_secs(1),
+            ),
+            serial_port: "gcs2SendOnly".into(),
+            ident: String::new(),
+            knows_vel: false,
+            axis_names: Vec::new(),
+        };
+        // C overwrites the refused command's status with the `\n` write's.
+        assert!(ctrl.send_only("MOV 1 1").is_ok());
+        assert_eq!(*written.lock().unwrap(), ["MOV 1 1", "\n"]);
+    }
+
+    /// Refuses the `#4` status query and answers `POS?`, `TMN?` and `TMX?`.
+    struct StatusRefused {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for StatusRefused {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            match data {
+                [4] => return Err(pigcs2_err("refused")),
+                b"POS? 1" => self.reply = b"1=2.5".to_vec(),
+                b"TMN? 1" => self.reply = b"1=-10".to_vec(),
+                b"TMX? 1" => self.reply = b"1=10".to_vec(),
+                _ => {}
+            }
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    #[test]
+    fn a_failed_status_read_keeps_the_last_bits_and_the_poll_goes_on() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = StatusRefused {
+            base: PortDriverBase::new("gcs2StatusRefused", 1, PortFlags::default()),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2StatusRefused").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctrl = PIGCS2Controller {
+            handle: SyncIOHandle::from_handle(
+                rt.port_handle().clone(),
+                0,
+                std::time::Duration::from_secs(1),
+            ),
+            serial_port: "gcs2StatusRefused".into(),
+            ident: String::new(),
+            knows_vel: false,
+            axis_names: Vec::new(),
+        };
+        let mut axis = PIGCS2Axis {
+            controller: Arc::new(Mutex::new(ctrl)),
+            axis_name: "1".into(),
+            axis_no: 0,
+            has_limit_switches: true,
+            has_reference: true,
+            homed: true,
+            is_homing: false,
+            servo_on: true,
+            problem: false,
+            moving: true,
+            neg_limit: false,
+            pos_limit: true,
+            last_position: 0.0,
+            last_direction: true,
+            low_limit: 0.0,
+            high_limit: 0.0,
+            max_acceleration: None,
+        };
+        let status = axis.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(status.position, 2.5);
+        assert!(status.moving && status.high_limit && status.powered);
+        assert!(!status.problem);
+        assert_eq!((axis.low_limit, axis.high_limit), (-10.0, 10.0));
     }
 
     #[test]

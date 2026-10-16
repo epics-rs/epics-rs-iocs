@@ -2,7 +2,8 @@
 //!
 //! Assembles: an asyn octet port (`drvAsynIPPortConfigure` or
 //! `drvAsynSerialPortConfigure`), the Aerotech iocsh commands
-//! (`EnsembleAsynConfig`, `A3200AsynConfig`), the motor record type, and the
+//! (`EnsembleAsynSetup`/`Config`, `A3200AsynSetup`/`Config`),
+//! `drvAsynMotorConfigure` over their drivers, the motor record type, and the
 //! CA + PVA (QSRV) server.
 //!
 //! Usage:
@@ -13,8 +14,11 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_aerotech::ioc::{a3200_config_command, ensemble_config_command};
-use motor_common::MotorHolder;
+use motor_aerotech::ioc::{
+    MOTOR_A3200, MOTOR_ENSEMBLE, a3200_config_command, a3200_setup_command,
+    ensemble_config_command, ensemble_setup_command,
+};
+use motor_common::model2::drv_asyn_motor_configure_command;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -38,12 +42,20 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // Aerotech config commands create the controller + all axes on one motor
-    // device support (Ensemble by axis index, A3200 by discovered axis name).
-    let holder = MotorHolder::new();
-    app = app.register_startup_command(ensemble_config_command(&holder));
-    app = app.register_startup_command(a3200_config_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    // Aerotech Setup/Config commands build the cards drvAsynMotorConfigure
+    // opens + motor device support.
+    app = app.register_startup_command(ensemble_setup_command());
+    app = app.register_startup_command(ensemble_config_command());
+    app = app.register_startup_command(a3200_setup_command());
+    app = app.register_startup_command(a3200_config_command());
+    app = app.register_startup_command(drv_asyn_motor_configure_command(vec![
+        &MOTOR_ENSEMBLE,
+        &MOTOR_A3200,
+    ]));
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

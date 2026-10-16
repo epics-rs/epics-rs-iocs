@@ -5,7 +5,8 @@
 # matches the C HXPDriver's hardcoded record MRES.
 
 record(motor, "$(P)$(MX)") {
-    field(DTYP, "HXP_$(PORT)_0")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),0)")
     field(SCAN, "Passive")
     field(DHLM, "$(HLM=50)")
     field(DLLM, "$(LLM=-50)")
@@ -15,7 +16,8 @@ record(motor, "$(P)$(MX)") {
 }
 
 record(motor, "$(P)$(MY)") {
-    field(DTYP, "HXP_$(PORT)_1")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),1)")
     field(SCAN, "Passive")
     field(DHLM, "$(HLM=50)")
     field(DLLM, "$(LLM=-50)")
@@ -25,7 +27,8 @@ record(motor, "$(P)$(MY)") {
 }
 
 record(motor, "$(P)$(MZ)") {
-    field(DTYP, "HXP_$(PORT)_2")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),2)")
     field(SCAN, "Passive")
     field(DHLM, "$(HLM=50)")
     field(DLLM, "$(LLM=-50)")
@@ -35,7 +38,8 @@ record(motor, "$(P)$(MZ)") {
 }
 
 record(motor, "$(P)$(MU)") {
-    field(DTYP, "HXP_$(PORT)_3")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),3)")
     field(SCAN, "Passive")
     field(DHLM, "$(HLM=15)")
     field(DLLM, "$(LLM=-15)")
@@ -45,7 +49,8 @@ record(motor, "$(P)$(MU)") {
 }
 
 record(motor, "$(P)$(MV)") {
-    field(DTYP, "HXP_$(PORT)_4")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),4)")
     field(SCAN, "Passive")
     field(DHLM, "$(HLM=15)")
     field(DLLM, "$(LLM=-15)")
@@ -55,7 +60,8 @@ record(motor, "$(P)$(MV)") {
 }
 
 record(motor, "$(P)$(MW)") {
-    field(DTYP, "HXP_$(PORT)_5")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),5)")
     field(SCAN, "Passive")
     field(DHLM, "$(HLM=15)")
     field(DLLM, "$(LLM=-15)")

@@ -1,5 +1,6 @@
 record(motor, "$(P)$(M)") {
-    field(DTYP, "CONEX_$(PORT)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR=0))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.5)")

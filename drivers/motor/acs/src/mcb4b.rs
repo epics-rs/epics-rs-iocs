@@ -51,7 +51,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -142,6 +142,12 @@ impl Mcb4bAxis {
 }
 
 impl AsynMotor for Mcb4bAxis {
+    /// C `MCB4BAxis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (MCB4BDriver.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

@@ -1,5 +1,5 @@
-# Micos SMC Taurus: one motor record per axis. Load once per axis with N =
-# 0-based axis index (DTYP TAURUS_$(CARD)_$(N)); the command prefix uses N + 1.
+# Micos SMC Taurus: one motor record per axis. Load once per axis with ADDR =
+# 0-based axis index of port PORT; the command prefix uses ADDR + 1.
 #
 # The driver reports positions in controller-native engineering units. MRES is
 # the record's step (RRBV is an integer count and RDBD >= MRES). motorMicos
@@ -8,7 +8,8 @@
 # the controller (setnlimit).
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "TAURUS_$(CARD)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=5.0)")
     field(ACCL, "$(ACCL=0.2)")

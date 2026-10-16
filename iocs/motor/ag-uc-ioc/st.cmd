@@ -32,9 +32,9 @@ asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
 asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- Agilis controller + axes ----
-# AG_UCCreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs])
+# AG_UCCreateController(portName, serialPort, numAxes, movingPollPeriod, idlePollPeriod)
 AG_UCCreateController("$(PORT)", "$(SERIAL)", 2, 100, 1000)
-# AG_UCCreateAxis(motorPort, axis, hasLimits, forwardAmplitude, reverseAmplitude)
+# AG_UCCreateAxis(portName, axis, hasLimits, forwardAmplitude, reverseAmplitude)
 AG_UCCreateAxis("$(PORT)", 0, 0, 50, -50)
 AG_UCCreateAxis("$(PORT)", 1, 0, 50, -50)
 

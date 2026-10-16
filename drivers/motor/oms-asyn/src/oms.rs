@@ -45,16 +45,18 @@
 //!   `writeFloat64` overrides, closed-loop gain status (`CL?`), the following-
 //!   error / encoder-status word (`EA`). These are not motor-record motion
 //!   fields.
-//! - The init-time firmware-version gate and axis-count auto-detection: the
-//!   driver reads the firmware string once for logging, assumes the modern
-//!   (>= 1.30) command forms MAXnet mandates, and trusts the configured axis
-//!   count.
+//! - The init-time firmware-version gate: the driver reads the firmware
+//!   string once as a comms check and assumes the modern (>= 1.30) command
+//!   forms MAXnet mandates.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::atoi;
@@ -88,15 +90,18 @@ fn is_notification(s: &str) -> bool {
 /// its axes behind a mutex so command/reply pairs stay atomic.
 pub struct OmsController {
     handle: SyncIOHandle,
+    /// The octet port `pasynUserSyncIOSerial` prints on.
+    serial_port: String,
     /// `"MAXnet"` or `"MXA"` (label only; the protocol is identical).
     controller_type: &'static str,
 }
 
 impl OmsController {
     /// Wrap a connected octet handle.
-    pub fn new(handle: SyncIOHandle, controller_type: &'static str) -> Self {
+    pub fn new(handle: SyncIOHandle, serial_port: &str, controller_type: &'static str) -> Self {
         Self {
             handle,
+            serial_port: serial_port.to_owned(),
             controller_type,
         }
     }
@@ -108,8 +113,23 @@ impl OmsController {
 
     /// Send a command expecting no reply (C `sendOnly`).
     pub fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
-        Ok(())
+        let e = match self.handle.write_octet(0, cmd.as_bytes()) {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        PortManager::global().trace_manager().print(
+            Some(&self.serial_port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            format_args!(
+                "drv{}Asyn:sendOnly: error sending command {cmd}, sent={}, status={}\n",
+                self.controller_type,
+                e.partial_write().unwrap_or(0),
+                e.status() as i32
+            ),
+        );
+        Err(e)
     }
 
     /// Send a command and read one reply, skipping any notification lines and
@@ -138,14 +158,24 @@ impl OmsController {
     }
 
     /// Interrupt-clear and stop-all, then send an optional init string (C
-    /// `Init` preamble). Called once at controller creation.
-    pub fn init(&self, init_string: &str) -> AsynResult<()> {
-        self.send_only("IC;")?;
-        self.send_only("AM SA;")?;
+    /// `Init` preamble). Called once at controller creation. C ignores each
+    /// sendOnly's status here; a failure is only its printed line.
+    pub fn init(&self, init_string: &str) {
+        let _ = self.send_only("IC;");
+        let _ = self.send_only("AM SA;");
+        std::thread::sleep(Duration::from_millis(500));
         if !init_string.is_empty() {
-            self.send_only(init_string)?;
+            let _ = self.send_only(init_string);
         }
-        Ok(())
+        // Some init commands (like "LT") need time to process.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    /// The axis count: the fields of the `AA RP;` reply, empty ones skipped
+    /// as `epicsStrtok_r` does.
+    pub fn axis_count(&self) -> AsynResult<usize> {
+        let reply = self.send_receive("AA RP;")?;
+        Ok(reply.split(',').filter(|f| !f.is_empty()).count())
     }
 }
 
@@ -264,6 +294,12 @@ impl OmsAxis {
 }
 
 impl AsynMotor for OmsAxis {
+    /// C `omsBaseController`'s poller skips the pass (`continue`) on a failed
+    /// read, posting nothing.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     /// C `omsBaseAxis::setEncoderRatio` (omsBaseAxis.h:37): stored for the
     /// encoder sync before each move.
     fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
@@ -491,6 +527,8 @@ mod tests {
                 b"=h".to_vec()
             } else if cmd.ends_with("RE;") {
                 b"1000".to_vec()
+            } else if cmd == "AA RP;" {
+                b"100,,-5,0,".to_vec()
             } else {
                 Vec::new()
             };
@@ -527,12 +565,86 @@ mod tests {
             0,
             std::time::Duration::from_secs(1),
         );
-        let controller = Arc::new(Mutex::new(OmsController::new(io, "MAXnet")));
+        let controller = Arc::new(Mutex::new(OmsController::new(
+            io,
+            "omsEncoderRatio",
+            "MAXnet",
+        )));
         let mut axis = OmsAxis::new(controller, 0).unwrap();
         let user = AsynUser::new(0);
         axis.set_encoder_ratio(&user, 4.0).unwrap();
         axis.move_absolute(&user, 10.0, 1.0, 100.0, 1000.0).unwrap();
         assert!(written.lock().unwrap().iter().any(|c| c == "AX;LO250;"));
+    }
+
+    #[test]
+    fn the_axis_count_skips_empty_fields_as_strtok_does() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = EncoderAxis {
+            base: PortDriverBase::new("omsAxisCount", 1, PortFlags::default()),
+            written: Arc::new(Mutex::new(Vec::new())),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("omsAxisCount").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = OmsController::new(io, "omsAxisCount", "MAXnet");
+        assert_eq!(controller.axis_count().unwrap(), 3);
+    }
+
+    /// A line that refuses every write; records what was offered.
+    struct DeadLine {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for DeadLine {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.written
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(data).into_owned());
+            Err(oms_err("dead line"))
+        }
+    }
+
+    #[test]
+    fn init_sends_every_command_past_a_failed_send() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = DeadLine {
+            base: PortDriverBase::new("omsDeadInit", 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("omsDeadInit").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        OmsController::new(io, "omsDeadInit", "MAXnet").init("AX LP0;");
+        assert_eq!(*written.lock().unwrap(), ["IC;", "AM SA;", "AX LP0;"]);
     }
 
     #[test]

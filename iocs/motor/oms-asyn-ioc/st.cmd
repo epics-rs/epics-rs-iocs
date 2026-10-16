@@ -9,7 +9,7 @@
 #============================================================
 
 epicsEnvSet("P",      "oms:")
-epicsEnvSet("CTRL",   "omsPort")
+epicsEnvSet("PORT",   "MAXnet1")
 epicsEnvSet("IPPORT", "omsAsyn")
 epicsEnvSet("HOST",   "192.168.1.30:5001")
 
@@ -22,14 +22,12 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 # set either here to override it.
 
 # ---- MAXnet controller ----
-# omsMAXnetConfig(controllerName, asynPort, [initString], [movingPollMs],
-#                 [idlePollMs], [timeoutMs]). initString is sent verbatim at
-# boot (empty here); poll periods default to 100/1000 ms.
-omsMAXnetConfig("$(CTRL)", "$(IPPORT)", "", 100, 1000, 2000)
+# omsMAXnetConfig(portName, numAxes, serialPortName, movingPollPeriod,
+#                 idlePollPeriod, initString). The axes are those the
+# controller reports, up to numAxes; initString is sent verbatim at boot.
+omsMAXnetConfig("$(PORT)", 8, "$(IPPORT)", 200, 2000, "")
 
-# One motor record per axis: omsCreateAxis(controllerName, axis), axis 0-based.
-omsCreateAxis("$(CTRL)", 0)
-dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,CTRL=$(CTRL),AXIS=0")
+dbLoadRecords("$(OMS_ASYN_IOC)/db/oms.template", "P=$(P),M=m1,PORT=$(PORT),ADDR=0")
 
 iocInit()
 

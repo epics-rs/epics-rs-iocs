@@ -8,7 +8,7 @@
 #============================================================
 
 epicsEnvSet("P",      "OEM:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "PARKER1")
 epicsEnvSet("IPPORT", "OEM")
 epicsEnvSet("HOST",   "192.168.1.220:5000")
 epicsEnvSet("NAXES",  "1")
@@ -17,12 +17,12 @@ epicsEnvSet("NAXES",  "1")
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
 # ---- OEM750 controller ----
-# OEMCreateController(card, oemPort, numAxes, [movingPollMs], [idlePollMs]).
-OEMCreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
+# OEMCreateController(portName, OEMPortName, numAxes, movingPollPeriod, idlePollPeriod).
+OEMCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000)
 
-# One motor record per axis (DTYP OEM_$(CARD)_0, _1, ...). The driver reports
+# One motor record per axis (OUT @asyn($(CTRL),axis)). The driver reports
 # positions in controller counts, so MRES = 1.
-dbLoadRecords("$(PARKER_IOC)/db/oem.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(PARKER_IOC)/db/oem.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
 

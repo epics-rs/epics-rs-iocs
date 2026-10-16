@@ -424,6 +424,51 @@ impl XpsSocket {
         Ok(())
     }
 
+    // --- GPIO (drvXPSAsynAux) ----------------------------------------------
+
+    /// `GPIOAnalogGet(names)` → one value per name, in order.
+    pub fn gpio_analog_get(&self, names: &[&str]) -> XpsResult<Vec<f64>> {
+        let args: Vec<String> = names.iter().map(|n| format!("{n},double *")).collect();
+        let cmd = format!("GPIOAnalogGet ({})", args.join(","));
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok((1..=names.len()).map(|n| r.double(n)).collect())
+    }
+
+    /// `GPIOAnalogSet(name, value)`.
+    pub fn gpio_analog_set(&self, name: &str, value: f64) -> XpsResult<()> {
+        let cmd = format!("GPIOAnalogSet ({name},{})", g(value));
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `GPIOAnalogGainGet(name)` → the input's gain.
+    pub fn gpio_analog_gain_get(&self, name: &str) -> XpsResult<i32> {
+        let cmd = format!("GPIOAnalogGainGet ({name},int *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok(r.int(1))
+    }
+
+    /// `GPIOAnalogGainSet(name, gain)`.
+    pub fn gpio_analog_gain_set(&self, name: &str, gain: i32) -> XpsResult<()> {
+        let cmd = format!("GPIOAnalogGainSet ({name},{gain})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
+    /// `GPIODigitalGet(name)` → the port's bits (C `%hu`).
+    pub fn gpio_digital_get(&self, name: &str) -> XpsResult<u16> {
+        let cmd = format!("GPIODigitalGet ({name},unsigned short *)");
+        let r = self.exec(&cmd)?.require_ok()?;
+        Ok(r.bits(1) as u16)
+    }
+
+    /// `GPIODigitalSet(name, mask, value)`.
+    pub fn gpio_digital_set(&self, name: &str, mask: u16, value: u16) -> XpsResult<()> {
+        let cmd = format!("GPIODigitalSet ({name},{mask},{value})");
+        self.exec(&cmd)?.require_ok()?;
+        Ok(())
+    }
+
     // --- Gathering + events (trajectory readback) ---------------------------
 
     /// `GatheringReset()` — empty the in-memory gathering buffer. Required

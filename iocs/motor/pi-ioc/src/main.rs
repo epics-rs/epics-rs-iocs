@@ -13,7 +13,6 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_common::MotorHolder;
 use motor_pi::ioc::{
     pic630_config_command, pic630_setup_command, pic662_config_command, pic662_setup_command,
     pic663_config_command, pic663_setup_command, pic844_config_command, pic844_setup_command,
@@ -45,28 +44,30 @@ async fn main() -> CaResult<()> {
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // PIC862 + PIC663 iocsh commands + motor device support.
-    let holder = MotorHolder::new();
     app = app.register_startup_command(pic862_setup_command());
-    app = app.register_startup_command(pic862_config_command(&holder));
+    app = app.register_startup_command(pic862_config_command());
     app = app.register_startup_command(pic663_setup_command());
-    app = app.register_startup_command(pic663_config_command(&holder));
+    app = app.register_startup_command(pic663_config_command());
     app = app.register_startup_command(pic630_setup_command());
-    app = app.register_startup_command(pic630_config_command(&holder));
+    app = app.register_startup_command(pic630_config_command());
     app = app.register_startup_command(pic662_setup_command());
-    app = app.register_startup_command(pic662_config_command(&holder));
+    app = app.register_startup_command(pic662_config_command());
     app = app.register_startup_command(pic844_setup_command());
-    app = app.register_startup_command(pic844_config_command(&holder));
+    app = app.register_startup_command(pic844_config_command());
     app = app.register_startup_command(pic848_setup_command());
-    app = app.register_startup_command(pic848_config_command(&holder));
+    app = app.register_startup_command(pic848_config_command());
     app = app.register_startup_command(pie516_setup_command());
-    app = app.register_startup_command(pie516_config_command(&holder));
+    app = app.register_startup_command(pie516_config_command());
     app = app.register_startup_command(pie517_setup_command());
-    app = app.register_startup_command(pie517_config_command(&holder));
+    app = app.register_startup_command(pie517_config_command());
     app = app.register_startup_command(pie710_setup_command());
-    app = app.register_startup_command(pie710_config_command(&holder));
+    app = app.register_startup_command(pie710_config_command());
     app = app.register_startup_command(pie816_setup_command());
-    app = app.register_startup_command(pie816_config_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(pie816_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

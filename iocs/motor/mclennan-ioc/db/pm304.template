@@ -1,5 +1,5 @@
 # Mclennan PM304/PM600: one motor record per axis. Load once per axis with
-# N = 0-based axis index (DTYP PM304_$(CARD)_$(N)); the driver maps index
+# S = 0-based signal (DTYP "Mclennan PM304", OUT #C$(C) S$(S)); the driver maps index
 # 0,1,2,... to controller axes 1,2,3,...
 #
 # The PM304/PM600 is a stepper controller working in motor steps / encoder
@@ -9,7 +9,8 @@
 # switches are reported.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PM304_$(CARD)_$(N)")
+    field(DTYP, "Mclennan PM304")
+    field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10000.0)")
     field(ACCL, "$(ACCL=0.5)")

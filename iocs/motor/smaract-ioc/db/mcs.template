@@ -1,6 +1,5 @@
-# SmarAct MCS: one motor record per axis. Load once per axis with N = 0-based
-# axis number (DTYP MCS_$(CARD)_$(N)); the controller channel it drives is set
-# separately by smarActMCSCreateAxis.
+# SmarAct MCS: one motor record per axis, ADDR the axis number on controller
+# port PORT; the controller channel it drives is set by smarActMCSCreateAxis.
 #
 # The MCS driver reports the controller's raw integer position in nanometres
 # (linear) / micro-degrees (rotary) with no scaling, so positions cross the
@@ -10,7 +9,8 @@
 # the C startup defaults (not exposed as PVs).
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "MCS_$(CARD)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.2)")

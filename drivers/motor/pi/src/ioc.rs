@@ -1,16 +1,17 @@
 //! iocsh commands for the `motor-pi` driver's ported controllers.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::{EosRefusal, connect_with_eos};
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
-};
-use motor_common::{MotorHolder, TraceUser};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::model1_device;
 
 use crate::c630::{PIC630_NUM_AXIS, PIC630Axis, PIC630Controller};
 use crate::c662::{PIC662Axis, PIC662Controller};
@@ -54,53 +55,38 @@ const PIE816_TIMEOUT: Duration = Duration::from_secs(2);
 /// clone and shares the same 2.0 s value).
 const PIC663_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the `PIC862Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIC862Config` call, matching every
-/// other legacy-driver port in this workspace).
+/// `device(motor,VME_IO,devPIC862,"PIC862")` (devPIMotor.dbd:26).
+static DEV_PIC862: DevSup = model1_device("devPIC862", "PIC862");
+
+/// `PIC862_NUM_CARDS` (drvPIC862.cc:43).
+static PIC862: Model1 = Model1::new(&DEV_PIC862, 8, SCAN_RATE);
+
+/// `PIC862Setup(num_cards, scan_rate)`.
 pub fn pic862_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIC862Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIC862Setup(maxCards, [scanRate]) - Accepted for parity; PIC862Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIC862Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIC862.setup_command("PIC862Setup")
 }
 
-/// Build the `PIC862Config(card, asynPort, addr, [movingPollMs],
-/// [idlePollMs])` command bound to `holder`. `addr` is the controller's
-/// multi-drop bus address (0-15, a single hex digit on the wire — C's
-/// documented "0-F" range).
-pub fn pic862_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIC862Config(card, name, address)`.
+/// `address` is the controller's multi-drop bus address (0-F).
+pub fn pic862_config_command() -> CommandDef {
     CommandDef::new(
         "PIC862Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIC862Config(card, asynPort, addr, [movingPollMs], [idlePollMs]) - \
-         Create a PI C-862/C-863 controller (DTYP PIC862_{card}_0); addr is the \
-         multi-drop bus address (0-15)",
+        "PIC862Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIC862Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIC862.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let addr = req_int(args, 2, "addr")?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let addr = req_int(args, 2, "asyn address (GPIB)")?;
             if !(0..=15).contains(&addr) {
                 return Err("PIC862Config: addr must be 0-15".into());
             }
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -111,79 +97,48 @@ pub fn pic862_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller = PIC862Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC862Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC862Axis::new(controller).map_err(|e| format!("PIC862Config: {e}"))?;
-            let dtyp_key = format!("PIC862_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(
-                ctx,
-                TraceUser::Model1,
-                dtyp_key,
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-            );
-
-            println!(
-                "PIC862Config: card={card} asynPort={asyn_port} addr={addr} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIC862_{card}_0)"
-            );
+            PIC862.install(ctx, card, 0, motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIC663Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIC663Config` call, matching every
-/// other legacy-driver port in this workspace).
+/// `device(motor,VME_IO,devPIC663,"PIC663")` (devPIMotor.dbd:32).
+static DEV_PIC663: DevSup = model1_device("devPIC663", "PIC663");
+
+/// `PIC663_NUM_CARDS` (drvPIC663.cc:34).
+static PIC663: Model1 = Model1::new(&DEV_PIC663, 8, SCAN_RATE);
+
+/// `PIC663Setup(num_cards, scan_rate)`.
 pub fn pic663_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIC663Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIC663Setup(maxCards, [scanRate]) - Accepted for parity; PIC663Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIC663Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIC663.setup_command("PIC663Setup")
 }
 
-/// Build the `PIC663Config(card, asynPort, addr, [movingPollMs],
-/// [idlePollMs])` command bound to `holder`. `addr` is the controller's
-/// multi-drop bus address (0-15, a single hex digit on the wire — same
-/// `\x01{addr}VE` select-at-connect exchange as the C-862 clone it derives
-/// from).
-pub fn pic663_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIC663Config(card, name, address)`.
+/// `address` is the controller's multi-drop bus address (0-F).
+pub fn pic663_config_command() -> CommandDef {
     CommandDef::new(
         "PIC663Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIC663Config(card, asynPort, addr, [movingPollMs], [idlePollMs]) - \
-         Create a PI C-663 controller (DTYP PIC663_{card}_0); addr is the \
-         multi-drop bus address (0-15)",
+        "PIC663Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIC663Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIC663.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let addr = req_int(args, 2, "addr")?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let addr = req_int(args, 2, "asyn address (GPIB)")?;
             if !(0..=15).contains(&addr) {
                 return Err("PIC663Config: addr must be 0-15".into());
             }
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -194,111 +149,80 @@ pub fn pic663_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller = PIC663Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC663Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC663Axis::new(controller).map_err(|e| format!("PIC663Config: {e}"))?;
-            let dtyp_key = format!("PIC663_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(
-                ctx,
-                TraceUser::Model1,
-                dtyp_key,
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-            );
-
-            println!(
-                "PIC663Config: card={card} asynPort={asyn_port} addr={addr} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIC663_{card}_0)"
-            );
+            PIC663.install(ctx, card, 0, motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIC630Setup(maxControllers, maxAxes, [scanRate])` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `PIC630Config` call).
+/// `device(motor,VME_IO,devPIC630,"PI C630")` (devPIMotor.dbd:8).
+static DEV_PIC630: DevSup = model1_device("devPIC630", "PI C630");
+
+/// `PIC630_NUM_CARDS` (drvPIC630.h:24).
+static PIC630: Model1 = Model1::new(&DEV_PIC630, 8, SCAN_RATE);
+
+/// `PIC630_num_axis`: the axes on each chain, as `PIC630Setup` set them.
+static PIC630_AXES: AtomicU8 = AtomicU8::new(PIC630_NUM_AXIS);
+
+/// `PIC630Setup(num_cards, num_channels, scan_rate)`.
 pub fn pic630_setup_command() -> CommandDef {
+    PIC630.register_row();
     CommandDef::new(
         "PIC630Setup",
         vec![
-            arg_int_req("maxControllers"),
-            arg_int_req("maxAxes"),
-            arg_int_opt("scanRate"),
+            arg_int_req("Max. controller groups"),
+            arg_int_req("Max. axes per group"),
+            arg_int_req("Polling rate"),
         ],
-        "PIC630Setup(maxControllers, maxAxes, [scanRate]) - Accepted for parity; \
-         PIC630Config allocates per call",
+        "PIC630Setup(num_cards, num_channels, scan_rate)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("PIC630Setup: maxControllers must be > 0".into());
-            }
+            PIC630.setup(c_int(args, 0), c_int(args, 2));
+            let channels = c_int(args, 1);
+            let channels = if (1..=PIC630_NUM_AXIS as i32).contains(&channels) {
+                channels as u8
+            } else {
+                PIC630_NUM_AXIS
+            };
+            PIC630_AXES.store(channels, Ordering::Relaxed);
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIC630Config(card, asynPort, numAxes, [cur1..cur9],
-/// [movingPollMs], [idlePollMs])` command bound to `holder`.
-///
-/// `numAxes` (1-9) is the number of daisy-chained axes on this serial line,
-/// addressed `1`-`numAxes`. It is passed explicitly here because C derives it
-/// from `PIC630Setup`'s global `num_channels`, and this port's `PIC630Setup`
-/// is a stateless parity no-op. `cur1..cur9` are the per-axis drive currents
-/// (`0`=OFF, `1`=100 mA … `8`=800 mA), sent as `{addr}DC{cur}` at connect;
-/// currents beyond `numAxes` are ignored.
-pub fn pic630_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
-    let mut arg_defs = vec![
-        arg_int_req("card"),
-        arg_str_req("asynPort"),
-        arg_int_req("numAxes"),
+/// `PIC630Config(card, name, cur0, …, cur8)`: the drive current of each
+/// axis on the chain (0 = OFF, 1 = 100 mA … 8 = 800 mA), sent at connect.
+pub fn pic630_config_command() -> CommandDef {
+    const CURRENTS: [&str; PIC630_NUM_AXIS as usize] = [
+        "Ch 1 current setting",
+        "Ch 2 current setting",
+        "Ch 3 current setting",
+        "Ch 4 current setting",
+        "Ch 5 current setting",
+        "Ch 6 current setting",
+        "Ch 7 current setting",
+        "Ch 8 current setting",
+        "Ch 9 current setting",
     ];
-    for i in 1..=PIC630_NUM_AXIS {
-        arg_defs.push(arg_int_opt(match i {
-            1 => "cur1",
-            2 => "cur2",
-            3 => "cur3",
-            4 => "cur4",
-            5 => "cur5",
-            6 => "cur6",
-            7 => "cur7",
-            8 => "cur8",
-            _ => "cur9",
-        }));
-    }
-    arg_defs.push(arg_int_opt("movingPollMs"));
-    arg_defs.push(arg_int_opt("idlePollMs"));
-
+    let mut arg_defs = vec![
+        arg_int_req("Card being configured"),
+        arg_str_req("asyn port name"),
+    ];
+    arg_defs.extend(CURRENTS.map(arg_int_req));
     CommandDef::new(
         "PIC630Config",
         arg_defs,
-        "PIC630Config(card, asynPort, numAxes, [cur1..cur9], [movingPollMs], [idlePollMs]) - \
-         Create a PI C-630 stepper chain (DTYP PIC630_{card}_{axis}, axis 0..numAxes-1); \
-         cur1..cur9 are per-axis drive currents (0=OFF, 1=100mA .. 8=800mA)",
+        "PIC630Config(card, name, cur0, ..., cur8)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIC630Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIC630.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let num_axes = req_int(args, 2, "numAxes")?;
-            if !(1..=PIC630_NUM_AXIS as i64).contains(&num_axes) {
-                return Err(format!("PIC630Config: numAxes must be 1-{PIC630_NUM_AXIS}"));
-            }
-            let num_axes = num_axes as u8;
-            // cur1..cur9 live at arg indices 3..=11.
-            let currents: Vec<i32> = (0..PIC630_NUM_AXIS as usize)
-                .map(|i| opt_int(args, 3 + i, 0, "cur").map(|v| v as i32))
-                .collect::<Result<_, _>>()?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(
-                args,
-                3 + PIC630_NUM_AXIS as usize,
-                4 + PIC630_NUM_AXIS as usize,
-            )?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let num_axes = PIC630_AXES.load(Ordering::Relaxed);
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -312,69 +236,43 @@ pub fn pic630_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let controller = Arc::new(Mutex::new(controller));
 
             for signal in 0..num_axes {
-                let axis = PIC630Axis::new(controller.clone(), signal, currents[signal as usize])
+                let current = c_int(args, 2 + signal as usize);
+                let axis = PIC630Axis::new(controller.clone(), signal, current)
                     .map_err(|e| format!("PIC630Config: {e}"))?;
-                let dtyp_key = format!("PIC630_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                PIC630.install(ctx, card, signal as i32, motor)?;
             }
-
-            println!(
-                "PIC630Config: card={card} asynPort={asyn_port} numAxes={num_axes} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PIC630_{card}_0..{})",
-                num_axes - 1
-            );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIC662Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIC662Config` call).
+/// `device(motor,VME_IO,devPIC662,"PIC662")` (devPIMotor.dbd:20).
+static DEV_PIC662: DevSup = model1_device("devPIC662", "PIC662");
+
+/// `PIC662_NUM_CARDS` (drvPIC662.cc:61).
+static PIC662: Model1 = Model1::new(&DEV_PIC662, 8, SCAN_RATE);
+
+/// `PIC662Setup(num_cards, scan_rate)`.
 pub fn pic662_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIC662Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIC662Setup(maxCards, [scanRate]) - Accepted for parity; PIC662Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIC662Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIC662.setup_command("PIC662Setup")
 }
 
-/// Build the `PIC662Config(card, asynPort, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`. The E-662 is a single-axis SCPI-like piezo
-/// controller with no protocol address.
-pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIC662Config(card, name)`.
+pub fn pic662_config_command() -> CommandDef {
     CommandDef::new(
         "PIC662Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
         ],
-        "PIC662Config(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create a PI E-662 piezo controller (DTYP PIC662_{card}_0)",
+        "PIC662Config(card, name)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIC662Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIC662.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -385,76 +283,43 @@ pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller =
                 PIC662Controller::new(handle).map_err(|e| format!("PIC662Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 
             let axis = PIC662Axis::new(controller).map_err(|e| format!("PIC662Config: {e}"))?;
-            let dtyp_key = format!("PIC662_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(
-                ctx,
-                TraceUser::Model1,
-                dtyp_key,
-                motor,
-                moving_poll_ms,
-                idle_poll_ms,
-            );
-
-            println!(
-                "PIC662Config: card={card} asynPort={asyn_port} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIC662_{card}_0)"
-            );
+            PIC662.install(ctx, card, 0, motor)?;
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIC844Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIC844Config` call).
+/// `device(motor,VME_IO,devPIC844,"PIC844")` (devPIMotor.dbd:2).
+static DEV_PIC844: DevSup = model1_device("devPIC844", "PIC844");
+
+/// `PIC844_NUM_CARDS` (drvPIC844.cc:69).
+static PIC844: Model1 = Model1::new(&DEV_PIC844, 8, SCAN_RATE);
+
+/// `PIC844Setup(num_cards, scan_rate)`.
 pub fn pic844_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIC844Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIC844Setup(maxCards, [scanRate]) - Accepted for parity; PIC844Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIC844Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIC844.setup_command("PIC844Setup")
 }
 
-/// Build the `PIC844Config(card, asynPort, addr, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`. Installs all four axes (DTYP
-/// `PIC844_{card}_{axis}`, `axis` 0-3; wire axis is `axis + 1`). `addr` is the
-/// C `asyn_address` (GPIB); like the C driver it is stored for signature parity
-/// but never used on the wire (the axis is selected by an `AXIS n;` prefix, and
-/// the transport connects at asyn sub-address 0).
-pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIC844Config(card, name, address)`.
+pub fn pic844_config_command() -> CommandDef {
     CommandDef::new(
         "PIC844Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIC844Config(card, asynPort, addr, [movingPollMs], [idlePollMs]) - \
-         Create a PI C-844 4-axis controller (DTYP PIC844_{card}_0..3); addr is \
-         accepted for parity but unused on the wire",
+        "PIC844Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIC844Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIC844.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let _addr = req_int(args, 2, "addr")?; // parity only; unused on wire
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -465,80 +330,46 @@ pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller =
                 PIC844Controller::new(handle).map_err(|e| format!("PIC844Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 
             for signal in 0..PIC844_NUM_AXES {
                 let axis = PIC844Axis::new(controller.clone(), signal)
                     .map_err(|e| format!("PIC844Config: {e}"))?;
-                let dtyp_key = format!("PIC844_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                PIC844.install(ctx, card, signal as i32, motor)?;
             }
-
-            println!(
-                "PIC844Config: card={card} asynPort={asyn_port} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIC844_{card}_0..3)"
-            );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIC848Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIC848Config` call).
+/// `device(motor,VME_IO,devPIC848,"PIC848")` (devPIMotor.dbd:14).
+static DEV_PIC848: DevSup = model1_device("devPIC848", "PIC848");
+
+/// `PIC848_NUM_CARDS` (drvPIC848.cc:58).
+static PIC848: Model1 = Model1::new(&DEV_PIC848, 8, SCAN_RATE);
+
+/// `PIC848Setup(num_cards, scan_rate)`.
 pub fn pic848_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIC848Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIC848Setup(maxCards, [scanRate]) - Accepted for parity; PIC848Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIC848Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIC848.setup_command("PIC848Setup")
 }
 
-/// Build the `PIC848Config(card, asynPort, addr, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`. The axis count is probed at connect (`CST?` until
-/// `NOSTAGE`); one axis is installed per present stage (DTYP
-/// `PIC848_{card}_{axis}`, `axis` 0-3, wire letter `A`+`axis`). `addr` is the C
-/// `asyn_address` (GPIB), stored for signature parity but unused on the wire
-/// (the axis is selected by byte 5 of each command; the transport connects at
-/// asyn sub-address 0).
-pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIC848Config(card, name, address)`.
+pub fn pic848_config_command() -> CommandDef {
     CommandDef::new(
         "PIC848Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIC848Config(card, asynPort, addr, [movingPollMs], [idlePollMs]) - \
-         Create a PI C-848 controller; axes are probed via CST? (DTYP \
-         PIC848_{card}_0..N); addr is accepted for parity but unused on the wire",
+        "PIC848Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIC848Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIC848.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let _addr = req_int(args, 2, "addr")?; // parity only; unused on wire
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -549,7 +380,6 @@ pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller =
                 PIC848Controller::new(handle).map_err(|e| format!("PIC848Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let num_axes = controller.num_axes();
             if num_axes == 0 {
                 return Err(format!(
@@ -562,76 +392,41 @@ pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             for signal in 0..num_axes {
                 let axis = PIC848Axis::new(controller.clone(), signal)
                     .map_err(|e| format!("PIC848Config: {e}"))?;
-                let dtyp_key = format!("PIC848_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                PIC848.install(ctx, card, signal as i32, motor)?;
             }
-
-            println!(
-                "PIC848Config: card={card} asynPort={asyn_port} \
-                 ident=\"{ident}\" numAxes={num_axes} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIC848_{card}_0..{})",
-                num_axes - 1
-            );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIE516Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIE516Config` call).
+/// `device(motor,VME_IO,devPIE516,"PIE516")` (devPIMotor.dbd:44).
+static DEV_PIE516: DevSup = model1_device("devPIE516", "PIE516");
+
+/// `PIE516_NUM_CARDS` (drvPIE516.cc:65).
+static PIE516: Model1 = Model1::new(&DEV_PIE516, 10, SCAN_RATE);
+
+/// `PIE516Setup(num_cards, scan_rate)`.
 pub fn pie516_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIE516Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIE516Setup(maxCards, [scanRate]) - Accepted for parity; PIE516Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIE516Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIE516.setup_command("PIE516Setup")
 }
 
-/// Build the `PIE516Config(card, asynPort, [addr], [movingPollMs],
-/// [idlePollMs])` command bound to `holder`. The E-516 is a 3-axis piezo
-/// controller; the axis count is probed at connect time and one motor device
-/// support is installed per responding axis (`DTYP PIE516_{card}_{axis}`,
-/// axis = 0..n). `addr` ("asyn address (GPIB)") is accepted for C signature
-/// parity but ignored — the driver hardcodes the asyn sub-address to 0 and
-/// selects axes by the per-command A/B/C letter, not a bus address.
-pub fn pie516_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIE516Config(card, name, address)`.
+pub fn pie516_config_command() -> CommandDef {
     CommandDef::new(
         "PIE516Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIE516Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - \
-         Create a PI E-516 piezo controller; probes axes and installs one motor \
-         per axis (DTYP PIE516_{card}_{axis}). addr is accepted for parity but \
-         ignored.",
+        "PIE516Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIE516Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIE516.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -642,81 +437,47 @@ pub fn pie516_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller =
                 PIE516Controller::new(handle).map_err(|e| format!("PIE516Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let num_axes = controller.num_axes();
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
                 let axis_obj = PIE516Axis::new(controller.clone(), axis)
                     .map_err(|e| format!("PIE516Config: {e}"))?;
-                let dtyp_key = format!("PIE516_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                PIE516.install(ctx, card, axis as i32, motor)?;
             }
-
-            println!(
-                "PIE516Config: card={card} asynPort={asyn_port} axes={num_axes} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIE516_{card}_0..{})",
-                num_axes.saturating_sub(1)
-            );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIE517Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIE517Config` call).
+/// `device(motor,VME_IO,devPIE517,"PIE517")` (devPIMotor.dbd:50).
+static DEV_PIE517: DevSup = model1_device("devPIE517", "PIE517");
+
+/// `PIE517_NUM_CARDS` (drvPIE517.cc:73).
+static PIE517: Model1 = Model1::new(&DEV_PIE517, 10, SCAN_RATE);
+
+/// `PIE517Setup(num_cards, scan_rate)`.
 pub fn pie517_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIE517Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIE517Setup(maxCards, [scanRate]) - Accepted for parity; PIE517Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIE517Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIE517.setup_command("PIE517Setup")
 }
 
-/// Build the `PIE517Config(card, asynPort, [addr], [movingPollMs],
-/// [idlePollMs])` command bound to `holder`. The E-517 is a 3-axis piezo
-/// controller (digit-addressed axes 1/2/3); the axis count is probed at connect
-/// time and one motor device support is installed per responding axis (`DTYP
-/// PIE517_{card}_{axis}`, axis = 0..n). `addr` is accepted for C signature
-/// parity but ignored.
-pub fn pie517_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIE517Config(card, name, address)`.
+pub fn pie517_config_command() -> CommandDef {
     CommandDef::new(
         "PIE517Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIE517Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - \
-         Create a PI E-517 piezo controller; probes axes and installs one motor \
-         per axis (DTYP PIE517_{card}_{axis}). addr is accepted for parity but \
-         ignored.",
+        "PIE517Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIE517Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIE517.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -733,74 +494,41 @@ pub fn pie517_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             for axis in 0..num_axes {
                 let axis_obj = PIE517Axis::new(controller.clone(), axis)
                     .map_err(|e| format!("PIE517Config: {e}"))?;
-                let dtyp_key = format!("PIE517_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                PIE517.install(ctx, card, axis as i32, motor)?;
             }
-
-            println!(
-                "PIE517Config: card={card} asynPort={asyn_port} axes={num_axes} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PIE517_{card}_0..{})",
-                num_axes.saturating_sub(1)
-            );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIE710Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIE710Config` call).
+/// `device(motor,VME_IO,devPIE710,"PIE710")` (devPIMotor.dbd:38).
+static DEV_PIE710: DevSup = model1_device("devPIE710", "PIE710");
+
+/// `PIE710_NUM_CARDS` (drvPIE710.cc:57).
+static PIE710: Model1 = Model1::new(&DEV_PIE710, 8, SCAN_RATE);
+
+/// `PIE710Setup(num_cards, scan_rate)`.
 pub fn pie710_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIE710Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIE710Setup(maxCards, [scanRate]) - Accepted for parity; PIE710Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIE710Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIE710.setup_command("PIE710Setup")
 }
 
-/// Build the `PIE710Config(card, asynPort, [addr], [movingPollMs],
-/// [idlePollMs])` command bound to `holder`. The E-710 is a closed-loop
-/// DC-servo controller with up to 6 digit-addressed axes (1..6); the axis count
-/// is probed at connect time and one motor device support is installed per
-/// responding axis (`DTYP PIE710_{card}_{axis}`, axis = 0..n). `addr` is the C
-/// `PIE710Config` GPIB/asyn address argument, accepted for signature parity but
-/// not used by the serial transport.
-pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIE710Config(card, name, address)`.
+pub fn pie710_config_command() -> CommandDef {
     CommandDef::new(
         "PIE710Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIE710Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - \
-         Create a PI E-710 DC-servo controller; probes up to 6 axes (1..6) and \
-         installs one motor per axis (DTYP PIE710_{card}_{axis}). addr is the \
-         asyn/GPIB address, accepted for parity but unused on serial.",
+        "PIE710Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIE710Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIE710.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -812,80 +540,46 @@ pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let controller =
                 PIE710Controller::new(handle).map_err(|e| format!("PIE710Config: {e}"))?;
             let num_axes = controller.num_axes();
-            let ident = controller.ident().to_owned();
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
                 let axis_obj = PIE710Axis::new(controller.clone(), axis)
                     .map_err(|e| format!("PIE710Config: {e}"))?;
-                let dtyp_key = format!("PIE710_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                PIE710.install(ctx, card, axis as i32, motor)?;
             }
-
-            println!(
-                "PIE710Config: card={card} asynPort={asyn_port} axes={num_axes} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIE710_{card}_0..{})",
-                num_axes.saturating_sub(1)
-            );
             Ok(CommandOutcome::Continue)
         },
     )
 }
 
-/// Build the `PIE816Setup(maxCards, [scanRate])` no-op command (startup-script
-/// parity; the asyn-rs port allocates per `PIE816Config` call).
+/// `device(motor,VME_IO,devPIE816,"PIE816")` (devPIMotor.dbd:56).
+static DEV_PIE816: DevSup = model1_device("devPIE816", "PIE816");
+
+/// `PIE816_NUM_CARDS` (drvPIE816.cc:73).
+static PIE816: Model1 = Model1::new(&DEV_PIE816, 10, SCAN_RATE);
+
+/// `PIE816Setup(num_cards, scan_rate)`.
 pub fn pie816_setup_command() -> CommandDef {
-    CommandDef::new(
-        "PIE816Setup",
-        vec![arg_int_req("maxCards"), arg_int_opt("scanRate")],
-        "PIE816Setup(maxCards, [scanRate]) - Accepted for parity; PIE816Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxCards")?;
-            if max < 1 {
-                return Err("PIE816Setup: maxCards must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    PIE816.setup_command("PIE816Setup")
 }
 
-/// Build the `PIE816Config(card, asynPort, [addr], [movingPollMs],
-/// [idlePollMs])` command bound to `holder`. The E-816 is a piezo controller
-/// with up to 12 letter-addressed axes (A..L); the axis count is probed at
-/// connect time and one motor device support is installed per responding axis
-/// (`DTYP PIE816_{card}_{axis}`, axis = 0..n). `addr` is accepted for C
-/// signature parity but ignored.
-pub fn pie816_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `PIE816Config(card, name, address)`.
+pub fn pie816_config_command() -> CommandDef {
     CommandDef::new(
         "PIE816Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("addr"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+            arg_int_req("asyn address (GPIB)"),
         ],
-        "PIE816Config(card, asynPort, [addr], [movingPollMs], [idlePollMs]) - \
-         Create a PI E-816 piezo controller; probes up to 12 axes (A..L) and \
-         installs one motor per axis (DTYP PIE816_{card}_{axis}). addr is \
-         accepted for parity but ignored.",
+        "PIE816Config(card, name, address)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("PIE816Config: card must be >= 0".into());
+            let card = req_int(args, 0, "Card being configured")?;
+            if !PIE816.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -897,30 +591,14 @@ pub fn pie816_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let controller =
                 PIE816Controller::new(handle).map_err(|e| format!("PIE816Config: {e}"))?;
             let num_axes = controller.num_axes();
-            let ident = controller.ident().to_owned();
             let controller = Arc::new(Mutex::new(controller));
 
             for axis in 0..num_axes {
                 let axis_obj = PIE816Axis::new(controller.clone(), axis)
                     .map_err(|e| format!("PIE816Config: {e}"))?;
-                let dtyp_key = format!("PIE816_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                PIE816.install(ctx, card, axis as i32, motor)?;
             }
-
-            println!(
-                "PIE816Config: card={card} asynPort={asyn_port} axes={num_axes} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=PIE816_{card}_0..{})",
-                num_axes.saturating_sub(1)
-            );
             Ok(CommandOutcome::Continue)
         },
     )

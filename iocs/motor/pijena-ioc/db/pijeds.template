@@ -1,5 +1,5 @@
 # piezosystem jena E-516 (PIJEDS): one motor record per axis. Load once per
-# axis with N = 0-based axis index (DTYP PIJEDS_$(CARD)_$(N)); the driver maps
+# axis with S = 0-based signal (DTYP "PIJEDS", OUT #C$(C) S$(S)); the driver maps
 # index 0,1,2,... to controller axes 0,1,2,...
 #
 # The E-516 is a CLOSED-LOOP capacitive-feedback piezo positioner. Positions
@@ -10,7 +10,8 @@
 # rate.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PIJEDS_$(CARD)_$(N)")
+    field(DTYP, "PIJEDS")
+    field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10.0)")
     field(ACCL, "$(ACCL=0.5)")

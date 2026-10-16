@@ -1,13 +1,14 @@
-# AMCI ANG1: one motor record per axis. Load once per axis with N = 0-based
-# axis index (DTYP $(PORT)_$(N)); PORT is the controller's asyn port name
+# AMCI ANG1: one motor record per axis. Load once per axis with ADDR the 0-based
+# axis of controller PORT as in C's basic_asyn_motor.db; PORT is the controller's asyn port name
 # passed to ANG1CreateController. In practice each ANG1 module is its own
-# controller instance with a single axis (N=0) — see motor-amci::ang1's
+# controller instance with a single axis (ADDR=0) — see motor-amci::ang1's
 # module doc on the shared, non-offset register block.
 #
 # The controller works in motor steps, so MRES = 1 and EGU = steps.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "$(PORT)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10000.0)")
     field(ACCL, "$(ACCL=0.5)")

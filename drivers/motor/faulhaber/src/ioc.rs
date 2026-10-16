@@ -1,110 +1,74 @@
 //! `MCDC2805Setup` / `MCDC2805Config` iocsh commands for the Faulhaber
-//! MCDC2805.
-//!
-//! Mirrors C `MCDC2805Config(card, numMotors, name)`: connect the serial octet
-//! port, probe the nodes ([`FaulhaberController::new`]), and register each
-//! behind a `DTYP`-keyed motor device support (`MCDC2805_{card}_{node}`,
-//! 0-based). `MCDC2805Setup` (which only sized a controller array in C) is
-//! accepted as a no-op for startup-script parity.
-//!
-//! An extra `countsPerRev` argument (not in the C signature) supplies the
-//! encoder resolution the C driver took from the record's `SREV` field, which
-//! is not visible at the asyn-rs boundary.
+//! MCDC2805, C's model-1 interface: records reach axis `signal` of `card`
+//! through `DTYP "MCDC2805"` and `OUT "#C card S signal"`. Config connects
+//! and identifies the controller at once, where C's `motor_init` does so at
+//! iocInit.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::connect_serial;
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
-};
-use motor_common::{MotorHolder, TraceUser};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
+use motor_common::model1::{Model1, SCAN_RATE};
+use motor_common::model1_device;
 
 use crate::faulhaber::{FaulhaberAxis, FaulhaberController};
 
 /// Serial command timeout (C `COMM_TIMEOUT` 2 s).
 const MCDC2805_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the `MCDC2805Setup(maxControllers, [scanRate])` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `MCDC2805Config`).
+/// The motor record's SREV default: C converts velocities with the record's
+/// SREV (devMCDC2805.cc:227), which does not reach the driver here.
+const SREV_DEFAULT: f64 = 200.0;
+
+/// `device(motor,VME_IO,devMCDC2805,"MCDC2805")` (devFaulhaberMotor.dbd:2).
+static DEV_MCDC2805: DevSup = model1_device("devMCDC2805", "MCDC2805");
+
+/// `MCDC2805_NUM_CARDS` (drvMCDC2805.cc:56).
+static MCDC2805: Model1 = Model1::new(&DEV_MCDC2805, 8, SCAN_RATE);
+
+/// `MCDC2805Setup(num_cards, scan_rate)`.
 pub fn mcdc2805_setup_command() -> CommandDef {
-    CommandDef::new(
-        "MCDC2805Setup",
-        vec![arg_int_req("maxControllers"), arg_int_opt("scanRate")],
-        "MCDC2805Setup(maxControllers, [scanRate]) - Accepted for parity; MCDC2805Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("MCDC2805Setup: maxControllers must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    MCDC2805.setup_command("MCDC2805Setup")
 }
 
-/// Build the `MCDC2805Config(card, numMotors, asynPort, countsPerRev,
-/// [movingPollMs], [idlePollMs])` command bound to `holder`.
-pub fn mcdc2805_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `MCDC2805Config(card, modules, name)`.
+pub fn mcdc2805_config_command() -> CommandDef {
     CommandDef::new(
         "MCDC2805Config",
         vec![
-            arg_int_req("card"),
-            arg_int_req("numMotors"),
-            arg_str_req("asynPort"),
-            arg_int_req("countsPerRev"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_int_req("# modules on this serial port"),
+            arg_str_req("asyn port name"),
         ],
-        "MCDC2805Config(card, numMotors, asynPort, countsPerRev, [movingPollMs], [idlePollMs]) - \
-         Create a Faulhaber MCDC2805 controller (DTYP MCDC2805_{card}_{0..N-1}); \
-         responding nodes are auto-detected up to numMotors",
+        "MCDC2805Config(card, modules, name)",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("MCDC2805Config: card must be >= 0".into());
+            if !MCDC2805.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let num_motors = req_int(args, 1, "numMotors")?;
+            let num_motors = req_int(args, 1, "# modules on this serial port")?;
             if !(1..=8).contains(&num_motors) {
                 return Err("MCDC2805Config: numMotors must be 1..=8".into());
             }
-            let asyn_port = req_string(args, 2, "asynPort")?;
-            let counts_per_rev = req_int(args, 3, "countsPerRev")?;
-            if counts_per_rev <= 0 {
-                return Err("MCDC2805Config: countsPerRev must be > 0".into());
-            }
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
+            let asyn_port = req_string(args, 2, "asyn port name")?;
 
             let handle = connect_serial(&asyn_port, MCDC2805_TIMEOUT)?;
             let controller = FaulhaberController::new(handle, num_motors as usize)
                 .map_err(|e| format!("MCDC2805Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let num_axes = controller.num_axes();
             let controller = Arc::new(Mutex::new(controller));
 
             for node in 0..num_axes {
-                let ax = FaulhaberAxis::new(controller.clone(), node, counts_per_rev as f64)
+                let ax = FaulhaberAxis::new(controller.clone(), node, SREV_DEFAULT)
                     .map_err(|e| format!("MCDC2805Config: node {node}: {e}"))?;
-                let dtyp_key = format!("MCDC2805_{card}_{node}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                MCDC2805.install(ctx, card, node as i32, motor)?;
             }
-            println!(
-                "MCDC2805Config: card={card} asynPort={asyn_port} nodes={num_axes} \
-                 countsPerRev={counts_per_rev} ident=\"{ident}\" \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MCDC2805_{card}_{{0..{}}})",
-                num_axes - 1
-            );
             Ok(CommandOutcome::Continue)
         },
     )

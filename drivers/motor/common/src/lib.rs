@@ -2,16 +2,18 @@
 //! from `epics-modules/motor`.
 //!
 //! The per-vendor crates (`motor-newport`, `motor-micronix`, …) all share the
-//! same shape: a `*CreateController` iocsh command connects an octet port,
-//! builds one [`epics_rs::asyn::interfaces::motor::AsynMotor`] per axis, and
-//! registers each behind a `DTYP`-keyed motor device support that
-//! `dbLoadRecords` binds. This crate factors out everything that is not
-//! protocol-specific:
+//! same shape: a C-named create command connects an octet port, builds one
+//! [`epics_rs::asyn::interfaces::motor::AsynMotor`] per axis, and registers
+//! each where a record's OUT reaches it — `@asyn(PORT,ADDR)` for an asyn
+//! or model-2 driver, `#C card S signal` for a model-1 one — as motor-rs's
+//! [`devices`] binds them at `init_record`. This crate factors out everything
+//! that is not protocol-specific:
 //!
-//! - [`MotorHolder`] — stores the device supports, wires
-//!   each motor through motor-rs's [`MotorBuilder`], and hands the device
-//!   support back to the record layer by `DTYP` name ([`take`
-//!   semantics][MotorHolder::device_support_factory]).
+//! - [`install`] — wires one axis through motor-rs's [`MotorBuilder`],
+//!   registers it and starts its poller.
+//! - [`model1::Model1`] — a model-1 driver's `Setup` and card table.
+//! - [`model2::Model2`] — a model-2 driver's cards, opened by
+//!   `drvAsynMotorConfigure`.
 //! - [`iocsh`] — argument parsing helpers for the create commands.
 //! - [`connect`] — octet-port connect helpers ([`connect_serial`],
 //!   [`connect_ip`]).
@@ -19,24 +21,34 @@
 //!   protocols share.
 //!
 //! [`MotorBuilder`]: epics_rs::motor::builder::MotorBuilder
+//! [`devices`]: epics_rs::motor::devices
 //! [`connect_serial`]: connect::connect_serial
 //! [`connect_ip`]: connect::connect_ip
 
 pub mod connect;
 pub mod iocsh;
+pub mod model1;
+pub mod model2;
 pub mod util;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
-use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::CommandContext;
-use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
-use epics_rs::motor::device_support::MotorDeviceSupport;
-use epics_rs::motor::poll_loop::PollCommand;
+use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
+pub use epics_rs::motor::devices::{
+    device_support_factory, devices, model1_device, register_controller_port,
+    register_drv_motor_asyn_port, register_model1_device,
+};
 pub use epics_rs::motor::trace::TraceUser;
+
+/// Create C `asynMotorController` port `port` with axes `0..num_axes` for a
+/// driver with no parameters of its own, gated on the IOC's interruptAccept.
+pub fn register_port(ctx: &CommandContext, port: &str, num_axes: i32) -> Result<(), String> {
+    let owner = ctx.db().scan_control().interrupt_gate();
+    register_controller_port(owner, port, num_axes, ()).map(drop)
+}
 
 /// The trace user of an axis a C asyn driver serves: its port and address.
 pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
@@ -46,91 +58,27 @@ pub fn asyn_user(port: &str, addr: i32) -> TraceUser {
     }
 }
 
-/// Holds every motor device support created by a vendor's `*CreateController`
-/// commands, keyed for the record layer to
-/// claim by `DTYP` name.
-///
-/// One holder is shared (via `Arc`) across all of a controller's axes and
-/// registered once as the IOC's dynamic device-support factory. It is
-/// vendor-independent; a vendor that needs extra per-controller bookkeeping
-/// (e.g. a two-step create-controller/create-axis API) keeps that state in
-/// its own holder wrapper and delegates motor installation here.
-#[derive(Default)]
-pub struct MotorHolder {
-    motors: Mutex<HashMap<String, Option<MotorDeviceSupport>>>,
-}
-
-impl MotorHolder {
-    /// Create an empty holder.
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    /// Wire one motor into a record + poll loop: build the device support and
-    /// poll loop for `motor`, spawn the poll loop (polling from iocRun), and store the
-    /// device support under `dtyp_key` for later `dbLoadRecords` binding.
-    /// `user` is the asyn user its trace lines print on: [`asyn_user`] for a
-    /// C asyn driver, [`TraceUser::Model1`] for a model-1 one.
-    pub fn install(
-        &self,
-        ctx: &CommandContext,
-        user: TraceUser,
-        dtyp_key: String,
-        motor: Arc<Mutex<dyn AsynMotor>>,
-        moving_poll_ms: u64,
-        idle_poll_ms: u64,
-    ) {
-        let MotorSetup {
-            record: _,
-            device_support,
-            poll_loop,
-            poll_cmd_tx,
-        } = MotorBuilder::new(motor)
-            .trace_user(user)
-            .moving_poll_interval(Duration::from_millis(moving_poll_ms))
-            .idle_poll_interval(Duration::from_millis(idle_poll_ms))
-            .build();
-
-        let device_support = device_support.with_dtyp_name(dtyp_key.clone());
-
-        ctx.bridge().spawn(poll_loop.run());
-
-        // Released when the IOC runs, as C's poller starts delivering status
-        // after iocInit: owned here so no IOC binary can leave the axis unpolled.
-        init_hook_register(Arc::new(move |state| {
-            if state == InitHookState::AfterIocRunning {
-                let _ = poll_cmd_tx.try_send(PollCommand::StartPolling);
-            }
-        }));
-        self.motors
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(dtyp_key, Some(device_support));
-    }
-
-    /// Dynamic device-support factory: hand the record layer the device
-    /// support registered under the record's `DTYP` name. Each support is
-    /// consumed once (take semantics), so a second record with the same `DTYP`
-    /// gets `None`.
-    pub fn device_support_factory(
-        self: &Arc<Self>,
-    ) -> impl Fn(
-        &epics_rs::ca::server::ioc_app::DeviceSupportContext,
-    ) -> Option<Box<dyn epics_rs::base::server::device_support::DeviceSupport>>
-    + Send
-    + Sync
-    + 'static {
-        let holder = self.clone();
-        move |ctx: &epics_rs::ca::server::ioc_app::DeviceSupportContext| {
-            let mut motors = holder.motors.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = motors.get_mut(ctx.dtyp)
-                && let Some(ds) = slot.take()
-            {
-                return Some(
-                    Box::new(ds) as Box<dyn epics_rs::base::server::device_support::DeviceSupport>
-                );
-            }
-            None
-        }
-    }
+/// Make `motor` the axis at `user` — [`asyn_user`] on a port the create
+/// command registered with [`register_port`], or [`TraceUser::Model1`] for
+/// a card of a model-1 driver — and start its poller, which polls from
+/// here on as C's poller thread does from controller creation.
+pub fn install(
+    ctx: &CommandContext,
+    user: TraceUser,
+    motor: Arc<Mutex<dyn AsynMotor>>,
+    moving_poll_ms: u64,
+    idle_poll_ms: u64,
+) -> Result<(), String> {
+    let AxisSetup {
+        axis,
+        poll_loop,
+        poll_cmd_tx: _,
+    } = MotorBuilder::new(motor)
+        .trace_user(user)
+        .moving_poll_interval(Duration::from_millis(moving_poll_ms))
+        .idle_poll_interval(Duration::from_millis(idle_poll_ms))
+        .build_axis();
+    epics_rs::motor::devices::register_axis(axis)?;
+    ctx.bridge().spawn(poll_loop.run());
+    Ok(())
 }

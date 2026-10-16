@@ -30,17 +30,17 @@ asynSetOption("$(SERIAL)", 0, "stop",   "1")
 asynOctetSetInputEos("$(SERIAL)", 0, "\n\r")
 
 # ---- MMC-200 controller ----
-# MMC200CreateController(motorPort, serialPort, numAxes,
-#                        [movingPollMs], [idlePollMs], [ignoreLimits])
+# MMC200CreateController(portName, MMC200PortName, numAxes,
+#                        movingPollPeriod, idlePollPeriod, ignoreLimits)
 MMC200CreateController("$(PORT)", "$(SERIAL)", 2, 500, 2000, 1)
 
-# One motor record per axis (DTYP MMC200_$(PORT)_0, _1, ...).
+# One motor record per axis (OUT @asyn($(PORT),axis)).
 # Positions travel the driver boundary in EGU (controller units, mm or deg)
 # directly; MRES only sets the record's raw-count resolution. Set MRES to the
 # axis's physical resolution (the example matches a 2.44140625e-6 mm/microstep
 # stage).
-dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
-dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m2,N=1,PORT=$(PORT),MRES=2.44140625e-6,EGU=mm")
+dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m1,PORT=$(PORT),ADDR=0,MRES=2.44140625e-6,EGU=mm")
+dbLoadRecords("$(MICRONIX_IOC)/db/mmc200.template", "P=$(P),M=m2,PORT=$(PORT),ADDR=1,MRES=2.44140625e-6,EGU=mm")
 
 iocInit()
 

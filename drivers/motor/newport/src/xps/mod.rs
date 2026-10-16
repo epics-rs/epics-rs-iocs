@@ -12,15 +12,18 @@ pub mod axis;
 pub mod commands;
 pub mod controller;
 pub mod corrector;
+#[cfg(test)]
+pub(crate) mod fake;
 pub mod ftp;
 pub mod gathering;
+pub mod gpio;
 pub mod pco;
 pub mod profile;
 pub mod rpc;
 
 pub use axis::XpsAxis;
-pub use controller::{ExecutionPlan, XpsController};
-pub use corrector::{CorrectorType, XpsCorrectorInfo};
+pub use controller::{ExecutionPlan, SetPositionFailure, XpsController};
+pub use corrector::{CorrectorType, PidFailure, XpsCorrectorInfo};
 pub use gathering::{GatheringReadback, parse_gathering_buffer, readback_csv};
 pub use pco::PcoParams;
 pub use profile::{

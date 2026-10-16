@@ -17,6 +17,7 @@ use super::rpc::{XpsResult, XpsSocket};
 
 /// A registered axis's identity, kept by the controller for group enumeration.
 struct AxisRef {
+    axis_no: i32,
     positioner: String,
     group: String,
 }
@@ -31,6 +32,9 @@ struct BuiltTrajectory {
     /// `(positioner, target)`, already resolved to absolute or relative units
     /// per the profile's move mode.
     start_moves: Vec<(String, f64)>,
+    /// Per-axis flyback after the run, resolved the same way: the last point
+    /// (absolute) or back one post-ramp distance (relative).
+    end_moves: Vec<(String, f64)>,
     move_mode: MoveMode,
 }
 
@@ -41,6 +45,7 @@ pub struct ExecutionPlan {
     pub file_name: String,
     pub group: String,
     pub start_moves: Vec<(String, f64)>,
+    pub end_moves: Vec<(String, f64)>,
     pub move_mode: MoveMode,
     /// The profile's per-point times, for the pulse-output window
     /// (C `profileTimes_`).
@@ -50,6 +55,30 @@ pub struct ExecutionPlan {
     /// `executeProfile` builds the gathering list over all `numAxes_` axes,
     /// not just the profile's).
     pub gathering_positioners: Vec<String>,
+}
+
+/// The [`XpsController::set_position`] step that failed, with its XPS code.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetPositionFailure {
+    /// The grouped branch's `GroupPositionCurrentGet` of the last axis: the
+    /// position was not set.
+    CurrentGet(i32),
+    /// `GroupKill`/`GroupInitialize`: the position was not set. `grouped`
+    /// picks C's line, which differs between the two branches.
+    Initialize { code: i32, grouped: bool },
+    /// `GroupReferencingStop`: C reports it and returns success.
+    ReferencingStop(i32),
+}
+
+/// C `buildProfile`'s message for a failed `MultipleAxesPVTVerification`.
+fn verify_message(status: i32) -> String {
+    match -status {
+        69 => "Acceleration Too High".into(),
+        68 => "Velocity Too High".into(),
+        70 => "Final Velocity Non Zero".into(),
+        75 => "Negative or Null Delta Time".into(),
+        _ => format!("Unknown trajectory verify error={status}"),
+    }
 }
 
 /// Shared controller state for one XPS, owning the poll socket.
@@ -62,6 +91,11 @@ pub struct XpsController {
     set_position_settling: Duration,
     /// `autoEnable` — re-enable a disabled axis on move (default on).
     auto_enable: bool,
+    /// `noDisableError` — a disabled axis (state 20) is no MSTA problem.
+    no_disable_error: bool,
+    /// `enableMovingMode_`: an axis's move is done when its move socket
+    /// answers, not when its group stops moving.
+    moving_mode: bool,
     /// Each registered axis's `(positioner, group)`, in registration order —
     /// for group-membership counts (C `XPSAxis::isInGroup`) and for enumerating
     /// a group's positioners when building/executing a PVT profile.
@@ -94,6 +128,8 @@ impl XpsController {
             enable_set_position,
             set_position_settling,
             auto_enable: true,
+            no_disable_error: false,
+            moving_mode: false,
             axes: Vec::new(),
             referencing_groups: HashSet::new(),
             profile: None,
@@ -121,10 +157,32 @@ impl XpsController {
         self.auto_enable = enable;
     }
 
+    /// Whether a disabled axis leaves the problem bit clear (C
+    /// `noDisableError_`).
+    pub fn no_disable_error(&self) -> bool {
+        self.no_disable_error
+    }
+
+    /// C `XPSNoDisableError`.
+    pub fn set_no_disable_error(&mut self) {
+        self.no_disable_error = true;
+    }
+
+    /// Whether moving mode is on (C `enableMovingMode_`).
+    pub fn moving_mode(&self) -> bool {
+        self.moving_mode
+    }
+
+    /// C `XPSEnableMovingMode`.
+    pub fn set_moving_mode(&mut self) {
+        self.moving_mode = true;
+    }
+
     /// Record an axis's positioner and group so group-membership counts and
     /// group positioner enumeration stay accurate.
-    pub fn register_axis(&mut self, positioner: &str, group: &str) {
+    pub fn register_axis(&mut self, axis_no: i32, positioner: &str, group: &str) {
         self.axes.push(AxisRef {
+            axis_no,
             positioner: positioner.to_string(),
             group: group.to_string(),
         });
@@ -161,28 +219,69 @@ impl XpsController {
     }
 
     /// Redefine the current position of `positioner` to `position` device
-    /// units, via the XPS referencing mode (C `XPSAxis::setPosition`, single-
-    /// positioner branch: `GroupKill` → `GroupInitialize` → settle →
-    /// `GroupReferencingStart` → `GroupReferencingActionExecute(SetPosition)` →
-    /// `GroupReferencingStop`). Requires `enableSetPosition`.
+    /// units, via the XPS referencing mode (C `XPSAxis::setPosition`):
+    /// `GroupKill` → `GroupInitialize` → settle → `GroupReferencingStart` →
+    /// `GroupReferencingActionExecute(SetPosition)` → `GroupReferencingStop`.
+    /// When the group holds more than one axis, every axis's current position
+    /// is read first and its siblings are set back to it.
     ///
-    /// The multi-positioner group branch (`isInGroup > 1`, coordinated XY/XYZ
-    /// referencing of siblings) is not modeled here; callers detect it via
-    /// [`axes_in_group`] and report it rather than issuing a partial sequence.
-    ///
-    /// [`axes_in_group`]: XpsController::axes_in_group
-    pub fn set_position(&self, positioner: &str, group: &str, position: f64) -> XpsResult<()> {
-        // C: GroupKill's status is not checked before GroupInitialize.
+    /// C checks only the last `GroupPositionCurrentGet` and `GroupInitialize`,
+    /// which abort the sequence, and `GroupReferencingStop`, which it reports
+    /// and then returns success for; the caller prints each line.
+    pub fn set_position(
+        &self,
+        positioner: &str,
+        group: &str,
+        position: f64,
+    ) -> Result<(), SetPositionFailure> {
+        let grouped = self.axes_in_group(group) > 1;
+        let mut current = Vec::new();
+        if grouped {
+            let mut axes: Vec<&AxisRef> = self.axes.iter().collect();
+            axes.sort_by_key(|a| a.axis_no);
+            let mut last = Ok(());
+            for a in axes {
+                let read = self.poll.group_position_current_get(&a.positioner);
+                // C leaves a failed read's position unset; here it is 0.
+                current.push((a, *read.as_ref().unwrap_or(&0.0)));
+                last = read.map(|_| ());
+            }
+            last.map_err(|e| SetPositionFailure::CurrentGet(e.code()))?;
+        }
         let _ = self.poll.group_kill(group);
-        self.poll.group_initialize(group)?;
+        self.poll
+            .group_initialize(group)
+            .map_err(|e| SetPositionFailure::Initialize {
+                code: e.code(),
+                grouped,
+            })?;
 
         // Settle after initialization so the stage does not oscillate.
         std::thread::sleep(self.set_position_settling);
 
-        self.poll.group_referencing_start(group)?;
+        let _ = self.poll.group_referencing_start(group);
+        // C indexes the cached positions by the in-group counter rather than
+        // by axis number; each sibling here gets the position read for it.
+        for (a, p) in &current {
+            if a.group == group && a.positioner != positioner {
+                let _ = self.poll.group_referencing_action_execute(
+                    &a.positioner,
+                    "SetPosition",
+                    "None",
+                    *p,
+                );
+            }
+        }
+        let _ =
+            self.poll
+                .group_referencing_action_execute(positioner, "SetPosition", "None", position);
+        if grouped {
+            // Some axis types (e.g. spindle) stay in referencing mode without it.
+            std::thread::sleep(Duration::from_millis(50));
+        }
         self.poll
-            .group_referencing_action_execute(positioner, "SetPosition", "None", position)?;
-        self.poll.group_referencing_stop(group)
+            .group_referencing_stop(group)
+            .map_err(|e| SetPositionFailure::ReferencingStop(e.code()))
     }
 
     /// Whether `setPosition` is enabled (C `enableSetPosition_`).
@@ -231,7 +330,12 @@ impl XpsController {
             let (_vel, accel, _min_jerk, _max_jerk) = self
                 .poll
                 .positioner_sgamma_parameters_get(&ax.positioner)
-                .map_err(|e| format!("SGamma read for {}: {e}", ax.positioner))?;
+                .map_err(|e| {
+                    format!(
+                        "Error calling positionerSGammaParametersSet, status={}\n",
+                        e.code()
+                    )
+                })?;
             max_accels.push(accel);
         }
         profile.generate(&max_accels).map_err(|e| e.to_string())
@@ -257,7 +361,9 @@ impl XpsController {
             .profile
             .as_ref()
             .ok_or("no profile defined (call XPSDefineProfileFromFile first)")?;
-        if built.pre_distance.len() != profile.axes.len() {
+        if built.pre_distance.len() != profile.axes.len()
+            || built.post_distance.len() != profile.axes.len()
+        {
             return Err("built trajectory does not match the defined profile".into());
         }
         let group = profile.group.clone();
@@ -265,14 +371,21 @@ impl XpsController {
 
         self.poll
             .multiple_axes_pvt_verification(&group, file_name)
-            .map_err(|e| format!("PVT verification failed: {e}"))?;
+            .map_err(|e| verify_message(e.code()))?;
 
         let mut start_moves = Vec::with_capacity(profile.axes.len());
+        let mut end_moves = Vec::with_capacity(profile.axes.len());
         for (j, ax) in profile.axes.iter().enumerate() {
             let (min_pos, max_pos, _max_vel, _max_accel) = self
                 .poll
                 .multiple_axes_pvt_verification_result_get(&ax.positioner, file_name)
-                .map_err(|e| format!("PVT result get for {}: {e}", ax.positioner))?;
+                .map_err(|e| {
+                    format!(
+                        "MultipleAxesPVTVerificationResultGet error for axis {}, status={}\n",
+                        ax.positioner,
+                        e.code()
+                    )
+                })?;
             let (low, high) = self
                 .poll
                 .positioner_user_travel_limits_get(&ax.positioner)
@@ -281,18 +394,16 @@ impl XpsController {
             let start = ax.positions[0];
             if start + min_pos < low {
                 return Err(format!(
-                    "{}: trajectory low {:.6} violates soft limit {:.6}",
+                    "Low soft limit violation for axis {}, position={:.6}, limit={low:.6}\n",
                     ax.positioner,
                     start + min_pos,
-                    low
                 ));
             }
             if start + max_pos > high {
                 return Err(format!(
-                    "{}: trajectory high {:.6} violates soft limit {:.6}",
+                    "High soft limit violation for axis {}, position={:.6}, limit={high:.6}\n",
                     ax.positioner,
                     start + max_pos,
-                    high
                 ));
             }
             // The execute-time move places the motor one pre-ramp distance
@@ -302,12 +413,18 @@ impl XpsController {
                 MoveMode::Relative => -built.pre_distance[j],
             };
             start_moves.push((ax.positioner.clone(), target));
+            let end = match move_mode {
+                MoveMode::Absolute => ax.positions[ax.positions.len() - 1],
+                MoveMode::Relative => -built.post_distance[j],
+            };
+            end_moves.push((ax.positioner.clone(), end));
         }
 
         self.built_trajectory = Some(BuiltTrajectory {
             file_name: file_name.to_string(),
             group,
             start_moves,
+            end_moves,
             move_mode,
         });
         Ok(())
@@ -324,6 +441,7 @@ impl XpsController {
             file_name: built.file_name.clone(),
             group: built.group.clone(),
             start_moves: built.start_moves.clone(),
+            end_moves: built.end_moves.clone(),
             move_mode: built.move_mode,
             times: profile.times.clone(),
             gathering_positioners: self.registered_positioners(),
@@ -335,5 +453,20 @@ impl XpsController {
     /// `SetpointPosition;CurrentPosition` pair per registered axis per sample).
     pub fn registered_positioners(&self) -> Vec<String> {
         self.axes.iter().map(|a| a.positioner.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C `buildProfile`'s `switch (-status)` (XPSController.cpp:756-774).
+    #[test]
+    fn verify_message_matches_c_switch() {
+        assert_eq!(verify_message(-69), "Acceleration Too High");
+        assert_eq!(verify_message(-68), "Velocity Too High");
+        assert_eq!(verify_message(-70), "Final Velocity Non Zero");
+        assert_eq!(verify_message(-75), "Negative or Null Delta Time");
+        assert_eq!(verify_message(-1), "Unknown trajectory verify error=-1");
     }
 }

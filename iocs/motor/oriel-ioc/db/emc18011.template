@@ -1,5 +1,5 @@
 # Oriel Encoder Mike 18011: one motor record per axis. Load once per axis with
-# N = 0-based axis index (DTYP EMC18011_$(CARD)_$(N)); the driver maps index
+# S = 0-based signal (DTYP "EMC18011", OUT #C$(C) S$(S)); the driver maps index
 # 0,1,2 to controller motors 1,2,3.
 #
 # The controller works in millimetres (position query and G/T moves are mm).
@@ -10,7 +10,8 @@
 # only for the currently selected motor.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "EMC18011_$(CARD)_$(N)")
+    field(DTYP, "EMC18011")
+    field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.2)")

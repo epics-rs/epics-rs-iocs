@@ -29,7 +29,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -59,8 +59,7 @@ fn parse_error(what: &str) -> AsynError {
     agap_err(format!("AGAP: could not parse {what} response"))
 }
 
-/// C `AGAP_CONEXAxis` constructor: axis 0 → `'U'`, otherwise `'V'`. Also used
-/// by the IOC create command to form the per-axis DTYP key.
+/// C `AGAP_CONEXAxis` constructor: axis 0 → `'U'`, otherwise `'V'`.
 pub(crate) fn axis_name(axis_index: u8) -> char {
     if axis_index == 0 { 'U' } else { 'V' }
 }
@@ -93,25 +92,29 @@ fn parse_closed_loop(resp: &str) -> Option<bool> {
 pub struct AgapController {
     handle: SyncIOHandle,
     controller_id: i32,
+    /// Firmware string from `VE` (C `controllerVersion_`).
+    version: String,
 }
 
 impl AgapController {
     /// Connect and identify an AGAP controller: read the firmware version
-    /// (`VE`) and verify it reports `CONEX-AGAP`. Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle, controller_id: i32) -> AsynResult<Self> {
-        let ctrl = Self {
+    /// (`VE`). Performs blocking serial I/O. `None` when `VE` fails, where C
+    /// returns before creating the axes or the poller.
+    pub fn new(handle: SyncIOHandle, controller_id: i32) -> Option<Self> {
+        let mut ctrl = Self {
             handle,
             controller_id,
+            version: String::new(),
         };
         // C reads `&inString_[4]` for the VE reply.
-        let version_resp = ctrl.write_read(&format!("{controller_id}VE"))?;
-        let version = version_resp.get(4..).unwrap_or("");
-        if !version.contains("CONEX-AGAP") {
-            return Err(agap_err(format!(
-                "AGAP: unknown model, firmware=\"{version}\""
-            )));
-        }
-        Ok(ctrl)
+        let Ok(version_resp) = ctrl.write_read(&format!("{controller_id}VE")) else {
+            eprintln!(
+                "AGAP_CONEXController::AGAP_CONEXController: cannot read version information from AGAP_CONEX controller"
+            );
+            return None;
+        };
+        ctrl.version = version_resp.get(4..).unwrap_or("").to_string();
+        Some(ctrl)
     }
 
     fn write(&self, cmd: &str) -> AsynResult<()> {
@@ -144,27 +147,35 @@ impl AgapAxis {
     /// Construct axis `axis_index` (0 → `U`, 1 → `V`) on a shared controller,
     /// running the C `AGAP_CONEXAxis` constructor query sequence. Performs
     /// blocking serial I/O under the controller lock.
-    pub fn new(controller: Arc<Mutex<AgapController>>, axis_index: u8) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<AgapController>>, axis_index: u8) -> Self {
         let axis_name = axis_name(axis_index);
 
         {
             // C reads stage ID (ID?), system resolution (SU?) and the per-axis
             // soft limits (SL/SR) here, but stores them only for report(),
             // which has no analogue in this driver. Issue the queries for
-            // startup wire fidelity and discard the replies; stepSize is the
-            // fixed 1e-4 constant regardless.
+            // startup wire fidelity and discard the replies (C ignores their
+            // status); stepSize is the fixed 1e-4 constant regardless. An
+            // unknown model returns before the queries and is still polled.
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let id = ctrl.controller_id;
-            let _ = ctrl.write_read(&format!("{id}ID?"))?;
-            let _ = ctrl.write_read(&format!("{id}SU?"))?;
-            let _ = ctrl.write_read(&format!("{id}SL{axis_name}?"))?;
-            let _ = ctrl.write_read(&format!("{id}SR{axis_name}?"))?;
+            if ctrl.version.contains("CONEX-AGAP") {
+                let id = ctrl.controller_id;
+                let _ = ctrl.write_read(&format!("{id}ID?"));
+                let _ = ctrl.write_read(&format!("{id}SU?"));
+                let _ = ctrl.write_read(&format!("{id}SL{axis_name}?"));
+                let _ = ctrl.write_read(&format!("{id}SR{axis_name}?"));
+            } else {
+                eprintln!(
+                    "AGAP_CONEXAxis::AGAP_CONEXAxis: unknown model, firmware string={}",
+                    ctrl.version
+                );
+            }
         }
 
-        Ok(Self {
+        Self {
             controller,
             axis_name,
-        })
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AgapController> {
@@ -173,6 +184,12 @@ impl AgapAxis {
 }
 
 impl AsynMotor for AgapAxis {
+    /// C `AGAP_CONEXAxis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (AGAP_CONEX.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

@@ -5,13 +5,12 @@
 #   cargo run -p aerotech-ioc -- st.a3200.cmd
 #
 # Requires an Aerotech A3200 controller reachable over TCP (or swap in the
-# serial port line below). Axes are addressed by name string; A3200AsynConfig
-# discovers the name of each axis 0..numAxes and installs it at
-# DTYP A3200_{card}_{axisName}.
+# serial port line below). A3200AsynConfig discovers the name of each axis
+# 0..numAxes; records address axis n as @asyn($(CTRL),n).
 #============================================================
 
 epicsEnvSet("P",      "a3200:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "L1")
 epicsEnvSet("IPPORT", "a3200Asyn")
 epicsEnvSet("HOST",   "192.168.1.50:8000")
 
@@ -21,13 +20,14 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "115200")
 
 # ---- A3200 controller ----
-# A3200AsynConfig(card, asynPort, numAxes, [taskNumber], [linear], [movingPollMs],
-#                 [idlePollMs], [timeoutMs]). Discovers axis names 0..numAxes and
-#                 attaches each; DTYP is A3200_{card}_{axisName}.
-A3200AsynConfig("$(CARD)", "$(IPPORT)", 1, 1, 1, 100, 1000, 2000)
+A3200AsynSetup(1)
 
-# One motor record per axis. AXISNAME is the controller's axis name (X here).
-dbLoadRecords("$(AEROTECH_IOC)/db/a3200.template", "P=$(P),M=m1,CTRL=$(CARD),AXISNAME=X")
+# A3200AsynConfig(card, portName, asynAddress, numAxes, movingPollPeriod,
+#                 idlePollPeriod, taskNumber, linear), periods in ms.
+A3200AsynConfig(0, "$(IPPORT)", 0, 1, 100, 1000, 1, 1)
+drvAsynMotorConfigure("$(CTRL)", "motorA3200", 0, 1)
+
+dbLoadRecords("$(AEROTECH_IOC)/db/a3200.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
 

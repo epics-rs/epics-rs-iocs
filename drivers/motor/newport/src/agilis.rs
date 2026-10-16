@@ -38,7 +38,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -117,8 +117,8 @@ fn axis_id(axis_no: i32) -> i32 {
 
 /// C `AG_UCAxis`: channel ID — 0 for the single-channel UC2, else
 /// `axisNo / 2 + 1`.
-fn channel_id(model: AgUcModel, axis_no: i32) -> i32 {
-    if model == AgUcModel::Uc2 {
+fn channel_id(model: Option<AgUcModel>, axis_no: i32) -> i32 {
+    if model == Some(AgUcModel::Uc2) {
         0
     } else {
         axis_no / 2 + 1
@@ -176,27 +176,49 @@ fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
 /// channel-select plus command stay atomic on the shared line.
 pub struct AgUcController {
     handle: SyncIOHandle,
-    model: AgUcModel,
+    /// `None` when C returns before `startPoller` (VE failed or the model is
+    /// unknown): the axes are still created but never polled.
+    model: Option<AgUcModel>,
 }
 
 impl AgUcController {
     /// Connect and initialise an Agilis controller: reset (`RS`), enter remote
     /// mode (`MR`), read the firmware version (`VE`) and detect the model.
     /// Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
-        // Reset, then settle; the controller needs time after RS.
-        write_raw(&handle, "RS")?;
+    pub fn new(handle: SyncIOHandle) -> Self {
+        // Reset, then settle; the controller needs time after RS. C ignores
+        // the RS/MR write status.
+        let _ = write_raw(&handle, "RS");
         thread::sleep(RESET_SETTLE);
         // Remote mode.
-        write_raw(&handle, "MR")?;
+        let _ = write_raw(&handle, "MR");
         // Firmware version → model.
-        let version = write_read_raw(&handle, "VE")?;
-        let model = AgUcModel::from_version(&version)
-            .ok_or_else(|| agilis_err(format!("Agilis: unknown model, firmware=\"{version}\"")))?;
-        Ok(Self { handle, model })
+        let version = write_read_raw(&handle, "VE");
+        println!(
+            "Agilis controller firmware version = {}",
+            version.as_deref().unwrap_or("")
+        );
+        let model = match version {
+            Err(_) => {
+                eprintln!(
+                    "AG_UCController::AG_UCController: cannot read version information from Agilis controller"
+                );
+                None
+            }
+            Ok(version) => {
+                let model = AgUcModel::from_version(&version);
+                if model.is_none() {
+                    eprintln!(
+                        "AG_UCController::AG_UCController: unknown model, firmware string={version}"
+                    );
+                }
+                model
+            }
+        };
+        Self { handle, model }
     }
 
-    pub fn model(&self) -> AgUcModel {
+    pub fn model(&self) -> Option<AgUcModel> {
         self.model
     }
 
@@ -250,25 +272,25 @@ impl AgUcAxis {
         has_limits: bool,
         forward_amplitude: i32,
         reverse_amplitude: i32,
-    ) -> AsynResult<Self> {
+    ) -> Self {
         let (axis_id, channel_id) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let id = axis_id(axis_no);
             let ch = channel_id(ctrl.model, axis_no);
             let (forward, reverse) = setup_amplitudes(forward_amplitude, reverse_amplitude);
-            ctrl.write_on_channel(ch, &format!("{id}SU{forward}"))?;
-            ctrl.write_on_channel(ch, &format!("{id}SU{reverse}"))?;
+            let _ = ctrl.write_on_channel(ch, &format!("{id}SU{forward}"));
+            let _ = ctrl.write_on_channel(ch, &format!("{id}SU{reverse}"));
             (id, ch)
         };
 
-        Ok(Self {
+        Self {
             controller,
             axis_id,
             channel_id,
             has_limits,
             current_position: 0,
             position_offset: 0,
-        })
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AgUcController> {
@@ -277,6 +299,12 @@ impl AgUcAxis {
 }
 
 impl AsynMotor for AgUcAxis {
+    /// C `AG_UCAxis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (AG_UC.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -351,6 +379,10 @@ impl AsynMotor for AgUcAxis {
         // `self`, leaving `self.current_position` free to update below.
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
+        // C never starts the poller: the axis reports its initial status only.
+        if ctrl.model.is_none() {
+            return Ok(MotorStatus::default());
+        }
 
         // Select this axis's channel (C issues CC unconditionally, incl. CC0
         // on a UC2).
@@ -422,12 +454,14 @@ mod tests {
         assert_eq!(axis_id(2), 1);
         assert_eq!(axis_id(7), 2);
         // UC2 → channel 0; UC8 → axisNo/2 + 1.
-        assert_eq!(channel_id(AgUcModel::Uc2, 0), 0);
-        assert_eq!(channel_id(AgUcModel::Uc2, 1), 0);
-        assert_eq!(channel_id(AgUcModel::Uc8, 0), 1);
-        assert_eq!(channel_id(AgUcModel::Uc8, 1), 1);
-        assert_eq!(channel_id(AgUcModel::Uc8, 2), 2);
-        assert_eq!(channel_id(AgUcModel::Uc8, 7), 4);
+        assert_eq!(channel_id(Some(AgUcModel::Uc2), 0), 0);
+        assert_eq!(channel_id(Some(AgUcModel::Uc2), 1), 0);
+        assert_eq!(channel_id(Some(AgUcModel::Uc8), 0), 1);
+        assert_eq!(channel_id(Some(AgUcModel::Uc8), 1), 1);
+        assert_eq!(channel_id(Some(AgUcModel::Uc8), 2), 2);
+        assert_eq!(channel_id(Some(AgUcModel::Uc8), 7), 4);
+        // Unknown model (C never set AG_UCModel_): not UC2.
+        assert_eq!(channel_id(None, 2), 2);
     }
 
     #[test]

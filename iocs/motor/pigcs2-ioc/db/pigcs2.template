@@ -1,6 +1,5 @@
-# PI GCS2: one motor record per axis. DTYP is PIGCS2_$(CTRL)_$(AXIS), the key
-# registered by PIGCS2CreateController (card + GCS axis name string, e.g.
-# "1" — not a bare index).
+# PI GCS2: one motor record per axis, ADDR the 0-based index of the axis in
+# SAI? order on controller port PORT, as in C's basic_asyn_motor.db.
 #
 # Positions/velocities/accelerations are the controller's native physical
 # units (GCS2 POS/MOV/VEL are already EGU on the controller), with no
@@ -10,7 +9,8 @@
 # VELO/ACCL are in units/second and units/second^2.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PIGCS2_$(CTRL)_$(AXIS)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1)")
     field(ACCL, "$(ACCL=0.2)")

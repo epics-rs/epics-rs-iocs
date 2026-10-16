@@ -9,7 +9,7 @@
 #============================================================
 
 epicsEnvSet("P",      "micos:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "MICOS1")
 epicsEnvSet("IPPORT", "taurusPort")
 epicsEnvSet("HOST",   "192.168.1.18:4001")
 epicsEnvSet("NAXES",  "1")
@@ -24,13 +24,13 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
 
 # ---- Taurus controller ----
-# SMCTaurusCreateController(card, taurusPort, numAxes, [movingPollMs], [idlePollMs]).
-SMCTaurusCreateController(0, "$(IPPORT)", $(NAXES), 100, 500)
+# SMCTaurusCreateController(portName, taurusPort, numAxes, movingPollPeriod, idlePollPeriod).
+SMCTaurusCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 500)
 
-# One motor record per axis (DTYP TAURUS_$(CARD)_0, ...). The driver reports
+# One motor record per axis (OUT @asyn($(CTRL),axis)). The driver reports
 # positions in controller-native engineering units; the template's MRES is the
 # record step.
-dbLoadRecords("$(MICOS_IOC)/db/taurus.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(MICOS_IOC)/db/taurus.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
 

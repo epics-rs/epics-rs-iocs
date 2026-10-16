@@ -17,8 +17,64 @@ use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use yokogawa_gm10::device_support;
 use yokogawa_gm10::instrument::{Registry, gm10_init};
+
+/// `yokogawaDasApp/src/gm10Support.dbd`'s `device()` lines.
+static DEVICES: &[(&str, &[DevSup])] = &[
+    (
+        "ai",
+        &[row("devGM10_ai", device_support::DTYP, 6, &[1, 2, 3, 4])],
+    ),
+    (
+        "ao",
+        &[row("devGM10_ao", device_support::DTYP, 6, &[1, 2, 4])],
+    ),
+    (
+        "bi",
+        &[row("devGM10_bi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    (
+        "bo",
+        &[row("devGM10_bo", device_support::DTYP, 5, &[1, 2, 4])],
+    ),
+    (
+        "mbbi",
+        &[row("devGM10_mbbi", device_support::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    (
+        "mbbo",
+        &[row("devGM10_mbbo", device_support::DTYP, 5, &[1, 2, 4])],
+    ),
+    (
+        "longin",
+        &[row(
+            "devGM10_longin",
+            device_support::DTYP,
+            5,
+            &[1, 2, 3, 4],
+        )],
+    ),
+    (
+        "stringin",
+        &[row(
+            "devGM10_stringin",
+            device_support::DTYP,
+            6,
+            &[1, 2, 3, 4],
+        )],
+    ),
+];
+
+const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
+    DevSup {
+        name,
+        choice,
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(number, funcs, false),
+    }
+}
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -36,7 +92,7 @@ async fn main() -> CaResult<()> {
     epics_rs::base::runtime::env::set_default("GM10", env!("CARGO_MANIFEST_DIR"));
 
     let mut app = IocApplication::new();
-    app = app.register_dynamic_device_support(device_support::factory(registry.clone()));
+    app = app.register_dynamic_device_support(DEVICES, device_support::factory(registry.clone()));
 
     app = app.register_startup_command(CommandDef::new(
         "gm10Init",

@@ -8,7 +8,7 @@
 #============================================================
 
 epicsEnvSet("P",      "ACR:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "PARKER1")
 epicsEnvSet("IPPORT", "ARIES1")
 epicsEnvSet("HOST",   "gse-aries1:5002")
 epicsEnvSet("NAXES",  "1")
@@ -22,13 +22,13 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\r")
 
 # ---- ACR controller ----
-# ACRCreateController(card, acrPort, numAxes, [movingPollMs], [idlePollMs]).
-ACRCreateController(0, "$(IPPORT)", $(NAXES), 20, 1000)
+# ACRCreateController(portName, ACRPortName, numAxes, movingPollPeriod, idlePollPeriod).
+ACRCreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 20, 1000)
 
-# One motor record per axis (DTYP ACR_$(CARD)_0, _1, ...). The driver reports
+# One motor record per axis (OUT @asyn($(CTRL),axis)). The driver reports
 # positions in controller counts (PPU divides commands, not readback), so
 # MRES = 1.
-dbLoadRecords("$(PARKER_IOC)/db/acr.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
+dbLoadRecords("$(PARKER_IOC)/db/acr.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
 
 iocInit()
 

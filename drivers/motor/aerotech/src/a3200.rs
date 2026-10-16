@@ -59,19 +59,16 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::{atof, atoi, atol};
 
+use crate::exchange::Exchange;
+
 /// Reply read buffer size (C `BUFFER_SIZE`).
 const READ_BUF: usize = 256;
-
-fn trim_line(raw: &[u8]) -> String {
-    let s = String::from_utf8_lossy(raw);
-    s.trim_end_matches(['\r', '\n', '\0']).to_string()
-}
 
 /// Port EOS set at connect (C `ASCII_EOS_STR`, drvA3200Asyn.cc:890-891).
 pub const INPUT_EOS: &[u8] = b"\n";
@@ -125,34 +122,40 @@ fn fmt(v: f64) -> String {
 /// task number and linear/single-axis move mode. Shared by its axes behind a
 /// mutex so command/reply pairs stay atomic (C `sendReceiveMutex`).
 pub struct A3200Controller {
-    handle: SyncIOHandle,
+    io: Exchange,
     task_number: u32,
     linear: bool,
 }
 
 impl A3200Controller {
     /// Wrap a connected octet handle with the motion task number and move mode.
-    pub fn new(handle: SyncIOHandle, task_number: u32, linear: bool) -> Self {
+    pub fn new(
+        handle: SyncIOHandle,
+        serial_port: &str,
+        motor_port: &str,
+        task_number: u32,
+        linear: bool,
+    ) -> Self {
         Self {
-            handle,
+            io: Exchange::new(
+                handle,
+                "drvA3200Asyn",
+                READ_BUF,
+                None,
+                serial_port,
+                motor_port,
+            ),
             task_number,
             linear,
         }
     }
 
     fn read_line(&self) -> AsynResult<String> {
-        Ok(trim_line(&self.handle.read_octet(0, READ_BUF)?))
+        self.io.read_line()
     }
 
-    /// Write a command and read one reply line.
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        // C sendAndReceive: pasynOctetSyncIO->writeRead; plain reads follow
-        // only for the value line after a bare ACK.
-        Ok(trim_line(&self.handle.write_read(
-            0,
-            cmd.as_bytes(),
-            READ_BUF,
-        )?))
+        self.io.write_read(cmd)
     }
 
     /// Send a command that returns only an ACK. Errors on fault/empty.
@@ -366,6 +369,12 @@ impl A3200Axis {
 }
 
 impl AsynMotor for A3200Axis {
+    /// C `A3200Poller` sets `motorAxisCommError` and `continue`s past
+    /// `callCallback`, posting nothing (drvA3200Asyn.cc).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

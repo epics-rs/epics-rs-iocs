@@ -1,5 +1,5 @@
-# ACS SPiiPlus: one motor record per axis. DTYP is ACSMOTION_$(CTRL)_$(AXIS),
-# the key registered by AcsMotionConfig (card + 0-based axis index).
+# ACS SPiiPlus: one motor record per axis, ADDR the 0-based axis of controller
+# PORT as in C's basic_asyn_motor.db.
 #
 # Positions/velocities/accelerations are the controller's native user units
 # (ACSPL+ APOS/PTP/VEL), with no resolution scaling in the driver, and EGU is
@@ -9,7 +9,8 @@
 # units/second and units/second^2.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "ACSMOTION_$(CTRL)_$(AXIS)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10)")
     field(ACCL, "$(ACCL=0.2)")

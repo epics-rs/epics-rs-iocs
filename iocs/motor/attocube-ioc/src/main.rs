@@ -12,8 +12,8 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_attocube::ioc::{anc150_config_command, anc150_setup_command};
-use motor_common::MotorHolder;
+use motor_attocube::ioc::{MOTOR_ANC150, anc150_config_command, anc150_setup_command};
+use motor_common::model2::drv_asyn_motor_configure_command;
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -37,11 +37,14 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // ANC150 iocsh commands + motor device support.
-    let holder = MotorHolder::new();
+    // ANC150 iocsh commands, drvAsynMotorConfigure + motor device support.
     app = app.register_startup_command(anc150_setup_command());
-    app = app.register_startup_command(anc150_config_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(anc150_config_command());
+    app = app.register_startup_command(drv_asyn_motor_configure_command(vec![&MOTOR_ANC150]));
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

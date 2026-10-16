@@ -11,7 +11,7 @@
 #============================================================
 
 epicsEnvSet("P",       "SCU:")
-epicsEnvSet("CARD",    "0")
+epicsEnvSet("CTRL",    "SCU_1")
 epicsEnvSet("SERPORT", "serial1")
 epicsEnvSet("DEVICE",  "/dev/ttyUSB0")
 
@@ -28,21 +28,22 @@ asynOctetSetInputEos("$(SERPORT)", 0, "\n")
 asynOctetSetOutputEos("$(SERPORT)", 0, "\n")
 
 # ---- SCU controller + axes ----
-# smarActSCUCreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
-smarActSCUCreateController(0, "$(SERPORT)", 3, 50, 1000)
+# smarActSCUCreateController(motorPortName, ioPortName, numAxes,
+#                            movingPollPeriod, idlePollPeriod), periods in s.
+smarActSCUCreateController("$(CTRL)", "$(SERPORT)", 3, 0.05, 1.0)
 
-# smarActSCUCreateAxis(card, axisNo, channel): axisNo is 0-based (DTYP
-# SCU_$(CARD)_$(N)), channel is the controller channel it drives.
-smarActSCUCreateAxis(0, 0, 0)
-smarActSCUCreateAxis(0, 1, 1)
-smarActSCUCreateAxis(0, 2, 2)
+# smarActSCUCreateAxis(controllerPortName, axisNumber, channel): records reach
+# axisNumber as @asyn($(CTRL),axisNumber); channel is the controller channel.
+smarActSCUCreateAxis("$(CTRL)", 0, 0)
+smarActSCUCreateAxis("$(CTRL)", 1, 1)
+smarActSCUCreateAxis("$(CTRL)", 2, 2)
 
 # One motor record per axis. The driver reports positions in motor-record steps
 # (1000 steps = 1 micron for linear, 1 millidegree for rotary), so MRES = 0.001
 # makes the record read directly in microns / millidegrees.
-dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
+dbLoadRecords("$(SMARACT_IOC)/db/scu.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
 
 iocInit()
 

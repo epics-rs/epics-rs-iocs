@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -56,6 +56,9 @@ pub const OUTPUT_EOS: &[u8] = b"\r\n";
 /// `PR IS` read buffer and timeout (C `resp[1024]`, `IMS_TIMEOUT`).
 const IS_READ_BUF: usize = 1024;
 const IS_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// C `DRIVER_NAME`, the prefix of the driver's console lines.
+const DRIVER_NAME: &str = "ImsMDrivePlusMotorDriver";
 
 /// Rule under the setup-config banner lines.
 const RULE: &str = "-------------------------------------------";
@@ -118,9 +121,14 @@ pub struct ImsMDrivePlusAxis {
 impl ImsMDrivePlusAxis {
     /// Connect an axis on `handle`, addressing it by `device_name` (empty for no
     /// party mode). `port` is the octet port under `handle`, whose output EOS a
-    /// Lexium MDrive switches. Probes the firmware version (to pick the EOS and,
-    /// on MForce, the S1-S4 switch config) and the encoder flag.
-    pub fn new(handle: SyncIOHandle, port: &PortHandle, device_name: String) -> AsynResult<Self> {
+    /// Lexium MDrive switches. As in C, a failed configuration is logged and the
+    /// axis is still created.
+    pub fn new(
+        handle: SyncIOHandle,
+        port: &PortHandle,
+        motor_name: &str,
+        device_name: String,
+    ) -> Self {
         let mut axis = Self {
             handle,
             device_name,
@@ -130,8 +138,13 @@ impl ImsMDrivePlusAxis {
             has_encoder: false,
             homing: false,
         };
-        axis.setup(port)?;
-        Ok(axis)
+        if axis.config_axis() == AsynStatus::Error {
+            eprintln!(
+                "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}"
+            );
+        }
+        axis.read_home_and_limit_config(port);
+        axis
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
@@ -152,27 +165,45 @@ impl ImsMDrivePlusAxis {
         Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
 
-    fn setup(&mut self, port: &PortHandle) -> AsynResult<()> {
-        // Firmware version: retry a few times, require a plausible reply (C
-        // requires strlen >= 2). MForce 1 answers `PR VR` with an error, so a
-        // short/failed reply is not necessarily fatal — but a total silence is.
-        let mut version = String::new();
+    /// C `configAxis`: up to three `PR VR` probes, then the `PR EE` encoder
+    /// flag. An asyn error is logged and retried; any other reply shorter than
+    /// two bytes ends the configuration without `PR EE`.
+    fn config_axis(&mut self) -> AsynStatus {
         for _ in 0..3 {
-            if let Ok(v) = self.write_read("PR VR")
-                && v.len() >= 2
-            {
-                version = v;
-                break;
+            let resp = match self.handle.write_read(0, &self.framed("PR VR"), READ_BUF) {
+                Err(e) if e.status() == AsynStatus::Error => {
+                    eprintln!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.");
+                    continue;
+                }
+                Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
+                Ok(raw) => raw,
+            };
+            let resp = resp.split(|&b| b == 0).next().unwrap_or_default();
+            if resp.len() < 2 {
+                eprintln!(
+                    "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.",
+                    String::from_utf8_lossy(resp)
+                );
+                return AsynStatus::Error;
             }
+            break;
         }
-        if version.len() < 2 {
-            return Err(ims_err(
-                "ims: version inquiry failed (no response from controller)",
-            ));
+        match self.write_read("PR EE") {
+            Ok(resp) => {
+                self.has_encoder = atoi(&resp) != 0;
+                AsynStatus::Success
+            }
+            Err(e) => e.status(),
         }
+    }
 
-        // Console lines are C readHomeAndLimitConfig's printfs.
-        println!("Controller version {version}");
+    /// C `readHomeAndLimitConfig`, console lines included.
+    fn read_home_and_limit_config(&mut self, port: &PortHandle) {
+        // MForce 1 answers `PR VR` with an error, so its status is ignored.
+        let version = self.write_read("PR VR").unwrap_or_default();
+        if !version.is_empty() {
+            println!("Controller version {version}");
+        }
         println!("Setup config:");
         let vlow = version.to_lowercase();
         if vlow.contains("lmm") || vlow.contains("lmd") {
@@ -190,7 +221,7 @@ impl ImsMDrivePlusAxis {
                     println!("Have device name going party modus, line ending LF.");
                     b"\n"
                 };
-                port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos)?;
+                let _ = port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos);
             }
             let block = self.read_input_setup(port).unwrap_or_default();
             let text = block.split(|&b| b == 0).next().unwrap_or_default();
@@ -224,12 +255,6 @@ impl ImsMDrivePlusAxis {
             self.neg_limit_switch.unwrap_or(-1)
         );
         println!("{RULE}");
-
-        // Encoder present? (`EE` echo-encoder flag.)
-        if let Ok(resp) = self.write_read("PR EE") {
-            self.has_encoder = atoi(&resp) != 0;
-        }
-        Ok(())
     }
 
     /// Lexium `PR IS`: the whole I/O-setup block, read with a NUL input EOS
@@ -332,6 +357,12 @@ impl ImsMDrivePlusAxis {
 }
 
 impl AsynMotor for ImsMDrivePlusAxis {
+    /// C `ImsMDrivePlusMotorAxis::handleAxisError` sets only
+    /// `motorStatusProblem_`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

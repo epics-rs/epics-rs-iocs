@@ -31,7 +31,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::controller::{PmacController, pmac_err};
@@ -211,6 +211,12 @@ impl PmacAxis {
 }
 
 impl AsynMotor for PmacAxis {
+    /// C `pmacAxis::getAxisStatus` sets no status bit on a failed read; the
+    /// failure goes to the controller's `PMAC_C_COMMSERROR`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -333,11 +339,10 @@ impl AsynMotor for PmacAxis {
         lock(&self.controller).command(&format!("I{axis}14={position:.6}"))
     }
 
-    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch. Every axis of a
-    /// controller shares one deferral flag, so the first axis the record defers
-    /// arms the controller and the release executes all the pending moves.
+    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch, which C takes
+    /// at every address: the motor record defers with 1, releases with 0.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
-        lock(&self.controller).set_deferred_moves(defer)
+        lock(&self.controller).set_moves_deferred(i32::from(defer))
     }
 
     /// C `pmacAxis::getAxisStatus`.
@@ -345,6 +350,9 @@ impl AsynMotor for PmacAxis {
         let axis = self.axis;
         let mut controller = lock(&self.controller);
         let config = controller.axis_config(axis);
+        // C `pmacController::poll` reads the global status before any axis, and
+        // whether or not the axis reply then parses.
+        let controller_problem = controller.controller_problem();
 
         // One round trip for the two status words, the following error and the
         // position. With an open-loop axis the encoder position comes back from
@@ -382,10 +390,7 @@ impl AsynMotor for PmacAxis {
         self.amp_enabled = flags.amp_enabled;
         self.fatal_following = flags.following_error;
 
-        let mut problem = flags.general_problem;
-        if controller.controller_problem() {
-            problem = true;
-        }
+        let mut problem = flags.general_problem || controller_problem;
         // If the hardware limits are off and *we* did not turn them off to home,
         // something else did: that is a problem the operator must see.
         if !config.limits_check_disabled

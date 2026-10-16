@@ -5,13 +5,12 @@
 #   cargo run -p newfocus-ioc -- st.cmd
 #
 # Requires a New Focus PMNC 8750/8752 network controller reachable at the
-# HOST below. PMNC87xxCreateController identifies the controller (VER) and
-# autodiscovers its driver modules and channels (MPV/DRT) at startup, so it
-# must be reachable when the command runs.
+# HOST below. PMNC87xxConfig identifies the controller (VER) and autodiscovers
+# its driver modules and channels (MPV/DRT), so it must be reachable when the
+# command runs.
 #============================================================
 
 epicsEnvSet("P",     "NF:")
-epicsEnvSet("PORT",  "MOTOR1")
 epicsEnvSet("ASYN",  "PMNC1")
 epicsEnvSet("HOST",  "192.168.0.100:23")
 
@@ -19,14 +18,15 @@ epicsEnvSet("HOST",  "192.168.0.100:23")
 drvAsynIPPortConfigure("$(ASYN)", "$(HOST)", 0, 0, 0)
 
 # ---- PMNC controller ----
-# PMNC87xxCreateController(motorPort, asynPort, [movingPollMs], [idlePollMs])
-# Autodiscovers driver modules and channels; one motor axis per channel.
-PMNC87xxCreateController("$(PORT)", "$(ASYN)", 100, 1000)
+# PMNC87xxSetup(num_cards, num_drivers, scan_rate in Hz)
+PMNC87xxSetup(1, 2, 10)
+# PMNC87xxConfig(card, asyn port): one motor axis per discovered channel.
+PMNC87xxConfig(0, "$(ASYN)")
 
-# One motor record per discovered channel (DTYP PMNC_$(PORT)_0, _1, ...).
+# One motor record per discovered channel, signal S of card 0.
 # Picomotor moves are integer steps: positions travel the driver boundary in
 # EGU (= steps) directly, so MRES=1 and EGU=steps.
-dbLoadRecords("$(NEWFOCUS_IOC)/db/newfocus.template", "P=$(P),M=m1,N=0,PORT=$(PORT),MRES=1,EGU=steps")
+dbLoadRecords("$(NEWFOCUS_IOC)/db/newfocus.template", "P=$(P),M=m1,C=0,S=0,MRES=1,EGU=steps")
 
 iocInit()
 

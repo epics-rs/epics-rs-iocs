@@ -4,7 +4,8 @@
 # (display/deadband granularity).
 
 record(motor, "$(P)$(MU)") {
-    field(DTYP, "AGAP_$(PORT)_U")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),0)")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.5)")
@@ -16,7 +17,8 @@ record(motor, "$(P)$(MU)") {
 }
 
 record(motor, "$(P)$(MV)") {
-    field(DTYP, "AGAP_$(PORT)_V")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),1)")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1.0)")
     field(ACCL, "$(ACCL=0.5)")

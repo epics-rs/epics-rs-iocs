@@ -1,12 +1,13 @@
-# Newport New Focus PMNC 8750/8752: one motor record per discovered channel.
-# Load once per axis with N = 0-based discovery index (DTYP PMNC_$(PORT)_$(N));
-# the driver maps the index onto the discovered (driver module, channel).
+# Newport New Focus PMNC 8750/8752: one motor record per discovered channel,
+# signal S of card C as in C's basic_motor.db; the driver maps the signal onto
+# the discovered (driver module, channel).
 # Picomotor moves are integer steps: positions travel the driver boundary in
 # EGU (= steps), so MRES=1 (EGU identical to raw counts). Velocity is
 # steps/sec (clamped to 2000), acceleration steps/sec^2 (clamped 16..32000).
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "PMNC_$(PORT)_$(N)")
+    field(DTYP, "PMNC87xx")
+    field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=1000)")
     field(ACCL, "$(ACCL=0.5)")

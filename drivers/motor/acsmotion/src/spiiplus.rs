@@ -31,22 +31,16 @@
 //! `MRES` must be the axis resolution (raw counts are integers). Consequently the encoder readback is `?FPOS` directly
 //! (already in user units), not `FPOS/EFAC` as in the raw-step C frame.
 //!
-//! ## Homing (deviation, documented)
+//! ## Homing
 //!
-//! C `home()` reads a per-axis mbbo homing method PV (`SPiiPlusHomingMethod_`,
-//! default `NONE` → home errors) plus offset/max-distance/current-limit PVs, and
-//! emits `HOME axis,method,vel,[maxdist],offset[,currlimit]`. Those aux PVs are
-//! not present at the plain motor boundary, so the homing *method* is supplied
-//! once at controller-configuration time (default [`HOME_LIMIT_INDEX`], resolved
-//! to the negative/positive limit+index code by the record's home direction).
-//! The offset/max-distance/current-limit are fixed at 0 (max-distance emitted as
-//! the empty field the controller treats as "unbounded", current-limit omitted),
-//! matching the C behavior when those PVs are left at their defaults.
+//! C `home()` reads the axis's `SPIIPLUS_HOMING_*` parameters, which
+//! `SPiiPlusHoming.db` writes through the controller port;
+//! [`AcsMotionParams`] takes those writes into the controller.
 //!
 //! ## Not modeled (documented)
 //!
 //! SPiiPlusBinComm binary array protocol (replaced by ASCII queries), profile /
-//! PVT moves and the profile thread, the SPiiPlusAux driver, and the ~30 aux
+//! PVT moves and the profile thread, the SPiiPlusAux driver, and the other aux
 //! asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
 //! and factors, reference position, PEG, disable-set-position guard, global
 //! variable read/write, ACSPL program start/stop).
@@ -54,9 +48,14 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::param::ParamType;
+use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::ControllerParams;
 
 use motor_common::util::{atof, atoi};
 
@@ -85,7 +84,8 @@ const FAULT_HARD_LEFT_LIMIT: i32 = 1 << 1;
 const MFLAGS_DUMMY: i32 = 1 << 0;
 const MFLAGS_HOME: i32 = 1 << 3;
 
-/// mbbo homing-method selectors (C `MBBO_HOME_*`), supplied at config time.
+/// mbbo homing-method selectors (C `MBBO_HOME_*`), `SPiiPlusHoming.db`'s
+/// `homingMethod` values.
 pub const HOME_NONE: i32 = 0;
 pub const HOME_LIMIT_INDEX: i32 = 1;
 pub const HOME_LIMIT: i32 = 2;
@@ -146,31 +146,75 @@ fn fmt(v: f64) -> String {
     format!("{v}")
 }
 
+/// One axis's `SPIIPLUS_HOMING_*` parameters (C `home()` reads them at each
+/// home).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Homing {
+    pub method: i32,
+    pub max_dist: f64,
+    pub offset_pos: f64,
+    pub offset_neg: f64,
+    pub curr_limit: f64,
+}
+
+impl Homing {
+    /// C `home()`'s `HOME axis,method,vel,[maxdist],offset[,currlimit]`: a
+    /// zero max distance leaves its field empty and a zero current limit is
+    /// omitted, since the controller takes either literally.
+    fn command(&self, axis: usize, code: i32, velocity: f64, forward: bool) -> String {
+        let max_dist = match self.max_dist {
+            0.0 => String::new(),
+            d => fmt(d),
+        };
+        let offset = if forward {
+            self.offset_pos
+        } else {
+            self.offset_neg
+        };
+        let mut cmd = format!(
+            "HOME {axis},{code},{},{max_dist},{}",
+            fmt(velocity),
+            fmt(offset)
+        );
+        if self.curr_limit != 0.0 {
+            cmd += &format!(",{}", fmt(self.curr_limit));
+        }
+        cmd
+    }
+}
+
 /// Shared controller endpoint: owns the octet handle, the version string, the
-/// axis count, and the configuration-time homing method.
+/// axis count, and each axis's homing parameters.
 pub struct SpiiPlusController {
     handle: SyncIOHandle,
+    /// C `pasynUserSelf`'s port, the `AcsMotionConfig` port name.
+    port: String,
+    /// C `SPiiPlusComm`'s port, `<ACSPortName>Comm`, whose `pasynUserSelf`
+    /// prints every exchange error.
+    comm_port: String,
     ident: String,
     num_axes: usize,
-    homing_method: i32,
+    homing: Vec<Homing>,
 }
 
 impl SpiiPlusController {
     /// Connect and identify a SPiiPlus controller (C `SPiiPlusController`
     /// constructor): probe `?VR` (retry up to 3 times) and read the firmware
-    /// version. `num_axes` and `homing_method` come from the config command.
-    /// Performs blocking octet I/O.
-    pub fn new(handle: SyncIOHandle, num_axes: usize, homing_method: i32) -> AsynResult<Self> {
+    /// version. `num_axes` comes from the config command. Performs blocking
+    /// octet I/O.
+    pub fn new(handle: SyncIOHandle, port: &str, num_axes: usize) -> AsynResult<Self> {
         let mut ctrl = Self {
             handle,
+            port: port.to_string(),
+            comm_port: format!("{port}Comm"),
             ident: String::new(),
             num_axes,
-            homing_method,
+            homing: vec![Homing::default(); num_axes],
         };
 
         let mut probed = false;
         for _ in 0..3 {
-            if let Ok(v) = ctrl.command("?VR")
+            if let Ok(v) = ctrl.exchange("writeReadStr", "?VR")
                 && !v.is_empty()
             {
                 ctrl.ident = v;
@@ -194,17 +238,27 @@ impl SpiiPlusController {
         self.num_axes
     }
 
+    /// The homing parameters of axis `axis`.
+    pub fn homing(&self, axis: usize) -> Homing {
+        self.homing[axis]
+    }
+
+    /// Send a set/motion command (C `writeReadAck`).
+    fn command(&self, cmd: &str) -> AsynResult<String> {
+        self.exchange("writeReadAck", cmd)
+    }
+
     /// Send a command and return its reply (trimmed of CR/LF/NUL/`:` prompt and
     /// spaces). A reply whose first character is `?` is a controller error
-    /// (`?<errno>`), returned as an [`AsynError`] (C `writeReadAck`). A
-    /// successful set/motion command replies with only the prompt (empty after
-    /// trimming); a query replies with the value.
-    fn command(&self, cmd: &str) -> AsynResult<String> {
+    /// (`?<errno>`): C prints it as `func` and asks the controller for its
+    /// text. A successful set/motion command replies with only the prompt
+    /// (empty after trimming); a query replies with the value.
+    fn exchange(&self, func: &str, cmd: &str) -> AsynResult<String> {
         // C SPiiPlusComm::writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        let text = String::from_utf8_lossy(&raw);
-        let text = text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string();
+        let text = self.write_read(cmd)?;
         if text.starts_with('?') {
+            self.print(format_args!("SPiiPlusComm:{func}: Command failed: {cmd}\n"));
+            self.error_message(&text);
             return Err(spiiplus_err(format!(
                 "SPiiPlus command failed: {cmd} -> {text}"
             )));
@@ -212,14 +266,49 @@ impl SpiiPlusController {
         Ok(text)
     }
 
+    fn write_read(&self, cmd: &str) -> AsynResult<String> {
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let text = String::from_utf8_lossy(&raw);
+        Ok(text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string())
+    }
+
+    /// C `writeReadErrorMessage`: `?<reply>` (`??<errno>`) fetches the
+    /// error's text; its status never changes the caller's.
+    fn error_message(&self, reply: &str) {
+        let errno = atoi(&reply[1..]);
+        match self.write_read(&format!("?{reply}")) {
+            Ok(text) if !text.starts_with('?') => self.print(format_args!(
+                "SPiiPlusComm:writeReadErrorMessage: ERROR #{errno}: {text}\n"
+            )),
+            _ => self.print(format_args!(
+                "SPiiPlusComm:writeReadErrorMessage: ERROR #{errno}\n"
+            )),
+        }
+    }
+
+    fn print(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.comm_port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
+    }
+
     /// Read a single integer array element `?VAR(index)` (0 on empty reply).
     fn query_int(&self, var: &str, index: usize) -> AsynResult<i32> {
-        Ok(atoi(&self.command(&format!("?{var}({index})"))?))
+        Ok(atoi(
+            &self.exchange("writeReadInt", &format!("?{var}({index})"))?,
+        ))
     }
 
     /// Read a single double array element `?VAR(index)` (0.0 on empty reply).
     fn query_double(&self, var: &str, index: usize) -> AsynResult<f64> {
-        Ok(atof(&self.command(&format!("?{var}({index})"))?))
+        Ok(atof(&self.exchange(
+            "writeReadDouble",
+            &format!("?{var}({index})"),
+        )?))
     }
 }
 
@@ -282,6 +371,12 @@ impl SpiiPlusAxis {
 }
 
 impl AsynMotor for SpiiPlusAxis {
+    /// C `SPiiPlusAxis::poll` copies the controller's last read and sets no
+    /// status bit when `SPiiPlusController::poll` fails.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -346,14 +441,19 @@ impl AsynMotor for SpiiPlusAxis {
         }
         let ctrl = self.lock();
         let a = self.axis;
-        let code = home_code(ctrl.homing_method, forward).ok_or_else(|| {
-            spiiplus_err(format!(
-                "SPiiPlus: no homing method configured for axis {a} (homingMethod=none)"
-            ))
-        })?;
-        // HOME axis,method,vel,[maxdist],offset — maxdist empty (unbounded),
-        // offset 0, current-limit omitted (C defaults when the aux PVs are 0).
-        ctrl.command(&format!("HOME {a},{code},{},,0", fmt(velocity)))?;
+        let homing = ctrl.homing(a);
+        let Some(code) = home_code(homing.method, forward) else {
+            // C prints and returns asynSuccess.
+            PortManager::global().trace_manager().print(
+                Some(&ctrl.port),
+                Some(0),
+                0,
+                TraceMask::ERROR,
+                format_args!("SPiiPlusController:home: No homing method selected for axis {a}\n"),
+            );
+            return Ok(());
+        };
+        ctrl.command(&homing.command(a, code, velocity, forward))?;
         Ok(())
     }
 
@@ -446,6 +546,84 @@ impl AsynMotor for SpiiPlusAxis {
     }
 }
 
+/// C `SPiiPlusController`'s homing parameters (SPiiPlusDriver.cpp:73,
+/// :113-116), per axis.
+#[derive(Clone, Copy, Debug)]
+struct HomingParams {
+    method: usize,
+    max_dist: usize,
+    offset_pos: usize,
+    offset_neg: usize,
+    curr_limit: usize,
+}
+
+/// `SPiiPlusController::writeInt32` / `writeFloat64` for the homing
+/// parameters: each is stored per axis for `home()` to read.
+pub struct AcsMotionParams {
+    controller: Arc<Mutex<SpiiPlusController>>,
+    params: Option<HomingParams>,
+}
+
+impl AcsMotionParams {
+    pub fn new(controller: Arc<Mutex<SpiiPlusController>>) -> Self {
+        Self {
+            controller,
+            params: None,
+        }
+    }
+
+    fn set(&self, addr: i32, set: impl FnOnce(&mut Homing)) {
+        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        set(&mut ctrl.homing[addr as usize]);
+    }
+}
+
+impl ControllerParams for AcsMotionParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        self.params = Some(HomingParams {
+            method: base.create_param("SPIIPLUS_HOMING_METHOD", ParamType::Int32)?,
+            max_dist: base.create_param("SPIIPLUS_HOMING_MAX_DIST", ParamType::Float64)?,
+            offset_pos: base.create_param("SPIIPLUS_HOMING_OFFSET_POS", ParamType::Float64)?,
+            offset_neg: base.create_param("SPIIPLUS_HOMING_OFFSET_NEG", ParamType::Float64)?,
+            curr_limit: base.create_param("SPIIPLUS_HOMING_CURR_LIMIT", ParamType::Float64)?,
+        });
+        Ok(())
+    }
+
+    fn write_int32(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> AsynResult<()> {
+        if let Some(p) = self.params
+            && user.reason == p.method
+        {
+            self.set(user.addr, |h| h.method = value);
+        }
+        Ok(())
+    }
+
+    fn write_float64(
+        &mut self,
+        _: &mut PortDriverBase,
+        user: &AsynUser,
+        value: f64,
+    ) -> AsynResult<()> {
+        let Some(p) = self.params else {
+            return Ok(());
+        };
+        self.set(user.addr, |h| match user.reason {
+            r if r == p.max_dist => h.max_dist = value,
+            r if r == p.offset_pos => h.offset_pos = value,
+            r if r == p.offset_neg => h.offset_neg = value,
+            r if r == p.curr_limit => h.curr_limit = value,
+            _ => {}
+        });
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +655,21 @@ mod tests {
         assert_eq!(home_code(HOME_NONE, true), None);
         assert_eq!(home_code(7, true), None); // MBBO_HOME_CUSTOM -> SPIIPLUS_HOME_NONE
         assert_eq!(home_code(999, false), None);
+    }
+
+    #[test]
+    fn home_command_leaves_zero_max_dist_empty_and_omits_zero_curr_limit() {
+        let mut h = Homing {
+            method: HOME_LIMIT_INDEX,
+            offset_pos: 1.5,
+            offset_neg: -2.0,
+            ..Homing::default()
+        };
+        assert_eq!(h.command(3, 2, 10.0, true), "HOME 3,2,10,,1.5");
+        assert_eq!(h.command(3, 1, 10.0, false), "HOME 3,1,10,,-2");
+        h.max_dist = 50.0;
+        h.curr_limit = 0.5;
+        assert_eq!(h.command(0, 2, 10.0, true), "HOME 0,2,10,50,1.5,0.5");
     }
 
     #[test]

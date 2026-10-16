@@ -1,16 +1,11 @@
 //! `AcsMotionConfig` iocsh command for the ACS SPiiPlus.
 //!
-//! Mirrors C `AcsMotionConfig(acsPort, asynPort, numAxes, movingPoll, idlePoll,
-//! virtualAxisList)`: connect the serial/TCP octet port, identify the controller
-//! ([`SpiiPlusController::new`]), and register each axis behind a `DTYP`-keyed
-//! motor device support (`ACSMOTION_{card}_{index}`, 0-based).
-//!
-//! Two arguments extend the C signature to carry configuration the C driver
-//! reads from runtime aux PVs that are absent at the plain motor boundary:
-//! `homingMethod` (the mbbo homing-method selector, applied to every axis;
-//! default limit+index) and the poll intervals in milliseconds (the C module's
-//! `movingPoll`/`idlePoll` are seconds). The `virtualAxisList` is a
-//! comma/space-separated list of 0-based axis indices, as in C.
+//! C `AcsMotionConfig(acsPort, asynPort, numAxes, movingPollPeriod,
+//! idlePollPeriod, virtualAxisList)`: connect the serial/TCP octet port,
+//! identify the controller ([`SpiiPlusController::new`]), and create controller
+//! port `acsPort` whose axes records address as `@asyn(acsPort,axis)`. The poll
+//! periods are seconds and `virtualAxisList` is comma-separated 0-based axis
+//! indices, as in C.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -21,22 +16,22 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_int, opt_string, poll_intervals,
-    req_int, req_string,
+    arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_int,
+    req_string,
 };
-use motor_common::{MotorHolder, asyn_user};
+use motor_common::{asyn_user, install, register_controller_port};
 
-use crate::spiiplus::{HOME_LIMIT_INDEX, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
+use crate::spiiplus::{AcsMotionParams, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
 
 /// Command timeout (C `SPiiPlusComm` uses the asyn default; 2 s here).
 const ACSMOTION_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Parse the `virtualAxisList` string (comma/space-separated 0-based indices)
+/// Parse the `virtualAxisList` string (comma-separated 0-based indices)
 /// into a set, ignoring blanks and out-of-range/unparseable entries (C warns and
 /// continues). Returns the set of valid virtual axis indices.
 fn parse_virtual_axes(list: &str, num_axes: usize) -> HashSet<usize> {
     let mut set = HashSet::new();
-    for tok in list.split([',', ' ', '\t']).filter(|s| !s.is_empty()) {
+    for tok in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         match tok.parse::<usize>() {
             Ok(idx) if idx < num_axes => {
                 set.insert(idx);
@@ -49,39 +44,32 @@ fn parse_virtual_axes(list: &str, num_axes: usize) -> HashSet<usize> {
     set
 }
 
-/// Build the `AcsMotionConfig(card, asynPort, numAxes, [virtualAxisList],
-/// [homingMethod], [movingPollMs], [idlePollMs])` command bound to `holder`.
-pub fn acsmotion_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// Build the `AcsMotionConfig(acsPort, asynPort, numAxes, movingPollPeriod,
+/// idlePollPeriod, virtualAxisList)` command.
+pub fn acsmotion_config_command() -> CommandDef {
     CommandDef::new(
         "AcsMotionConfig",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("numAxes"),
-            arg_str_opt("virtualAxisList"),
-            arg_int_opt("homingMethod"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_str_req("ACS port name"),
+            arg_str_req("asyn port name"),
+            arg_int_req("num axes"),
+            arg_double_opt("Moving polling rate"),
+            arg_double_opt("Idle polling rate"),
+            arg_str_opt("Virtual axis list"),
         ],
-        "AcsMotionConfig(card, asynPort, numAxes, [virtualAxisList], [homingMethod], \
-         [movingPollMs], [idlePollMs]) - Create an ACS SPiiPlus controller (DTYP \
-         ACSMOTION_{card}_{0..N-1}); virtualAxisList is comma/space-separated 0-based \
-         indices; homingMethod is the mbbo selector 0..6 (default 1=limit+index)",
+        "AcsMotionConfig(acsPort, asynPort, numAxes, movingPollPeriod, idlePollPeriod, \
+         virtualAxisList)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("AcsMotionConfig: card must be >= 0".into());
-            }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let num_axes = req_int(args, 2, "numAxes")?;
+            let port_name = req_string(args, 0, "ACS port name")?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let num_axes = req_int(args, 2, "num axes")?;
             if num_axes < 1 {
                 return Err("AcsMotionConfig: numAxes must be > 0".into());
             }
             let num_axes = num_axes as usize;
-            let virtual_list = opt_string(args, 3)?.unwrap_or_default();
-            let homing_method = opt_int(args, 4, HOME_LIMIT_INDEX as i64, "homingMethod")? as i32;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 5, 6)?;
+            let moving_poll = opt_double(args, 3, 0.0, "Moving polling rate")?;
+            let idle_poll = opt_double(args, 4, 0.0, "Idle polling rate")?;
+            let virtual_list = opt_string(args, 5)?.unwrap_or_default();
 
             let virtual_axes = parse_virtual_axes(&virtual_list, num_axes);
 
@@ -92,31 +80,28 @@ pub fn acsmotion_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 OUTPUT_EOS,
                 EosRefusal::Ignored,
             )?;
-            let controller = SpiiPlusController::new(handle, num_axes, homing_method)
+            let controller = SpiiPlusController::new(handle, &port_name, num_axes)
                 .map_err(|e| format!("AcsMotionConfig: {e}"))?;
-            let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 
+            register_controller_port(
+                ctx.db().scan_control().interrupt_gate(),
+                &port_name,
+                num_axes as i32,
+                AcsMotionParams::new(controller.clone()),
+            )?;
             for index in 0..num_axes {
                 let is_virtual = virtual_axes.contains(&index);
                 let ax = SpiiPlusAxis::new(controller.clone(), index, is_virtual);
-                let dtyp_key = format!("ACSMOTION_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(
+                install(
                     ctx,
-                    asyn_user(&card.to_string(), index as i32),
-                    dtyp_key,
+                    asyn_user(&port_name, index as i32),
                     motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                    (moving_poll * 1000.0) as u64,
+                    (idle_poll * 1000.0) as u64,
+                )?;
             }
-            println!(
-                "AcsMotionConfig: card={card} asynPort={asyn_port} axes={num_axes} \
-                 virtual={virtual_axes:?} homingMethod={homing_method} ident=\"{ident}\" \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=ACSMOTION_{card}_{{0..{}}})",
-                num_axes - 1
-            );
             Ok(CommandOutcome::Continue)
         },
     )

@@ -25,18 +25,17 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- EMC18011 controller ----
-# EMC18011Setup(maxControllers, [scanRate]) is accepted for startup-script
-# parity; the asyn-rs port allocates per EMC18011Config call.
+# EMC18011Setup(num_cards, scan_rate in Hz)
 EMC18011Setup(1, 10)
 
-# EMC18011Config(card, asynPort, [movingPollMs], [idlePollMs]) - fixed 3 axes.
-EMC18011Config(0, "$(SERIAL)", 100, 1000)
+# EMC18011Config(card, asyn port) - fixed 3 axes.
+EMC18011Config(0, "$(SERIAL)")
 
-# One motor record per axis (DTYP EMC18011_$(CARD)_0, _1, _2). The controller
+# One motor record per axis (DTYP "EMC18011", OUT #C$(CARD) S0, S1, ...). The controller
 # works in millimetres (EGU = mm) at a 0.01 mm step (MRES).
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m1,C=$(CARD),S=0")
+dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m2,C=$(CARD),S=1")
+dbLoadRecords("$(ORIEL_IOC)/db/emc18011.template", "P=$(P),M=m3,C=$(CARD),S=2")
 
 iocInit()
 

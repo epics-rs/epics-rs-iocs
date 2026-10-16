@@ -2,7 +2,8 @@
 # stepper (no encoder), so positions are raw accumulated steps — MRES = 1.
 
 record(motor, "$(P)$(M0)") {
-    field(DTYP, "AG_UC_$(PORT)_0")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),0)")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=100.0)")
     field(ACCL, "$(ACCL=0.5)")
@@ -14,7 +15,8 @@ record(motor, "$(P)$(M0)") {
 }
 
 record(motor, "$(P)$(M1)") {
-    field(DTYP, "AG_UC_$(PORT)_1")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),1)")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=100.0)")
     field(ACCL, "$(ACCL=0.5)")
