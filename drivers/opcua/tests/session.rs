@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
 use opcua::client::{Notification, ServerInfo, UaConnection, UaConnector};
 use opcua::item::{Item, Leaf};
 use opcua::link::{InfoDefaults, LinkInfo, NodeIdentifier, RecordKind, parse_link};
@@ -879,6 +880,35 @@ async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
     assert_eq!(updates[1].status, StatusCode::BadConnectionClosed);
     assert_eq!(item0.lock().state, ConnectionStatus::Down);
     assert_eq!(mock.calls.lock().disconnects, 1);
+}
+
+/// C prints the ACTIVATED -> CREATED transition (`SessionOpen62541.cpp:2520-2523`).
+#[tokio::test]
+async fn a_lost_connection_prints_disconnected() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert!(
+        lines
+            .lock()
+            .iter()
+            .any(|l| l == "OPC UA session sess: disconnected\n")
+    );
 }
 
 #[tokio::test]

@@ -601,6 +601,11 @@ impl SessionWorker {
 
                 _ = tokio::time::sleep_until(flush_at.into()), if self.has_pending() => {
                     if !self.flush(&connection).await {
+                        // The ACTIVATED -> CREATED arm (`SessionOpen62541.cpp:2520-2523`).
+                        errlog_vprintf(format_args!(
+                            "OPC UA session {}: disconnected\n",
+                            self.handle.name
+                        ));
                         self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
                         return ServeOutcome::Disconnected;
                     }
