@@ -20,13 +20,14 @@ use async_opcua::types::{
     DataValue, DateTime, ExpandedMessageInfo, ExtensionObject, NodeId, StatusCode, StructureType,
     Variant,
 };
+use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use crate::link::{Bini, LinkInfo, TimestampSource};
 use crate::queue::{ConnectionStatus, ProcessReason, Update, UpdateQueue};
 use crate::session::{Priority, Request, SessionHandle};
-use crate::value::EnumChoices;
+use crate::value::{EnumChoices, type_name};
 
 /// One record's binding to an item (`DataElementOpen62541Leaf` +
 /// `RecordConnector`).
@@ -121,6 +122,9 @@ pub struct Item {
     /// The server's data type dictionary, needed to rebuild a structure around a
     /// changed element.
     pub type_tree: Option<Arc<DataTypeTree>>,
+    /// The `@element` timestamp source was found unusable and said so; C
+    /// reports it once per structure mapping, which a connection loss drops.
+    timestamp_element_reported: bool,
     /// The session the item's node lives on — `None` until
     /// [`Item::adopt`] puts it there.
     ///
@@ -162,6 +166,7 @@ impl Item {
             last_status: StatusCode::Good,
             last_timestamp: None,
             type_tree: None,
+            timestamp_element_reported: false,
             session: None,
         }
     }
@@ -230,7 +235,8 @@ impl Item {
         let data = value.value.clone().unwrap_or(Variant::Empty);
         self.last_value = Some(data.clone());
         self.last_status = status;
-        self.last_timestamp = Some(self.timestamp_for(&self.link, &value, &data));
+        let data_time = self.data_timestamp(&data);
+        self.last_timestamp = Some(timestamp_for(&self.link, &value, data_time));
 
         for leaf in &self.leaves {
             let mut leaf = leaf.lock();
@@ -242,7 +248,7 @@ impl Item {
                 leaf.incoming = Some(element.clone());
             }
 
-            let timestamp = self.timestamp_for(&leaf.link, &value, &data);
+            let timestamp = timestamp_for(&leaf.link, &value, data_time);
             if leaf.state == ConnectionStatus::InitialRead {
                 match leaf.link.bini {
                     // The initial value is thrown away; the item still needed it
@@ -291,6 +297,7 @@ impl Item {
         if reason == ProcessReason::ConnectionLoss {
             self.state = ConnectionStatus::Down;
             self.last_value = None;
+            self.timestamp_element_reported = false;
         }
         for leaf in &self.leaves {
             let mut leaf = leaf.lock();
@@ -338,9 +345,9 @@ impl Item {
                 .or_else(|| self.last_value.clone())
                 .unwrap_or(Variant::Empty);
             let Some(tree) = &self.type_tree else {
-                log::error!(
-                    "{}: cannot write element: the server's type tree is not loaded",
-                    leaf.record
+                eprintln!(
+                    "Cannot get a structure definition for item {} because the type dictionary is not loaded.",
+                    self.node_id
                 );
                 result = Some(base);
                 continue;
@@ -348,7 +355,7 @@ impl Item {
             match with_element(&base, &leaf.link.element_path, value, tree) {
                 Ok(updated) => result = Some(updated),
                 Err(e) => {
-                    log::error!("{}: cannot write element: {e}", leaf.record);
+                    eprintln!("Item {}: {e}", self.node_id);
                     result = Some(base);
                 }
             }
@@ -385,28 +392,50 @@ impl Item {
         }
     }
 
-    /// `ItemOpen62541::getStatus` / `uaToEpicsTime` — which of the value's
-    /// timestamps the record takes.
-    fn timestamp_for(&self, link: &LinkInfo, value: &DataValue, data: &Variant) -> SystemTime {
-        let pick = |dt: Option<DateTime>| dt.map(system_time_of);
-        match link.timestamp {
-            TimestampSource::Server => pick(value.server_timestamp),
-            TimestampSource::Source => pick(value.source_timestamp),
-            TimestampSource::Data => {
-                let element = &self.link.timestamp_element;
-                match element_of(data, std::slice::from_ref(element)) {
-                    Some(Variant::DateTime(dt)) => Some(system_time_of(*dt)),
-                    _ => {
-                        log::warn!(
-                            "item {}: element '{element}' is not a DateTime; using the server time",
-                            self.node_id
-                        );
-                        pick(value.server_timestamp)
-                    }
+    /// The time in the item's `@element`, if it names a DateTime element
+    /// (`DataElementOpen62541Node::createMap`, `DataElementOpen62541Node.cpp:146-169`).
+    fn data_timestamp(&mut self, data: &Variant) -> Option<SystemTime> {
+        let element = &self.link.timestamp_element;
+        if element.is_empty() {
+            return None;
+        }
+        let found = element_of(data, std::slice::from_ref(element));
+        if let Some(Variant::DateTime(dt)) = found {
+            return Some(system_time_of(*dt));
+        }
+        if !std::mem::replace(&mut self.timestamp_element_reported, true) {
+            let record = self.addressing_record();
+            let element = &self.link.timestamp_element;
+            match found {
+                Some(other) => {
+                    let kind = match &other {
+                        Variant::Array(a) => format!("{:?}[]", a.value_type),
+                        other => type_name(other),
+                    };
+                    errlog_vprintf(format_args!(
+                        "{record}: timestamp element {element} has invalid type {kind} - using source timestamp\n"
+                    ));
                 }
+                None => errlog_vprintf(format_args!(
+                    "{record}: timestamp element {element} not found - using source timestamp\n"
+                )),
             }
         }
-        .unwrap_or_else(SystemTime::now)
+        None
+    }
+
+    /// The record whose link addresses the item's node (C `recConnector`).
+    pub fn addressing_record(&self) -> String {
+        self.leaves
+            .iter()
+            .find_map(|leaf| {
+                let leaf = leaf.lock();
+                leaf.link
+                    .item_record()
+                    .is_none()
+                    .then(|| leaf.record.clone())
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -444,6 +473,19 @@ fn system_time_of(dt: DateTime) -> SystemTime {
     } else {
         UNIX_EPOCH - Duration::new((-secs) as u64, 0) + Duration::from_nanos(u64::from(nanos))
     }
+}
+
+/// `ItemOpen62541::getStatus` / `uaToEpicsTime` — which of the value's
+/// timestamps the record takes. An unusable `@element` falls back to the
+/// source timestamp, as C's `tsData = tsSource` does.
+fn timestamp_for(link: &LinkInfo, value: &DataValue, data_time: Option<SystemTime>) -> SystemTime {
+    let pick = |dt: Option<DateTime>| dt.map(system_time_of);
+    match link.timestamp {
+        TimestampSource::Server => pick(value.server_timestamp),
+        TimestampSource::Source => pick(value.source_timestamp),
+        TimestampSource::Data => data_time.or_else(|| pick(value.source_timestamp)),
+    }
+    .unwrap_or_else(SystemTime::now)
 }
 
 /// Walk an element path into a structured value.
@@ -485,16 +527,20 @@ pub fn with_element(
     let Some((name, rest)) = path.split_first() else {
         return Ok(value);
     };
-    let structure =
-        as_structure(base).ok_or_else(|| format!("'{name}' is not inside a structure"))?;
+    let structure = as_structure(base).ok_or_else(|| {
+        format!(
+            "element {name} is in no structured data but a {}",
+            type_name(base)
+        )
+    })?;
     let type_id = structure.full_data_type_id().node_id;
     let type_def = tree
         .get_struct_type(&type_id)
-        .ok_or_else(|| format!("the type of element '{name}' is not in the server's type tree"))?;
+        .ok_or_else(|| format!("element {name}: type {type_id} is not in the type dictionary"))?;
     let index = *type_def
         .index_by_name
         .get(name)
-        .ok_or_else(|| format!("the structure has no element '{name}'"))?;
+        .ok_or_else(|| format!("element {name} not found in {type_id}"))?;
 
     let updated = if matches!(type_def.structure_type, StructureType::Union) {
         // A union holds one field at a time; writing a member selects it.
@@ -513,7 +559,7 @@ pub fn with_element(
         let field = fields
             .get(index)
             .cloned()
-            .ok_or_else(|| format!("the structure has no element '{name}'"))?;
+            .ok_or_else(|| format!("element {name} not found in {type_id}"))?;
         fields[index] = with_element(&field, rest, value, tree)?;
         DynamicStructure::new_struct(type_def.clone(), tree.clone(), fields)
     }

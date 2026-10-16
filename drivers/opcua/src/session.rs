@@ -829,7 +829,7 @@ impl SessionWorker {
                         let item = item.lock();
                         eprintln!(
                             "OPC UA record {} monitored item {} failed with error {}",
-                            addressing_record(&item),
+                            item.addressing_record(),
                             item.wire_node_id(),
                             status_name(*status)
                         );
@@ -934,20 +934,6 @@ fn monitored_item_request(item: &Item) -> MonitoredItemCreateRequest {
 }
 
 /// Which failures mean the session is gone rather than the request being bad.
-/// The record whose link addresses the item's node (C `recConnector`).
-fn addressing_record(item: &Item) -> String {
-    item.leaves
-        .iter()
-        .find_map(|leaf| {
-            let leaf = leaf.lock();
-            leaf.link
-                .item_record()
-                .is_none()
-                .then(|| leaf.record.clone())
-        })
-        .unwrap_or_default()
-}
-
 /// C `UA_StatusCode_name`: the code's name without the info bits.
 pub(crate) fn status_name(status: StatusCode) -> &'static str {
     status.sub_code().name()
