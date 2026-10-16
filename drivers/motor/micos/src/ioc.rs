@@ -7,19 +7,25 @@
 //! `drvAsynIPPort` or a `drvAsynSerialPort`, so `connect_ip` is used (the lookup
 //! is transport-agnostic).
 
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::connect::connect_ip;
+use motor_common::connect::{EosRefusal, connect_ip, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{asyn_user, install, register_port};
+use motor_common::model1::{Model1, SCAN_RATE, c_int};
+use motor_common::{asyn_user, install, model1_device, register_port};
 
 use crate::corvus::{CorvusAxis, CorvusController};
+use crate::drv_micos::{
+    DrvMicosAxis, MICOS_NUM_AXIS, MICOS_NUM_CARDS, MicosController, micos_probe,
+};
 use crate::hydra::{HydraAxis, HydraController};
 use crate::taurus::{TaurusAxis, TaurusController};
 
@@ -161,6 +167,85 @@ pub fn taurus_create_controller_command() -> CommandDef {
                     moving_poll_ms,
                     idle_poll_ms,
                 )?;
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// drvMicos.cc's `COMM_TIMEOUT`.
+const MICOS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `device(motor,VME_IO,devMicos,"Micos MoCo")` (devMicos.dbd).
+static DEV_MICOS: DevSup = model1_device("devMicos", "Micos MoCo");
+
+static MICOS: Model1 = Model1::new(&DEV_MICOS, MICOS_NUM_CARDS, SCAN_RATE);
+
+/// `MicosSetup`'s drivers per card, `Micos_num_axis`.
+static MICOS_NUM_AXES: AtomicI32 = AtomicI32::new(MICOS_NUM_AXIS);
+
+/// `MicosSetup(num_cards, num_channels, scan_rate)`.
+pub fn micos_setup_command() -> CommandDef {
+    MICOS.register_row();
+    CommandDef::new(
+        "MicosSetup",
+        vec![
+            arg_int_req("Max. controller count"),
+            arg_int_req("Max. motor count"),
+            arg_int_req("Polling rate"),
+        ],
+        "MicosSetup(num_cards, num_channels, scan_rate)",
+        |args: &[ArgValue], _ctx: &CommandContext| {
+            let num_axis = c_int(args, 1);
+            let num_axis = if (1..=MICOS_NUM_AXIS).contains(&num_axis) {
+                num_axis
+            } else {
+                MICOS_NUM_AXIS
+            };
+            MICOS_NUM_AXES.store(num_axis, Ordering::Relaxed);
+            MICOS.setup(c_int(args, 0), c_int(args, 2));
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `MicosConfig(card, name)`. Connects and probes the card at once, where
+/// C's `motor_init` does so at iocInit; a card where any of the
+/// `num_channels` drivers is silent is left unconfigured, as there.
+pub fn micos_config_command() -> CommandDef {
+    CommandDef::new(
+        "MicosConfig",
+        vec![
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
+        ],
+        "MicosConfig(card, name)",
+        |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !MICOS.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            // The MoCo ends a reply with CR LF ETX. C asks for all three as
+            // the input EOS, which asyn refuses (eoslen > 2), so its reads
+            // end only on timeout; the ETX alone ends one here.
+            let handle = connect_with_eos(
+                &asyn_port,
+                MICOS_TIMEOUT,
+                b"\x03",
+                b"\r",
+                EosRefusal::Ignored,
+            )?;
+            let controller = MicosController::new(handle);
+            let num_axis = MICOS_NUM_AXES.load(Ordering::Relaxed);
+            if !micos_probe(&controller, num_axis) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let controller = Arc::new(Mutex::new(controller));
+            for signal in 0..num_axis {
+                let motor: Arc<Mutex<dyn AsynMotor>> =
+                    Arc::new(Mutex::new(DrvMicosAxis::new(controller.clone(), signal)));
+                MICOS.install(ctx, card, signal, motor)?;
             }
             Ok(CommandOutcome::Continue)
         },
