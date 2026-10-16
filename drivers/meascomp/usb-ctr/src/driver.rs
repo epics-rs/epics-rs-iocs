@@ -306,7 +306,13 @@ impl PortDriver for CtrDriver {
     /// lives in McsState::mcs_buffers and only leaves the driver here.
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         if user.reason != self.params.mca_data {
-            return Ok(0);
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("USBCTR:readInt32Array: got illegal command {}", user.reason),
+            );
+            trace::asyn_status(-1)?;
         }
         let counter = user.addr as usize;
         let num_channels = self
@@ -326,7 +332,16 @@ impl PortDriver for CtrDriver {
     /// MCS time base (seconds from the start of the scan).
     fn read_float32_array(&mut self, user: &AsynUser, buf: &mut [f32]) -> AsynResult<usize> {
         if user.reason != self.params.mcs_time_wf {
-            return Ok(0);
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "USBCTR:readFloat32Array: ERROR: unknown function={}",
+                    user.reason
+                ),
+            );
+            trace::asyn_status(-1)?;
         }
         // Only the points the scan is configured for, as C
         // computeMCSTimes' doCallbacksFloat32Array(.., numTimePoints, ..)
@@ -346,7 +361,17 @@ impl PortDriver for CtrDriver {
     /// MCS absolute time base (seconds since the epoch, per acquired point).
     fn read_float64_array(&mut self, user: &AsynUser, buf: &mut [f64]) -> AsynResult<usize> {
         if user.reason != self.params.mcs_abs_time_wf {
-            return Ok(0);
+            // C's functionName is "readFloat6Array".
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "USBCTR:readFloat6Array: ERROR: unknown function={}",
+                    user.reason
+                ),
+            );
+            trace::asyn_status(-1)?;
         }
         let st = self.state.lock().unwrap();
         // Points actually acquired, as C readMCS reports them.
