@@ -24,20 +24,19 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- PIJEDS controller ----
-# PIJEDSSetup(maxControllers, [scanRate]) is accepted for startup-script parity;
-# the asyn-rs port allocates per PIJEDSConfig call.
+# PIJEDSSetup(num_cards, scan_rate in Hz)
 PIJEDSSetup(1, 10)
 
-# PIJEDSConfig(card, asynPort, [movingPollMs], [idlePollMs]) - axis count
+# PIJEDSConfig(card, asyn port, GPIB address) - axis count
 # auto-detected.
-PIJEDSConfig(0, "$(SERIAL)", 100, 1000)
+PIJEDSConfig(0, "$(SERIAL)", 0)
 
-# One motor record per detected axis (DTYP PIJEDS_$(CARD)_0, _1, ...).
+# One motor record per detected axis (DTYP "PIJEDS", OUT #C$(CARD) S0, S1, ...).
 # The E-516 is a closed-loop piezo positioner: positions travel the driver
 # boundary in physical units (µm), so MRES = drive_resolution (1e-3) and
 # EGU = um. Homing and hardware limit switches are not supported.
-dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m1,C=$(CARD),S=0")
+dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m2,C=$(CARD),S=1")
 
 iocInit()
 
