@@ -24,9 +24,7 @@ use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
@@ -220,7 +218,6 @@ pub struct MarccdRuntime {
     pub marccd_params: MarccdParams,
     pool: Arc<NDArrayPool>,
     array_output: Arc<Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Worker threads; kept alive for the IOC's lifetime.
     pub tasks: Vec<std::thread::JoinHandle<()>>,
 }
@@ -238,8 +235,7 @@ impl MarccdRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -280,7 +276,6 @@ pub fn create_marccd_detector(
     let marccd_params = driver.p;
     let pool = driver.ad.pool.clone();
 
-    let queued_counter = driver.ad.queued_counter.clone();
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the marCCD port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
@@ -307,6 +302,7 @@ pub fn create_marccd_detector(
         image_event: image_ev.clone(),
         acq_start: acq_start.clone(),
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
     };
     let image_worker = Worker {
         server: server.clone(),
@@ -315,6 +311,7 @@ pub fn create_marccd_detector(
         image_event: image_ev.clone(),
         acq_start: acq_start.clone(),
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
     };
     let cmd_worker = Worker {
         server,
@@ -323,6 +320,7 @@ pub fn create_marccd_detector(
         image_event: image_ev,
         acq_start,
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
     };
 
     let tasks = vec![
@@ -343,7 +341,6 @@ pub fn create_marccd_detector(
         marccd_params,
         pool,
         array_output,
-        queued_counter,
         tasks,
     })
 }

@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
@@ -79,6 +80,7 @@ pub(crate) struct Worker {
     /// C `acqStartTime` as an f64 epoch second count (bits).
     pub acq_start: Arc<AtomicU64>,
     pub output: ArrayPublisher,
+    pub pool: Arc<NDArrayPool>,
 }
 
 /// Current time as an f64 epoch second count (C `secPastEpoch + nsec/1e9`).
@@ -377,11 +379,14 @@ impl Worker {
             Err(s) => return s,
         };
 
-        if array_callbacks != 0 {
-            let mut array = NDArray::with_data(
+        // C dereferences a refused alloc (marCCD.cpp:314); the frame is
+        // dropped after the pool's reached-limit line.
+        if array_callbacks != 0
+            && let Ok(mut array) = self.pool.wrap(
                 vec![NDDimension::new(nx), NDDimension::new(ny)],
                 NDDataBuffer::U16(data),
-            );
+            )
+        {
             array.unique_id = image_counter;
             array.timestamp = EpicsTimestamp::now();
             // C uses `acqStartTime` for the double timestamp, and
