@@ -269,9 +269,12 @@ impl CellBody for Job {
         ex.recbuf = response;
     }
 
-    /// C's request has no `timeoutUser` and is never canceled, so it always
-    /// runs; one that did not is the callback's `finish` with nothing read.
-    fn unrun(&self, _why: Unrun) {
+    /// Nothing cancels the request and it has no timeout callback, so only a
+    /// port shutting down with it queued leaves it unrun — a path C, whose
+    /// ports are never deleted, has no counterpart for. The pass then decodes
+    /// nothing read.
+    fn unrun(&self, why: Unrun) {
+        assert!(matches!(why, Unrun::Refused(_)), "vac request {why:?}");
         let mut ex = self.exchange.lock().unwrap();
         ex.read_alarm = false;
         ex.recbuf = ResponseBuf::default();
@@ -279,6 +282,12 @@ impl CellBody for Job {
 
     fn done(self: Arc<Self>) {
         self.reentry.reprocess();
+    }
+
+    /// `createAsynUser(callback, 0)` (devDigitelPump.c:123): a request on a disconnected
+    /// device runs.
+    fn timeout_user(&self) -> bool {
+        false
     }
 }
 
