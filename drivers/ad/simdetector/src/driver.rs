@@ -107,21 +107,25 @@ impl SimDetector {
         })
     }
 
-    /// `simDetector::setShutter` (simDetector.cpp:490-502).
-    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+    /// `simDetector::setShutter` (simDetector.cpp:490-502). C's is void and
+    /// ignores every param status, so an unset `ADShutterMode` reads as 0.
+    fn set_shutter(&mut self, open: bool) {
         let mode = self
             .ad
             .port_base
-            .get_int32_param(self.ad.params.shutter_mode, 0)?;
+            .get_int32_param(self.ad.params.shutter_mode, 0)
+            .unwrap_or(0);
         match shutter_op(mode, open) {
             ShutterOp::DetectorStatus(v) => {
-                self.ad
+                let _ = self
+                    .ad
                     .port_base
-                    .set_int32_param(self.ad.params.shutter_status, 0, v)?;
+                    .set_int32_param(self.ad.params.shutter_status, 0, v);
             }
-            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => self.ad.set_shutter(open)?,
+            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => {
+                let _ = self.ad.set_shutter(open);
+            }
         }
-        Ok(())
     }
 }
 
@@ -199,7 +203,8 @@ impl PortDriver for SimDetector {
         } else if !sim.owns(reason) {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
             status = if reason == p.shutter_control {
-                self.set_shutter(value != 0)
+                self.set_shutter(value != 0);
+                Ok(())
             } else {
                 self.ad.write_int32_pool(reason, value).map(drop)
             };
