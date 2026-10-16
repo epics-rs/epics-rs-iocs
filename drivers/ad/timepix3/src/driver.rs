@@ -13,6 +13,7 @@ use epics_rs::asyn::user::AsynUser;
 use serde_json::json;
 
 use crate::adlog;
+use crate::calibration::PathPolicy;
 use crate::family::DetectorFamily;
 use crate::http::{HttpError, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
 use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
@@ -92,6 +93,7 @@ pub struct TimePix3Driver {
     pub http: Arc<ServalHttp>,
     pub shared: Arc<Shared>,
     cmd_tx: rt::CommandSender<Command>,
+    calibration: PathPolicy,
 }
 
 impl TimePix3Driver {
@@ -124,9 +126,29 @@ impl TimePix3Driver {
             http,
             shared,
             cmd_tx,
+            calibration: PathPolicy::default(),
         };
         driver.init_params()?;
+        driver.configure_calibration(
+            &std::env::var("ADTIMEPIX_CALIBRATION_ROOT").unwrap_or_default(),
+        )?;
         Ok(driver)
+    }
+
+    /// C `ADTimePixConfig`'s ADTIMEPIX_CALIBRATION_ROOT, "/" when unset
+    /// (ADTimePix.cpp:74-75, :1597-1609).
+    fn configure_calibration(&mut self, root: &str) -> AsynResult<()> {
+        let status = self
+            .calibration
+            .configure(if root.is_empty() { "/" } else { root });
+        let policy = match status {
+            Ok(()) if self.calibration.permissive() => "Permissive: /".to_string(),
+            Ok(()) => format!("Enforced: {}", self.calibration.root()),
+            Err(e) => format!("Blocked: {}", e.message()),
+        };
+        let root = self.calibration.root();
+        self.set_text(self.p.calibration_root, &root)?;
+        self.set_text(self.p.calibration_policy, &policy)
     }
 
     /// C's constructor seeds (ADTimePix.cpp:1414-1553, ADTimePix3 R1-6-4).
@@ -1422,6 +1444,37 @@ impl PortDriver for TimePix3Driver {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// The calibration root and its policy read back what the constructor
+    /// configured (ADTimePix.cpp:1597-1609).
+    #[test]
+    fn the_calibration_policy_reads_back_its_root() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_CALIB_ROOT",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.configure_calibration("").unwrap();
+        assert_eq!(det.text(p.calibration_root, 0), "/");
+        assert_eq!(det.text(p.calibration_policy, 0), "Permissive: /");
+        let tmp = std::env::temp_dir().canonicalize().unwrap();
+        det.configure_calibration(tmp.to_str().unwrap()).unwrap();
+        assert_eq!(
+            det.text(p.calibration_policy, 0),
+            format!("Enforced: {}", tmp.display())
+        );
+        det.configure_calibration("relative").unwrap();
+        assert_eq!(det.text(p.calibration_root, 0), "");
+        assert_eq!(
+            det.text(p.calibration_policy, 0),
+            "Blocked: calibration root is not absolute"
+        );
+    }
 
     /// writeOctet stores up to the first NUL and ignores a blank threshold
     /// list (ADTimePix.cpp:424-440).
