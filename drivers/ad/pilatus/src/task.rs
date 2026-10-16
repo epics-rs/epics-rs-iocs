@@ -17,7 +17,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAt
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PersistentArray, PublishedArray};
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
@@ -81,8 +81,8 @@ pub struct Shared {
     pub demanded_energy: f64,
     /// C `badPixelMap` truncated to `numBadPixels`.
     pub bad_pixels: Vec<BadPixel>,
-    /// C `pFlatField->pData`.
-    pub flat_field: Vec<i32>,
+    /// C `pFlatField`, `None` when the pool refused it at construction.
+    pub flat_field: Option<PersistentArray>,
     /// C `averageFlatField`.
     pub average_flat_field: f64,
 }
@@ -410,7 +410,7 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
     let (nx, ny) = max_size(&mut w.ctx).await;
     let bad_pixels = w.shared.lock().bad_pixels.clone();
     let read = read_image_file(&mut w.ctx, file, None, 0.0, nx, ny, &bad_pixels).await;
-    let (mut data, _desc) = match read {
+    let (mut data, description) = match read {
         Ok(v) => v,
         Err(_) => {
             w.ctx.trace(
@@ -433,21 +433,36 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
         return;
     };
     apply_flat_field_floor(&mut data, min_flat_field, average);
-    {
-        let mut s = w.shared.lock();
-        s.flat_field = data.clone();
-        s.average_flat_field = average;
-    }
-
-    // C `doCallbacksGenericPointer(pFlatField, NDArrayData, 0)`.
-    // A refused flat field is not published; the pool printed the
-    // reached-limit line.
-    if let Ok(array) = build_array(&w.pool, 0, nx, ny, data, None) {
-        w.output.publish(array).await;
-    }
+    let Some(array) = refill_flat_field(&mut w.shared.lock(), &data, description, average) else {
+        w.ctx.callbacks().await;
+        return;
+    };
+    w.output.publish(array).await;
 
     w.ctx.set_i32(valid, 1);
     w.ctx.callbacks().await;
+}
+
+/// C reads into `pFlatField` and publishes it (pilatusDetector.cpp:290,
+/// :316). `None` with no flat-field array or a refused refill, which leaves
+/// FlatFieldValid 0; the pool printed its reached-limit line.
+fn refill_flat_field(
+    s: &mut Shared,
+    data: &[i32],
+    description: Option<String>,
+    average: f64,
+) -> Option<PublishedArray> {
+    let flat = s.flat_field.as_mut()?;
+    let array = flat.refill().ok()?;
+    let NDDataBuffer::I32(pixels) = &mut array.data else {
+        unreachable!("allocated as NDInt32")
+    };
+    pixels.copy_from_slice(data);
+    if let Some(d) = description {
+        array.attributes.add(tiff_description(d));
+    }
+    s.average_flat_field = average;
+    Some(flat.published())
 }
 
 // ---------------------------------------------------------------------------
@@ -680,12 +695,7 @@ fn build_array(
     let buffer = NDDataBuffer::I32(data);
     let mut attributes = NDAttributeList::new();
     if let Some(d) = description {
-        attributes.add(NDAttribute::new_static(
-            "TIFFImageDescription",
-            "TIFFImageDescription",
-            NDAttrSource::Driver,
-            NDAttrValue::String(d),
-        ));
+        attributes.add(tiff_description(d));
     }
     let mut array = pool.wrap(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer)?;
     array.unique_id = unique_id;
@@ -693,6 +703,17 @@ fn build_array(
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
     Ok(array)
+}
+
+/// C `pImage->pAttributeList->add("TIFFImageDescription", ...)`
+/// (pilatusDetector.cpp:722).
+fn tiff_description(description: String) -> NDAttribute {
+    NDAttribute::new_static(
+        "TIFFImageDescription",
+        "TIFFImageDescription",
+        NDAttrSource::Driver,
+        NDAttrValue::String(description),
+    )
 }
 
 async fn max_size(ctx: &mut Ctx) -> (usize, usize) {
@@ -903,7 +924,9 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                 let flat_field_valid = w.ctx.get_i32(w.ctx.p.flat_field_valid).await.unwrap_or(0);
                 if flat_field_valid != 0 {
                     let s = w.shared.lock();
-                    apply_flat_field(&mut data, &s.flat_field, s.average_flat_field);
+                    if let Some(NDDataBuffer::I32(flat)) = s.flat_field.as_ref().map(|f| &f.data) {
+                        apply_flat_field(&mut data, flat, s.average_flat_field);
+                    }
                 }
 
                 // C dereferences a refused alloc (pilatusDetector.cpp:1190);
@@ -989,6 +1012,48 @@ mod tests {
     fn epoch_secs_truncates_like_time_t() {
         let t = UNIX_EPOCH + std::time::Duration::from_millis(1_500);
         assert_eq!(epoch_secs(t), 1);
+    }
+
+    fn flat_field_pool(max_memory: usize) -> (DriverPool, Shared) {
+        let pool = DriverPool::standalone(max_memory);
+        let flat = pool
+            .alloc(
+                vec![NDDimension::new(2), NDDimension::new(1)],
+                epics_rs::ad_core::ndarray::NDDataType::Int32,
+            )
+            .unwrap();
+        let s = Shared {
+            flat_field: Some(PersistentArray::new(flat)),
+            ..Shared::default()
+        };
+        (pool, s)
+    }
+
+    /// C publishes the one `pFlatField` it allocated (pilatusDetector.cpp:316,
+    /// :1728), so a second read charges no second buffer.
+    #[test]
+    fn a_flat_field_read_publishes_the_array_allocated_at_construction() {
+        let (pool, mut s) = flat_field_pool(8);
+        let first = refill_flat_field(&mut s, &[5, 6], Some("d".into()), 5.5).unwrap();
+        assert!(matches!(&first.data, NDDataBuffer::I32(v) if v == &[5, 6]));
+        let first_ptr = Arc::as_ptr(first.array());
+        drop(first);
+        let second = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
+        assert_eq!(Arc::as_ptr(second.array()), first_ptr);
+        assert!(second.attributes.get("TIFFImageDescription").is_some());
+        assert_eq!((pool.num_alloc_buffers(), s.average_flat_field), (1, 7.5));
+    }
+
+    /// A refused refill publishes nothing, so FlatFieldValid stays 0, and the
+    /// last flat field and its average are kept.
+    #[test]
+    fn a_refused_flat_field_refill_publishes_nothing() {
+        let (_pool, mut s) = flat_field_pool(8);
+        let held = refill_flat_field(&mut s, &[5, 6], None, 5.5).unwrap();
+        assert!(refill_flat_field(&mut s, &[7, 8], None, 7.5).is_none());
+        assert!(matches!(&held.data, NDDataBuffer::I32(v) if v == &[5, 6]));
+        assert_eq!(s.average_flat_field, 5.5);
+        assert!(refill_flat_field(&mut Shared::default(), &[1, 2], None, 1.0).is_none());
     }
 
     #[test]

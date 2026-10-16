@@ -19,8 +19,8 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::DriverPool;
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverPool, PersistentArray};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
@@ -462,11 +462,7 @@ pub fn create_pilatus_detector(
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
 
-    let n_pixels = (max_size_x.max(0) as usize) * (max_size_y.max(0) as usize);
-    let shared = Arc::new(Mutex::new(Shared {
-        flat_field: vec![0i32; n_pixels],
-        ..Shared::default()
-    }));
+    let shared = Arc::new(Mutex::new(Shared::default()));
 
     let driver = PilatusDriver::new(
         port_name,
@@ -481,6 +477,19 @@ pub fn create_pilatus_detector(
         },
     )
     .map_err(|e| format!("failed to create Pilatus driver: {e}"))?;
+    // C allocates pFlatField once, here (pilatusDetector.cpp:1726-1728).
+    shared.lock().flat_field = driver
+        .ad
+        .pool
+        .alloc(
+            vec![
+                NDDimension::new(max_size_x.max(0) as usize),
+                NDDimension::new(max_size_y.max(0) as usize),
+            ],
+            NDDataType::Int32,
+        )
+        .ok()
+        .map(PersistentArray::new);
 
     let ad_params = driver.ad.params;
     let pilatus_params = driver.p;
