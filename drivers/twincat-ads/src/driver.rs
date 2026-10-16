@@ -59,6 +59,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use parking_lot::Mutex;
 
+use asyn_rs::asyn_record::PortClaim;
 use asyn_rs::error::{AsynError, AsynResult, AsynStatus};
 use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
@@ -1799,11 +1800,13 @@ impl Drop for AdsRuntime {
 /// succeeds, so an IOC whose PLC is off never finishes `iocInit`. Here a failed
 /// first connect is logged and left to the supervisor: the IOC starts, the
 /// records sit in COMM/INVALID, and they come alive when the PLC does.
-pub fn create_ads_port(cfg: AdsConfig) -> AsynResult<AdsRuntime> {
+///
+/// `claim` is the port name, taken first as C's `asynPortDriver` base does.
+pub fn create_ads_port(claim: &PortClaim, cfg: AdsConfig) -> AsynResult<AdsRuntime> {
     let driver = AdsPortDriver::new(cfg)?;
     let shared = driver.shared();
 
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     let _ = shared.trace.set(runtime_handle.port_handle().clone());
 
     println!(
