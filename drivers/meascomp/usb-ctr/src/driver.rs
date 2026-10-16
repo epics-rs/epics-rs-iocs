@@ -188,6 +188,33 @@ impl PortDriver for CtrDriver {
             if let Err(e) = dev.digital_out(uldaq_sys::AUXPORT, value as u64) {
                 status = e.code;
             }
+        } else if reason == self.params.trigger_mode {
+            // C maps the Windows UL trigger values onto uldaq's, defaulting
+            // to TRIG_LOW, and still sets the trigger after the error line.
+            let trigger_type = match value {
+                0 => uldaq_sys::TRIG_POS_EDGE,
+                1 => uldaq_sys::TRIG_NEG_EDGE,
+                6 => uldaq_sys::TRIG_HIGH,
+                7 => uldaq_sys::TRIG_LOW,
+                _ => {
+                    trace.print(
+                        TraceMask::ERROR,
+                        format_args!("USBCTR::writeInt32 error unsupported trigger value={value}"),
+                    );
+                    uldaq_sys::TRIG_LOW
+                }
+            };
+            let dev = self.device.lock().unwrap();
+            if let Err(e) = dev.daq_in_set_trigger(trigger_type, Default::default(), 0.0, 0.0, 0) {
+                status = e.code;
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "USBCTR::writeInt32 error calling cbDaqSetTrigger status={}, error={}",
+                        e.code, e.message
+                    ),
+                );
+            }
         } else if reason == self.params.mca_start_acquire {
             let already_running = self.state.lock().unwrap().mcs.running;
             if value != 0 && !already_running {
