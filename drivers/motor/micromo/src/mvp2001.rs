@@ -342,7 +342,6 @@ impl AsynMotor for Mvp2001Axis {
             velocity: 0.0,
             done,
             moving: !done,
-            direction: true,
             high_limit: (status & 0x2000) != 0,
             low_limit: (status & 0x8000) != 0,
             powered: (status & 0x100) == 0,
