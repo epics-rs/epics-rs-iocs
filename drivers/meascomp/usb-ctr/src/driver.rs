@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -204,7 +205,7 @@ impl PortDriver for CtrDriver {
         let reason = user.reason;
         let addr = device_addr(user.addr);
 
-        self.base.params.set_int32(reason, addr, value)?;
+        self.base.set_int32_param(reason, addr, value)?;
 
         if reason == self.params.pulse_run {
             // C starts on any non-zero write, running or not: with a pulse
@@ -272,17 +273,11 @@ impl PortDriver for CtrDriver {
             } else if current_point >= num_channels {
                 // Already complete: toggle MCA_ACQUIRING so the SNL program
                 // clears Acquiring.
-                self.base
-                    .params
-                    .set_int32(self.params.mca_acquiring, 0, 1)?;
+                self.base.set_int32_param(self.params.mca_acquiring, 0, 1)?;
                 self.base.call_param_callbacks(0)?;
-                self.base
-                    .params
-                    .set_int32(self.params.mca_acquiring, 0, 0)?;
+                self.base.set_int32_param(self.params.mca_acquiring, 0, 0)?;
             } else {
-                self.base
-                    .params
-                    .set_int32(self.params.mca_acquiring, 0, 1)?;
+                self.base.set_int32_param(self.params.mca_acquiring, 0, 1)?;
                 let num_channels = num_channels.max(0) as usize;
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
@@ -320,11 +315,9 @@ impl PortDriver for CtrDriver {
                     &trace,
                 );
                 self.base
-                    .params
-                    .set_float64(self.params.mca_dwell_time, 0, actual_dwell)?;
+                    .set_float64_param(self.params.mca_dwell_time, 0, actual_dwell)?;
                 self.base
-                    .params
-                    .set_int32(self.params.mcs_current_point, 0, 0)?;
+                    .set_int32_param(self.params.mcs_current_point, 0, 0)?;
             }
         } else if reason == self.params.mca_stop_acquire {
             let dev = self.device.lock().unwrap();
@@ -340,7 +333,7 @@ impl PortDriver for CtrDriver {
                 .iter()
                 .flat_map(|p| p.updates(&self.params, num_counters))
             {
-                self.base.params.set_value(reason, addr, value)?;
+                self.base.set_param_value(reason, addr, value)?;
             }
         } else if reason == self.params.mca_erase {
             let port = &self.base.port_name;
@@ -356,22 +349,18 @@ impl PortDriver for CtrDriver {
                 num_points.max(0) as usize,
             );
             self.base
-                .params
-                .set_int32(self.params.mcs_current_point, 0, 0)?;
+                .set_int32_param(self.params.mcs_current_point, 0, 0)?;
             for i in 0..MAX_MCS_COUNTERS as i32 {
                 self.base
-                    .params
-                    .set_float64(self.params.mca_elapsed_live, i, 0.0)?;
+                    .set_float64_param(self.params.mca_elapsed_live, i, 0.0)?;
                 self.base
-                    .params
-                    .set_float64(self.params.mca_elapsed_real, i, 0.0)?;
+                    .set_float64_param(self.params.mca_elapsed_real, i, 0.0)?;
                 self.base.call_param_callbacks(i)?;
             }
         } else if reason == self.params.mca_num_channels && value > self.max_time_points as i32 {
             let max = self.max_time_points as i32;
             self.base
-                .params
-                .set_int32(self.params.mca_num_channels, 0, max)?;
+                .set_int32_param(self.params.mca_num_channels, 0, max)?;
             user.print(
                 TraceMask::ERROR,
                 file!(),
@@ -516,7 +505,7 @@ impl PortDriver for CtrDriver {
         let trace = self.state.lock().unwrap().trace.clone();
         let reason = user.reason;
         let addr = device_addr(user.addr);
-        self.base.params.set_float64(reason, addr, value)?;
+        self.base.set_float64_param(reason, addr, value)?;
         if reason == self.params.mca_preset_real {
             // C readMCS reads the preset on every pass.
             self.state.lock().unwrap().mcs.preset_real_time = value;
@@ -604,7 +593,7 @@ impl PortDriver for CtrDriver {
             }
         }
 
-        self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+        self.base.set_uint32_param(reason, addr, value, mask, 0)?;
         // C's last loop pass leaves `outValue` at bit NUM_IO_BITS-1 of `value`.
         let out_value = if reason == self.params.digital_output {
             (value >> (NUM_IO_BITS - 1)) & 1
@@ -652,22 +641,24 @@ impl CtrRuntime {
 }
 
 /// Create a USB-CTR driver, start the port runtime actor and polling thread.
+/// `claim` is the port name taken before the device is opened, as C's
+/// `asynPortDriver` base registers it first.
 pub fn create_usb_ctr(
-    port_name: &str,
+    claim: &PortClaim,
     unique_id: &str,
     max_time_points: usize,
 ) -> Result<CtrRuntime, String> {
     let device = DaqDevice::connect(unique_id)
         .map_err(|e| format!("failed to connect to CTR device: {e}"))?;
 
-    let driver = CtrDriver::new(port_name, device, max_time_points)
+    let driver = CtrDriver::new(claim.name(), device, max_time_points)
         .map_err(|e| format!("failed to create CtrDriver: {e}"))?;
 
     let params = driver.params;
     let device = driver.device.clone();
     let state = driver.state.clone();
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _actor_jh) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the USB-CTR port runtime: {e}"))?;
 
     state
