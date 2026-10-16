@@ -849,8 +849,8 @@ mod tests {
     }
 
     /// The last frame of a Single acquisition under a software trigger;
-    /// returns ADAcquire and SoftwareTrigger after it.
-    fn last_software_triggered_frame(name: &str, max_memory: usize) -> (i32, i32) {
+    /// returns ADAcquire, SoftwareTrigger and NDArrayCounter after it.
+    fn last_software_triggered_frame(name: &str, max_memory: usize) -> (i32, i32, i32) {
         let mut det = detector_sized(name, max_memory);
         let (ad_params, params, init_param) = (det.ad.params, det.params, det.init_param);
         let pool = det.ad.pool.clone();
@@ -891,21 +891,28 @@ mod tests {
         let trigger = handle
             .read_int32_blocking(params.software_trigger, 0)
             .unwrap();
+        let counter = handle
+            .read_int32_blocking(ad_params.base.array_counter, 0)
+            .unwrap();
         std::mem::forget(runtime);
-        (acquire, trigger)
+        (acquire, trigger, counter)
     }
 
     /// merlinDetector.cpp:209/:242: a frame the pool refuses `continue`s past
     /// the software-trigger reset and the completion (:290-305).
     #[test]
     fn a_refused_last_frame_leaves_the_acquisition_running() {
-        assert_eq!(
-            last_software_triggered_frame("MERLIN_LAST_OK", 1 << 20),
-            (0, 0)
-        );
-        assert_eq!(
-            last_software_triggered_frame("MERLIN_LAST_REFUSED", 1000),
-            (1, 1)
-        );
+        let (acquire, trigger, _) = last_software_triggered_frame("MERLIN_LAST_OK", 1 << 20);
+        assert_eq!((acquire, trigger), (0, 0));
+        let (acquire, trigger, _) = last_software_triggered_frame("MERLIN_LAST_REFUSED", 1000);
+        assert_eq!((acquire, trigger), (1, 1));
+    }
+
+    /// merlinDetector.cpp:150-152 counts every data frame before the
+    /// NDArray is made.
+    #[test]
+    fn a_refused_frame_still_advances_the_array_counter() {
+        let (_, _, counter) = last_software_triggered_frame("MERLIN_COUNTER_REFUSED", 1000);
+        assert_eq!(counter, 1);
     }
 }

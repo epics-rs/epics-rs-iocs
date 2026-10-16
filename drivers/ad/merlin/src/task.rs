@@ -173,11 +173,18 @@ pub(crate) async fn handle_frame(
             .handle
             .set_params_and_notify(
                 0,
-                vec![ParamSetValue::new(
-                    ctx.ad_params.num_images_counter,
-                    0,
-                    ParamValue::Int32(images),
-                )],
+                vec![
+                    ParamSetValue::new(
+                        ctx.ad_params.num_images_counter,
+                        0,
+                        ParamValue::Int32(images),
+                    ),
+                    ParamSetValue::new(
+                        ctx.ad_params.base.array_counter,
+                        0,
+                        ParamValue::Int32(array_counter),
+                    ),
+                ],
             )
             .await;
     }
@@ -445,7 +452,6 @@ async fn publish(ctx: &AcquisitionContext, array: DriverArray) {
         .set_params_and_notify(
             0,
             vec![
-                ParamSetValue::new(base.array_counter, 0, ParamValue::Int32(array.unique_id)),
                 ParamSetValue::new(base.timestamp_rbv, 0, ParamValue::Float64(ts.as_f64())),
                 ParamSetValue::new(base.epics_ts_sec, 0, ParamValue::Int32(ts.sec as i32)),
                 ParamSetValue::new(base.epics_ts_nsec, 0, ParamValue::Int32(ts.nsec as i32)),
