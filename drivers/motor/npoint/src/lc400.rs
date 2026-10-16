@@ -23,7 +23,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::ControllerParams;
+use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
 
 /// `LC400_TIMEOUT`.
 pub const LC400_TIMEOUT: Duration = Duration::from_secs(5);
@@ -736,6 +736,27 @@ impl ControllerParams for Lc400ControllerParams {
 
     fn write_int32(
         &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> ParamWrite {
+        self.write_int32_own(base, user, value).into()
+    }
+
+    fn write_float64(
+        &mut self,
+        base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: f64,
+    ) -> ParamWrite {
+        self.write_float64_own(base, user, value).into()
+    }
+}
+
+/// The driver's own write code, which then passes to the base.
+impl Lc400ControllerParams {
+    fn write_int32_own(
+        &mut self,
         _base: &mut PortDriverBase,
         user: &AsynUser,
         value: i32,
@@ -763,8 +784,7 @@ impl ControllerParams for Lc400ControllerParams {
         };
         ctrl.write_single(address + register, value)
     }
-
-    fn write_float64(
+    fn write_float64_own(
         &mut self,
         _base: &mut PortDriverBase,
         user: &AsynUser,
