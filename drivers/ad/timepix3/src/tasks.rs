@@ -16,9 +16,8 @@ use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
-use epics_rs::asyn::user::AsynUser;
 use serde_json::Value;
 
 use crate::accum::Update;
@@ -76,24 +75,28 @@ impl Ctx {
         .await;
     }
 
-    /// `PortHandle` has no `Int64` parameter setter, so the request goes in
-    /// directly; the driver's default `write_int64` stores it and fires the
-    /// callbacks, which is exactly C's `setInteger64Param` +
-    /// `callParamCallbacks`.
+    /// C `setInteger64Param` + `callParamCallbacks`.
     async fn set_int64(&self, reason: usize, addr: i32, value: i64) {
-        let user = AsynUser::new(reason).with_addr(addr);
-        let _ = self
-            .handle
-            .submit_async(RequestOp::Int64Write { value }, user)
-            .await;
+        self.set(
+            addr,
+            vec![ParamSetValue::new(reason, addr, ParamValue::Int64(value))],
+        )
+        .await;
     }
 
+    /// C `doCallbacksInt64Array` from the stream threads (serval_stream.cpp:975,
+    /// histogram_io.cpp:541/605). The array also lands in the parameter, which
+    /// C does not keep; a read then returns the last published array.
     async fn set_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
-        let user = AsynUser::new(reason).with_addr(addr);
-        let _ = self
-            .handle
-            .submit_async(RequestOp::Int64ArrayWrite { data }, user)
-            .await;
+        self.set(
+            addr,
+            vec![ParamSetValue::new(
+                reason,
+                addr,
+                ParamValue::Int64Array(data.into()),
+            )],
+        )
+        .await;
     }
 }
 
@@ -1192,6 +1195,52 @@ mod tests {
         let r = rail_voltages(&d);
         assert_eq!(r[0], (1.5, 1.4));
         assert_eq!(r[3], (0.0, 0.0));
+    }
+
+    #[tokio::test]
+    async fn preview_sums_reach_io_intr_subscribers() {
+        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager};
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut driver =
+            crate::driver::TimePix3Driver::new("TPXT", http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        // No database here, so the port gets an already-open interruptAccept.
+        driver.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle().clone();
+        let ctx = Ctx {
+            handle: handle.clone(),
+            http,
+            shared,
+            p,
+            ad,
+            output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        };
+
+        let (_sub, mut rx) = handle.interrupts().register_interrupt_user(
+            InterruptFilter {
+                reason: Some(p.prv_hst_histogram_data),
+                ..Default::default()
+            },
+            1024,
+        );
+        ctx.set_int64_array(p.prv_hst_histogram_data, 0, vec![3, 1, 4])
+            .await;
+        let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no callback")
+            .unwrap();
+        let ParamValue::Int64Array(a) = v.value else {
+            panic!("expected an Int64Array, got {:?}", v.value);
+        };
+        assert_eq!(&a[..], [3, 1, 4]);
     }
 
     #[test]
