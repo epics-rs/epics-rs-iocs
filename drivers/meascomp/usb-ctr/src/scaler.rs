@@ -48,6 +48,8 @@ pub fn start_scaler(
     num_counters: usize,
     trace: &SelfTrace,
 ) -> Result<(), String> {
+    // C writeInt32 calls setScalerPresets ahead of startScaler.
+    set_scaler_presets(device, state, num_counters, trace);
     let num_counters = num_counters as i32;
 
     // Configure each counter for counting mode
@@ -89,24 +91,6 @@ pub fn start_scaler(
             })?;
     }
 
-    // Set presets as max limits
-    for i in 0..num_counters as usize {
-        if state.presets[i] > 0 {
-            device
-                .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
-                .map_err(|e| {
-                    trace.print(
-                        TraceMask::ERROR,
-                        format_args!(
-                            "USBCTR::setScalerPresets error calling cbCLoad32, counter={i}, presetCounts={}, status={}, error={}",
-                            state.presets[i] as i32, e.code, e.message
-                        ),
-                    );
-                    format!("counter_load MAX_LIMIT({i}) error: {e}")
-                })?;
-        }
-    }
-
     // Start continuous counter scan
     let requested_rate = 10000.0; // Will be adjusted by driver
     let mut rate = requested_rate;
@@ -141,6 +125,51 @@ pub fn start_scaler(
 
     state.running = true;
     Ok(())
+}
+
+/// Load each non-zero preset as its counter's limit, and counter 0's output
+/// registers so its output drops at preset 0. C `USBCTR::setScalerPresets`,
+/// whose failures are reported and passed over.
+fn set_scaler_presets(
+    device: &DaqDevice,
+    state: &ScalerState,
+    num_counters: usize,
+    trace: &SelfTrace,
+) {
+    for i in 0..num_counters {
+        let preset = state.presets[i];
+        if preset == 0 {
+            continue;
+        }
+        if let Err(e) = device.counter_load(i as i32, CRT_MAX_LIMIT, preset) {
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::setScalerPresets error calling cbCLoad32, counter={i}, presetCounts={}, status={}, error={}",
+                    preset as i32, e.code, e.message
+                ),
+            );
+        }
+    }
+    if let Err(e) = device.counter_load(0, CRT_OUTPUT_VAL0, 0) {
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL0REG0, value=0, status={}, error={}",
+                e.code, e.message
+            ),
+        );
+    }
+    let preset0 = state.presets[0];
+    if let Err(e) = device.counter_load(0, CRT_OUTPUT_VAL1, preset0) {
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::setScalerPresets error calling cbCLoad32, reg=OUTPUTVAL1REG0, value={}, status={}, error={}",
+                preset0 as i32, e.code, e.message
+            ),
+        );
+    }
 }
 
 /// Read latest counter values from the scan buffer. Check for preset completion.
