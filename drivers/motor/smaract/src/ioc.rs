@@ -272,15 +272,8 @@ pub fn mcs_create_controller_command() -> CommandDef {
                      been disabled for this controller\n"
                 ));
             }
-            let controller = connect_with_eos(
-                &io_port,
-                MCS_TIMEOUT,
-                mcs::INPUT_EOS,
-                mcs::OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )
-            .ok()
-            .map(|handle| McsController::new(handle, disable_speed));
+            let controller = mcs::connect_link(&port_name, &io_port, MCS_TIMEOUT)
+                .map(|handle| McsController::new(handle, disable_speed));
             register(
                 ctx,
                 &MCS_CONTROLLERS,

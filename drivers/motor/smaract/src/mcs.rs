@@ -42,12 +42,16 @@
 //! `set_closed_loop`/`set_pid_gain` are therefore no-ops (as in C).
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
+use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::util::atoi;
 
 /// Response buffer size.
@@ -56,6 +60,25 @@ const READ_BUF: usize = 64;
 /// Port EOS set at connect (smarActMCSMotorDriver.cpp:202-203).
 pub const INPUT_EOS: &[u8] = b"\n";
 pub const OUTPUT_EOS: &[u8] = b"\n";
+
+/// C's constructor link setup: slurp up to 2.0 s of telnet negotiation before
+/// the EOS is set, warning if any arrived, then set both EOS. `None` when
+/// `io_port` does not exist.
+pub fn connect_link(port_name: &str, io_port: &str, timeout: Duration) -> Option<SyncIOHandle> {
+    let port = get_port(io_port)?;
+    let junk = SyncIOHandle::from_handle(port.handle, 0, Duration::from_secs(2));
+    let got_junk = match junk.read_octet(0, 100) {
+        Ok(bytes) => bytes.len(),
+        Err(e) => e.partial_read().map_or(0, |p| p.data.len()),
+    };
+    if got_junk > 0 {
+        errlog_vprintf(format_args!(
+            "SmarActMCSController({port_name}): WARNING - detected unexpected characters on \
+             link ({io_port}); make sure you have a RAW (not TELNET) connection\n"
+        ));
+    }
+    connect_with_eos(io_port, timeout, INPUT_EOS, OUTPUT_EOS, EosRefusal::Ignored).ok()
+}
 
 /// Micro-degrees per revolution (C `UDEG_PER_REV`).
 const UDEG_PER_REV: i64 = 360_000_000;
@@ -447,5 +470,87 @@ mod tests {
         for code in [0, 3, 9] {
             assert!(!status_is_moving(code), "code {code} should be idle");
         }
+    }
+
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    /// A link that holds `pending` bytes and logs each read and EOS set.
+    struct Link {
+        base: PortDriverBase,
+        pending: Vec<u8>,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl PortDriver for Link {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            self.log.lock().unwrap().push("read");
+            if self.pending.is_empty() {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                });
+            }
+            let n = self.pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            Ok(n)
+        }
+        fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            self.log.lock().unwrap().push("input eos");
+            Ok(())
+        }
+        fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            self.log.lock().unwrap().push("output eos");
+            Ok(())
+        }
+    }
+
+    fn publish(name: &str, pending: &[u8]) -> Arc<Mutex<Vec<&'static str>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let driver = Link {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            pending: pending.to_vec(),
+            log: log.clone(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        std::mem::forget(rt);
+        log
+    }
+
+    /// One read, then both EOS sets (their order is not C's concern here).
+    fn assert_drained_first(log: &[&str]) {
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert_eq!(log[0], "read", "{log:?}");
+    }
+
+    #[test]
+    fn the_link_is_drained_before_the_eos_is_set() {
+        let log = publish("mcsTelnetLink", b"\xff\xfb\x01");
+        assert!(connect_link("MCS1", "mcsTelnetLink", Duration::from_secs(1)).is_some());
+        assert_drained_first(&log.lock().unwrap());
+    }
+
+    #[test]
+    fn a_quiet_link_still_connects() {
+        let log = publish("mcsRawLink", b"");
+        assert!(connect_link("MCS1", "mcsRawLink", Duration::from_secs(1)).is_some());
+        assert_drained_first(&log.lock().unwrap());
+    }
+
+    #[test]
+    fn a_missing_link_connects_nothing() {
+        assert!(connect_link("MCS1", "mcsMissingLink", Duration::from_secs(1)).is_none());
     }
 }
