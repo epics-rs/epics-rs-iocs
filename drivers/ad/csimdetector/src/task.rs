@@ -52,9 +52,7 @@ fn float64(reason: usize, addr: i32, value: f64) -> ParamSetValue {
 
 impl CSimTaskContext {
     async fn notify(&self, addr: i32, updates: Vec<ParamSetValue>) {
-        if let Err(e) = self.handle.set_params_and_notify(addr, updates).await {
-            log::error!("ADCSimDetector: parameter update failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify(addr, updates).await;
     }
 
     /// The `ADAcquire` half of `asynNDArrayDriver::setIntegerParam`, for the
@@ -128,7 +126,6 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // zero-size dimension to `NDArrayPool::convert`. `ad-core-rs` rejects a
         // zero-size dimension, so the frame is skipped instead.
         if cfg.num_time_points == 0 {
-            log::error!("ADCSimDetector: NumTimePoints is 0, skipping frame");
             rt::sleep(Duration::from_secs_f64(0.001)).await;
             continue;
         }
@@ -145,12 +142,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             NDDimension::new(MAX_SIGNALS),
             NDDimension::new(cfg.num_time_points),
         ];
-        let mut image = match ctx.pool.alloc(dims, cfg.data_type) {
-            Ok(image) => image,
-            Err(e) => {
-                log::error!("ADCSimDetector: error allocating array: {e}");
-                continue;
-            }
+        let Ok(mut image) = ctx.pool.alloc(dims, cfg.data_type) else {
+            continue;
         };
         image.data = result.data;
 
@@ -181,11 +174,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
 
         // Per-signal 1-D arrays.
         for i in 0..MAX_SIGNALS {
-            match extract_signal(&ctx.pool, &image, i) {
-                Ok(array) => {
-                    ctx.publishers[i + 1].publish(Arc::new(array)).await;
-                }
-                Err(e) => log::error!("ADCSimDetector: error converting signal {i}: {e}"),
+            if let Ok(array) = extract_signal(&ctx.pool, &image, i) {
+                ctx.publishers[i + 1].publish(Arc::new(array)).await;
             }
 
             // `callParamCallbacks(i)` — parameter list `i`, not `i+1`.
