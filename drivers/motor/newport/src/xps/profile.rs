@@ -312,7 +312,7 @@ pub fn pulse_output_window(
         || end_pulses < start_pulses
         || end_pulses > num_elements + 1
     {
-        return Err("start or end pulses outside valid range".into());
+        return Err("Error: start or end pulses outside valid range".into());
     }
     let last_time = end_pulses.min(num_elements);
     let time: f64 = (start_pulses..=last_time)

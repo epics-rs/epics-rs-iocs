@@ -27,13 +27,14 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
-use epics_rs::motor::trace::TraceUser;
+use epics_rs::motor::trace::{MotorTrace, TraceUser};
 use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
 
 use crate::agap::{self, AgapAxis, AgapController};
@@ -672,11 +673,11 @@ impl NewportHolder {
                         .xps_controllers
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    let reg = controllers.get(&motor_port).ok_or_else(|| {
-                        format!(
-                            "XPSCreateAxis: controller '{motor_port}' not found (call XPSCreateController first)"
-                        )
-                    })?;
+                    // C prints and returns an error iocsh discards.
+                    let Some(reg) = controllers.get(&motor_port) else {
+                        println!("XPSController:XPSCreateAxis: Error port {motor_port} not found");
+                        return Ok(CommandOutcome::Continue);
+                    };
                     (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
                 };
 
@@ -756,11 +757,20 @@ impl NewportHolder {
                             )
                         })?
                 };
-                {
-                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                    ctrl.poll_socket()
-                        .tcl_script_execute(&tcl_file, &task_name, &parameters)
-                        .map_err(|e| format!("XPSTclScriptExecute: {e}"))?;
+                let run = controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .poll_socket()
+                    .tcl_script_execute(&tcl_file, &task_name, &parameters);
+                if let Err(e) = run {
+                    MotorTrace::new(&motor_port, 0).print_self(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "TCLScriptExecute returned error {}, on XPS: {motor_port}",
+                            e.code()
+                        ),
+                    );
+                    return Ok(CommandOutcome::Continue);
                 }
                 println!(
                     "XPSTclScriptExecute: motorPort={motor_port} tclFile={tcl_file} task={task_name} params={parameters}"
@@ -967,24 +977,27 @@ impl NewportHolder {
                 // Generate and verify hold the controller lock (they use the
                 // poll socket); the FTP upload touches no controller state, so
                 // it runs between the two without the lock held.
-                let built = {
-                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                    ctrl.build_profile_text()
-                        .map_err(|e| format!("XPSBuildProfile: {e}"))?
+                let build = || {
+                    let built = controller
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .build_profile_text()?;
+                    ftp::upload_trajectory(
+                        &host,
+                        &ftp_dir,
+                        &file_name,
+                        &built.text,
+                        &ftp_user,
+                        &ftp_pass,
+                    )?;
+                    controller
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .verify_profile(&file_name, &built)
                 };
-                ftp::upload_trajectory(
-                    &host,
-                    &ftp_dir,
-                    &file_name,
-                    &built.text,
-                    &ftp_user,
-                    &ftp_pass,
-                )
-                .map_err(|e| format!("XPSBuildProfile: {e}"))?;
-                {
-                    let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                    ctrl.verify_profile(&file_name, &built)
-                        .map_err(|e| format!("XPSBuildProfile: {e}"))?;
+                if let Err(message) = build() {
+                    xps_profile_failed(&motor_port, "buildProfile", &message);
+                    return Ok(CommandOutcome::Continue);
                 }
                 println!(
                     "XPSBuildProfile: motorPort={motor_port} file={file_name} uploaded to {host}:{ftp_dir} and verified"
@@ -1037,13 +1050,18 @@ impl NewportHolder {
                 };
 
                 let controller = holder.xps_controller(&motor_port, "XPSExecuteProfile")?;
-                let plan = {
-                    let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-                    ctrl.execution_plan()
-                }
-                .ok_or_else(|| {
-                    "XPSExecuteProfile: no built profile (call XPSBuildProfile first)".to_string()
-                })?;
+                let plan = controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .execution_plan();
+                let Some(plan) = plan else {
+                    xps_profile_failed(
+                        &motor_port,
+                        "runProfile",
+                        "no built profile (call XPSBuildProfile first)",
+                    );
+                    return Ok(CommandOutcome::Continue);
+                };
 
                 // Pulse window: default one pulse per trajectory element over
                 // the whole profile (C reads these from records).
@@ -1051,13 +1069,19 @@ impl NewportHolder {
                 let start_pulses = opt_int(args, 3, 1, "startPulses")?;
                 let end_pulses = opt_int(args, 4, num_elements, "endPulses")?;
                 let num_pulses = opt_int(args, 5, num_elements, "numPulses")?;
-                let (pulse_start, pulse_end, pulse_period) = profile::pulse_output_window(
+                let window = profile::pulse_output_window(
                     &plan.times,
                     start_pulses as i32,
                     end_pulses as i32,
                     num_pulses as i32,
-                )
-                .map_err(|e| format!("XPSExecuteProfile: {e}"))?;
+                );
+                let (pulse_start, pulse_end, pulse_period) = match window {
+                    Ok(w) => w,
+                    Err(e) => {
+                        xps_profile_failed(&motor_port, "runProfile", &e.to_string());
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
 
                 // A dedicated blocking socket so the seconds-to-minutes-long
                 // execution never contends with the shared poll socket.
@@ -1074,72 +1098,19 @@ impl NewportHolder {
                     ThreadPriority::Low,
                     StackSizeClass::Medium,
                     move || {
-                        for (positioner, target) in &plan.start_moves {
-                            let moved = match plan.move_mode {
-                                MoveMode::Absolute => {
-                                    exec_sock.group_move_absolute(positioner, *target)
-                                }
-                                MoveMode::Relative => {
-                                    exec_sock.group_move_relative(positioner, *target)
-                                }
-                            };
-                            if let Err(e) = moved {
-                                eprintln!(
-                                    "XPSExecuteProfile: move to start for {positioner} failed: {e}"
-                                );
-                                return;
-                            }
-                        }
-
-                        // Configure gathering + the per-pulse sampling event
-                        // (C executeProfile order: reset, configure, pulse window,
-                        // trigger, action, start).
-                        let event_id = match Self::xps_start_gathering(
+                        match Self::xps_run_profile(
                             &exec_sock,
                             &plan,
+                            executions,
                             pulse_start,
                             pulse_end,
                             pulse_period,
                         ) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                eprintln!("XPSExecuteProfile: {e}");
-                                return;
-                            }
-                        };
-
-                        let run = exec_sock.multiple_axes_pvt_execution(
-                            &plan.group,
-                            &plan.file_name,
-                            executions,
-                        );
-
-                        // Tear down the event and stop gathering even on a failed
-                        // or aborted run (C removes the event and stops gathering
-                        // unconditionally after MultipleAxesPVTExecution).
-                        if let Err(e) = exec_sock.event_extended_remove(event_id) {
-                            eprintln!("XPSExecuteProfile: EventExtendedRemove failed: {e}");
-                        }
-                        match exec_sock.gathering_stop() {
-                            // -30: gathering never started (aborted before one
-                            // element completed); C tolerates it.
-                            Ok(()) | Err(XpsError::Api(-30)) => {}
-                            Err(e) => eprintln!("XPSExecuteProfile: GatheringStop failed: {e}"),
-                        }
-
-                        match run {
-                            Ok(()) => println!(
+                            None => println!(
                                 "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
                                 plan.file_name
                             ),
-                            // -27: the trajectory was aborted (C reports it as such).
-                            Err(XpsError::Api(-27)) => {
-                                eprintln!("XPSExecuteProfile: MultipleAxesPVTExecution aborted")
-                            }
-                            Err(e) => eprintln!(
-                                "XPSExecuteProfile: execution of '{}' failed: {e}",
-                                plan.file_name
-                            ),
+                            Some(message) => xps_profile_failed(&motor_port, "runProfile", &message),
                         }
                     },
                 )
@@ -1149,11 +1120,69 @@ impl NewportHolder {
         )
     }
 
+    /// Run a built trajectory: move to the start, configure gathering, execute,
+    /// then remove the event and stop gathering (C `runProfile`,
+    /// XPSController.cpp:862-1145). Returns C's message for the last failed
+    /// step, which C prints once at the end.
+    fn xps_run_profile(
+        sock: &XpsSocket,
+        plan: &ExecutionPlan,
+        executions: i32,
+        pulse_start: i32,
+        pulse_end: i32,
+        pulse_period: f64,
+    ) -> Option<String> {
+        for (positioner, target) in &plan.start_moves {
+            let moved = match plan.move_mode {
+                MoveMode::Absolute => sock.group_move_absolute(positioner, *target),
+                MoveMode::Relative => sock.group_move_relative(positioner, *target),
+            };
+            if let Err(e) = moved {
+                return Some(format!("move to start for {positioner} failed: {e}"));
+            }
+        }
+        let event_id =
+            match Self::xps_start_gathering(sock, plan, pulse_start, pulse_end, pulse_period) {
+                Ok(id) => id,
+                Err(message) => return Some(message),
+            };
+
+        let mut message =
+            match sock.multiple_axes_pvt_execution(&plan.group, &plan.file_name, executions) {
+                Ok(()) => None,
+                // -27: the trajectory was aborted.
+                Err(XpsError::Api(-27)) => Some("MultipleAxesPVTExecution aborted".to_string()),
+                Err(e) => Some(format!(
+                    "Error performing MultipleAxesPVTExecution, status={}",
+                    e.code()
+                )),
+            };
+        // C removes the event and stops gathering whatever the run returned.
+        if let Err(e) = sock.event_extended_remove(event_id) {
+            message = Some(format!(
+                "Error performing ExtendedEventRemove, status={}",
+                e.code()
+            ));
+        }
+        match sock.gathering_stop() {
+            // -30: gathering never started (aborted before one element
+            // completed); C tolerates it.
+            Ok(()) | Err(XpsError::Api(-30)) => {}
+            Err(e) => {
+                message = Some(format!(
+                    "Error performing GatheringStop, status={}",
+                    e.code()
+                ))
+            }
+        }
+        message
+    }
+
     /// Configure and start gathering for a trajectory run: reset the buffer,
     /// declare `SetpointPosition`+`CurrentPosition` per registered positioner,
     /// window the trajectory pulse train, and fire `GatheringOneData` on every
-    /// pulse (C `executeProfile`, XPSController.cpp:935-1060). Returns the
-    /// extended-event ID to remove after the run.
+    /// pulse (C `runProfile`, XPSController.cpp:935-1060). Returns the
+    /// extended-event ID to remove after the run, or C's message.
     fn xps_start_gathering(
         sock: &XpsSocket,
         plan: &ExecutionPlan,
@@ -1162,7 +1191,7 @@ impl NewportHolder {
         pulse_period: f64,
     ) -> Result<i32, String> {
         sock.gathering_reset()
-            .map_err(|e| format!("GatheringReset failed: {e}"))?;
+            .map_err(|e| format!("Error performing GatheringReset, status={}", e.code()))?;
         let types: Vec<String> = plan
             .gathering_positioners
             .iter()
@@ -1173,8 +1202,13 @@ impl NewportHolder {
                 ]
             })
             .collect();
-        sock.gathering_configuration_set(&types)
-            .map_err(|e| format!("GatheringConfigurationSet failed: {e}"))?;
+        sock.gathering_configuration_set(&types).map_err(|e| {
+            let buffer: String = types.iter().map(|t| format!("{t};")).collect();
+            format!(
+                "Error performing GatheringConfigurationSet, status={}, buffer={buffer}",
+                e.code()
+            )
+        })?;
         sock.multiple_axes_pvt_pulse_output_set(&plan.group, pulse_start, pulse_end, pulse_period)
             .map_err(|e| format!("MultipleAxesPVTPulseOutputSet failed: {e}"))?;
         let triggers = vec![
@@ -1182,11 +1216,23 @@ impl NewportHolder {
             format!("{}.PVT.TrajectoryPulse", plan.group),
         ];
         sock.event_extended_configuration_trigger_set(&triggers)
-            .map_err(|e| format!("EventExtendedConfigurationTriggerSet failed: {e}"))?;
+            .map_err(|e| {
+                let buffer = triggers.join(";");
+                format!(
+                    "Error performing EventExtendedConfigurationTriggerSet, status={}, buffer={buffer}, strlen(buffer)={}",
+                    e.code(),
+                    buffer.len()
+                )
+            })?;
         sock.event_extended_configuration_action_set(&["GatheringOneData".to_string()])
-            .map_err(|e| format!("EventExtendedConfigurationActionSet failed: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "Error performing EventExtendedConfigurationActionSet, status={}",
+                    e.code()
+                )
+            })?;
         sock.event_extended_start()
-            .map_err(|e| format!("EventExtendedStart failed: {e}"))
+            .map_err(|e| format!("Error performing EventExtendedStart, status={}", e.code()))
     }
 
     /// Create the `XPSReadbackProfile` iocsh command.
@@ -1219,35 +1265,49 @@ impl NewportHolder {
                 }
                 let sock = ctrl.poll_socket();
 
-                let (current_samples, _max_samples) = sock
-                    .gathering_current_number_get()
-                    .map_err(|e| format!("GatheringCurrentNumberGet failed: {e}"))?;
+                let (current_samples, _max_samples) = match sock.gathering_current_number_get() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let message =
+                            format!("Error calling GatherCurrentNumberGet, status={}", e.code());
+                        xps_profile_failed(&motor_port, "readbackProfile", &message);
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
 
                 let mut readback = GatheringReadback::new(positioners.len());
                 let mut num_read = 0i32;
-                while num_read < current_samples {
-                    // Ask for everything left; on a controller error halve the
-                    // request until it fits (C readbackProfile).
-                    let mut lines = current_samples - num_read;
-                    let buffer = loop {
-                        match sock.gathering_data_multiple_lines_get(num_read, lines) {
-                            Ok(buf) => break buf,
-                            Err(_) if lines > 1 => lines /= 2,
-                            Err(e) => {
-                                return Err(format!("GatheringDataMultipleLinesGet failed: {e}"));
+                let mut read = || -> Result<(), String> {
+                    while num_read < current_samples {
+                        // Ask for everything left; on a controller error halve
+                        // the request until it fits (C readbackProfile).
+                        let mut lines = current_samples - num_read;
+                        let buffer = loop {
+                            match sock.gathering_data_multiple_lines_get(num_read, lines) {
+                                Ok(buf) => break buf,
+                                Err(_) if lines > 1 => lines /= 2,
+                                Err(_) => {
+                                    return Err(
+                                        "Error reading gathering data, numInBuffer = 0".into()
+                                    );
+                                }
                             }
+                        };
+                        let parsed = gathering::parse_gathering_buffer(
+                            &buffer,
+                            positioners.len(),
+                            &mut readback,
+                        )?;
+                        if parsed == 0 {
+                            return Err("gathering returned no lines".into());
                         }
-                    };
-                    let parsed = gathering::parse_gathering_buffer(
-                        &buffer,
-                        positioners.len(),
-                        &mut readback,
-                    )
-                    .map_err(|e| format!("XPSReadbackProfile: {e}"))?;
-                    if parsed == 0 {
-                        return Err("XPSReadbackProfile: gathering returned no lines".into());
+                        num_read += parsed as i32;
                     }
-                    num_read += parsed as i32;
+                    Ok(())
+                };
+                if let Err(message) = read() {
+                    xps_profile_failed(&motor_port, "readbackProfile", &message);
+                    return Ok(CommandOutcome::Continue);
                 }
 
                 let csv = gathering::readback_csv(&positioners, &readback);
@@ -2015,4 +2075,13 @@ fn connect_ip(ip_port: &str, timeout: Duration) -> Result<SyncIOHandle, String> 
         SERIAL_ADDR,
         timeout,
     ))
+}
+
+/// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "%s:%s: %s\n", driverName,
+/// functionName, message)` for a failed XPS profile build, run or readback.
+fn xps_profile_failed(motor_port: &str, function: &str, message: &str) {
+    MotorTrace::new(motor_port, 0).print_self(
+        TraceMask::ERROR,
+        format_args!("XPSController:{function}: {message}"),
+    );
 }

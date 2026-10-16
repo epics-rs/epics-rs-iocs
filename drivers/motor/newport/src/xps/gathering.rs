@@ -52,26 +52,27 @@ pub fn parse_gathering_buffer(
         if line.is_empty() {
             continue;
         }
-        let values: Vec<f64> = line
+        let mut fields = line
             .split(';')
             .filter(|f| !f.trim().is_empty())
-            .map(|f| {
-                f.trim()
-                    .parse::<f64>()
-                    .map_err(|_| format!("bad gathering value '{f}'"))
-            })
-            .collect::<Result<_, _>>()?;
-        if values.len() < num_axes * NUM_GATHERING_ITEMS {
-            return Err(format!(
-                "gathering line has {} values, expected {} ({} per axis x {num_axes} axes)",
-                values.len(),
-                num_axes * NUM_GATHERING_ITEMS,
-                NUM_GATHERING_ITEMS,
-            ));
+            .map(|f| f.trim().parse::<f64>().ok());
+        let mut sample = Vec::with_capacity(num_axes);
+        for _ in 0..num_axes {
+            // C `sscanf("%lf;%lf")` per axis: nitems is how many leading
+            // values parsed.
+            let setpoint = fields.next().flatten();
+            let actual = setpoint.and(fields.next().flatten());
+            match (setpoint, actual) {
+                (Some(setpoint), Some(actual)) => sample.push((setpoint, actual)),
+                _ => {
+                    let nitems = usize::from(setpoint.is_some());
+                    return Err(format!(
+                        "Error reading Gathering.dat file, nitems={nitems}, should be {NUM_GATHERING_ITEMS}"
+                    ));
+                }
+            }
         }
-        for axis in 0..num_axes {
-            let setpoint = values[axis * NUM_GATHERING_ITEMS];
-            let actual = values[axis * NUM_GATHERING_ITEMS + 1];
+        for (axis, (setpoint, actual)) in sample.into_iter().enumerate() {
             readback.actuals[axis].push(actual);
             readback.following_errors[axis].push(actual - setpoint);
         }
@@ -148,13 +149,19 @@ mod tests {
         // C: nitems != NUM_GATHERING_ITEMS fails the readback.
         let mut rb = GatheringReadback::new(2);
         let err = parse_gathering_buffer("1.0;1.5\n", 2, &mut rb).unwrap_err();
-        assert!(err.contains("expected 4"), "unexpected error: {err}");
+        assert_eq!(
+            err,
+            "Error reading Gathering.dat file, nitems=0, should be 2"
+        );
     }
 
     #[test]
     fn junk_value_is_an_error() {
         let mut rb = GatheringReadback::new(1);
-        assert!(parse_gathering_buffer("1.0;abc\n", 1, &mut rb).is_err());
+        assert_eq!(
+            parse_gathering_buffer("1.0;abc\n", 1, &mut rb).unwrap_err(),
+            "Error reading Gathering.dat file, nitems=1, should be 2"
+        );
     }
 
     #[test]

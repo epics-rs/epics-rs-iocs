@@ -66,6 +66,17 @@ pub enum SetPositionFailure {
     ReferencingStop(i32),
 }
 
+/// C `buildProfile`'s message for a failed `MultipleAxesPVTVerification`.
+fn verify_message(status: i32) -> String {
+    match -status {
+        69 => "Acceleration Too High".into(),
+        68 => "Velocity Too High".into(),
+        70 => "Final Velocity Non Zero".into(),
+        75 => "Negative or Null Delta Time".into(),
+        _ => format!("Unknown trajectory verify error={status}"),
+    }
+}
+
 /// Shared controller state for one XPS, owning the poll socket.
 pub struct XpsController {
     poll: XpsSocket,
@@ -287,7 +298,12 @@ impl XpsController {
             let (_vel, accel, _min_jerk, _max_jerk) = self
                 .poll
                 .positioner_sgamma_parameters_get(&ax.positioner)
-                .map_err(|e| format!("SGamma read for {}: {e}", ax.positioner))?;
+                .map_err(|e| {
+                    format!(
+                        "Error calling positionerSGammaParametersSet, status={}\n",
+                        e.code()
+                    )
+                })?;
             max_accels.push(accel);
         }
         profile.generate(&max_accels).map_err(|e| e.to_string())
@@ -321,14 +337,20 @@ impl XpsController {
 
         self.poll
             .multiple_axes_pvt_verification(&group, file_name)
-            .map_err(|e| format!("PVT verification failed: {e}"))?;
+            .map_err(|e| verify_message(e.code()))?;
 
         let mut start_moves = Vec::with_capacity(profile.axes.len());
         for (j, ax) in profile.axes.iter().enumerate() {
             let (min_pos, max_pos, _max_vel, _max_accel) = self
                 .poll
                 .multiple_axes_pvt_verification_result_get(&ax.positioner, file_name)
-                .map_err(|e| format!("PVT result get for {}: {e}", ax.positioner))?;
+                .map_err(|e| {
+                    format!(
+                        "MultipleAxesPVTVerificationResultGet error for axis {}, status={}\n",
+                        ax.positioner,
+                        e.code()
+                    )
+                })?;
             let (low, high) = self
                 .poll
                 .positioner_user_travel_limits_get(&ax.positioner)
@@ -337,18 +359,16 @@ impl XpsController {
             let start = ax.positions[0];
             if start + min_pos < low {
                 return Err(format!(
-                    "{}: trajectory low {:.6} violates soft limit {:.6}",
+                    "Low soft limit violation for axis {}, position={:.6}, limit={low:.6}\n",
                     ax.positioner,
                     start + min_pos,
-                    low
                 ));
             }
             if start + max_pos > high {
                 return Err(format!(
-                    "{}: trajectory high {:.6} violates soft limit {:.6}",
+                    "High soft limit violation for axis {}, position={:.6}, limit={high:.6}\n",
                     ax.positioner,
                     start + max_pos,
-                    high
                 ));
             }
             // The execute-time move places the motor one pre-ramp distance
@@ -391,5 +411,20 @@ impl XpsController {
     /// `SetpointPosition;CurrentPosition` pair per registered axis per sample).
     pub fn registered_positioners(&self) -> Vec<String> {
         self.axes.iter().map(|a| a.positioner.clone()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C `buildProfile`'s `switch (-status)` (XPSController.cpp:756-774).
+    #[test]
+    fn verify_message_matches_c_switch() {
+        assert_eq!(verify_message(-69), "Acceleration Too High");
+        assert_eq!(verify_message(-68), "Velocity Too High");
+        assert_eq!(verify_message(-70), "Final Velocity Non Zero");
+        assert_eq!(verify_message(-75), "Negative or Null Delta Time");
+        assert_eq!(verify_message(-1), "Unknown trajectory verify error=-1");
     }
 }
