@@ -387,7 +387,6 @@ impl PortDriver for MythenDriver {
             self.det.state.read_mode.store(read_mode, Ordering::Release);
             status.or(self.set_acquire(value));
         } else {
-            let image_mode = self.int_param(self.ad.params.image_mode);
             if reason == self.p.setting {
                 status.or(self.det.load_settings(value));
             } else if reason == self.p.use_flat_field {
@@ -403,6 +402,8 @@ impl PortDriver for MythenDriver {
             } else if reason == self.p.use_gates {
                 status.set(self.det.set_use_gates(value));
             } else if reason == self.p.num_frames {
+                // C `setFrames` reads ADImageMode itself (mythen.cpp:312).
+                let image_mode = self.int_param(self.ad.params.image_mode);
                 status.or(self.det.set_frames(value, image_mode));
             } else if reason == self.p.trigger {
                 status.or(self.det.set_trigger(value));
