@@ -267,6 +267,7 @@ impl SpiiPlusAxis {
             last_status: MotorStatus {
                 done: true,
                 has_encoder: true,
+                gain_support: true,
                 ..MotorStatus::default()
             },
         }
@@ -455,6 +456,8 @@ impl AsynMotor for SpiiPlusAxis {
             direction: d.direction,
             powered: d.powered,
             has_encoder: true,
+            // C motor_init sets GAIN_SUPPORT, so CNEN drives enable/disable.
+            gain_support: true,
             ..MotorStatus::default()
         };
         self.last_status = status.clone();

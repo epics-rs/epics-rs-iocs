@@ -43,7 +43,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -252,7 +252,6 @@ impl Pm304Axis {
             prev_position: 0,
             last_status: MotorStatus {
                 done: true,
-                gain_support: true,
                 ..MotorStatus::default()
             },
         }
@@ -373,30 +372,6 @@ impl AsynMotor for Pm304Axis {
         Ok(())
     }
 
-    fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
-        let ctrl = self.lock();
-        // C ENABLE_TORQUE -> "RS", DISABL_TORQUE -> "AB".
-        let cmd = if enable {
-            format!("{}RS", self.axis)
-        } else {
-            format!("{}AB", self.axis)
-        };
-        ctrl.command(&cmd)?;
-        Ok(())
-    }
-
-    fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
-        let ctrl = self.lock();
-        let g = nint(gain);
-        let cmd = match kind {
-            PidGainKind::Proportional => format!("{}KP{g}", self.axis),
-            PidGainKind::Integral => format!("{}KS{g}", self.axis),
-            PidGainKind::Derivative => format!("{}KV{g}", self.axis),
-        };
-        ctrl.command(&cmd)?;
-        Ok(())
-    }
-
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let ctrl = self.lock();
         let use_encoder = ctrl.use_encoder(self.index);
@@ -436,7 +411,8 @@ impl AsynMotor for Pm304Axis {
             problem: bits.problem,
             direction,
             has_encoder: use_encoder,
-            gain_support: true,
+            // No GAIN_SUPPORT: C set_status keeps the status word zeroed at
+            // init, so the record never sends torque (RS/AB) or gain commands.
             ..MotorStatus::default()
         };
         self.last_status = status.clone();

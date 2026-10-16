@@ -184,7 +184,7 @@ impl KohzuAxis {
             prev_position: 0,
             last_status: MotorStatus {
                 done: true,
-                gain_support: false,
+                gain_support: true,
                 ..MotorStatus::default()
             },
         }
@@ -372,7 +372,8 @@ impl AsynMotor for KohzuAxis {
             powered,
             comms_error: false,
             problem: false,
-            gain_support: false,
+            // C motor_init sets GAIN_SUPPORT, so CNEN drives COF.
+            gain_support: true,
             ..MotorStatus::default()
         };
         Ok(self.last_status.clone())
