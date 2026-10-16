@@ -6,7 +6,6 @@
 //! task reaches the parameter library through the actor and the server through
 //! its own mutex — see the invariant in [`crate::connection`].
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,6 +20,7 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -392,20 +392,20 @@ impl PslDetector {
     }
 
     /// Report whether the directory the server saves into exists here as well
-    /// (C `checkPath`).
+    /// (C `asynNDArrayDriver::checkPath`, asynNDArrayDriver.cpp:98-111): an
+    /// empty path is left alone, any other is stored with its separator.
     fn check_path(&mut self) -> AsynResult<()> {
-        let path = String::from_utf8_lossy(
-            self.ad
-                .port_base
-                .get_string_param(self.ad.params.base.file_path, 0)?,
-        )
-        .into_owned();
-        let exists = !path.is_empty() && Path::new(&path).is_dir();
-        self.ad.port_base.set_int32_param(
-            self.ad.params.base.file_path_exists,
-            0,
-            exists as i32,
-        )?;
+        let p = self.ad.params.base;
+        let mut path = String::from_utf8_lossy(self.ad.port_base.get_string_param(p.file_path, 0)?)
+            .into_owned();
+        if path.is_empty() {
+            return Ok(());
+        }
+        let exists = check_path_str(&mut path);
+        self.ad.port_base.set_string_param(p.file_path, 0, path)?;
+        self.ad
+            .port_base
+            .set_int32_param(p.file_path_exists, 0, exists as i32)?;
         Ok(())
     }
 
@@ -868,5 +868,25 @@ mod tests {
         det.write_int32(&mut AsynUser::new(p.bin_x), 2).unwrap();
         // The parameter is stored either way.
         assert_eq!(det.get_i32(p.base.file_number), 3);
+    }
+
+    /// A FilePath write runs C `checkPath` (PSL.cpp:886), which stores the
+    /// path with its separator and leaves FilePathExists alone for an empty
+    /// one (asynNDArrayDriver.cpp:104-109).
+    #[test]
+    fn a_file_path_write_runs_check_path() {
+        let mut det = detector("PSL_CHECK_PATH");
+        let p = det.ad.params.base;
+        let dir = std::env::temp_dir().display().to_string();
+        let dir = dir.trim_end_matches('/').to_string();
+        let _ = det.write_octet(&mut AsynUser::new(p.file_path), dir.as_bytes());
+        let stored = |det: &PslDetector| {
+            String::from_utf8_lossy(det.ad.port_base.get_string_param(p.file_path, 0).unwrap())
+                .into_owned()
+        };
+        assert_eq!(stored(&det), format!("{dir}/"));
+        assert_eq!(det.get_i32(p.file_path_exists), 1);
+        let _ = det.write_octet(&mut AsynUser::new(p.file_path), b"");
+        assert_eq!(det.get_i32(p.file_path_exists), 1);
     }
 }
