@@ -8,10 +8,10 @@
 //! through this same device support unmodified.
 //!
 //! The record drives the device half of its cycle through [`McaDset`]:
-//! `read_begin` runs [`McaRecord::begin_device_cycle`] on every pass and
-//! `read()` runs [`McaRecord::finish_device_cycle`]. As in C, every message
-//! is queued to the port (`devMcaAsyn.c:262-337`). Each read is its own
-//! request, reused from a free list, whose body is C's
+//! `read_begin` runs [`McaRecord::begin_device_cycle`] on every ask, the
+//! ask again after a nested pass included, and `read()` has nothing left.
+//! As in C, every message is queued to the port (`devMcaAsyn.c:262-337`).
+//! Each read is its own request, reused from a free list, whose body is C's
 //! `asynCallback` (`:342-391`): on an `ASYN_CANBLOCK` port the pass ends PACT
 //! and the body re-enters the record, and on a port without it the body runs
 //! inside the send and the re-entered pass runs nested.
@@ -574,20 +574,15 @@ impl DeviceSupport for DevMcaAsyn {
             .handle
             .can_block()
             .then(|| (done.device_done(), done.priority()));
-        Ok(match mca.begin_device_cycle(port, clock) {
+        Ok(match mca.begin_device_cycle(port, clock, done.again()) {
             McaStart::Synchronous => ReadStart::Synchronous,
             McaStart::Pending => ReadStart::Pending,
             McaStart::Reentered => ReadStart::Reentered,
         })
     }
 
-    /// The rest of the pass `read_begin` began.
-    fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let clock = self.clock;
-        let Some(port) = self.port.as_mut() else {
-            return Ok(DeviceReadOutcome::ok());
-        };
-        Self::mca(record)?.finish_device_cycle(port, clock);
+    /// `read_begin` ran the whole device half.
+    fn read(&mut self, _record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         Ok(DeviceReadOutcome::ok())
     }
 
@@ -863,14 +858,17 @@ mod tests {
 
     impl Fixture {
         /// One cycle's device half as the framework runs it on this port,
-        /// whose reads all run inline: each `Reentered` pass nests.
+        /// whose reads all run inline: each `Reentered` runs the nested pass
+        /// and asks again.
         fn cycle(&mut self) {
             fn pass(rec: &mut McaRecord, port: &mut McaPort) {
                 port.reads.nuse.store(rec.nuse, Ordering::Relaxed);
-                if rec.begin_device_cycle(port, StampSource::default()) == McaStart::Reentered {
+                let clock = StampSource::default();
+                let mut start = rec.begin_device_cycle(port, clock, false);
+                while start == McaStart::Reentered {
                     pass(rec, port);
+                    start = rec.begin_device_cycle(port, clock, true);
                 }
-                rec.finish_device_cycle(port, StampSource::default());
             }
             pass(&mut self.rec, self.dev.port.as_mut().unwrap());
         }
