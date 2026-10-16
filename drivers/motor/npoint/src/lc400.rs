@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
-use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -25,7 +24,9 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
+use epics_rs::motor::controller_port::{
+    ControllerParams, FinishedWrite, ParamWrite, WriteHook, WriteValue,
+};
 
 /// `LC400_TIMEOUT`.
 pub const LC400_TIMEOUT: Duration = Duration::from_secs(5);
@@ -701,9 +702,44 @@ impl Lc400ControllerParams {
     pub fn new(controller: Arc<Mutex<Lc400Controller>>) -> Self {
         Self { controller }
     }
+}
 
-    fn address(&self, user: &AsynUser) -> AsynResult<u32> {
-        base_address(user.addr.max(0) as usize).ok_or_else(|| lc400_err("no LC400 axis"))
+/// The channel registers of axis `addr`; C's `asynError` for an axis
+/// with none.
+fn axis_address(addr: i32) -> AsynResult<u32> {
+    base_address(addr.max(0) as usize).ok_or_else(|| lc400_err("no LC400 axis"))
+}
+
+/// `writeInt32` / `writeFloat64`'s code around the base, which the
+/// record's writes reach as well as the port's.
+struct Lc400WriteHook;
+
+impl WriteHook for Lc400WriteHook {
+    /// C refuses a write to an axis with no controller address before the
+    /// base.
+    fn check(&self, addr: i32, _function: usize) -> AsynResult<()> {
+        axis_address(addr).map(drop)
+    }
+
+    /// C `writeFloat64` traces every write at its end, the base's included.
+    fn after_write(&self, write: &FinishedWrite<'_>) {
+        let WriteValue::Float64(value) = write.value else {
+            return;
+        };
+        let function = write.function;
+        match write.status {
+            Err(e) => write.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "LC400MotorDriver:writeFloat64: error, status={} function={function}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => write.print(
+                TraceMask::IO_DRIVER,
+                format_args!("LC400MotorDriver:writeFloat64: function={function}, value={value:.6}"),
+            ),
+        }
     }
 }
 
@@ -736,6 +772,10 @@ impl ControllerParams for Lc400ControllerParams {
         Ok(())
     }
 
+    fn write_hook(&self) -> Option<Arc<dyn WriteHook>> {
+        Some(Arc::new(Lc400WriteHook))
+    }
+
     /// C `writeInt32`: the controller's own registers are written here and
     /// the base never runs for them, so nothing is stored or posted.
     fn write_int32(
@@ -744,7 +784,7 @@ impl ControllerParams for Lc400ControllerParams {
         user: &AsynUser,
         value: i32,
     ) -> ParamWrite {
-        let address = match self.address(user) {
+        let address = match axis_address(user.addr) {
             Ok(address) => address,
             Err(e) => return ParamWrite::Handled(Err(e)),
         };
@@ -772,65 +812,143 @@ impl ControllerParams for Lc400ControllerParams {
     }
 
     /// C `writeFloat64`, its own registers handled as in
-    /// [`Self::write_int32`], each traced as C does. C also traces the
-    /// base's writes with its line, after the base ran; the hook runs
-    /// before the base and cannot.
+    /// [`Self::write_int32`]; [`Lc400WriteHook`] traces them.
     fn write_float64(
         &mut self,
-        base: &mut PortDriverBase,
+        _base: &mut PortDriverBase,
         user: &AsynUser,
         value: f64,
     ) -> ParamWrite {
-        let status = match self.address(user) {
-            Err(e) => Err(e),
-            Ok(address) => {
-                let ctrl = lock(&self.controller);
-                let Some(p) = ctrl.params else {
-                    return ParamWrite::PassToBase(Ok(()));
-                };
-                match user.reason {
-                    r if r == p.digital_pos => {
-                        ctrl.write_single(address + ST_DIGITAL_SP, value as i32)
-                    }
-                    r if r == p.p_gain => ctrl.write_double(address + P_GAIN, value),
-                    r if r == p.i_gain => ctrl.write_double(address + I_GAIN, value),
-                    r if r == p.d_gain => ctrl.write_double(address + D_GAIN, value),
-                    _ => return ParamWrite::PassToBase(Ok(())),
-                }
-            }
+        let address = match axis_address(user.addr) {
+            Ok(address) => address,
+            Err(e) => return ParamWrite::Handled(Err(e)),
         };
-        let function = user.reason;
-        let print = |mask, args: std::fmt::Arguments<'_>| {
-            PortManager::global().trace_manager().print(
-                Some(&base.port_name),
-                Some(user.addr),
-                function as i32,
-                mask,
-                args,
-            )
+        let ctrl = lock(&self.controller);
+        let Some(p) = ctrl.params else {
+            return ParamWrite::PassToBase(Ok(()));
         };
-        match &status {
-            Err(e) => print(
-                TraceMask::ERROR,
-                format_args!(
-                    "LC400MotorDriver:writeFloat64: error, status={} function={function}, value={value:.6}",
-                    e.status() as i32
-                ),
-            ),
-            Ok(()) => print(
-                TraceMask::IO_DRIVER,
-                format_args!(
-                    "LC400MotorDriver:writeFloat64: function={function}, value={value:.6}"
-                ),
-            ),
-        }
-        ParamWrite::Handled(status)
+        ParamWrite::Handled(match user.reason {
+            r if r == p.digital_pos => ctrl.write_single(address + ST_DIGITAL_SP, value as i32),
+            r if r == p.p_gain => ctrl.write_double(address + P_GAIN, value),
+            r if r == p.i_gain => ctrl.write_double(address + I_GAIN, value),
+            r if r == p.d_gain => ctrl.write_double(address + D_GAIN, value),
+            _ => return ParamWrite::PassToBase(Ok(())),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::registry::open_owner;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::motor::builder::MotorBuilder;
+    use epics_rs::motor::controller_port::index;
+    use epics_rs::motor::devices::{register_axis, register_controller_port};
+    use epics_rs::motor::trace::TraceUser;
+
     use super::*;
+
+    /// A four-axis LC400 port with no line: axis 3 has no controller
+    /// address, and the controller's own registers fail to write.
+    fn port(name: &str) -> (PortHandle, Lc400Params) {
+        let controller = Arc::new(Mutex::new(Lc400Controller::new(None, 4)));
+        let params = Lc400ControllerParams::new(controller.clone());
+        let port = register_controller_port(&open_owner(), name, 4, params).unwrap();
+        for addr in 0..4 {
+            let motor: Arc<Mutex<dyn AsynMotor>> =
+                Arc::new(Mutex::new(Lc400Axis::new(controller.clone(), addr)));
+            let user = TraceUser::Asyn {
+                port: name.to_owned(),
+                addr: addr as i32,
+            };
+            register_axis(MotorBuilder::new(motor).trace_user(user).build_axis().axis).unwrap();
+        }
+        let params = lock(&controller).params.unwrap();
+        (port, params)
+    }
+
+    /// Run `body` with `port`'s trace file a fresh file, at C's error and
+    /// IO_DRIVER masks; return its lines.
+    fn traced(port: &str, body: impl FnOnce()) -> Vec<String> {
+        let path = std::env::temp_dir().join(format!("lc400-trace-{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let manager = PortManager::global();
+        let trace = manager.trace_manager();
+        trace.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let file = Arc::new(Mutex::new(file));
+        trace.set_trace_file(Some(port), TraceFile::File(file.clone()));
+        // An axis's own slot keeps the file it had.
+        for addr in 0..4 {
+            trace.set_device_trace_file(port, addr, TraceFile::File(file.clone()));
+        }
+        body();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_base_write_to_an_axis_with_no_address_is_refused_before_the_base() {
+        let (port, _) = port("lc400NoAddr");
+        port.write_float64_blocking(index::REC_RESOLUTION, 0, 0.5)
+            .unwrap();
+        assert_eq!(
+            port.read_float64_blocking(index::REC_RESOLUTION, 0)
+                .unwrap(),
+            0.5
+        );
+        let refused = port.write_float64_blocking(index::REC_RESOLUTION, 3, 0.5);
+        assert_eq!(refused.unwrap_err().status(), AsynStatus::Error);
+        assert!(
+            port.read_float64_blocking(index::REC_RESOLUTION, 3)
+                .is_err()
+        );
+        assert!(
+            port.write_int32_blocking(index::REC_DIRECTION, 3, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn every_float_write_is_traced_as_c_writes_it_the_base_included() {
+        let (port, p) = port("lc400Trace");
+        let lines = traced("lc400Trace", || {
+            port.write_float64_blocking(index::REC_RESOLUTION, 0, 0.5)
+                .unwrap();
+            assert!(port.write_float64_blocking(p.p_gain, 0, 2.0).is_err());
+            assert!(
+                port.write_float64_blocking(index::REC_RESOLUTION, 3, 0.5)
+                    .is_err()
+            );
+            // writeInt32 prints nothing.
+            assert!(port.write_int32_blocking(p.servo_state, 0, 1).is_err());
+        });
+        let resolution = index::REC_RESOLUTION;
+        let p_gain = p.p_gain;
+        let expected = [
+            format!("LC400MotorDriver:writeFloat64: function={resolution}, value=0.500000"),
+            format!(
+                "LC400MotorDriver:writeFloat64: error, status=3 function={p_gain}, value=2.000000"
+            ),
+            format!(
+                "LC400MotorDriver:writeFloat64: error, status=3 function={resolution}, value=0.500000"
+            ),
+        ];
+        let lines: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("LC400MotorDriver"))
+            .collect();
+        assert_eq!(lines.len(), expected.len(), "{lines:?}");
+        for (line, want) in lines.iter().zip(&expected) {
+            assert!(
+                line.ends_with(want.as_str()),
+                "{line:?} does not end with {want:?}"
+            );
+        }
+    }
 
     #[test]
     fn trapezoid_ends_at_the_target_and_ramps_in_between() {
