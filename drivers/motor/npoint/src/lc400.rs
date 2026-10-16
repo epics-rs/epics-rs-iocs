@@ -1,0 +1,827 @@
+//! nPoint LC400 controller driver (`LC400MotorDriver.cpp`, a model-3
+//! `asynMotorController`).
+//!
+//! The LC400 is a register machine spoken to in packed little-endian binary
+//! frames, each ending in `0x55`: `A0 addr` reads one 32-bit word (answered
+//! `A0 addr value 55`), `A2 addr value` writes one, `A3 value` writes the next
+//! word of an array started by `A2`, and `A4 addr count` reads `count` words
+//! (answered `A4 addr`, the words, then `55`).
+//!
+//! A move is a wavetable: a trapezoidal profile of up to `LC400_W_MAXPTS`
+//! points is written to the channel's table, read back and compared, then
+//! played once.
+
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::sleep;
+use std::time::Duration;
+
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::param::{ParamType, ParamValue};
+use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::ControllerParams;
+
+/// `LC400_TIMEOUT`.
+pub const LC400_TIMEOUT: Duration = Duration::from_secs(5);
+/// `LC400_MIN_DELAY`: one wavetable cycle, in seconds.
+const MIN_DELAY: f64 = 24e-6;
+/// `LC400_MAX_ARRAY`: the most points C's waveform buffers hold.
+const MAX_ARRAY: i32 = 83300;
+/// The end-of-frame byte.
+const EOS: u8 = 0x55;
+
+/// The firmware string's address and length in words.
+const FW_ADDR: u32 = 0x1183_0028;
+const FW_WORDS: usize = 5;
+
+// Per-channel register offsets (LC400MemoryAddr.h).
+const ST_RANGE_CMD: u32 = 0x078;
+const ST_RANGE_TYPE: u32 = 0x044;
+const ST_DIGITAL_SP: u32 = 0x218;
+const ST_DIGITAL_POS: u32 = 0x334;
+const SERVO_STATE: u32 = 0x084;
+const P_GAIN: u32 = 0x720;
+const I_GAIN: u32 = 0x728;
+const D_GAIN: u32 = 0x730;
+const WAV_ENABLE: u32 = 0x1F4;
+const WAV_INDEX: u32 = 0x1F8;
+const WAV_DELAY: u32 = 0x200;
+const WAV_END: u32 = 0x204;
+const WAV_ACTIVE: u32 = 0x208;
+const WAV_ITERATIONS: u32 = 0xD50;
+const WAV_COUNT: u32 = 0xD54;
+
+/// `getBaseAddress`: channel registers of axes 0-2, `None` beyond.
+fn base_address(axis: usize) -> Option<u32> {
+    [0x1183_1000, 0x1183_2000, 0x1183_3000].get(axis).copied()
+}
+
+/// `getWavetableAddress`.
+fn wavetable_address(axis: usize) -> Option<u32> {
+    [0xC000_0000, 0xC005_4000, 0xC00A_8000].get(axis).copied()
+}
+
+fn lc400_err(message: impl Into<String>) -> AsynError {
+    AsynError::Status {
+        status: AsynStatus::Error,
+        message: message.into(),
+    }
+}
+
+/// The reasons of the parameters `LC400Controller` creates.
+#[derive(Clone, Copy)]
+struct Lc400Params {
+    range: usize,
+    range_type: usize,
+    digital_pos: usize,
+    servo_state: usize,
+    p_gain: usize,
+    i_gain: usize,
+    d_gain: usize,
+    firmware: usize,
+    w_enable: usize,
+    w_index: usize,
+    w_delay: usize,
+    w_end_idx: usize,
+    w_active: usize,
+    w_iter: usize,
+    w_iter_cts: usize,
+    w_max_pts: usize,
+}
+
+/// What C keeps per axis, in `LC400Axis` or in its parameters.
+#[derive(Default)]
+struct AxisState {
+    /// `range`: the stage range, read once at creation.
+    range: i32,
+    /// `posHardLimit`, `negHardLimit`, `tolHardLimit`, in counts.
+    pos_hard: i32,
+    neg_hard: i32,
+    tol_hard: i32,
+    /// `motorStatusHighLimit_` / `motorStatusLowLimit_`, which a poll
+    /// latches and a move reads.
+    high_limit: bool,
+    low_limit: bool,
+    /// `motorStatusDone_`, as the last poll set it.
+    done: bool,
+    /// `LC400_DIGITAL_POS`, as the last poll set it: where a move starts.
+    digital_pos: f64,
+    /// `LC400_W_MAXPTS`.
+    max_pts: i32,
+}
+
+impl AxisState {
+    /// `getCts`.
+    fn cts(&self, position: f64) -> i32 {
+        (position * 1_048_574.0 / f64::from(self.range)) as i32
+    }
+}
+
+/// One LC400 and its axes.
+pub struct Lc400Controller {
+    /// `None` when C's connect failed, which C reports and carries on from.
+    handle: Option<SyncIOHandle>,
+    port: Option<PortHandle>,
+    params: Option<Lc400Params>,
+    firmware: Vec<u8>,
+    axes: Vec<AxisState>,
+}
+
+impl Lc400Controller {
+    /// `LC400Controller` and its `LC400Axis` constructors: read the firmware
+    /// string and each axis's range.
+    pub fn new(handle: Option<SyncIOHandle>, num_axes: usize) -> Self {
+        let mut controller = Self {
+            handle,
+            port: None,
+            params: None,
+            firmware: Vec::new(),
+            axes: (0..num_axes).map(|_| AxisState::default()).collect(),
+        };
+        match controller.read_array(FW_ADDR, FW_WORDS) {
+            Ok(words) => {
+                let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                controller.firmware = bytes[..end].to_vec();
+            }
+            Err(_) => eprintln!(
+                "LC400MotorDriver:LC400Controller: cannot read LC400 controller firmware version"
+            ),
+        }
+        println!(
+            "Firmware Version: {}",
+            String::from_utf8_lossy(&controller.firmware)
+        );
+        for axis in 0..num_axes {
+            if let Some(address) = base_address(axis) {
+                controller.axes[axis].range = controller
+                    .read_single(address + ST_RANGE_CMD)
+                    .unwrap_or_default();
+            }
+            controller.set_hard_limits(axis, 0.0, 0.0, 0.0);
+        }
+        controller
+    }
+
+    /// Post what a poll or move reads to the controller port from here on.
+    pub fn attach_port(&mut self, port: PortHandle) {
+        self.port = Some(port);
+    }
+
+    pub fn num_axes(&self) -> usize {
+        self.axes.len()
+    }
+
+    fn handle(&self) -> AsynResult<&SyncIOHandle> {
+        self.handle
+            .as_ref()
+            .ok_or_else(|| lc400_err("not connected to the LC400"))
+    }
+
+    /// Read exactly `len` bytes: C issues one read for a whole frame, which
+    /// leaves the rest of its buffer unset when the frame arrives in pieces.
+    fn read_exact(&self, len: usize) -> AsynResult<Vec<u8>> {
+        let handle = self.handle()?;
+        let mut buf = Vec::with_capacity(len);
+        while buf.len() < len {
+            let chunk = handle.read_octet(0, len - buf.len())?;
+            if chunk.is_empty() {
+                return Err(lc400_err("short LC400 reply"));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(buf)
+    }
+
+    /// `readSingle`.
+    fn read_single(&self, addr: u32) -> AsynResult<i32> {
+        let mut out = vec![0xA0];
+        out.extend_from_slice(&addr.to_le_bytes());
+        out.push(EOS);
+        self.handle()?.write_octet(0, &out)?;
+        let reply = self.read_exact(10)?;
+        Ok(i32::from_le_bytes([reply[5], reply[6], reply[7], reply[8]]))
+    }
+
+    /// `writeSingle`.
+    fn write_single(&self, addr: u32, value: i32) -> AsynResult<()> {
+        let mut out = vec![0xA2];
+        out.extend_from_slice(&addr.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+        out.push(EOS);
+        self.handle()?.write_octet(0, &out).map(drop)
+    }
+
+    /// `writeArray`: the first word with `A2`, the rest as one `A3` run.
+    fn write_array(&self, addr: u32, values: &[i32]) -> AsynResult<()> {
+        let Some((first, rest)) = values.split_first() else {
+            return Ok(());
+        };
+        self.write_single(addr, *first)?;
+        let out: Vec<u8> = rest
+            .iter()
+            .flat_map(|v| {
+                let mut frame = vec![0xA3];
+                frame.extend_from_slice(&v.to_le_bytes());
+                frame.push(EOS);
+                frame
+            })
+            .collect();
+        self.handle()?.write_octet(0, &out).map(drop)
+    }
+
+    /// `readArray`.
+    fn read_array(&self, addr: u32, count: usize) -> AsynResult<Vec<i32>> {
+        let mut out = vec![0xA4];
+        out.extend_from_slice(&addr.to_le_bytes());
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        out.push(EOS);
+        let header = self.handle()?.write_read(0, &out, 5)?;
+        if header.len() < 5 {
+            self.read_exact(5 - header.len())?;
+        }
+        let words = self.read_exact(4 * count)?;
+        self.read_exact(1)?;
+        Ok(words
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| i32::from_le_bytes(*w))
+            .collect())
+    }
+
+    /// A float register: two words, low first, as C's `doubleToInt` union.
+    fn read_double(&self, addr: u32) -> AsynResult<f64> {
+        let lo = self.read_single(addr)? as u32;
+        let hi = self.read_single(addr + 4)? as u32;
+        Ok(f64::from_bits(u64::from(hi) << 32 | u64::from(lo)))
+    }
+
+    fn write_double(&self, addr: u32, value: f64) -> AsynResult<()> {
+        let bits = value.to_bits();
+        self.write_single(addr, bits as u32 as i32)?;
+        self.write_single(addr + 4, (bits >> 32) as u32 as i32)
+    }
+
+    /// `LC400Axis::setHardLimits`.
+    fn set_hard_limits(&mut self, axis: usize, pos: f64, neg: f64, tol: f64) {
+        let state = &mut self.axes[axis];
+        state.pos_hard = state.cts(pos);
+        state.neg_hard = state.cts(neg);
+        state.tol_hard = state.cts(tol);
+        println!(
+            "hardLimits pos,neg,tol = {},{},{}",
+            state.pos_hard, state.neg_hard, state.tol_hard
+        );
+    }
+
+    /// `updateAuxParams`: the static parameters of `axis`, read only while
+    /// every axis is done.
+    fn aux_params(&self, address: u32) -> AsynResult<Vec<(usize, ParamValue)>> {
+        let Some(p) = self.params else {
+            return Ok(Vec::new());
+        };
+        if self.axes.iter().any(|a| !a.done) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![
+            (
+                p.range,
+                ParamValue::Int32(self.read_single(address + ST_RANGE_CMD)?),
+            ),
+            (
+                p.range_type,
+                ParamValue::Int32(self.read_single(address + ST_RANGE_TYPE)?),
+            ),
+            (
+                p.servo_state,
+                ParamValue::Int32(self.read_single(address + SERVO_STATE)?),
+            ),
+            (
+                p.p_gain,
+                ParamValue::Float64(self.read_double(address + P_GAIN)?),
+            ),
+            (
+                p.i_gain,
+                ParamValue::Float64(self.read_double(address + I_GAIN)?),
+            ),
+            (
+                p.d_gain,
+                ParamValue::Float64(self.read_double(address + D_GAIN)?),
+            ),
+        ])
+    }
+}
+
+/// `LC400ConfigAxis`: hard limits of `axis`, in position units.
+pub fn config_axis(controller: &Mutex<Lc400Controller>, axis: i32, high: f64, low: f64, tol: f64) {
+    let mut ctrl = lock(controller);
+    if axis < 0 || axis as usize >= ctrl.num_axes() {
+        println!("invalid axis number: {axis}");
+        return;
+    }
+    ctrl.set_hard_limits(axis as usize, high, low, tol);
+}
+
+fn lock(controller: &Mutex<Lc400Controller>) -> MutexGuard<'_, Lc400Controller> {
+    controller.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `genTrapezoid`'s waveform: `points[0]` is overwritten by the caller.
+struct Waveform {
+    cycle_count: usize,
+    points: Vec<i32>,
+}
+
+/// `genTrapezoid`: `ipos` to `fpos` in at most `max_pts` points of a
+/// trapezoidal velocity profile, each held `cycle_count + 1` cycles.
+fn gen_trapezoid(ipos: f64, fpos: f64, mut vel: f64, acc: f64, max_pts: usize) -> Waveform {
+    let d_tot = (fpos - ipos).abs();
+    let mut t_acc = vel / acc;
+    let mut d_acc = vel * vel / (2.0 * acc);
+    let mut d_cnt = d_tot - 2.0 * d_acc;
+    let mut t_cnt = d_cnt / vel;
+    if t_cnt < 0.0 {
+        t_cnt = 0.0;
+        d_cnt = 0.0;
+        d_acc = d_tot / 2.0;
+        t_acc = (2.0 * d_acc / acc).sqrt();
+        vel = acc * t_acc;
+    }
+    let t_tot = 2.0 * t_acc + t_cnt;
+    let mut cycle_count = (t_tot / MIN_DELAY / max_pts as f64).ceil() as usize;
+    let t_per_cycle = cycle_count as f64 * MIN_DELAY;
+    let npts = ((t_tot / t_per_cycle).floor() as usize).min(max_pts);
+
+    // C fills data[i+1], and the last point into data[0]; one spare slot.
+    let mut data = vec![0i32; npts + 1];
+    let dir = if fpos > ipos { 1.0 } else { -1.0 };
+    for i in 0..npts {
+        let t = i as f64 * t_per_cycle;
+        if i < npts / 2 && t < t_acc {
+            data[i + 1] = (ipos + dir * acc * t * t / 2.0) as i32;
+        } else if t < t_acc + t_cnt {
+            let tt = t - t_acc;
+            data[i + 1] = (ipos + dir * (d_acc + vel * tt)) as i32;
+        } else {
+            let tt = t - t_acc - t_cnt;
+            let at = if i < npts - 1 { i + 1 } else { 0 };
+            data[at] = (ipos + dir * (d_acc + d_cnt + vel * tt - acc * tt * tt / 2.0)) as i32;
+        }
+    }
+    if cycle_count == 0 {
+        eprintln!("Cycle Count was calculated to be 0, which shouldn't happen. Setting it to 1");
+        cycle_count = 1;
+    }
+    data.truncate(npts);
+    Waveform {
+        cycle_count: cycle_count - 1,
+        points: data,
+    }
+}
+
+/// Where a move goes: relative moves are from the last polled position.
+#[derive(Clone, Copy)]
+enum Target {
+    Absolute(f64),
+    Relative(f64),
+}
+
+/// One LC400 channel.
+pub struct Lc400Axis {
+    controller: Arc<Mutex<Lc400Controller>>,
+    axis: usize,
+}
+
+impl Lc400Axis {
+    pub fn new(controller: Arc<Mutex<Lc400Controller>>, axis: usize) -> Self {
+        Self { controller, axis }
+    }
+
+    /// Post `updates` at this axis's address, as the next
+    /// `callParamCallbacks` would.
+    fn post(&self, updates: Vec<(usize, ParamValue)>) {
+        if updates.is_empty() {
+            return;
+        }
+        let port = lock(&self.controller).port.clone();
+        if let Some(port) = port {
+            let addr = self.axis as i32;
+            let updates = updates
+                .into_iter()
+                .map(|(reason, value)| ParamSetValue::new(reason, addr, value))
+                .collect();
+            let _ = port.set_params_and_notify_blocking(addr, updates);
+        }
+    }
+
+    /// `LC400Axis::move`.
+    fn move_to(&mut self, target: Target, velocity: f64, acceleration: f64) -> AsynResult<()> {
+        let (Some(ch), Some(wav)) = (base_address(self.axis), wavetable_address(self.axis)) else {
+            return Err(lc400_err(format!("LC400 has no axis {}", self.axis)));
+        };
+        // genTrapezoid asserts both; a zero rate would divide by it.
+        if velocity <= 0.0 || acceleration <= 0.0 {
+            return Err(lc400_err(
+                "LC400 move needs a positive velocity and acceleration",
+            ));
+        }
+        let mut updates = Vec::new();
+        let ctrl = lock(&self.controller);
+        let result = ctrl.play(
+            self.axis,
+            (ch, wav),
+            target,
+            velocity,
+            acceleration,
+            &mut updates,
+        );
+        drop(ctrl);
+        // C sets each readback as it reads it; whatever was read before a
+        // failure reaches the next callParamCallbacks.
+        self.post(updates);
+        result
+    }
+}
+
+/// `LC400Axis::stop`'s writes, which `move` starts with: the status of the
+/// last, C ignoring the others.
+fn halt(ctrl: &Lc400Controller, ch: u32, wav: u32) -> AsynResult<()> {
+    let _ = ctrl.write_single(ch + WAV_ACTIVE, 0);
+    if let Ok(current) = ctrl.read_single(ch + ST_DIGITAL_POS) {
+        let _ = ctrl.write_single(wav, current);
+    }
+    ctrl.write_single(ch + WAV_INDEX, 0)
+}
+
+impl Lc400Controller {
+    /// The body of `LC400Axis::move` after its axis checks, on the channel and
+    /// wavetable addresses `(ch, wav)`.
+    fn play(
+        &self,
+        axis: usize,
+        (ch, wav): (u32, u32),
+        target: Target,
+        velocity: f64,
+        acceleration: f64,
+        updates: &mut Vec<(usize, ParamValue)>,
+    ) -> AsynResult<()> {
+        let halted = halt(self, ch, wav);
+        let state = &self.axes[axis];
+        let initial = state.digital_pos;
+        let mut position = match target {
+            Target::Absolute(position) => position,
+            Target::Relative(distance) => initial + distance,
+        };
+        if (position > initial && state.high_limit) || (position < initial && state.low_limit) {
+            return halted;
+        }
+        if state.pos_hard != 0 && position > f64::from(state.pos_hard) {
+            position = f64::from(state.pos_hard);
+        } else if state.neg_hard != 0 && position < f64::from(state.neg_hard) {
+            position = f64::from(state.neg_hard);
+        }
+        // C divides by LC400_W_MAXPTS when it is 0 and overruns its
+        // LC400_MAX_ARRAY buffers above it.
+        if !(1..=MAX_ARRAY).contains(&state.max_pts) {
+            return Err(lc400_err(format!(
+                "LC400_W_MAXPTS {} is outside 1..={MAX_ARRAY}",
+                state.max_pts
+            )));
+        }
+        let mut points = gen_trapezoid(
+            initial,
+            position,
+            velocity,
+            acceleration,
+            state.max_pts as usize,
+        );
+        // A move too short for one point leaves C's writeArray counting down
+        // from 0 - 1; there is nothing to play.
+        let Some(first) = points.points.first_mut() else {
+            return halted;
+        };
+        *first = initial as i32;
+        self.write_array(wav, &points.points)?;
+        // The controller needs time to take the array.
+        sleep(Duration::from_millis(10));
+        let readback = self.read_array(wav, points.points.len())?;
+        if let Some(i) = (0..points.points.len()).find(|&i| points.points[i] != readback[i]) {
+            println!(
+                "something is wrong with array pos[{i}] wrote {} read {}",
+                points.points[i], readback[i]
+            );
+            return Err(lc400_err("LC400 wavetable readback differs"));
+        }
+
+        self.write_single(ch + WAV_ACTIVE, 0)?;
+        self.write_single(ch + WAV_ENABLE, 2)?;
+        self.write_single(ch + WAV_DELAY, points.cycle_count as i32)?;
+        self.write_single(ch + WAV_END, points.points.len() as i32 - 1)?;
+        self.write_single(ch + WAV_ITERATIONS, 1)?;
+        self.write_single(ch + WAV_COUNT, 1)?;
+
+        // C reads WAV_ACTIVE a second time for LC400_W_ENABLE; the enable
+        // register is read here.
+        if let Some(p) = self.params {
+            for (reason, register) in [
+                (p.w_active, WAV_ACTIVE),
+                (p.w_enable, WAV_ENABLE),
+                (p.w_index, WAV_INDEX),
+                (p.w_delay, WAV_DELAY),
+                (p.w_end_idx, WAV_END),
+                (p.w_iter, WAV_ITERATIONS),
+                (p.w_iter_cts, WAV_COUNT),
+            ] {
+                updates.push((reason, ParamValue::Int32(self.read_single(ch + register)?)));
+            }
+        }
+
+        self.write_single(ch + WAV_ACTIVE, 1)?;
+        // C spins until the table starts, forever when the read fails; a failed
+        // read ends the wait here.
+        while self.read_single(ch + WAV_INDEX)? == 0 {
+            sleep(Duration::from_millis(10));
+        }
+        self.write_single(wav, position as i32)
+    }
+}
+
+impl AsynMotor for Lc400Axis {
+    /// C `LC400Axis::poll`'s `skip` label sets only `motorStatusProblem_`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
+    fn move_absolute(
+        &mut self,
+        _user: &AsynUser,
+        position: f64,
+        _min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.move_to(Target::Absolute(position), velocity, acceleration)
+    }
+
+    fn move_relative(
+        &mut self,
+        _user: &AsynUser,
+        distance: f64,
+        _min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        self.move_to(Target::Relative(distance), velocity, acceleration)
+    }
+
+    /// A move to the hard limit, or half the range when none is set. C
+    /// reads axis 0's limit bits for every axis; each reads its own here.
+    fn move_velocity(
+        &mut self,
+        _user: &AsynUser,
+        _min_velocity: f64,
+        velocity: f64,
+        acceleration: f64,
+    ) -> AsynResult<()> {
+        let target = {
+            let ctrl = lock(&self.controller);
+            let state = &ctrl.axes[self.axis];
+            if (velocity > 0.0 && state.high_limit) || (velocity < 0.0 && state.low_limit) {
+                return Ok(());
+            }
+            let half = f64::from(state.cts(f64::from(state.range / 2)));
+            if velocity < 0.0 {
+                if state.neg_hard != 0 {
+                    f64::from(state.neg_hard)
+                } else {
+                    -half
+                }
+            } else if state.pos_hard != 0 {
+                f64::from(state.pos_hard)
+            } else {
+                half
+            }
+        };
+        self.move_to(Target::Absolute(target), velocity.abs(), acceleration)
+    }
+
+    /// The LC400 has no home; C keeps `asynMotorAxis::home`.
+    fn home(
+        &mut self,
+        _user: &AsynUser,
+        _min_velocity: f64,
+        _velocity: f64,
+        _acceleration: f64,
+        _forward: bool,
+    ) -> AsynResult<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
+        let (Some(ch), Some(wav)) = (base_address(self.axis), wavetable_address(self.axis)) else {
+            return Err(lc400_err(format!("LC400 has no axis {}", self.axis)));
+        };
+        halt(&lock(&self.controller), ch, wav)
+    }
+
+    /// C keeps `asynMotorAxis::setPosition`.
+    fn set_position(&mut self, _user: &AsynUser, _position: f64) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// `LC400Axis::poll`: the position, then WAV_ACTIVE for done; the limit
+    /// bits latch at a hard limit once done and clear while moving away.
+    fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        let Some(address) = base_address(self.axis) else {
+            return Err(lc400_err(format!("LC400 has no axis {}", self.axis)));
+        };
+        let mut ctrl = lock(&self.controller);
+        let digital_pos = ctrl.params.map(|p| p.digital_pos);
+        let mut updates = Vec::new();
+        let result = (|| -> AsynResult<()> {
+            let current = ctrl.read_single(address + ST_DIGITAL_POS)?;
+            ctrl.axes[self.axis].digital_pos = f64::from(current);
+            if let Some(reason) = digital_pos {
+                updates.push((reason, ParamValue::Float64(f64::from(current))));
+            }
+            let busy = ctrl.read_single(address + WAV_ACTIVE)?;
+            let done = busy == 0;
+            if done {
+                updates.extend(ctrl.aux_params(address)?);
+            }
+            let state = &mut ctrl.axes[self.axis];
+            if done {
+                if state.pos_hard != 0 && current >= state.pos_hard {
+                    state.high_limit = true;
+                }
+                if state.neg_hard != 0 && current <= state.neg_hard {
+                    state.low_limit = true;
+                }
+            } else {
+                if current < state.pos_hard - state.tol_hard {
+                    state.high_limit = false;
+                }
+                if current > state.neg_hard + state.tol_hard {
+                    state.low_limit = false;
+                }
+            }
+            state.done = done;
+            Ok(())
+        })();
+        let state = &ctrl.axes[self.axis];
+        let status = MotorStatus {
+            position: state.digital_pos,
+            done: state.done,
+            moving: !state.done,
+            high_limit: state.high_limit,
+            low_limit: state.low_limit,
+            powered: true,
+            problem: result.is_err(),
+            ..MotorStatus::default()
+        };
+        drop(ctrl);
+        self.post(updates);
+        Ok(status)
+    }
+}
+
+/// `LC400Controller`'s parameters and its `writeInt32` / `writeFloat64`.
+pub struct Lc400ControllerParams {
+    controller: Arc<Mutex<Lc400Controller>>,
+}
+
+impl Lc400ControllerParams {
+    pub fn new(controller: Arc<Mutex<Lc400Controller>>) -> Self {
+        Self { controller }
+    }
+
+    fn address(&self, user: &AsynUser) -> AsynResult<u32> {
+        base_address(user.addr.max(0) as usize).ok_or_else(|| lc400_err("no LC400 axis"))
+    }
+}
+
+impl ControllerParams for Lc400ControllerParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        let params = Lc400Params {
+            range: base.create_param("LC400_RANGE", ParamType::Int32)?,
+            range_type: base.create_param("LC400_RANGE_TYPE", ParamType::Int32)?,
+            digital_pos: base.create_param("LC400_DIGITAL_POS", ParamType::Float64)?,
+            servo_state: base.create_param("LC400_SERVO_STATE", ParamType::Int32)?,
+            p_gain: base.create_param("LC400_P_GAIN", ParamType::Float64)?,
+            i_gain: base.create_param("LC400_I_GAIN", ParamType::Float64)?,
+            d_gain: base.create_param("LC400_D_GAIN", ParamType::Float64)?,
+            firmware: base.create_param("LC400_FW", ParamType::Octet)?,
+            w_enable: base.create_param("LC400_W_ENABLE", ParamType::Int32)?,
+            w_index: base.create_param("LC400_W_INDEX", ParamType::Int32)?,
+            w_delay: base.create_param("LC400_W_DELAY", ParamType::Int32)?,
+            w_end_idx: base.create_param("LC400_W_ENDIDX", ParamType::Int32)?,
+            w_active: base.create_param("LC400_W_ACTIVE", ParamType::Int32)?,
+            w_iter: base.create_param("LC400_W_ITER", ParamType::Int32)?,
+            w_iter_cts: base.create_param("LC400_W_ITERCTS", ParamType::Int32)?,
+            w_max_pts: base.create_param("LC400_W_MAXPTS", ParamType::Int32)?,
+        };
+        let mut ctrl = lock(&self.controller);
+        base.set_string_param(params.firmware, 0, &ctrl.firmware)?;
+        for (axis, state) in ctrl.axes.iter().enumerate() {
+            base.set_int32_param(params.range, axis as i32, state.range)?;
+        }
+        ctrl.params = Some(params);
+        Ok(())
+    }
+
+    fn write_int32(
+        &mut self,
+        _base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> AsynResult<()> {
+        let address = self.address(user)?;
+        let mut ctrl = lock(&self.controller);
+        let Some(p) = ctrl.params else {
+            return Ok(());
+        };
+        let register = match user.reason {
+            r if r == p.servo_state => SERVO_STATE,
+            r if r == p.w_enable => WAV_ENABLE,
+            r if r == p.w_index => WAV_INDEX,
+            r if r == p.w_delay => WAV_DELAY,
+            r if r == p.w_end_idx => WAV_END,
+            r if r == p.w_active => WAV_ACTIVE,
+            r if r == p.w_iter => WAV_ITERATIONS,
+            r if r == p.w_max_pts => {
+                if let Some(state) = ctrl.axes.get_mut(user.addr as usize) {
+                    state.max_pts = value;
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        ctrl.write_single(address + register, value)
+    }
+
+    fn write_float64(
+        &mut self,
+        _base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: f64,
+    ) -> AsynResult<()> {
+        let address = self.address(user)?;
+        let ctrl = lock(&self.controller);
+        let Some(p) = ctrl.params else {
+            return Ok(());
+        };
+        let result = match user.reason {
+            r if r == p.digital_pos => ctrl.write_single(address + ST_DIGITAL_SP, value as i32),
+            r if r == p.p_gain => ctrl.write_double(address + P_GAIN, value),
+            r if r == p.i_gain => ctrl.write_double(address + I_GAIN, value),
+            r if r == p.d_gain => ctrl.write_double(address + D_GAIN, value),
+            _ => return Ok(()),
+        };
+        if result.is_err() {
+            eprintln!(
+                "LC400MotorDriver:writeFloat64: error, function={}, value={value:.6}",
+                user.reason
+            );
+        }
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trapezoid_ends_at_the_target_and_ramps_in_between() {
+        // 1000 counts at 1000 counts/s, 4000 counts/s^2: 1.25 s. Each point
+        // holds ceil(1.25 / 24e-6 / 20000) = 3 cycles, written as 2, so
+        // 1.25 / 72e-6 = 17361 points.
+        let w = gen_trapezoid(0.0, 1000.0, 1000.0, 4000.0, 20000);
+        assert_eq!(w.points.len(), 17361);
+        assert_eq!(w.cycle_count, 2);
+        // The last point lands in slot 0, at the target to within a count.
+        assert!((w.points[0] - 1000).abs() <= 1, "{}", w.points[0]);
+        assert!(w.points.windows(2).skip(1).all(|p| p[1] >= p[0]));
+    }
+
+    #[test]
+    fn trapezoid_too_short_to_cruise_becomes_a_triangle() {
+        let w = gen_trapezoid(100.0, 0.0, 1000.0, 1000.0, 1000);
+        // C genTrapezoid's cycle_count and data_len for the same input.
+        assert_eq!((w.cycle_count, w.points.len()), (26, 976));
+        assert!(w.points[1..].iter().all(|&p| (0..=100).contains(&p)));
+        assert!(w.points[1] >= w.points[w.points.len() - 1]);
+    }
+
+    #[test]
+    fn double_register_is_low_word_first() {
+        let bits = 1.5f64.to_bits();
+        let (lo, hi) = (bits as u32, (bits >> 32) as u32);
+        assert_eq!(f64::from_bits(u64::from(hi) << 32 | u64::from(lo)), 1.5);
+    }
+}
