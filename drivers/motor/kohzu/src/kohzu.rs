@@ -125,8 +125,8 @@ impl KohzuController {
     /// command produces a `C\t…` reply, so this is used for both queries and
     /// set commands (whose reply is discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C send_mess flushes the input before every write.
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c == '\r' || c == '\n' || c == '\0' || c == '\u{2}')
