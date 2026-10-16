@@ -11,7 +11,7 @@
 //! Commands that return data prepend a terminator to the reply. The C
 //! `writeRead2xController` handles this by reading twice with a short delay: the
 //! first read consumes the prepended terminator, then after ~33 ms the real
-//! reply is read. This port replicates that with [`Mvp2001Controller::query`].
+//! reply is read. This port replicates that with `Mvp2001Controller::query`.
 //! Replies have the form `"0001 000001F4"`; the value is the hex field starting
 //! at byte offset 5 (C `parseReply` copies from `inString[5]` and `sscanf`s
 //! `%x`).
@@ -30,7 +30,7 @@
 //!
 //! - The C poller is a background thread; here the `POS`/`ST` reads run inside
 //!   [`poll`](AsynMotor::poll).
-//! - Homing is unimplemented in C (returns success without acting); [`home`] is
+//! - Homing is unimplemented in C (returns success without acting); `home` is
 //!   likewise a no-op.
 
 use std::sync::{Arc, Mutex, MutexGuard};
