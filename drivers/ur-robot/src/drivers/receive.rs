@@ -400,7 +400,6 @@ pub fn start_poller(
     std::thread::Builder::new()
         .name("ur-receive-poll".into())
         .spawn(move || {
-            ready.wait();
             let mut backoff = Backoff::new();
             let alarm_targets = params.alarm_targets();
             // Starts true so an IOC that boots with the robot down raises
@@ -464,14 +463,15 @@ pub fn start_poller(
                 // recovery clears the alarm in the very batch that carries
                 // the fresh values.
                 let healthy_now = matches!(&snapshot, Some(s) if !s.is_empty());
-                updates.extend(crate::drivers::health_transition(
-                    &alarm_targets,
-                    healthy_now,
-                    &mut was_healthy,
-                ));
-
-                for (addr, batch) in by_addr(updates) {
-                    let _ = handle.set_params_and_notify_blocking(addr, batch);
+                if ready.is_open() {
+                    updates.extend(crate::drivers::health_transition(
+                        &alarm_targets,
+                        healthy_now,
+                        &mut was_healthy,
+                    ));
+                    for (addr, batch) in by_addr(updates) {
+                        let _ = handle.set_params_and_notify_blocking(addr, batch);
+                    }
                 }
                 std::thread::sleep(poll_period);
             }

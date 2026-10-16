@@ -853,40 +853,41 @@ pub fn start_poller(
     std::thread::Builder::new()
         .name("ur-control-poll".into())
         .spawn(move || {
-            ready.wait();
+            let alarm_targets = params.alarm_targets();
             // Starts true so an IOC that boots with the robot down raises
             // the COMM alarm on its first cycle.
             let mut was_healthy = true;
             loop {
-                let updates = {
+                let (mut updates, healthy_now) = {
                     let mut guard = inner.lock();
-                    poll_once(params, &mut guard, &receive, &mut was_healthy)
+                    poll_once(params, &mut guard, &receive)
                 };
-                let _ = handle.set_params_and_notify_blocking(0, updates);
+                if ready.is_open() {
+                    updates.extend(crate::drivers::health_transition(
+                        &alarm_targets,
+                        healthy_now,
+                        &mut was_healthy,
+                    ));
+                    let _ = handle.set_params_and_notify_blocking(0, updates);
+                }
                 std::thread::sleep(poll_period);
             }
         })
         .expect("failed to spawn the RTDE control poll thread")
 }
 
-/// One pass of the control poll loop. `was_healthy` is the poll thread's
-/// health-edge memory for the COMM alarm on `ControlParams::alarm_targets`.
+/// One pass of the control poll loop: the parameter updates, and whether the
+/// link is healthy for the COMM alarm on `ControlParams::alarm_targets`.
 pub fn poll_once(
     p: ControlParams,
     inner: &mut ControlInner,
     receive: &ReceiveHandle,
-    was_healthy: &mut bool,
-) -> Vec<ParamSetValue> {
+) -> (Vec<ParamSetValue>, bool) {
     let mut updates = Vec::new();
 
     if !inner.connected() {
         updates.push(ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(0)));
-        updates.extend(crate::drivers::health_transition(
-            &p.alarm_targets(),
-            false,
-            was_healthy,
-        ));
-        return updates;
+        return (updates, false);
     }
     // IS_CONNECTED reflects aliveness, not just the socket: a stale stream
     // (open socket, packages stopped) reads 0. Unlike receive, control never
@@ -900,11 +901,6 @@ pub fn poll_once(
         p.is_connected,
         0,
         ParamValue::Int32(i32::from(alive)),
-    ));
-    updates.extend(crate::drivers::health_transition(
-        &p.alarm_targets(),
-        alive,
-        was_healthy,
     ));
 
     let is_steady = if inner.custom_script.is_some() {
@@ -927,7 +923,7 @@ pub fn poll_once(
             spdlog::debug(format_args!("Motion stopped due to safety."));
             inner.motion_task_done(p, &mut updates);
         }
-        return updates;
+        return (updates, alive);
     }
 
     if inner.pending_motion.is_some() {
@@ -935,7 +931,7 @@ pub fn poll_once(
     } else if inner.custom_script.is_some() {
         poll_custom_script(p, inner, receive, &mut updates);
     }
-    updates
+    (updates, alive)
 }
 
 /// The asynchronous-motion state machine.
@@ -1154,23 +1150,8 @@ mod tests {
         let mut inner = ControlInner::default();
         let receive = ReceiveHandle::new();
 
-        // The first cycle to see the outage also raises the COMM alarm on
-        // the alarm targets (IS_STEADY).
-        let mut was_healthy = true;
-        let updates = poll_once(p, &mut inner, &receive, &mut was_healthy);
-        assert_eq!(updates.len(), 2);
-        assert_eq!(int_update(&updates, p.is_connected), Some(0));
-        assert!(updates.iter().any(|u| matches!(
-            u,
-            ParamSetValue::Status {
-                reason,
-                status: epics_rs::asyn::error::AsynStatus::Disconnected,
-                ..
-            } if *reason == p.is_steady
-        )));
-
-        // A steady outage publishes IS_CONNECTED alone.
-        let updates = poll_once(p, &mut inner, &receive, &mut was_healthy);
+        let (updates, healthy) = poll_once(p, &mut inner, &receive);
+        assert!(!healthy);
         assert_eq!(updates.len(), 1);
         assert_eq!(int_update(&updates, p.is_connected), Some(0));
     }

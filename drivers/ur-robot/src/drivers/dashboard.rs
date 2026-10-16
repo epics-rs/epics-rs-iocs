@@ -370,7 +370,6 @@ pub fn start_poller(
     std::thread::Builder::new()
         .name("ur-dashboard-poll".into())
         .spawn(move || {
-            ready.wait();
             let alarm_targets = params.alarm_targets();
             // Starts true so an IOC that boots with the dashboard down
             // raises the COMM alarm on its first cycle.
@@ -416,13 +415,15 @@ pub fn start_poller(
                     }
                 }
 
-                updates.extend(crate::drivers::health_transition(
-                    &alarm_targets,
-                    state.connected,
-                    &mut was_healthy,
-                ));
+                if ready.is_open() {
+                    updates.extend(crate::drivers::health_transition(
+                        &alarm_targets,
+                        state.connected,
+                        &mut was_healthy,
+                    ));
+                    let _ = handle.set_params_and_notify_blocking(0, updates);
+                }
                 shared.set(state);
-                let _ = handle.set_params_and_notify_blocking(0, updates);
                 std::thread::sleep(poll_period);
             }
         })
