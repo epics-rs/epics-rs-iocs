@@ -88,7 +88,7 @@ impl Mcb4bController {
     /// EOS). Every MCB-4B command produces a reply, so this is used for both
     /// queries and set commands (whose reply is discarded) to keep the stream
     /// synchronized.
-    fn command(&self, cmd: &str) -> AsynResult<String> {
+    pub(crate) fn command(&self, cmd: &str) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
         let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
