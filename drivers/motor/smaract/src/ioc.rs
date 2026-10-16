@@ -200,8 +200,13 @@ pub fn scu_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 )
             };
 
-            let ax = ScuAxis::new(controller, channel as i32)
-                .map_err(|e| format!("smarActSCUCreateAxis: {e}"))?;
+            let ax = ScuAxis::new(
+                controller,
+                channel as i32,
+                &card.to_string(),
+                axis_no as i32,
+            )
+            .map_err(|e| format!("smarActSCUCreateAxis: {e}"))?;
             let dtyp_key = format!("SCU_{card}_{axis_no}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
             holder.install(
