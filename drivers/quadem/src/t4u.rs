@@ -1036,8 +1036,9 @@ pub struct T4uRuntime {
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    /// The sub-ports the driver built; dropping them closes the sockets.
-    _transport: Vec<PortRuntimeHandle>,
+    /// The sub-ports the driver built; dropping them closes the sockets. C++
+    /// registers them by name, so `st.cmd` can trace them.
+    pub sub_ports: Vec<PortRuntimeHandle>,
     _cmd_thread: thread::JoinHandle<()>,
     _data_thread: thread::JoinHandle<()>,
     _callback_thread: thread::JoinHandle<()>,
@@ -1253,7 +1254,7 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
         nd_params,
         pool,
         outputs,
-        _transport: transport.runtimes,
+        sub_ports: transport.runtimes,
         _cmd_thread: cmd_thread_handle,
         _data_thread: data_thread_handle,
         _callback_thread: callback_thread,

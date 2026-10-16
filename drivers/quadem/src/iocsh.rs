@@ -7,6 +7,7 @@ use epics_rs::ad_core::ioc::{GenericDriverContext, PluginManager};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::runtime::port::PortRuntimeHandle;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::iocsh::registry::{
     ArgDesc, ArgType, ArgValue, CommandContext, CommandDef, CommandOutcome,
@@ -19,8 +20,8 @@ use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
 use crate::t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};
 
-/// Publish a configured quadEM port: the asyn port itself, then its twelve
-/// NDArray fan-outs.
+/// Publish a configured quadEM port: the asyn port itself, the sub-ports the
+/// driver built for itself, then its twelve NDArray fan-outs.
 ///
 /// Address 0 (the Current1 time series) is the port's default NDArray source;
 /// addresses 1..=10 carry the remaining data items and address 11 the full 2-D
@@ -33,8 +34,16 @@ pub fn register_quadem_port(
     handle: PortHandle,
     pool: Arc<NDArrayPool>,
     outputs: &[Arc<parking_lot::Mutex<NDArrayOutput>>],
+    sub_ports: &[PortRuntimeHandle],
 ) -> epics_rs::asyn::error::AsynResult<()> {
     epics_rs::asyn::asyn_record::register_port(port_name, handle, owner)?;
+    for sub in sub_ports {
+        epics_rs::asyn::asyn_record::register_port(
+            sub.port_name(),
+            sub.port_handle().clone(),
+            owner,
+        )?;
+    }
 
     mgr.set_driver(Arc::new(GenericDriverContext::new(
         pool,
@@ -123,6 +132,7 @@ pub fn ahxxx_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
+                &[],
             )
             .map_err(|e| e.to_string())?;
 
@@ -205,6 +215,7 @@ pub fn nsls_em_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
+                &rt.sub_ports,
             )
             .map_err(|e| e.to_string())?;
 
@@ -272,6 +283,7 @@ pub fn fx4_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
+                &[],
             )
             .map_err(|e| e.to_string())?;
 
@@ -338,6 +350,7 @@ pub fn pcr4_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
+                &[],
             )
             .map_err(|e| e.to_string())?;
 
@@ -417,6 +430,7 @@ pub fn t4u_em_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
+                &rt.sub_ports,
             )
             .map_err(|e| e.to_string())?;
 
@@ -502,6 +516,7 @@ pub fn t4u_direct_em_configure_command(
                 rt.port_handle().clone(),
                 rt.pool.clone(),
                 &rt.outputs,
+                &rt.sub_ports,
             )
             .map_err(|e| e.to_string())?;
 

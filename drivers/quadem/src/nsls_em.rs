@@ -5,10 +5,9 @@
 //! broadcasts a discovery datagram on UDP 37747, looks for the module with the
 //! requested ID, and then opens a TCP command port (4747) and a TCP data port
 //! (5757) to that module's address. The three sub-ports are created by the
-//! driver and owned by [`NslsEmRuntime`]; they are not registered under names
-//! in the asyn port registry, because nothing in the module's databases refers
-//! to them (C++ names them `UDP_<port>`, `TCP_Command_<port>`, `TCP_Data_<port>`
-//! only so `asynReport` can find them).
+//! driver and owned by [`NslsEmRuntime`], and registered as `UDP_<port>`,
+//! `TCP_Command_<port>` and `TCP_Data_<port>`, the names C++'s `NSLS_EM.cmd`
+//! traces them by.
 //!
 //! Two C++ defects are not reproduced; both are noted at the site:
 //!
@@ -74,12 +73,11 @@ type SharedState = Arc<parking_lot::Mutex<NslsState>>;
 // Transport
 // ===========================================================================
 
-/// The sockets C++ builds in its constructor. The discovery port is closed once
-/// the module is found, as in C++, where nothing reads it again.
+/// The sockets C++ builds in its constructor.
 struct Transport {
     command: OctetIo,
     data: OctetIo,
-    /// The runtimes of the two TCP sub-ports; dropping them closes the sockets,
+    /// The UDP, command and data sub-ports; dropping them closes the sockets,
     /// so [`NslsEmRuntime`] keeps them for the life of the port.
     runtimes: Vec<PortRuntimeHandle>,
 }
@@ -129,7 +127,6 @@ fn find_module(port_name: &str, broadcast_address: &str, module_id: i32) -> Asyn
             Err(e) => return Err(e),
         }
     }
-    drop(udp_runtime);
 
     let found = modules
         .iter()
@@ -172,7 +169,7 @@ fn find_module(port_name: &str, broadcast_address: &str, module_id: i32) -> Asyn
     Ok(Transport {
         command,
         data,
-        runtimes: vec![command_runtime, data_runtime],
+        runtimes: vec![udp_runtime, command_runtime, data_runtime],
     })
 }
 
@@ -488,8 +485,9 @@ pub struct NslsEmRuntime {
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    /// The TCP command and data ports this driver created for itself.
-    _sub_ports: Vec<PortRuntimeHandle>,
+    /// The `UDP_`, `TCP_Command_` and `TCP_Data_` ports this driver created for
+    /// itself; C++ registers them by name, so `st.cmd` can trace them.
+    pub sub_ports: Vec<PortRuntimeHandle>,
     _read_thread: thread::JoinHandle<()>,
     _callback_thread: thread::JoinHandle<()>,
 }
@@ -574,7 +572,7 @@ pub fn create_nsls_em(
         nd_params,
         pool,
         outputs,
-        _sub_ports: sub_ports,
+        sub_ports,
         _read_thread: read_thread_handle,
         _callback_thread: callback_thread,
     })
