@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
 use epics_rs::ad_core::ioc::GenericDriverContext;
@@ -110,25 +111,14 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
 
-                let cmd = get_port(&cmd_port).ok_or_else(|| {
-                    format!(
-                        "command port '{cmd_port}' not found (call drvAsynIPPortConfigure first)"
-                    )
-                })?;
-                let data = get_port(&data_port).ok_or_else(|| {
-                    format!("data port '{data_port}' not found (call drvAsynIPPortConfigure first)")
-                })?;
+                // C ignores both connect statuses (merlinDetector.cpp:1398-1401):
+                // a missing socket port leaves a user whose every transfer fails.
+                let (cmd, _) = SyncIOHandle::connect_port(&cmd_port, 0, Duration::ZERO);
+                let (data, _) = SyncIOHandle::connect_port(&data_port, 0, Duration::ZERO);
 
-                let rt = create_merlin_detector(
-                    &claim,
-                    cmd.handle.clone(),
-                    data.handle.clone(),
-                    size_x,
-                    size_y,
-                    det_type,
-                    max_memory,
-                )
-                .map_err(|e| format!("failed to create the Merlin detector: {e}"))?;
+                let rt =
+                    create_merlin_detector(&claim, cmd, data, size_x, size_y, det_type, max_memory)
+                        .map_err(|e| format!("failed to create the Merlin detector: {e}"))?;
 
                 claim
                     .publish(
