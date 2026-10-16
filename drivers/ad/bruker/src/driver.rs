@@ -226,8 +226,7 @@ impl PortDriver for BrukerDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
         let p = self.ad.params;
         let q = self.params;
