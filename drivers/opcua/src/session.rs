@@ -188,7 +188,20 @@ impl SessionConfig {
                     "invalid security-mode (valid: best None Sign SignAndEncrypt)\n"
                 )),
             },
-            "sec-policy" => self.security_policy = Some(value.to_string()),
+            "sec-policy" => {
+                // C matches the policy's short name and keeps its URI.
+                let supported = supported_security_policies();
+                match supported.iter().find(|(_, name)| *name == value) {
+                    Some((uri, _)) => self.security_policy = Some(uri.to_string()),
+                    None => {
+                        let valid: String = supported
+                            .iter()
+                            .map(|(_, name)| format!(" {name}"))
+                            .collect();
+                        errlog_vprintf(format_args!("invalid security policy (valid:{valid})\n"));
+                    }
+                }
+            }
             "sec-id" => self.identity_file = Some(value.to_string()),
             "debug" => self.debug = count(),
             "nodes-max" | "batch-nodes" => {
@@ -1111,6 +1124,26 @@ pub(crate) fn strtoul(s: &str) -> u64 {
     } else {
         value
     }
+}
+
+/// C `securitySupportedPolicies`: (URI, short name) of each policy the
+/// client can use, in the client library's order.
+fn supported_security_policies() -> Vec<(&'static str, &'static str)> {
+    use async_opcua::crypto::SecurityPolicy;
+    [
+        SecurityPolicy::None,
+        SecurityPolicy::Basic128Rsa15,
+        SecurityPolicy::Basic256,
+        SecurityPolicy::Basic256Sha256,
+        SecurityPolicy::Aes128Sha256RsaOaep,
+        SecurityPolicy::Aes256Sha256RsaPss,
+    ]
+    .into_iter()
+    .map(|policy| {
+        let uri = policy.to_uri();
+        (uri, uri.rsplit_once('#').map_or(uri, |(_, name)| name))
+    })
+    .collect()
 }
 
 /// C `getYesNo` (`linkParser.cpp:44`).

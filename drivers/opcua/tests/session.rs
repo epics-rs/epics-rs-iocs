@@ -358,6 +358,22 @@ fn a_bad_session_option_is_passed_over() {
 }
 
 #[test]
+fn sec_policy_takes_the_short_name_and_keeps_the_uri() {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("sec-policy", "Basic256Sha256").unwrap();
+    assert_eq!(
+        config.security_policy.as_deref(),
+        Some("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256")
+    );
+    // An unknown name is reported and leaves the policy alone.
+    config.set_option("sec-policy", "Rot13").unwrap();
+    assert_eq!(
+        config.security_policy.as_deref(),
+        Some("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256")
+    );
+}
+
+#[test]
 fn an_illegal_autoconnect_is_the_one_option_error() {
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
     assert_eq!(
