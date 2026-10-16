@@ -64,40 +64,67 @@ pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
     })
 }
 
-/// Parse a family-prefixed channel address: bare digits (`Signal`, 1-999),
-/// `A<n>` (`Math`, 1-200), `C<n>` (`Comm`, 1-500), `K<n>` (`Const`, 1-100),
-/// `W<n>` (`VarConst`, 1-100). Returns `None` on a malformed or
-/// out-of-range address.
-pub fn parse_channel_address(arg: &str) -> Option<ChannelAddress> {
-    let mut chars = arg.chars();
-    let first = chars.next()?;
-    let (family, digits, max): (_, &str, u32) = match first {
-        '0'..='9' => (ChannelFamily::Signal, arg, 999),
-        'A' => (ChannelFamily::Math, arg.get(1..)?, 200),
-        'C' => (ChannelFamily::Comm, arg.get(1..)?, 500),
-        'K' => (ChannelFamily::Const, arg.get(1..)?, 100),
-        'W' => (ChannelFamily::VarConst, arg.get(1..)?, 100),
-        _ => return None,
+/// C `strtol(s, &end, 10)`: optional leading whitespace and sign, then
+/// decimal digits, stopping at the first non-digit. Returns the value
+/// (saturated, where C `atoi` overflow is UB) and the unparsed tail, which
+/// is `s` itself when there are no digits.
+pub fn strtol(s: &str) -> (i64, &str) {
+    let body = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (neg, unsigned) = match body.as_bytes().first() {
+        Some(b'-') => (true, &body[1..]),
+        Some(b'+') => (false, &body[1..]),
+        _ => (false, body),
     };
-    let index: u32 = digits.parse().ok()?;
-    if index == 0 || index > max {
-        return None;
+    let n = unsigned.bytes().take_while(u8::is_ascii_digit).count();
+    if n == 0 {
+        return (0, s);
     }
-    Some(ChannelAddress { family, index })
+    let mag = unsigned[..n].bytes().fold(0i64, |acc, d| {
+        acc.saturating_mul(10).saturating_add(i64::from(d - b'0'))
+    });
+    (if neg { -mag } else { mag }, &unsigned[n..])
 }
 
-/// `ALARM:<addr>.<1-4>` — a channel address plus a mandatory `.N` sub-index.
+/// Parse a family-prefixed channel address: bare digits (`Signal`, 1-999),
+/// `A<n>` (`Math`, 1-200), `C<n>` (`Comm`, 1-500), `K<n>` (`Const`, 1-100),
+/// `W<n>` (`VarConst`, 1-100). The number is read with C `atoi`, so
+/// trailing text after the digits is ignored. Returns `None` on an
+/// unknown prefix or an out-of-range number.
+pub fn parse_channel_address(arg: &str) -> Option<ChannelAddress> {
+    parse_channel_address_tail(arg).map(|(addr, _)| addr)
+}
+
+fn parse_channel_address_tail(arg: &str) -> Option<(ChannelAddress, &str)> {
+    let first = arg.chars().next()?;
+    let (family, digits, max): (_, &str, i64) = match first {
+        '0'..='9' => (ChannelFamily::Signal, arg, 999),
+        'A' => (ChannelFamily::Math, &arg[1..], 200),
+        'C' => (ChannelFamily::Comm, &arg[1..], 500),
+        'K' => (ChannelFamily::Const, &arg[1..], 100),
+        'W' => (ChannelFamily::VarConst, &arg[1..], 100),
+        _ => return None,
+    };
+    let (index, tail) = strtol(digits);
+    if index <= 0 || index > max {
+        return None;
+    }
+    Some((
+        ChannelAddress {
+            family,
+            index: index as u32,
+        },
+        tail,
+    ))
+}
+
+/// `ALARM:<addr>.<1-4>`: the text right after the address number must be
+/// exactly `.N` (`devGM10_mbbi.c:176-183`).
 pub fn parse_alarm_address(arg: &str) -> Option<(ChannelAddress, u8)> {
-    let (addr_part, sub_part) = arg.split_once('.')?;
-    let addr = parse_channel_address(addr_part)?;
-    if sub_part.len() != 1 {
-        return None;
+    let (addr, tail) = parse_channel_address_tail(arg)?;
+    match tail.as_bytes() {
+        [b'.', sub @ b'1'..=b'4'] => Some((addr, sub - b'0')),
+        _ => None,
     }
-    let sub = sub_part.as_bytes()[0];
-    if !(b'1'..=b'4').contains(&sub) {
-        return None;
-    }
-    Some((addr, sub - b'0'))
 }
 
 #[cfg(test)]
@@ -202,5 +229,21 @@ mod tests {
         assert_eq!(parse_alarm_address("0027.5"), None);
         assert_eq!(parse_alarm_address("0027"), None);
         assert_eq!(parse_alarm_address("0027.12"), None);
+        assert_eq!(parse_alarm_address("0027x.2"), None);
+        assert_eq!(
+            parse_alarm_address("A3.4").map(|(a, s)| (a.index, s)),
+            Some((3, 4))
+        );
+    }
+
+    #[test]
+    fn address_number_reads_like_c_atoi() {
+        assert_eq!(parse_channel_address("27abc").map(|a| a.index), Some(27));
+        assert_eq!(parse_channel_address("A 7").map(|a| a.index), Some(7));
+        assert_eq!(parse_channel_address("C+12").map(|a| a.index), Some(12));
+        assert_eq!(parse_channel_address("C-12"), None);
+        assert_eq!(parse_channel_address("99999999999999999999999"), None);
+        assert_eq!(strtol("  -42rest"), (-42, "rest"));
+        assert_eq!(strtol("x1"), (0, "x1"));
     }
 }

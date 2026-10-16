@@ -135,9 +135,7 @@ fn parse_module_index(arg: Option<&str>, record_type: &str, command: &str) -> Ca
             format!("{command} argument must be numeric"),
         ));
     }
-    let i: i32 = arg
-        .parse()
-        .map_err(|_| bad(record_type, format!("{command} argument must be numeric")))?;
+    let (i, _) = link::strtol(arg);
     if !(0..=9).contains(&i) {
         return Err(bad(
             record_type,
@@ -371,10 +369,8 @@ fn resolve_operation(
             Ok(Operation::IntegerVal(channel))
         }
         "stringin" => match command {
-            "IP_ADDR" => {
-                require_no_arg(arg, record_type, command)?;
-                Ok(Operation::IpAddr)
-            }
+            // devGM10_stringin.c:102-107 ignores any argument.
+            "IP_ADDR" => Ok(Operation::IpAddr),
             "MODULE_STRING" => Ok(Operation::ModuleString(parse_module_index(
                 arg,
                 record_type,
@@ -383,13 +379,11 @@ fn resolve_operation(
             "ERROR" => {
                 let arg =
                     arg.ok_or_else(|| bad(record_type, "ERROR requires a channel argument"))?;
-                let channel: u32 = arg
-                    .parse()
-                    .map_err(|_| bad(record_type, "ERROR channel must be numeric"))?;
-                if channel == 0 || channel > 3 {
+                let (channel, _) = link::strtol(arg);
+                if channel <= 0 || channel > 3 {
                     return Err(bad(record_type, "ERROR channel must be 1-3"));
                 }
-                Ok(Operation::ErrorText(channel))
+                Ok(Operation::ErrorText(channel as u32))
             }
             "UNIT" => {
                 let arg =
@@ -1075,13 +1069,32 @@ mod tests {
     // -- resolve_operation: stringin --
 
     #[test]
-    fn stringin_ip_addr_is_bare() {
+    fn stringin_ip_addr_ignores_argument() {
+        let instrument = connect_default_fixture();
+        for arg in [None, Some("x")] {
+            assert!(matches!(
+                resolve_operation("stringin", "IP_ADDR", arg, &instrument).unwrap(),
+                Operation::IpAddr
+            ));
+        }
+    }
+
+    #[test]
+    fn numeric_arguments_read_like_c_atoi() {
         let instrument = connect_default_fixture();
         assert!(matches!(
-            resolve_operation("stringin", "IP_ADDR", None, &instrument).unwrap(),
-            Operation::IpAddr
+            resolve_operation("stringin", "ERROR", Some("2x"), &instrument).unwrap(),
+            Operation::ErrorText(2)
         ));
-        assert!(resolve_operation("stringin", "IP_ADDR", Some("x"), &instrument).is_err());
+        assert!(matches!(
+            resolve_operation("bi", "MODULE_PRESENCE", Some("3z"), &instrument).unwrap(),
+            Operation::ModulePresence(3)
+        ));
+        assert!(matches!(
+            resolve_operation("mbbi", "ALARM", Some("1.2"), &instrument).unwrap(),
+            Operation::Alarm(_, 2)
+        ));
+        assert!(resolve_operation("mbbi", "ALARM", Some("1.2x"), &instrument).is_err());
     }
 
     #[test]
