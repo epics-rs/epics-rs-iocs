@@ -535,7 +535,7 @@ impl DeviceSupport for GmDevice {
         match *op {
             Operation::AnalogVal(addr) => {
                 if !is_io_intr {
-                    instrument.channel_start(addr.family, addr.index)?;
+                    instrument.channel_start(addr.family, addr.index);
                 }
                 let v = instrument.analog_get(addr.family, addr.index);
                 record.put_field("VAL", EpicsValue::Double(v))?;
@@ -543,7 +543,7 @@ impl DeviceSupport for GmDevice {
             }
             Operation::IntegerVal(channel) => {
                 if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel)?;
+                    instrument.channel_start(ChannelFamily::Signal, channel);
                 }
                 let v = instrument.integer_get(channel);
                 record.put_field("VAL", EpicsValue::Long(v))?;
@@ -551,7 +551,7 @@ impl DeviceSupport for GmDevice {
             }
             Operation::BinaryVal(channel) => {
                 if !is_io_intr {
-                    instrument.channel_start(ChannelFamily::Signal, channel)?;
+                    instrument.channel_start(ChannelFamily::Signal, channel);
                 }
                 let v = instrument.binary_get(channel);
                 record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
@@ -673,34 +673,34 @@ impl DeviceSupport for GmDevice {
                         ));
                     }
                 };
-                instrument.submit(command)?;
+                instrument.submit(command);
             }
             Operation::BinarySet(channel) => {
                 let on = match record.get_field("VAL") {
                     Some(EpicsValue::Enum(v)) => v != 0,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetBinaryOutput(channel, on))?;
+                instrument.submit(Command::SetBinaryOutput(channel, on));
             }
-            Operation::ChanTrig => instrument.submit(Command::ReadAllData)?,
-            Operation::MiscTrig => instrument.submit(Command::ReadAllMisc)?,
-            Operation::InfoTrig => instrument.submit(Command::ReadAllInfos)?,
-            Operation::StatTrig => instrument.submit(Command::ReadStatus)?,
+            Operation::ChanTrig => instrument.submit(Command::ReadAllData),
+            Operation::MiscTrig => instrument.submit(Command::ReadAllMisc),
+            Operation::InfoTrig => instrument.submit(Command::ReadAllInfos),
+            Operation::StatTrig => instrument.submit(Command::ReadStatus),
             Operation::RecordingModeSet => {
                 let on = match record.get_field("VAL") {
                     Some(EpicsValue::Enum(v)) => v != 0,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetOpMode(on))?;
+                instrument.submit(Command::SetOpMode(on));
             }
-            Operation::ErrorClearSet => instrument.submit(Command::ClearError)?,
-            Operation::AlarmAckSet => instrument.submit(Command::AcknowledgeAlarms)?,
+            Operation::ErrorClearSet => instrument.submit(Command::ClearError),
+            Operation::AlarmAckSet => instrument.submit(Command::AcknowledgeAlarms),
             Operation::ComputeCmdSet => {
                 let v = match record.get_field("VAL") {
                     Some(EpicsValue::Enum(v)) => v as u8,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetCompute(v))?;
+                instrument.submit(Command::SetCompute(v));
             }
             Operation::AnalogVal(_)
             | Operation::IntegerVal(_)
@@ -1203,5 +1203,29 @@ mod tests {
         record.init_record_tail();
         assert_eq!(record.get_field("VAL"), Some(EpicsValue::Enum(1)));
         assert_eq!(record.get_field("RVAL"), Some(EpicsValue::ULong(1)));
+    }
+
+    #[test]
+    fn bo_error_clear_device_error_reply_is_not_a_write_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = crate::instrument::test_support::default_init_responses();
+        responses.push(b"E1,205:1:12\r\n".to_vec());
+        responses.push(ascii_frame(b"junk 'Something broke' junk"));
+        let device_thread = spawn_fake_device(listener, responses);
+        let instrument = crate::instrument::Instrument::connect_to(addr).unwrap();
+        let f = factory(registry_with("gm10dev", instrument));
+        let ctx = DeviceSupportContext {
+            record_type: "bo",
+            dtyp: DTYP,
+            inp: "",
+            out: "gm10dev ERROR_CLEAR",
+        };
+        let mut device = f(&ctx).unwrap();
+        let mut record = FakeRecord::new("bo").with("VAL", EpicsValue::Enum(1));
+        device.init(&mut record).unwrap();
+        device.write(&mut record).unwrap();
+        let received = device_thread.join().unwrap();
+        assert_eq!(received.last().unwrap(), "_ERR,205\r\n");
     }
 }

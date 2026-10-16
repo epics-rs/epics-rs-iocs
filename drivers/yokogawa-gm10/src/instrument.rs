@@ -93,7 +93,7 @@ pub enum Command {
 
 struct Job {
     command: Command,
-    done: mpsc::Sender<io::Result<()>>,
+    done: mpsc::Sender<()>,
 }
 
 /// Handle to a connected GM10 unit. Cheap to clone (`Arc`-backed); one
@@ -169,20 +169,21 @@ impl Instrument {
         self.interrupts.register(category)
     }
 
-    /// Block until the actor thread has finished processing `command`.
-    pub fn submit(&self, command: Command) -> io::Result<()> {
+    /// Block until the actor thread has finished processing `command`. C's
+    /// `command_process` discards every handler's status (`drvGM10.c:1263-1309`),
+    /// so there is none to return.
+    pub fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
-        self.tx
+        if self
+            .tx
             .send(Job {
                 command,
                 done: done_tx,
             })
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-            })?;
-        done_rx.recv().map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-        })?
+            .is_ok()
+        {
+            let _ = done_rx.recv();
+        }
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -410,14 +411,14 @@ impl Instrument {
     /// `gm10_channel_start` (`drvGM10.c:1725-1760`): the first-scan async
     /// read-refresh for a single channel, collapsed to a blocking round
     /// trip. Signal channels with no recognized type are a silent no-op.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32) -> io::Result<()> {
+    pub fn channel_start(&self, family: ChannelFamily, channel: u32) {
         if family == ChannelFamily::Signal
             && matches!(
                 self.channel_type(channel),
                 ChannelType::None | ChannelType::Unknown
             )
         {
-            return Ok(());
+            return;
         }
         let command = match family {
             ChannelFamily::Signal => Command::ReadSignal(channel),
@@ -439,8 +440,8 @@ pub struct Actor {
 impl Actor {
     fn run(mut self, rx: mpsc::Receiver<Job>) {
         while let Ok(job) = rx.recv() {
-            let result = self.process(job.command);
-            let _ = job.done.send(result);
+            let _ = self.process(job.command);
+            let _ = job.done.send(());
         }
     }
 
@@ -986,15 +987,9 @@ pub(crate) mod test_support {
         })
     }
 
-    /// One connected instrument: module 0 is a present `InputAnalog`
-    /// module, channel 1 is `InputAnalog` (unit "DEGC", value 1.234),
-    /// `K1`/`W1` (Const/VarConst) are set to 12.5/-7.5. Every other
-    /// Signal channel (e.g. 2) is `ChannelType::None` — "channel does not
-    /// exist" gate tests use it directly.
-    pub(crate) fn connect_default_fixture() -> Arc<Instrument> {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let responses = vec![
+    /// The replies `connect_default_fixture`'s init sequence consumes.
+    pub(crate) fn default_init_responses() -> Vec<Vec<u8>> {
+        vec![
             fsysconf_one_input_analog_module(),  // FSysConf
             ascii_frame(b"ORec,0\r\n"),          // ORec?
             ascii_frame(b"OMath,0\r\n"),         // OMath?
@@ -1005,8 +1000,18 @@ pub(crate) mod test_support {
             one_record_fdata_binary(),           // FData,1
             ascii_frame(b"aaaaaaaa001,12.5\nE"), // SKConst?
             ascii_frame(b"aaaaaaaa001,-7.5\nE"), // SWConst?
-        ];
-        let device = spawn_fake_device(listener, responses);
+        ]
+    }
+
+    /// One connected instrument: module 0 is a present `InputAnalog`
+    /// module, channel 1 is `InputAnalog` (unit "DEGC", value 1.234),
+    /// `K1`/`W1` (Const/VarConst) are set to 12.5/-7.5. Every other
+    /// Signal channel (e.g. 2) is `ChannelType::None` — "channel does not
+    /// exist" gate tests use it directly.
+    pub(crate) fn connect_default_fixture() -> Arc<Instrument> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let device = spawn_fake_device(listener, default_init_responses());
         let instrument = Instrument::connect_to(addr).unwrap();
         device.join().unwrap();
         instrument
@@ -1049,7 +1054,7 @@ mod tests {
         assert!(!instrument.get_error_flag());
 
         let mut error_rx = instrument.register_interrupt(InterruptCategory::Error);
-        assert!(instrument.submit(Command::ClearError).is_err());
+        instrument.submit(Command::ClearError);
         assert!(instrument.get_error_flag());
         assert_eq!(instrument.get_error(1), "Something broke");
         assert!(error_rx.try_recv().is_ok());
