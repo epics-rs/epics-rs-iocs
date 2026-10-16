@@ -16,6 +16,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
@@ -350,31 +351,49 @@ impl PortDriver for PixiradDetector {
 
         let p = self.ad.params;
         let q = self.params;
+        let mut status = Ok(());
         if reason == p.acquire {
             if value != 0 && !was_acquiring {
-                self.start_acquire()?;
+                status = self.start_acquire();
             } else if value == 0 && was_acquiring {
-                self.command(&protocol::acquisition_break())?;
+                status = self.command(&protocol::acquisition_break()).map(|_| ());
             }
         } else if reason == q.sync_in_polarity
             || reason == q.sync_out_polarity
             || reason == q.sync_out_function
         {
-            self.set_sync()?;
+            status = self.set_sync();
         } else if reason == p.frame_type || reason == q.count_mode {
-            self.set_thresholds(1)?;
+            status = self.set_thresholds(1);
         } else if reason == q.hv_state || reason == q.cooling_state {
-            self.set_cooling_and_hv()?;
+            status = self.set_cooling_and_hv();
         } else if reason == q.system_reset {
             if value != 0 {
-                self.system_reset()?;
+                status = self.system_reset();
             }
         } else if reason == q.auto_calibrate && value != 0 {
-            self.do_auto_calibrate()?;
+            status = self.do_auto_calibrate();
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "pixirad:writeInt32: error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("pixirad:writeInt32: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -385,14 +404,32 @@ impl PortDriver for PixiradDetector {
 
         let p = self.ad.params;
         let q = self.params;
+        let mut status = Ok(());
         if reason == p.temperature || reason == q.hv_value {
-            self.set_cooling_and_hv()?;
+            status = self.set_cooling_and_hv();
         } else if reason == q.hit_threshold || q.threshold.contains(&reason) {
-            self.set_thresholds(1)?;
+            status = self.set_thresholds(1);
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "pixirad:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("pixirad:writeFloat64: function={reason}, value={value:.6}"),
+            ),
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        status
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, value: &[u8]) -> AsynResult<usize> {
