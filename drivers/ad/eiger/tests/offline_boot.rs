@@ -254,4 +254,12 @@ fn a_failed_put_prints_only_the_parameter_chain() {
             || l.starts_with("eigerDetector::writeInt32: error status=")),
         "{text}"
     );
+    // TRIGGER_MODE's driver-set enum values leave it unfetched, so put<int>
+    // fetches first (eigerParam.cpp:807-808).
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.ends_with("[param=TRIGGER_MODE] underlying baseFetch failed")),
+        "{text}"
+    );
 }

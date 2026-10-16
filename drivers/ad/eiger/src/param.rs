@@ -469,8 +469,9 @@ impl ParamRegistry {
     /// (C `EigerParam::setEnumValues`).
     pub fn set_enum_values(&mut self, index: usize, values: &[&str]) {
         if let Some(d) = self.defs.get_mut(&index) {
+            // C leaves mType alone: the first fetch makes it an enum
+            // (eigerParam.cpp:359-363, :475-476).
             d.meta.enum_values = values.iter().map(|s| s.to_string()).collect();
-            d.meta.kind = Kind::Enum;
             d.custom_enum = true;
         }
     }
