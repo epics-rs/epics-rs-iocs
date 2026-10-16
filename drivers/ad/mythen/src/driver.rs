@@ -19,8 +19,8 @@ use crate::protocol::CHANNELS_PER_MODULE;
 
 /// The detector is one row of channels, however many modules it has
 /// (C `MAX_DIMS` / `dims[1]`, mythen.cpp:1345).
-const SENSOR_SIZE_X: i32 = CHANNELS_PER_MODULE as i32;
-const SENSOR_SIZE_Y: i32 = 1;
+pub(crate) const SENSOR_SIZE_X: i32 = CHANNELS_PER_MODULE as i32;
+pub(crate) const SENSOR_SIZE_Y: i32 = 1;
 
 /// The parameters this driver adds to `ADDriver` (C `SD*String`).
 #[derive(Debug, Clone, Copy)]
