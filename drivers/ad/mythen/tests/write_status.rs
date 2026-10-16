@@ -286,3 +286,15 @@ fn a_refused_write_prints_the_param_librarys_status() {
         "{text}"
     );
 }
+
+/// mythen.cpp:1170: the write returns the OR of its steps. An int written to
+/// the float SDThreshold fails only its own setIntegerParam, with
+/// asynParamWrongType (8), not the asynError a last-status return gives.
+#[test]
+fn a_write_returns_the_or_of_its_steps() {
+    let (mut driver, _received) = driver("MYTHEN_WS_OR");
+    let mut user = AsynUser::new(driver.p.threshold);
+    let e = driver.write_int32(&mut user, 1).unwrap_err();
+    assert_eq!(e.c_status_code(), 8);
+    assert_eq!(e.message(), "");
+}

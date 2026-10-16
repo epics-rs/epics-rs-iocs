@@ -322,7 +322,6 @@ impl MythenDriver {
 #[derive(Default)]
 struct StatusOr {
     bits: i32,
-    last: Option<AsynStatus>,
     message: String,
 }
 
@@ -331,7 +330,6 @@ impl StatusOr {
     fn or(&mut self, step: AsynResult<()>) {
         if let Err(e) = step {
             self.bits |= e.c_status_code();
-            self.last = Some(e.status());
         }
     }
 
@@ -354,13 +352,9 @@ impl StatusOr {
         self.set(step);
     }
 
+    /// `return (asynStatus)status`: the OR, not the last failing step.
     fn into_result(self) -> AsynResult<()> {
-        self.last.map_or(Ok(()), |status| {
-            Err(AsynError::Status {
-                status,
-                message: self.message,
-            })
-        })
+        AsynError::from_c_status_code(self.bits, self.message).map_or(Ok(()), Err)
     }
 }
 
