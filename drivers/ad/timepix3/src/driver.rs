@@ -931,6 +931,12 @@ impl PortDriver for TimePix3Driver {
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
 
+        if reason == self.p.bias_enable && !(value == 0 || value == 1) {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("BiasEnabled must be 0 or 1 (received {value})"),
+            });
+        }
         self.ad.port_base.set_int32_param(reason, addr, value)?;
 
         let p = self.p;
@@ -1378,6 +1384,31 @@ impl PortDriver for TimePix3Driver {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// BiasEnable takes 0 or 1 only; anything else is refused before the
+    /// parameter is stored (ADTimePix.cpp:500-505).
+    #[test]
+    fn a_bias_enable_outside_zero_and_one_is_refused() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_BIAS_ENABLE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let e = det
+            .write_int32(&mut AsynUser::new(p.bias_enable), 2)
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("BiasEnabled must be 0 or 1 (received 2)"),
+            "{e}"
+        );
+        assert_eq!(det.int(p.bias_enable, 0), 0);
+    }
 
     /// A NumImages write in single mode is clamped to 1 and says so on
     /// ASYN_TRACEIO_DRIVER (ADTimePix.cpp:716-724).
