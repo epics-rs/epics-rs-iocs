@@ -627,9 +627,10 @@ impl PortDriver for SpecsAnalyserDriver {
                 self.ad
                     .port_base
                     .set_int32_param(self.p.safe_state, addr, old_value)?;
+                // C only passes the refusal to debug() (specsAnalyser.cpp:883).
                 result = Err(AsynError::Status {
                     status: AsynStatus::Error,
-                    message: "Unable to enter safe state while busy".to_string(),
+                    message: String::new(),
                 });
             }
         } else if let Some(raw_name) = self
@@ -828,4 +829,53 @@ pub fn create_specs_analyser_detector(
         array_output,
         tasks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A driver whose `driverPort_` does not exist, so no write reaches a wire.
+    fn offline(name: &str) -> SpecsAnalyserDriver {
+        let (driver_port, _) = SyncIOHandle::connect_port(
+            &format!("{name}_NONE"),
+            0,
+            secs(SOCKET_TIMEOUT),
+            InterfaceType::Octet,
+        );
+        SpecsAnalyserDriver::new(
+            name,
+            Arc::new(driver_port),
+            0,
+            0,
+            1 << 20,
+            SharedWireHandles {
+                wire_state: Arc::new(Mutex::new(0)),
+                connected: Arc::new(AtomicBool::new(false)),
+                start: Arc::new(Event::new()),
+                stop: Arc::new(Event::new()),
+            },
+        )
+        .unwrap()
+    }
+
+    /// C refuses SafeState while busy with asynError and no errorMessage
+    /// (specsAnalyser.cpp:880-885).
+    #[test]
+    fn a_busy_safe_state_is_refused_with_no_message() {
+        let mut driver = offline("SPECS_SAFE");
+        let (status, safe_state) = (driver.ad.params.status, driver.p.safe_state);
+        driver
+            .ad
+            .port_base
+            .set_int32_param(status, 0, ADStatus::Acquire as i32)
+            .unwrap();
+        let e = driver
+            .write_int32(&mut AsynUser::new(safe_state), 1)
+            .unwrap_err();
+        assert_eq!(
+            (e.status(), e.message()),
+            (AsynStatus::Error, String::new())
+        );
+    }
 }
