@@ -102,11 +102,18 @@ pub type XpsResult<T> = Result<T, XpsError>;
 pub struct XpsReply(String);
 
 impl XpsReply {
-    /// The leading error code (C `sscanf(reply, "%i", &ret)`); `0` = OK. An
-    /// empty reply yields `0` (C leaves `ret` at its `-1` init, but for our
-    /// EOS-framed transport an empty reply cannot occur; `atoi("") == 0`).
+    /// The leading error code (C `sscanf(reply, "%i", &ret)`); `0` = OK. A
+    /// reply with no leading integer keeps C's `ret = -1` init: a move written
+    /// into a socket the controller closed reads EOF and gets an empty reply,
+    /// which C reports as an error (XPS_C8_drivers.cpp:3355,3376).
     pub fn code(&self) -> i32 {
-        atoi(&self.0)
+        let t = self.0.trim_start();
+        let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+        if digits.starts_with(|c: char| c.is_ascii_digit()) {
+            atoi(t)
+        } else {
+            -1
+        }
     }
 
     /// Require a success code, returning `self` for out-param extraction or
@@ -255,11 +262,15 @@ impl XpsSocket {
                 Err(e) => return Err(XpsError::Transport(e)),
                 Ok(raw) => {
                     let reply = XpsReply(String::from_utf8_lossy(&raw).into_owned());
-                    match reply.code() {
-                        0 => return Ok(()),
-                        -1 => continue,
-                        code => return Err(XpsError::Api(code)),
+                    // The retry test is C's `atoi(valueRtrn)`; the verdict is the
+                    // caller's `sscanf` on the reply it was left with.
+                    if atoi(&reply.0) == -1 {
+                        continue;
                     }
+                    return match reply.code() {
+                        0 => Ok(()),
+                        code => Err(XpsError::Api(code)),
+                    };
                 }
             }
         }
@@ -361,6 +372,13 @@ mod tests {
         let r = XpsReply("-17".to_string());
         assert_eq!(r.code(), -17);
         assert!(matches!(r.require_ok(), Err(XpsError::Api(-17))));
+    }
+
+    #[test]
+    fn reply_without_a_code_keeps_c_minus_one() {
+        assert_eq!(XpsReply(String::new()).code(), -1);
+        assert_eq!(XpsReply("EndOfAPI".to_string()).code(), -1);
+        assert_eq!(XpsReply("-".to_string()).code(), -1);
     }
 
     #[test]
