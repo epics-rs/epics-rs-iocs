@@ -84,10 +84,13 @@ impl Anf2Controller {
     /// `drvModbusAsynConfigure` (C constructor's `pasynInt32SyncIO`/
     /// `pasynInt32ArraySyncIO` connect loop).
     pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> Result<Self, String> {
+        let (in_regs, in_status) = ModbusRegs::connect(in_port, TIMEOUT);
+        let (out_regs, out_status) = ModbusRegs::connect(out_port, TIMEOUT);
+        in_status.and(out_status).map_err(|e| e.to_string())?;
         Ok(Self {
             in_port: in_port.to_string(),
-            in_regs: ModbusRegs::connect(in_port, TIMEOUT)?,
-            out_regs: ModbusRegs::connect(out_port, TIMEOUT)?,
+            in_regs,
+            out_regs,
             num_axes,
             axes_created: 0,
         })

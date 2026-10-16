@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::iocsh::{
     DEFAULT_IDLE_POLL_MS, DEFAULT_MOVING_POLL_MS, arg_int_opt, arg_int_req, arg_str_req,
@@ -194,11 +196,18 @@ pub fn ang1_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
-            let controller = Ang1Controller::new(&in_port, &out_port)
-                .map_err(|e| format!("ANG1CreateController: {e}"))?;
+            register_port(ctx, &port_name, num_axes as i32)?;
+            let (controller, out_status) = Ang1Controller::new(&in_port, &out_port);
+            if out_status.is_err() {
+                MotorTrace::new(port_name.clone(), 0).print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "ANG1Controller::ANG1Controller: cannot connect to ANG1 controller\n"
+                    ),
+                );
+            }
             let controller = Arc::new(Mutex::new(controller));
 
-            register_port(ctx, &port_name, num_axes as i32)?;
             for axis in 0..num_axes {
                 // Infallible, matching C: axis construction ignores the
                 // initial setPosition status and never aborts this command.

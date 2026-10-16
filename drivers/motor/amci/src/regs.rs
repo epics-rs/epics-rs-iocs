@@ -6,14 +6,15 @@
 //! A modbus-rs port is just another asyn port: `drvModbusAsynConfigure`
 //! registers it in the same global port registry every asyn port uses
 //! (`asyn_rs::asyn_record::register_port`), keyed by the port name given in
-//! `st.cmd`. [`ModbusRegs::connect`] looks it up there and resolves the two
+//! `st.cmd`. [`ModbusRegs::connect`] connects to it there and resolves the two
 //! drvInfo strings the driver needs against it: `MODBUS_DATA` (plain register
 //! access — C's `pasynInt32SyncIO->connect(port, addr, &user, NULL)`, which
 //! skips `drvUserCreate` for a `NULL` drvInfo and so falls on the port's
 //! default reason; explicit resolution is used here instead of relying on
 //! that default, since modbus-rs's parameter creation order does not
 //! reproduce it) and `MODBUS_READ` (the force-read trigger — C's
-//! `pasynUserForceRead_`, connected with drvInfo `"MODBUS_READ"`).
+//! `pasynUserForceRead_`, connected with drvInfo `"MODBUS_READ"`). A missing
+//! port keeps C's unconnected user, which refuses every transfer.
 
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::DrvUserRequest;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 /// C `MODBUS_DATA_STRING` — the modbus-rs param every register read/write
@@ -33,28 +35,29 @@ const MODBUS_READ: &str = "MODBUS_READ";
 
 /// A connected handle onto one modbus-rs port's register space.
 pub struct ModbusRegs {
-    handle: PortHandle,
+    handle: SyncIOHandle,
     data_reason: usize,
     timeout: Duration,
 }
 
 impl ModbusRegs {
     /// Connect to a modbus-rs port previously created by
-    /// `drvModbusAsynConfigure`, by name.
-    pub fn connect(port_name: &str, timeout: Duration) -> Result<Self, String> {
-        let entry = get_port(port_name).ok_or_else(|| {
-            format!("modbus port '{port_name}' not found (call drvModbusAsynConfigure first)")
-        })?;
-        let handle = entry.handle;
+    /// `drvModbusAsynConfigure`, by name. As C's SyncIO connect, the user is
+    /// kept when the port is missing and the connect status is returned beside
+    /// it; C's NULL drvInfo cannot be refused, so a refused `MODBUS_DATA`
+    /// leaves reason 0 as C's default.
+    pub fn connect(port_name: &str, timeout: Duration) -> (Self, AsynResult<()>) {
+        let (handle, connected) = SyncIOHandle::connect_port(port_name, 0, timeout);
         let data_reason = handle
-            .drv_user_create_blocking(&DrvUserRequest::new(MODBUS_DATA, 0))
-            .map_err(|e| e.to_string())?
-            .reason;
-        Ok(Self {
+            .port()
+            .and_then(|port| port.drv_user_create_blocking(&DrvUserRequest::new(MODBUS_DATA, 0)))
+            .map_or(0, |r| r.reason);
+        let regs = Self {
             handle,
             data_reason,
             timeout,
-        })
+        };
+        (regs, connected)
     }
 
     fn user(&self, reason: usize, addr: i32) -> AsynUser {
@@ -67,6 +70,7 @@ impl ModbusRegs {
     pub fn read16(&self, addr: i32) -> AsynResult<i32> {
         let result = self
             .handle
+            .port()?
             .submit_blocking(RequestOp::Int32Read, self.user(self.data_reason, addr))?;
         result.int_val.ok_or_else(|| AsynError::Status {
             status: AsynStatus::Error,
@@ -76,7 +80,7 @@ impl ModbusRegs {
 
     /// Write one register (C `writeReg16` / `pasynInt32SyncIO->write`).
     pub fn write16(&self, addr: i32, value: i32) -> AsynResult<()> {
-        self.handle.submit_blocking(
+        self.handle.port()?.submit_blocking(
             RequestOp::Int32Write { value },
             self.user(self.data_reason, addr),
         )?;
@@ -87,7 +91,7 @@ impl ModbusRegs {
     /// `pasynInt32ArraySyncIO->write`); the port must be configured with a
     /// write-multiple-registers Modbus function.
     pub fn write_array(&self, addr: i32, data: Vec<i32>) -> AsynResult<()> {
-        self.handle.submit_blocking(
+        self.handle.port()?.submit_blocking(
             RequestOp::Int32ArrayWrite { data },
             self.user(self.data_reason, addr),
         )?;
@@ -231,6 +235,15 @@ mod tests {
         assert_eq!(fr.reason(), reason);
         fr.write().unwrap();
         assert_eq!(*taken.lock().unwrap(), [(reason, 0)]);
+    }
+
+    #[test]
+    fn a_missing_port_keeps_registers_that_refuse_transfers() {
+        let (regs, status) = ModbusRegs::connect("amciRegsMissing", Duration::from_millis(10));
+        assert!(status.is_err());
+        assert!(regs.read16(0).is_err());
+        assert!(regs.write16(0, 1).is_err());
+        assert!(regs.write_array(0, vec![0]).is_err());
     }
 
     #[test]

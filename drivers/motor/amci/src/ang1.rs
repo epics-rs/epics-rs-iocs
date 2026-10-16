@@ -78,13 +78,17 @@ pub struct Ang1Controller {
 
 impl Ang1Controller {
     /// Connect the In/Out Modbus ports previously created by
-    /// `drvModbusAsynConfigure`.
-    pub fn new(in_port: &str, out_port: &str) -> Result<Self, String> {
-        Ok(Self {
+    /// `drvModbusAsynConfigure`. C keeps the controller either way; the
+    /// output connect's status, the only one C checks, is returned.
+    pub fn new(in_port: &str, out_port: &str) -> (Self, AsynResult<()>) {
+        let (in_regs, _) = ModbusRegs::connect(in_port, TIMEOUT);
+        let (out_regs, out_status) = ModbusRegs::connect(out_port, TIMEOUT);
+        let ctrl = Self {
             in_port: in_port.to_string(),
-            in_regs: ModbusRegs::connect(in_port, TIMEOUT)?,
-            out_regs: ModbusRegs::connect(out_port, TIMEOUT)?,
-        })
+            in_regs,
+            out_regs,
+        };
+        (ctrl, out_status)
     }
 
     fn read16(&self, reg: i32) -> AsynResult<i32> {
@@ -386,6 +390,14 @@ impl AsynMotor for Ang1Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_of_missing_ports_keeps_its_axes() {
+        let (ctrl, out_status) = Ang1Controller::new("ang1MissingIn", "ang1MissingOut");
+        assert!(out_status.is_err());
+        let ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        assert!(ax.lock().read16(STATUS_1).is_err());
+    }
 
     #[test]
     fn pack1000_exact_multiple() {
