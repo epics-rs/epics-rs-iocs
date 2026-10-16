@@ -17,10 +17,10 @@ epicsEnvSet("NAXES",  "2")
 drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyS1", 0, 0, 0)
 #drvAsynIPPortConfigure("$(IPPORT)", "192.168.1.17:4001", 0, 0, 0)
 
-# hydra framing: the driver appends the CR/LF command terminator, so only the
-# input EOS is configured here. Do not set an output EOS — the port would append
-# it a second time.
+# Port EOS as the C example sets it (motor.cmd.SMChydra:14-15);
+# the driver sends bare commands.
 asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
+asynOctetSetOutputEos("$(IPPORT)", 0, "\r\n")
 
 # ---- hydra controller ----
 # SMChydraCreateController(card, hydraPort, numAxes, [movingPollMs], [idlePollMs]).

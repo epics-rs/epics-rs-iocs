@@ -3,8 +3,8 @@
 //! Ported from `motorMicos/micosApp/src/SMChydraAxis.cpp` +
 //! `SMChydraDriver.cpp` (a model-3 `asynMotorController`/`asynMotorAxis` pair).
 //! Connects over a `drvAsynIPPort` or `drvAsynSerialPort`; commands are ASCII,
-//! CR/LF-terminated (the startup script sets the input EOS, the driver owns
-//! output framing).
+//! CR/LF-terminated (the startup script sets both EOS, as the C example does;
+//! the driver sends bare commands).
 //!
 //! ## Per-axis addressing
 //!
@@ -52,9 +52,6 @@ use motor_common::util::{atof, atoi};
 /// Response buffer size.
 const READ_BUF: usize = 128;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r\n";
-
 /// `nst` status bits.
 const STATUS_MOVING: i32 = 0x1; // axis in motion
 const STATUS_POWER_OFF: i32 = 0x100; // drive power disabled
@@ -88,23 +85,16 @@ impl HydraController {
         Self { handle }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected.
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a query and read one reply line.
     fn query(&self, cmd: &str) -> AsynResult<String> {
         // C writeReadController: pasynOctetSyncIO->writeRead.
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
