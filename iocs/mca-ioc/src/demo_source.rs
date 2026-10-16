@@ -8,9 +8,10 @@
 //! Publishes two params, matching what
 //! [`FastSweepDriver::connect`](mca::fastsweep::FastSweepDriver::connect)'s
 //! default `dataString`/`intervalString` ("DATA"/"SCAN_PERIOD") expect:
-//! - `"DATA"` (`asynInt32Array`, `maxSignals` elements) — a triangular peak
-//!   that drifts one channel per period, so an acquiring sweep shows a
-//!   moving, recognizable shape rather than flat noise.
+//! - `"DATA"` (`asynInt32Array`, `maxSignals` elements) — one sample per
+//!   signal, a triangle across the signals whose peak moves one signal per
+//!   period, so each signal's swept spectrum is a periodic triangle wave.
+//!   With one signal (this IOC's `st.cmd`) every sample is 50.
 //! - `"SCAN_PERIOD"` (`asynFloat64`) — the fixed sample period, published
 //!   once at connect and never changed; FastSweep reads it once as its
 //!   `computeNumAverage` seed.
