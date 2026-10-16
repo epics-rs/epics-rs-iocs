@@ -339,11 +339,10 @@ impl AsynMotor for PmacAxis {
         lock(&self.controller).command(&format!("I{axis}14={position:.6}"))
     }
 
-    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch. Every axis of a
-    /// controller shares one deferral flag, so the first axis the record defers
-    /// arms the controller and the release executes all the pending moves.
+    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch, which C takes
+    /// at every address: the motor record defers with 1, releases with 0.
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
-        lock(&self.controller).set_deferred_moves(defer)
+        lock(&self.controller).set_moves_deferred(i32::from(defer))
     }
 
     /// C `pmacAxis::getAxisStatus`.

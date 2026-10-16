@@ -14,23 +14,25 @@
 //! The axis asks the controller whether moves are deferred and, if so, hands it
 //! the demand instead of sending one.
 //!
-//! ## Controller-level PVs (deviation)
+//! ## Controller-level parameters
 //!
-//! The C driver exposes `PMAC_C_GLOBALSTATUS`, `PMAC_C_FEEDRATE`,
-//! `PMAC_C_FEEDRATE_LIMIT`, `PMAC_C_FEEDRATE_POLL`, `PMAC_C_FEEDRATE_PROBLEM`,
-//! `PMAC_C_COMMSERROR` and `PMAC_C_COORDINATE_SYS_GROUP` as asyn parameters on
-//! address 0, bound to records by `pmacController.template`. The asyn-rs motor
-//! boundary carries no controller-level parameter port, so the *inputs* among
-//! them (feed-rate polling on/off and its limit, the CS-group selection) keep
-//! their defaults: no feed-rate poll, limit 100, no group switch. The *outputs* (global status, feed-rate
-//! problem) keep their real effect: they raise the motor record's PROBLEM bit,
-//! exactly as they do in C through `pmacAxis::getAxisStatus`.
+//! C's `PMAC_C_*` parameters and `MOTOR_DEFER_MOVES` live at address 0 of the
+//! controller port, bound to records by `pmacController.template`:
+//! [`PmacControllerParams`] is the `pmacController::writeInt32` that takes
+//! them, and the controller posts what its poll reads to the same port.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::param::{ParamType, ParamValue};
+use epics_rs::asyn::port::PortDriverBase;
+use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::controller_port::{ControllerParams, index};
 
 use crate::cs_groups::{AxisPoll, CsGroups, DeferredMove, fast_deferred_command};
 use crate::protocol::{HARDWARE_PROB, parse_feedrate, parse_global_status};
@@ -48,35 +50,13 @@ const FEEDRATE_DEADBAND: i32 = 1;
 /// `pmacAsynIPPort.c` header.
 const BELL: u8 = 0x07;
 
-/// How the controller executes a deferred move when the record releases it.
-///
-/// C reads this from the motor record's `motorDeferMoves_` value (1 =
-/// `DEFERRED_FAST_MOVES`, 2 = `DEFERRED_COORDINATED_MOVES`). The asyn-rs motor
-/// interface carries deferral as a plain `bool`
-/// ([`AsynMotor::set_deferred_moves`][epics_rs::asyn::interfaces::motor::AsynMotor::set_deferred_moves]),
-/// so the *mode* is chosen once, at `pmacCreateController` time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeferredMode {
-    /// C `DEFERRED_FAST_MOVES`: one combined jog line, axes start together but
-    /// are not interpolated.
-    Fast,
-    /// C `DEFERRED_COORDINATED_MOVES`: motion program 101 in the axes' shared
-    /// coordinate system — all axes start *and* stop together.
-    Coordinated,
-}
+/// C `DEFERRED_FAST_MOVES`: `MOTOR_DEFER_MOVES` 1 defers moves into one
+/// combined jog line; the axes start together but are not interpolated.
+pub const DEFERRED_FAST_MOVES: i32 = 1;
 
-impl DeferredMode {
-    /// Parse the C numeric selector (1 = fast, 2 = coordinated).
-    pub fn from_code(code: i64) -> Result<Self, String> {
-        match code {
-            1 => Ok(Self::Fast),
-            2 => Ok(Self::Coordinated),
-            _ => Err(format!(
-                "deferredMode must be 1 (fast) or 2 (coordinated), got {code}"
-            )),
-        }
-    }
-}
+/// C `DEFERRED_COORDINATED_MOVES`: `MOTOR_DEFER_MOVES` 2 runs motion program
+/// 101 in the axes' shared coordinate system, so all start and stop together.
+pub const DEFERRED_COORDINATED_MOVES: i32 = 2;
 
 /// Per-axis configuration set by the iocsh commands after the axis is created.
 /// C keeps these on the axis object and mutates them through
@@ -139,8 +119,8 @@ pub struct PmacController {
     axes: BTreeSet<i32>,
     config: BTreeMap<i32, AxisConfig>,
 
-    deferred_mode: DeferredMode,
-    moves_deferred: bool,
+    /// C `movesDeferred_`: the last `MOTOR_DEFER_MOVES` value, 0 for none.
+    moves_deferred: i32,
     deferred: BTreeMap<i32, DeferredMove>,
     /// Last poll result per axis, for the coordinated-move builder.
     poll_cache: BTreeMap<i32, AxisPoll>,
@@ -157,33 +137,45 @@ pub struct PmacController {
     feed_rate_problem: bool,
     global_read_at: Option<Instant>,
     global_ttl: Duration,
+    /// The controller port's parameters and, once published, its handle, to
+    /// post what the poll reads.
+    params: Option<PmacParams>,
+    port: Option<PortHandle>,
 }
 
 impl PmacController {
-    pub fn new(
-        handle: Option<SyncIOHandle>,
-        deferred_mode: DeferredMode,
-        feed_rate_poll: bool,
-        feed_rate_limit: i32,
-        global_ttl: Duration,
-    ) -> Self {
+    /// C's constructor: no deferral and no feed-rate poll until the
+    /// template's records write them.
+    pub fn new(handle: Option<SyncIOHandle>, global_ttl: Duration) -> Self {
         Self {
             handle,
             axes: BTreeSet::new(),
             config: BTreeMap::new(),
-            deferred_mode,
-            moves_deferred: false,
+            moves_deferred: 0,
             deferred: BTreeMap::new(),
             poll_cache: BTreeMap::new(),
             cs_groups: CsGroups::new(),
-            feed_rate_poll,
-            feed_rate_limit,
+            feed_rate_poll: false,
+            feed_rate_limit: 0,
             feed_rate: 0,
             global_problem: false,
             feed_rate_problem: false,
             global_read_at: None,
             global_ttl,
+            params: None,
+            port: None,
         }
+    }
+
+    /// Post what the poll reads to the controller port from here on.
+    pub fn attach_port(&mut self, port: PortHandle) {
+        self.port = Some(port);
+    }
+
+    /// Whether the low-level port connected: C's `PMAC_C_COMMSERROR` at
+    /// construction.
+    pub fn connected(&self) -> bool {
+        self.handle.is_some()
     }
 
     /// C `pmacController::lowLevelWriteRead`; see [`octet_write_read`].
@@ -305,20 +297,45 @@ impl PmacController {
             Some(status) => self.global_problem = (status & HARDWARE_PROB) != 0,
             // A failed read leaves the previous verdict, as C does (it sets the
             // comms-error param and keeps the last global status).
-            None => return,
+            None => return self.post(|p| vec![(p.comms_error, 1)]),
         }
-        if !self.feed_rate_poll {
-            return;
-        }
-        if let Some(rate) = self
-            .write_read("%")
-            .ok()
+        let rate = self
+            .feed_rate_poll
+            .then(|| self.write_read("%").ok())
+            .flatten()
             .as_deref()
-            .and_then(parse_feedrate)
-        {
+            .and_then(parse_feedrate);
+        if let Some(rate) = rate {
             self.feed_rate = rate;
             self.feed_rate_problem = rate < self.feed_rate_limit - FEEDRATE_DEADBAND;
         }
+        let feed_rate_read = rate.is_some();
+        // C `pmacController::poll`: the feed rate and its verdict are posted
+        // only while polled.
+        let (global, rate, problem) = (
+            i32::from(self.global_problem),
+            self.feed_rate,
+            i32::from(self.feed_rate_problem),
+        );
+        self.post(|p| {
+            let mut values = vec![(p.global_status, global), (p.comms_error, 0)];
+            if feed_rate_read {
+                values.extend([(p.feed_rate, rate), (p.feed_rate_problem, problem)]);
+            }
+            values
+        });
+    }
+
+    /// Set address-0 parameters and run their callbacks.
+    fn post(&self, values: impl FnOnce(&PmacParams) -> Vec<(usize, i32)>) {
+        let (Some(port), Some(params)) = (&self.port, &self.params) else {
+            return;
+        };
+        let updates = values(params)
+            .into_iter()
+            .map(|(reason, value)| ParamSetValue::new(reason, 0, ParamValue::Int32(value)))
+            .collect();
+        let _ = port.set_params_and_notify_blocking(0, updates);
     }
 
     /// The last polled global feed rate (C `PMAC_C_FEEDRATE`), 0 when feed-rate
@@ -330,11 +347,7 @@ impl PmacController {
     // ---- deferred moves ----
 
     pub fn moves_deferred(&self) -> bool {
-        self.moves_deferred
-    }
-
-    pub fn deferred_mode(&self) -> DeferredMode {
-        self.deferred_mode
+        self.moves_deferred != 0
     }
 
     pub fn is_deferred(&self, axis: i32) -> bool {
@@ -352,21 +365,27 @@ impl PmacController {
         self.deferred.remove(&axis);
     }
 
-    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch: releasing the
-    /// deferral executes the pending moves in the configured mode.
-    pub fn set_deferred_moves(&mut self, defer: bool) -> AsynResult<()> {
-        let release = !defer && self.moves_deferred;
-        self.moves_deferred = defer;
-        if !release {
-            return Ok(());
-        }
-        let result = match self.deferred_mode {
-            DeferredMode::Fast => self.process_deferred_moves(),
-            DeferredMode::Coordinated => self.process_deferred_coord_moves(),
+    /// C `pmacController::writeInt32`, `motorDeferMoves_` branch: 0 releases
+    /// the pending moves in the mode the last value armed, then `value` is the
+    /// mode.
+    pub fn set_moves_deferred(&mut self, value: i32) -> AsynResult<()> {
+        let result = match (value, self.moves_deferred) {
+            (0, DEFERRED_FAST_MOVES) => self.process_deferred_moves(),
+            (0, DEFERRED_COORDINATED_MOVES) => self.process_deferred_coord_moves(),
+            _ => Ok(()),
         };
-        // C clears the pending moves whether or not the command succeeded.
-        self.deferred.clear();
+        if value == 0 {
+            // C clears the pending moves whether or not the command succeeded.
+            self.deferred.clear();
+        }
+        self.moves_deferred = value;
         result
+    }
+
+    /// C `pmacController::writeInt32`, `PMAC_C_FeedRate_` branch: the PMAC
+    /// does not answer `%n`.
+    pub fn set_feed_rate(&self, value: i32) -> AsynResult<()> {
+        self.write_read(&format!("%{value}")).map(drop)
     }
 
     fn process_deferred_moves(&mut self) -> AsynResult<()> {
@@ -420,18 +439,111 @@ impl PmacController {
     }
 }
 
+/// C `pmacController`'s own parameters (pmacController.cpp:183-191), all
+/// read and written at address 0.
+#[derive(Clone, Copy, Debug)]
+pub struct PmacParams {
+    pub global_status: usize,
+    pub comms_error: usize,
+    pub feed_rate: usize,
+    pub feed_rate_limit: usize,
+    pub feed_rate_poll: usize,
+    pub feed_rate_problem: usize,
+    pub coord_sys_group: usize,
+}
+
+/// `pmacController`'s part of the controller port: its parameters and
+/// `writeInt32`, ahead of the base's.
+pub struct PmacControllerParams {
+    controller: Arc<Mutex<PmacController>>,
+}
+
+impl PmacControllerParams {
+    pub fn new(controller: Arc<Mutex<PmacController>>) -> Self {
+        Self { controller }
+    }
+}
+
+fn lock(controller: &Mutex<PmacController>) -> std::sync::MutexGuard<'_, PmacController> {
+    controller.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl ControllerParams for PmacControllerParams {
+    fn create_params(&mut self, base: &mut PortDriverBase) -> AsynResult<()> {
+        let mut create = |name| base.create_param(name, ParamType::Int32);
+        create("PMAC_C_FIRSTPARAM")?;
+        let params = PmacParams {
+            global_status: create("PMAC_C_GLOBALSTATUS")?,
+            comms_error: create("PMAC_C_COMMSERROR")?,
+            feed_rate: create("PMAC_C_FEEDRATE")?,
+            feed_rate_limit: create("PMAC_C_FEEDRATE_LIMIT")?,
+            feed_rate_poll: create("PMAC_C_FEEDRATE_POLL")?,
+            feed_rate_problem: create("PMAC_C_FEEDRATE_PROBLEM")?,
+            coord_sys_group: create("PMAC_C_COORDINATE_SYS_GROUP")?,
+        };
+        create("PMAC_C_LASTPARAM")?;
+        // C's constructor (pmacController.cpp:194-205).
+        let mut controller = lock(&self.controller);
+        base.set_int32_param(params.comms_error, 0, i32::from(!controller.connected()))?;
+        base.set_int32_param(params.global_status, 0, 0)?;
+        base.set_int32_param(params.feed_rate_problem, 0, 0)?;
+        controller.params = Some(params);
+        Ok(())
+    }
+
+    /// Address 0 is C's `pAxisZero`, the axis that carries these parameters.
+    fn is_controller_axis(&self, addr: i32) -> bool {
+        addr == 0
+    }
+
+    fn write_int32(
+        &mut self,
+        _base: &mut PortDriverBase,
+        user: &AsynUser,
+        value: i32,
+    ) -> AsynResult<()> {
+        let mut controller = lock(&self.controller);
+        let Some(p) = controller.params else {
+            return Ok(());
+        };
+        match user.reason {
+            r if r == p.feed_rate_poll => controller.feed_rate_poll = value != 0,
+            // C reads the limit parameter at each poll.
+            r if r == p.feed_rate_limit => controller.feed_rate_limit = value,
+            r if r == p.feed_rate => return controller.set_feed_rate(value),
+            r if r == p.coord_sys_group => return controller.switch_cs_group(value),
+            // An axis address reaches the same branch through
+            // `PmacAxis::set_deferred_moves`.
+            index::DEFER_MOVES if user.addr == 0 => return controller.set_moves_deferred(value),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn deferred_mode_from_code() {
-        assert_eq!(DeferredMode::from_code(1).unwrap(), DeferredMode::Fast);
-        assert_eq!(
-            DeferredMode::from_code(2).unwrap(),
-            DeferredMode::Coordinated
+    fn defer_value_arms_the_mode_and_zero_releases_it() {
+        let mut c = PmacController::new(None, Duration::ZERO);
+        c.set_moves_deferred(DEFERRED_COORDINATED_MOVES).unwrap();
+        assert!(c.moves_deferred());
+        c.set_moves_deferred(0).unwrap();
+        assert!(!c.moves_deferred());
+        // Releasing a fast deferral with a pending move sends the jog line,
+        // which fails on a controller with no low-level port.
+        c.set_moves_deferred(DEFERRED_FAST_MOVES).unwrap();
+        c.defer_move(
+            1,
+            DeferredMove {
+                position: 1.0,
+                relative: false,
+                time_ms: 0.0,
+            },
         );
-        assert!(DeferredMode::from_code(0).is_err());
-        assert!(DeferredMode::from_code(3).is_err());
+        assert!(c.set_moves_deferred(0).is_err());
+        assert!(!c.is_deferred(1));
     }
 }

@@ -60,6 +60,9 @@ pmacCreateAxes("$(CTRL)", $(NUMAXES))
 #dbLoadRecords("$(PMAC_IOC)/db/pmac_cs.template", "P=$(P),M=cs2x,PORT=CS2,ADDR=6")
 
 # ---- records ----
+# Controller parameters at address 0: global status, feed rate, CS group,
+# deferred moves.
+dbLoadRecords("$(PMAC_IOC)/db/pmacController.template", "P=$(P)ctrl,PORT=$(CTRL)")
 dbLoadRecords("$(PMAC_IOC)/db/pmac.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=1")
 dbLoadRecords("$(PMAC_IOC)/db/pmac.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=2")
 

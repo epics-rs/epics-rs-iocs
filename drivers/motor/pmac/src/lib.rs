@@ -42,12 +42,6 @@
 //!   record already does the division, so this port speaks controller counts
 //!   (real axes, `MRES = 1`) and PLC EGU (CS axes, `MRES` = the C 1e-4
 //!   `stepSize`, since raw counts are integers). See [`axis`].
-//! - **Controller-level PVs are not served.** The C driver's
-//!   `PMAC_C_FEEDRATE_POLL` / `_LIMIT`, the deferred-move *mode* and the
-//!   coordinate-system group selection are asyn parameters on address 0, which
-//!   the asyn-rs motor boundary does not carry; the controller keeps their
-//!   defaults (fast deferred moves, no feed-rate poll, no group switch). See
-//!   [`controller`].
 //! - **Deferred moves live on the controller,** not on each axis. See
 //!   [`controller`].
 //!
@@ -83,6 +77,6 @@ pub mod ioc;
 pub mod protocol;
 
 pub use axis::PmacAxis;
-pub use controller::{DeferredMode, PmacController};
+pub use controller::PmacController;
 pub use coord::{PmacCoordSystem, PmacCsAxis};
 pub use ioc::pmac_commands;

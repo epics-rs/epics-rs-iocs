@@ -26,10 +26,10 @@ use epics_rs::base::server::iocsh::registry::*;
 use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
 use motor_common::model2::{Model2, Model2Axis};
-use motor_common::{asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_controller_port};
 
 use crate::axis::PmacAxis;
-use crate::controller::{DeferredMode, PMAC_TIMEOUT, PmacController};
+use crate::controller::{PMAC_TIMEOUT, PmacController, PmacControllerParams};
 use crate::coord::{CS_AXES, PmacCoordSystem, PmacCsAxis};
 use crate::ethernet::pmac_asyn_ip_configure_command;
 
@@ -161,20 +161,23 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let num_axes = c_int(args, 3);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
-            register_port(ctx, &name, num_axes + 1)?;
-            let controller = PmacController::new(
+            let controller = Arc::new(Mutex::new(PmacController::new(
                 low_level_port_connect(&low_level_port, low_level_addr),
-                DeferredMode::Fast,
-                false,
-                100,
                 POLL_CACHE_TTL,
-            );
+            )));
+            let params = PmacControllerParams::new(controller.clone());
+            let owner = ctx.db().scan_control().interrupt_gate();
+            let handle = register_controller_port(owner, &name, num_axes + 1, params)?;
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .attach_port(handle);
             registry
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(ControllerReg {
                     name,
-                    controller: Arc::new(Mutex::new(controller)),
+                    controller,
                     moving_poll_ms,
                     idle_poll_ms,
                 });
@@ -519,13 +522,7 @@ mod tests {
     }
 
     fn controller_on(port: &str) -> PmacController {
-        PmacController::new(
-            low_level_port_connect(port, 0),
-            DeferredMode::Fast,
-            false,
-            100,
-            POLL_CACHE_TTL,
-        )
+        PmacController::new(low_level_port_connect(port, 0), POLL_CACHE_TTL)
     }
 
     #[test]

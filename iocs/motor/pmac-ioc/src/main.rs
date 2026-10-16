@@ -38,6 +38,9 @@ async fn main() -> CaResult<()> {
     let (motor_name, motor_factory) = epics_rs::motor::motor_record_factory();
     app = app.register_record_type(motor_name, motor_factory);
 
+    // asyn's devEpics, for the controller records at address 0.
+    app = epics_rs::asyn::adapter::register_asyn_device_support(app);
+
     // Standard asyn iocsh commands — the serial/IP port configure verbs and the
     // EOS setters a raw-ASCII PMAC link needs.
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
