@@ -17,6 +17,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -685,10 +686,12 @@ impl PslRuntime {
 
 /// Create the detector port and start its acquisition task (C `PSLConfig`).
 ///
-/// `server_handle` is the `drvAsynIPPort` that reaches PSLViewer.
+/// `server_handle` is the user of the `drvAsynIPPort` that reaches PSLViewer —
+/// one with no port when that port does not exist, since C ignores the
+/// connect status (PSL.cpp:166-167).
 pub fn create_psl_detector(
     claim: &PortClaim,
-    server_handle: PortHandle,
+    server_handle: SyncIOHandle,
     max_memory: usize,
 ) -> AsynResult<PslRuntime> {
     let port_name = claim.name();
@@ -731,6 +734,7 @@ mod tests {
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::registry::claim_port;
+    use std::time::Duration;
 
     /// A detector whose PSLViewer socket never connects: the writes under
     /// test must not need the server.
@@ -746,7 +750,29 @@ mod tests {
             stop_requested: AtomicBool::new(false),
         });
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
-        PslDetector::new(name, PslServer::new(handle), 1 << 20, shared, tx).unwrap()
+        PslDetector::new(
+            name,
+            PslServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
+            1 << 20,
+            shared,
+            tx,
+        )
+        .unwrap()
+    }
+
+    /// C ignores the `pasynOctetSyncIO->connect` status (PSL.cpp:166): with no
+    /// server port configured, getVersion fails and the port stays up.
+    #[test]
+    fn a_detector_whose_server_port_is_missing_still_boots() {
+        let (server, status) = SyncIOHandle::connect_port("PSL_NONE_IP", 0, Duration::ZERO);
+        assert!(status.is_err());
+        let rt = create_psl_detector(&claim_port("PSL_NONE").unwrap(), server, 1 << 20)
+            .expect("the detector port");
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        assert_eq!(
+            sync.read_int32(rt.ad_params.status).unwrap(),
+            ADStatus::Error as i32
+        );
     }
 
     /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
@@ -935,7 +961,14 @@ mod tests {
             stop_requested: AtomicBool::new(false),
         });
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
-        let mut det = PslDetector::new(name, PslServer::new(handle), 1 << 20, shared, tx).unwrap();
+        let mut det = PslDetector::new(
+            name,
+            PslServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
+            1 << 20,
+            shared,
+            tx,
+        )
+        .unwrap();
         det.state.valid_options = ["RecordPath".to_string()].into();
         let p = det.ad.params.base;
         det.get_config().unwrap();
