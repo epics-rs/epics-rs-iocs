@@ -22,6 +22,7 @@ use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -32,7 +33,7 @@ use crate::protocol::{
     CMD_ERASE, DONE_MODE_CHANGE, DONE_SCAN_DATA, cmd_change, cmd_scan, full_file_name,
     response_done,
 };
-use crate::server::{SERVER_ADDR, classify};
+use crate::server::{SERVER_ADDR, classify, server_submit};
 use crate::types::{
     CamStatus, EraseMode, Event, IMAGE_SIZES, MAR345_COMMAND_TIMEOUT, MAR345_POLL_DELAY,
     MAX_FILENAME_LEN, MAX_MESSAGE_SIZE, Mode, Status, secs,
@@ -74,8 +75,8 @@ impl Step for Held {
 pub struct Worker {
     /// The mar345 port, whose actor is the driver lock.
     pub port: PortHandle,
-    /// The marServer octet port created by `drvAsynIPPortConfigure`.
-    pub server_port: PortHandle,
+    /// C `pasynUserServer`, shared with the driver.
+    pub server_port: Arc<SyncIOHandle>,
     pub ad: ADBaseParams,
     pub p: Mar345Params,
     /// C `fromServer`.
@@ -131,7 +132,8 @@ impl Worker {
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(timeout));
         let read = l.unlocked(|| {
-            self.server_port.submit_blocking(
+            server_submit(
+                &self.server_port,
                 RequestOp::OctetRead {
                     buf_size: MAX_MESSAGE_SIZE,
                 },
@@ -595,7 +597,7 @@ mod tests {
         det.connect_downstream(sender);
         let worker = Worker {
             port: h.clone(),
-            server_port: crate::driver::tests::server_handle(name),
+            server_port: Arc::new(crate::driver::tests::server_user(name)),
             ad,
             p: det.mar345_params,
             from: String::new(),
