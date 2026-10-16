@@ -402,6 +402,7 @@ mod tests {
     /// Axis 0 of an E-516 on a fresh [`Stage`] port named `port`.
     fn stage_axis(port: &str) -> PiJedsAxis {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let stage = Stage {
@@ -410,7 +411,9 @@ mod tests {
             target: 0.0,
             reply: Vec::new(),
         };
-        let (rt, _jh) = create_port_runtime(stage, RuntimeConfig::default()).unwrap();
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(port).unwrap(), stage, RuntimeConfig::default())
+                .unwrap();
         let io = SyncIOHandle::from_handle(
             rt.port_handle().clone(),
             0,
