@@ -28,7 +28,8 @@
 //!   from every switch arm, including the illegal-command default -- no
 //!   internal I/O failure (a failed `sendMessage`) is ever surfaced to the
 //!   asyn caller, only logged. `RontecDriver::dispatch_write` reproduces
-//!   this: every `send_message` result inside it is discarded.
+//!   this: every `send_message` result inside it is discarded once
+//!   `send_message` has printed C's `ASYN_TRACE_ERROR` line for it.
 //! - **`mcaElapsedLiveTime` always mirrors `mcaElapsedRealTime`.** C's
 //!   `mcaReadStatus` handler (`drvMcaRontec.c:307-317`) sets `elive` from
 //!   `atoi(&response[4])` on the **same** `response` buffer the preceding
@@ -95,6 +96,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use mca::interface::McaReason;
@@ -232,7 +234,7 @@ impl RontecDriver {
         // don't clear after sending. Best-effort: C ignores this call's
         // status entirely and `RontecConfig` always returns success
         // regardless (`drvMcaRontec.c:199`).
-        let _ = driver.send_message("$SM 4,0", RONTEC_TIMEOUT);
+        let _ = driver.send_message("$SM 4,0");
 
         Ok(driver)
     }
@@ -256,24 +258,46 @@ impl RontecDriver {
             .find(|r| self.reasons[*r as usize] == idx)
     }
 
-    /// C `sendMessage` (`drvMcaRontec.c:581-604`), minus the `"!ERROR"`
-    /// trace-log check: every caller of `sendMessage` in C already discards
-    /// its `asynStatus` return regardless of that check's outcome (see
-    /// module doc's "always returns success" quirk), so it has no
-    /// observable effect through this driver's contract.
-    fn send_message(&self, output: &str, timeout: Duration) -> AsynResult<Vec<u8>> {
-        let user = self.octet_user(timeout);
-        let result = self.serial.submit_blocking(
-            RequestOp::OctetWriteRead {
-                data: output.as_bytes().to_vec(),
-                buf_size: RONTEC_MESSAGE_SIZE,
-                flush: true,
+    /// C `sendMessage` (`drvMcaRontec.c:581-604`): the error line is printed
+    /// through the serial port's trace, as C prints it on `pPvt->pasynUser`.
+    fn send_message(&self, output: &str) -> AsynResult<Vec<u8>> {
+        let result = self
+            .serial
+            .submit_blocking(
+                RequestOp::OctetWriteRead {
+                    data: output.as_bytes().to_vec(),
+                    buf_size: RONTEC_MESSAGE_SIZE,
+                    flush: true,
+                },
+                self.octet_user(RONTEC_TIMEOUT),
+            )
+            .map(|r| r.data.unwrap_or_default());
+        // A failed read still wrote the whole command; a failed write read
+        // nothing. A bare error carries neither count.
+        let (input, status, nbytes_out): (&[u8], AsynStatus, usize) = match &result {
+            Ok(data) => (data, AsynStatus::Success, output.len()),
+            Err(e) => match (e.partial_read(), e.partial_write()) {
+                (Some(p), _) => (&p.data, e.status(), output.len()),
+                (None, Some(n)) => (&[], e.status(), n),
+                (None, None) => (&[], e.status(), 0),
             },
-            user,
-        )?;
+        };
+        if status != AsynStatus::Success || input.starts_with(b"!ERROR") {
+            self.serial.user_trace().print(
+                self.addr,
+                OCTET_REASON as i32,
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "drvMcaRontec::sendMessage: error {}, status={}, nbytesOut={nbytes_out}, nbytesIn={}",
+                    String::from_utf8_lossy(input),
+                    status as i32,
+                    input.len()
+                ),
+            );
+        }
         result
-            .data
-            .ok_or_else(|| protocol_error("sendMessage: writeRead returned no data"))
     }
 
     /// C `int32ArrayRead` (`drvMcaRontec.c:436-478`), with the buffer
@@ -362,7 +386,7 @@ impl RontecDriver {
     /// at source (module doc): a field is only updated when its query
     /// actually succeeded.
     fn read_status(&mut self) {
-        if let Ok(resp) = self.send_message("$FP", RONTEC_TIMEOUT)
+        if let Ok(resp) = self.send_message("$FP")
             && let Some(&flag) = resp.get(4)
         {
             self.acquiring = flag == b'-';
@@ -376,7 +400,7 @@ impl RontecDriver {
 
         // Preserved quirk: `elive` mirrors `ereal` from the same `"$MS"`
         // reply (module doc's "unfixable-without-spec" entry).
-        if let Ok(resp) = self.send_message("$MS", RONTEC_TIMEOUT)
+        if let Ok(resp) = self.send_message("$MS")
             && resp.len() > 4
         {
             let value = c_atoi(&resp[4..]);
@@ -387,12 +411,18 @@ impl RontecDriver {
 
     /// C `mcaNumChannels`'s handler (`drvMcaRontec.c:322-330`), with the
     /// division-by-zero defect fixed at source (module doc).
-    fn set_num_channels(&mut self, value: i32) {
+    fn set_num_channels(&mut self, user: &AsynUser, value: i32) {
         // C caches the value before the bounds check, and an out-of-range
         // write leaves that cached value in place -- preserved (matches
         // `mca::fastsweep`'s own documented `NumChannels` quirk).
         self.nchans = value;
         let nchans = if value > RONTEC_MAXCHANS as i32 {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("mcaRontecServer Illegal nuse field"),
+            );
             self.nchans = RONTEC_MAXCHANS as i32;
             RONTEC_MAXCHANS as i32
         } else {
@@ -409,34 +439,70 @@ impl RontecDriver {
     /// `Ok(())` -- see module doc's "always returns success" quirk; unlike
     /// C, this is enforced by construction (no `?` anywhere in this
     /// function) rather than by a single trailing `return`.
-    fn dispatch_write(&mut self, reason: Option<McaReason>, ivalue: i32, dvalue: f64) {
-        match reason {
+    fn dispatch_write(&mut self, user: &AsynUser, ivalue: i32, dvalue: f64) {
+        match self.reason_of(user.reason) {
             Some(McaReason::StartAcquire) => {
                 let _ = if self.plive > 0 {
-                    self.send_message(&format!("$LT {}", self.plive), RONTEC_TIMEOUT)
+                    self.send_message(&format!("$LT {}", self.plive))
                 } else if self.preal > 0 {
-                    self.send_message(&format!("$MT {}", self.preal), RONTEC_TIMEOUT)
+                    self.send_message(&format!("$MT {}", self.preal))
                 } else {
-                    self.send_message("$MT 0", RONTEC_TIMEOUT)
+                    self.send_message("$MT 0")
                 };
             }
             Some(McaReason::StopAcquire) => {
-                let _ = self.send_message("$MP ON", RONTEC_TIMEOUT);
+                let _ = self.send_message("$MP ON");
             }
             Some(McaReason::Erase) => {
-                let _ = self.send_message("$CC", RONTEC_TIMEOUT);
+                let _ = self.send_message("$CC");
             }
             Some(McaReason::ReadStatus) => self.read_status(),
-            Some(McaReason::NumChannels) => self.set_num_channels(ivalue),
+            Some(McaReason::NumChannels) => self.set_num_channels(user, ivalue),
             Some(McaReason::PresetRealTime) => self.preal = (1000.0 * dvalue) as i32,
             Some(McaReason::PresetLiveTime) => self.plive = (1000.0 * dvalue) as i32,
-            // NOOPs for Rontec (module doc): ChannelAdvanceSource,
-            // AcquireMode, Sequence, Prescale, PresetSweeps,
-            // PresetLowChannel, PresetHighChannel, DwellTime, PresetCounts.
-            // Also the illegal-command / unreachable (Data/Acquiring/
-            // Elapsed*) default, matching C's default arm.
-            _ => {}
+            // NOOPs for Rontec (module doc).
+            Some(
+                McaReason::ChannelAdvanceSource
+                | McaReason::AcquireMode
+                | McaReason::Sequence
+                | McaReason::Prescale
+                | McaReason::PresetSweeps
+                | McaReason::PresetLowChannel
+                | McaReason::PresetHighChannel
+                | McaReason::DwellTime
+                | McaReason::PresetCounts,
+            ) => {}
+            Some(
+                McaReason::Data
+                | McaReason::Acquiring
+                | McaReason::ElapsedLiveTime
+                | McaReason::ElapsedRealTime
+                | McaReason::ElapsedCounts,
+            )
+            | None => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "drvMcaRontec::RontecWrite port {} got illegal command {}",
+                    self.base.port_name, user.reason
+                ),
+            ),
         }
+    }
+
+    /// C `RontecRead`'s default arm (`drvMcaRontec.c:417-422`).
+    fn illegal_read(&self, user: &AsynUser) -> AsynError {
+        user.print(
+            TraceMask::ERROR,
+            file!(),
+            line!(),
+            format_args!(
+                "drvMcaRontec::RontecRead got illegal command {}",
+                user.reason
+            ),
+        );
+        protocol_error(format!("RontecRead got illegal command {}", user.reason))
     }
 }
 
@@ -450,14 +516,12 @@ impl PortDriver for RontecDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = self.reason_of(user.reason);
-        self.dispatch_write(reason, value, 0.0);
+        self.dispatch_write(user, value, 0.0);
         Ok(())
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = self.reason_of(user.reason);
-        self.dispatch_write(reason, 0, value);
+        self.dispatch_write(user, 0, value);
         Ok(())
     }
 
@@ -466,10 +530,7 @@ impl PortDriver for RontecDriver {
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
         match self.reason_of(user.reason) {
             Some(McaReason::Acquiring) => Ok(i32::from(self.acquiring)),
-            _ => Err(protocol_error(format!(
-                "RontecRead got illegal command {}",
-                user.reason
-            ))),
+            _ => Err(self.illegal_read(user)),
         }
     }
 
@@ -481,10 +542,7 @@ impl PortDriver for RontecDriver {
             Some(McaReason::ElapsedLiveTime) => Ok(f64::from(self.elive) / 1000.0),
             Some(McaReason::ElapsedRealTime) => Ok(f64::from(self.ereal) / 1000.0),
             Some(McaReason::ElapsedCounts) => Ok(0.0),
-            _ => Err(protocol_error(format!(
-                "RontecRead got illegal command {}",
-                user.reason
-            ))),
+            _ => Err(self.illegal_read(user)),
         }
     }
 
@@ -498,6 +556,7 @@ impl PortDriver for RontecDriver {
 
 #[cfg(test)]
 mod tests {
+    use epics_rs::asyn::request::RequestResult;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::create_port_runtime;
 
@@ -583,7 +642,7 @@ mod tests {
     fn set_num_channels_guards_against_a_zero_value() {
         let mut d = dummy_driver();
         d.binning = 7;
-        d.set_num_channels(0);
+        d.set_num_channels(&AsynUser::default(), 0);
         assert_eq!(d.nchans, 0);
         assert_eq!(
             d.binning, 7,
@@ -596,7 +655,7 @@ mod tests {
     #[test]
     fn set_num_channels_caches_an_out_of_range_value_before_clamping() {
         let mut d = dummy_driver();
-        d.set_num_channels(RONTEC_MAXCHANS as i32 * 2);
+        d.set_num_channels(&AsynUser::default(), RONTEC_MAXCHANS as i32 * 2);
         assert_eq!(d.nchans, RONTEC_MAXCHANS as i32);
         assert_eq!(d.binning, 1);
     }
@@ -604,7 +663,7 @@ mod tests {
     #[test]
     fn set_num_channels_computes_binning_for_a_normal_value() {
         let mut d = dummy_driver();
-        d.set_num_channels(1024);
+        d.set_num_channels(&AsynUser::default(), 1024);
         assert_eq!(d.nchans, 1024);
         assert_eq!(d.binning, 4);
     }
@@ -612,10 +671,214 @@ mod tests {
     #[test]
     fn preset_times_are_stored_in_milliseconds() {
         let mut d = dummy_driver();
-        d.dispatch_write(Some(McaReason::PresetRealTime), 0, 2.5);
+        d.dispatch_write(&AsynUser::new(McaReason::PresetRealTime as usize), 0, 2.5);
         assert_eq!(d.preal, 2500);
-        d.dispatch_write(Some(McaReason::PresetLiveTime), 0, 1.0);
+        d.dispatch_write(&AsynUser::new(McaReason::PresetLiveTime as usize), 0, 1.0);
         assert_eq!(d.plive, 1000);
+    }
+
+    /// A serial port answering each Rontec command from `reply`, logging
+    /// every write.
+    struct FakeSerial {
+        base: PortDriverBase,
+        reply: fn(&[u8]) -> Vec<u8>,
+        pending: Vec<u8>,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        input_eos: Vec<u8>,
+    }
+
+    impl PortDriver for FakeSerial {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.writes.lock().unwrap().push(data.to_vec());
+            self.pending = (self.reply)(data);
+            Ok(data.len())
+        }
+
+        /// No reply is a timeout, carried the way the EOS interpose carries
+        /// every failed read.
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            if self.pending.is_empty() {
+                return Err(AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "timeout".into(),
+                }
+                .with_partial_read(epics_rs::asyn::interpose::PartialOctetRead {
+                    data: Vec::new(),
+                    eom_reason: epics_rs::asyn::interpose::EomReason::empty(),
+                }));
+            }
+            let n = self.pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.pending[..n]);
+            self.pending.drain(..n);
+            Ok(n)
+        }
+
+        fn set_input_eos(&mut self, _user: &AsynUser, eos: &[u8]) -> AsynResult<()> {
+            self.input_eos = eos.to_vec();
+            Ok(())
+        }
+
+        fn get_input_eos(&self, _user: &AsynUser) -> Vec<u8> {
+            self.input_eos.clone()
+        }
+    }
+
+    /// A Rontec port on a [`FakeSerial`], both tracing into one file.
+    struct Rig {
+        rontec: epics_rs::asyn::runtime::port::PortRuntimeHandle,
+        _serial: epics_rs::asyn::runtime::port::PortRuntimeHandle,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        trace_path: std::path::PathBuf,
+    }
+
+    impl Rig {
+        fn new(tag: &str, reply: fn(&[u8]) -> Vec<u8>) -> Self {
+            use epics_rs::asyn::services::PortServices;
+            use epics_rs::asyn::trace::TraceFile;
+            let services = PortServices::new();
+            let config = || RuntimeConfig {
+                services: services.clone(),
+                ..RuntimeConfig::default()
+            };
+            let serial_name = format!("RIGSER_{tag}");
+            let rontec_name = format!("RIGRON_{tag}");
+            let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let serial = FakeSerial {
+                base: PortDriverBase::new(&serial_name, 1, PortFlags::default()),
+                reply,
+                pending: Vec::new(),
+                writes: writes.clone(),
+                input_eos: b"\r".to_vec(),
+            };
+            let (serial_rt, _) = create_port_runtime(serial, config()).expect("serial runtime");
+            let mut d = dummy_driver();
+            d.base = PortDriverBase::new(
+                &rontec_name,
+                1,
+                PortFlags {
+                    multi_device: true,
+                    can_block: true,
+                    destructible: true,
+                },
+            );
+            d.reasons = McaReason::create_params(&mut d.base).expect("params");
+            d.serial = serial_rt.port_handle().clone();
+            let (rontec, _) = create_port_runtime(d, config()).expect("rontec runtime");
+            let trace_path =
+                std::env::temp_dir().join(format!("mca-rontec-{tag}-{}.trace", std::process::id()));
+            let file = std::sync::Arc::new(std::sync::Mutex::new(
+                std::fs::File::create(&trace_path).expect("trace file"),
+            ));
+            for name in [&serial_name, &rontec_name] {
+                services
+                    .trace()
+                    .set_trace_file(Some(name), TraceFile::File(file.clone()));
+            }
+            Rig {
+                rontec,
+                _serial: serial_rt,
+                writes,
+                trace_path,
+            }
+        }
+
+        fn submit(&self, op: RequestOp, reason: McaReason) -> AsynResult<RequestResult> {
+            self.rontec
+                .port_handle()
+                .submit_blocking(op, AsynUser::new(reason as usize))
+        }
+
+        fn trace(&self) -> String {
+            std::fs::read_to_string(&self.trace_path).expect("trace file")
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.trace_path);
+        }
+    }
+
+    fn rontec_reply(cmd: &[u8]) -> Vec<u8> {
+        match cmd {
+            b"$CC" => b"!ERROR 3".to_vec(),
+            b"$MP ON" => Vec::new(),
+            _ => b"!OK".to_vec(),
+        }
+    }
+
+    /// C `sendMessage` prints the `!ERROR` reply at `ASYN_TRACE_ERROR`
+    /// (`drvMcaRontec.c:598-601`) while the write still succeeds.
+    #[test]
+    fn send_message_prints_an_error_reply() {
+        let rig = Rig::new("err", rontec_reply);
+        rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Erase)
+            .expect("RontecWrite always succeeds");
+        assert_eq!(rig.writes.lock().unwrap().as_slice(), [b"$CC".to_vec()]);
+        assert!(
+            rig.trace().contains(
+                "drvMcaRontec::sendMessage: error !ERROR 3, status=0, nbytesOut=3, nbytesIn=8\n"
+            ),
+            "{}",
+            rig.trace()
+        );
+        rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Sequence)
+            .expect("noop");
+        assert_eq!(rig.trace().matches("sendMessage").count(), 1);
+    }
+
+    #[test]
+    fn send_message_prints_an_io_failure() {
+        let rig = Rig::new("timeout", rontec_reply);
+        rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::StopAcquire)
+            .expect("RontecWrite always succeeds");
+        assert!(
+            rig.trace()
+                .contains("drvMcaRontec::sendMessage: error , status=1, nbytesOut=6, nbytesIn=0\n"),
+            "{}",
+            rig.trace()
+        );
+    }
+
+    #[test]
+    fn an_oversized_nuse_prints_c_illegal_nuse_line() {
+        let rig = Rig::new("nuse", rontec_reply);
+        rig.submit(
+            RequestOp::Int32Write {
+                value: RONTEC_MAXCHANS as i32 + 1,
+            },
+            McaReason::NumChannels,
+        )
+        .expect("write");
+        assert!(rig.trace().contains("mcaRontecServer Illegal nuse field"));
+    }
+
+    /// C `RontecWrite`/`RontecRead` default arms (`drvMcaRontec.c:372-376,
+    /// 417-422`).
+    #[test]
+    fn illegal_commands_print_c_lines() {
+        let rig = Rig::new("illegal", rontec_reply);
+        rig.submit(RequestOp::Int32Write { value: 1 }, McaReason::Acquiring)
+            .expect("RontecWrite always succeeds");
+        assert!(
+            rig.trace()
+                .contains("drvMcaRontec::RontecWrite port RIGRON_illegal got illegal command 17\n"),
+            "{}",
+            rig.trace()
+        );
+        assert!(rig.submit(RequestOp::Int32Read, McaReason::Erase).is_err());
+        assert!(
+            rig.trace()
+                .contains("drvMcaRontec::RontecRead got illegal command 3\n")
+        );
     }
 
     #[test]
