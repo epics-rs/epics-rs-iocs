@@ -11,7 +11,7 @@ use crate::cache::*;
 use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
-use epics_rs::base::server::database::WriteDone;
+use epics_rs::base::server::database::DeviceDone;
 use epics_rs::base::server::driver_support::DriverSupport;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
@@ -99,7 +99,7 @@ pub enum Command {
 /// or the record whose `process()` it re-runs (drvMW100.c:1418-1424).
 enum Done {
     Wait(mpsc::Sender<()>),
-    Process(WriteDone),
+    Process(DeviceDone),
     NoRecord,
 }
 
@@ -200,7 +200,7 @@ impl Instrument {
     /// actor completes `done` when it has run. On a device with no queue
     /// thread `done` is dropped un-run and the record stays in PACT, as C's
     /// packet sits on a list nobody drains.
-    pub fn submit_write(&self, command: Command, done: WriteDone) {
+    pub fn submit_write(&self, command: Command, done: DeviceDone) {
         self.send(command, Done::Process(done));
     }
 

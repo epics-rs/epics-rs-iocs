@@ -27,7 +27,7 @@ use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::sync::mpsc::{self, Receiver, Sender};
-use epics_rs::base::server::database::WriteDoneSource;
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
 };
@@ -788,7 +788,7 @@ impl DeviceSupport for MwDevice {
     fn write_begin(
         &mut self,
         record: &mut dyn Record,
-        done: &WriteDoneSource<'_>,
+        done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         let Some(Resolved { instrument, op }) = self.resolved.as_ref() else {
             return Ok(WriteStart::Completed);
@@ -807,7 +807,7 @@ impl DeviceSupport for MwDevice {
         ) {
             record.put_field("VAL", EpicsValue::Enum(0))?;
         }
-        instrument.submit_write(command, done.write_done());
+        instrument.submit_write(command, done.device_done());
         Ok(WriteStart::Pending)
     }
 }
@@ -923,7 +923,7 @@ mod tests {
         fe1_one_signal_channel, is0_all_zero, one_record_fd1_binary, spawn_fake_device,
     };
     use epics_rs::base::runtime::task::test_block_on;
-    use epics_rs::base::server::database::{PvDatabase, WriteDone};
+    use epics_rs::base::server::database::{DeviceDone, PvDatabase};
     use epics_rs::base::server::device_support::wire_device_to_record;
     use epics_rs::base::server::recgbl::alarm_status;
     use epics_rs::base::server::record::{AlarmSeverity, FieldDesc};
@@ -1508,9 +1508,15 @@ mod tests {
             let mut record = FakeRecord::new("bo");
             device.init(&mut record).unwrap();
             let db = PvDatabase::new();
-            let cell = WriteDone::new(&db, "TEST".into(), 0);
+            let cell = DeviceDone::new(
+                &db,
+                &epics_rs::base::server::record::RecordInstance::new(
+                    "TEST",
+                    epics_rs::base::server::records::bo::BoRecord::default(),
+                ),
+            );
             let start = device
-                .write_begin(&mut record, &WriteDoneSource::new(&cell))
+                .write_begin(&mut record, &DeviceDoneSource::new(&cell))
                 .unwrap();
             assert!(matches!(start, WriteStart::Pending));
             assert_eq!(

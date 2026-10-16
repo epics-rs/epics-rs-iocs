@@ -15,7 +15,7 @@
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
-use epics_rs::base::server::database::WriteDoneSource;
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
     DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
 };
@@ -678,14 +678,14 @@ impl DeviceSupport for GmDevice {
     fn write_begin(
         &mut self,
         record: &mut dyn Record,
-        done: &WriteDoneSource<'_>,
+        done: &DeviceDoneSource<'_>,
     ) -> CaResult<WriteStart> {
         let (Some(Resolved { instrument, .. }), Some(command)) =
             (&self.resolved, self.output_command(record)?)
         else {
             return Ok(WriteStart::Completed);
         };
-        let (write_done, priority) = (done.write_done(), done.priority());
+        let (write_done, priority) = (done.device_done(), done.priority());
         instrument.enqueue(
             command,
             Box::new(move || {
@@ -1329,7 +1329,7 @@ mod tests {
 
     #[test]
     fn bo_write_begin_queues_the_command_and_stays_pending() {
-        use epics_rs::base::server::database::{PvDatabase, WriteDone};
+        use epics_rs::base::server::database::{DeviceDone, PvDatabase};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut responses = crate::instrument::test_support::default_init_responses();
@@ -1348,9 +1348,15 @@ mod tests {
         device.init(&mut record).unwrap();
         record.fields.insert("VAL", EpicsValue::Enum(1));
         let db = PvDatabase::new();
-        let done = WriteDone::new(&db, "GM10:TRIG".into(), 0);
+        let done = DeviceDone::new(
+            &db,
+            &epics_rs::base::server::record::RecordInstance::new(
+                "GM10:TRIG",
+                epics_rs::base::server::records::bo::BoRecord::default(),
+            ),
+        );
         let start = device
-            .write_begin(&mut record, &WriteDoneSource::new(&done))
+            .write_begin(&mut record, &DeviceDoneSource::new(&done))
             .unwrap();
         assert!(matches!(start, WriteStart::Pending));
         assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
