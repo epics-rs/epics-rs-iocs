@@ -4,7 +4,7 @@
 //!
 //! As in `marCCD.cpp` they run under the driver lock, which here is the port
 //! actor: `writeInt32` / `writeFloat64` call them inline, and the worker
-//! threads reach them through `task::DriverLock`. Each call blocks the
+//! threads reach them through `task::Held`. Each call blocks the
 //! actor on the marServer port, which is a different port, so the round trip
 //! cannot interleave with another context's.
 

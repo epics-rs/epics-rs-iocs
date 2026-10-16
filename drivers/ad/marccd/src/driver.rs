@@ -27,7 +27,7 @@ use crate::params::MarccdParams;
 use crate::protocol::{
     cmd_set_bin, cmd_set_frameshift, cmd_set_gating, cmd_set_readout_mode, cmd_set_stability,
 };
-use crate::task::{DriverLock, Worker, start_det_task, start_image_task};
+use crate::task::{Worker, start_det_task, start_image_task};
 use crate::types::{
     Event, FrameType, TASK_ACQUIRE, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TriggerMode,
     test_task_status,
@@ -359,26 +359,22 @@ pub fn create_marccd_detector(
     // `image_event` (C `imageEventId`) is signalled by the det task in overlap
     // mode and awaited by the image task.
     let image_ev = Arc::new(Event::new());
-    let worker = || -> Result<Worker, String> {
-        Ok(Worker {
-            port: handle.clone(),
-            lock: DriverLock::new(handle.clone())
-                .map_err(|e| format!("failed to start the marCCD lock thread: {e}"))?,
-            start: start.clone(),
-            stop: stop.clone(),
-            image_event: image_ev.clone(),
-            acq_start: acq_start.clone(),
-            output: ArrayPublisher::new(array_output.clone()),
-            pool: pool.clone(),
-            owner: owner.clone(),
-        })
+    let worker = || Worker {
+        port: handle.clone(),
+        start: start.clone(),
+        stop: stop.clone(),
+        image_event: image_ev.clone(),
+        acq_start: acq_start.clone(),
+        output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
+        owner: owner.clone(),
     };
 
     let started = handle
         .with_driver_blocking::<MarccdDriver, _>(MarccdDriver::init)
         .map_err(|e| format!("marCCD init failed: {e}"))?;
     let tasks = if started {
-        vec![start_det_task(worker()?), start_image_task(worker()?)]
+        vec![start_det_task(worker()), start_image_task(worker())]
     } else {
         Vec::new()
     };

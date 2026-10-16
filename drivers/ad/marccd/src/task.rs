@@ -5,14 +5,14 @@
 //! * `MarccdImageTask` is C's `getImageDataTask` — the overlapped
 //!   correction/readback path.
 //!
-//! Each thread holds the driver lock ([`DriverLock`]) over exactly C's
+//! Each thread holds the driver lock ([`Held`]) over exactly C's
 //! spans, releasing it only where C calls `unlock()`: the start and image
 //! events, the exposure and acquire-period waits, `readTiff`'s waits and
 //! the image task's poll sleeps.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
@@ -23,7 +23,7 @@ use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::port::PortDriver;
-use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::port_handle::{DriverHold, PortHandle};
 use epics_rs::asyn::trace::TraceMask;
 
 use crate::driver::MarccdDriver;
@@ -42,8 +42,6 @@ use crate::types::{
 pub(crate) struct Worker {
     /// The marCCD port, whose actor is the driver lock.
     pub port: PortHandle,
-    /// This thread's hold on that lock.
-    pub lock: DriverLock,
     pub start: Arc<Event>,
     pub stop: Arc<Event>,
     pub image_event: Arc<Event>,
@@ -72,80 +70,24 @@ fn epoch_secs(t: SystemTime) -> i64 {
     }
 }
 
-type Op = Box<dyn FnOnce(&mut MarccdDriver) + Send>;
+/// The driver lock a worker thread holds — C `lock()` … `unlock()`.
+pub(crate) type Held = DriverHold<MarccdDriver>;
 
-/// A worker thread's C `lock()`: a carrier thread keeps one
-/// `with_driver_blocking` call open on the port actor for as long as the
-/// worker holds the lock, running the worker's steps in it, so no client
-/// write reaches the driver between them.
-pub(crate) struct DriverLock {
-    carrier: mpsc::Sender<mpsc::Receiver<Op>>,
+/// [`DriverHold::run`] for a thread that carries on past a stopped port:
+/// the step yields `R::default()`.
+pub(crate) trait Step {
+    fn step<R: Default + Send + 'static>(
+        &mut self,
+        f: impl FnOnce(&mut MarccdDriver) -> R + Send + 'static,
+    ) -> R;
 }
 
-impl DriverLock {
-    pub(crate) fn new(port: PortHandle) -> std::io::Result<Self> {
-        let (carrier, sessions) = mpsc::channel::<mpsc::Receiver<Op>>();
-        std::thread::Builder::new()
-            .name("MarccdLock".into())
-            .spawn(move || {
-                for ops in sessions {
-                    let _ = port.with_driver_blocking::<MarccdDriver, _>(move |d| {
-                        for op in ops {
-                            op(d);
-                        }
-                    });
-                }
-            })?;
-        Ok(Self { carrier })
-    }
-
-    /// C `lock()`.
-    pub(crate) fn lock(&self) -> Held<'_> {
-        Held {
-            lock: self,
-            ops: self.enter(),
-        }
-    }
-
-    fn enter(&self) -> Option<mpsc::Sender<Op>> {
-        let (ops, session) = mpsc::channel();
-        self.carrier.send(session).ok()?;
-        Some(ops)
-    }
-}
-
-/// The driver lock, held; dropping it is C's `unlock()`.
-pub(crate) struct Held<'a> {
-    lock: &'a DriverLock,
-    ops: Option<mpsc::Sender<Op>>,
-}
-
-impl Held<'_> {
-    /// Run `f` on the driver inside the held lock. A stopped port yields
-    /// `R::default()`.
-    pub(crate) fn run<R: Default + Send + 'static>(
+impl Step for Held {
+    fn step<R: Default + Send + 'static>(
         &mut self,
         f: impl FnOnce(&mut MarccdDriver) -> R + Send + 'static,
     ) -> R {
-        let Some(ops) = &self.ops else {
-            return R::default();
-        };
-        let (tx, rx) = mpsc::sync_channel(1);
-        let op: Op = Box::new(move |d| {
-            let _ = tx.send(f(d));
-        });
-        if ops.send(op).is_err() {
-            return R::default();
-        }
-        rx.recv().unwrap_or_default()
-    }
-
-    /// C `unlock()` … `lock()` around `wait`.
-    pub(crate) fn unlocked<R>(&mut self, wait: impl FnOnce() -> R) -> R {
-        self.ops = None;
-        let r = wait();
-        self.ops = self.lock.enter();
-        r
+        self.run(f).unwrap_or_default()
     }
 }
 
@@ -167,8 +109,8 @@ impl Worker {
 
     /// C `acquireFrame`: the lock is released only while waiting out the
     /// exposure.
-    fn acquire_frame(&self, l: &mut Held<'_>, exposure_time: f64, use_shutter: bool) {
-        let trigger_mode = l.run(|d| {
+    fn acquire_frame(&self, l: &mut Held, exposure_time: f64, use_shutter: bool) {
+        let trigger_mode = l.step(|d| {
             let trigger_mode = d.get_i32(d.ad.params.trigger_mode);
             // Wait for the acquire task to be done with the previous acquisition.
             d.wait_state(|s| {
@@ -188,7 +130,7 @@ impl Worker {
 
         let start = Instant::now();
         if use_shutter {
-            l.run(|d| {
+            l.step(|d| {
                 let _ = ADDriver::set_shutter(d, true);
             });
         }
@@ -216,13 +158,13 @@ impl Worker {
                 break;
             }
             let time_remaining = (exposure_time - start.elapsed().as_secs_f64()).max(0.0);
-            l.run(move |d| {
+            l.step(move |d| {
                 d.set_f64(d.ad.params.time_remaining, time_remaining);
                 d.callbacks();
             });
         }
 
-        l.run(move |d| {
+        l.step(move |d| {
             d.set_f64(d.ad.params.time_remaining, 0.0);
             d.callbacks();
             if use_shutter {
@@ -232,9 +174,9 @@ impl Worker {
     }
 
     /// C `getImageData`, entered and left with the lock held.
-    async fn get_image_data(&self, l: &mut Held<'_>) -> CamStatus {
+    async fn get_image_data(&self, l: &mut Held) -> CamStatus {
         // Inquire about the image dimensions.
-        let (full_file_name, nx, ny, image_counter, array_callbacks) = l.run(|d| {
+        let (full_file_name, nx, ny, image_counter, array_callbacks) = l.step(|d| {
             d.get_config();
             let base = d.ad.params.base;
             let full = d.get_str(base.full_file_name, MAX_FILENAME_LEN);
@@ -271,7 +213,7 @@ impl Worker {
             array.time_stamp = self.load_acq_start();
             // C `getAttributes`, evaluated where its PARAM values live.
             let owner = self.owner.clone();
-            let fresh = l.run(move |d| {
+            let fresh = l.step(move |d| {
                 let mut attributes = owner.attributes().lock();
                 (!attributes.list.is_empty()).then(|| attributes.update(d.base()))
             });
@@ -292,12 +234,12 @@ impl Worker {
     /// This returns [`CamStatus::Error`] instead so no image is published.
     fn read_tiff(
         &self,
-        l: &mut Held<'_>,
+        l: &mut Held,
         file: &str,
         nx: usize,
         ny: usize,
     ) -> Result<Vec<u16>, CamStatus> {
-        let timeout = l.run(|d| d.get_f64(d.p.tiff_timeout));
+        let timeout = l.step(|d| d.get_f64(d.p.tiff_timeout));
         let t_start = Instant::now();
         let start_time = epoch_secs(SystemTime::now());
 
@@ -413,22 +355,24 @@ pub(crate) fn start_det_task(w: Worker) -> std::thread::JoinHandle<()> {
 
 /// C `marCCDTask`: it holds the lock except while waiting for a start.
 async fn det_loop(w: Worker) {
-    let mut l = w.lock.lock();
+    let Ok(mut l) = w.port.hold_driver_blocking::<MarccdDriver>() else {
+        return;
+    };
     loop {
-        let acquire = l.run(|d| d.get_i32(d.ad.params.acquire));
+        let acquire = l.step(|d| d.get_i32(d.ad.params.acquire));
         if acquire == 0 {
-            l.run(|d| {
+            l.step(|d| {
                 d.set_str(d.ad.params.status_message, "Waiting for acquire command");
                 d.callbacks();
             });
             l.unlocked(|| w.start.wait());
-            l.run(|d| {
+            l.step(|d| {
                 d.set_i32(d.ad.params.num_images_counter, 0);
                 d.callbacks();
             });
         }
 
-        let image_mode = l.run(|d| d.get_i32(d.ad.params.image_mode));
+        let image_mode = l.step(|d| d.get_i32(d.ad.params.image_mode));
         match ImageMode::from_i32(image_mode) {
             Some(ImageMode::Single | ImageMode::Multiple | ImageMode::Continuous) => {
                 collect_normal(&w, &mut l).await;
@@ -445,8 +389,8 @@ async fn det_loop(w: Worker) {
 
 /// `writeServer(command)` then poll until `task` is neither queued nor
 /// executing and marServer is not busy.
-fn run_server_task(l: &mut Held<'_>, command: &'static str, task: i32) {
-    l.run(move |d| {
+fn run_server_task(l: &mut Held, command: &'static str, task: i32) {
+    l.step(move |d| {
         d.write_server(command);
         d.wait_state(|s| {
             test_task_status(s, task, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0
@@ -456,9 +400,9 @@ fn run_server_task(l: &mut Held<'_>, command: &'static str, task: i32) {
 }
 
 /// C `collectNormal`.
-async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
+async fn collect_normal(w: &Worker, l: &mut Held) {
     let (image_mode, frame_type, acquire_time, auto_save, overlap, shutter_mode, array_callbacks) =
-        l.run(|d| {
+        l.step(|d| {
             let ad = d.ad.params;
             let values = (
                 d.get_i32(ad.image_mode),
@@ -486,7 +430,7 @@ async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
     match FrameType::from_i32(frame_type) {
         Some(FrameType::Normal) | Some(FrameType::Raw) => {
             let full_file_name = if auto_save != 0 {
-                l.run(|d| d.create_file_name())
+                l.step(|d| d.create_file_name())
             } else {
                 String::new()
             };
@@ -496,17 +440,17 @@ async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
             } else {
                 3
             };
-            completed = l.run(move |d| {
+            completed = l.step(move |d| {
                 !d.readout_frame(buffer_number, Some(&full_file_name), wait)
                     .is_err()
             });
         }
         Some(FrameType::Background) => {
             w.acquire_frame(l, 0.001, false);
-            completed = l.run(|d| !d.readout_frame(1, None, true).is_err());
+            completed = l.step(|d| !d.readout_frame(1, None, true).is_err());
             if completed {
                 w.acquire_frame(l, 0.001, false);
-                completed = l.run(|d| !d.readout_frame(2, None, true).is_err());
+                completed = l.step(|d| !d.readout_frame(2, None, true).is_err());
             }
             if completed {
                 run_server_task(l, "dezinger,1", TASK_DEZINGER);
@@ -514,20 +458,20 @@ async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
         }
         Some(FrameType::DoubleCorrelation) => {
             w.acquire_frame(l, acquire_time / 2.0, use_shutter);
-            completed = l.run(|d| !d.readout_frame(2, None, true).is_err());
+            completed = l.step(|d| !d.readout_frame(2, None, true).is_err());
             // If the user aborted then ADAcquire will be 0.
-            if completed && l.run(|d| d.get_i32(d.ad.params.acquire)) == 0 {
+            if completed && l.step(|d| d.get_i32(d.ad.params.acquire)) == 0 {
                 completed = false;
             }
             if completed {
                 w.acquire_frame(l, acquire_time / 2.0, use_shutter);
-                completed = l.run(|d| !d.readout_frame(0, None, true).is_err());
+                completed = l.step(|d| !d.readout_frame(0, None, true).is_err());
             }
             if completed {
                 run_server_task(l, "dezinger,0", TASK_DEZINGER);
                 run_server_task(l, "correct", TASK_CORRECT);
                 if auto_save != 0 {
-                    l.run(|d| d.save_file(1, true));
+                    l.step(|d| d.save_file(1, true));
                 }
             }
         }
@@ -537,7 +481,7 @@ async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
     // C runs the counter increments and the overlap/readback dispatch only when
     // no `goto cleanup` fired.
     if completed {
-        l.run(|d| {
+        l.step(|d| {
             let ad = d.ad.params;
             let image_counter = d.get_i32(ad.base.array_counter) + 1;
             d.set_i32(ad.base.array_counter, image_counter);
@@ -557,7 +501,7 @@ async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
     }
 
     // cleanup
-    let (acquire, acquire_period) = l.run(move |d| {
+    let (acquire, acquire_period) = l.step(move |d| {
         let ad = d.ad.params;
         if image_mode == ImageMode::Multiple as i32 {
             let num_images = d.get_i32(ad.num_images);
@@ -580,7 +524,7 @@ async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
         let elapsed = now_epoch_f64() - w.load_acq_start();
         let delay_time = acquire_period - elapsed;
         if delay_time > 0.0 {
-            l.run(|d| {
+            l.step(|d| {
                 d.set_i32(d.ad.params.status, ADStatus::Waiting as i32);
                 d.callbacks();
             });
@@ -588,7 +532,7 @@ async fn collect_normal(w: &Worker, l: &mut Held<'_>) {
         }
     }
 
-    l.run(|d| d.callbacks());
+    l.step(|d| d.callbacks());
 }
 
 /// The parameters C's `collectSeries` reads at its top.
@@ -612,7 +556,7 @@ struct SeriesParams {
 }
 
 /// C `collectSeries`.
-async fn collect_series(w: &Worker, l: &mut Held<'_>) {
+async fn collect_series(w: &Worker, l: &mut Held) {
     let SeriesParams {
         frame_type,
         image_mode,
@@ -629,7 +573,7 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
         series_file_template,
         series_file_digits,
         series_file_first,
-    } = l.run(|d| {
+    } = l.step(|d| {
         let ad = d.ad.params;
         let p = d.p;
         SeriesParams {
@@ -679,13 +623,13 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
         };
     let full_file_template = full_file_template(series_file_digits);
 
-    l.run(|d| {
+    l.step(|d| {
         d.write_header();
     });
     w.store_acq_start(now_epoch_f64());
 
     if use_shutter {
-        l.run(|d| {
+        l.step(|d| {
             let _ = ADDriver::set_shutter(d, true);
         });
     }
@@ -719,7 +663,7 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
                     )
                 }
             };
-            l.run(move |d| {
+            l.step(move |d| {
                 d.write_server(&cmd);
             });
         }
@@ -733,7 +677,7 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
                 file_suffix,
                 series_file_digits,
             );
-            l.run(move |d| {
+            l.step(move |d| {
                 d.write_server(&cmd);
             });
         }
@@ -741,7 +685,7 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
     }
 
     // Bump the TIFF timeout while waiting for the series files to appear.
-    l.run(move |d| {
+    l.step(move |d| {
         d.set_f64(d.p.tiff_timeout, tiff_timeout + acquire_period);
         d.callbacks();
     });
@@ -754,18 +698,18 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
             i + series_file_first,
         )
         .unwrap_or_default();
-        l.run(move |d| {
+        l.step(move |d| {
             d.set_str(d.ad.params.base.full_file_name, &full_file_name);
             d.callbacks();
         });
         let status = w.get_image_data(l).await;
         if status.is_err() {
-            l.run(|d| {
+            l.step(|d| {
                 d.write_server("abort");
             });
             break;
         }
-        l.run(|d| {
+        l.step(|d| {
             let ad = d.ad.params;
             let image_counter = d.get_i32(ad.base.array_counter) + 1;
             d.set_i32(ad.base.array_counter, image_counter);
@@ -780,13 +724,13 @@ async fn collect_series(w: &Worker, l: &mut Held<'_>) {
 
 /// C `collectSeries` `done:` block.
 fn finish_series(
-    l: &mut Held<'_>,
+    l: &mut Held,
     tiff_timeout: f64,
     use_shutter: bool,
     auto_increment: i32,
     file_number: i32,
 ) {
-    l.run(move |d| {
+    l.step(move |d| {
         d.set_f64(d.p.tiff_timeout, tiff_timeout);
         d.callbacks();
         if use_shutter {
@@ -812,24 +756,26 @@ pub(crate) fn start_image_task(w: Worker) -> std::thread::JoinHandle<()> {
 /// C `getImageDataTask`: it releases the lock for the image event and each
 /// poll sleep.
 async fn image_loop(w: Worker) {
-    let mut l = w.lock.lock();
+    let Ok(mut l) = w.port.hold_driver_blocking::<MarccdDriver>() else {
+        return;
+    };
     loop {
         l.unlocked(|| w.image_event.wait());
 
         // Wait for the correction to complete.
-        let mut s = l.run(|d| d.get_state());
+        let mut s = l.step(|d| d.get_state());
         while test_task_status(s, TASK_CORRECT, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0 {
             l.unlocked(|| std::thread::sleep(secs(MARCCD_POLL_DELAY)));
-            s = l.run(|d| d.get_state());
+            s = l.step(|d| d.get_state());
         }
 
         // Wait for the write to complete.
-        let mut s = l.run(|d| d.get_state());
+        let mut s = l.step(|d| d.get_state());
         while test_task_status(s, TASK_WRITE, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0
             || task_state(s) >= TASK_STATE_BUSY
         {
             l.unlocked(|| std::thread::sleep(secs(MARCCD_POLL_DELAY)));
-            s = l.run(|d| d.get_state());
+            s = l.step(|d| d.get_state());
         }
 
         w.get_image_data(&mut l).await;
@@ -878,7 +824,6 @@ mod tests {
         det.connect_downstream(sender);
         let worker = Worker {
             port: h.clone(),
-            lock: DriverLock::new(h.clone()).unwrap(),
             start: Arc::new(Event::new()),
             stop: Arc::new(Event::new()),
             image_event: Arc::new(Event::new()),
@@ -900,7 +845,7 @@ mod tests {
             p.write_octet(ad.base.full_file_name, 0, path.into_bytes())
                 .await
                 .unwrap();
-            let mut l = worker.lock.lock();
+            let mut l = worker.port.hold_driver_blocking().unwrap();
             assert_eq!(worker.get_image_data(&mut l).await, CamStatus::Success);
         })
         .join()
