@@ -24,6 +24,8 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #                 virtualAxisList). Poll periods in seconds; virtualAxisList is
 #                 comma-separated 0-based indices.
 AcsMotionConfig("$(CTRL)", "$(IPPORT)", $(NUMAXES), 0.1, 1.0, "")
+# Profile moves: SPiiPlusCreateProfile(acsPort, maxPoints, maxPulses).
+#SPiiPlusCreateProfile("$(CTRL)", 2000, 2000)
 
 # One motor record for axis 0.
 dbLoadRecords("$(ACSMOTION_IOC)/db/acsmotion.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
