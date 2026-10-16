@@ -31,8 +31,7 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! The binary bulk poll (replaced by ASCII queries), the profile
-//! readback, and the other aux
+//! The binary bulk poll (replaced by ASCII queries), and the other aux
 //! asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
 //! and factors, reference position, PEG, disable-set-position guard, global
 //! variable read/write, ACSPL program start/stop).
@@ -709,6 +708,10 @@ impl ControllerParams for AcsMotionParams {
 
     fn build_profile(&mut self, ctx: &mut ControllerCtx<'_>) -> AsynResult<()> {
         self.build(ctx)
+    }
+
+    fn readback_profile(&mut self, ctx: &mut ControllerCtx<'_>) -> AsynResult<()> {
+        self.readback(ctx)
     }
 
     /// C `executeProfile`: the profile thread runs it; the base's axis

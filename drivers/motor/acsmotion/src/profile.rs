@@ -1,17 +1,21 @@
 //! SPiiPlus profile moves: C `SPiiPlusController::initializeProfile`,
-//! `buildProfile` and its helpers, `writeFloat64Array`, and
-//! `SPiiPlusAxis::defineProfile` / `correctProfile`.
+//! `buildProfile` and its helpers, `readbackProfile`, `writeFloat64Array`,
+//! and `SPiiPlusAxis::defineProfile` / `correctProfile` /
+//! `readbackProfile`.
 //!
 //! Positions are in controller units: an axis's profile positions are its
 //! steps times `resolution_`, as C's `defineProfile` leaves them.
 
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
     ControllerCtx, PROFILE_BUILD_BUSY, PROFILE_BUILD_DONE, PROFILE_EXECUTE_MOVE_START,
-    PROFILE_MOVE_MODE_ABSOLUTE, PROFILE_MOVE_MODE_RELATIVE, PROFILE_STATUS_FAILURE,
-    PROFILE_STATUS_SUCCESS, PROFILE_STATUS_UNDEFINED, index,
+    PROFILE_MOVE_MODE_ABSOLUTE, PROFILE_MOVE_MODE_RELATIVE, PROFILE_READBACK_BUSY,
+    PROFILE_READBACK_DONE, PROFILE_STATUS_FAILURE, PROFILE_STATUS_SUCCESS,
+    PROFILE_STATUS_UNDEFINED, index,
 };
 
 use crate::bincomm::Span;
@@ -783,6 +787,132 @@ impl AcsMotionParams {
         Ok((plan, message))
     }
 
+    /// C `SPiiPlusController::readbackProfile`: each profile axis's
+    /// recorded positions and following errors, converted to user units
+    /// and posted for every axis. The outcome is in PROFILE_READBACK_STATUS
+    /// and PROFILE_READBACK_MESSAGE; a failed controller read also fails
+    /// the write.
+    pub(crate) fn readback(&mut self, ctx: &mut ControllerCtx<'_>) -> AsynResult<()> {
+        print(
+            ctx,
+            TraceMask::FLOW,
+            "readbackProfile",
+            format_args!(" entry"),
+        );
+        set_message(ctx, index::PROFILE_READBACK_MESSAGE, "");
+        set_int(ctx, index::PROFILE_READBACK_STATE, PROFILE_READBACK_BUSY);
+        set_int(
+            ctx,
+            index::PROFILE_READBACK_STATUS,
+            PROFILE_STATUS_UNDEFINED,
+        );
+        let _ = ctx.base.call_param_callbacks(0);
+
+        let (ok, message, status) = match self.read_data_collection(ctx) {
+            Ok(message) => (true, message, Ok(())),
+            Err((message, status)) => (false, message, status),
+        };
+
+        let max = ctx.profile.max_points;
+        set_int(ctx, index::PROFILE_NUM_READBACKS, max as i32);
+        let port = ctx.base.port_name.clone();
+        for addr in 0..ctx.profile.axes.len() {
+            let resolution = self.lock().resolution(addr);
+            PortManager::global().trace_manager().print(
+                Some(&port),
+                Some(addr as i32),
+                0,
+                TraceMask::FLOW,
+                format_args!(
+                    "SPiiPlusController:readbackProfile: axis={addr}, resolution={resolution:.6}"
+                ),
+            );
+            // SPiiPlusAxis::readbackProfile: controller units to steps.
+            let axis = &mut ctx.profile.axes[addr];
+            let n = max.min(axis.readbacks.len());
+            for (r, f) in axis.readbacks[..n]
+                .iter_mut()
+                .zip(&mut axis.following_errors[..n])
+            {
+                *r /= resolution;
+                *f /= resolution;
+            }
+            // C drops the axis's status.
+            let _ = ctx.axis_readback_profile(addr as i32);
+        }
+
+        let status_value = if ok {
+            PROFILE_STATUS_SUCCESS
+        } else {
+            PROFILE_STATUS_FAILURE
+        };
+        set_int(ctx, index::PROFILE_READBACK_STATUS, status_value);
+        set_message(ctx, index::PROFILE_READBACK_MESSAGE, &message);
+        if !ok {
+            print(
+                ctx,
+                TraceMask::ERROR,
+                "readbackProfile",
+                format_args!(" {message}"),
+            );
+        }
+        // PROFILE_READBACK is a busy record: cleared only now.
+        set_int(ctx, index::PROFILE_READBACK, 0);
+        set_int(ctx, index::PROFILE_READBACK_STATE, PROFILE_READBACK_DONE);
+        let _ = ctx.base.call_param_callbacks(0);
+        status
+    }
+
+    /// The body of C `readbackProfile` up to its `done:` label: the message
+    /// it leaves, `Err` where C sets `readbackOK = false` with the failed
+    /// read's status.
+    fn read_data_collection(
+        &mut self,
+        ctx: &mut ControllerCtx<'_>,
+    ) -> Result<String, (String, AsynResult<()>)> {
+        let axes = self.profile.profile_axes.clone();
+        if axes.is_empty() {
+            return Err(("No axes selected".into(), Ok(())));
+        }
+        print(
+            ctx,
+            TraceMask::IO_DRIVER,
+            "readbackProfile",
+            format_args!(" axisList = {}", axes_to_string(&axes)),
+        );
+        let message = format!("Selected axes: {}", motors_to_string(&axes));
+        set_message(ctx, index::PROFILE_READBACK_MESSAGE, &message);
+        let _ = ctx.base.call_param_callbacks(0);
+
+        for axis in &mut ctx.profile.axes {
+            axis.readbacks.fill(0.0);
+            axis.following_errors.fill(0.0);
+        }
+        let max = ctx.profile.max_points;
+        // Rows: position, position error, time.
+        let span = Span {
+            idx1: (0, 2),
+            idx2: (0, max as i32 - 1),
+        };
+        for (j, &addr) in axes.iter().enumerate() {
+            let data = self
+                .lock()
+                .comm()
+                .get_double_array(&format!("DC_DATA_{}", j + 1), span)
+                .map_err(|e: AsynError| (message.clone(), Err(e)))?;
+            // DC_DATA_{j+1} is the j-th profile axis's; C fills getAxis(j).
+            let Some(axis) = ctx.profile.axes.get_mut(addr) else {
+                continue;
+            };
+            let rows = data.chunks(max.max(1));
+            for (row, target) in rows.zip([&mut axis.readbacks, &mut axis.following_errors]) {
+                let n = row.len().min(target.len());
+                target[..n].copy_from_slice(&row[..n]);
+            }
+        }
+        Ok(message)
+    }
+
     /// C `buildProfile`'s loop over the profile axes: the longest
     /// acceleration and deceleration times any axis needs, at 90% of its
     /// XACC or the user's PROFILE_ACCELERATION if longer, and each axis's
@@ -1197,6 +1327,60 @@ pub(crate) mod tests {
             (p.pulse_start_pos, p.pulse_end_pos, p.pulse_spacing)
         });
         assert_eq!(pulses, (0.0, 15.0, 5.0));
+    }
+
+    #[test]
+    fn a_readback_fills_the_profile_axis_from_its_data_collection_in_user_units() {
+        let rig = rig("spiiPRead", 2, SERVOS);
+        rig.define(&[1], &[0.0, 1.0, 2.0, 3.0], PROFILE_MOVE_MODE_ABSOLUTE);
+        rig.int(index::PROFILE_BUILD, 0, 1);
+        {
+            let mut line = rig.line.lock().unwrap();
+            let cells = line.vars.entry("DC_DATA_1".into()).or_default();
+            // 0.5 controller units a step, 0.1 a step in user units.
+            for j in 0..8 {
+                cells.insert((0, j), 5.0 * f64::from(j));
+                cells.insert((1, j), 0.5);
+            }
+        }
+        rig.sent();
+        rig.int(index::PROFILE_READBACK, 0, 1);
+        assert_eq!(rig.sent(), ["BIN ??DC_DATA_1(0,2)(0,7)"]);
+        assert_eq!(
+            rig.port
+                .read_int32_blocking(index::PROFILE_READBACK_STATUS, 0)
+                .unwrap(),
+            PROFILE_STATUS_SUCCESS
+        );
+        assert_eq!(
+            rig.message(index::PROFILE_READBACK_MESSAGE),
+            "Selected axes: 2"
+        );
+        let (axis0, axis1) = rig.with(|_, ctx| {
+            let a = &ctx.profile.axes;
+            (a[0].readbacks.clone(), a[1].clone())
+        });
+        assert!(axis0.iter().all(|&r| r == 0.0));
+        for j in 0..8 {
+            assert!(close(axis1.readbacks[j], j as f64));
+            assert!(close(axis1.following_errors[j], 0.1));
+        }
+    }
+
+    #[test]
+    fn a_readback_with_no_axis_selected_fails() {
+        let rig = rig("spiiPReadNone", 1, SERVOS);
+        rig.int(index::PROFILE_READBACK, 0, 1);
+        assert_eq!(
+            rig.port
+                .read_int32_blocking(index::PROFILE_READBACK_STATUS, 0)
+                .unwrap(),
+            PROFILE_STATUS_FAILURE
+        );
+        assert_eq!(
+            rig.message(index::PROFILE_READBACK_MESSAGE),
+            "No axes selected"
+        );
     }
 
     #[test]
