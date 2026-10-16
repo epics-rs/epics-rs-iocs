@@ -27,6 +27,7 @@ use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::request::{PortCalls, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 
@@ -308,16 +309,12 @@ pub fn create_ip_port(
 /// hands back a user — unbound on a missing port, beside `connectDevice`'s
 /// refusal (asynManager.c:1339-1342).
 pub fn connect_octet(port_name: &str, timeout: Duration) -> (OctetIo, AsynResult<()>) {
-    match epics_rs::asyn::asyn_record::get_port(port_name) {
-        Some(port) => (OctetIo::new(port.handle.clone(), timeout), Ok(())),
-        None => (
-            OctetIo::unbound(timeout),
-            Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("asynManager:connectDevice port {port_name} not found"),
-            }),
-        ),
-    }
+    let (user, status) = SyncIOHandle::connect_port(port_name, OCTET_ADDR, timeout);
+    let io = match user.port() {
+        Ok(port) => OctetIo::new(port.clone(), timeout),
+        Err(_) => OctetIo::unbound(timeout),
+    };
+    (io, status)
 }
 
 #[cfg(test)]
