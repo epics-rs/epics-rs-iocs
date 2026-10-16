@@ -97,8 +97,6 @@ impl CtrDriver {
             trace: SelfTrace::default(),
         }));
 
-        println!("CtrDriver: port={port_name}, model={product_name}, serial={uid}, fw={fw}");
-
         Ok(Self {
             base,
             params,
