@@ -7,10 +7,75 @@ use std::sync::atomic::Ordering;
 
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use ether_ip::device;
 use ether_ip::driver;
+
+/// `ether_ipApp/src/ether_ip-{3-14,lint,lsio}.dbd`'s `device()` lines.
+static DEVICES: &[(&str, &[DevSup])] = &[
+    ("ai", &[row("devAiEtherIP", device::DTYP, 6, &[1, 2, 3, 4])]),
+    ("bi", &[row("devBiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])]),
+    (
+        "int64in",
+        &[row("devInt64inEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    (
+        "lsi",
+        &[row("devLsiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    (
+        "mbbi",
+        &[row("devMbbiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    (
+        "mbbiDirect",
+        &[row("devMbbiDirectEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    (
+        "stringin",
+        &[row("devSiEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    (
+        "waveform",
+        &[row("devWfEtherIP", device::DTYP, 5, &[1, 2, 3, 4])],
+    ),
+    ("ao", &[row("devAoEtherIP", device::DTYP, 6, &[1, 2, 4])]),
+    (
+        "bo",
+        &[
+            row("devBoEtherIP", device::DTYP, 6, &[1, 2, 4]),
+            row("devBoEtherIPReset", device::DTYP_RESET, 6, &[4]),
+        ],
+    ),
+    (
+        "int64out",
+        &[row("devInt64outEtherIP", device::DTYP, 5, &[1, 2, 4])],
+    ),
+    ("lso", &[row("devLsoEtherIP", device::DTYP, 5, &[1, 2, 4])]),
+    (
+        "mbbo",
+        &[row("devMbboEtherIP", device::DTYP, 5, &[1, 2, 4])],
+    ),
+    (
+        "mbboDirect",
+        &[row("devMbboDirectEtherIP", device::DTYP, 5, &[1, 2, 4])],
+    ),
+    (
+        "stringout",
+        &[row("devSoEtherIP", device::DTYP, 5, &[1, 2, 4])],
+    ),
+];
+
+const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
+    DevSup {
+        name,
+        choice,
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(number, funcs, false),
+    }
+}
 
 fn int_arg(args: &[ArgValue], i: usize) -> Option<i64> {
     match args.get(i) {
@@ -42,7 +107,7 @@ async fn main() -> CaResult<()> {
 
     // One dynamic factory covers every record type: the DTYP is always
     // "EtherIP" (or "EtherIPReset"), and the tag comes from the INP/OUT text.
-    app = app.register_dynamic_device_support(device::device_factory);
+    app = app.register_dynamic_device_support(DEVICES, device::device_factory);
 
     // drvEtherIP_define_PLC(name, ip_addr, slot)
     app = app.register_startup_command(CommandDef::new(

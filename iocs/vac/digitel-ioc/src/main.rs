@@ -20,7 +20,26 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
+use epics_rs::base::server::record::{DbLinkType, DevSup, Dset};
 use vac::ioc::{device_support_factory, digitel_record_factory};
+
+/// `vacApp/src/devVacSen.dbd` and `devDigitelPump.dbd`'s `device()` lines.
+static DEVICES: &[(&str, &[DevSup])] = &[
+    ("vs", &[row("devVacSen", "asyn VacSen", 5, &[2, 4])]),
+    (
+        "digitel",
+        &[row("devDigitelPump", "asyn DigitelPump", 5, &[2, 4])],
+    ),
+];
+
+const fn row(name: &'static str, choice: &'static str, number: u8, funcs: &'static [u8]) -> DevSup {
+    DevSup {
+        name,
+        choice,
+        link_type: DbLinkType::InstIo,
+        dset: Dset::new(number, funcs, false),
+    }
+}
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -46,7 +65,7 @@ async fn main() -> CaResult<()> {
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
     // `asyn DigitelPump` device support, resolved from each record's INP link.
-    app = app.register_dynamic_device_support(device_support_factory());
+    app = app.register_dynamic_device_support(DEVICES, device_support_factory());
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

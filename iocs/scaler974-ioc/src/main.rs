@@ -150,15 +150,23 @@ async fn main() -> CaResult<()> {
     // does -- see scaler974::registry's module doc for why
     // DeviceSupportContext::out is unusable for a scalerRecord, and why
     // this crate's registry is deliberately single-instance-only.
-    app = app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
-        if ctx.dtyp != "Asyn Scaler" {
-            return None;
-        }
-        let driver = scaler974::registry::take()?;
-        Some(Box::new(
-            epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(driver),
-        ) as Box<dyn DeviceSupport>)
-    });
+    app = app.register_dynamic_device_support(
+        &[(
+            "scaler",
+            std::slice::from_ref(
+                &epics_rs::scaler::device_support::scaler_asyn::ASYN_SCALER_DEVICE,
+            ),
+        )],
+        |ctx: &DeviceSupportContext| {
+            if ctx.dtyp != "Asyn Scaler" {
+                return None;
+            }
+            let driver = scaler974::registry::take()?;
+            Some(Box::new(
+                epics_rs::scaler::device_support::scaler_asyn::ScalerAsynDeviceSupport::new(driver),
+            ) as Box<dyn DeviceSupport>)
+        },
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }
