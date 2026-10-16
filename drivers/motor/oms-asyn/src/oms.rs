@@ -125,16 +125,16 @@ impl OmsController {
     /// Send a command and read one reply, skipping any notification lines and
     /// stripping the leading ACK/CR/LF (C `sendReceive`).
     pub fn send_receive(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        let mut raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         // A move notification may sit ahead of the real reply; skip it. Bound
         // the retries so a chatty controller cannot spin forever.
         for _ in 0..12 {
-            let raw = self.handle.read_octet(0, READ_BUF)?;
             let s = String::from_utf8_lossy(&raw);
             let trimmed = s
                 .trim_start_matches(['\x06', '\r', '\n'])
                 .trim_end_matches(['\r', '\n', '\0', ' ']);
             if is_notification(trimmed) {
+                raw = self.handle.read_octet(0, READ_BUF)?;
                 continue;
             }
             return Ok(trimmed.to_string());
