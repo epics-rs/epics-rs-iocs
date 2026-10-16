@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -272,6 +272,19 @@ impl PortDriver for MultiFunctionDriver {
                 .get_int32_param(self.params.analog_out_sync_enable, 0)
                 .unwrap_or(0);
             if sync_enable == 0 {
+                if self.state.lock().unwrap().wave_gen.running {
+                    trace.report_error(
+                        -1,
+                        FUNCTION,
+                        "cannot write analog outputs while waveform generator is running.",
+                    );
+                    // C returns before its callbacks and its summary line, and
+                    // sets no error message.
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: String::new(),
+                    });
+                }
                 let dev = self.device.lock().unwrap();
                 let range = self
                     .base
