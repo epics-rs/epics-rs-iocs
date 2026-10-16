@@ -16,9 +16,7 @@ use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::params::SimParams;
@@ -293,7 +291,6 @@ pub struct SimDetectorRuntime {
     pub sim_params: SimParams,
     pool: Arc<NDArrayPool>,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Owns the `SimDetTask` thread for the lifetime of the IOC.
     pub task_handle: std::thread::JoinHandle<()>,
 }
@@ -311,8 +308,7 @@ impl SimDetectorRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -344,7 +340,7 @@ pub fn create_sim_detector(
     // live queued-array count when ADWaitForPlugins is set. The `NDArrayOutput`
     // must live outside the driver instead, because `create_port_runtime` takes
     // ownership of it and the IOC still needs to attach plugin senders.
-    let queued_counter = det.ad.queued_counter.clone();
+    let queued = det.ad.owner.queued().clone();
 
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
@@ -354,7 +350,7 @@ pub fn create_sim_detector(
         stop_rx,
         handle: runtime_handle.port_handle().clone(),
         publisher: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
+        queued,
         pool: pool.clone(),
         ad: ad_params,
         sim: sim_params,
@@ -366,7 +362,6 @@ pub fn create_sim_detector(
         sim_params,
         pool,
         array_output,
-        queued_counter,
         task_handle,
     })
 }

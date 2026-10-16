@@ -164,9 +164,7 @@ impl SimTaskContext {
         }
 
         let reset = self.read_i32(self.sim.reset_image).await != 0;
-        let image = engine
-            .compute_image(&cfg, &self.pool, reset)
-            .map_err(|_| "error allocating buffer in convert()")?;
+        let image = engine.compute_image(&cfg, &self.pool, reset)?;
 
         let layout = Layout::for_color_mode(cfg.color_mode);
         let elements: usize = image.dims.iter().map(|d| d.size).product();

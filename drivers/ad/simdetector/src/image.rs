@@ -17,7 +17,6 @@
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
-use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 
@@ -739,12 +738,13 @@ impl SimEngine {
     /// reallocated (and therefore reset) whenever the element count or data type
     /// changes, so `reset` is exactly "the working buffers are fresh" — the
     /// invariant the absolute-vs-incremental branches in the generators depend on.
+    /// The error is the text of C's asynPrint for the refused allocation.
     pub fn compute_image(
         &mut self,
         cfg: &SimConfig,
         pool: &NDArrayPool,
         reset_requested: bool,
-    ) -> ADResult<NDArray> {
+    ) -> Result<NDArray, &'static str> {
         let layout = Layout::for_color_mode(cfg.color_mode);
         let sx = cfg.geometry.max_size_x as usize;
         let sy = cfg.geometry.max_size_y as usize;
@@ -776,7 +776,9 @@ impl SimEngine {
         if let Some(c) = layout.color_dim {
             dims[c] = NDDimension::new(3);
         }
-        let mut raw = NDArray::with_data(dims, bufs.raw_buffer());
+        let mut raw = pool
+            .wrap(dims, bufs.raw_buffer())
+            .map_err(|_| "error allocating raw buffer")?;
         if cfg.sim_mode != SimMode::OffsetNoise {
             // C adds the ColorMode attribute inside the three pattern
             // generators; SimModeOffsetNoise is an empty case, so its arrays
@@ -810,6 +812,7 @@ impl SimEngine {
         }
 
         pool.convert(&raw, &dims_out, cfg.data_type)
+            .map_err(|_| "error allocating buffer in convert()")
     }
 }
 
