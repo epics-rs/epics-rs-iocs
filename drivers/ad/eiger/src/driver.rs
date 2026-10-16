@@ -489,13 +489,14 @@ impl PortDriver for EigerDriver {
                     0,
                     ADStatus::Aborted as i32,
                 )?;
-                self.ops.rest.abort().map_err(rest_err)?;
+                // C ignores mApi.abort()'s status: the stop is signalled anyway.
+                let _ = self.ops.rest.abort();
                 self.signals.stop();
             }
             self.ad.port_base.set_int32_param(acquire, 0, value)?;
         } else if Some(reason) == self.p.fw_clear {
             self.put_int(reason, 1)?;
-            self.fetch(self.p.fw_free)?;
+            let _ = self.fetch(self.p.fw_free);
         } else if reason == self.ad.params.read_status {
             self.eiger_status()?;
         } else if reason == self.p.restart && value == 1 {
@@ -515,14 +516,11 @@ impl PortDriver for EigerDriver {
                     .expect("hv_reset implies hv_reset_time"),
                 0,
             )?;
-            self.ops
-                .rest
-                .hv_reset(reset_time as i32)
-                .map_err(rest_err)?;
+            let _ = self.ops.rest.hv_reset(reset_time as i32);
         } else if reason == self.p.trigger_mode {
             // INTE and EXTE deliver exactly one image per trigger.
             if value == TRIGGER_MODE_INTE || value == TRIGGER_MODE_EXTE {
-                self.put_int(self.p.num_images, 1)?;
+                let _ = self.put_int(self.p.num_images, 1);
             }
             self.put_int(reason, value)?;
         } else if self.ops.reg.lock().contains(reason) {
@@ -537,8 +535,8 @@ impl PortDriver for EigerDriver {
                         .port_base
                         .get_int32_param(self.p.stream_version, 0)?;
                     self.signals.stream_apis(Some(version));
-                    self.put_bool(self.p.stream_enable, false)?;
-                    self.put_bool(self.p.stream_enable, true)?;
+                    let _ = self.put_bool(self.p.stream_enable, false);
+                    let _ = self.put_bool(self.p.stream_enable, true);
                 } else {
                     self.signals.stream_apis(None);
                 }
@@ -555,25 +553,25 @@ impl PortDriver for EigerDriver {
         let addr = user.addr;
 
         if reason == self.p.photon_energy {
-            self.status_message("Setting Photon Energy...")?;
-            self.ad.port_base.call_param_callbacks(0)?;
-            self.put_f64(reason, value)?;
-            self.status_message("Photon Energy set")?;
+            let _ = self.status_message("Setting Photon Energy...");
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            let _ = self.put_f64(reason, value);
+            let _ = self.status_message("Photon Energy set");
         } else if reason == self.p.threshold {
-            self.status_message("Setting Threshold Energy...")?;
-            self.ad.port_base.call_param_callbacks(0)?;
-            self.put_f64(reason, value)?;
-            self.status_message("Threshold Energy set")?;
+            let _ = self.status_message("Setting Threshold Energy...");
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            let _ = self.put_f64(reason, value);
+            let _ = self.status_message("Threshold Energy set");
         } else if reason == self.p.wavelength {
-            self.status_message("Setting Wavelength...")?;
-            self.ad.port_base.call_param_callbacks(0)?;
-            self.put_f64(reason, value)?;
-            self.status_message("Wavelength set")?;
+            let _ = self.status_message("Setting Wavelength...");
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            let _ = self.put_f64(reason, value);
+            let _ = self.status_message("Wavelength set");
         } else if reason == self.p.wavelength_epsilon {
-            self.ad.port_base.set_float64_param(reason, 0, value)?;
+            let _ = self.ad.port_base.set_float64_param(reason, 0, value);
             self.ops.reg.lock().set_epsilon(self.p.wavelength, value);
         } else if reason == self.p.energy_epsilon {
-            self.ad.port_base.set_float64_param(reason, 0, value)?;
+            let _ = self.ad.port_base.set_float64_param(reason, 0, value);
             let mut reg = self.ops.reg.lock();
             reg.set_epsilon(self.p.photon_energy, value);
             for t in params::thresholds(&self.p) {
