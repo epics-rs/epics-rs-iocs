@@ -213,20 +213,8 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
             0,
             ParamValue::Octet(det_type.clone().into_bytes().into()),
         ),
-        ParamSetValue::new(
-            ctx.ad.status,
-            0,
-            ParamValue::Int32(if serval_ok && det_ok {
-                if ctx.shared.acquiring() {
-                    ADStatus::Acquire as i32
-                } else {
-                    ADStatus::Idle as i32
-                }
-            } else {
-                ADStatus::Disconnected as i32
-            }),
-        ),
     ];
+    connection_status(ctx, serval_ok, det_ok, &mut updates);
     if det_ok {
         updates.push(ParamSetValue::new(
             ctx.ad.base.model,
@@ -244,6 +232,32 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
 
 /// The first disk in `Server.DiskSpace`, which is empty until raw file writing
 /// is configured (C getDashboard, serval_http.cpp:388).
+/// C `updateStatusFromConnection` (serval_http.cpp:148-164).
+fn connection_status(
+    ctx: &Arc<Ctx>,
+    serval_ok: bool,
+    det_ok: bool,
+    updates: &mut Vec<ParamSetValue>,
+) {
+    let (message, status) = match (serval_ok, det_ok) {
+        (true, true) if ctx.shared.acquiring() => ("OK", ADStatus::Acquire),
+        (true, true) => ("OK", ADStatus::Idle),
+        (false, false) => ("SERVAL and detector disconnected", ADStatus::Disconnected),
+        (false, true) => ("SERVAL disconnected", ADStatus::Disconnected),
+        (true, false) => ("Detector disconnected", ADStatus::Disconnected),
+    };
+    updates.push(ParamSetValue::new(
+        ctx.ad.status_message,
+        0,
+        ParamValue::Octet(message.as_bytes().to_vec().into()),
+    ));
+    updates.push(ParamSetValue::new(
+        ctx.ad.status,
+        0,
+        ParamValue::Int32(status as i32),
+    ));
+}
+
 /// C `updateServalVersionFromDashboard` (serval_http.cpp:133).
 fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let Some(server) = dashboard.get("Server").filter(|s| s.is_object()) else {
