@@ -192,8 +192,7 @@ impl Mm4000Controller {
 
     /// Write a command and read the reply (C `sendAndReceive`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
@@ -231,7 +230,14 @@ impl Mm4000Controller {
                     Err(_) => data.comms_error = true,
                 }
             }
-            _ => data.comms_error = true,
+            // C MM4000Poller sets only motorAxisCommError; every other
+            // parameter keeps the last value read.
+            _ => {
+                data = Mm4000PollData {
+                    comms_error: true,
+                    ..self.cache.clone()
+                }
+            }
         }
         self.cache = data.clone();
         self.fetched_at = Some(Instant::now());
@@ -451,20 +457,18 @@ impl AsynMotor for Mm4000Axis {
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
         let data = self.lock().poll_data();
         let idx = self.axis - 1;
-        if data.comms_error {
-            return Ok(MotorStatus {
-                comms_error: true,
-                problem: true,
-                ..MotorStatus::default()
-            });
-        }
-        let byte = data.status_bytes[idx].ok_or_else(|| {
-            mm_err(format!(
-                "MM4000 axis {}: missing MS status field",
-                self.axis
-            ))
-        })?;
-        let position = data.positions[idx].ok_or_else(|| {
+        let byte = data
+            .status_bytes
+            .get(idx)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                mm_err(format!(
+                    "MM4000 axis {}: missing MS status field",
+                    self.axis
+                ))
+            })?;
+        let position = data.positions.get(idx).copied().flatten().ok_or_else(|| {
             mm_err(format!(
                 "MM4000 axis {}: missing TP position field",
                 self.axis
@@ -482,7 +486,7 @@ impl AsynMotor for Mm4000Axis {
             home: byte & MM4000_HOME != 0,
             powered: byte & MM4000_POWER_OFF == 0,
             problem: data.problem,
-            comms_error: false,
+            comms_error: data.comms_error,
             // C motorAxisInit defaults motorAxisHasClosedLoop on for every
             // axis; the TC closed-loop probe result is stored but unused.
             gain_support: true,
@@ -497,6 +501,75 @@ impl AsynMotor for Mm4000Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// One MM4000 axis parked at 5 mm whose line goes silent on `dead`.
+    struct Line {
+        base: epics_rs::asyn::port::PortDriverBase,
+        dead: Arc<AtomicBool>,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Line {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.reply = match String::from_utf8_lossy(data).trim_end() {
+                "VE;" => b"VEMM4000 Version 2.04".to_vec(),
+                "TP;" => b"1TP5.0000".to_vec(),
+                "MS;" => b"1MS@".to_vec(),
+                "TE;" => b"TE@".to_vec(),
+                "1TU" => b"1TU0.0001".to_vec(),
+                c => format!("{c}0").into_bytes(),
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            if self.dead.load(Ordering::SeqCst) {
+                return Err(mm_err("timeout".into()));
+            }
+            let n = self.reply.len();
+            buf[..n].copy_from_slice(&self.reply);
+            Ok(n)
+        }
+    }
+
+    /// C MM4000Poller only raises motorAxisCommError on a failed `MS;`/`TP;`
+    /// (drvMM4000Asyn.c:653-657), so the readback keeps the last position.
+    #[test]
+    fn a_dead_line_keeps_the_last_position() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let dead = Arc::new(AtomicBool::new(false));
+        let line = Line {
+            base: PortDriverBase::new("mm4000_dead", 1, PortFlags::default()),
+            dead: dead.clone(),
+            reply: Vec::new(),
+        };
+        let (rt, _jh) = create_port_runtime(
+            &claim_port("mm4000_dead").unwrap(),
+            line,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let ctrl = Mm4000Controller::new(io, 1, Duration::ZERO).unwrap();
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1).unwrap();
+        let user = AsynUser::default();
+        assert_eq!(axis.poll(&user).unwrap().position, 5.0);
+
+        dead.store(true, Ordering::SeqCst);
+        let status = axis.poll(&user).unwrap();
+        assert!(status.comms_error);
+        assert_eq!(status.position, 5.0, "a dead line reads back as 0");
+        assert!(status.done);
+    }
 
     #[test]
     fn model_detection_via_mm_substring() {

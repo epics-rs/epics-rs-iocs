@@ -9,7 +9,7 @@
 //! C stores each pending deferred move on the *axis* (`pmacAxis::deferredMove_`
 //! and friends) and has the controller reach into every axis object to build
 //! the combined move. Here the pending moves live in the controller
-//! ([`PmacController::deferred`]) — the same object that executes them — so
+//! (`PmacController::deferred`) — the same object that executes them — so
 //! there is exactly one owner of the deferred state and no cross-axis locking.
 //! The axis asks the controller whether moves are deferred and, if so, hands it
 //! the demand instead of sending one.
@@ -119,8 +119,7 @@ pub fn pmac_err(message: impl Into<String>) -> AsynError {
 /// command left the record believing it had been accepted. Here a `<BELL>` reply
 /// is an error.
 pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<String> {
-    handle.write_octet(0, command.as_bytes())?;
-    let raw = handle.read_octet(0, PMAC_MAXBUF)?;
+    let raw = handle.write_read(0, command.as_bytes(), PMAC_MAXBUF)?;
     if raw.first() == Some(&BELL) {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(|c: char| c.is_control() || c == '\0');
@@ -132,7 +131,10 @@ pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<Stri
 }
 
 pub struct PmacController {
-    handle: SyncIOHandle,
+    /// `None` when the low-level port refused the connect or an EOS set: C
+    /// keeps the controller with a NULL `lowLevelPortUser_` and every command
+    /// fails.
+    handle: Option<SyncIOHandle>,
     /// Axes created with `pmacCreateAxis`/`pmacCreateAxes` (1-based; address 0
     /// is reserved for controller parameters in C and is never an axis).
     axes: BTreeSet<i32>,
@@ -160,7 +162,7 @@ pub struct PmacController {
 
 impl PmacController {
     pub fn new(
-        handle: SyncIOHandle,
+        handle: Option<SyncIOHandle>,
         deferred_mode: DeferredMode,
         feed_rate_poll: bool,
         feed_rate_limit: i32,
@@ -187,7 +189,11 @@ impl PmacController {
 
     /// C `pmacController::lowLevelWriteRead`; see [`octet_write_read`].
     pub fn write_read(&self, command: &str) -> AsynResult<String> {
-        octet_write_read(&self.handle, command)
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| pmac_err("no low level asynOctetSyncIO port"))?;
+        octet_write_read(handle, command)
     }
 
     /// Send a command whose reply carries no value (moves, jogs, set-position).

@@ -2,8 +2,8 @@
 //!
 //! Ported from `motorParker/parkerApp/src/OEMMotorDriver.cpp` (a model-3
 //! `asynMotorController`/`asynMotorAxis` pair). Commands are ASCII, prefixed by
-//! the 1-based unit address (`<addr>` = axis + 1), CR-terminated (the startup
-//! script sets the input EOS; the driver owns output framing). Connects over a
+//! the 1-based unit address (`<addr>` = axis + 1), CR-terminated by the port
+//! EOS, CR both ways as the C constructor sets it. Connects over a
 //! `drvAsynIPPort`.
 //!
 //! ## Reply model
@@ -50,9 +50,6 @@ use motor_common::util::{atof, leading_hex};
 /// Response buffer size.
 const READ_BUF: usize = 64;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
-
 /// 2^32, subtracted to sign-extend a negative 32-bit step count (C).
 const TWO_POW_32: f64 = 4_294_967_296.0;
 
@@ -67,38 +64,29 @@ pub struct OemController {
 
 impl OemController {
     /// Wrap a connected octet handle. The C controller constructor connects,
-    /// sets the CR EOS, creates the axes and starts the poller; here the EOS is
-    /// set by the startup script and axes are created by the ioc command.
+    /// sets the CR EOS, creates the axes and starts the poller; here
+    /// `OEMCreateController` sets the EOS and creates the axes.
     pub fn new(handle: SyncIOHandle) -> Self {
         Self { handle }
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
-    fn read_line(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw)
+    fn trimmed(raw: &[u8]) -> String {
+        String::from_utf8_lossy(raw)
             .trim_matches(['\r', '\n', '\0', ' '])
-            .to_string())
+            .to_string()
     }
 
     /// Send a command and read its single acknowledgement line.
     fn command(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let _ack = self.read_line()?;
+        let _ack = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(())
     }
 
     /// Send a query and read the echo line then the data line (returned).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let _echo = self.read_line()?;
-        self.read_line()
+        let _echo = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let raw = self.handle.read_octet(0, READ_BUF)?;
+        Ok(Self::trimmed(&raw))
     }
 }
 
@@ -127,7 +115,7 @@ impl OemAxis {
             homed: false,
             encoder_base: 0.0,
             position: 0.0,
-            direction: true,
+            direction: false,
         };
         axis.lock().configure(axis.address)?;
         Ok(axis)
@@ -322,7 +310,9 @@ impl AsynMotor for OemAxis {
             direction: new_direction,
             high_limit,
             low_limit,
+            // C sets motorStatusAtHome_ and motorStatusHome_ together.
             home,
+            encoder_home: home,
             homed: homed_status,
             ..MotorStatus::default()
         })

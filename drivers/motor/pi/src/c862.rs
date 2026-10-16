@@ -15,8 +15,7 @@
 //! hardcodes the asyn sub-address to 0, ignoring `cntrl->asyn_address`
 //! entirely at the transport layer. The "address" is instead a protocol-level
 //! multi-drop selector (below) — this port connects via
-//! [`motor_common::connect::connect_serial`], exactly like every other octet
-//! driver in this workspace.
+//! [`motor_common::connect::connect_with_eos`].
 //!
 //! ## Wire shape — the port owns framing (not the driver)
 //!
@@ -29,23 +28,16 @@
 //! Mclennan PM304 port (which appends its own terminator and leaves the
 //! port's output EOS unset) — see the `motor-port-eos-ownership` convention:
 //! which one applies is a per-C-driver fact, not a template to copy.
-//! `SyncIOHandle` (unlike the real `pasynUser`) exposes no method for a
-//! driver to configure a port's EOS itself, so this port pushes both EOS
-//! settings into `st.cmd` (`asynOctetSetInputEos`/`asynOctetSetOutputEos`)
-//! instead of setting them from [`PIC862Controller::new`] — same wire
-//! result, different call site. [`PIC862Controller::send`] therefore writes
-//! **bare** command bytes with no manual terminator.
+//! `PIC862Config` sets both the same way, and `PIC862Controller::send`
+//! therefore writes **bare** command bytes with no manual terminator.
 //!
-//! Input terminator: `"\n\x03"` (LF then ASCII ETX, 2 bytes) — `\x03` is
-//! representable as a 2-hex-digit `\x` escape in `st.cmd` (this port's
-//! `asyn-rs` iocsh escape decoder has no octal-triplet form, so the C
-//! header's `"\n\003"` spelling doesn't carry over literally).
+//! Input terminator: `"\n\x03"` (LF then ASCII ETX, 2 bytes).
 //!
 //! `recv_mess` unconditionally drops the **last** received byte
 //! (`com[nread - 1] = '\0'; /* Strip trailing CR. */`) after the port's own
 //! EOS strip already removed the `\n\x03` — i.e. every reply carries one
 //! extra CR ahead of the terminator that the port's EOS layer doesn't know
-//! about. [`PIC862Controller::recv`] reproduces this unconditional
+//! about. `PIC862Controller::reply` reproduces this unconditional
 //! single-byte drop (not a `trim_end_matches`, which would strip a variable
 //! count) and folds any transport error into an empty reply, matching
 //! `recv_mess`'s swallow of `status != asynSuccess` into `""`.
@@ -86,7 +78,7 @@
 //! active-low in that configuration).
 //!
 //! A comm failure on `TS` runs the C `NORMAL`/`RETRY`/`COMM_ERR` two-strike
-//! debounce ([`CommState`]): the first bad `TS` in a row is silently retried
+//! debounce (`CommState`): the first bad `TS` in a row is silently retried
 //! (cached status returned unchanged); a second consecutive one sets
 //! `comms_error`/`problem`. `TS` succeeding unconditionally proceeds to `TP`
 //! with **no further debounce tied to `TP`** — a genuine C asymmetry (`TP`'s
@@ -122,7 +114,7 @@
 //!   handling beyond the shared SV/SA preamble).
 //! - `JOG` (`move_velocity`) — **the C-862 has no jog command**: `SV{|v|}`
 //!   then `MA` to whichever record soft limit (`DHLM`/`DLLM`, cached from
-//!   [`AsynMotor::set_high_limit`]/[`set_low_limit`]) the velocity sign
+//!   [`AsynMotor::set_high_limit`]/[`set_low_limit`](AsynMotor::set_low_limit)) the velocity sign
 //!   selects, exactly like MM3000's jog simulation. `SET_HIGH_LIMIT`/
 //!   `SET_LOW_LIMIT` themselves send no wire command (`trans->state =
 //!   IDLE_STATE`) — record-side caching only.
@@ -140,13 +132,9 @@
 //!   `AsynMotor` counterpart either and are not ported.
 //!
 //! ## Not modeled (documented deviations)
-//! - **`recv_mess(..., FLUSH)`**: before retrying after a non-`NORMAL` comm
-//!   state, C discards any buffered input via a non-blocking port-level
-//!   flush. [`epics_rs::asyn::sync_io::SyncIOHandle`] exposes no synchronous
-//!   flush primitive (only `read_octet`/`write_octet`); emulating it with a
-//!   blocking read would stall `poll()` for a full timeout when nothing is
-//!   buffered, which is worse than the omission. Skipped — a minor hygiene
-//!   gap on an already-degraded comm path, not a wire-command difference.
+//! - **`recv_mess(..., FLUSH)`**: C flushes buffered input only before
+//!   retrying after a non-`NORMAL` comm state; this port flushes before every
+//!   query (`exchange`), a superset that also covers that retry.
 //! - **PREM/POST** (record pre/post-move command strings): handled generically
 //!   by this workspace's motor-rs record layer, not per-driver, matching
 //!   every other port here.
@@ -283,8 +271,7 @@ impl PIC862Controller {
 
         let select_cmd = format!("\u{1}{addr:X}VE");
         for _ in 0..3 {
-            ctrl.send(&select_cmd)?;
-            let (reply, raw_len) = ctrl.recv();
+            let (reply, raw_len) = ctrl.exchange(&select_cmd);
             if raw_len > 0 {
                 ctrl.ident = reply;
                 break;
@@ -311,14 +298,21 @@ impl PIC862Controller {
         Ok(())
     }
 
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> (String, usize) {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
     /// Read one reply, unconditionally dropping the last byte (C
     /// `recv_mess`'s "Strip trailing CR" — always removes the last byte,
     /// not just an actual CR). Returns `(reply, raw_len)`; `raw_len` is the
     /// pre-strip byte count (C's `charcnt`), needed by callers that gate on
     /// it directly. Any transport failure or empty read folds into `("", 0)`,
     /// matching `recv_mess`'s swallow of a bad read into an empty string.
-    fn recv(&self) -> (String, usize) {
-        match self.handle.read_octet(0, READ_BUF) {
+    fn reply(read: AsynResult<Vec<u8>>) -> (String, usize) {
+        match read {
             Ok(raw) if !raw.is_empty() => {
                 let stripped = &raw[..raw.len() - 1];
                 (String::from_utf8_lossy(stripped).into_owned(), raw.len())
@@ -334,8 +328,7 @@ impl PIC862Controller {
     /// cached status (debounced retry) or flag a hard comm error, decided by
     /// [`Self::comm_state`] after the call.
     fn poll_status(&mut self) -> Option<PolledStatus> {
-        let _ = self.send("TS");
-        let (ts_reply, ts_raw_len) = self.recv();
+        let (ts_reply, ts_raw_len) = self.exchange("TS");
         let regs = if ts_raw_len > 18 {
             parse_ts_reply(&ts_reply)
         } else {
@@ -359,8 +352,7 @@ impl PIC862Controller {
             (!bits.plus_ls_raw, !bits.minus_ls_raw)
         };
 
-        let _ = self.send("TP");
-        let (tp_reply, _) = self.recv();
+        let (tp_reply, _) = self.exchange("TP");
         let position = parse_value_at(&tp_reply, 2).map_or(0.0, |v| nint(v) as f64);
 
         Some(PolledStatus {
@@ -378,7 +370,7 @@ impl PIC862Controller {
 pub struct PIC862Axis {
     controller: Arc<Mutex<PIC862Controller>>,
     /// Record soft limits (dial EGU = raw counts, `MRES = 1`), cached from
-    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`] — the C-862 has no
+    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`](AsynMotor::set_low_limit) — the C-862 has no
     /// jog command, so a jog moves to whichever of these the record's DHLM
     /// / DLLM the requested direction selects (C `JOG` case).
     high_limit: Option<f64>,

@@ -110,8 +110,7 @@ impl C300Controller {
 
     /// Write a query and return its reply (C `writeReadController`).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write_only(cmd)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0'])
             .to_string())
@@ -264,7 +263,6 @@ impl AsynMotor for C300Axis {
             velocity: 0.0,
             done,
             moving: !done,
-            direction: true,
             has_encoder: self.has_encoder,
             gain_support: self.has_encoder,
             ..MotorStatus::default()

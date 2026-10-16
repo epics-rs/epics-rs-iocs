@@ -11,8 +11,8 @@
 //!
 //! `motor_init` sets `setOutputEos("\n")` **and** `setInputEos("\n")`;
 //! `send_mess` writes bare bytes (no terminator, no echo — `cmnd_response =
-//! false`), so the port's output EOS puts the `\n` on the wire (both set in
-//! `st.cmd`).
+//! false`), so the port's output EOS puts the `\n` on the wire (both set by
+//! `PIC848Config`).
 //!
 //! The axis selector is not a prefix (C-844) but a **single byte at index 5**
 //! of a fixed-width command: `send_mess` does `local_buff[5] = *name` where
@@ -33,14 +33,14 @@
 //! `*IDN?` (retry up to 3× until a non-empty reply → `brdptr->ident`). Then the
 //! axis count is discovered: `CST? {A..D}` until a reply whose body (`&buff[2]`)
 //! is `"NOSTAGE"`. For each present axis, `REF? {letter}` sets the
-//! [reference](PIC848Axis::reference) flag (`&buff[2] == "0"` → `false`, else
+//! `reference` flag (`&buff[2] == "0"` → `false`, else
 //! `true`), which governs `LOAD_POS`. Every axis has encoder + gain support.
 //!
 //! ## Status
 //! Per axis, under one lock (C `set_status`):
 //! 1. `STA? {letter}` → reply parsed as `%c=%d` (`"A=1024"`). A reply with
 //!    fewer than 3 bytes, no `'='` at index 1, or no integer body drives the
-//!    NORMAL/RETRY/COMM_ERR two-strike debounce ([`CommState`], shared across
+//!    NORMAL/RETRY/COMM_ERR two-strike debounce (`CommState`, shared across
 //!    axes as `cntrl->status` is per-controller). The integer is a
 //!    `C848_Status_Reg` (`epicsUInt16`, `#else`/LSB layout): `Done = bit 0`
 //!    (→ `RA_DONE`), `plus_ls = bit 5`, `minus_ls = bit 6`, `torque = bit 8`
@@ -72,7 +72,7 @@
 //!   `SET_VELOCITY`.
 //! - `STOP_AXIS` (`stop`): `HLT  L`.
 //! - `LOAD_POS` (`set_position`): if the axis has a reference switch
-//!   ([`reference`](PIC848Axis::reference) `true`), only `0.0` is allowed →
+//!   (`reference` `true`), only `0.0` is allowed →
 //!   `DFH  L` (define home); a non-zero request is an error. Otherwise
 //!   `POS  L{+p}`.
 //! - `ENABLE_TORQUE`/`DISABL_TORQUE` (`set_closed_loop`): enabling while torque
@@ -90,8 +90,9 @@
 //!   sends `HLT  #`. That depends on record-layer move state this interface does
 //!   not carry; the `Done`-bit primary done signal is honored, the timeout
 //!   `HLT` is omitted (as the C-862 port omits its `no_motion_count`).
-//! - **`recv_mess(FLUSH)`** on comm recovery / **`report()`**: no `SyncIOHandle`
-//!   flush primitive / not implemented, as elsewhere in this workspace.
+//! - **`recv_mess(FLUSH)`** on comm recovery: replaced by a flush before every
+//!   query (`exchange`), a superset of C's error-path flush.
+//! - **`report()`**: not implemented, as elsewhere in this workspace.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -227,18 +228,24 @@ impl PIC848Controller {
         Ok(())
     }
 
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> String {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
     /// Read one EOS-stripped reply, folding a transport failure / empty read
     /// into `""` (C `recv_mess`).
-    fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
+    fn reply(read: AsynResult<Vec<u8>>) -> String {
+        match read {
             Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
             _ => String::new(),
         }
     }
 
     fn query(&self, cmd: &str) -> String {
-        let _ = self.send(cmd);
-        self.recv()
+        self.exchange(cmd)
     }
 
     /// C `set_status` for axis `signal`. `None` means keep the cached status

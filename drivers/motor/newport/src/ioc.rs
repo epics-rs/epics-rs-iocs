@@ -22,17 +22,18 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
+use epics_rs::motor::trace::TraceUser;
 use motor_common::connect::{EosConnectError, EosRefusal, connect_with_eos};
 
 use crate::agap::{self, AgapAxis, AgapController};
@@ -154,6 +155,14 @@ pub struct NewportHolder {
     hxp_controllers: Mutex<HashMap<String, HxpRegistration>>,
 }
 
+/// The trace user of an axis a C asyn driver serves: its port and address.
+fn asyn_user(port: &str, addr: i32) -> TraceUser {
+    TraceUser::Asyn {
+        port: port.into(),
+        addr,
+    }
+}
+
 impl NewportHolder {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -167,10 +176,13 @@ impl NewportHolder {
     /// Shared wiring for every `*CreateController` command: build the motor
     /// record + poll loop for `motor`, spawn the poll loop (polling from iocRun), and
     /// store the device support under `dtyp_key` for later `dbLoadRecords`
-    /// binding.
+    /// binding. `user` is the asyn user its trace lines print on:
+    /// [`asyn_user`] for a C asyn driver, [`TraceUser::Model1`] for a model-1
+    /// one (ESP300, MM3000, PM500, PMNC).
     fn install(
         &self,
         ctx: &CommandContext,
+        user: TraceUser,
         dtyp_key: String,
         motor: Arc<Mutex<dyn AsynMotor>>,
         moving_poll_ms: u64,
@@ -182,6 +194,7 @@ impl NewportHolder {
             poll_loop,
             poll_cmd_tx,
         } = MotorBuilder::new(motor)
+            .trace_user(user)
             .moving_poll_interval(Duration::from_millis(moving_poll_ms))
             .idle_poll_interval(Duration::from_millis(idle_poll_ms))
             .build();
@@ -245,7 +258,14 @@ impl NewportHolder {
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(Smc100Axis::new(handle, SMC100_AXIS, wire_scale)));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&motor_port, 0),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "SMC100CreateController: motorPort={motor_port} serialPort={serial_port} wireScale={wire_scale} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
                 );
@@ -292,7 +312,14 @@ impl NewportHolder {
                 let dtyp_key = format!("CONEX_{motor_port}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&motor_port, 0),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "AG_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
                 );
@@ -347,7 +374,14 @@ impl NewportHolder {
                         .map_err(|e| format!("AGAP_CONEXCreateController: {e}"))?;
                     let dtyp_key = format!("AGAP_{motor_port}_{}", agap::axis_name(axis_index));
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        asyn_user(&motor_port, axis_index as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "AGAP_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=AGAP_{motor_port}_U, AGAP_{motor_port}_V)"
@@ -491,7 +525,14 @@ impl NewportHolder {
                 let dtyp_key = format!("AG_UC_{motor_port}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&motor_port, axis),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "AG_UCCreateAxis: motorPort={motor_port} axis={axis} hasLimits={has_limits} fwdAmp={forward_amplitude} revAmp={reverse_amplitude} (DTYP={dtyp_key})"
                 );
@@ -646,7 +687,14 @@ impl NewportHolder {
                 let dtyp_key = format!("XPS_{motor_port}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&motor_port, axis),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "XPSCreateAxis: motorPort={motor_port} movePort={move_port} axis={axis} positioner={positioner_name} stepsPerUnit={steps_per_unit} (DTYP={dtyp_key})"
                 );
@@ -1014,75 +1062,82 @@ impl NewportHolder {
                     "XPSExecuteProfile: motorPort={motor_port} group={} file={} executions={executions} pulses={num_pulses} over elements {start_pulses}..{end_pulses} (running on background thread)",
                     plan.group, plan.file_name
                 );
-                thread::spawn(move || {
-                    for (positioner, target) in &plan.start_moves {
-                        let moved = match plan.move_mode {
-                            MoveMode::Absolute => {
-                                exec_sock.group_move_absolute(positioner, *target)
+                // C's XPSProfile thread (XPSController.cpp:206-209).
+                spawn_dedicated_thread(
+                    "XPSProfile".into(),
+                    ThreadPriority::Low,
+                    StackSizeClass::Medium,
+                    move || {
+                        for (positioner, target) in &plan.start_moves {
+                            let moved = match plan.move_mode {
+                                MoveMode::Absolute => {
+                                    exec_sock.group_move_absolute(positioner, *target)
+                                }
+                                MoveMode::Relative => {
+                                    exec_sock.group_move_relative(positioner, *target)
+                                }
+                            };
+                            if let Err(e) = moved {
+                                eprintln!(
+                                    "XPSExecuteProfile: move to start for {positioner} failed: {e}"
+                                );
+                                return;
                             }
-                            MoveMode::Relative => {
-                                exec_sock.group_move_relative(positioner, *target)
+                        }
+
+                        // Configure gathering + the per-pulse sampling event
+                        // (C executeProfile order: reset, configure, pulse window,
+                        // trigger, action, start).
+                        let event_id = match Self::xps_start_gathering(
+                            &exec_sock,
+                            &plan,
+                            pulse_start,
+                            pulse_end,
+                            pulse_period,
+                        ) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("XPSExecuteProfile: {e}");
+                                return;
                             }
                         };
-                        if let Err(e) = moved {
-                            eprintln!(
-                                "XPSExecuteProfile: move to start for {positioner} failed: {e}"
-                            );
-                            return;
+
+                        let run = exec_sock.multiple_axes_pvt_execution(
+                            &plan.group,
+                            &plan.file_name,
+                            executions,
+                        );
+
+                        // Tear down the event and stop gathering even on a failed
+                        // or aborted run (C removes the event and stops gathering
+                        // unconditionally after MultipleAxesPVTExecution).
+                        if let Err(e) = exec_sock.event_extended_remove(event_id) {
+                            eprintln!("XPSExecuteProfile: EventExtendedRemove failed: {e}");
                         }
-                    }
-
-                    // Configure gathering + the per-pulse sampling event
-                    // (C executeProfile order: reset, configure, pulse window,
-                    // trigger, action, start).
-                    let event_id = match Self::xps_start_gathering(
-                        &exec_sock,
-                        &plan,
-                        pulse_start,
-                        pulse_end,
-                        pulse_period,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            eprintln!("XPSExecuteProfile: {e}");
-                            return;
+                        match exec_sock.gathering_stop() {
+                            // -30: gathering never started (aborted before one
+                            // element completed); C tolerates it.
+                            Ok(()) | Err(XpsError::Api(-30)) => {}
+                            Err(e) => eprintln!("XPSExecuteProfile: GatheringStop failed: {e}"),
                         }
-                    };
 
-                    let run = exec_sock.multiple_axes_pvt_execution(
-                        &plan.group,
-                        &plan.file_name,
-                        executions,
-                    );
-
-                    // Tear down the event and stop gathering even on a failed
-                    // or aborted run (C removes the event and stops gathering
-                    // unconditionally after MultipleAxesPVTExecution).
-                    if let Err(e) = exec_sock.event_extended_remove(event_id) {
-                        eprintln!("XPSExecuteProfile: EventExtendedRemove failed: {e}");
-                    }
-                    match exec_sock.gathering_stop() {
-                        // -30: gathering never started (aborted before one
-                        // element completed); C tolerates it.
-                        Ok(()) | Err(XpsError::Api(-30)) => {}
-                        Err(e) => eprintln!("XPSExecuteProfile: GatheringStop failed: {e}"),
-                    }
-
-                    match run {
-                        Ok(()) => println!(
-                            "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
-                            plan.file_name
-                        ),
-                        // -27: the trajectory was aborted (C reports it as such).
-                        Err(XpsError::Api(-27)) => {
-                            eprintln!("XPSExecuteProfile: MultipleAxesPVTExecution aborted")
+                        match run {
+                            Ok(()) => println!(
+                                "XPSExecuteProfile: trajectory '{}' complete (read samples with XPSReadbackProfile)",
+                                plan.file_name
+                            ),
+                            // -27: the trajectory was aborted (C reports it as such).
+                            Err(XpsError::Api(-27)) => {
+                                eprintln!("XPSExecuteProfile: MultipleAxesPVTExecution aborted")
+                            }
+                            Err(e) => eprintln!(
+                                "XPSExecuteProfile: execution of '{}' failed: {e}",
+                                plan.file_name
+                            ),
                         }
-                        Err(e) => eprintln!(
-                            "XPSExecuteProfile: execution of '{}' failed: {e}",
-                            plan.file_name
-                        ),
-                    }
-                });
+                    },
+                )
+                .map_err(|e| format!("XPSExecuteProfile: cannot create XPSProfile thread: {e}"))?;
                 Ok(CommandOutcome::Continue)
             },
         )
@@ -1244,7 +1299,14 @@ impl NewportHolder {
                     let ax = HxpAxis::new(controller.clone(), move_sock, axis_no);
                     let dtyp_key = format!("HXP_{motor_port}_{axis_no}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        asyn_user(&motor_port, axis_no as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
 
                 let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
@@ -1515,7 +1577,14 @@ impl NewportHolder {
                         .map_err(|e| format!("ESP300CreateController: axis {axis}: {e}"))?;
                     let dtyp_key = format!("ESP300_{motor_port}_{}", axis - 1);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        TraceUser::Model1,
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "ESP300CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=ESP300_{motor_port}_{{0..{}}})",
@@ -1566,7 +1635,14 @@ impl NewportHolder {
                         .map_err(|e| format!("MM3000CreateController: axis {axis}: {e}"))?;
                     let dtyp_key = format!("MM3000_{motor_port}_{}", axis - 1);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        TraceUser::Model1,
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "MM3000CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM3000_{motor_port}_{{0..{}}})",
@@ -1626,7 +1702,14 @@ impl NewportHolder {
                         .map_err(|e| format!("MM4000CreateController: axis {axis}: {e}"))?;
                     let dtyp_key = format!("MM4000_{motor_port}_{}", axis - 1);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        asyn_user(&motor_port, (axis - 1) as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "MM4000CreateController: motorPort={motor_port} serialPort={serial_port} firmware=\"{firmware}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM4000_{motor_port}_{{0..{}}})",
@@ -1678,7 +1761,14 @@ impl NewportHolder {
                         .map_err(|e| format!("PM500CreateController: axis {index}: {e}"))?;
                     let dtyp_key = format!("PM500_{motor_port}_{index}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        TraceUser::Model1,
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "PM500CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PM500_{motor_port}_{{0..{}}})",
@@ -1699,8 +1789,8 @@ impl NewportHolder {
     /// `drvAsynIPPortConfigure`), autodiscovers its driver modules and
     /// channels (`MPV` for the 8750, `DRT` for the 8752), and creates one
     /// motor axis per discovered channel (DTYP `PMNC_{motorPort}_{0..}`).
-    /// The port input EOS must be the `>` prompt
-    /// (`asynOctetSetInputEos(port, 0, ">")`). Replaces the C
+    /// The controller sets the port EOS itself (CR out, `>` prompt in), as C
+    /// `motor_init` does. Replaces the C
     /// `PMNC87xxSetup`/`PMNC87xxConfig` pair.
     pub fn pmnc87xx_create_controller_command(self: &Arc<Self>) -> CommandDef {
         let holder = self.clone();
@@ -1718,8 +1808,10 @@ impl NewportHolder {
                 let asyn_port = req_string(args, 1, "asynPort")?;
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-                let handle = connect_ip(&asyn_port, PMNC_TIMEOUT)?;
-                let controller = PmncController::new(handle)
+                let port = get_port(&asyn_port).ok_or_else(|| {
+                    format!("IP port '{asyn_port}' not found (call drvAsynIPPortConfigure first)")
+                })?;
+                let controller = PmncController::new(port.handle.clone(), PMNC_TIMEOUT)
                     .map_err(|e| format!("PMNC87xxCreateController: {e}"))?;
                 let ident = controller.ident().to_string();
                 let model = controller.model();
@@ -1731,7 +1823,14 @@ impl NewportHolder {
                         .map_err(|e| format!("PMNC87xxCreateController: axis {index}: {e}"))?;
                     let dtyp_key = format!("PMNC_{motor_port}_{index}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        TraceUser::Model1,
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "PMNC87xxCreateController: motorPort={motor_port} asynPort={asyn_port} ident=\"{ident}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PMNC_{motor_port}_{{0..{}}})",

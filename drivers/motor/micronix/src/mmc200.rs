@@ -5,8 +5,8 @@
 //! the wire; commands are `{n}CMD` and queries `{n}CMD?` reply with a leading
 //! `#` (e.g. `#MMC-200 …`, `#8`, `#0.000000,0.000000`). Motion commands take
 //! no reply — only `?` queries are read — so this port pairs
-//! [`Mmc200Controller::write`] (fire-and-forget) with
-//! [`Mmc200Controller::query`] (write + read) exactly as the C driver pairs
+//! `Mmc200Controller::write` (fire-and-forget) with
+//! `Mmc200Controller::query` (write + read) exactly as the C driver pairs
 //! `writeController` with `writeReadController`.
 //!
 //! ## Units
@@ -88,8 +88,7 @@ impl Mmc200Controller {
     /// trailing line terminator. The leading `#` is left intact — callers skip
     /// it with `reply.get(1..)`, matching C's `&inString_[1]`.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.write(cmd)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         let reply = String::from_utf8_lossy(&raw);
         Ok(reply.trim_end_matches(['\r', '\n', '\0']).to_string())
     }

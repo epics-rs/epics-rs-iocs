@@ -3,7 +3,8 @@
 # 0,1,2 to controller motors 1,2,3.
 #
 # The controller works in millimetres (position query and G/T moves are mm).
-# Positions travel the driver boundary in mm, so MRES = 1 and EGU = mm. VELO
+# Positions travel the driver boundary in mm (EGU = mm); MRES is the record's
+# step (RRBV is an integer count), the C drive_resolution 0.01 mm. VELO
 # (mm/s) feeds the V command; done and the plus/minus limit switches come from
 # the Z status character. The controller only reports position when stopped, and
 # only for the currently selected motor.
@@ -15,7 +16,7 @@ record(motor, "$(P)$(M)") {
     field(ACCL, "$(ACCL=0.2)")
     field(DHLM, "$(HLM=25.0)")
     field(DLLM, "$(LLM=-25.0)")
-    field(MRES, "$(MRES=1.0)")
+    field(MRES, "$(MRES=0.01)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=3)")
 }

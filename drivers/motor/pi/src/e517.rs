@@ -20,7 +20,7 @@
 //! 3. **Replies are `=`-delimited.** C `recv_mess` runs `pos = strchr(com,
 //!    '='); if (pos) strcpy(com, &pos[1])` on every read — the controller
 //!    echoes the query and returns `…=value`, so everything up to and including
-//!    the first `'='` is stripped before parsing. [`strip_eq`] reproduces this.
+//!    the first `'='` is stripped before parsing. `strip_eq` reproduces this.
 //!
 //! ## Connect handshake (C `motor_init`, mostly commented out)
 //! The E-517 `motor_init` has the ONLINE loop, `GET_IDENT`, and `VCO`
@@ -56,7 +56,7 @@
 //!   wire command.
 //!
 //! ## Framing & not-modeled deviations
-//! Same as the E-516 port: port-owned EOS (`"\n"` both ways, set in `st.cmd`),
+//! Same as the E-516 port: port-owned EOS (`"\n"` both ways, set at Config),
 //! the redundant `EOL`+output-EOS trailing empty command on moves collapsed to
 //! a single terminator, and `recv_mess(FLUSH)` / `no_motion_count` / `report()`
 //! not modeled. See [`crate::e516`] for the full rationale.
@@ -191,8 +191,7 @@ impl PIE517Controller {
 
         let mut num_axes = 0;
         for label in AXIS_LABELS {
-            ctrl.send(&format!("POS? {label}"))?;
-            if ctrl.recv().is_empty() {
+            if ctrl.exchange(&format!("POS? {label}")).is_empty() {
                 break;
             }
             num_axes += 1;
@@ -213,11 +212,18 @@ impl PIE517Controller {
         Ok(())
     }
 
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> String {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
     /// Read one reply, `=`-stripped (C `recv_mess`'s `strchr('=')` fixup). The
     /// port's input EOS already removed the `"\n"`. Any transport failure or
     /// empty read folds into `""`.
-    fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
+    fn reply(read: AsynResult<Vec<u8>>) -> String {
+        match read {
             Ok(raw) if !raw.is_empty() => strip_eq(&String::from_utf8_lossy(&raw)).to_owned(),
             _ => String::new(),
         }
@@ -246,17 +252,13 @@ impl PIE517Controller {
     fn read_axis(&mut self, axis: usize) -> Option<AxisReading> {
         let label = AXIS_LABELS[axis];
 
-        self.send(&format!("ONT? {label}")).ok()?;
-        let ontarget = scan_int(&self.recv())?;
+        let ontarget = scan_int(&self.exchange(&format!("ONT? {label}")))?;
 
-        self.send(&format!("OVF? {label}")).ok()?;
-        let overflow = scan_int(&self.recv())?;
+        let overflow = scan_int(&self.exchange(&format!("OVF? {label}")))?;
 
-        self.send(&format!("SVO? {label}")).ok()?;
-        let servo = scan_int(&self.recv())?;
+        let servo = scan_int(&self.exchange(&format!("SVO? {label}")))?;
 
-        self.send(&format!("POS? {label}")).ok()?;
-        let pos_reply = self.recv();
+        let pos_reply = self.exchange(&format!("POS? {label}"));
         if pos_reply.is_empty() {
             return None;
         }

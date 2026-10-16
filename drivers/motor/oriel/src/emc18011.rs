@@ -4,8 +4,8 @@
 //! model-1 dev/drv pair). One serial line drives up to three encoder-mike axes,
 //! but the controller can address only **one motor at a time**: a motor must be
 //! selected with `M<n>` before it will move or report status. Commands are
-//! terminated by CR (`\r`, the driver owns output framing) and replies by LF
-//! (`\n`, the startup script sets the input EOS). Every command produces a
+//! terminated by the port output EOS CR and replies by input EOS LF, both set
+//! by `EMC18011Config` as C `motor_init` does. Every command produces a
 //! reply, so each is written and its reply consumed to keep the stream
 //! synchronized.
 //!
@@ -39,7 +39,8 @@
 //! driver multiplies the record's raw steps by a fixed `drive_resolution`
 //! (0.01) to reach mm and divides on readback; at the asyn-rs motor boundary,
 //! which is dial-frame EGU, that scaling cancels, so this port works directly in
-//! mm: `MRES` is 1 and `EGU` is mm.
+//! mm (`EGU` is mm). The record's `MRES` must still be `drive_resolution`:
+//! raw counts are integers, so it is the step.
 //!
 //! ## Deviations from C (documented)
 //!
@@ -61,9 +62,6 @@ use motor_common::util::{atof, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
-
-/// Command terminator (C `EMC18011_OUT_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
 
 /// Fixed number of axes (C `EMC18011_MAX_MOTORS`).
 pub const MAX_MOTORS: usize = 3;
@@ -151,6 +149,16 @@ pub struct Emc18011Controller {
     ident: String,
     /// The 0-based index of the motor currently selected and in motion, if any.
     active: Option<usize>,
+    comm_state: CommState,
+}
+
+/// Controller communication state (C `cntrl->status`): one invalid `Z` reply
+/// is retried silently, a second in a row is a comm error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
 }
 
 impl Emc18011Controller {
@@ -162,6 +170,7 @@ impl Emc18011Controller {
             handle,
             ident: "Oriel Encoder Mike 18011".to_string(),
             active: None,
+            comm_state: CommState::Normal,
         };
 
         let mut online = false;
@@ -193,19 +202,11 @@ impl Emc18011Controller {
         MAX_MOTORS
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and return its reply (trimmed). Every command produces a
     /// reply, so this is used for both queries and set commands (whose reply is
     /// discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
@@ -363,17 +364,38 @@ impl AsynMotor for Emc18011Axis {
             return Ok(self.last_status.clone());
         }
 
-        let z = decode_z(ctrl.command("Z")?.chars().next().unwrap_or(Z_RUNUP));
+        // C drvEMC18011.cc:249-321: a missing or unknown `Z` reply keeps the
+        // previous status once (RETRY); a second in a row raises COMM_ERR.
+        let z_char = ctrl
+            .command("Z")
+            .ok()
+            .and_then(|r| r.chars().next())
+            .filter(|c| (Z_STOPPED..=Z_LSUP).contains(c));
+        let Some(z_char) = z_char else {
+            let hard = ctrl.comm_state != CommState::Normal;
+            ctrl.comm_state = if hard {
+                CommState::CommErr
+            } else {
+                CommState::Retry
+            };
+            drop(ctrl);
+            if hard {
+                self.last_status.comms_error = true;
+                self.last_status.problem = true;
+            }
+            return Ok(self.last_status.clone());
+        };
+        ctrl.comm_state = CommState::Normal;
+        let z = decode_z(z_char);
 
         let mut position = self.prev_position;
         if !z.moving {
-            // Stopped or at a limit: read a valid position and release the slot.
-            let reply = ctrl.command("A")?;
-            let value = atof(&reply);
-            if !reply.is_empty() {
-                position = value;
+            // Stopped or at a limit: a position reply releases the slot; with
+            // none C keeps the motor selected and the old position.
+            if let Some(reply) = ctrl.command("A").ok().filter(|r| !r.is_empty()) {
+                position = atof(&reply);
+                ctrl.active = None;
             }
-            ctrl.active = None;
         }
         drop(ctrl);
 

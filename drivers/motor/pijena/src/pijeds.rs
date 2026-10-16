@@ -9,8 +9,9 @@
 //!
 //! ## Wire protocol
 //!
-//! Commands are `\r`-terminated (C `EDS_OUT_EOS`); replies are framed by an ETX
-//! (0x11) input EOS (C `EDS_IN_ETX`), optionally led by an STX (0x13). Each
+//! Commands are `\r`-terminated by the port's output EOS (C `EDS_OUT_EOS`);
+//! replies are framed by an ETX (0x11) input EOS (C `EDS_IN_ETX`), optionally
+//! led by an STX (0x13). `PIJEDSConfig` sets both, as C `motor_init` does. Each
 //! command names the axis in place of `#`:
 //!
 //! - `set,<axis>,<pos>`   — move to absolute position (µm), write-only
@@ -53,9 +54,6 @@ use motor_common::util::{atof, atoi};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 128;
-
-/// Command terminator (C `EDS_OUT_EOS`).
-const TERMINATOR: &[u8] = b"\r";
 
 /// Position resolution significant digits (C `EDS_MAX_RES`); the `set`/`sr`
 /// value is formatted with this many decimals.
@@ -145,25 +143,17 @@ impl PiJedsController {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a write-only set command (`set`/`sr`/`cl`); the E-516 returns no
     /// reply to these forms.
     fn write_cmd(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Send a query command and return its reply, stripped of framing control
     /// bytes (STX/ETX) and surrounding whitespace.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c.is_control() || c.is_whitespace())
@@ -206,6 +196,8 @@ impl PiJedsAxis {
             moving: false,
             last_status: MotorStatus {
                 done: true,
+                // C motor_init: encoder_present = YES, EA_PRESENT = 1.
+                has_encoder: true,
                 gain_support: true,
                 ..MotorStatus::default()
             },
@@ -281,8 +273,8 @@ impl AsynMotor for PiJedsAxis {
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
-        // C STOP_AXIS sends nothing — the piezo reaches target immediately.
-        self.moving = false;
+        // C STOP_AXIS sends nothing and leaves the motion node, so the stage
+        // still travels to target and the settle test still owns `moving`.
         Ok(())
     }
 
@@ -355,6 +347,7 @@ impl AsynMotor for PiJedsAxis {
             comms_error: false,
             problem: false,
             gain_support: true,
+            has_encoder: true,
             ..MotorStatus::default()
         };
         Ok(self.last_status.clone())
@@ -364,6 +357,93 @@ impl AsynMotor for PiJedsAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An E-516 axis 0 that steps 1 µm toward its `set` target per `mess`.
+    struct Stage {
+        base: epics_rs::asyn::port::PortDriverBase,
+        pos: f64,
+        target: f64,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Stage {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).trim_end().to_string();
+            let f: Vec<&str> = cmd.split(',').collect();
+            self.reply = match f.as_slice() {
+                [""] => b"DSM V1.959".to_vec(),
+                ["mess", "0"] => {
+                    self.pos += (self.target - self.pos).clamp(-1.0, 1.0);
+                    format!("mess,0,{:.3}", self.pos).into_bytes()
+                }
+                ["stat", "0"] => b"stat,0,133".to_vec(),
+                ["mess" | "stat", _] => b"not present".to_vec(),
+                ["set", "0", t] => {
+                    self.target = t.parse().unwrap();
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let n = self.reply.len();
+            buf[..n].copy_from_slice(&self.reply);
+            Ok(n)
+        }
+    }
+
+    /// Axis 0 of an E-516 on a fresh [`Stage`] port named `port`.
+    fn stage_axis(port: &str) -> PiJedsAxis {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let stage = Stage {
+            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            pos: 0.0,
+            target: 0.0,
+            reply: Vec::new(),
+        };
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(port).unwrap(), stage, RuntimeConfig::default())
+                .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        PiJedsAxis::new(Arc::new(Mutex::new(PiJedsController::new(io).unwrap())), 0)
+    }
+
+    /// C STOP_AXIS sends nothing and keeps the motion node, so a stage stopped
+    /// mid-travel still settles at its target and reports done.
+    #[test]
+    fn a_stop_mid_travel_still_ends_in_done() {
+        let mut axis = stage_axis("pijeds_stop");
+        let user = AsynUser::default();
+        axis.move_absolute(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
+        assert!(!axis.poll(&user).unwrap().done);
+        axis.stop(&user, 0.0).unwrap();
+        let done = (0..20).any(|_| axis.poll(&user).unwrap().done);
+        assert!(done, "the stage settled at 5 but never reported done");
+        assert_eq!(axis.poll(&user).unwrap().position, 5.0);
+    }
+
+    /// C motor_init sets EA_PRESENT on every axis (drvPIJEDS.cc:666-667), so
+    /// MSTA bit 8 holds from boot and on every poll.
+    #[test]
+    fn every_axis_reports_an_encoder() {
+        let mut axis = stage_axis("pijeds_enc");
+        assert!(axis.last_status.has_encoder);
+        assert!(axis.poll(&AsynUser::default()).unwrap().has_encoder);
+    }
 
     #[test]
     fn value_field_extracts_after_second_comma() {

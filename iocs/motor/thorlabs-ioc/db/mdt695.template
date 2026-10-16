@@ -4,7 +4,8 @@
 #
 # The controller is open-loop voltage control: a move sets the channel output
 # voltage and readback reports the commanded voltage. Positions travel the driver
-# boundary in volts, so MRES = 1 and EGU = V. There is no motion feedback, so the
+# boundary in volts (EGU = V); MRES is the record's step (RRBV is an integer
+# count), so it is the C drive_resolution, 0.1 V (drvMDT695.h). There is no motion feedback, so the
 # record is always done immediately, with no limit switches and no encoder.
 # Set DHLM/DLLM to the controller's voltage range (commonly 0..75 or 0..150 V).
 
@@ -15,7 +16,7 @@ record(motor, "$(P)$(M)") {
     field(ACCL, "$(ACCL=0.2)")
     field(DHLM, "$(HLM=75.0)")
     field(DLLM, "$(LLM=0.0)")
-    field(MRES, "$(MRES=1.0)")
+    field(MRES, "$(MRES=0.1)")
     field(EGU,  "$(EGU=V)")
     field(PREC, "$(PREC=1)")
 }

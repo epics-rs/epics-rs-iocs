@@ -234,8 +234,7 @@ impl PhytronController {
     /// removed). A NAK or malformed reply is an error (C `bACKonly = true`).
     fn command(&self, cmd: &str) -> AsynResult<String> {
         let frame = build_frame(self.ctrl_type, self.address, cmd);
-        self.handle.write_octet(0, &frame)?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &frame, READ_BUF)?;
         parse_reply(&raw)
     }
 
@@ -271,6 +270,9 @@ pub struct PhytronAxis {
     /// Limit-home state machine (C `homeState_`): 0 = idle, else bit0 = homing
     /// direction (1 = forward/high), bits>>1 = phase.
     home_state: i32,
+    /// C's `motorEncoderRatio_` (1 at phytronAxisMotor.cpp:1353): the poll
+    /// reports `P22R` times it (:2005-2006).
+    encoder_ratio: f64,
 }
 
 impl PhytronAxis {
@@ -306,6 +308,7 @@ impl PhytronAxis {
             axis_module_no,
             motor_enabled: false,
             home_state: 0,
+            encoder_ratio: 1.0,
         })
     }
 
@@ -356,6 +359,24 @@ impl PhytronAxis {
 }
 
 impl AsynMotor for PhytronAxis {
+    /// C `phytronAxis::setEncoderRatio` (phytronAxisMotor.cpp:1759-1779):
+    /// read the encoder (`P22R`), then set the conversion factor `P39` to
+    /// `1/ratio`.
+    fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {
+        // asynMotorController::writeFloat64 stores the ratio before
+        // dispatching, so a refused command still scales the poll (:289).
+        self.encoder_ratio = ratio;
+        let ctrl = self.lock();
+        let set = ctrl.set_char();
+        let m = self.axis_module_no.as_str();
+        ctrl.command(&format!("{m}P22R"))?
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| phytron_err("phytron: setEncoderRatio: invalid encoder position"))?;
+        ctrl.command(&format!("{m}P39{set}{:.6}", 1.0 / ratio))?;
+        Ok(())
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -515,7 +536,7 @@ impl AsynMotor for PhytronAxis {
 
         Ok(MotorStatus {
             position: pos,
-            encoder_position: enc,
+            encoder_position: enc * self.encoder_ratio,
             done: !moving,
             moving,
             high_limit: high,
@@ -647,6 +668,93 @@ fn mcc_status_word(axis_digit: u8, perr: &str, sui: &str, moving: bool) -> AsynR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An MCC that ACKs every command, answering `P22R` with 1000 and the
+    /// rest of a poll with an idle, fault-free axis; records each command
+    /// payload.
+    struct Mcc {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Mcc {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(&data[2..data.len() - 1]).into_owned();
+            let payload: &[u8] = match cmd.as_str() {
+                c if c.ends_with("P22R") => b"1000",
+                c if c.ends_with("P20R") || c.ends_with("=E") => b"0",
+                c if c.ends_with("=H") => b"E",
+                "SUI" => b"I=00000000",
+                _ => b"",
+            };
+            self.reply = [&[STX, ACK][..], payload, &[ETX]].concat();
+            self.written.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    #[test]
+    fn set_encoder_ratio_reads_the_encoder_then_sets_p39_to_its_inverse() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = Mcc {
+            base: PortDriverBase::new("phytronEncoderRatio", 1, PortFlags::default()),
+            written: written.clone(),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("phytronEncoderRatio").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
+        let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
+        axis.set_encoder_ratio(&AsynUser::new(0), 0.5).unwrap();
+        assert_eq!(*written.lock().unwrap(), ["1P22R", "1P39S2.000000"]);
+    }
+
+    #[test]
+    fn the_poll_reports_the_encoder_times_the_encoder_ratio() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = Mcc {
+            base: PortDriverBase::new("phytronEncoderPoll", 1, PortFlags::default()),
+            written: Arc::new(Mutex::new(Vec::new())),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("phytronEncoderPoll").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = Arc::new(Mutex::new(PhytronController::new(io, CtrlType::Mcc, 0)));
+        let mut axis = PhytronAxis::new(controller, 0, 1).unwrap();
+        let user = AsynUser::new(0);
+        assert_eq!(axis.poll(&user).unwrap().encoder_position, 1000.0);
+        axis.set_encoder_ratio(&user, 0.5).unwrap();
+        assert_eq!(axis.poll(&user).unwrap().encoder_position, 500.0);
+    }
 
     #[test]
     fn phymotion_frame_has_stx_etx_and_crc() {

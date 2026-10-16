@@ -13,12 +13,12 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_string, poll_intervals, req_int,
     req_string,
 };
+use motor_common::{MotorHolder, TraceUser};
 
 use crate::spiiplus::{CommandMode, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
 
@@ -87,7 +87,14 @@ pub fn spiiplus_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = SpiiPlusAxis::new(controller.clone(), index);
                 let dtyp_key = format!("SPIIPLUS_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "SPiiPlusConfig: card={card} asynPort={asyn_port} axes={num_axes} \

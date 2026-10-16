@@ -33,13 +33,6 @@ use crate::protocol;
 /// strings are short; 256 bytes is generous).
 const READ_BUF: usize = 256;
 
-/// Command line terminator. The SMC100 speaks CR/LF-terminated ASCII. The C
-/// driver relies on the asyn serial port's output EOS to append it; this
-/// driver appends it itself, so st.cmd sets only the input EOS (replies are
-/// still split by it). `crate::protocol` keeps the bare command text (as C
-/// `outString_` does), so the wire format stays unit-testable.
-const TERMINATOR: &[u8] = b"\r\n";
-
 /// A Newport SMC100 axis driver implementing [`AsynMotor`].
 pub struct Smc100Axis {
     /// Synchronous octet handle to the dedicated serial-transport asyn port.
@@ -64,25 +57,16 @@ impl Smc100Axis {
         }
     }
 
-    /// Frame a command with the CR/LF [`TERMINATOR`] (see its docs for why the
-    /// driver appends this itself rather than relying on port EOS).
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
-    /// Write a command (C `writeController`); the terminator is appended here.
+    /// Write a command (C `writeController`). C SMC100Driver sets no EOS: the
+    /// CR/LF framing is the port's, from st.cmd.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a command and read the reply (C `writeReadController`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let reply = self.handle.read_octet(0, READ_BUF)?;
+        let reply = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&reply).into_owned())
     }
 

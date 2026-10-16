@@ -23,9 +23,10 @@ asynSetOption("$(SERIAL)", 0, "baud",   "57600")
 asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
-# The driver appends the CR/LF terminator itself (no output EOS); replies
-# are split by the input EOS.
+
+# CR/LF both ways (C st.cmd.SMC100); the driver sends bare commands.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- SMC100 controller ----
 # SMC100CreateController(motorPort, serialPort, wireScale, [movingPollMs], [idlePollMs])

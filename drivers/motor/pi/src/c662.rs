@@ -12,8 +12,8 @@
 //! `motor_init` sets `setOutputEos("\n")` **and** `setInputEos("\n")` after
 //! connecting, and `send_mess`'s `local_buff` never appends a terminator
 //! (`strcat(local_buff, com)` only) — so the port's output EOS puts the `\n` on
-//! the wire. This port has no `SyncIOHandle` EOS hook, so both are set in
-//! `st.cmd` (both `"\n"`) and [`PIC662Controller::send`] writes **bare** bytes.
+//! the wire. `PIC662Config` sets both to `"\n"` and `PIC662Controller::send`
+//! writes **bare** bytes.
 //! There is no protocol address (SCPI, single device) and, unlike the C-630,
 //! the device does **not** echo (`cmnd_response = false`): a command write is
 //! never followed by a read.
@@ -35,7 +35,7 @@
 //! `*ESR?`.
 //!
 //! A failed `*ESR?` runs the same NORMAL/RETRY/COMM_ERR two-strike debounce as
-//! the C-862 ([`CommState`]): the first empty reply is silently retried (cached
+//! the C-862 (`CommState`): the first empty reply is silently retried (cached
 //! status kept), the second consecutive one sets `comms_error`/`problem`.
 //!
 //! ## Position (`POS?`)
@@ -75,8 +75,9 @@
 //!   record-layer state this interface does not carry. `OpComplete`/`ExeError`
 //!   (the primary done signal) is honored; the stability fallback is omitted,
 //!   matching the C-862 port's treatment of `no_motion_count`.
-//! - **`recv_mess(..., FLUSH)`** / **`report()`**: no `SyncIOHandle` flush
-//!   primitive / not implemented, as elsewhere in this workspace.
+//! - **`recv_mess(..., FLUSH)`**: replaced by a flush before every query
+//!   (`exchange`), a superset of C's error-path flush.
+//! - **`report()`**: not implemented, as elsewhere in this workspace.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -162,19 +163,25 @@ impl PIC662Controller {
         Ok(())
     }
 
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> String {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
     /// Read one EOS-stripped reply, folding a transport failure or empty read
     /// into `""` (C `recv_mess`'s `if ((status != asynSuccess) || (nread <= 0))
     /// com[0] = '\0'`).
-    fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
+    fn reply(read: AsynResult<Vec<u8>>) -> String {
+        match read {
             Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
             _ => String::new(),
         }
     }
 
     fn query(&self, cmd: &str) -> String {
-        let _ = self.send(cmd);
-        self.recv()
+        self.exchange(cmd)
     }
 
     /// C `set_status`: `*ESR?` (comm-debounced) then `POS?`. `None` means the

@@ -6,8 +6,7 @@
 //! probes and attaches each axis to a `DTYP`-keyed motor device support
 //! (`OMS_{controllerName}_{axis}`). The controller is looked up by name from a
 //! registry shared by the commands. Both port kinds (`drvAsynIPPort` /
-//! `drvAsynSerialPort`) work, so `connect_ip` is used (the lookup is
-//! transport-agnostic).
+//! `drvAsynSerialPort`) work.
 //!
 //! `omsMAXnetConfig` and `omsMXAConfig` differ only in the controller label
 //! (and, in the C driver, a minimum-firmware value used to select command
@@ -18,15 +17,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_ip;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, poll_intervals,
     req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::oms::{OmsAxis, OmsController};
 
@@ -93,9 +94,10 @@ fn oms_config_command(
                     "{cmd_name}: controller '{name}' already registered"
                 ));
             }
-            let handle = connect_ip(
+            let handle = connect_with_default_eos(
                 &asyn_port,
                 Duration::from_millis(timeout_ms.max(0.0) as u64),
+                &format!("{controller_type}Config"),
             )?;
             let controller = OmsController::new(handle, controller_type);
             match controller.firmware_version() {
@@ -153,9 +155,82 @@ fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> Co
                 .map_err(|e| format!("omsCreateAxis: {e}"))?;
             let dtyp_key = format!("OMS_{name}_{axis}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
-            holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                asyn_user(&name, axis as i32),
+                dtyp_key.clone(),
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
             println!("omsCreateAxis: {dtyp_key} (axis={axis})");
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// Connect to the octet port, giving it the OMS EOS (input `"\n\r"`, output
+/// `"\n"`) only where st.cmd left that direction empty, as
+/// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`. As there, a
+/// refused get skips that direction and a refused set is printed, never fatal
+/// (omsMAXnet.cpp:134-142, omsMXA.cpp:129-137).
+fn connect_with_default_eos(
+    port_name: &str,
+    timeout: Duration,
+    who: &str,
+) -> Result<SyncIOHandle, String> {
+    let port = get_port(port_name).ok_or_else(|| format!("asyn port '{port_name}' not found"))?;
+    let user = || AsynUser::new(0).with_addr(0);
+    let handle = &port.handle;
+    if handle
+        .get_input_eos_blocking(user())
+        .is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_input_eos_blocking(user(), b"\n\r")
+    {
+        println!("{who}: unable to set InputEOS {port_name}: {e}");
+    }
+    if handle
+        .get_output_eos_blocking(user())
+        .is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_output_eos_blocking(user(), b"\n")
+    {
+        println!("{who}: unable to set OutputEOS {port_name}: {e}");
+    }
+    Ok(SyncIOHandle::from_handle(handle.clone(), 0, timeout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    /// A port with no EOS support of its own: both sets are refused.
+    struct Bare(PortDriverBase);
+
+    impl PortDriver for Bare {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    #[test]
+    fn a_port_refusing_the_default_eos_still_connects() {
+        let name = "omsEosRefused";
+        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        let port = rt.port_handle().clone();
+        assert!(
+            port.set_input_eos_blocking(AsynUser::new(0), b"\n\r")
+                .is_err()
+        );
+        claim.publish(port, &open_owner()).unwrap();
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
+    }
 }

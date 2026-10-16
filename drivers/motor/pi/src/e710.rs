@@ -11,15 +11,15 @@
 //! ## Addressing — digit axes, first-char substitution
 //! `PIE710_axis[] = {"1".."6"}`, `MAX_AXES = 6`. C `send_mess` overwrites only
 //! `local_buff[0]` with `*name`, so the leading `#` placeholder of a command
-//! becomes the axis digit (`#GI8` → `1GI8`, `#TP` → `1TP`). [`substitute_axis`]
+//! becomes the axis digit (`#GI8` → `1GI8`, `#TP` → `1TP`). `substitute_axis`
 //! reproduces this exactly — including the consequence that when the record
 //! concatenates two commands into one transaction (velocity + move), **only the
 //! first command's `#` is replaced; an inner `#` stays literal** (see Motion).
 //!
 //! ## EOS ownership
 //! C `motor_init` sets output and input EOS to `"\n"` itself, so the asyn port
-//! owns framing: this port writes bare command bytes and the `st.cmd` example
-//! sets `"\n"` both ways. Commands carry a trailing `,` (the E-710 command
+//! owns framing: `PIE710Config` sets `"\n"` both ways and this port writes
+//! bare command bytes. Commands carry a trailing `,` (the E-710 command
 //! separator), which is the last byte before the port-appended `"\n"`.
 //!
 //! ## Connect handshake (C `motor_init`)
@@ -42,7 +42,7 @@
 //! But upstream writes the shift as `mstat.All = statusInt * (2^8)`, and in C
 //! `2^8` is the bitwise-XOR `2 ^ 8 == 10`, **not** `256` — so C multiplies a
 //! "shifted" status by ten and its bits never reach the high byte where the
-//! meaningful bits live. [`decode_status`] implements the intended `* 256`
+//! meaningful bits live. `decode_status` implements the intended `* 256`
 //! (`<< 8`) instead (upstream defect register `doc/upstream-c-defects.md`
 //! #45, retro-fixed per the fix-at-source policy).
 //!
@@ -84,8 +84,8 @@
 //!   outside the ported method set and not emitted.)
 //!
 //! ## Not-modeled deviations
-//! `recv_mess(FLUSH)` (the pre-poll flush when comms are already errored),
-//! `no_motion_count`, post-move `PREM`/`POST` strings, and `report()` are not
+//! `recv_mess(FLUSH)` (the pre-poll flush when comms are already errored) is
+//! replaced by a flush before every query (`exchange`). `no_motion_count`, post-move `PREM`/`POST` strings, and `report()` are not
 //! modeled — the moving/idle poll cadence and the record's own retry logic
 //! cover the same ground, as in the other PI ports.
 
@@ -311,8 +311,7 @@ impl PIE710Controller {
         let mut version = 0;
         let mut second_ok = false;
         for _ in 0..3 {
-            ctrl.send("GI")?; // GET_IDENT, no axis substitution (name == NULL).
-            ident = ctrl.recv();
+            ident = ctrl.exchange("GI"); // GET_IDENT, no axis substitution (name == NULL).
             version = parse_version(&ident);
             second_ok = !ctrl.recv().is_empty();
             // C loops while (status == 0 && !version && retry < 3).
@@ -333,8 +332,7 @@ impl PIE710Controller {
 
         let mut num_axes = 0;
         for label in AXIS_LABELS {
-            ctrl.send(&substitute_axis("#TP", label))?;
-            if ctrl.recv().is_empty() {
+            if ctrl.exchange(&substitute_axis("#TP", label)).is_empty() {
                 break;
             }
             num_axes += 1;
@@ -363,7 +361,18 @@ impl PIE710Controller {
     /// Read one reply (the port's input EOS already stripped the `"\n"`). Any
     /// transport failure or empty read folds into `""`.
     fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
+        Self::reply(self.handle.read_octet(0, READ_BUF))
+    }
+
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> String {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
+    fn reply(read: AsynResult<Vec<u8>>) -> String {
+        match read {
             Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
             _ => String::new(),
         }
@@ -393,13 +402,11 @@ impl PIE710Controller {
     fn read_axis(&mut self, axis: usize) -> Option<AxisReading> {
         let label = AXIS_LABELS[axis];
 
-        self.send(&substitute_axis("#GI8", label)).ok()?;
-        let status_int = parse_gi8(&self.recv())?;
+        let status_int = parse_gi8(&self.exchange(&substitute_axis("#GI8", label)))?;
         let bits = decode_status(status_int, self.status_shift);
 
         // #TP read is NOT gated: C converts even an empty reply (atof("") == 0).
-        self.send(&substitute_axis("#TP", label)).ok()?;
-        let position = nint(atof(&self.recv()) / POS_RES);
+        let position = nint(atof(&self.exchange(&substitute_axis("#TP", label))) / POS_RES);
 
         Some(AxisReading {
             done: bits.done,

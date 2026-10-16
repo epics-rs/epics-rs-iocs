@@ -11,15 +11,14 @@
 //! Same as C-862: pure `pasynOctetSyncIO` despite the iocsh argument label
 //! "asyn address (GPIB)" — `motor_init`'s `connect(cntrl->asyn_port, 0, ...)`
 //! hardcodes the asyn sub-address to 0. Connects via
-//! [`motor_common::connect::connect_serial`].
+//! [`motor_common::connect::connect_with_eos`].
 //!
 //! ## Wire shape — the port owns framing
 //! `motor_init` calls `pasynOctetSyncIO->setOutputEos(pasynUser, "\r", 1)`
 //! and `setInputEos(pasynUser, "\n\x03", 2)` right after connecting;
 //! `send_mess`'s buffer never appends a terminator (`strcat(local_buff,
 //! com)` only). Same ownership as C-862 — see the `motor-port-eos-ownership`
-//! convention. `SyncIOHandle` has no driver-side EOS-set hook, so both EOS
-//! values are set from `st.cmd` instead of from [`PIC663Controller::new`].
+//! convention. `PIC663Config` sets both EOS values the same way.
 //!
 //! `recv_mess` unconditionally drops the **last** received byte (C
 //! `com[nread - 1] = '\0'; /* Strip traling CR. */` — a real typo in the C
@@ -86,8 +85,8 @@
 //!   command (record-side cache only, or C-862-style immediate-move no-op).
 //!
 //! ## Not modeled (documented deviations)
-//! - **`recv_mess(..., FLUSH)`** before a retry: same gap as C-862 —
-//!   `SyncIOHandle` has no synchronous flush primitive.
+//! - **`recv_mess(..., FLUSH)`** before a retry: replaced by a flush before
+//!   every query (`exchange`), a superset of C's error-path flush.
 //! - **`GET_IDENT` dead macro** (`#define GET_IDENT 0x01`, never referenced
 //!   in the C source — a vestige of the C-862 copy-paste): not ported.
 //! - **`report()`**: not implemented, matching every other port here.
@@ -209,8 +208,7 @@ impl PIC663Controller {
 
         let select_cmd = format!("\u{1}{addr:X}VE");
         for _ in 0..3 {
-            ctrl.send(&select_cmd)?;
-            let (reply, raw_len) = ctrl.recv();
+            let (reply, raw_len) = ctrl.exchange(&select_cmd);
             if raw_len > 0 {
                 ctrl.ident = reply;
                 break;
@@ -236,11 +234,18 @@ impl PIC663Controller {
         Ok(())
     }
 
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> (String, usize) {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
     /// Read one reply, unconditionally dropping the last byte (C
     /// `recv_mess`'s "Strip trailing CR"). Returns `(reply, raw_len)`;
     /// `raw_len` is the pre-strip byte count (C's `charcnt`).
-    fn recv(&self) -> (String, usize) {
-        match self.handle.read_octet(0, READ_BUF) {
+    fn reply(read: AsynResult<Vec<u8>>) -> (String, usize) {
+        match read {
             Ok(raw) if !raw.is_empty() => {
                 let stripped = &raw[..raw.len() - 1];
                 (String::from_utf8_lossy(stripped).into_owned(), raw.len())
@@ -252,8 +257,7 @@ impl PIC663Controller {
     /// C `set_status`: `TS` gated by the comm debounce, then (on a good
     /// `TS`) `TP` with no further debounce.
     fn poll_status(&mut self) -> Option<PolledStatus> {
-        let _ = self.send("TS");
-        let (ts_reply, ts_raw_len) = self.recv();
+        let (ts_reply, ts_raw_len) = self.exchange("TS");
         let regs = if ts_raw_len > 9 {
             parse_ts_reply(&ts_reply)
         } else {
@@ -272,8 +276,7 @@ impl PIC663Controller {
 
         let bits = decode_regs(&regs);
 
-        let _ = self.send("TP");
-        let (tp_reply, _) = self.recv();
+        let (tp_reply, _) = self.exchange("TP");
         let position = parse_value_at(&tp_reply, 2).map_or(0.0, |v| nint(v) as f64);
 
         Some(PolledStatus {
@@ -290,7 +293,7 @@ impl PIC663Controller {
 pub struct PIC663Axis {
     controller: Arc<Mutex<PIC663Controller>>,
     /// Record soft limits (dial EGU = raw counts, `MRES = 1`), cached from
-    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`] — the C-663 has no
+    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`](AsynMotor::set_low_limit) — the C-663 has no
     /// jog command, so a jog moves to whichever of these the record's DHLM
     /// / DLLM the requested direction selects.
     high_limit: Option<f64>,

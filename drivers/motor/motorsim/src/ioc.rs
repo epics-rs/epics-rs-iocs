@@ -14,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::motorsim::{
     DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, MotorSimAxis,
@@ -81,9 +81,14 @@ impl MotorSimHolder {
                     )));
                     let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
                     let dtyp_key = format!("motorSim_{motor_port}_{index}");
-                    holder
-                        .inner
-                        .install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.inner.install(
+                        ctx,
+                        asyn_user(&motor_port, index as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                     holder
                         .axes
                         .lock()

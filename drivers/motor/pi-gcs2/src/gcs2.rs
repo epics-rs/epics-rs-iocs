@@ -4,10 +4,9 @@
 //! core, base class) + `PIGCSMotorController.cpp` (the C-863/C-867/C-663/
 //! C-884/E-861/E-871/E-873 motor specialization) — the two classes the task
 //! scopes as "generic GCS2 stage-controller path". Commands are plain ASCII
-//! text terminated by `\n`; the driver owns output framing and the startup
-//! script sets only the input EOS (`\n`), as in the C module's
-//! `PIasynController` constructor (`pasynOctetSyncIO->setInputEos(...,"\n",1)`
-//! plus `setOutputEos(...,"",0)`). Axes are addressed by the GCS *name
+//! text terminated by `\n`; the driver owns output framing and
+//! `PIGCS2CreateController` sets input EOS `"\n"` and an empty output EOS, as
+//! the C `PIasynController` constructor does. Axes are addressed by the GCS *name
 //! string* returned by `SAI?` (e.g. `"1"`), not a bare index.
 //!
 //! ## Wire shape
@@ -40,7 +39,7 @@
 //! `SAI?` (axis discovery) is the one multi-line reply: PI GCS marks a
 //! non-final line with a trailing space before the EOS (`PIInterface::
 //! sendAndReceive`'s `while(inputBuff[strlen(inputBuff)-1]==' ')` continuation
-//! loop) — [`PIGCS2Controller::find_connected_axes`] replicates that instead
+//! loop) — `PIGCS2Controller::find_connected_axes` replicates that instead
 //! of assuming one line per reply.
 //!
 //! ## Units
@@ -50,7 +49,8 @@
 //! counts-per-unit (CPU) integer fraction (`PI_PARA_MOT_CPU_Z`/`_N`,
 //! `getResolution`) used only to convert between the record's raw-step frame
 //! and the controller's EGU — at the asyn-rs motor boundary (already EGU) that
-//! conversion cancels, so it is dropped here: no CPU query, `MRES` = 1.
+//! conversion cancels, so it is dropped here: no CPU query. The record's
+//! `MRES` must still be the axis resolution: raw counts are integers.
 //!
 //! ## Config (single-step, matching upstream — not a two-step registry)
 //!
@@ -295,8 +295,7 @@ impl PIGCS2Controller {
     /// Write a framed command and read one reply line (C `sendAndReceive`),
     /// trimmed of any stray CR/NUL.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
             .to_string())
@@ -307,10 +306,9 @@ impl PIGCS2Controller {
     /// reads (no further write) while the previous line ended in a space,
     /// then trim that marker off each line (C `findConnectedAxes`).
     fn find_connected_axes(&self) -> AsynResult<Vec<String>> {
-        self.handle.write_octet(0, &framed("SAI?"))?;
+        let mut raw = self.handle.write_read(0, &framed("SAI?"), READ_BUF)?;
         let mut names = Vec::new();
         loop {
-            let raw = self.handle.read_octet(0, READ_BUF)?;
             let line = String::from_utf8_lossy(&raw)
                 .trim_end_matches(['\r', '\0'])
                 .to_string();
@@ -322,6 +320,7 @@ impl PIGCS2Controller {
             if !continues {
                 break;
             }
+            raw = self.handle.read_octet(0, READ_BUF)?;
         }
         Ok(names)
     }
@@ -491,8 +490,7 @@ impl PIGCS2Controller {
     /// `char(4)` -> `(homing, moving, negLimit, posLimit, servoControl)` for
     /// `axis_no` (C `PIGCSMotorController::getStatus`).
     fn get_status(&self, axis_no: usize) -> AsynResult<(bool, bool, bool, bool, bool)> {
-        self.handle.write_octet(0, &[0x04])?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        let raw = self.handle.write_read(0, &[0x04], READ_BUF)?;
         let reply = String::from_utf8_lossy(&raw)
             .trim_end_matches(['\r', '\0'])
             .to_string();

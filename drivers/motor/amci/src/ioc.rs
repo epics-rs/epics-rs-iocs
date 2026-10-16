@@ -20,10 +20,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::anf2::{Anf2Axis, Anf2Controller, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1Controller};
@@ -137,7 +137,14 @@ pub fn anf2_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 .map_err(|e| format!("ANF2CreateAxis: {e}"))?;
             let dtyp_key = format!("{port_name}_{axis}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                asyn_user(&port_name, axis as i32),
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "ANF2CreateAxis: portName={port_name} axis={axis} config=0x{config:x} \
@@ -225,7 +232,14 @@ pub fn ang1_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = Ang1Axis::new(controller.clone(), axis as i32);
                 let dtyp_key = format!("{port_name}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&port_name, axis as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(

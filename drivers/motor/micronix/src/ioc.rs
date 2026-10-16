@@ -11,11 +11,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::connect::connect_serial;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::mmc200::{Mmc200Axis, Mmc200Controller};
 
@@ -56,7 +56,14 @@ pub fn mmc200_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef
                     .map_err(|e| format!("MMC200CreateController: axis {index}: {e}"))?;
                 let dtyp_key = format!("MMC200_{motor_port}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&motor_port, index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "MMC200CreateController: motorPort={motor_port} serialPort={serial_port} \

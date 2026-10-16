@@ -13,11 +13,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::anc150::{Anc150Axis, Anc150Controller, INPUT_EOS, OUTPUT_EOS};
 
@@ -85,7 +85,14 @@ pub fn anc150_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("ANC150AsynConfig: axis {axis}: {e}"))?;
                 let dtyp_key = format!("ANC150_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&card.to_string(), axis as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "ANC150AsynConfig: card={card} asynPort={asyn_port} axes={num_axes} \

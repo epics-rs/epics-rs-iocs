@@ -31,13 +31,14 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::axis::PmacAxis;
 use crate::controller::{DeferredMode, PMAC_TIMEOUT, PmacController};
@@ -63,18 +64,44 @@ fn registry_lock(registry: &Registry) -> std::sync::MutexGuard<'_, HashMap<Strin
 }
 
 /// Connect a [`SyncIOHandle`] to an already-configured octet port at the given
-/// asyn address (C `pasynOctetSyncIO->connect(lowLevelPortName,
-/// lowLevelPortAddress, …)`). motor-common's helpers hard-code address 0, and
-/// the PMAC commands carry the address explicitly.
+/// asyn address and set its ACK input / CR output EOS, as C
+/// `lowLevelPortConnect` does (pmacController.cpp:194, pmacAsynCoord.c:802);
+/// every PMAC reply ends in ACK, so without it every read times out.
+/// motor-common's helpers hard-code address 0, and the PMAC commands carry the
+/// address explicitly.
 fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, String> {
     let entry = get_port(port).ok_or_else(|| {
         format!("low level port '{port}' not found (call pmacAsynIPConfigure or drvAsynIPPortConfigure first)")
     })?;
+    let user = || AsynUser::new(0).with_addr(addr);
+    entry
+        .handle
+        .set_input_eos_blocking(user(), b"\x06")
+        .map_err(|e| format!("failed to set input EOS on '{port}': {e}"))?;
+    entry
+        .handle
+        .set_output_eos_blocking(user(), b"\r")
+        .map_err(|e| format!("failed to set output EOS on '{port}': {e}"))?;
     Ok(SyncIOHandle::from_handle(
         entry.handle.clone(),
         addr,
         PMAC_TIMEOUT,
     ))
+}
+
+/// C `pmacController`'s constructor (pmacController.cpp:194-200): a refused
+/// connect or EOS set is printed and the controller is still created, with no
+/// low-level user.
+fn low_level_port_connect(port: &str, addr: i32) -> Option<SyncIOHandle> {
+    connect_octet(port, addr)
+        .inspect_err(|e| {
+            eprintln!("pmacController: {e}");
+            println!(
+                "pmacController::pmacController: Failed to connect to low level \
+                 asynOctetSyncIO port {port}"
+            );
+        })
+        .ok()
 }
 
 /// Every PMAC iocsh command, sharing one controller registry.
@@ -138,10 +165,8 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
                 ));
             }
 
-            let handle = connect_octet(&low_level_port, low_level_addr)
-                .map_err(|e| format!("pmacCreateController: {e}"))?;
             let controller = PmacController::new(
-                handle,
+                low_level_port_connect(&low_level_port, low_level_addr),
                 deferred_mode,
                 feed_rate_poll,
                 feed_rate_limit,
@@ -192,6 +217,7 @@ fn create_axis(
         Arc::new(Mutex::new(PmacAxis::new(reg.controller.clone(), axis)));
     holder.install(
         ctx,
+        asyn_user(name, axis),
         format!("PMAC_{name}_{axis}"),
         motor,
         reg.moving_poll_ms,
@@ -478,6 +504,7 @@ fn pmac_asyn_coord_create_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(cs_axis));
                 holder.install(
                     ctx,
+                    asyn_user(&cs_name, axis as i32),
                     format!("PMACCS_{cs_name}_{axis}"),
                     motor,
                     moving_poll_ms,
@@ -492,4 +519,53 @@ fn pmac_asyn_coord_create_command(holder: &Arc<MotorHolder>) -> CommandDef {
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    /// A port with no EOS support of its own: both sets are refused.
+    struct Bare(PortDriverBase);
+
+    impl PortDriver for Bare {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    fn controller_on(port: &str) -> PmacController {
+        PmacController::new(
+            low_level_port_connect(port, 0),
+            DeferredMode::Fast,
+            false,
+            100,
+            POLL_CACHE_TTL,
+        )
+    }
+
+    #[test]
+    fn a_refused_eos_set_leaves_a_controller_whose_commands_fail() {
+        let name = "pmacEosRefused";
+        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        assert!(controller_on(name).write_read("I100").is_err());
+        drop(rt);
+    }
+
+    #[test]
+    fn a_missing_low_level_port_leaves_a_controller_whose_commands_fail() {
+        assert!(controller_on("pmacNoSuchPort").write_read("I100").is_err());
+    }
 }

@@ -16,11 +16,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, TraceUser};
 
 use crate::pijeds::{PiJedsAxis, PiJedsController};
 
@@ -67,7 +67,13 @@ pub fn pijeds_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-            let handle = connect_serial(&asyn_port, PIJEDS_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIJEDS_TIMEOUT,
+                b"\x11",
+                b"\r",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PiJedsController::new(handle).map_err(|e| format!("PIJEDSConfig: {e}"))?;
             let ident = controller.ident().to_string();
@@ -82,7 +88,14 @@ pub fn pijeds_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = PiJedsAxis::new(controller.clone(), axis);
                 let dtyp_key = format!("PIJEDS_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "PIJEDSConfig: card={card} asynPort={asyn_port} axes={num_axes} \

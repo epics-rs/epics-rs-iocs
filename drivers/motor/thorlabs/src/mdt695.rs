@@ -22,7 +22,8 @@
 //! volts). The C driver scales the record's raw steps by a fixed
 //! `drive_resolution` (0.1) to reach volts and divides on readback; at the
 //! asyn-rs motor boundary, which is dial-frame EGU, that scaling cancels, so
-//! this port works directly in volts: `MRES` is 1 and `EGU` is V.
+//! this port works directly in volts (`EGU` is V). The record's `MRES` must
+//! still be `drive_resolution`: raw counts are integers, so it is the step.
 //!
 //! ## Echo
 //!

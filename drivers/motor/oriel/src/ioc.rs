@@ -13,11 +13,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, TraceUser};
 
 use crate::emc18011::{Emc18011Axis, Emc18011Controller};
 
@@ -64,7 +64,13 @@ pub fn emc18011_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-            let handle = connect_serial(&asyn_port, EMC18011_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                EMC18011_TIMEOUT,
+                b"\n",
+                b"\r",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 Emc18011Controller::new(handle).map_err(|e| format!("EMC18011Config: {e}"))?;
             let ident = controller.ident().to_string();
@@ -75,7 +81,14 @@ pub fn emc18011_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = Emc18011Axis::new(controller.clone(), index);
                 let dtyp_key = format!("EMC18011_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "EMC18011Config: card={card} asynPort={asyn_port} axes={num_axes} \

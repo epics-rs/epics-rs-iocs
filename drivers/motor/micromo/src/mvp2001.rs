@@ -11,7 +11,7 @@
 //! Commands that return data prepend a terminator to the reply. The C
 //! `writeRead2xController` handles this by reading twice with a short delay: the
 //! first read consumes the prepended terminator, then after ~33 ms the real
-//! reply is read. This port replicates that with [`Mvp2001Controller::query`].
+//! reply is read. This port replicates that with `Mvp2001Controller::query`.
 //! Replies have the form `"0001 000001F4"`; the value is the hex field starting
 //! at byte offset 5 (C `parseReply` copies from `inString[5]` and `sscanf`s
 //! `%x`).
@@ -30,7 +30,7 @@
 //!
 //! - The C poller is a background thread; here the `POS`/`ST` reads run inside
 //!   [`poll`](AsynMotor::poll).
-//! - Homing is unimplemented in C (returns success without acting); [`home`] is
+//! - Homing is unimplemented in C (returns success without acting); `home` is
 //!   likewise a no-op.
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -134,9 +134,8 @@ impl Mvp2001Controller {
     /// Write a data-returning command and read its reply, consuming the
     /// prepended terminator first (C `writeRead2xController`).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
         // First read: the prepended terminator (discarded).
-        let _ = self.handle.read_octet(0, READ_BUF)?;
+        let _ = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         sleep(REPLY_DELAY);
         // Second read: the real reply.
         let raw = self.handle.read_octet(0, READ_BUF)?;
@@ -343,7 +342,6 @@ impl AsynMotor for Mvp2001Axis {
             velocity: 0.0,
             done,
             moving: !done,
-            direction: true,
             high_limit: (status & 0x2000) != 0,
             low_limit: (status & 0x8000) != 0,
             powered: (status & 0x100) == 0,

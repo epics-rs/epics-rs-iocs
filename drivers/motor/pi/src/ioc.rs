@@ -6,11 +6,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, TraceUser};
 
 use crate::c630::{PIC630_NUM_AXIS, PIC630Axis, PIC630Controller};
 use crate::c662::{PIC662Axis, PIC662Controller};
@@ -102,7 +102,13 @@ pub fn pic862_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIC862_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIC862_TIMEOUT,
+                b"\n\x03",
+                b"\r",
+                EosRefusal::Ignored,
+            )?;
             let controller = PIC862Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC862Config: {e}"))?;
             let ident = controller.ident().to_string();
@@ -111,7 +117,14 @@ pub fn pic862_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let axis = PIC862Axis::new(controller).map_err(|e| format!("PIC862Config: {e}"))?;
             let dtyp_key = format!("PIC862_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                TraceUser::Model1,
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "PIC862Config: card={card} asynPort={asyn_port} addr={addr} \
@@ -172,7 +185,13 @@ pub fn pic663_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIC663_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIC663_TIMEOUT,
+                b"\n\x03",
+                b"\r",
+                EosRefusal::Ignored,
+            )?;
             let controller = PIC663Controller::new(handle, addr as u8)
                 .map_err(|e| format!("PIC663Config: {e}"))?;
             let ident = controller.ident().to_string();
@@ -181,7 +200,14 @@ pub fn pic663_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let axis = PIC663Axis::new(controller).map_err(|e| format!("PIC663Config: {e}"))?;
             let dtyp_key = format!("PIC663_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                TraceUser::Model1,
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "PIC663Config: card={card} asynPort={asyn_port} addr={addr} \
@@ -274,7 +300,13 @@ pub fn pic630_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 4 + PIC630_NUM_AXIS as usize,
             )?;
 
-            let handle = connect_serial(&asyn_port, PIC630_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIC630_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller = PIC630Controller::new(handle, num_axes)
                 .map_err(|e| format!("PIC630Config: {e}"))?;
             let controller = Arc::new(Mutex::new(controller));
@@ -284,7 +316,14 @@ pub fn pic630_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIC630Config: {e}"))?;
                 let dtyp_key = format!("PIC630_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -337,7 +376,13 @@ pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-            let handle = connect_serial(&asyn_port, PIC662_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIC662_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PIC662Controller::new(handle).map_err(|e| format!("PIC662Config: {e}"))?;
             let ident = controller.ident().to_string();
@@ -346,7 +391,14 @@ pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let axis = PIC662Axis::new(controller).map_err(|e| format!("PIC662Config: {e}"))?;
             let dtyp_key = format!("PIC662_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                TraceUser::Model1,
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "PIC662Config: card={card} asynPort={asyn_port} \
@@ -404,7 +456,13 @@ pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let _addr = req_int(args, 2, "addr")?; // parity only; unused on wire
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIC844_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIC844_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PIC844Controller::new(handle).map_err(|e| format!("PIC844Config: {e}"))?;
             let ident = controller.ident().to_string();
@@ -415,7 +473,14 @@ pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIC844Config: {e}"))?;
                 let dtyp_key = format!("PIC844_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -475,7 +540,13 @@ pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let _addr = req_int(args, 2, "addr")?; // parity only; unused on wire
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIC848_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIC848_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PIC848Controller::new(handle).map_err(|e| format!("PIC848Config: {e}"))?;
             let ident = controller.ident().to_string();
@@ -493,7 +564,14 @@ pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIC848Config: {e}"))?;
                 let dtyp_key = format!("PIC848_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -555,7 +633,13 @@ pub fn pie516_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIE516_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIE516_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PIE516Controller::new(handle).map_err(|e| format!("PIE516Config: {e}"))?;
             let ident = controller.ident().to_string();
@@ -567,7 +651,14 @@ pub fn pie516_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE516Config: {e}"))?;
                 let dtyp_key = format!("PIE516_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -627,7 +718,13 @@ pub fn pie517_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIE517_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIE517_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PIE517Controller::new(handle).map_err(|e| format!("PIE517Config: {e}"))?;
             let num_axes = controller.num_axes();
@@ -638,7 +735,14 @@ pub fn pie517_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE517Config: {e}"))?;
                 let dtyp_key = format!("PIE517_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -698,7 +802,13 @@ pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIE710_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIE710_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PIE710Controller::new(handle).map_err(|e| format!("PIE710Config: {e}"))?;
             let num_axes = controller.num_axes();
@@ -710,7 +820,14 @@ pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE710Config: {e}"))?;
                 let dtyp_key = format!("PIE710_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -770,7 +887,13 @@ pub fn pie816_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let asyn_port = req_string(args, 1, "asynPort")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIE816_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIE816_TIMEOUT,
+                b"\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
             let controller =
                 PIE816Controller::new(handle).map_err(|e| format!("PIE816Config: {e}"))?;
             let num_axes = controller.num_axes();
@@ -782,7 +905,14 @@ pub fn pie816_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE816Config: {e}"))?;
                 let dtyp_key = format!("PIE816_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(

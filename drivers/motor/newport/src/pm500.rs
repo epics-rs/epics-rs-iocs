@@ -29,8 +29,9 @@
 //! ## Deviations from C (documented)
 //!
 //! - C leaves `drive_resolution` at 0.0 for an unrecognized `CONFIG?`
-//!   firmware string, which divides by zero in `set_status` (positions read
-//!   ±inf); this port errors at axis creation instead, naming the firmware.
+//!   firmware string and still creates the axis, with 1-digit command
+//!   precision; this port does the same. The ±inf readback and zeroed moves
+//!   that 0.0 causes at C's raw-step boundary do not exist at the EGU boundary.
 //! - C's axis-discovery and status parsing index fixed reply offsets into a
 //!   buffer that may hold stale bytes after a read failure; this port treats
 //!   a too-short reply like an empty one (comm-retry machine).
@@ -73,12 +74,11 @@ enum CommState {
 /// C `motor_init` firmware lookup: the drive resolution comes from the axis
 /// firmware reported by `CONFIG?` — 302 (50 nm translator), 309 (25 nm
 /// translator), 300 (unknown translator), and the XXX rotator placeholder
-/// all map to 0.01. Unknown firmware is `None` (C leaves 0.0 and later
-/// divides by it — see module Deviations).
-fn resolution_for_firmware(firmware: &str) -> Option<f64> {
+/// all map to 0.01. Unknown firmware keeps C's initial 0.0.
+fn resolution_for_firmware(firmware: &str) -> f64 {
     match firmware {
-        "302" | "309" | "300" | "XXX" => Some(0.01),
-        _ => None,
+        "302" | "309" | "300" | "XXX" => 0.01,
+        _ => 0.0,
     }
 }
 
@@ -105,10 +105,8 @@ impl Pm500Controller {
             comm_state: CommState::Normal,
         };
         // C sends SCUM 1 and SENAINT $AF and reads (ignoring) one reply each.
-        ctrl.write("SCUM 1")?;
-        let _ = ctrl.read_once();
-        ctrl.write("SENAINT $AF")?;
-        let _ = ctrl.read_once();
+        let _ = ctrl.exchange("SCUM 1");
+        let _ = ctrl.exchange("SENAINT $AF");
 
         // Identity probe (C sends SVN? twice: existence check, then read).
         let probe = ctrl.command("SVN?").unwrap_or_default();
@@ -151,15 +149,10 @@ impl Pm500Controller {
         out
     }
 
-    /// Write a command message (C `send_mess`); the terminator is appended
-    /// here.
-    fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        Ok(())
-    }
-
-    fn read_once(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+    /// Write a command message and read its reply (C `send_mess`, which
+    /// flushes stale input first, + `recv_mess`).
+    fn exchange(&self, cmd: &str) -> AsynResult<String> {
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
@@ -168,8 +161,7 @@ impl Pm500Controller {
     /// so even pure motion messages consume a response. C `recv_mess` logs
     /// a "system error" on an `SE` reply but still returns it.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.write(cmd)?;
-        let reply = self.read_once()?;
+        let reply = self.exchange(cmd)?;
         if reply.starts_with("SE") {
             eprintln!("PM500 system error: {reply}");
         }
@@ -205,15 +197,9 @@ impl Pm500Axis {
         })?;
         let digits = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let config = ctrl.command(&format!("{name}CONFIG?"))?;
-            let firmware = config.get(8..).unwrap_or("");
-            let resolution = resolution_for_firmware(firmware).ok_or_else(|| {
-                pm_err(format!(
-                    "PM500 axis {name}: unrecognized CONFIG? firmware \"{firmware}\" \
-                     (no drive resolution known)"
-                ))
-            })?;
-            max_digits(resolution)
+            // A failed read leaves C an empty firmware string, so resolution 0.0.
+            let config = ctrl.command(&format!("{name}CONFIG?")).unwrap_or_default();
+            max_digits(resolution_for_firmware(config.get(8..).unwrap_or("")))
         };
         Ok(Self {
             controller,
@@ -430,12 +416,14 @@ mod tests {
 
     #[test]
     fn firmware_lookup_matches_c_table() {
-        assert_eq!(resolution_for_firmware("302"), Some(0.01));
-        assert_eq!(resolution_for_firmware("309"), Some(0.01));
-        assert_eq!(resolution_for_firmware("300"), Some(0.01));
-        assert_eq!(resolution_for_firmware("XXX"), Some(0.01));
-        assert_eq!(resolution_for_firmware("310"), None);
-        assert_eq!(resolution_for_firmware(""), None);
+        assert_eq!(resolution_for_firmware("302"), 0.01);
+        assert_eq!(resolution_for_firmware("309"), 0.01);
+        assert_eq!(resolution_for_firmware("300"), 0.01);
+        assert_eq!(resolution_for_firmware("XXX"), 0.01);
+        assert_eq!(resolution_for_firmware("310"), 0.0);
+        assert_eq!(resolution_for_firmware(""), 0.0);
+        // C motor_init: digits from 0.0 floor at 1.
+        assert_eq!(max_digits(resolution_for_firmware("310")), 1);
     }
 
     #[test]

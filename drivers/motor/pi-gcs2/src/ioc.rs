@@ -15,11 +15,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
-use motor_common::connect::connect_serial;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, asyn_user};
 
 use crate::gcs2::{PIGCS2Axis, PIGCS2Controller};
 
@@ -56,7 +56,13 @@ pub fn pigcs2_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let num_axes = num_axes as usize;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_serial(&asyn_port, PIGCS2_TIMEOUT)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                PIGCS2_TIMEOUT,
+                b"\n",
+                b"",
+                EosRefusal::BothFatal,
+            )?;
             let controller = PIGCS2Controller::new(handle)
                 .map_err(|e| format!("PIGCS2CreateController: {e}"))?;
             let ident = controller.ident().to_string();
@@ -75,7 +81,14 @@ pub fn pigcs2_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIGCS2CreateController: {e}"))?;
                 let dtyp_key = format!("PIGCS2_{card}_{axis_name}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    asyn_user(&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "PIGCS2CreateController: card={card} asynPort={asyn_port} axes={num_axes} \

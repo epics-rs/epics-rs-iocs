@@ -3,8 +3,8 @@
 # 1-based CS axis number: 1=A 2=B 3=C 4=U 5=V 6=W 7=X 8=Y 9=Z).
 #
 # A CS axis is driven in the EGU the coordinate system's position-reporting PLC
-# publishes on Q8n, so MRES = 1 (the C driver's stepsPerUnit was the same factor
-# applied twice, once in the driver and once as its reciprocal in MRES).
+# publishes on Q8n. MRES is the record's step (RRBV is an integer count), so it
+# keeps the C default stepSize, 1e-4 (pmacAsynCoord.c).
 #
 # Homing and jogging are not defined for a kinematic axis: HOMF/HOMR/JOGF/JOGR
 # return an error, as they do in the C driver.
@@ -16,7 +16,7 @@ record(motor, "$(P)$(M)") {
     field(ACCL, "$(ACCL=0.5)")
     field(DHLM, "$(HLM=100)")
     field(DLLM, "$(LLM=-100)")
-    field(MRES, "$(MRES=1.0)")
+    field(MRES, "$(MRES=0.0001)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
 }

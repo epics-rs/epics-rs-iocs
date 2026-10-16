@@ -12,11 +12,11 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::MotorHolder;
 use motor_common::connect::connect_serial;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
+use motor_common::{MotorHolder, TraceUser};
 
 use crate::pm304::{Pm304Axis, Pm304Controller};
 
@@ -80,7 +80,14 @@ pub fn pm304_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = Pm304Axis::new(controller.clone(), index);
                 let dtyp_key = format!("PM304_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    TraceUser::Model1,
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "PM304Config: card={card} asynPort={asyn_port} axes={num_axes} \

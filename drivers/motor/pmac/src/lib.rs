@@ -40,7 +40,8 @@
 //!   `pmacSetCoordStepsPerUnit` configure a driver-side multiplier whose inverse
 //!   the IOC must put in the record's `MRES`. The two cancel, and the motor
 //!   record already does the division, so this port speaks controller counts
-//!   (real axes) and PLC EGU (CS axes) with `MRES = 1`. See [`axis`].
+//!   (real axes, `MRES = 1`) and PLC EGU (CS axes, `MRES` = the C 1e-4
+//!   `stepSize`, since raw counts are integers). See [`axis`].
 //! - **Controller-level PVs become configuration.** The C driver's
 //!   `PMAC_C_FEEDRATE_POLL` / `_LIMIT`, the deferred-move *mode* and the
 //!   coordinate-system group selection are asyn parameters on address 0, which

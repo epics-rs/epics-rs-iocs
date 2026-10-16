@@ -30,9 +30,8 @@
 //! `setInputEos(pasynUser, "\n", 1)` right after connecting — the port owns
 //! the terminator (the `motor-port-eos-ownership` convention; here the C picks
 //! port-owned framing, same class as the C-862 but with `"\n"` both ways).
-//! `SyncIOHandle` exposes no driver-side EOS hook, so both EOS values are set
-//! from `st.cmd` (`asynOctetSetInputEos`/`asynOctetSetOutputEos`, `"\n"`) and
-//! [`PIE516Controller::send`] writes **bare** command bytes.
+//! `PIE516Config` sets both through `connect_with_eos` and
+//! `PIE516Controller::send` writes **bare** command bytes.
 //!
 //! **Documented deviation — the redundant trailing terminator.** C
 //! `devPIE516_build_trans` appends `EOL_E516` (`"\n"`) to every *motion*
@@ -103,9 +102,8 @@
 //!   `SET_ENC_RATIO` → no wire command (`send = false`).
 //!
 //! ## Not modeled (documented deviations)
-//! - **`recv_mess(..., FLUSH)`** before each poll and before retry:
-//!   `SyncIOHandle` has no synchronous flush primitive (same gap noted for the
-//!   C-862 port).
+//! - **`recv_mess(..., FLUSH)`** before each poll and before retry: replaced
+//!   by a flush before every query (`exchange`).
 //! - **`no_motion_count`** / poll-rate scheduling: not tracked (position is
 //!   updated unconditionally from `POS?`).
 //! - **`report()`** diagnostic: not implemented (the identify string is logged
@@ -245,8 +243,7 @@ impl PIE516Controller {
         let mut online = false;
         for _ in 0..3 {
             ctrl.send("ONL 1")?;
-            ctrl.send("ONL?")?;
-            let reply = ctrl.recv();
+            let reply = ctrl.exchange("ONL?");
             if !reply.is_empty() {
                 online = atoi(&reply) == 1;
             }
@@ -261,14 +258,12 @@ impl PIE516Controller {
         }
 
         // 2. Identify.
-        ctrl.send("VER?")?;
-        ctrl.ident = ctrl.recv();
+        ctrl.ident = ctrl.exchange("VER?");
 
         // 3. Probe axes: POS? for each candidate letter, stop at first silence.
         let mut num_axes = 0;
         for label in AXIS_LABELS {
-            ctrl.send(&format!("POS? {label}"))?;
-            if ctrl.recv().is_empty() {
+            if ctrl.exchange(&format!("POS? {label}")).is_empty() {
                 break;
             }
             num_axes += 1;
@@ -298,11 +293,18 @@ impl PIE516Controller {
         Ok(())
     }
 
+    /// Write a query and read its reply as one exchange that first flushes
+    /// stale input, so a stray line cannot shift every later reply by one
+    /// (C recovers the same way through `recv_mess(FLUSH)`).
+    fn exchange(&self, cmd: &str) -> String {
+        Self::reply(self.handle.write_read(0, cmd.as_bytes(), READ_BUF))
+    }
+
     /// Read one reply (the port's input EOS already stripped the `"\n"`). Any
     /// transport failure or empty read folds into `""`, matching C
     /// `recv_mess`'s swallow of a bad read into an empty string.
-    fn recv(&self) -> String {
-        match self.handle.read_octet(0, READ_BUF) {
+    fn reply(read: AsynResult<Vec<u8>>) -> String {
+        match read {
             Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw).into_owned(),
             _ => String::new(),
         }
@@ -334,24 +336,19 @@ impl PIE516Controller {
         let label = AXIS_LABELS[axis];
 
         // ONLINE gate: a non-1 reply re-asserts ONLINE + velocity-control mode.
-        self.send("ONL?").ok()?;
-        let online = scan_int(&self.recv())?;
+        let online = scan_int(&self.exchange("ONL?"))?;
         if online == 0 {
             self.send("ONL 1").ok()?;
             self.send("VCO A1 B1 C1").ok()?;
         }
 
-        self.send(&format!("ONT? {label}")).ok()?;
-        let ontarget = scan_int(&self.recv())?;
+        let ontarget = scan_int(&self.exchange(&format!("ONT? {label}")))?;
 
-        self.send(&format!("OVF? {label}")).ok()?;
-        let overflow = scan_int(&self.recv())?;
+        let overflow = scan_int(&self.exchange(&format!("OVF? {label}")))?;
 
-        self.send(&format!("SVO? {label}")).ok()?;
-        let servo = scan_int(&self.recv())?;
+        let servo = scan_int(&self.exchange(&format!("SVO? {label}")))?;
 
-        self.send(&format!("POS? {label}")).ok()?;
-        let pos_reply = self.recv();
+        let pos_reply = self.exchange(&format!("POS? {label}"));
         if pos_reply.is_empty() {
             return None;
         }
