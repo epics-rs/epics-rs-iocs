@@ -52,7 +52,7 @@ impl TetrAmmDriver {
     fn new(
         port_name: &str,
         qe_port_name: &str,
-        io: OctetIo,
+        (io, status): (OctetIo, AsynResult<()>),
         max_memory: usize,
         shared: Arc<QuadEmShared>,
     ) -> AsynResult<Self> {
@@ -60,6 +60,25 @@ impl TetrAmmDriver {
         let p_interlock_status = base
             .port_base
             .create_param(P_INTERLOCK_STATUS, epics_rs::asyn::param::ParamType::Int32)?;
+        let unlinked = |base, io| Self {
+            base,
+            io,
+            shared: shared.clone(),
+            p_interlock_status,
+            firmware_version: String::new(),
+            qe_port_name: qe_port_name.to_string(),
+            num_resync: Arc::new(AtomicU64::new(0)),
+        };
+        // C++ returns from its constructor here and keeps the port, with no
+        // meter link and no read thread.
+        if let Err(e) = status {
+            println!(
+                "drvTetrAMM::drvTetrAMM: error calling pasynOctetSyncIO->connect, status={}, error={}",
+                trace::status_code(&e),
+                e.message_display()
+            );
+            return Ok(unlinked(base, io));
+        }
 
         // C++ `drvTetrAMM::drvTetrAMM`: setInputEos(pasynUserMeter_, "\r\n", 2).
         io.set_input_eos(b"\r\n")?;
@@ -78,15 +97,7 @@ impl TetrAmmDriver {
             acq.num_channels = 4;
         }
 
-        let mut this = Self {
-            base,
-            io,
-            shared,
-            p_interlock_status,
-            firmware_version: String::new(),
-            qe_port_name: qe_port_name.to_string(),
-            num_resync: Arc::new(AtomicU64::new(0)),
-        };
+        let mut this = unlinked(base, io);
 
         // C++ calls getFirmwareVersion() from the constructor, ignoring its
         // status; reset() is left for later because the meter may be offline
@@ -765,7 +776,8 @@ pub struct TetrAmmRuntime {
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    _read_thread: thread::JoinHandle<()>,
+    /// `None` when the constructor found no QE port.
+    _read_thread: Option<thread::JoinHandle<()>>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -787,9 +799,13 @@ pub fn create_tetramm(
 ) -> AsynResult<TetrAmmRuntime> {
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
-    let (io, status) = connect_octet(qe_port_name, proto::TETRAMM_TIMEOUT);
-    status?;
-    let driver = TetrAmmDriver::new(port_name, qe_port_name, io, max_memory, shared.clone())?;
+    let driver = TetrAmmDriver::new(
+        port_name,
+        qe_port_name,
+        connect_octet(qe_port_name, proto::TETRAMM_TIMEOUT),
+        max_memory,
+        shared.clone(),
+    )?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
     let pool = driver.base.pool.clone();
@@ -808,10 +824,12 @@ pub fn create_tetramm(
         shared: shared.clone(),
         num_resync,
     };
-    let read_thread_handle = thread::Builder::new()
-        .name("drvTetrAMMTask".into())
-        .spawn(move || read_thread(read_ctx))
-        .expect("failed to spawn drvTetrAMMTask");
+    let read_thread_handle = read_ctx.io.handle().is_some().then(|| {
+        thread::Builder::new()
+            .name("drvTetrAMMTask".into())
+            .spawn(move || read_thread(read_ctx))
+            .expect("failed to spawn drvTetrAMMTask")
+    });
 
     let callback_thread = qe::start_callback_task(CallbackContext {
         trigger_rx,
@@ -913,7 +931,7 @@ mod tests {
         std::mem::forget(runtime);
         // st.cmd's asynOctetSetOutputEos; the driver sets only the input EOS.
         io.set_output_eos(b"\r").unwrap();
-        TetrAmmDriver::new(name, name, io, 0, QuadEmShared::new(16).0).unwrap()
+        TetrAmmDriver::new(name, name, (io, Ok(())), 0, QuadEmShared::new(16).0).unwrap()
     }
 
     #[test]
@@ -975,5 +993,13 @@ mod tests {
         let reset = log.iter().position(|c| c == "STATUS:RESET").unwrap();
         assert_eq!(log[reset + 1], "HVS:ON");
         assert!(log[reset + 2].starts_with("HVS:"), "{log:?}");
+    }
+
+    /// C++ prints the connect failure and returns from its constructor: the
+    /// port stays, with no read thread.
+    #[test]
+    fn a_missing_qe_port_keeps_the_port_without_a_link() {
+        let rt = create_tetramm("QE_TETRA_NOQE", "QE_TETRA_NOQE_IP", 4, 0).unwrap();
+        assert!(rt._read_thread.is_none());
     }
 }
