@@ -258,24 +258,32 @@ pub struct Mm3000Axis {
 impl Mm3000Axis {
     /// Construct axis `axis` (1-based). Sends the C `motor_init` `TPE`
     /// encoder probe for wire parity and ignores the result (see the module
-    /// quirk note — C always ends up with `encoder_present = YES`). Performs
-    /// blocking serial I/O under the controller lock; on encoderless axes
-    /// the probe costs one read timeout, as it does in C.
+    /// quirk note — C always ends up with `encoder_present = YES`), then
+    /// `set_status`. Performs blocking serial I/O under the controller lock;
+    /// on encoderless axes the probe costs one read timeout, as it does in C.
     pub fn new(controller: Arc<Mutex<Mm3000Controller>>, axis: usize) -> Self {
         let axis_type = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             let _ = ctrl.write_read(&format!("{axis}TPE"));
             ctrl.axis_types()[axis - 1]
         };
-        Self {
+        let mut ax = Self {
             controller,
             axis,
             axis_type,
             encoder_present: true,
             high_limit: None,
             low_limit: None,
-            last_status: MotorStatus::default(),
-        }
+            // C clears the status, then sets EA_PRESENT and GAIN_SUPPORT
+            // for an encoder.
+            last_status: MotorStatus {
+                gain_support: true,
+                has_encoder: true,
+                ..MotorStatus::default()
+            },
+        };
+        ax.set_status();
+        ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Mm3000Controller> {
@@ -439,9 +447,15 @@ impl AsynMotor for Mm3000Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Port of C `set_status`: `{axis}MS` (binary status byte) then
-        // `{axis}TP` (position), each guarded by the NORMAL/RETRY/COMM_ERR
-        // machine on an empty or failed read.
+        Ok(self.set_status())
+    }
+}
+
+impl Mm3000Axis {
+    /// Port of C `set_status`: `{axis}MS` (binary status byte) then
+    /// `{axis}TP` (position), each guarded by the NORMAL/RETRY/COMM_ERR
+    /// machine on an empty or failed read.
+    fn set_status(&mut self) -> MotorStatus {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let a = self.axis;
@@ -468,7 +482,7 @@ impl AsynMotor for Mm3000Axis {
                 self.last_status.comms_error = true;
                 self.last_status.problem = true;
             }
-            return Ok(self.last_status.clone());
+            return self.last_status.clone();
         };
         self.last_status.comms_error = false;
         let mstat = MsBits::from_byte(ms.as_bytes()[0]);
@@ -478,7 +492,7 @@ impl AsynMotor for Mm3000Axis {
                 self.last_status.comms_error = true;
                 self.last_status.problem = true;
             }
-            return Ok(self.last_status.clone());
+            return self.last_status.clone();
         };
         drop(ctrl);
 
@@ -502,7 +516,7 @@ impl AsynMotor for Mm3000Axis {
             has_encoder: self.encoder_present,
             ..MotorStatus::default()
         };
-        Ok(self.last_status.clone())
+        self.last_status.clone()
     }
 }
 
@@ -510,10 +524,13 @@ impl AsynMotor for Mm3000Axis {
 mod tests {
     use super::*;
 
-    /// Answers `VE` and fails every other read.
+    /// Answers `VE` and the commands in `replies`, fails every other read,
+    /// and records every command.
     struct IdentOnly {
         base: epics_rs::asyn::port::PortDriverBase,
+        replies: &'static [(&'static str, &'static str)],
         reply: Vec<u8>,
+        sent: Arc<Mutex<Vec<String>>>,
     }
 
     impl epics_rs::asyn::port::PortDriver for IdentOnly {
@@ -524,11 +541,16 @@ mod tests {
             &mut self.base
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-            self.reply = if data == b"VE" {
-                b"MM3000 Version 2.4".to_vec()
-            } else {
-                Vec::new()
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = match cmd.as_str() {
+                "VE" => b"MM3000 Version 2.4".to_vec(),
+                c => self
+                    .replies
+                    .iter()
+                    .find(|(k, _)| *k == c)
+                    .map_or_else(Vec::new, |(_, v)| v.as_bytes().to_vec()),
             };
+            self.sent.lock().unwrap().push(cmd);
             Ok(data.len())
         }
         fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
@@ -551,7 +573,9 @@ mod tests {
 
         let port = IdentOnly {
             base: PortDriverBase::new("mm3000IdentOnly", 1, PortFlags::default()),
+            replies: &[],
             reply: Vec::new(),
+            sent: Arc::default(),
         };
         let (rt, _actor) = create_port_runtime(
             &claim_port("mm3000IdentOnly").unwrap(),
@@ -566,6 +590,53 @@ mod tests {
         );
         let ctrl = Mm3000Controller::new(io).unwrap();
         assert!(ctrl.axis_types().is_empty());
+    }
+
+    /// An MM3000 line answering `replies`: its controller, and the wire log
+    /// from after the controller was built.
+    fn mm3000_line(
+        name: &str,
+        replies: &'static [(&'static str, &'static str)],
+    ) -> (Mm3000Controller, Arc<Mutex<Vec<String>>>) {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let port = IdentOnly {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            replies,
+            reply: Vec::new(),
+            sent: sent.clone(),
+        };
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
+                .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        assert_eq!(
+            std::mem::take(&mut *sent.lock().unwrap()),
+            ["VE", "ST", "VE", "RC"]
+        );
+        (ctrl, sent)
+    }
+
+    /// drvMM3000.cc motor_init ends each axis with set_status.
+    #[test]
+    fn axis_init_runs_set_status_after_the_tpe_probe() {
+        let (ctrl, sent) = mm3000_line(
+            "mm3000InitStatus",
+            &[("RC", "1=dc 2=unused"), ("1MS", "D"), ("1TP", "1234 ")],
+        );
+        let axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        assert_eq!(*sent.lock().unwrap(), ["1TPE", "1MS", "1TP"]);
+        let s = &axis.last_status;
+        assert_eq!(s.position, 1234.0);
+        assert!(s.done && s.direction && s.powered && s.has_encoder);
     }
 
     #[test]
