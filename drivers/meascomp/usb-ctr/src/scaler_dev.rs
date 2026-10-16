@@ -40,7 +40,7 @@ impl ScalerDriver for CtrScalerDriver {
         let dev = self.device.lock().unwrap();
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
-        scaler::reset_scaler(&dev, &mut st.scaler, &st.trace);
+        scaler::reset_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);
         st.scaler.presets = [0; MAX_COUNTERS];
         st.scaler.done.call_callbacks();
         Ok(())
@@ -56,7 +56,7 @@ impl ScalerDriver for CtrScalerDriver {
 
     fn write_preset(&mut self, channel: usize, preset: u32) -> CaResult<u32> {
         let mut st = self.state.lock().unwrap();
-        if channel < MAX_COUNTERS {
+        if channel < st.num_counters {
             st.scaler.presets[channel] = preset as u64;
         }
         st.scaler.done.call_callbacks();
@@ -69,7 +69,7 @@ impl ScalerDriver for CtrScalerDriver {
         let st = &mut *guard;
         if start {
             // C `writeInt32` ignores `startScaler`'s status; it prints its own.
-            let _ = scaler::start_scaler(&dev, &mut st.scaler, &st.trace);
+            let _ = scaler::start_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);
         } else {
             scaler::stop_scaler(&dev, &mut st.scaler, &st.trace);
         }
@@ -83,6 +83,6 @@ impl ScalerDriver for CtrScalerDriver {
     }
 
     fn num_channels(&self) -> usize {
-        MAX_COUNTERS
+        self.state.lock().unwrap().num_counters
     }
 }

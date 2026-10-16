@@ -14,6 +14,8 @@ use crate::trace::SelfTrace;
 
 /// Shared state between driver and poller.
 pub struct PollerState {
+    /// C `numCounters_`: 8 on a USB-CTR08, 4 on a USB-CTR04.
+    pub num_counters: usize,
     pub scaler: ScalerState,
     pub mcs: McsState,
     pub trace: SelfTrace,
@@ -80,7 +82,8 @@ fn poller_loop(
 
                 if let Ok(mut st) = state.lock() {
                     if st.scaler.running {
-                        scaler::read_scaler(&dev, &mut st.scaler, &trace);
+                        let num_counters = st.num_counters;
+                        scaler::read_scaler(&dev, &mut st.scaler, num_counters, &trace);
                         if st.scaler.done.get() != 0 {
                             snap.scaler_done_snapshot = Some(st.scaler.counts);
                         }
@@ -92,7 +95,7 @@ fn poller_loop(
                         snap.mcs_just_stopped = mcs_was_acquiring && !st.mcs.acquiring;
                         snap.mcs_elapsed = st.mcs.elapsed_secs();
                     } else {
-                        for counter in 0..MAX_COUNTERS {
+                        for counter in 0..st.num_counters {
                             if let Ok(value) = dev.counter_in(counter as i32) {
                                 snap.counters[counter] = Some(value as i64);
                             }

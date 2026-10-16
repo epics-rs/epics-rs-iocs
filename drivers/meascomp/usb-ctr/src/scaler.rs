@@ -45,9 +45,10 @@ impl ScalerState {
 pub fn start_scaler(
     device: &DaqDevice,
     state: &mut ScalerState,
+    num_counters: usize,
     trace: &SelfTrace,
 ) -> Result<(), String> {
-    let num_counters = MAX_COUNTERS as i32;
+    let num_counters = num_counters as i32;
 
     // Configure each counter for counting mode
     for i in 0..num_counters {
@@ -89,7 +90,7 @@ pub fn start_scaler(
     }
 
     // Set presets as max limits
-    for i in 0..MAX_COUNTERS {
+    for i in 0..num_counters as usize {
         if state.presets[i] > 0 {
             device
                 .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
@@ -143,7 +144,12 @@ pub fn start_scaler(
 }
 
 /// Read latest counter values from the scan buffer. Check for preset completion.
-pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrace) {
+pub fn read_scaler(
+    device: &DaqDevice,
+    state: &mut ScalerState,
+    num_counters: usize,
+    trace: &SelfTrace,
+) {
     let polled = device.counter_in_scan_status();
     print_get_status(trace, "readScaler", &polled);
     let Ok((status, xfer)) = polled else {
@@ -154,7 +160,6 @@ pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrac
         return;
     }
 
-    let num_counters = MAX_COUNTERS;
     let buf_len = state.scan_buffer.len();
     if buf_len == 0 || xfer.current_index < 0 {
         return;
@@ -207,11 +212,16 @@ pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrac
 }
 
 /// Reset all counters to zero.
-pub fn reset_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrace) {
+pub fn reset_scaler(
+    device: &DaqDevice,
+    state: &mut ScalerState,
+    num_counters: usize,
+    trace: &SelfTrace,
+) {
     if state.running {
         stop_scaler(device, state, trace);
     }
-    for i in 0..MAX_COUNTERS {
+    for i in 0..num_counters {
         state.counts[i] = 0;
         let _ = device.counter_clear(i as i32);
     }

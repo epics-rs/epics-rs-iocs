@@ -91,7 +91,17 @@ impl CtrDriver {
             base.set_uint32_param(params.digital_input, 0, data as u32, 0xFFFF_FFFF, 0)?;
         }
 
+        // C sets numCounters_ only for these two boards.
+        let num_counters = match product_name.as_str() {
+            "USB-CTR08" => 8,
+            "USB-CTR04" => 4,
+            _ => {
+                println!("Unknown model");
+                MAX_COUNTERS
+            }
+        };
         let state = Arc::new(Mutex::new(PollerState {
+            num_counters,
             scaler: ScalerState::new(),
             mcs: McsState::new(max_time_points),
             trace: SelfTrace::default(),
@@ -239,10 +249,12 @@ impl PortDriver for CtrDriver {
                     .get_int32_param(self.params.mcs_point0_action, 0)?
                     != 0;
                 // C `writeInt32` ignores `startMCS`'s status; it prints its own.
+                let num_counters = st.num_counters;
                 let _ = mcs::start_mcs(
                     &dev,
                     &mut st.mcs,
                     &McsScan {
+                        num_counters,
                         num_points: num_channels,
                         dwell_time: dwell,
                         counter_enable: enable,

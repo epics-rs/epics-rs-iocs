@@ -87,6 +87,8 @@ pub fn compute_times(state: &mut McsState) {
 /// Acquisition settings for [`start_mcs`], read from the MCA/MCS records.
 #[derive(Clone, Copy, Debug)]
 pub struct McsScan {
+    /// C `numCounters_`.
+    pub num_counters: usize,
     pub num_points: usize,
     pub dwell_time: f64,
     pub counter_enable: u32,
@@ -107,6 +109,7 @@ pub fn start_mcs(
     trace: &SelfTrace,
 ) -> Result<(), String> {
     let McsScan {
+        num_counters,
         num_points,
         dwell_time,
         counter_enable,
@@ -124,6 +127,9 @@ pub fn start_mcs(
     let mut chan_map = Vec::new();
 
     for i in 0..MAX_MCS_COUNTERS {
+        if i >= num_counters && i != DIGITAL_IO_COUNTER {
+            continue;
+        }
         if counter_enable & (1 << i) != 0 {
             // Configure counter for MCS (matches C++ drvUSBCTR startMCS)
             let mode = CMM_OUTPUT_ON
@@ -131,7 +137,7 @@ pub fn start_mcs(
                 | CMM_CLEAR_ON_READ
                 | CMM_GATING_ON
                 | CMM_INVERT_GATE;
-            if i < MAX_COUNTERS {
+            if i < num_counters {
                 device
                     .counter_config_scan(
                         i as i32,
