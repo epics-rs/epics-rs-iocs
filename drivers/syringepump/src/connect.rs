@@ -39,15 +39,65 @@ pub fn connect_octet(
             "octet port '{port_name}' not found (call drvAsynSerialPortConfigure/drvAsynIPPortConfigure first)"
         )
     })?;
-    port.handle
-        .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS)
-        .map_err(|e| format!("failed to set input EOS on '{port_name}': {e}"))?;
-    port.handle
-        .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS)
-        .map_err(|e| format!("failed to set output EOS on '{port_name}': {e}"))?;
+    // StreamDevice never fails on a refused EOS: it warns and reads on
+    // (AsynDriverInterface.cc:450-456, :842-857) and ignores the output
+    // status (:663, :689).
+    let _ = port
+        .handle
+        .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS);
+    let _ = port
+        .handle
+        .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS);
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),
         addr,
         timeout,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
+
+    /// A port that refuses every EOS.
+    struct NoEos(PortDriverBase);
+
+    impl PortDriver for NoEos {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "no EOS".into(),
+            })
+        }
+        fn set_output_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "no EOS".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_port_refusing_both_eos_still_connects() {
+        let name = "SP_NOEOS";
+        let driver = NoEos(PortDriverBase::new(name, 1, PortFlags::default()));
+        let (rt, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        epics_rs::asyn::asyn_record::register_port(
+            name,
+            rt.port_handle().clone(),
+            &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
+        )
+        .unwrap();
+        assert!(connect_octet(name, 0, Duration::from_secs(1)).is_ok());
+    }
 }
