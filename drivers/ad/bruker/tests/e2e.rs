@@ -12,6 +12,7 @@ use std::time::Duration;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::interpose::eos::EosInterpose;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::sync_io::SyncIOHandle;
@@ -89,7 +90,8 @@ fn ip_port(name: &str, addr: &str, input_eos: &[u8], output_eos: &[u8]) -> PortH
     // bytes are only cached, never applied, unless this layer is there.
     driver.install_interpose(Box::new(EosInterpose::default()));
     let (runtime, _) =
-        create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
+        create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+            .expect("ip port runtime");
     let handle = runtime.port_handle().clone();
     handle
         .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), input_eos)
@@ -125,7 +127,8 @@ impl Fixture {
         let status_port = ip_port(&format!("{name}_STATUS"), &status_addr, b"\n", b"");
 
         let detector =
-            create_bruker_detector(name, command_port, status_port, 0).expect("the detector port");
+            create_bruker_detector(&claim_port(name).unwrap(), command_port, status_port, 0)
+                .expect("the detector port");
 
         // The plugin: it takes every array the driver publishes and parks it
         // where the test thread can pick it up.
@@ -367,13 +370,14 @@ fn a_binning_write_does_not_depend_on_bis() {
         // The EOS setters need a connection, which a dead BIS never gives.
         let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
         let (runtime, _) =
-            create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .expect("ip port runtime");
         let handle = runtime.port_handle().clone();
         std::mem::forget(runtime);
         handle
     };
     let detector = create_bruker_detector(
-        "BISDEAD",
+        &claim_port("BISDEAD").unwrap(),
         closed("BISDEAD_COMMAND"),
         closed("BISDEAD_STATUS"),
         0,
