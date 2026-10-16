@@ -58,6 +58,10 @@ async fn main() -> CaResult<()> {
 
     let (asyn_name, asyn_factory) = epics_rs::asyn::asyn_record::asyn_record_factory();
     app = app.register_record_type(asyn_name, move || asyn_factory());
+    // RontecXFlash.db uses scalcout, opt-in in epics-rs as calc's own dbd.
+    app = app.register_record_type("scalcout", || {
+        Box::new(epics_rs::base::server::records::scalcout::ScalcoutRecord::default())
+    });
     let (mca_name, mca_factory) = mca_rs::mca_record_factory();
     app = app.register_record_type(mca_name, move || mca_factory());
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);

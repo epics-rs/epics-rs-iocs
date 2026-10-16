@@ -26,6 +26,7 @@ RontecConfig("RONTEC0", "S0", 0)
 
 # ---- records ----
 dbLoadRecords("$(MCA_RONTEC_IOC)/db/mca.db", "P=mca:,R=rontec1,PORT=RONTEC0,ADDR=0,NCHAN=4096")
+dbLoadRecords("$(MCA_RONTEC_IOC)/db/RontecXFlash.db", "P=mcaTest:,R=Rontec1,PORT=S0")
 
 #------------------------------------------------------------------------------
 iocInit()
