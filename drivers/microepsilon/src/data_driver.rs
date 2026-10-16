@@ -472,17 +472,25 @@ fn reader_thread(
     // `packet.rs`'s module doc, extended here to the cross-iteration case).
     let mut last_meas_value_counter: u32 = 0;
     let mut last_chan_values = [0.0f64; MAX_CHANNELS];
+    let mut port_open = false;
 
     loop {
         if !reader_state.is_communicating {
             let connected = rbk_port_handle
                 .submit_blocking(RequestOp::Connect, AsynUser::default())
                 .is_ok();
-            if !connected {
+            if connected {
+                port_open = true;
+            } else {
                 long_wait();
             }
         }
 
+        // C resets `eopReached` only on an open port; otherwise it keeps the
+        // last pass's 1 and the read loop is skipped until a connect works.
+        if !port_open {
+            continue;
+        }
         let mut tread = 0usize;
         let mut eop_reached = false;
         while !eop_reached {
@@ -560,6 +568,7 @@ fn reader_thread(
                     .is_ok();
                 if disconnected {
                     eop_reached = true;
+                    port_open = false;
                     long_wait();
                 }
             }
