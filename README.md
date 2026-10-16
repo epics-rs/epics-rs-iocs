@@ -292,7 +292,7 @@ Records (`iocs/ad/mar345-ioc/db/mar345.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p mar345-ioc --release -- iocs/ad/mar345-ioc/st.cmd`
 
-Deviation: server I/O runs on a dedicated worker thread (a `PortDriver` method can't block on a second asyn port from inside its own port actor), so `writeInt32` only sets `mode` and signals an event while a `task` worker owns the `Server` and performs every socket round-trip — command order and the wire bytes are unchanged. Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.27.0) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
+Boot: clean on `ad-plugins-rs`/`ad-core-rs` 0.24.3 (the pin when that was verified; not re-verified since the workspace moved to 0.27.0) — `AdIoc` registers the asyn port/EOS/trace iocsh commands and `$(ADCORE)` resolves to `ad-core-rs`'s real crate dir, so `drvAsynIPPortConfigure`, the record loads, and `$(ADCORE)/ioc/commonPlugins.cmd` all run unmodified (verified live to `iocInit`: 8357 records, CA/PVA server up). On the older 0.22.1 baseline those asyn commands were unregistered and `$(ADCORE)` was a dead path; reaching a clean boot on 0.24.3 needed only the `iocBoot/`→`ioc/` commonPlugins path correction in st.cmd.
 
 ---
 
@@ -312,7 +312,7 @@ Records (`iocs/ad/marccd-ioc/db/marCCD.template`, includes `ADBase.template` + `
 
 Build/run: `cargo run -p marccd-ioc --release -- iocs/ad/marccd-ioc/st.cmd`
 
-Deviation: the upstream template's duplicate `MarState_RBV` definition was dropped as a retro-fixed upstream defect (`doc/upstream-c-defects.md` #15). Server I/O runs on three worker threads sharing one `Server` behind a `tokio::sync::Mutex` (the analog of the C driver lock), since a `PortDriver` method can't block on a second port from its own actor; command order and the wire bytes are unchanged, only the moment a record's write callback returns differs.
+Deviation: the upstream template's duplicate `MarState_RBV` definition was dropped as a retro-fixed upstream defect (`doc/upstream-c-defects.md` #15). Server I/O runs on the port actor, C's driver lock: inline in `writeInt32` / `writeFloat64`, and through `PortHandle::with_driver` from the acquisition and image threads.
 
 ---
 

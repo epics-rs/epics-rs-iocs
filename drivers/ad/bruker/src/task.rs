@@ -21,9 +21,10 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -36,8 +37,7 @@ use crate::types::*;
 pub(crate) struct AcquisitionContext {
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: BrukerParams,
     pub shared: Arc<SharedState>,
@@ -315,10 +315,14 @@ async fn publish_frame(
     // buffer. The array is the size of the frame that was actually read.
     let ts = EpicsTimestamp::now();
     let data_size = image.data.len() * 4;
-    let mut array = NDArray::with_data(
+    // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.wrap(
         vec![NDDimension::new(image.cols), NDDimension::new(image.rows)],
         NDDataBuffer::U32(image.data),
-    );
+    ) else {
+        return Ok(());
+    };
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
@@ -361,7 +365,7 @@ async fn publish_frame(
     )
     .await;
 
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
     Ok(())
 }
 
@@ -521,13 +525,9 @@ async fn read_f64(ctx: &AcquisitionContext, reason: usize) -> f64 {
 
 async fn read_string(ctx: &AcquisitionContext, reason: usize) -> String {
     ctx.handle
-        .read_octet(reason, 0, MAX_FILENAME_LEN)
+        .get_string_param(reason, 0, MAX_FILENAME_LEN)
         .await
-        .map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .trim_end_matches('\0')
-                .to_string()
-        })
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
 }
 

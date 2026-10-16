@@ -183,7 +183,6 @@ pub struct D435iConfigSnapshot {
     pub image_mode: epics_rs::ad_core::driver::ImageMode,
     pub num_images: i32,
     pub array_callbacks: bool,
-    pub wait_for_plugins: bool,
 
     // Post-processing filters
     pub decimation_enable: bool,
@@ -235,11 +234,6 @@ impl D435iConfigSnapshot {
             ),
             num_images: handle.read_int32(ad.num_images, 0).await?,
             array_callbacks: handle.read_int32(ad.base.array_callbacks, 0).await? != 0,
-            wait_for_plugins: handle
-                .read_int32(ad.base.wait_for_plugins, 0)
-                .await
-                .unwrap_or(0)
-                != 0,
 
             decimation_enable: handle
                 .read_int32(rs.rs_decimation_enable, 0)

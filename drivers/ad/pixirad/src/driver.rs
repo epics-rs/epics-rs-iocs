@@ -21,11 +21,9 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 
 use crate::connection::{Exchange, PixiradServer};
 use crate::params::PixiradParams;
@@ -381,6 +379,9 @@ impl PortDriver for PixiradDetector {
             }
         } else if reason == q.auto_calibrate && value != 0 {
             status = self.do_auto_calibrate();
+        } else if reason < q.system_reset {
+            // FIRST_PIXIRAD_PARAM is PixiradSystemReset (pixirad.cpp:238).
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -406,17 +407,20 @@ impl PortDriver for PixiradDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         let p = self.ad.params;
         let q = self.params;
-        let mut status = Ok(());
         if reason == p.temperature || reason == q.hv_value {
             status = self.set_cooling_and_hv();
         } else if reason == q.hit_threshold || q.threshold.contains(&reason) {
             status = self.set_thresholds(1);
+        } else if reason < q.system_reset {
+            // ADDriver::writeFloat64 is asynPortDriver's (pixirad.cpp:1469).
+            status = self.ad.port_base.write_float64_param(user, value);
         }
 
         match &status {
@@ -490,9 +494,8 @@ pub struct PixiradRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub params: PixiradParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -502,7 +505,7 @@ impl PixiradRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -510,8 +513,7 @@ impl PixiradRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -571,10 +573,8 @@ pub fn create_pixirad_detector(
     let ad_params = det.ad.params;
     let params = det.params;
     let pool = det.ad.pool.clone();
-
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(max_buffers);
 
@@ -590,7 +590,7 @@ pub fn create_pixirad_detector(
         task::start_data_task(DataContext {
             handle: runtime_handle.port_handle().clone(),
             output: ArrayPublisher::new(array_output.clone()),
-            queued: queued_counter.clone(),
+            pool: pool.clone(),
             ad_params,
             params,
             sensor,
@@ -612,7 +612,6 @@ pub fn create_pixirad_detector(
         params,
         pool,
         array_output,
-        queued_counter,
         threads,
     })
 }
@@ -629,6 +628,14 @@ mod tests {
     /// A box that answers `GOT:` to every command except those containing
     /// `reject`; `None` is a box that never accepts the connection.
     fn detector(name: &str, reject: Option<&'static str>) -> PixiradDetector {
+        detector_sized(name, reject, 1 << 20)
+    }
+
+    fn detector_sized(
+        name: &str,
+        reject: Option<&'static str>,
+        max_memory: usize,
+    ) -> PixiradDetector {
         let addr = match reject {
             None => "127.0.0.1:1".to_string(),
             Some(reject) => {
@@ -675,10 +682,31 @@ mod tests {
             sensor,
             476,
             512,
-            1 << 20,
+            max_memory,
             shared,
         )
         .expect("C builds the driver whatever the box answers")
+    }
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        let mut det = detector("PIXI_BASE_WRITE", None);
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
     }
 
     #[test]
@@ -720,5 +748,194 @@ mod tests {
         let mut det = detector("PIXI_THRESH_NAK", Some("SET_SENSOR_OPERATINGS"));
         det.write_int32(&mut AsynUser::new(q.auto_calibrate), 1)
             .unwrap();
+    }
+
+    /// The data task of a detector on a box that takes every command, fed
+    /// frames by the test instead of the UDP listener.
+    struct DataTask {
+        handle: PortHandle,
+        ad: ADBaseParams,
+        params: PixiradParams,
+        frames: std::sync::mpsc::SyncSender<Frame>,
+        arrays: epics_rs::ad_core::plugin::channel::NDArrayReceiver,
+        frame_bytes: usize,
+        pool: DriverPool,
+    }
+
+    impl DataTask {
+        fn start(name: &str, max_memory: usize) -> Self {
+            let det = detector_sized(name, Some("NEVER"), max_memory);
+            let (ad, params, pool, sensor) =
+                (det.ad.params, det.params, det.ad.pool.clone(), det.sensor);
+            let shared = det.shared.clone();
+            let (runtime, _) =
+                create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                    .unwrap();
+            let handle = runtime.port_handle().clone();
+            std::mem::forget(runtime);
+            let (sink, arrays) =
+                epics_rs::ad_core::plugin::channel::ndarray_channel("PIXI_SINK", 8);
+            let mut output = NDArrayOutput::new();
+            output.add(sink);
+            // A rendezvous: a send returns once the task is back for the next
+            // frame, so the frame before it is done.
+            let (frames, frame_rx) = std::sync::mpsc::sync_channel(0);
+            task::start_data_task(DataContext {
+                handle: handle.clone(),
+                output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output))),
+                pool: pool.clone(),
+                ad_params: ad,
+                params,
+                sensor,
+                shared,
+                frames: frame_rx,
+            });
+            Self {
+                handle,
+                ad,
+                params,
+                frames,
+                arrays,
+                frame_bytes: crate::decode::Decoder::new(sensor).frame_bytes(false),
+                pool,
+            }
+        }
+
+        fn send_frame(&self) {
+            self.frames
+                .send(Frame {
+                    is_autocal: false,
+                    align_errors: false,
+                    payload: vec![0; self.frame_bytes],
+                })
+                .unwrap();
+        }
+
+        fn counter(&self) -> i32 {
+            self.handle
+                .read_int32_blocking(self.ad.base.array_counter, 0)
+                .unwrap()
+        }
+    }
+
+    #[test]
+    fn every_image_carries_its_own_start_time() {
+        let mut t = DataTask::start("PIXI_TS", 1 << 20);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        t.send_frame();
+        let first = t.arrays.blocking_recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        t.send_frame();
+        let second = t.arrays.blocking_recv().unwrap();
+        assert!(second.timestamp.as_f64() > first.timestamp.as_f64());
+    }
+
+    /// C bumps NDArrayCounter only after the colour-0 alloc
+    /// (pixirad.cpp:1033, :1055-1057).
+    #[test]
+    fn a_frame_the_pool_refuses_leaves_the_counter_alone() {
+        // Room for one 476 x 512 NDUInt16 image.
+        let mut t = DataTask::start("PIXI_REFUSE", 600_000);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        t.send_frame();
+        let held = t.arrays.blocking_recv().unwrap();
+        assert_eq!(held.unique_id, 1);
+        t.send_frame();
+        t.send_frame();
+        assert_eq!(t.counter(), 1);
+        drop(held);
+        t.send_frame();
+        assert_eq!(t.arrays.blocking_recv().unwrap().unique_id, 2);
+    }
+
+    /// C fills colour `colorsCollected` of the image the colour-0 frame
+    /// allocated (pixirad.cpp:1023-1044): after a refused colour-0 alloc the
+    /// next frame is still colour 1, and a new image starts at colour 0.
+    #[test]
+    fn a_refused_colour_zero_loses_its_image_not_the_colour_order() {
+        // Room for one 476 x 512 x 2 NDUInt16 image.
+        let mut t = DataTask::start("PIXI_COLOUR", 1_000_000);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        t.handle
+            .write_int32_blocking(t.ad.frame_type, 0, FrameType::TwoColors as i32)
+            .unwrap();
+        t.send_frame();
+        t.send_frame();
+        let held = t.arrays.blocking_recv().unwrap();
+        assert_eq!(held.unique_id, 1);
+
+        t.send_frame(); // colour 0, refused
+        // The rendezvous returns once the refused frame is done.
+        t.send_frame(); // colour 1 of the refused image
+        let colors_collected = t
+            .handle
+            .read_int32_blocking(t.params.colors_collected, 0)
+            .unwrap();
+        assert_eq!(colors_collected, 1, "the refused frame took no colour slot");
+        drop(held);
+        t.send_frame(); // colour 0 of the next
+        assert_eq!(t.arrays.pending(), 0);
+        t.send_frame();
+        assert_eq!(t.arrays.blocking_recv().unwrap().unique_id, 2);
+    }
+
+    /// The colour-0 alloc does not depend on NDArrayCallbacks.
+    #[test]
+    fn an_image_is_allocated_from_the_pool_with_callbacks_off() {
+        let t = DataTask::start("PIXI_NOCB", 1 << 20);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 0)
+            .unwrap();
+        t.send_frame();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while t.counter() != 1 {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(t.pool.num_alloc_buffers(), 1);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (pixirad.cpp:1469), whose
+    /// IO_DRIVER line precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "PIXI_BASE_F64";
+        let mut det = detector(port, None);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        let _ = det.write_float64(&mut user, 2.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("pixirad:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
     }
 }

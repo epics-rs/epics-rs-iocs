@@ -6,7 +6,6 @@
 //! task reaches the parameter library through the actor and the server through
 //! its own mutex — see the invariant in [`crate::connection`].
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,13 +20,12 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::ndarray_driver::check_path_str;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::connection::{PslServer, ServerResult};
@@ -343,7 +341,6 @@ impl PslDetector {
             self.ad
                 .port_base
                 .set_string_param(self.ad.params.base.file_path, 0, path)?;
-            self.check_path()?;
         }
 
         if self.supports("RecordName") {
@@ -394,20 +391,20 @@ impl PslDetector {
     }
 
     /// Report whether the directory the server saves into exists here as well
-    /// (C `checkPath`).
+    /// (C `asynNDArrayDriver::checkPath`, asynNDArrayDriver.cpp:98-111): an
+    /// empty path is left alone, any other is stored with its separator.
     fn check_path(&mut self) -> AsynResult<()> {
-        let path = String::from_utf8_lossy(
-            self.ad
-                .port_base
-                .get_string_param(self.ad.params.base.file_path, 0)?,
-        )
-        .into_owned();
-        let exists = !path.is_empty() && Path::new(&path).is_dir();
-        self.ad.port_base.set_int32_param(
-            self.ad.params.base.file_path_exists,
-            0,
-            exists as i32,
-        )?;
+        let p = self.ad.params.base;
+        let mut path = String::from_utf8_lossy(self.ad.port_base.get_string_param(p.file_path, 0)?)
+            .into_owned();
+        if path.is_empty() {
+            return Ok(());
+        }
+        let exists = check_path_str(&mut path);
+        self.ad.port_base.set_string_param(p.file_path, 0, path)?;
+        self.ad
+            .port_base
+            .set_int32_param(p.file_path_exists, 0, exists as i32)?;
         Ok(())
     }
 
@@ -519,13 +516,7 @@ impl PortDriver for PslDetector {
         } else if reason == p.base.file_number {
             self.send(&protocol::set_record_number(value))
         } else if reason < self.params.camera_name {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            if reason == p.shutter_control {
-                self.ad.set_shutter(value != 0);
-                Ok(())
-            } else {
-                self.ad.write_int32_pool(reason, value).map(drop)
-            }
+            ADDriver::ad_write_int32(self, user, value)
         } else {
             Ok(())
         };
@@ -554,20 +545,22 @@ impl PortDriver for PslDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         let p = self.ad.params;
-        let status = if reason == p.acquire_time {
-            self.send(&protocol::set_exposure(value))
+        if reason == p.acquire_time {
+            status = self.send(&protocol::set_exposure(value));
         } else if reason == p.acquire_period {
-            self.send(&protocol::set_frame_time(value))
+            status = self.send(&protocol::set_frame_time(value));
         } else if reason == p.gain {
-            self.send(&protocol::set_chip_gain(value))
-        } else {
-            Ok(())
-        };
+            status = self.send(&protocol::set_chip_gain(value));
+        } else if reason < self.params.camera_name {
+            // ADDriver::writeFloat64 is asynPortDriver's (PSL.cpp:848).
+            status = self.ad.port_base.write_float64_param(user, value);
+        }
 
         let _ = self.get_config();
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -666,9 +659,8 @@ pub struct PslRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub params: PslParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     task: std::thread::JoinHandle<()>,
 }
@@ -678,7 +670,7 @@ impl PslRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -686,8 +678,7 @@ impl PslRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -711,16 +702,14 @@ pub fn create_psl_detector(
     let ad_params = det.ad.params;
     let params = det.params;
     let pool = det.ad.pool.clone();
-
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task = start_acquisition_task(AcquisitionContext {
         server,
         handle: runtime_handle.port_handle().clone(),
         output: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
+        pool: pool.clone(),
         ad_params,
         shared,
         commands: rx,
@@ -732,7 +721,6 @@ pub fn create_psl_detector(
         params,
         pool,
         array_output,
-        queued_counter,
         task,
     })
 }
@@ -759,6 +747,83 @@ mod tests {
         });
         let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
         PslDetector::new(name, PslServer::new(handle), 1 << 20, shared, tx).unwrap()
+    }
+
+    /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
+    /// an ASYN_TRACEIO_DRIVER line (ADDriver.cpp:111-113,
+    /// asynNDArrayDriver.cpp:703-705).
+    #[test]
+    fn a_base_class_write_runs_both_base_class_write_int32s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "PSL_BASE_TRACE";
+        let det = detector(name);
+        let p = det.ad.params.base;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for driver in ["asynNDArrayDriver", "ADDriver"] {
+            assert!(
+                text.contains(&format!(
+                    "{driver}:writeInt32: function={}",
+                    p.pool_poll_stats
+                )),
+                "{driver}: {text:?}"
+            );
+        }
+        std::mem::forget(runtime);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (PSL.cpp:848), whose
+    /// IO_DRIVER line precedes PSL's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "PSL_BASE_F64";
+        let det = detector(name);
+        let delay = det.ad.params.shutter_open_delay;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_float64_blocking(delay, 0, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("PSL:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+        std::mem::forget(runtime);
     }
 
     #[test]
@@ -802,5 +867,82 @@ mod tests {
         det.write_int32(&mut AsynUser::new(p.bin_x), 2).unwrap();
         // The parameter is stored either way.
         assert_eq!(det.get_i32(p.base.file_number), 3);
+    }
+
+    /// A FilePath write runs C `checkPath` (PSL.cpp:886), which stores the
+    /// path with its separator and leaves FilePathExists alone for an empty
+    /// one (asynNDArrayDriver.cpp:104-109).
+    #[test]
+    fn a_file_path_write_runs_check_path() {
+        let mut det = detector("PSL_CHECK_PATH");
+        let p = det.ad.params.base;
+        let dir = std::env::temp_dir().display().to_string();
+        let dir = dir.trim_end_matches('/').to_string();
+        let _ = det.write_octet(&mut AsynUser::new(p.file_path), dir.as_bytes());
+        let stored = |det: &PslDetector| {
+            String::from_utf8_lossy(det.ad.port_base.get_string_param(p.file_path, 0).unwrap())
+                .into_owned()
+        };
+        assert_eq!(stored(&det), format!("{dir}/"));
+        assert_eq!(det.get_i32(p.file_path_exists), 1);
+        let _ = det.write_octet(&mut AsynUser::new(p.file_path), b"");
+        assert_eq!(det.get_i32(p.file_path_exists), 1);
+    }
+
+    /// A PSLViewer that answers every command with `reply`.
+    struct FakeServer {
+        base: PortDriverBase,
+        reply: Vec<u8>,
+    }
+
+    impl PortDriver for FakeServer {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let n = self.reply.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.reply[..n]);
+            Ok(n)
+        }
+    }
+
+    /// getConfig stores GetRecordPath's answer as it came, without
+    /// `checkPath` (PSL.cpp:453-459).
+    #[test]
+    fn get_config_stores_the_record_path_unchecked() {
+        let name = "PSL_RECORD_PATH";
+        let dir = std::env::temp_dir().display().to_string();
+        let dir = dir.trim_end_matches('/').to_string();
+        let ip = format!("{name}_IP");
+        let mut base = PortDriverBase::new(&ip, 1, Default::default());
+        base.init_connected(true);
+        let server = FakeServer {
+            base,
+            reply: dir.clone().into_bytes(),
+        };
+        let (runtime, _) =
+            create_port_runtime(&claim_port(&ip).unwrap(), server, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        let mut det = PslDetector::new(name, PslServer::new(handle), 1 << 20, shared, tx).unwrap();
+        det.state.valid_options = ["RecordPath".to_string()].into();
+        let p = det.ad.params.base;
+        det.get_config().unwrap();
+        let stored =
+            String::from_utf8_lossy(det.ad.port_base.get_string_param(p.file_path, 0).unwrap())
+                .into_owned();
+        assert_eq!(stored, dir);
+        assert_eq!(det.get_i32(p.file_path_exists), 0);
     }
 }

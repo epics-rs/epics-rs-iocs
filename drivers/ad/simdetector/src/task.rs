@@ -1,6 +1,5 @@
 //! Port of `simDetector::simTask` (simDetector.cpp:729-883).
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::param::ParamValue;
@@ -9,10 +8,9 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::NDArray;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 
 use crate::image::{Layout, SimEngine};
@@ -25,19 +23,12 @@ use crate::types::Signal;
 /// stop event always gets a chance to be seen.
 const MIN_DELAY: f64 = 1e-5;
 
-/// DEVIATION: C's `ADAcquireBusy` is cleared asynchronously by
-/// `asynNDArrayDriver::setIntegerParam(NDNumQueuedArrays, 0)`. The Rust task
-/// owns no driver reference, so it blocks on the queued-array counter instead.
-/// This bounds that block; `ad-core-rs` offers no unbounded variant.
-const PLUGIN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub(crate) struct SimTaskContext {
     pub start_rx: rt::CommandReceiver<Signal>,
     pub stop_rx: rt::CommandReceiver<Signal>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
-    pub queued: Arc<QueuedArrayCounter>,
-    pub pool: Arc<NDArrayPool>,
+    pub pool: DriverPool,
     pub ad: ADBaseParams,
     pub sim: SimParams,
 }
@@ -119,22 +110,16 @@ impl SimTaskContext {
         notify(&self.handle, vec![int32(self.ad.status, status as i32)]).await;
     }
 
-    /// Clear `ADAcquireBusy`, honouring `ADWaitForPlugins`. Also clears
-    /// `ADAcquire` when the task itself is the one ending the acquisition.
-    async fn clear_acquire_busy(&self, also_clear_acquire: bool) {
-        if self.read_i32(self.ad.wait_for_plugins).await != 0 {
-            self.queued.wait_until_zero(PLUGIN_DRAIN_TIMEOUT);
-        }
-        let mut updates = vec![int32(self.ad.acquire_busy, 0)];
-        if also_clear_acquire {
-            updates.push(int32(self.ad.acquire, 0));
-        }
-        notify(&self.handle, updates).await;
+    /// The task ending the acquisition (C `setIntegerParam(ADAcquire, 0)`);
+    /// ADAcquireBusy follows that store, WaitForPlugins included
+    /// (asynNDArrayDriver.cpp:636-663).
+    async fn end_acquisition(&self) {
+        notify(&self.handle, vec![int32(self.ad.acquire, 0)]).await;
     }
 
     /// `simDetector::computeImage` (simDetector.cpp:505-718).
     /// The error is the text of `computeImage`'s own asynPrint.
-    async fn compute_image(&self, engine: &mut SimEngine) -> Result<NDArray, &'static str> {
+    async fn compute_image(&self, engine: &mut SimEngine) -> Result<DriverArray, &'static str> {
         let (mut cfg, read_ok) = self.sim.read_config(&self.handle, &self.ad).await;
         if !read_ok {
             self.handle.trace().output(
@@ -164,9 +149,7 @@ impl SimTaskContext {
         }
 
         let reset = self.read_i32(self.sim.reset_image).await != 0;
-        let image = engine
-            .compute_image(&cfg, &self.pool, reset)
-            .map_err(|_| "error allocating buffer in convert()")?;
+        let image = engine.compute_image(&cfg, &self.pool, reset)?;
 
         let layout = Layout::for_color_mode(cfg.color_mode);
         let elements: usize = image.dims.iter().map(|d| d.size).product();
@@ -260,7 +243,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
                 .await;
                 ctx.set_shutter(false).await;
                 acquire = false;
-                ctx.clear_acquire_busy(true).await;
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -282,9 +265,10 @@ async fn sim_task(mut ctx: SimTaskContext) {
         ctx.set_shutter(false).await;
 
         if !acquire {
-            // `writeInt32` already wrote ADAcquire=0; only ADAcquireBusy may
-            // still be pending on the plugin queue.
-            ctx.clear_acquire_busy(false).await;
+            // `writeInt32` already stored ADAcquire=0.
+            ctx.pool
+                .owner()
+                .store_array(0, Some(image.share().array().clone()));
             continue;
         }
 
@@ -312,9 +296,11 @@ async fn sim_task(mut ctx: SimTaskContext) {
         // writes the NDTimeStamp / NDEpicsTSSec parameters.
         image.update_time_stamps_now();
 
+        let image = image.share();
         if array_callbacks {
-            ctx.publisher.publish(Arc::new(image)).await;
+            ctx.publisher.publish(image.clone()).await;
         }
+        ctx.pool.owner().store_array(0, Some(image.array().clone()));
 
         // See if acquisition is done.
         if image_mode == ImageMode::Single
@@ -329,7 +315,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
             )
             .await;
             acquire = false;
-            ctx.clear_acquire_busy(true).await;
+            ctx.end_acquisition().await;
         }
 
         // Sleep for the acquire period minus the elapsed time.
@@ -346,7 +332,6 @@ async fn sim_task(mut ctx: SimTaskContext) {
                     Wait::Stopped => {
                         acquire = false;
                         ctx.stopped_status(image_mode).await;
-                        ctx.clear_acquire_busy(false).await;
                     }
                     Wait::TimedOut => {}
                 }

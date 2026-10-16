@@ -542,11 +542,11 @@ impl PortDriver for TetrAmmDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.qe_write_int32(user.reason, user.addr, value)
+        self.qe_write_int32(user, value)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        self.qe_write_float64(user.reason, user.addr, value)
+        self.qe_write_float64(user, value)
     }
 }
 
@@ -768,7 +768,7 @@ pub struct TetrAmmRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: QuadEmParams,
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
+    pub pool: epics_rs::ad_core::ndarray_pool::DriverPool,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
     /// `None` when the constructor found no QE port.
     _read_thread: Option<thread::JoinHandle<()>>,
@@ -832,6 +832,7 @@ pub fn create_tetramm(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });
@@ -974,7 +975,10 @@ mod tests {
     fn stopping_a_dead_meter_fails_the_acquire_write() {
         let mut drv = driver_on("QE_TETRA_DEAD", "127.0.0.1:1");
         let acquire = drv.base.nd_params.acquire;
-        assert!(drv.qe_write_int32(acquire, 0, 0).is_err());
+        assert!(
+            drv.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 0)
+                .is_err()
+        );
     }
 
     #[test]

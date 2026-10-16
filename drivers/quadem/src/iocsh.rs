@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::ad_core::ioc::{GenericDriverContext, PluginManager};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::asyn::manager::claim_port_driver;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -34,7 +34,7 @@ pub fn register_quadem_port(
     owner: &Arc<InterruptGate>,
     claim: PortClaim,
     handle: PortHandle,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     outputs: &[Arc<parking_lot::Mutex<NDArrayOutput>>],
 ) -> epics_rs::asyn::error::AsynResult<()> {
     let port_name = claim.name().to_string();

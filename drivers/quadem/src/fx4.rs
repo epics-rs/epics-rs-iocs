@@ -344,11 +344,11 @@ impl PortDriver for Fx4Driver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.qe_write_int32(user.reason, user.addr, value)
+        self.qe_write_int32(user, value)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        self.qe_write_float64(user.reason, user.addr, value)
+        self.qe_write_float64(user, value)
     }
 }
 
@@ -608,7 +608,7 @@ pub struct Fx4Runtime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: QuadEmParams,
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
+    pub pool: epics_rs::ad_core::ndarray_pool::DriverPool,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
     _socket_thread: thread::JoinHandle<()>,
     _data_thread: thread::JoinHandle<()>,
@@ -678,6 +678,7 @@ pub fn create_fx4(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

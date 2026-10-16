@@ -182,10 +182,12 @@ impl Fixture {
     }
 
     fn string(&self, reason: usize) -> String {
-        let bytes = self.sync.read_octet(reason, 256).expect("string parameter");
-        String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .to_string()
+        let bytes = self
+            .detector
+            .port_handle()
+            .get_string_param_blocking(reason, 0, 256)
+            .expect("string parameter");
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// The next array the plugin is handed, or nothing within `timeout`.
@@ -389,6 +391,53 @@ fn a_binning_write_does_not_depend_on_bis() {
     sync.write_int32(ad.bin_x, 2).expect("binning 2");
     assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
     assert!(sync.write_int32(ad.bin_x, 3).is_err());
+}
+
+/// BISDetector.cpp:668 hands base-class writes to ADDriver::writeInt32,
+/// which with asynNDArrayDriver::writeInt32 closes with an
+/// ASYN_TRACEIO_DRIVER line (ADDriver.cpp:111-113, asynNDArrayDriver.cpp:703-705).
+#[test]
+fn a_base_class_write_runs_both_base_class_write_int32s() {
+    use epics_rs::asyn::trace::{TraceFile, TraceMask};
+    let closed = |name: &str| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .expect("ip port runtime");
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        handle
+    };
+    let name = "BISTRACE";
+    let detector = create_bruker_detector(
+        &claim_port(name).unwrap(),
+        closed("BISTRACE_COMMAND"),
+        closed("BISTRACE_STATUS"),
+        0,
+    )
+    .expect("the detector port");
+    let h = detector.port_handle().clone();
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    h.trace().set_trace_file(
+        Some(name),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    h.trace()
+        .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+    let reason = detector.ad_params.base.pool_poll_stats;
+    h.write_int32_blocking(reason, 0, 1).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    for driver in ["asynNDArrayDriver", "ADDriver"] {
+        assert!(
+            text.contains(&format!("{driver}:writeInt32: function={reason}")),
+            "{driver}: {text:?}"
+        );
+    }
 }
 
 /// BISTask ignores its getDoubleParam status (BISDetector.cpp:498), so a scan

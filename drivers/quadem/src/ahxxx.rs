@@ -531,11 +531,11 @@ impl PortDriver for AhxxxDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.qe_write_int32(user.reason, user.addr, value)
+        self.qe_write_int32(user, value)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        self.qe_write_float64(user.reason, user.addr, value)
+        self.qe_write_float64(user, value)
     }
 }
 
@@ -750,7 +750,7 @@ pub struct AhxxxRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: QuadEmParams,
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
+    pub pool: epics_rs::ad_core::ndarray_pool::DriverPool,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
     /// `None` when the constructor found no QE port.
     _read_thread: Option<thread::JoinHandle<()>>,
@@ -822,6 +822,7 @@ pub fn create_ahxxx(
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

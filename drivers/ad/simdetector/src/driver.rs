@@ -14,11 +14,9 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::params::SimParams;
@@ -106,25 +104,6 @@ impl SimDetector {
             stop_tx,
         })
     }
-
-    /// `simDetector::setShutter` (simDetector.cpp:490-502). C's is void and
-    /// ignores every param status, so an unset `ADShutterMode` reads as 0.
-    fn set_shutter(&mut self, open: bool) {
-        let mode = self
-            .ad
-            .port_base
-            .get_int32_param(self.ad.params.shutter_mode, 0)
-            .unwrap_or(0);
-        match shutter_op(mode, open) {
-            ShutterOp::DetectorStatus(v) => {
-                let _ = self
-                    .ad
-                    .port_base
-                    .set_int32_param(self.ad.params.shutter_status, 0, v);
-            }
-            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => self.ad.set_shutter(open),
-        }
-    }
 }
 
 impl PortDriver for SimDetector {
@@ -205,13 +184,7 @@ impl PortDriver for SimDetector {
         } else if sim.int32_write_dirties_image(reason, &p) {
             status = self.ad.port_base.set_int32_param(sim.reset_image, 0, 1);
         } else if !sim.owns(reason) {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            status = if reason == p.shutter_control {
-                self.set_shutter(value != 0);
-                Ok(())
-            } else {
-                self.ad.write_int32_pool(reason, value).map(drop)
-            };
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -238,23 +211,22 @@ impl PortDriver for SimDetector {
     /// `simDetector::writeFloat64` (simDetector.cpp:965-993).
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        let mut status = self
+        // Both branches replace the store's status (simDetector.cpp:973-980).
+        let _ = self
             .ad
             .port_base
             .set_float64_param(reason, user.addr, value);
-
-        if self
+        let status = if self
             .sim
             .float64_write_dirties_image(reason, self.ad.params.gain)
         {
-            status = self
-                .ad
+            self.ad
                 .port_base
-                .set_int32_param(self.sim.reset_image, 0, 1);
-        }
-        // Otherwise C calls `ADDriver::writeFloat64`, which neither ADDriver nor
-        // asynNDArrayDriver override: asynPortDriver::writeFloat64 only sets the
-        // parameter (done above) and fires callbacks (done below).
+                .set_int32_param(self.sim.reset_image, 0, 1)
+        } else {
+            // ADDriver::writeFloat64 is asynPortDriver's (simDetector.cpp:979).
+            self.ad.port_base.write_float64_param(user, value)
+        };
 
         let _ = self.ad.port_base.call_param_callbacks(0);
         match &status {
@@ -286,6 +258,25 @@ impl ADDriver for SimDetector {
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
     }
+
+    /// `simDetector::setShutter` (simDetector.cpp:490-502). C's is void and
+    /// ignores every param status, so an unset `ADShutterMode` reads as 0.
+    fn set_shutter(&mut self, open: bool) {
+        let mode = self
+            .ad
+            .port_base
+            .get_int32_param(self.ad.params.shutter_mode, 0)
+            .unwrap_or(0);
+        match shutter_op(mode, open) {
+            ShutterOp::DetectorStatus(v) => {
+                let _ = self
+                    .ad
+                    .port_base
+                    .set_int32_param(self.ad.params.shutter_status, 0, v);
+            }
+            ShutterOp::Nothing | ShutterOp::EpicsControl(_) => self.ad.set_shutter(open),
+        }
+    }
 }
 
 /// Handles kept by the IOC after the driver has been moved into its runtime.
@@ -293,9 +284,8 @@ pub struct SimDetectorRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub sim_params: SimParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Owns the `SimDetTask` thread for the lifetime of the IOC.
     pub task_handle: std::thread::JoinHandle<()>,
 }
@@ -305,7 +295,7 @@ impl SimDetectorRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -313,8 +303,7 @@ impl SimDetectorRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -342,11 +331,9 @@ pub fn create_sim_detector(
     let ad_params = det.ad.params;
     let sim_params = det.sim;
     let pool = det.ad.pool.clone();
-    // Share the driver's own counter so `ADDriverBase::set_acquire` sees the
-    // live queued-array count when ADWaitForPlugins is set. The `NDArrayOutput`
-    // must live outside the driver instead, because `create_port_runtime` takes
-    // ownership of it and the IOC still needs to attach plugin senders.
-    let queued_counter = det.ad.queued_counter.clone();
+    // The `NDArrayOutput` must live outside the driver, because
+    // `create_port_runtime` takes ownership of it and the IOC still needs to
+    // attach plugin senders.
 
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
@@ -356,7 +343,6 @@ pub fn create_sim_detector(
         stop_rx,
         handle: runtime_handle.port_handle().clone(),
         publisher: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
         pool: pool.clone(),
         ad: ad_params,
         sim: sim_params,
@@ -368,7 +354,6 @@ pub fn create_sim_detector(
         sim_params,
         pool,
         array_output,
-        queued_counter,
         task_handle,
     })
 }
@@ -423,6 +408,49 @@ mod tests {
     /// simDetector inherits `asynNDArrayDriver::writeOctet`, so an
     /// `NDAttributesFile` write loads the set and a `FilePath` write runs
     /// `checkPath`.
+    /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
+    /// an ASYN_TRACEIO_DRIVER line (ADDriver.cpp:111-113,
+    /// asynNDArrayDriver.cpp:703-705).
+    #[test]
+    fn a_base_class_write_runs_both_base_class_write_int32s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "SIM_BASE_TRACE";
+        let det = {
+            let (start_tx, _) = rt::command_channel::<Signal>(1);
+            let (stop_tx, _) = rt::command_channel::<Signal>(1);
+            SimDetector::new(name, 64, 48, NDDataType::UInt8, 0, start_tx, stop_tx).unwrap()
+        };
+        let p = det.ad.params.base;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for driver in ["asynNDArrayDriver", "ADDriver"] {
+            assert!(
+                text.contains(&format!(
+                    "{driver}:writeInt32: function={}",
+                    p.pool_poll_stats
+                )),
+                "{driver}: {text:?}"
+            );
+        }
+        std::mem::forget(runtime);
+    }
+
     #[test]
     fn octet_writes_reach_the_asyn_nd_array_driver_branches() {
         let mut f = Fixture::new();
@@ -643,5 +671,237 @@ mod tests {
         let p = f.det.ad.params;
         f.write_i32(p.shutter_control, 1);
         assert_eq!(f.get_i32(p.shutter_status), 0);
+    }
+
+    /// An 8 x 8 detector set up for one 1 ms Single image, with the
+    /// parameters the IOC's PINI records seed.
+    fn single_image_detector(name: &str, array_callbacks: i32) -> SimDetectorRuntime {
+        single_image_detector_in(name, array_callbacks, 0)
+    }
+
+    fn single_image_detector_in(
+        name: &str,
+        array_callbacks: i32,
+        max_memory: usize,
+    ) -> SimDetectorRuntime {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+
+        let rt = create_sim_detector(
+            &claim_port(name).unwrap(),
+            8,
+            8,
+            NDDataType::UInt8,
+            0,
+            max_memory,
+        )
+        .unwrap();
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    ad.base.array_callbacks,
+                    0,
+                    ParamValue::Int32(array_callbacks),
+                ),
+                ParamSetValue::new(ad.base.wait_for_plugins, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Single as i32),
+                ),
+                ParamSetValue::new(ad.acquire_time, 0, ParamValue::Float64(0.001)),
+            ],
+        )
+        .unwrap();
+        // The IOC's PINI records seed these; read_config refuses them unset.
+        let sp = rt.sim_params;
+        let floats = [
+            ad.gain,
+            sp.gain_x,
+            sp.gain_y,
+            sp.gain_red,
+            sp.gain_green,
+            sp.gain_blue,
+            sp.offset,
+            sp.noise,
+            sp.peak_height_variation,
+            sp.x_sine1_amplitude,
+            sp.x_sine1_frequency,
+            sp.x_sine1_phase,
+            sp.x_sine2_amplitude,
+            sp.x_sine2_frequency,
+            sp.x_sine2_phase,
+            sp.y_sine1_amplitude,
+            sp.y_sine1_frequency,
+            sp.y_sine1_phase,
+            sp.y_sine2_amplitude,
+            sp.y_sine2_frequency,
+            sp.y_sine2_phase,
+        ];
+        let ints = [
+            sp.mode,
+            sp.peak_num_x,
+            sp.peak_num_y,
+            sp.peak_start_x,
+            sp.peak_start_y,
+            sp.peak_step_x,
+            sp.peak_step_y,
+            sp.peak_width_x,
+            sp.peak_width_y,
+            sp.x_sine_operation,
+            sp.y_sine_operation,
+        ];
+        let mut seeds = Vec::new();
+        for r in floats {
+            if h.read_float64_blocking(r, 0).is_err() {
+                seeds.push(ParamSetValue::new(r, 0, ParamValue::Float64(0.0)));
+            }
+        }
+        for r in ints {
+            if h.read_int32_blocking(r, 0).is_err() {
+                seeds.push(ParamSetValue::new(r, 0, ParamValue::Int32(0)));
+            }
+        }
+        h.set_params_and_notify_blocking(0, seeds).unwrap();
+        rt
+    }
+
+    #[test]
+    fn wait_for_plugins_holds_acquire_busy_until_the_frame_is_released() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use std::time::{Duration, Instant};
+
+        let rt = single_image_detector("SIM_BUSY", 1);
+        let (tx, mut rx) = ndarray_channel("SIM_BUSY_SINK", 8);
+        rt.connect_downstream(tx);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        let read = |reason| h.read_int32_blocking(reason, 0).unwrap();
+        let wait_for = |reason, value| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while read(reason) != value {
+                assert!(
+                    Instant::now() < deadline,
+                    "param {reason} never became {value}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_for(ad.acquire, 0);
+        assert_eq!(read(ad.acquire_busy), 1, "busy cleared with a frame queued");
+        drop(rx.blocking_recv().expect("frame"));
+        wait_for(ad.acquire_busy, 0);
+        std::mem::forget(rt);
+    }
+
+    /// C keeps the last image in pArrays[0] until just before the next
+    /// convert (simDetector.cpp:696-700), published or not.
+    #[test]
+    fn the_last_image_stays_charged_after_the_acquisition() {
+        use std::time::{Duration, Instant};
+
+        let rt = single_image_detector("SIM_LAST", 0);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() != 1
+            || h.read_int32_blocking(ad.acquire_busy, 0).unwrap() != 0
+        {
+            assert!(Instant::now() < deadline, "no image");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pool = rt.pool();
+        // pRaw_, pBackground_, pRamp_, pPeak_ and pArrays[0].
+        assert_eq!(pool.num_alloc_buffers() - pool.num_free_buffers(), 5);
+
+        // pArrays[0] is preAllocateBuffers' template (asynNDArrayDriver.cpp:717-726).
+        let p = &ad.base;
+        h.write_int32_blocking(p.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        let free = pool.num_free_buffers();
+        h.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
+        assert_eq!(pool.num_free_buffers(), free + 2);
+        std::mem::forget(rt);
+    }
+
+    /// C releases pArrays[0] after the SimBuffers reset (simDetector.cpp:625-646,
+    /// :696), so a reset the pool refuses leaves the last image charged.
+    #[test]
+    fn a_refused_reset_keeps_the_last_image_in_parrays0() {
+        use std::time::{Duration, Instant};
+
+        let rt = single_image_detector_in("SIM_RESET_HOLD", 0, 5 * 64);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        let wait_idle = |count: i32| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() != count
+                && h.read_int32_blocking(ad.status, 0).unwrap() != ADStatus::Error as i32
+                || h.read_int32_blocking(ad.acquire_busy, 0).unwrap() != 0
+            {
+                assert!(Instant::now() < deadline, "acquisition did not end");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_idle(1);
+        let pool = rt.pool();
+        assert!(pool.owner().array(0).is_some());
+
+        h.write_int32_blocking(ad.base.data_type, 0, NDDataType::UInt16 as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_idle(1);
+        assert_eq!(
+            h.read_int32_blocking(ad.status, 0).unwrap(),
+            ADStatus::Error as i32
+        );
+        assert!(pool.owner().array(0).is_some());
+        std::mem::forget(rt);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (simDetector.cpp:979), whose
+    /// IO_DRIVER line precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "SIM_F64_BASE";
+        let mut det = {
+            let (start_tx, _) = rt::command_channel::<Signal>(1);
+            let (stop_tx, _) = rt::command_channel::<Signal>(1);
+            SimDetector::new(port, 64, 48, NDDataType::UInt8, 0, start_tx, stop_tx).unwrap()
+        };
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        let _ = det.write_float64(&mut user, 2.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("simDetector:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
     }
 }

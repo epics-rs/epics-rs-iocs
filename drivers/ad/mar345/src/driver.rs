@@ -1,11 +1,7 @@
 //! The `PortDriver` half of the mar345 port: `writeInt32` sets the shared `mode`
-//! and signals the worker events, and the runtime wiring that spawns the single
-//! `mar345Task` worker.
-//!
-//! marServer I/O is not done here — a `PortDriver` method runs inside the port
-//! actor, whose runtime cannot block on a second port — so each branch only
-//! updates `mode` (an atomic shared with the worker) and signals the
-//! start / stop / abort events, exactly as C's `writeInt32` does.
+//! and signals the worker events, exactly as C's does, and the runtime wiring
+//! that spawns the single `mar345Task` worker. The one write that talks to
+//! marServer is a detector shutter, inline as in C.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
@@ -21,17 +17,14 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
-use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode, ShutterMode};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use parking_lot::Mutex;
 
 use crate::params::Mar345Params;
-use crate::server::Server;
 use crate::task::{Worker, start_task};
 use crate::types::{EraseMode, Event, Mode, Resolution, ScanSize, Status, TriggerMode};
 
@@ -50,6 +43,11 @@ pub struct Mar345Driver {
     abort: Arc<Event>,
     /// C `mar345Mode_t mode`, shared with the worker.
     mode: Arc<AtomicI32>,
+    /// C `pasynUserServer`: the marServer octet port.
+    pub(crate) server: PortHandle,
+    /// C `pData` (mar345.cpp:741-747): allocated once and never read, so it
+    /// stays charged on the pool for the driver's life.
+    _raw_buffer: Option<DriverArray>,
 }
 
 /// The handles the driver shares with its worker thread.
@@ -58,6 +56,7 @@ struct DriverLinks {
     stop: Arc<Event>,
     abort: Arc<Event>,
     mode: Arc<AtomicI32>,
+    server: PortHandle,
 }
 
 impl Mar345Driver {
@@ -87,6 +86,14 @@ impl Mar345Driver {
         base.set_int32_param(p.num_erased, 0, 0)?;
         base.set_int32_param(p.erase, 0, 0)?;
 
+        let raw_buffer = ad.pool.alloc(
+            vec![
+                NDDimension::new(MAX_DIM as usize),
+                NDDimension::new(MAX_DIM as usize),
+            ],
+            NDDataType::Int16,
+        );
+
         Ok(Self {
             ad,
             p,
@@ -94,6 +101,8 @@ impl Mar345Driver {
             stop: links.stop,
             abort: links.abort,
             mode: links.mode,
+            server: links.server,
+            _raw_buffer: raw_buffer.ok(),
         })
     }
 }
@@ -153,8 +162,7 @@ impl PortDriver for Mar345Driver {
                 self.abort.signal();
             }
         } else if function < p.first() {
-            // Base-class parameter: pool controls plus plain stores.
-            status = self.ad.write_int32_pool(function, value).map(|_| ());
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -187,6 +195,20 @@ impl ADDriver for Mar345Driver {
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
     }
+
+    /// `mar345::setShutter` (mar345.cpp:372-397).
+    fn set_shutter(&mut self, open: bool) {
+        let mode = self
+            .ad
+            .port_base
+            .get_int32_param(self.ad.params.shutter_mode, 0)
+            .unwrap_or(0);
+        if ShutterMode::from_i32(mode) == Some(ShutterMode::DetectorOnly) {
+            self.set_detector_shutter(open);
+            return;
+        }
+        self.ad.set_shutter(open);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,9 +219,8 @@ pub struct Mar345Runtime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub mar345_params: Mar345Params,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Worker thread; kept alive for the IOC's lifetime.
     pub tasks: Vec<std::thread::JoinHandle<()>>,
 }
@@ -209,7 +230,7 @@ impl Mar345Runtime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -217,8 +238,7 @@ impl Mar345Runtime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -252,6 +272,7 @@ pub fn create_mar345_detector(
             stop: stop.clone(),
             abort: abort.clone(),
             mode: mode.clone(),
+            server: server_handle.clone(),
         },
     )
     .map_err(|e| format!("failed to create mar345 driver: {e}"))?;
@@ -259,23 +280,27 @@ pub fn create_mar345_detector(
     let ad_params = driver.ad.params;
     let mar345_params = driver.p;
     let pool = driver.ad.pool.clone();
+    let owner = driver.ad.owner.clone();
 
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the mar345 port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
-    let server = Server::new(handle, server_handle, ad_params);
     let worker = Worker {
-        server,
+        port: handle,
+        server_port: server_handle,
+        ad: ad_params,
         p: mar345_params,
+        from: String::new(),
         start,
         stop,
         abort,
         mode,
         acq_start,
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
+        owner,
     };
     let tasks = vec![start_task(worker)];
 
@@ -285,7 +310,131 @@ pub fn create_mar345_detector(
         mar345_params,
         pool,
         array_output,
-        queued_counter,
         tasks,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+    use std::io::Read;
+
+    /// An IP port `{name}_IP` on a server that logs what it receives.
+    pub(crate) fn fake_server(name: &str) -> Arc<Mutex<String>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(String::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            while let Ok(n @ 1..) = stream.read(&mut buf) {
+                seen.lock().push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+        let ip = format!("{name}_IP");
+        let claim = claim_port(&ip).unwrap();
+        let (runtime, _) = create_port_runtime(
+            &claim,
+            DrvAsynIPPort::new(&ip, &addr).unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        std::mem::forget(runtime);
+        log
+    }
+
+    /// The fake server port `{name}_IP`.
+    pub(crate) fn server_handle(name: &str) -> PortHandle {
+        get_port(&format!("{name}_IP")).unwrap().handle.clone()
+    }
+
+    /// A driver on a fake server, outside any port runtime.
+    fn driver(name: &str, max_memory: usize) -> Mar345Driver {
+        fake_server(name);
+        Mar345Driver::new(
+            name,
+            max_memory,
+            DriverLinks {
+                start: Arc::new(Event::new()),
+                stop: Arc::new(Event::new()),
+                abort: Arc::new(Event::new()),
+                mode: Arc::new(AtomicI32::new(0)),
+                server: server_handle(name),
+            },
+        )
+        .unwrap()
+    }
+
+    /// ADDriver.cpp:96-98 calls the virtual setShutter, which mar345
+    /// overrides to drive a detector shutter through marServer, waiting out
+    /// the delay before ADShutterStatus (:372-396): all of it inside the write.
+    #[test]
+    fn a_detector_shutter_is_done_when_the_write_returns() {
+        let name = "MAR345_SHUTTER";
+        let log = fake_server(name);
+        let det =
+            create_mar345_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad) = (det.port_handle(), det.ad_params);
+        h.write_float64_blocking(ad.shutter_open_delay, 0, 0.2)
+            .unwrap();
+        h.write_int32_blocking(ad.shutter_mode, 0, ShutterMode::DetectorOnly as i32)
+            .unwrap();
+        let start = std::time::Instant::now();
+        h.write_int32_blocking(ad.shutter_control, 0, 1).unwrap();
+        assert!(start.elapsed().as_secs_f64() >= 0.2, "the open delay");
+        assert_eq!(h.read_int32_blocking(ad.shutter_status, 0).unwrap(), 1);
+        assert_eq!(
+            h.get_string_param_blocking(ad.string_to_server, 0, 256)
+                .unwrap(),
+            b"COMMAND SHUTTER OPEN"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !log.lock().contains("COMMAND SHUTTER OPEN") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never reached marServer"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::mem::forget(det);
+    }
+
+    /// A non-detector mode is ADDriver::setShutter inside the write
+    /// (ADDriver.cpp:43-47), with no shutter thread to reach.
+    #[test]
+    fn an_epics_shutter_is_set_inside_the_write() {
+        let mut d = driver("MAR345_EPICS_SHUTTER", 0);
+        let ad = d.ad.params;
+        d.ad.port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        d.ad_write_int32(&AsynUser::new(ad.shutter_control).with_addr(0), 1)
+            .unwrap();
+        assert_eq!(
+            d.ad.port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_raw_buffer_is_charged_at_construction() {
+        let d = driver("MAR345_RAW", 0);
+        assert_eq!(d.ad.pool.num_alloc_buffers(), 1);
+        assert_eq!(d.ad.pool.allocated_bytes(), 3450 * 3450 * 2);
+    }
+
+    #[test]
+    fn a_pool_without_room_for_the_raw_buffer_still_builds_the_driver() {
+        let d = driver("MAR345_RAW_REFUSED", 1000);
+        assert_eq!(d.ad.pool.num_alloc_buffers(), 0);
+    }
 }

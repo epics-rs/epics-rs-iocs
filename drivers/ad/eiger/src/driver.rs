@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
@@ -488,6 +488,9 @@ impl EigerDriver {
                     self.signals.stream_apis(None);
                 }
             }
+        } else if reason < self.p.state {
+            // mFirstParam is mState's index (eigerDetector.cpp:228, :587-588).
+            ADDriver::ad_write_int32(self, user, value)?;
         } else {
             self.ad.port_base.set_int32_param(reason, addr, value)?;
         }
@@ -527,6 +530,9 @@ impl EigerDriver {
             }
         } else if self.ops.reg.lock().contains(reason) {
             self.put_f64(reason, value)?;
+        } else if reason < self.p.state {
+            // ADDriver::writeFloat64 is asynPortDriver's (eigerDetector.cpp:667-668).
+            self.ad.port_base.write_float64_param(user, value)?;
         } else {
             self.ad.port_base.set_float64_param(reason, addr, value)?;
         }
@@ -564,6 +570,16 @@ pub(crate) fn asyn_err(message: String) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message,
+    }
+}
+
+impl ADDriver for EigerDriver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
     }
 }
 
@@ -642,7 +658,7 @@ impl PortDriver for EigerDriver {
             );
             return Err(e);
         }
-        let _ = self.ad.port_base.call_param_callbacks(user.addr);
+        let _ = self.ad.port_base.call_param_callbacks(0);
         user.print(
             TraceMask::IO_DRIVER,
             file!(),
@@ -672,7 +688,7 @@ impl PortDriver for EigerDriver {
                     line!(),
                     format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}"),
                 );
-                let _ = self.ad.port_base.call_param_callbacks(user.addr);
+                let _ = self.ad.port_base.call_param_callbacks(0);
             }
         }
         status
@@ -702,7 +718,7 @@ impl PortDriver for EigerDriver {
                     line!(),
                     format_args!("eigerDetector:writeOctet: function={function}, value={value}"),
                 );
-                let _ = self.ad.port_base.call_param_callbacks(user.addr);
+                let _ = self.ad.port_base.call_param_callbacks(0);
             }
         }
         status.map(|()| data.len())

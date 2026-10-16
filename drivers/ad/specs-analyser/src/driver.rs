@@ -20,11 +20,9 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -709,9 +707,8 @@ pub struct SpecsAnalyserRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub specs_params: SpecsParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<PlMutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     pub tasks: Vec<std::thread::JoinHandle<()>>,
 }
 
@@ -720,7 +717,7 @@ impl SpecsAnalyserRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -728,8 +725,7 @@ impl SpecsAnalyserRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -797,7 +793,6 @@ pub fn create_specs_analyser_detector(
         .map_err(|e| format!("failed to start the SPECS analyser port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(PlMutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let worker = Worker {
         self_handle: handle.clone(),
@@ -812,6 +807,7 @@ pub fn create_specs_analyser_detector(
         lens_modes,
         scan_ranges,
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
         batch: Vec::new(),
         last_status_ok: true,
     };
@@ -823,7 +819,6 @@ pub fn create_specs_analyser_detector(
         specs_params,
         pool,
         array_output,
-        queued_counter,
         tasks,
     })
 }

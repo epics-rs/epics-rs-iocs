@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime};
 
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -56,6 +57,7 @@ pub struct Ctx {
     pub p: TimePixParams,
     pub ad: ADDriverParams,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pub pool: DriverPool,
 }
 
 impl Ctx {
@@ -213,20 +215,8 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
             0,
             ParamValue::Octet(det_type.clone().into_bytes().into()),
         ),
-        ParamSetValue::new(
-            ctx.ad.status,
-            0,
-            ParamValue::Int32(if serval_ok && det_ok {
-                if ctx.shared.acquiring() {
-                    ADStatus::Acquire as i32
-                } else {
-                    ADStatus::Idle as i32
-                }
-            } else {
-                ADStatus::Disconnected as i32
-            }),
-        ),
     ];
+    connection_status(ctx, serval_ok, det_ok, &mut updates);
     if det_ok {
         updates.push(ParamSetValue::new(
             ctx.ad.base.model,
@@ -242,8 +232,33 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
     serval_ok && det_ok
 }
 
-/// The first disk in `Server.DiskSpace`, which is empty until raw file writing
-/// is configured (C getDashboard, serval_http.cpp:388).
+/// C `updateStatusFromConnection` (serval_http.cpp:251-285), less its
+/// acquisition-phase messages: a connected detector reads "OK".
+fn connection_status(
+    ctx: &Arc<Ctx>,
+    serval_ok: bool,
+    det_ok: bool,
+    updates: &mut Vec<ParamSetValue>,
+) {
+    let (message, status) = match (serval_ok, det_ok) {
+        (true, true) if ctx.shared.acquiring() => ("OK", ADStatus::Acquire),
+        (true, true) => ("OK", ADStatus::Idle),
+        (false, false) => ("SERVAL and detector disconnected", ADStatus::Disconnected),
+        (false, true) => ("SERVAL disconnected", ADStatus::Disconnected),
+        (true, false) => ("Detector disconnected", ADStatus::Disconnected),
+    };
+    updates.push(ParamSetValue::new(
+        ctx.ad.status_message,
+        0,
+        ParamValue::Octet(message.as_bytes().to_vec().into()),
+    ));
+    updates.push(ParamSetValue::new(
+        ctx.ad.status,
+        0,
+        ParamValue::Int32(status as i32),
+    ));
+}
+
 /// C `updateServalVersionFromDashboard` (serval_http.cpp:133).
 fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let Some(server) = dashboard.get("Server").filter(|s| s.is_object()) else {
@@ -269,6 +284,8 @@ fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetV
     }
 }
 
+/// The first disk in `Server.DiskSpace`, which is empty until raw file writing
+/// is configured (C getDashboard, serval_http.cpp:388).
 fn disk_space(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let p = ctx.p;
     let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") else {
@@ -985,7 +1002,18 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ],
             )
             .await;
-            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
+            publish_image(
+                ctx,
+                f.frame_number,
+                f.width,
+                f.height,
+                f.pixels,
+                &adlog::err(
+                    adlog::PROCESS_PRV_IMG_DATA_LINE,
+                    "Failed to allocate NDArray or NDArray has no data pointer",
+                ),
+            )
+            .await;
         }
         (StreamKind::Img, Frame::Image(f)) => {
             let p = ctx.p;
@@ -1031,7 +1059,18 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ADDR,
             )
             .await;
-            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
+            publish_image(
+                ctx,
+                f.frame_number,
+                f.width,
+                f.height,
+                f.pixels,
+                &adlog::err(
+                    adlog::PROCESS_IMG_DATA_LINE,
+                    "Failed to allocate NDArray or NDArray has no data pointer",
+                ),
+            )
+            .await;
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             let p = ctx.p;
@@ -1151,6 +1190,7 @@ async fn publish_image(
     width: usize,
     height: usize,
     pixels: Vec<u32>,
+    refused: &str,
 ) {
     if ctx
         .handle
@@ -1161,6 +1201,15 @@ async fn publish_image(
     {
         return;
     }
+    // C prints and drops a refused alloc before it counts
+    // (serval_stream.cpp:177-183, :808-814).
+    let Ok(mut array) = ctx.pool.wrap(
+        vec![NDDimension::new(width), NDDimension::new(height)],
+        NDDataBuffer::U32(pixels),
+    ) else {
+        ctx.trace(TraceMask::ERROR, refused);
+        return;
+    };
     let counter = ctx
         .handle
         .read_int32(ctx.ad.base.array_counter, 0)
@@ -1177,18 +1226,12 @@ async fn publish_image(
         epics_rs::ad_core::attributes::NDAttrValue::Int32(NDColorMode::Mono as i32),
     ));
 
-    let mut array = NDArray::with_data(
-        vec![NDDimension::new(width), NDDimension::new(height)],
-        NDDataBuffer::U32(pixels),
-    );
     array.unique_id = frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
     array.attributes = attributes;
 
-    ArrayPublisher::new(ctx.output.clone())
-        .publish(Arc::new(array))
-        .await;
+    ArrayPublisher::new(ctx.output.clone()).publish(array).await;
 }
 
 #[cfg(test)]
@@ -1262,6 +1305,7 @@ mod tests {
             p,
             ad,
             output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+            pool: DriverPool::standalone(0),
         };
 
         let (_sub, mut rx) = handle.interrupts().register_interrupt_user(
@@ -1320,6 +1364,7 @@ mod tests {
             p,
             ad,
             output: Arc::new(parking_lot::Mutex::new(output)),
+            pool: DriverPool::standalone(0),
         });
         ctx.set_int(ad.base.array_callbacks, 0, 1).await;
 

@@ -10,13 +10,12 @@ use epics_rs::asyn::request::ParamSetValue;
 
 use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::driver::LastArray;
 use crate::params::CSimParams;
 use crate::rng::Rng;
 use crate::signals::compute_arrays;
@@ -31,9 +30,7 @@ pub(crate) struct CSimTaskContext {
     pub handle: PortHandle,
     /// Index 0 publishes the 2-D array; `1..=MAX_SIGNALS` the 1-D signals.
     pub publishers: Vec<ArrayPublisher>,
-    pub queued: Arc<QueuedArrayCounter>,
-    pub pool: Arc<NDArrayPool>,
-    pub last_array: LastArray,
+    pub pool: DriverPool,
     pub nd: NDArrayDriverParams,
     pub sim: CSimParams,
 }
@@ -54,29 +51,12 @@ impl CSimTaskContext {
     async fn notify(&self, addr: i32, updates: Vec<ParamSetValue>) {
         let _ = self.handle.set_params_and_notify(addr, updates).await;
     }
-
-    /// The `ADAcquire` half of `asynNDArrayDriver::setIntegerParam`, for the
-    /// task's own `setIntegerParam(ADAcquire, 0)` (ADCSimDetector.cpp:206).
-    async fn acquire_off_updates(&self) -> Vec<ParamSetValue> {
-        let wait_for_plugins = self
-            .handle
-            .read_int32(self.nd.wait_for_plugins, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        let mut updates = Vec::with_capacity(2);
-        if !wait_for_plugins || self.queued.get() == 0 {
-            updates.push(int32(self.nd.acquire_busy, 0, 0));
-        }
-        updates.push(int32(self.nd.acquire, 0, 0));
-        updates
-    }
 }
 
 /// Slice signal `i` out of the `[MAX_SIGNALS, numTimePoints]` array and reshape
 /// the `[1, numTimePoints]` result to `[numTimePoints]`
 /// (ADCSimDetector.cpp:314-321).
-fn extract_signal(pool: &NDArrayPool, image: &NDArray, i: usize) -> ADResult<NDArray> {
+fn extract_signal(pool: &DriverPool, image: &NDArray, i: usize) -> ADResult<DriverArray> {
     let dims_out = vec![
         NDDimension {
             size: 1,
@@ -142,6 +122,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             NDDimension::new(MAX_SIGNALS),
             NDDimension::new(cfg.num_time_points),
         ];
+        // C releases pArrays[0] just before the alloc (ADCSimDetector.cpp:150-151).
+        ctx.pool.owner().store_array(0, None);
         let Ok(mut image) = ctx.pool.alloc(dims, cfg.data_type) else {
             continue;
         };
@@ -165,8 +147,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // driver cannot use (it hardcodes `max_addr = 1`), so no attributes are
         // attached.
 
-        let image = Arc::new(image);
-        *ctx.last_array.lock() = Some(image.clone());
+        let image = image.share();
+        ctx.pool.owner().store_array(0, Some(image.array().clone()));
 
         // `doCallbacksGenericPointer(pImage, NDArrayData, 0)` — unconditional:
         // ADCSimDetector never tests `NDArrayCallbacks`.
@@ -175,7 +157,7 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // Per-signal 1-D arrays.
         for i in 0..MAX_SIGNALS {
             if let Ok(array) = extract_signal(&ctx.pool, &image, i) {
-                ctx.publishers[i + 1].publish(Arc::new(array)).await;
+                ctx.publishers[i + 1].publish(array).await;
             }
 
             // `callParamCallbacks(i)` — parameter list `i`, not `i+1`.
@@ -185,7 +167,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
                 updates.push(float64(ctx.sim.elapsed_time, 0, elapsed_time));
                 updates.push(int32(ctx.nd.array_counter, 0, array_counter));
                 if result.acquire_finished {
-                    updates.extend(ctx.acquire_off_updates().await);
+                    // ADCSimDetector.cpp:208; the base rule drives ADAcquireBusy.
+                    updates.push(int32(ctx.nd.acquire, 0, 0));
                 }
             }
             ctx.notify(addr, updates).await;
@@ -218,7 +201,7 @@ mod tests {
 
     /// A `[MAX_SIGNALS, n]` array whose element `(i, j)` is `100*i + j`, so a
     /// correct extraction of signal `j` is `[j, 100+j, 200+j, ...]`.
-    fn fixture(pool: &NDArrayPool, n: usize) -> NDArray {
+    fn fixture(pool: &DriverPool, n: usize) -> DriverArray {
         let mut image = pool
             .alloc(
                 vec![NDDimension::new(MAX_SIGNALS), NDDimension::new(n)],
@@ -235,7 +218,7 @@ mod tests {
 
     #[test]
     fn each_signal_is_taken_with_a_stride_of_max_signals() {
-        let pool = NDArrayPool::new(0);
+        let pool = DriverPool::standalone(0);
         let image = fixture(&pool, 5);
         for j in 0..MAX_SIGNALS {
             let array = extract_signal(&pool, &image, j).unwrap();
@@ -250,7 +233,7 @@ mod tests {
 
     #[test]
     fn the_extracted_signal_is_one_dimensional_with_the_time_point_count() {
-        let pool = NDArrayPool::new(0);
+        let pool = DriverPool::standalone(0);
         let image = fixture(&pool, 5);
         let array = extract_signal(&pool, &image, 3).unwrap();
         assert_eq!(array.dims.len(), 1);
@@ -261,14 +244,14 @@ mod tests {
     fn the_extracted_signal_carries_the_parent_unique_id() {
         // `NDArrayPool::convert` does not copy `unique_id`; `extract_signal`
         // restores C's behaviour.
-        let pool = NDArrayPool::new(0);
+        let pool = DriverPool::standalone(0);
         let image = fixture(&pool, 4);
         assert_eq!(extract_signal(&pool, &image, 0).unwrap().unique_id, 42);
     }
 
     #[test]
     fn the_extracted_signal_keeps_the_source_data_type() {
-        let pool = NDArrayPool::new(0);
+        let pool = DriverPool::standalone(0);
         let mut image = fixture(&pool, 3);
         image.data = NDDataBuffer::I16(vec![7; MAX_SIGNALS * 3]);
         let array = extract_signal(&pool, &image, 2).unwrap();

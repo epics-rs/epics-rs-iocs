@@ -1,10 +1,6 @@
-//! The `PortDriver` half of the marCCD port: parameter writes and the
-//! bookkeeping C does inline in `writeInt32` / `writeFloat64` / `writeOctet`.
-//!
-//! marServer I/O is not done here — a `PortDriver` method runs inside the port
-//! actor, whose runtime cannot block on a second port — so each branch either
-//! signals a worker event directly (start/stop) or enqueues a [`Cmd`] for the
-//! `MarccdCmdTask`.
+//! The `PortDriver` half of the marCCD port: `writeInt32` / `writeFloat64`
+//! run their marServer round trips inline, as `marCCD.cpp` does under the
+//! driver lock, through the server helpers in [`crate::server`].
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -20,21 +16,22 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
-use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode, ShutterMode};
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
-use epics_rs::ad_core::runtime as rt;
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use parking_lot::Mutex;
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::params::MarccdParams;
-use crate::server::Server;
-use crate::task::{Cmd, Worker, start_cmd_task, start_det_task, start_image_task};
-use crate::types::{Event, TriggerMode};
+use crate::protocol::{
+    cmd_set_bin, cmd_set_frameshift, cmd_set_gating, cmd_set_readout_mode, cmd_set_stability,
+};
+use crate::task::{Worker, start_det_task, start_image_task};
+use crate::types::{
+    Event, FrameType, TASK_ACQUIRE, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TriggerMode,
+    test_task_status,
+};
 
 /// C `DRIVER_VERSION`.
 const DRIVER_VERSION: &str = "2.3.0";
@@ -42,15 +39,25 @@ const DRIVER_VERSION: &str = "2.3.0";
 pub struct MarccdDriver {
     pub ad: ADDriverBase,
     pub p: MarccdParams,
-    cmd_tx: rt::CommandSender<Cmd>,
-    /// C `stopEventId`. Start signalling is routed through the command task (it
-    /// needs a `getState` round-trip first), so the driver only holds `stop`.
+    /// The marServer octet port (C `pasynUserServer`).
+    pub(crate) server: PortHandle,
+    /// C `serverMode` (1 = marCCD, 2 = high speed).
+    pub(crate) server_mode: i32,
+    /// C `fromServer`.
+    pub(crate) from: String,
+    /// C `startEventId`.
+    start: Arc<Event>,
+    /// C `stopEventId`.
     stop: Arc<Event>,
+    /// C `pData` (marCCD.cpp:1556-1560): allocated once and never read, so it
+    /// stays charged on the pool for the driver's life.
+    _raw_buffer: Option<DriverArray>,
 }
 
 /// The handles the driver shares with its worker threads.
 struct DriverLinks {
-    cmd_tx: rt::CommandSender<Cmd>,
+    server: PortHandle,
+    start: Arc<Event>,
     stop: Arc<Event>,
 }
 
@@ -61,9 +68,48 @@ impl MarccdDriver {
         let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
-        let params = ad.params;
-        let base = &mut ad.port_base;
-        // C constructor defaults (marCCD.cpp:1563-1574).
+        Ok(Self {
+            ad,
+            p,
+            server: links.server,
+            server_mode: 1,
+            from: String::new(),
+            start: links.start,
+            stop: links.stop,
+            _raw_buffer: None,
+        })
+    }
+
+    /// The end of C's constructor (marCCD.cpp:1542-1580): `getServerMode`,
+    /// `getConfig`, `getState`, the `pData` allocation and the defaults.
+    /// `false` where C returns before creating the threads.
+    fn init(&mut self) -> bool {
+        if self.get_server_mode().is_err() {
+            let msg = format!(
+                "marCCD:marCCD: error calling getServerMode for server port {}",
+                self.server.port_name()
+            );
+            self.trace(TraceMask::ERROR, &msg);
+            return false;
+        }
+        self.get_config();
+        self.get_state();
+        let dims = vec![
+            NDDimension::new(self.get_i32(self.ad.params.max_size_x) as usize),
+            NDDimension::new(self.get_i32(self.ad.params.max_size_y) as usize),
+        ];
+        self._raw_buffer = self.ad.pool.alloc(dims, NDDataType::Int16).ok();
+        if self.set_defaults().is_err() {
+            println!("marCCD: unable to set camera parameters");
+            return false;
+        }
+        true
+    }
+
+    /// C constructor defaults (marCCD.cpp:1563-1574).
+    fn set_defaults(&mut self) -> AsynResult<()> {
+        let (params, p) = (self.ad.params, self.p);
+        let base = &mut self.ad.port_base;
         base.set_string_param(params.base.manufacturer, 0, "MAR")?;
         base.set_string_param(params.base.model, 0, "CCD")?;
         base.set_int32_param(params.base.data_type, 0, NDDataType::Int16 as i32)?;
@@ -74,18 +120,7 @@ impl MarccdDriver {
         base.set_int32_param(params.num_images, 0, 1)?;
         base.set_int32_param(p.overlap, 0, 0)?;
         base.set_string_param(params.base.driver_version, 0, DRIVER_VERSION)?;
-        base.set_float64_param(p.tiff_timeout, 0, 20.0)?;
-
-        Ok(Self {
-            ad,
-            p,
-            cmd_tx: links.cmd_tx,
-            stop: links.stop,
-        })
-    }
-
-    fn send(&self, cmd: Cmd) {
-        let _ = self.cmd_tx.try_send(cmd);
+        base.set_float64_param(p.tiff_timeout, 0, 20.0)
     }
 }
 
@@ -121,32 +156,48 @@ impl PortDriver for MarccdDriver {
 
         let mut status = Ok(());
         if function == params.acquire {
-            if value != 0 {
-                // C calls getState here to gate the start; that server round-trip
-                // and the start signalling run on the command task.
-                self.send(Cmd::StartAcquire);
-            } else if acquiring != 0 {
-                // Stop needs no server I/O: signal the acquisition task directly.
+            let state = self.get_state();
+            if value != 0
+                && test_task_status(
+                    state,
+                    TASK_ACQUIRE,
+                    TASK_STATUS_QUEUED | TASK_STATUS_EXECUTING,
+                ) == 0
+            {
+                // Kill any stale stop event, then wake the marCCD task.
+                self.stop.try_wait();
+                self.start.signal();
+            }
+            if value == 0 && acquiring != 0 {
                 // The inline exposure deadline replaces C's epicsTimerCancel.
                 self.stop.signal();
             }
         } else if function == params.bin_x || function == params.bin_y {
-            self.send(Cmd::SetBin);
-        } else if function == p.gate_mode {
-            self.send(Cmd::SetGating(value));
-        } else if function == p.readout_mode {
-            self.send(Cmd::SetReadoutMode(value));
+            // marCCDServer only reports the binning after the next image, so
+            // C does not read it back here.
+            let bin_x = self.get_i32(params.bin_x);
+            let bin_y = self.get_i32(params.bin_y);
+            self.write_server(&cmd_set_bin(bin_x, bin_y));
+        } else if function == p.gate_mode && self.server_mode == 2 {
+            self.write_server(&cmd_set_gating(value));
+            self.get_config();
+        } else if function == p.readout_mode && self.server_mode == 2 {
+            self.write_server(&cmd_set_readout_mode(value));
+            self.get_config();
         } else if function == p.frame_shift {
-            self.send(Cmd::SetFrameShift(value));
+            self.write_server(&cmd_set_frameshift(value));
+            self.get_config();
         } else if function == params.read_status {
             if value != 0 {
-                self.send(Cmd::ReadStatus);
+                self.get_state();
             }
         } else if function == params.base.write_file {
-            self.send(Cmd::WriteFile);
+            // Raw frames are saved uncorrected.
+            let frame_type = self.get_i32(params.frame_type);
+            let corrected_flag = i32::from(frame_type != FrameType::Raw as i32);
+            self.save_file(corrected_flag, true);
         } else if function < p.first() {
-            // Base-class parameter: pool controls plus plain stores.
-            status = self.ad.write_int32_pool(function, value).map(|_| ());
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -174,24 +225,38 @@ impl PortDriver for MarccdDriver {
         let function = user.reason;
         let p = self.p;
 
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(function, user.addr, value)?;
+            .set_float64_param(function, user.addr, value);
 
         if function == p.stability {
-            self.send(Cmd::SetStability(value));
+            self.write_server(&cmd_set_stability(value));
+            self.get_config();
+        } else if function < p.gate_mode {
+            // ADDriver::writeFloat64 is asynPortDriver's (marCCD.cpp:1344).
+            status = self.ad.port_base.write_float64_param(user, value);
         }
-        // Parameters below FIRST_MARCCD_PARAM need no extra work beyond the
-        // `set_float64` above, which is all `ADDriver::writeFloat64` does.
 
         let _ = self.ad.port_base.call_param_callbacks(0);
-        user.print(
-            TraceMask::IO_DRIVER,
-            file!(),
-            line!(),
-            format_args!("marCCD:writeFloat64: function={function}, value={value:.6}"),
-        );
-        Ok(())
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "marCCD:writeFloat64: error, status={} function={function}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("marCCD:writeFloat64: function={function}, value={value:.6}"),
+            ),
+        }
+        status
     }
 
     /// C inherits `ADDriver::writeOctet`.
@@ -208,6 +273,16 @@ impl ADDriver for MarccdDriver {
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
     }
+
+    /// `marCCD::setShutter` (marCCD.cpp:712-750).
+    fn set_shutter(&mut self, open: bool) {
+        let mode = self.get_i32(self.ad.params.shutter_mode);
+        if ShutterMode::from_i32(mode) == Some(ShutterMode::DetectorOnly) {
+            self.set_detector_shutter(open);
+            return;
+        }
+        self.ad.set_shutter(open);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,9 +293,8 @@ pub struct MarccdRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub marccd_params: MarccdParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Worker threads; kept alive for the IOC's lifetime.
     pub tasks: Vec<std::thread::JoinHandle<()>>,
 }
@@ -230,7 +304,7 @@ impl MarccdRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -238,8 +312,7 @@ impl MarccdRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -247,10 +320,7 @@ impl MarccdRuntime {
 /// C `marCCDConfig`.
 ///
 /// `server_port` must already exist (`drvAsynIPPortConfigure`), because C
-/// connects to it with `pasynOctetSyncIO->connect` in the constructor. Unlike
-/// the C constructor, `getServerMode` / `getConfig` / `getState` run
-/// asynchronously on the command task (a `PortDriver` cannot block on the
-/// server port from inside its own actor), enqueued as [`Cmd::Init`].
+/// connects to it with `pasynOctetSyncIO->connect` in the constructor.
 pub fn create_marccd_detector(
     claim: &PortClaim,
     server_port: &str,
@@ -260,9 +330,7 @@ pub fn create_marccd_detector(
     let server_entry = get_port(server_port).ok_or_else(|| {
         format!("marServer port '{server_port}' not found (call drvAsynIPPortConfigure first)")
     })?;
-    let server_handle = server_entry.handle.clone();
 
-    let (cmd_tx, cmd_rx) = rt::command_channel::<Cmd>(64);
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
 
@@ -270,7 +338,8 @@ pub fn create_marccd_detector(
         port_name,
         max_memory,
         DriverLinks {
-            cmd_tx: cmd_tx.clone(),
+            server: server_entry.handle.clone(),
+            start: start.clone(),
             stop: stop.clone(),
         },
     )
@@ -279,63 +348,36 @@ pub fn create_marccd_detector(
     let ad_params = driver.ad.params;
     let marccd_params = driver.p;
     let pool = driver.ad.pool.clone();
+    let owner = driver.ad.owner.clone();
 
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the marCCD port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
-    // The three worker contexts share one `Server` behind a `tokio::sync::Mutex`
-    // — C's driver-lock analog serialising all marServer I/O.
-    let server = Arc::new(AsyncMutex::new(Server::new(
-        handle,
-        server_handle,
-        ad_params,
-        marccd_params,
-    )));
     let acq_start = Arc::new(AtomicU64::new(0));
     // `image_event` (C `imageEventId`) is signalled by the det task in overlap
-    // mode and awaited by the image task; the other events/state are shared by
-    // all three workers.
+    // mode and awaited by the image task.
     let image_ev = Arc::new(Event::new());
-
-    let det_worker = Worker {
-        server: server.clone(),
+    let worker = || Worker {
+        port: handle.clone(),
         start: start.clone(),
         stop: stop.clone(),
         image_event: image_ev.clone(),
         acq_start: acq_start.clone(),
         output: ArrayPublisher::new(array_output.clone()),
-    };
-    let image_worker = Worker {
-        server: server.clone(),
-        start: start.clone(),
-        stop: stop.clone(),
-        image_event: image_ev.clone(),
-        acq_start: acq_start.clone(),
-        output: ArrayPublisher::new(array_output.clone()),
-    };
-    let cmd_worker = Worker {
-        server,
-        start,
-        stop,
-        image_event: image_ev,
-        acq_start,
-        output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
+        owner: owner.clone(),
     };
 
-    let tasks = vec![
-        start_cmd_task(cmd_worker, cmd_rx),
-        start_det_task(det_worker),
-        start_image_task(image_worker),
-    ];
-
-    // C runs getServerMode -> getConfig -> getState at the end of the
-    // constructor; do the same on the command task now the workers are up.
-    if cmd_tx.try_send(Cmd::Init).is_err() {
-        return Err("marccd: command task did not start".to_string());
-    }
+    let started = handle
+        .with_driver_blocking::<MarccdDriver, _>(MarccdDriver::init)
+        .map_err(|e| format!("marCCD init failed: {e}"))?;
+    let tasks = if started {
+        vec![start_det_task(worker()), start_image_task(worker())]
+    } else {
+        Vec::new()
+    };
 
     Ok(MarccdRuntime {
         runtime_handle,
@@ -343,7 +385,300 @@ pub fn create_marccd_detector(
         marccd_params,
         pool,
         array_output,
-        queued_counter,
         tasks,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::error::AsynError;
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    /// A marServer that answers each command with `reply(command)` and logs
+    /// what it was sent.
+    pub(crate) fn fake_server(
+        name: &str,
+        reply: fn(&str) -> &'static str,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let seen = log.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let command = String::from_utf8_lossy(&buf[..n]).into_owned();
+                // Only a `get_*` waits for a reply, so it ends its chunk.
+                let last = command
+                    .rfind("get_")
+                    .map_or(&command[..], |i| &command[i..]);
+                let answer = reply(last);
+                seen.lock().push(command);
+                if !answer.is_empty() && stream.write_all(answer.as_bytes()).is_err() {
+                    break;
+                }
+            }
+        });
+        let ip = format!("{name}_IP");
+        let claim = claim_port(&ip).unwrap();
+        let (runtime, _) = create_port_runtime(
+            &claim,
+            DrvAsynIPPort::new(&ip, &addr).unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
+        std::mem::forget(runtime);
+        log
+    }
+
+    /// A driver on a silent fake server, outside any port runtime.
+    fn driver(name: &str) -> MarccdDriver {
+        fake_server(name, |_| "");
+        let server = get_port(&format!("{name}_IP")).unwrap().handle.clone();
+        let links = DriverLinks {
+            server,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+        };
+        MarccdDriver::new(name, 0, links).unwrap()
+    }
+
+    /// Build the detector on `name`'s fake server, then send it a `set_bin`.
+    fn after_init(name: &str, reply: fn(&str) -> &'static str) -> (MarccdRuntime, Vec<String>) {
+        let log = fake_server(name, reply);
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        det.port_handle()
+            .write_int32_blocking(det.ad_params.bin_x, 0, 1)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !log.lock().iter().any(|c| c.starts_with("set_bin")) {
+            assert!(Instant::now() < deadline, "set_bin never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sent = log.lock().clone();
+        (det, sent)
+    }
+
+    /// How many times `command` reached the server.
+    pub(crate) fn sent_count(log: &Mutex<Vec<String>>, command: &str) -> usize {
+        log.lock().iter().map(|c| c.matches(command).count()).sum()
+    }
+
+    /// marCCD.cpp:1250-1357 talks to marServer inside writeInt32 /
+    /// writeFloat64, and ADDriver.cpp:96-98 reaches setShutter from there
+    /// (:723-743): every round trip is done when the write returns.
+    #[test]
+    fn server_round_trips_finish_inside_the_write() {
+        let name = "MARCCD_INLINE";
+        let log = fake_server(name, |c| {
+            let reply = if c.starts_with("get_mode") {
+                "2"
+            } else if c.starts_with("get_size") {
+                "64,32"
+            } else if c.starts_with("get_bin") {
+                "1,1"
+            } else if c.starts_with("get_stability") {
+                "2.5"
+            } else if c.starts_with("get_") {
+                "0"
+            } else {
+                return "";
+            };
+            // Longer than a queued worker could beat the next check by.
+            std::thread::sleep(Duration::from_millis(100));
+            reply
+        });
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad, p) = (det.port_handle(), det.ad_params, det.marccd_params);
+
+        h.write_int32_blocking(ad.bin_x, 0, 2).unwrap();
+        let to_server = h.get_string_param_blocking(ad.string_to_server, 0, 256);
+        assert_eq!(to_server.unwrap(), b"set_bin,2,1");
+
+        let states = sent_count(&log, "get_state");
+        h.write_int32_blocking(ad.read_status, 0, 1).unwrap();
+        assert_eq!(sent_count(&log, "get_state"), states + 1, "ADReadStatus");
+        h.write_int32_blocking(ad.acquire, 0, 0).unwrap();
+        assert_eq!(sent_count(&log, "get_state"), states + 2, "ADAcquire");
+
+        for (reason, value, command) in [
+            (p.gate_mode, 1, "set_gating,1"),
+            (p.readout_mode, 2, "set_readout_mode,2"),
+            (p.frame_shift, 3, "set_frameshift,3"),
+        ] {
+            let configs = sent_count(&log, "get_stability");
+            h.write_int32_blocking(reason, 0, value).unwrap();
+            assert_eq!(sent_count(&log, command), 1, "{command}");
+            assert_eq!(sent_count(&log, "get_stability"), configs + 1, "{command}");
+        }
+        h.write_float64_blocking(p.stability, 0, 1.0).unwrap();
+        assert_eq!(sent_count(&log, "set_stability,1.000000"), 1);
+        assert_eq!(h.read_float64_blocking(p.stability, 0).unwrap(), 2.5);
+
+        h.write_int32_blocking(ad.base.write_file, 0, 1).unwrap();
+        assert_eq!(sent_count(&log, "writefile,"), 1);
+
+        h.write_float64_blocking(ad.shutter_open_delay, 0, 0.2)
+            .unwrap();
+        h.write_int32_blocking(ad.shutter_mode, 0, ShutterMode::DetectorOnly as i32)
+            .unwrap();
+        h.write_int32_blocking(ad.shutter_control, 0, 1).unwrap();
+        assert_eq!(h.read_int32_blocking(ad.shutter_status, 0).unwrap(), 1);
+        assert_eq!(sent_count(&log, "shutter,1"), 1);
+        std::mem::forget(det);
+    }
+
+    /// A non-detector mode is ADDriver::setShutter inside the write
+    /// (ADDriver.cpp:43-47), with no worker to reach.
+    #[test]
+    fn an_epics_shutter_is_set_inside_the_write() {
+        let mut d = driver("MARCCD_EPICS_SHUTTER");
+        let ad = d.ad.params;
+        d.ad.port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        d.ad_write_int32(&AsynUser::new(ad.shutter_control).with_addr(0), 1)
+            .unwrap();
+        assert_eq!(
+            d.ad.port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_failed_get_server_mode_ends_the_init() {
+        let (_det, sent) = after_init("MARCCD_BAD_MODE", |_| "7");
+        assert_eq!(sent[0], "get_mode");
+        assert!(sent[1].starts_with("set_bin"), "{sent:?}");
+    }
+
+    /// marCCD.cpp:1543-1549 returns from the constructor at a failed
+    /// getServerMode, before the defaults (:1563-1574) and the threads.
+    #[test]
+    fn a_failed_get_server_mode_skips_the_defaults_and_the_tasks() {
+        let (det, _) = after_init("MARCCD_BAD_MODE_DEFAULTS", |_| "7");
+        let h = det.port_handle();
+        let manufacturer = h.get_string_param_blocking(det.ad_params.base.manufacturer, 0, 256);
+        assert!(
+            matches!(manufacturer, Err(AsynError::ParamUndefined(_))),
+            "{manufacturer:?}"
+        );
+        assert!(det.tasks.is_empty());
+    }
+
+    #[test]
+    fn the_raw_buffer_is_charged_after_get_config() {
+        let (det, _) = after_init("MARCCD_RAW", |c| {
+            if c.starts_with("get_mode") {
+                "1"
+            } else if c.starts_with("get_size") {
+                "64,32"
+            } else if c.starts_with("get_bin") {
+                "2,2"
+            } else if c.starts_with("get_") {
+                "0"
+            } else {
+                ""
+            }
+        });
+        assert_eq!(det.pool().num_alloc_buffers(), 1);
+        assert_eq!(det.pool().allocated_bytes(), 128 * 64 * 2);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (marCCD.cpp:1344), whose
+    /// IO_DRIVER line precedes marCCD's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MARCCD_BASE_F64";
+        let mut d = driver(port);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("marccd-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let gain = d.ad.params.gain;
+        let mut user = AsynUser::new(gain).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        d.write_float64(&mut user, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base =
+            format!("asynPortDriver:writeFloat64: function={gain}, name=GAIN, value=2.000000");
+        let own = format!("marCCD:writeFloat64: function={gain}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+    }
+
+    /// reviewer5: C's marCCDTask holds the driver lock across acquireFrame's
+    /// "wait for acquisition to actually start" poll (marCCD.cpp:776-781,
+    /// epicsThreadSleep under lock), so a client's BinX write cannot reach
+    /// marServer until the task unlocks.
+    #[test]
+    fn r5_a_client_write_waits_out_the_acquire_poll() {
+        let name = "MARCCD_R5_LOCK";
+        // marState 0 forever: the exposure never reports started.
+        let log = fake_server(name, |c| {
+            if c.starts_with("get_mode") {
+                "1"
+            } else if c.starts_with("get_size") {
+                "64,32"
+            } else if c.starts_with("get_bin") {
+                "1,1"
+            } else if c.starts_with("get_") {
+                "0"
+            } else {
+                ""
+            }
+        });
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad) = (det.port_handle().clone(), det.ad_params);
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sent_count(&log, "start") == 0 {
+            assert!(Instant::now() < deadline, "start never sent");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let writer = h.clone();
+        std::thread::spawn(move || {
+            let _ = writer.write_int32_blocking(ad.bin_x, 0, 2);
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(
+            sent_count(&log, "set_bin"),
+            0,
+            "set_bin reached marServer mid-poll"
+        );
+        std::mem::forget(det);
+    }
 }

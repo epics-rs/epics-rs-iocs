@@ -22,11 +22,9 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::connection::BisServer;
@@ -158,10 +156,9 @@ impl BrukerDetector {
     /// The acquisition task asks for this through `BIS_START_SCAN`, so the
     /// command socket has exactly one user and the parameters the command is
     /// built from are read where they are owned.
-    fn start_scan(&mut self) -> AsynResult<()> {
-        // C ignores createFileName's status and every read here
-        // (BISDetector.cpp:496-505): a failed name leaves the last one in
-        // NDFullFileName.
+    fn start_scan(&mut self) {
+        // C ignores every status here (BISDetector.cpp:496-530): a failed
+        // name leaves the last one in NDFullFileName.
         let _ = self.create_file_name();
 
         let p = self.ad.params;
@@ -181,50 +178,14 @@ impl BrukerDetector {
         )
         .into_owned();
 
-        self.ad
+        let _ = self
+            .ad
             .port_base
-            .set_string_param(p.status_message, 0, "Starting exposure")?;
-        self.ad.port_base.call_param_callbacks(0)?;
+            .set_string_param(p.status_message, 0, "Starting exposure");
+        let _ = self.ad.port_base.call_param_callbacks(0);
 
         let command = protocol::acquire(frame_type, &file_name, acquire_time, num_darks);
         self.command(&command, BIS_COMMAND_TIMEOUT);
-        Ok(())
-    }
-
-    /// BIS drives the shutter itself when the shutter is wired to the detector
-    /// (C `BISDetector::setShutter`, void like `ADDriver::setShutter`).
-    fn set_shutter(&mut self, open: bool) {
-        let p = self.ad.params;
-        if ShutterMode::from_i32(self.get_i32(p.shutter_mode)) != Some(ShutterMode::DetectorOnly) {
-            self.ad.set_shutter(open);
-            return;
-        }
-
-        let open_delay = self
-            .ad
-            .port_base
-            .get_float64_param(p.shutter_open_delay, 0)
-            .unwrap_or(0.0);
-        let close_delay = self
-            .ad
-            .port_base
-            .get_float64_param(p.shutter_close_delay, 0)
-            .unwrap_or(0.0);
-        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT);
-
-        // Opening: wait out the difference between the opening and the closing
-        // time so the exposure is the length that was asked for, and never less
-        // than a millisecond so two commands do not go out back to back.
-        // Closing: wait out the closing time.
-        let delay = if open {
-            (open_delay - close_delay).max(0.001)
-        } else {
-            close_delay
-        };
-        if delay > 0.0 {
-            std::thread::sleep(std::time::Duration::from_secs_f64(delay));
-        }
-        let _ = self.ad.port_base.call_param_callbacks(0);
     }
 }
 
@@ -277,17 +238,17 @@ impl PortDriver for BrukerDetector {
                     message: format!("binning {value} is not 1, 2, 4 or 8"),
                 });
             }
-        } else if reason == p.shutter_control {
-            self.set_shutter(value != 0);
         } else if reason == q.start_scan {
-            self.start_scan()?;
+            self.start_scan();
         } else if reason == q.epics_shutter {
             // C called `ADDriver::setShutter` from the acquisition task, going
             // past its own override on purpose: in EPICS shutter mode the
-            // shutter is not BIS's to drive.
+            // shutter is not BIS's to drive. It is void there
+            // (BISDetector.cpp:541, :561).
             self.ad.set_shutter(value != 0);
-        } else {
-            status = self.ad.write_int32_pool(reason, value).map(|_| ());
+        } else if reason < q.sfrm_timeout {
+            // FIRST_BIS_PARAM is BISSFRMTimeout (BISDetector.cpp:84).
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -325,6 +286,42 @@ impl ADDriver for BrukerDetector {
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
     }
+
+    /// BIS drives the shutter itself when the shutter is wired to the detector
+    /// (C `BISDetector::setShutter`, void like `ADDriver::setShutter`).
+    fn set_shutter(&mut self, open: bool) {
+        let p = self.ad.params;
+        if ShutterMode::from_i32(self.get_i32(p.shutter_mode)) != Some(ShutterMode::DetectorOnly) {
+            self.ad.set_shutter(open);
+            return;
+        }
+
+        let open_delay = self
+            .ad
+            .port_base
+            .get_float64_param(p.shutter_open_delay, 0)
+            .unwrap_or(0.0);
+        let close_delay = self
+            .ad
+            .port_base
+            .get_float64_param(p.shutter_close_delay, 0)
+            .unwrap_or(0.0);
+        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT);
+
+        // Opening: wait out the difference between the opening and the closing
+        // time so the exposure is the length that was asked for, and never less
+        // than a millisecond so two commands do not go out back to back.
+        // Closing: wait out the closing time.
+        let delay = if open {
+            (open_delay - close_delay).max(0.001)
+        } else {
+            close_delay
+        };
+        if delay > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+    }
 }
 
 /// What the IOC layer holds on to.
@@ -332,9 +329,8 @@ pub struct BrukerRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub params: BrukerParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -344,7 +340,7 @@ impl BrukerRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -352,8 +348,7 @@ impl BrukerRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -387,16 +382,14 @@ pub fn create_bruker_detector(
     let ad_params = det.ad.params;
     let params = det.params;
     let pool = det.ad.pool.clone();
-
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let threads = vec![
         task::start_acquisition_task(AcquisitionContext {
             handle: runtime_handle.port_handle().clone(),
             output: ArrayPublisher::new(array_output.clone()),
-            queued: queued_counter.clone(),
+            pool: pool.clone(),
             ad_params,
             params,
             shared: shared.clone(),
@@ -418,7 +411,6 @@ pub fn create_bruker_detector(
         params,
         pool,
         array_output,
-        queued_counter,
         threads,
     })
 }

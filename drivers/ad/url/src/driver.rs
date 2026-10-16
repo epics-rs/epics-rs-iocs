@@ -11,11 +11,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::params::URLParams;
@@ -107,13 +105,7 @@ impl PortDriver for URLDriver {
             }
             Ok(())
         } else if reason < self.url_params.url_name {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0);
-                Ok(())
-            } else {
-                self.ad.write_int32_pool(reason, value).map(|_| ())
-            }
+            ADDriver::ad_write_int32(self, user, value)
         } else {
             Ok(())
         };
@@ -154,9 +146,8 @@ pub struct URLRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub url_params: URLParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)] // kept alive for the acquisition task's lifetime
     task_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -166,7 +157,7 @@ impl URLRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -174,8 +165,7 @@ impl URLRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -198,13 +188,12 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
     let pool = det.ad.pool.clone();
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task_handle = start_acquisition_task(AcquisitionContext {
         acq_rx,
         handle: runtime_handle.port_handle().clone(),
         publisher: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
+        pool: pool.clone(),
         ad: ad_params,
         url: url_params,
     });
@@ -215,7 +204,6 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
         url_params,
         pool,
         array_output,
-        queued_counter,
         task_handle: Some(task_handle),
     })
 }
@@ -296,6 +284,126 @@ mod tests {
         h.write_int32_blocking(ad.acquire, 0, 0).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(next, 101);
+        std::mem::forget(rt);
+    }
+
+    #[test]
+    fn wait_for_plugins_holds_acquire_busy_until_the_frame_is_released() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("url-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("frame.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&png)
+            .unwrap();
+
+        let rt = create_url_detector(&claim_port("URL_BUSY").unwrap(), 1 << 20).unwrap();
+        let (tx, mut rx) = ndarray_channel("URL_BUSY_SINK", 8);
+        rt.connect_downstream(tx);
+        let (h, ad) = (rt.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    rt.url_params.url_name,
+                    0,
+                    ParamValue::Octet(format!("file://{}", png.display()).into_bytes().into()),
+                ),
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(ad.base.wait_for_plugins, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Single as i32),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let read = |reason| h.read_int32_blocking(reason, 0).unwrap();
+        let wait_for = |reason, value| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while read(reason) != value {
+                assert!(
+                    Instant::now() < deadline,
+                    "param {reason} never became {value}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_for(ad.acquire, 0);
+        // Idle is the task's last store of the acquisition.
+        wait_for(ad.status, ADStatus::Idle as i32);
+        assert_eq!(read(ad.acquire_busy), 1, "busy cleared with a frame queued");
+        drop(rx.blocking_recv().expect("frame"));
+        wait_for(ad.acquire_busy, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::mem::forget(rt);
+    }
+
+    /// C keeps the last image in pArrays[0] until the next alloc
+    /// (URLDriver.cpp:132-134), published or not.
+    #[test]
+    fn the_last_image_stays_charged_after_the_acquisition() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("url-last-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("frame.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&png)
+            .unwrap();
+
+        let rt = create_url_detector(&claim_port("URL_LAST").unwrap(), 1 << 20).unwrap();
+        let (h, ad) = (rt.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    rt.url_params.url_name,
+                    0,
+                    ParamValue::Octet(format!("file://{}", png.display()).into_bytes().into()),
+                ),
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(0)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Single as i32),
+                ),
+            ],
+        )
+        .unwrap();
+
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() != 1
+            || h.read_int32_blocking(ad.status, 0).unwrap() != ADStatus::Idle as i32
+        {
+            assert!(Instant::now() < deadline, "no image");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let pool = rt.pool();
+        assert_eq!(pool.num_alloc_buffers() - pool.num_free_buffers(), 1);
+
+        // pArrays[0] is preAllocateBuffers' template (asynNDArrayDriver.cpp:717-726).
+        let p = &ad.base;
+        h.write_int32_blocking(p.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        let free = pool.num_free_buffers();
+        h.write_int32_blocking(p.pool_pre_alloc, 0, 1).unwrap();
+        assert_eq!(pool.num_free_buffers(), free + 2);
         std::mem::forget(rt);
     }
 }

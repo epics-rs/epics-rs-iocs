@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use epics_rs::ad_core::driver::ADDriverBase;
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -866,6 +866,16 @@ impl TimePix3Driver {
     }
 }
 
+impl ADDriver for TimePix3Driver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
+    }
+}
+
 impl PortDriver for TimePix3Driver {
     fn base(&self) -> &PortDriverBase {
         &self.ad.port_base
@@ -1018,6 +1028,10 @@ impl PortDriver for TimePix3Driver {
                     status: AsynStatus::Error,
                     message: "timepix3: the connection task is not running".into(),
                 })
+        } else if reason < p.http_code {
+            // ADTIMEPIX_FIRST_PARAM is ADTimePixHttpCode (ADTimePix.h:467,
+            // ADTimePix.cpp:860-863).
+            ADDriver::ad_write_int32(self, user, value)
         } else {
             Ok(())
         };
@@ -1186,13 +1200,83 @@ impl PortDriver for TimePix3Driver {
             }
             return Ok(buf.len());
         }
+        // C answers every other reason with nElements, zero-filled past the
+        // data, including before the first value (mask_io.cpp:23-74, :205).
         let data = self
             .ad
             .port_base
             .params
-            .get_int32_array(reason, user.addr)?;
+            .get_int32_array(reason, user.addr)
+            .unwrap_or_default();
         let n = buf.len().min(data.len());
         buf[..n].copy_from_slice(&data[..n]);
-        Ok(n)
+        buf[n..].fill(0);
+        Ok(buf.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+
+    /// An image frame read before the first frame, and a pixel-config diff
+    /// shorter than the waveform, both come back as nElements zero-filled
+    /// (mask_io.cpp:23-74).
+    #[test]
+    fn an_int32_array_read_fills_the_waveform() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_READ_ARRAY",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let mut buf = [7; 4];
+        let n = det
+            .read_int32_array(&AsynUser::new(p.img_image_frame), &mut buf)
+            .unwrap();
+        assert_eq!((n, buf), (4, [0; 4]));
+        det.ad
+            .port_base
+            .params
+            .set_int32_array(p.pixel_config_diff, 0, vec![5, 6])
+            .unwrap();
+        let mut buf = [7; 4];
+        let n = det
+            .read_int32_array(&AsynUser::new(p.pixel_config_diff), &mut buf)
+            .unwrap();
+        assert_eq!((n, buf), (4, [5, 6, 0, 0]));
+    }
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_BASE_WRITE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(p.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
     }
 }

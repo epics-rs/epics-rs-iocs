@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::param::ParamValue;
@@ -8,9 +7,9 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
-use epics_rs::ad_core::ndarray::NDArray;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -27,22 +26,20 @@ pub(crate) struct AcquisitionContext {
     pub acq_rx: rt::CommandReceiver<AcqCommand>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
     pub ad: ADBaseParams,
     pub url: URLParams,
 }
 
 impl AcquisitionContext {
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.queued.wait_until_zero(Duration::from_secs(5));
-        }
+    /// ADAcquireBusy follows the ADAcquire store (asynNDArrayDriver.cpp:636-663),
+    /// WaitForPlugins included.
+    async fn end_acquisition(&self) {
         let _ = self
             .handle
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::new(self.ad.acquire_busy, 0, ParamValue::Int32(0)),
                     ParamSetValue::new(self.ad.status, 0, ParamValue::Int32(ADStatus::Idle as i32)),
                     ParamSetValue::new(self.ad.acquire, 0, ParamValue::Int32(0)),
                 ],
@@ -109,14 +106,10 @@ async fn acquire_one_image(
 ) -> Result<(), ()> {
     let url_bytes = ctx
         .handle
-        .read_octet(ctx.url.url_name, 0, MAX_FILENAME_LEN)
+        .get_string_param(ctx.url.url_name, 0, MAX_FILENAME_LEN)
         .await
         .unwrap_or_default();
-    let end = url_bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(url_bytes.len());
-    let url_string = String::from_utf8_lossy(&url_bytes[..end]).into_owned();
+    let url_string = String::from_utf8_lossy(&url_bytes).into_owned();
 
     // readImage's own lines (URLDriver.cpp:105,126,152); an empty URL returns
     // asynError without one.
@@ -175,7 +168,13 @@ async fn acquire_one_image(
     ));
 
     let end_ts = EpicsTimestamp::now();
-    let mut array = NDArray::with_data(decoded.dims, decoded.data);
+    // C releases pArrays[0] just before the alloc (URLDriver.cpp:132-133).
+    ctx.pool.owner().store_array(0, None);
+    // C dereferences a refused alloc unchecked (URLDriver.cpp:133); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.wrap(decoded.dims, decoded.data) else {
+        return Ok(());
+    };
     array.unique_id = image_counter;
     array.timestamp = end_ts;
     array.time_stamp = start_time.as_f64();
@@ -215,9 +214,11 @@ async fn acquire_one_image(
         )
         .await;
 
+    let array = array.share();
     if array_callbacks {
-        ctx.publisher.publish(Arc::new(array)).await;
+        ctx.publisher.publish(array.clone()).await;
     }
+    ctx.pool.owner().store_array(0, Some(array.array().clone()));
 
     Ok(())
 }
@@ -247,10 +248,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .handle
             .set_params_and_notify(
                 0,
-                vec![
-                    ParamSetValue::new(ctx.ad.num_images_counter, 0, ParamValue::Int32(0)),
-                    ParamSetValue::new(ctx.ad.acquire_busy, 0, ParamValue::Int32(1)),
-                ],
+                vec![ParamSetValue::new(
+                    ctx.ad.num_images_counter,
+                    0,
+                    ParamValue::Int32(0),
+                )],
             )
             .await;
 
@@ -361,12 +363,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
         }
 
-        let wait_for_plugins = ctx
-            .handle
-            .read_int32(ctx.ad.base.wait_for_plugins, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        ctx.end_acquisition(wait_for_plugins).await;
+        ctx.end_acquisition().await;
     }
 }

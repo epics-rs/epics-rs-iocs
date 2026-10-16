@@ -75,7 +75,7 @@ mod tests {
 
     fn fixture() -> (PortDriverBase, ADDriverParams, NdsaParams) {
         let mut base = PortDriverBase::new("NDSATEST", 1, PortFlags::default());
-        let ad = ADDriverParams::create(&mut base).unwrap();
+        let (ad, _) = ADDriverParams::create(&mut base).unwrap();
         let ndsa = NdsaParams::create(&mut base).unwrap();
         (base, ad, ndsa)
     }

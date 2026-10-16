@@ -15,7 +15,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::error::ADResult;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PersistentArray, PublishedArray};
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
@@ -79,8 +81,8 @@ pub struct Shared {
     pub demanded_energy: f64,
     /// C `badPixelMap` truncated to `numBadPixels`.
     pub bad_pixels: Vec<BadPixel>,
-    /// C `pFlatField->pData`.
-    pub flat_field: Vec<i32>,
+    /// C `pFlatField`, `None` when the pool refused it at construction.
+    pub flat_field: Option<PersistentArray>,
     /// C `averageFlatField`.
     pub average_flat_field: f64,
 }
@@ -90,6 +92,7 @@ pub(crate) struct Worker {
     pub ctx: Ctx,
     pub shared: Arc<Mutex<Shared>>,
     pub output: ArrayPublisher,
+    pub pool: DriverPool,
 }
 
 // ---------------------------------------------------------------------------
@@ -404,10 +407,21 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
         return;
     }
 
-    let (nx, ny) = max_size(&mut w.ctx).await;
-    let bad_pixels = w.shared.lock().bad_pixels.clone();
+    // readTiff checks the file against pFlatField's own dims (:678, :685).
+    let (dims, bad_pixels) = {
+        let s = w.shared.lock();
+        let dims = s
+            .flat_field
+            .as_ref()
+            .map(|f| (f.dims[0].size, f.dims[1].size));
+        (dims, s.bad_pixels.clone())
+    };
+    let Some((nx, ny)) = dims else {
+        w.ctx.callbacks().await;
+        return;
+    };
     let read = read_image_file(&mut w.ctx, file, None, 0.0, nx, ny, &bad_pixels).await;
-    let (mut data, _desc) = match read {
+    let (mut data, description) = match read {
         Ok(v) => v,
         Err(_) => {
             w.ctx.trace(
@@ -430,18 +444,35 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
         return;
     };
     apply_flat_field_floor(&mut data, min_flat_field, average);
-    {
-        let mut s = w.shared.lock();
-        s.flat_field = data.clone();
-        s.average_flat_field = average;
-    }
-
-    // C `doCallbacksGenericPointer(pFlatField, NDArrayData, 0)`.
-    let array = build_array(0, nx, ny, data, None);
-    w.output.publish(Arc::new(array)).await;
+    let Some(array) = refill_flat_field(&mut w.shared.lock(), &data, description, average) else {
+        w.ctx.callbacks().await;
+        return;
+    };
+    w.output.publish(array).await;
 
     w.ctx.set_i32(valid, 1);
     w.ctx.callbacks().await;
+}
+
+/// C reads into `pFlatField` and publishes it (pilatusDetector.cpp:290,
+/// :316). `None` with no flat-field array, which leaves FlatFieldValid 0.
+fn refill_flat_field(
+    s: &mut Shared,
+    data: &[i32],
+    description: Option<String>,
+    average: f64,
+) -> Option<PublishedArray> {
+    let flat = s.flat_field.as_mut()?;
+    let array = flat.refill();
+    let NDDataBuffer::I32(pixels) = &mut array.data else {
+        unreachable!("allocated as NDInt32")
+    };
+    pixels.copy_from_slice(data);
+    if let Some(d) = description {
+        array.attributes.add(tiff_description(d));
+    }
+    s.average_flat_field = average;
+    Some(flat.published())
 }
 
 // ---------------------------------------------------------------------------
@@ -663,29 +694,36 @@ async fn read_image_file(
 }
 
 fn build_array(
+    pool: &DriverPool,
     unique_id: i32,
     nx: usize,
     ny: usize,
     data: Vec<i32>,
     description: Option<String>,
-) -> NDArray {
+) -> ADResult<DriverArray> {
     let ts = EpicsTimestamp::now();
     let buffer = NDDataBuffer::I32(data);
     let mut attributes = NDAttributeList::new();
     if let Some(d) = description {
-        attributes.add(NDAttribute::new_static(
-            "TIFFImageDescription",
-            "TIFFImageDescription",
-            NDAttrSource::Driver,
-            NDAttrValue::String(d),
-        ));
+        attributes.add(tiff_description(d));
     }
-    let mut array = NDArray::with_data(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer);
+    let mut array = pool.wrap(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer)?;
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
-    array
+    Ok(array)
+}
+
+/// C `pImage->pAttributeList->add("TIFFImageDescription", ...)`
+/// (pilatusDetector.cpp:722).
+fn tiff_description(description: String) -> NDAttribute {
+    NDAttribute::new_static(
+        "TIFFImageDescription",
+        "TIFFImageDescription",
+        NDAttrSource::Driver,
+        NDAttrValue::String(description),
+    )
 }
 
 async fn max_size(ctx: &mut Ctx) -> (usize, usize) {
@@ -896,11 +934,16 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                 let flat_field_valid = w.ctx.get_i32(w.ctx.p.flat_field_valid).await.unwrap_or(0);
                 if flat_field_valid != 0 {
                     let s = w.shared.lock();
-                    apply_flat_field(&mut data, &s.flat_field, s.average_flat_field);
+                    if let Some(NDDataBuffer::I32(flat)) = s.flat_field.as_ref().map(|f| &f.data) {
+                        apply_flat_field(&mut data, flat, s.average_flat_field);
+                    }
                 }
 
-                let array = build_array(image_counter, nx, ny, data, description);
-                w.output.publish(Arc::new(array)).await;
+                // C dereferences a refused alloc (pilatusDetector.cpp:1190);
+                // the frame is dropped after the pool's reached-limit line.
+                if let Ok(array) = build_array(&w.pool, image_counter, nx, ny, data, description) {
+                    w.output.publish(array).await;
+                }
             }
 
             if num_images == 1 {
@@ -957,7 +1000,6 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
 
         w.ctx.set_shutter(false).await;
         w.ctx.set_i32(w.ctx.ad.acquire, 0);
-        w.ctx.set_i32(w.ctx.ad.acquire_busy, 0);
         w.ctx.set_i32(w.ctx.p.armed, 0);
         w.ctx.callbacks().await;
     }
@@ -982,9 +1024,132 @@ mod tests {
         assert_eq!(epoch_secs(t), 1);
     }
 
+    fn flat_field_pool(max_memory: usize) -> (DriverPool, Shared) {
+        let pool = DriverPool::standalone(max_memory);
+        let flat = pool
+            .alloc(
+                vec![NDDimension::new(2), NDDimension::new(1)],
+                epics_rs::ad_core::ndarray::NDDataType::Int32,
+            )
+            .unwrap();
+        let s = Shared {
+            flat_field: Some(PersistentArray::new(flat)),
+            ..Shared::default()
+        };
+        (pool, s)
+    }
+
+    /// C publishes the one `pFlatField` it allocated (pilatusDetector.cpp:316,
+    /// :1728), so a second read charges no second buffer.
+    #[test]
+    fn a_flat_field_read_publishes_the_array_allocated_at_construction() {
+        let (pool, mut s) = flat_field_pool(8);
+        let first = refill_flat_field(&mut s, &[5, 6], Some("d".into()), 5.5).unwrap();
+        assert!(matches!(&first.data, NDDataBuffer::I32(v) if v == &[5, 6]));
+        drop(first);
+        let second = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
+        assert!(matches!(&second.data, NDDataBuffer::I32(v) if v == &[7, 8]));
+        assert!(second.attributes.get("TIFFImageDescription").is_some());
+        assert_eq!(s.average_flat_field, 7.5);
+        assert_eq!(
+            (
+                pool.num_alloc_buffers(),
+                pool.num_free_buffers(),
+                pool.allocated_bytes()
+            ),
+            (1, 0, 8)
+        );
+    }
+
+    /// C refills `pFlatField` in place while a plugin still holds it, so a
+    /// held publish neither refuses the read nor charges a second buffer.
+    #[test]
+    fn a_held_flat_field_is_still_refilled() {
+        let (pool, mut s) = flat_field_pool(8);
+        let held = refill_flat_field(&mut s, &[5, 6], None, 5.5).unwrap();
+        let next = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
+        assert!(matches!(&next.data, NDDataBuffer::I32(v) if v == &[7, 8]));
+        assert!(matches!(&held.data, NDDataBuffer::I32(v) if v == &[5, 6]));
+        assert_eq!(s.average_flat_field, 7.5);
+        assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 8));
+        assert!(refill_flat_field(&mut Shared::default(), &[1, 2], None, 1.0).is_none());
+    }
+
+    /// readTiff rejects a file whose size is not pFlatField's
+    /// (pilatusDetector.cpp:678, :685), whatever MaxSizeX reads now.
+    #[test]
+    fn a_flat_field_file_sized_to_max_size_not_pflatfield_is_rejected() {
+        use crate::driver::{DriverLinks, PilatusDriver};
+        use epics_rs::ad_core::plugin::channel::NDArrayOutput;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let stop = Arc::new(Event::new());
+        let det = PilatusDriver::new(
+            "PILATUS_FLAT_DIMS",
+            2,
+            1,
+            0,
+            DriverLinks {
+                cmd_tx,
+                start: Arc::new(Event::new()),
+                stop: stop.clone(),
+                shared: shared.clone(),
+            },
+        )
+        .unwrap();
+        let (ad, p, pool) = (det.ad.params, det.p, det.ad.pool.clone());
+        shared.lock().flat_field = Some(PersistentArray::new(
+            pool.alloc(
+                vec![NDDimension::new(2), NDDimension::new(1)],
+                epics_rs::ad_core::ndarray::NDDataType::Int32,
+            )
+            .unwrap(),
+        ));
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("PILATUS_FLAT_DIMS").unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        h.write_int32_blocking(ad.max_size_x, 0, 3).unwrap();
+
+        let path = std::env::temp_dir().join(format!("pil-flat-{}.tif", std::process::id()));
+        let mut enc =
+            tiff::encoder::TiffEncoder::new(std::fs::File::create(&path).unwrap()).unwrap();
+        enc.write_image::<tiff::encoder::colortype::Gray32>(3, 1, &[7, 8, 9])
+            .unwrap();
+        let mut w = Worker {
+            ctx: Ctx::new(h.clone(), h.clone(), ad, p, stop),
+            shared: shared.clone(),
+            output: ArrayPublisher::new(Arc::new(Mutex::new(NDArrayOutput::new()))),
+            pool,
+        };
+        let file = path.to_string_lossy().into_owned();
+        let read = rt::run_thread_named("PilatusFlatTest", move || async move {
+            read_flat_field_file(&mut w, &file).await;
+        })
+        .join();
+        let _ = std::fs::remove_file(&path);
+        assert!(read.is_ok(), "readFlatFieldFile panicked");
+        assert_eq!(h.read_int32_blocking(p.flat_field_valid, 0).unwrap(), 0);
+        std::mem::forget(runtime);
+    }
+
     #[test]
     fn build_array_carries_tiff_description() {
-        let a = build_array(7, 2, 2, vec![1, 2, 3, 4], Some("desc".into()));
+        let a = build_array(
+            &DriverPool::standalone(0),
+            7,
+            2,
+            2,
+            vec![1, 2, 3, 4],
+            Some("desc".into()),
+        )
+        .unwrap();
         assert_eq!(a.unique_id, 7);
         assert_eq!(a.dims.len(), 2);
         assert_eq!(a.data_size, 16);

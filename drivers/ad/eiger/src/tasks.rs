@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::error::ADResult;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -166,6 +168,7 @@ pub struct Shared {
     pub api: ApiVersion,
     pub hostname: String,
     pub outputs: Outputs,
+    pub pool: DriverPool,
 
     /// Files downloaded but not yet reaped (mirrored into `PENDING_FILES`).
     pending_files: AtomicI32,
@@ -225,11 +228,8 @@ impl Shared {
     }
 
     async fn get_str(&self, reason: usize) -> String {
-        match self.handle.read_octet(reason, 0, 256).await {
-            Ok(bytes) => {
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                String::from_utf8_lossy(&bytes[..end]).into_owned()
-            }
+        match self.handle.get_string_param(reason, 0, 256).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => String::new(),
         }
     }
@@ -828,7 +828,16 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
     let active = active_thresholds(s).await;
     let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
 
+    // C `break`s out of the threshold loop on a refused alloc
+    // (eigerDetector.cpp:1849), dropping the rest of that image's thresholds.
+    let mut skip_image = false;
     for frame in frames {
+        if frame.threshold == 0 {
+            skip_image = false;
+        }
+        if skip_image {
+            continue;
+        }
         let (number, energy) = active
             .get(frame.threshold)
             .copied()
@@ -837,7 +846,7 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
         attrs.add(threshold_number_attr(number));
         attrs.add(threshold_energy_attr(energy));
 
-        publish(
+        if publish(
             s,
             Image {
                 dims: frame.dims,
@@ -849,7 +858,12 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
             },
             array_callbacks,
         )
-        .await;
+        .await
+        .is_err()
+        {
+            trace.err("parseH5File", "couldn't allocate NDArray");
+            skip_image = true;
+        }
     }
     Ok(())
 }
@@ -1037,17 +1051,23 @@ async fn monitor_task(s: Arc<Shared>) {
             if let Ok(buf) = s.rest().get_monitor_image(timeout) {
                 match tiff::decode(&buf) {
                     Ok(image) => {
-                        let array = build_array(
+                        let Ok(array) = build_array(
+                            &s.pool,
                             image.dims,
                             image.data,
                             None,
                             NDAttributeList::new(),
                             unique_id,
                             None,
-                        );
+                        ) else {
+                            s.trace().err("parseTiffFile", "couldn't allocate NDArray");
+                            s.trace().err("monitorTask", "couldn't parse file");
+                            rt::sleep(MONITOR_PERIOD).await;
+                            continue;
+                        };
                         unique_id += 1;
                         ArrayPublisher::new(s.outputs.monitor.clone())
-                            .publish(Arc::new(array))
+                            .publish(array)
                             .await;
                     }
                     Err(e) => {
@@ -1182,6 +1202,7 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 // C's addresses 0 and 1. It also carries no ThresholdNumber /
                 // ThresholdEnergy attributes; only the HDF5 and stream2 paths add
                 // those.
+                let number = frame.frame;
                 let image = Image {
                     dims: frame.dims,
                     data: frame.data,
@@ -1190,7 +1211,16 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                     threshold_index: 0,
                     timestamp: None,
                 };
-                publish(s, image.signed_if(signed_data), array_callbacks).await;
+                // A refused alloc is getFrame's STREAM_ERROR (streamApi.cpp:370),
+                // which ends the series like any other failed frame above.
+                if publish(s, image.signed_if(signed_data), array_callbacks)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("StreamApi::getFrame: failed to allocate NDArray for frame {number}");
+                    s.trace().err("streamTask", "failed to get frame packet");
+                    return false;
+                }
             }
         }
     }
@@ -1267,7 +1297,14 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
                 threshold_index: thresh,
                 timestamp: frame.timestamp,
             };
-            publish(s, image.signed_if(signed_data), array_callbacks).await;
+            // A refused alloc is getFrame's STREAM_ERROR (stream2Api.cpp:290),
+            // skipped like the other failed frames above.
+            if publish(s, image.signed_if(signed_data), array_callbacks)
+                .await
+                .is_err()
+            {
+                eprintln!("Stream2Api::getFrame: failed to allocate NDArray for frame");
+            }
         }
     }
 }
@@ -1277,17 +1314,18 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
 // ---------------------------------------------------------------------------
 
 fn build_array(
+    pool: &DriverPool,
     dims: [usize; 2],
     data: NDDataBuffer,
     codec: Option<epics_rs::ad_core::codec::Codec>,
     attributes: NDAttributeList,
     unique_id: i32,
     timestamp: Option<EpicsTimestamp>,
-) -> NDArray {
-    let mut array = NDArray::with_data(
+) -> ADResult<DriverArray> {
+    let mut array = pool.wrap(
         vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
         data,
-    );
+    )?;
     array.unique_id = unique_id;
     match timestamp {
         // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337).
@@ -1302,7 +1340,7 @@ fn build_array(
     }
     array.attributes = attributes;
     array.codec = codec;
-    array
+    Ok(array)
 }
 
 /// Publish one image on the main output and on its threshold's output
@@ -1356,7 +1394,9 @@ impl Image {
     }
 }
 
-async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
+/// `Err` when the pool refuses the frame (C's `alloc` returning NULL); the
+/// caller prints C's line for its path.
+async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResult<()> {
     let Image {
         dims,
         data,
@@ -1369,9 +1409,7 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
     // :1878), so the first array of an IOC's life is uniqueId 0.
     let unique_id = s.get_int(s.ad.base.array_counter).await;
     let counter = unique_id + 1;
-    let array = Arc::new(build_array(
-        dims, data, codec, attributes, unique_id, timestamp,
-    ));
+    let array = build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share();
 
     if array_callbacks {
         ArrayPublisher::new(s.outputs.main.clone())
@@ -1420,6 +1458,7 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
         ),
     ])
     .await;
+    Ok(())
 }
 
 /// Build the shared state the tasks run on, plus the driver's signal handles.
@@ -1433,6 +1472,7 @@ pub fn shared(
     api: ApiVersion,
     hostname: String,
     outputs: Outputs,
+    pool: DriverPool,
     signals: &Signals,
 ) -> Arc<Shared> {
     Arc::new(Shared {
@@ -1444,6 +1484,7 @@ pub fn shared(
         api,
         hostname,
         outputs,
+        pool,
         pending_files: AtomicI32::new(0),
         poll_stop: AtomicBool::new(false),
         poll_complete: AtomicBool::new(false),
@@ -1580,6 +1621,93 @@ mod tests {
         port
     }
 
+    /// eigerDetector.cpp:587-588 hands every int32 below mFirstParam to
+    /// ADDriver::writeInt32.
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        use epics_rs::ad_core::driver::ShutterMode;
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::asyn::user::AsynUser;
+
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: "EIGER_BASE_WRITE".to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    /// eigerDetector.cpp:667-668 hands every float64 below mFirstParam to
+    /// ADDriver::writeFloat64, which is asynPortDriver's: its IO_DRIVER line
+    /// precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use epics_rs::asyn::user::{AsynUser, UserTrace};
+
+        let port = "EIGER_BASE_F64";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: port.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        det.write_float64(&mut user, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("eigerDetector:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+    }
+
     #[tokio::test]
     async fn the_unique_id_is_the_array_counter_before_its_increment() {
         use epics_rs::ad_core::plugin::channel::ndarray_channel;
@@ -1615,11 +1743,14 @@ mod tests {
             ApiVersion::V1_6_0,
             "127.0.0.1".to_string(),
             outputs,
+            DriverPool::standalone(0),
             &signals,
         );
 
         for _ in 0..2 {
-            publish(&s, image(NDDataBuffer::U16(vec![1, 2]), None), true).await;
+            publish(&s, image(NDDataBuffer::U16(vec![1, 2]), None), true)
+                .await
+                .unwrap();
         }
         let mut ids = Vec::new();
         for _ in 0..2 {
@@ -1628,5 +1759,61 @@ mod tests {
         assert_eq!(ids, [0, 1]);
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
         std::mem::forget(runtime);
+    }
+
+    /// eigerDetector's writeInt32/writeFloat64/writeOctet call
+    /// callParamCallbacks() (eigerDetector.cpp:596, :682, :772): a write to
+    /// another address still posts what is pending at address 0.
+    #[test]
+    fn a_write_to_another_address_posts_address_zero() {
+        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager, InterruptValue};
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::asyn::user::AsynUser;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: "EIGER_ADDR0_POST".to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
+        det.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cb = std::sync::Arc::clone(&seen);
+        let _sub = det.ad.port_base.interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(0),
+                ..Default::default()
+            },
+            move |iv: &InterruptValue| seen_cb.lock().unwrap().push(iv.reason),
+        );
+        let pending = det.ad.params.shutter_close_delay;
+        // A store marks the parameter changed only when the value differs.
+        let pend = |det: &mut crate::driver::EigerDriver, value: f64| {
+            det.ad
+                .port_base
+                .set_float64_param(pending, 0, value)
+                .unwrap();
+            seen.lock().unwrap().clear();
+        };
+        pend(&mut det, 1.5);
+        let reason = det.ad.params.num_images;
+        let _ = det.write_int32(&mut AsynUser::new(reason).with_addr(1), 3);
+        assert!(seen.lock().unwrap().contains(&pending), "writeInt32");
+
+        pend(&mut det, 2.5);
+        let reason = det.ad.params.shutter_open_delay;
+        let _ = det.write_float64(&mut AsynUser::new(reason).with_addr(1), 2.0);
+        assert!(seen.lock().unwrap().contains(&pending), "writeFloat64");
+
+        pend(&mut det, 3.5);
+        let reason = det.ad.params.base.file_name;
+        let _ = det.write_octet(&mut AsynUser::new(reason).with_addr(1), b"f");
+        assert!(seen.lock().unwrap().contains(&pending), "writeOctet");
     }
 }

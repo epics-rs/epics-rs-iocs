@@ -663,7 +663,7 @@ impl PortDriver for T4uDriver {
         // C++ returns here for its own functions, without callbacks; their
         // readbacks post when the meter's register dump comes back.
         if reason < t.first {
-            return self.qe_write_int32(reason, channel, value);
+            return self.qe_write_int32(user, value);
         }
         Ok(())
     }
@@ -698,7 +698,7 @@ impl PortDriver for T4uDriver {
             let _ = std::io::stdout().flush();
         }
         if reason < t.first {
-            return self.qe_write_float64(reason, channel, value);
+            return self.qe_write_float64(user, value);
         }
         Ok(())
     }
@@ -1123,7 +1123,7 @@ pub struct T4uRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub params: QuadEmParams,
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
-    pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
+    pub pool: epics_rs::ad_core::ndarray_pool::DriverPool,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
     /// The sub-ports the driver built; dropping them closes the sockets. C++
     /// registers them by name, so `st.cmd` can trace them.
@@ -1440,6 +1440,7 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
         params,
         nd_params,
         outputs: outputs.clone(),
+        pool: pool.clone(),
         shared,
         acquire_param,
     });

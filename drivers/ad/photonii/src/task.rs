@@ -18,9 +18,10 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
+use epics_rs::ad_core::ndarray::NDDimension;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -35,8 +36,7 @@ pub(crate) struct AcquisitionContext {
     pub p2: P2Util,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: DriverPool,
     pub ad_params: ADBaseParams,
     pub params: PhotonIIParams,
     pub shared: Arc<SharedState>,
@@ -132,8 +132,8 @@ fn read_setup(ctx: &AcquisitionContext, sync: &SyncIOHandle) -> AcquireSetup {
         frame_type,
         acquire_time: sync.read_float64(ad.acquire_time).unwrap_or(0.0),
         count,
-        file_path: read_string(sync, ad.base.file_path),
-        file_name: read_string(sync, ad.base.file_name),
+        file_path: read_string(ctx, ad.base.file_path),
+        file_name: read_string(ctx, ad.base.file_name),
         file_number: sync.read_int32(ad.base.file_number).unwrap_or(0),
         array_callbacks: sync.read_int32(ad.base.array_callbacks).unwrap_or(1) != 0,
     }
@@ -383,10 +383,14 @@ async fn publish_frame(
 
     let ts = EpicsTimestamp::now();
     let data_type = data.data_type();
-    let mut array = NDArray::with_data(
+    // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
+    // is dropped after the pool's limit line.
+    let Ok(mut array) = ctx.pool.wrap(
         vec![NDDimension::new(PII_SIZE_X), NDDimension::new(PII_SIZE_Y)],
         data,
-    );
+    ) else {
+        return Ok(());
+    };
     array.unique_id = array_counter;
     array.timestamp = ts;
     // C stamped every frame of an acquisition with the acquisition's start
@@ -441,7 +445,7 @@ async fn publish_frame(
     )
     .await;
 
-    ctx.output.publish(Arc::new(array)).await;
+    ctx.output.publish(array).await;
     Ok(())
 }
 
@@ -489,11 +493,12 @@ async fn set_params(ctx: &AcquisitionContext, values: Vec<ParamSetValue>) {
     let _ = ctx.handle.set_params_and_notify(0, values).await;
 }
 
-fn read_string(sync: &SyncIOHandle, reason: usize) -> String {
-    match sync.read_octet(reason, MAX_MESSAGE_SIZE) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .to_string(),
+fn read_string(ctx: &AcquisitionContext, reason: usize) -> String {
+    match ctx
+        .handle
+        .get_string_param_blocking(reason, 0, MAX_MESSAGE_SIZE)
+    {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => String::new(),
     }
 }

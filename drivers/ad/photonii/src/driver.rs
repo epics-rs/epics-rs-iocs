@@ -21,11 +21,9 @@ use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::connection::{ChannelError, P2Util};
@@ -160,7 +158,7 @@ impl PortDriver for PhotonIIDetector {
             .port_base
             .set_int32_param(reason, user.addr, value)?;
 
-        let status: AsynResult<()> = Ok(());
+        let mut status: AsynResult<()> = Ok(());
         if reason == self.ad.params.acquire {
             self.set_acquire(value, was_acquiring)?;
         } else if reason == self.params.shutter {
@@ -181,6 +179,9 @@ impl PortDriver for PhotonIIDetector {
             }
         } else if reason == self.params.num_subframes {
             self.command(&protocol::set_num_subframes(value))?;
+        } else if reason < self.params.dr_sum_enable {
+            // FIRST_PII_PARAM is PII_DRSumEnable (PhotonII.h:47).
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -206,22 +207,37 @@ impl PortDriver for PhotonIIDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         if reason == self.ad.params.acquire_time {
-            self.command(&protocol::set_exposure_time(value))?;
+            let _ = self.command(&protocol::set_exposure_time(value));
+        } else if reason < self.params.dr_sum_enable {
+            // ADDriver::writeFloat64 is asynPortDriver's (PhotonII.cpp:549).
+            status = self.ad.port_base.write_float64_param(user, value);
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        user.print(
-            TraceMask::IO_DRIVER,
-            file!(),
-            line!(),
-            format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}"),
-        );
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "PhotonII::writeFloat64: error, status={} function={reason}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}"),
+            ),
+        }
+        status
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, value: &[u8]) -> AsynResult<usize> {
@@ -254,9 +270,8 @@ pub struct PhotonIIRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub params: PhotonIIParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     task: std::thread::JoinHandle<()>,
 }
@@ -266,7 +281,7 @@ impl PhotonIIRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -274,8 +289,7 @@ impl PhotonIIRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -300,16 +314,14 @@ pub fn create_photonii_detector(
     let ad_params = det.ad.params;
     let params = det.params;
     let pool = det.ad.pool.clone();
-
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task = start_acquisition_task(AcquisitionContext {
         p2,
         handle: runtime_handle.port_handle().clone(),
         output: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
+        pool: pool.clone(),
         ad_params,
         params,
         shared,
@@ -322,7 +334,88 @@ pub fn create_photonii_detector(
         params,
         pool,
         array_output,
-        queued_counter,
         task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+
+    fn detector(name: &str) -> PhotonIIDetector {
+        let ip = format!("{name}_IP");
+        let (runtime, _) = create_port_runtime(
+            &claim_port(&ip).unwrap(),
+            DrvAsynIPPort::new(&ip, "127.0.0.1:1").unwrap(),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let p2 = P2Util::new(runtime.port_handle().clone());
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            stop_requested: AtomicBool::new(false),
+        });
+        let (tx, _rx) = rt::command_channel::<TaskCommand>(4);
+        PhotonIIDetector::new(name, p2, 0, shared, tx).unwrap()
+    }
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let mut det = detector("PII_BASE_WRITE");
+        let ad = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.shutter_control), 1)
+            .unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (PhotonII.cpp:549), whose
+    /// IO_DRIVER line precedes PhotonII's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "PII_BASE_F64";
+        let mut det = detector(port);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("pii-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let gain = det.ad.params.gain;
+        let mut user = AsynUser::new(gain).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        det.write_float64(&mut user, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base =
+            format!("asynPortDriver:writeFloat64: function={gain}, name=GAIN, value=2.000000");
+        let own = format!("PhotonII::writeFloat64: function={gain}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+    }
 }

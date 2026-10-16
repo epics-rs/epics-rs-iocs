@@ -11,11 +11,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::params::PvaParams;
@@ -106,13 +104,8 @@ impl PortDriver for PvaDriver {
                 let _ = self.cmd_tx.try_send(PvaCommand::Stop);
             }
         } else if reason < self.pva_params.overrun_counter {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`. C
-            // overwrites its status with `callParamCallbacks()`'s.
-            if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0);
-            } else {
-                let _ = self.ad.write_int32_pool(reason, value);
-            }
+            // C overwrites its status with `callParamCallbacks()`'s.
+            let _ = ADDriver::ad_write_int32(self, user, value);
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
@@ -194,9 +187,8 @@ pub struct PvaRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub pva_params: PvaParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)] // kept alive for the monitor task's lifetime
     task_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -206,7 +198,7 @@ impl PvaRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -214,8 +206,7 @@ impl PvaRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -242,12 +233,12 @@ pub fn create_pva_detector(
     let pool = det.ad.pool.clone();
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task_handle = start_pva_task(MonitorContext {
         cmd_rx,
         handle: runtime_handle.port_handle().clone(),
         publisher: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
         ad: ad_params,
         pva: pva_params,
         initial_pv_name: pv_name.to_string(),
@@ -259,7 +250,6 @@ pub fn create_pva_detector(
         pva_params,
         pool,
         array_output,
-        queued_counter,
         task_handle: Some(task_handle),
     })
 }
@@ -268,6 +258,49 @@ pub fn create_pva_detector(
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
+    /// an ASYN_TRACEIO_DRIVER line (ADDriver.cpp:111-113,
+    /// asynNDArrayDriver.cpp:703-705).
+    #[test]
+    fn a_base_class_write_runs_both_base_class_write_int32s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "PVA_BASE_TRACE";
+        let det = {
+            let (cmd_tx, _cmd_rx) = rt::command_channel(1);
+            std::mem::forget(_cmd_rx);
+            PvaDriver::new(name, "", 1 << 20, cmd_tx).unwrap()
+        };
+        let p = det.ad.params.base;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for driver in ["asynNDArrayDriver", "ADDriver"] {
+            assert!(
+                text.contains(&format!(
+                    "{driver}:writeInt32: function={}",
+                    p.pool_poll_stats
+                )),
+                "{driver}: {text:?}"
+            );
+        }
+        std::mem::forget(runtime);
+    }
 
     #[test]
     fn a_base_class_write_reaches_addriver() {

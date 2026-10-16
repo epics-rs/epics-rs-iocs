@@ -23,11 +23,9 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 
 use crate::connection::{MpxConnection, default_timeout};
 use crate::params::MerlinParams;
@@ -565,13 +563,7 @@ impl PortDriver for MerlinDetector {
             self.try_set(MPXCMD_PROFILES, &value.to_string());
             Ok(())
         } else if reason < self.params.first() {
-            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0);
-                Ok(())
-            } else {
-                self.ad.write_int32_pool(reason, value).map(|_| ())
-            }
+            ADDriver::ad_write_int32(self, user, value)
         } else {
             Ok(())
         };
@@ -606,9 +598,10 @@ impl PortDriver for MerlinDetector {
             .port_base
             .get_float64_param(reason, user.addr)
             .unwrap_or(0.0);
-        self.ad
+        let stored = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         let name = if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
             Some(MPXVAR_THRESHOLD[i])
@@ -622,24 +615,28 @@ impl PortDriver for MerlinDetector {
                 .cmd
                 .set(name, &format!("{value:.6}"), default_timeout())
                 .map_err(AsynError::from);
-            self.get_threshold()?;
+            let _ = self.get_threshold();
             set
         } else if reason == self.ad.params.acquire_time || reason == self.ad.params.acquire_period {
-            self.set_acquire_params()
+            // C drops both helpers' statuses (merlinDetector.cpp:1274-1282).
+            let _ = self.set_acquire_params();
+            stored
         } else if reason == self.params.start_threshold_scan
             || reason == self.params.stop_threshold_scan
             || reason == self.params.step_threshold_scan
         {
-            self.update_threshold_scan_params()
+            let _ = self.update_threshold_scan_params();
+            stored
+        } else if reason < self.params.first() {
+            // ADDriver::writeFloat64 is asynPortDriver's (merlinDetector.cpp:1287).
+            self.ad.port_base.write_float64_param(user, value)
         } else {
-            Ok(())
+            stored
         };
 
         match &status {
             Err(e) => {
-                self.ad
-                    .port_base
-                    .set_float64_param(reason, user.addr, old)?;
+                let _ = self.ad.port_base.set_float64_param(reason, user.addr, old);
                 user.print(
                     TraceMask::ERROR,
                     file!(),
@@ -657,7 +654,7 @@ impl PortDriver for MerlinDetector {
                 format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}"),
             ),
         }
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
         status
     }
 }
@@ -678,9 +675,8 @@ pub struct MerlinRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub ad_params: ADBaseParams,
     pub params: MerlinParams,
-    pool: Arc<NDArrayPool>,
+    pool: DriverPool,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     data_task: std::thread::JoinHandle<()>,
     #[allow(dead_code)]
@@ -692,7 +688,7 @@ impl MerlinRuntime {
         self.runtime_handle.port_handle()
     }
 
-    pub fn pool(&self) -> &Arc<NDArrayPool> {
+    pub fn pool(&self) -> &DriverPool {
         &self.pool
     }
 
@@ -700,8 +696,7 @@ impl MerlinRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -742,16 +737,14 @@ pub fn create_merlin_detector(
     let params = det.params;
     let init_param = det.init_param;
     let pool = det.ad.pool.clone();
-
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let (data_task, status_task) = start_acquisition_task(AcquisitionContext {
         data,
         handle: runtime_handle.port_handle().clone(),
         output: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
+        pool: pool.clone(),
         ad_params,
         params,
         init_param,
@@ -765,7 +758,6 @@ pub fn create_merlin_detector(
         params,
         pool,
         array_output,
-        queued_counter,
         data_task,
         status_task,
     })
@@ -777,10 +769,15 @@ mod tests {
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::sync_io::SyncIOHandle;
 
     /// A detector whose command socket never connects: the writes under test
     /// must not need the device.
     fn detector(name: &str) -> MerlinDetector {
+        detector_sized(name, 1 << 20)
+    }
+
+    fn detector_sized(name: &str, max_memory: usize) -> MerlinDetector {
         let ip = format!("{name}_CMD");
         let driver = DrvAsynIPPort::new(&ip, "127.0.0.1:1").unwrap();
         let (runtime, _) =
@@ -794,7 +791,7 @@ mod tests {
             512,
             512,
             DetectorType::MerlinQuad,
-            1 << 20,
+            max_memory,
             Arc::new(SharedState::new()),
         )
         .unwrap()
@@ -818,6 +815,41 @@ mod tests {
             1,
             "ADShutterControl did not reach ADDriver::setShutter"
         );
+    }
+
+    /// ADDriver::writeInt32 and asynNDArrayDriver::writeInt32 each close with
+    /// an ASYN_TRACEIO_DRIVER line (ADDriver.cpp:111-113,
+    /// asynNDArrayDriver.cpp:703-705).
+    #[test]
+    fn a_base_class_write_runs_both_base_class_write_int32s() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "MERLIN_BASE_TRACE";
+        let det = detector(name);
+        let p = det.ad.params.base;
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(p.pool_poll_stats, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for driver in ["asynNDArrayDriver", "ADDriver"] {
+            assert!(
+                text.contains(&format!(
+                    "{driver}:writeInt32: function={}",
+                    p.pool_poll_stats
+                )),
+                "{driver}: {text:?}"
+            );
+        }
+        std::mem::forget(runtime);
     }
 
     #[test]
@@ -849,5 +881,122 @@ mod tests {
             det.ad.port_base.get_float64_param(threshold, 0).unwrap(),
             0.0
         );
+    }
+
+    /// The last frame of a Single acquisition under a software trigger;
+    /// returns ADAcquire, SoftwareTrigger and NDArrayCounter after it.
+    fn last_software_triggered_frame(name: &str, max_memory: usize) -> (i32, i32, i32) {
+        let mut det = detector_sized(name, max_memory);
+        let (ad_params, params, init_param) = (det.ad.params, det.params, det.init_param);
+        let pool = det.ad.pool.clone();
+        let shared = det.shared.clone();
+        let base = &mut det.ad.port_base;
+        base.set_int32_param(ad_params.acquire, 0, 1).unwrap();
+        base.set_int32_param(
+            ad_params.trigger_mode,
+            0,
+            TriggerMode::SoftwareTrigger as i32,
+        )
+        .unwrap();
+        base.set_int32_param(params.software_trigger, 0, 1).unwrap();
+        shared.images_remaining.store(1, Ordering::Release);
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle().clone();
+        let ctx = AcquisitionContext {
+            data: MpxConnection::new(handle.clone(), MPX_MAXLINE),
+            handle: handle.clone(),
+            output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()))),
+            pool,
+            ad_params,
+            params,
+            init_param,
+            det_type: DetectorType::MerlinQuad,
+            shared,
+        };
+        let mut body = crate::protocol::tests::quad_header(768, 1);
+        body.resize(768 + 256 * 256 * 2, 0);
+        epics_rs::ad_core::runtime::run_thread(move || async move {
+            let sync = SyncIOHandle::from_handle(ctx.handle.clone(), 0, default_timeout());
+            crate::task::handle_frame(&ctx, &sync, &body, &mut String::new()).await;
+        })
+        .join()
+        .unwrap();
+        let acquire = handle.read_int32_blocking(ad_params.acquire, 0).unwrap();
+        let trigger = handle
+            .read_int32_blocking(params.software_trigger, 0)
+            .unwrap();
+        let counter = handle
+            .read_int32_blocking(ad_params.base.array_counter, 0)
+            .unwrap();
+        std::mem::forget(runtime);
+        (acquire, trigger, counter)
+    }
+
+    /// merlinDetector.cpp:209/:242: a frame the pool refuses `continue`s past
+    /// the software-trigger reset and the completion (:290-305).
+    #[test]
+    fn a_refused_last_frame_leaves_the_acquisition_running() {
+        let (acquire, trigger, _) = last_software_triggered_frame("MERLIN_LAST_OK", 1 << 20);
+        assert_eq!((acquire, trigger), (0, 0));
+        let (acquire, trigger, _) = last_software_triggered_frame("MERLIN_LAST_REFUSED", 1000);
+        assert_eq!((acquire, trigger), (1, 1));
+    }
+
+    /// merlinDetector.cpp:150-152 counts every data frame before the
+    /// NDArray is made.
+    #[test]
+    fn a_refused_frame_still_advances_the_array_counter() {
+        let (_, _, counter) = last_software_triggered_frame("MERLIN_COUNTER_REFUSED", 1000);
+        assert_eq!(counter, 1);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (merlinDetector.cpp:1287), whose
+    /// IO_DRIVER line precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MERLIN_BASE_F64";
+        let mut det = detector(port);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        let _ = det.write_float64(&mut user, 2.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("merlinDetector:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+    }
+
+    /// C drops setAcquireParams' status (merlinDetector.cpp:1274-1276): a
+    /// dead server leaves the write the store's success and the new value.
+    #[test]
+    fn an_acquire_time_write_keeps_the_stores_status() {
+        let mut det = detector("MERLIN_ACQ_TIME");
+        let t = det.ad.params.acquire_time;
+        det.write_float64(&mut AsynUser::new(t).with_addr(0), 1.5)
+            .unwrap();
+        assert_eq!(det.ad.port_base.get_float64_param(t, 0).unwrap(), 1.5);
     }
 }

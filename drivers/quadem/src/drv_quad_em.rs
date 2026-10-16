@@ -6,7 +6,7 @@
 //! item each (4 currents, 2 sums, sum-all, 2 diffs, 2 positions) and address
 //! 11 carries the full 2-D array. This module reproduces that layout on top of
 //! `asyn_rs::PortDriverBase` plus `ad_core_rs`'s `NDArrayDriverParams` and
-//! `NDArrayPool`, because `NDArrayDriverBase::new` hard-codes `maxAddr = 1`.
+//! `DriverPool`, because `NDArrayDriverBase::new` hard-codes `maxAddr = 1`.
 //!
 //! Sample flow, unchanged from C++:
 //!
@@ -26,11 +26,11 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
 use crate::trace::{self, AsynPrint};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, handle_write_int32};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -39,6 +39,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::user::AsynUser;
 
 /// Number of data items published per sample (C++ `QE_MAX_DATA`).
 pub const QE_MAX_DATA: usize = 11;
@@ -869,19 +870,18 @@ pub trait QuadEmDevice {
     /// C++ `drvQuadEM::writeInt32`. Every step runs whatever an earlier one
     /// returned, as C's `status |=` does; the first failure is what the record
     /// sees.
-    fn qe_write_int32(&mut self, reason: usize, channel: i32, value: i32) -> AsynResult<()> {
+    fn qe_write_int32(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
+        let (reason, channel) = (user.reason, user.addr);
         let p = self.qe_base().params;
         let acquire = self.qe_base().nd_params.acquire;
         let shared = self.qe_shared().clone();
         let mut status = StatusOr::default();
 
-        status.add(if reason == acquire {
-            self.qe_base().set_ad_acquire(channel, value)
-        } else {
+        status.add(
             self.qe_base()
                 .port_base
-                .set_int32_param(reason, channel, value)
-        });
+                .set_int32_param(reason, channel, value),
+        );
         shared.shadow_int32(&p, reason, value);
 
         if reason == acquire {
@@ -892,7 +892,7 @@ pub trait QuadEmDevice {
         } else if reason == p.acquire_mode {
             if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
                 status.add(self.set_acquire(0));
-                let _ = self.qe_base().set_ad_acquire(0, 0);
+                let _ = self.qe_base().port_base.set_int32_param(acquire, 0, 0);
             }
             status.add(self.set_acquire_mode(value));
             status.add(self.read_status());
@@ -944,7 +944,17 @@ pub trait QuadEmDevice {
             status.add(self.reset());
             status.add(self.read_status());
         } else if reason < p.acquire_mode {
-            status.set(self.qe_base().write_int32_pool(reason));
+            // FIRST_QE_COMMAND is P_AcquireMode (drvQuadEM.h:151).
+            let b = self.qe_base();
+            let template = b.owner.array(0);
+            status.set(handle_write_int32(
+                &mut b.port_base,
+                &b.nd_params,
+                &b.pool,
+                template.as_deref(),
+                user,
+                value,
+            ));
         }
 
         // C's callParamCallbacks() posts address 0 only; the other addresses
@@ -960,7 +970,8 @@ pub trait QuadEmDevice {
     }
 
     /// C++ `drvQuadEM::writeFloat64`, with [`Self::qe_write_int32`]'s status rule.
-    fn qe_write_float64(&mut self, reason: usize, channel: i32, value: f64) -> AsynResult<()> {
+    fn qe_write_float64(&mut self, user: &AsynUser, value: f64) -> AsynResult<()> {
+        let (reason, channel) = (user.reason, user.addr);
         let p = self.qe_base().params;
         let shared = self.qe_shared().clone();
         let mut status = StatusOr::default();
@@ -1055,11 +1066,12 @@ pub struct QuadEmBase {
     pub port_base: PortDriverBase,
     pub nd_params: NDArrayDriverParams,
     pub params: QuadEmParams,
-    pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
+    pub pool: DriverPool,
     /// One output per asyn address: 0-10 single-value streams, 11 the full
     /// 2-D array.
     pub outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
-    pub queued: Vec<Arc<QueuedArrayCounter>>,
+    /// Keeps the pool's owner alive; the pool holds it weakly.
+    pub owner: Arc<ArrayOwner>,
 }
 
 impl QuadEmBase {
@@ -1074,7 +1086,7 @@ impl QuadEmBase {
             },
         );
 
-        let nd_params = NDArrayDriverParams::create(&mut port_base)?;
+        let (nd_params, owner) = NDArrayDriverParams::create(&mut port_base)?;
         let params = QuadEmParams::create(&mut port_base)?;
 
         port_base.set_int32_param(nd_params.array_callbacks, 0, 1)?;
@@ -1102,13 +1114,10 @@ impl QuadEmBase {
             port_base.set_float64_param(params.double_data, addr as i32, 0.0)?;
         }
 
-        let pool = epics_rs::ad_core::ndarray_pool::NDArrayPool::new(max_memory);
+        let pool = DriverPool::for_driver(max_memory, &owner);
 
         let outputs = (0..=QE_MAX_DATA)
             .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
-            .collect();
-        let queued = (0..=QE_MAX_DATA)
-            .map(|_| Arc::new(QueuedArrayCounter::new()))
             .collect();
 
         Ok(Self {
@@ -1117,84 +1126,12 @@ impl QuadEmBase {
             params,
             pool,
             outputs,
-            queued,
+            owner,
         })
     }
 
-    /// The `ADAcquire` branch of `asynNDArrayDriver::setIntegerParam`
-    /// (asynNDArrayDriver.cpp:639-653), which every `drvQuadEM` write of
-    /// `ADAcquire` goes through: `ADAcquireBusy` follows it, except that a stop
-    /// with `WaitForPlugins` set leaves it busy while arrays are still queued.
-    pub fn set_ad_acquire(&mut self, list: i32, value: i32) -> AsynResult<()> {
-        let p = self.nd_params;
-        let busy = if value != 0 {
-            Some(1)
-        } else if int_param(&self.port_base, p.wait_for_plugins, list) == 0
-            || self.queued.iter().all(|q| q.get() == 0)
-        {
-            Some(0)
-        } else {
-            None
-        };
-        if let Some(busy) = busy {
-            self.port_base.set_int32_param(p.acquire_busy, list, busy)?;
-        }
-        self.port_base.set_int32_param(p.acquire, list, value)
-    }
-
-    /// Pool branch of `asynNDArrayDriver::writeInt32`, which `drvQuadEM`
-    /// reaches through its `function < FIRST_QE_COMMAND` fallthrough.
-    ///
-    /// `NDPoolPreAllocBuffers` needs a template array (C++ `pArrays[0]`);
-    /// `drvQuadEM` never stores one, so pre-allocation only resets the request
-    /// parameter, exactly as it does upstream.
-    ///
-    /// Returns `true` when `param_index` named a pool control.
-    pub fn write_int32_pool(&mut self, param_index: usize) -> AsynResult<bool> {
-        let p = &self.nd_params;
-        if param_index == p.pool_empty_free_list {
-            self.pool.empty_free_list();
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if param_index == p.pool_poll_stats {
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if param_index == p.pool_pre_alloc {
-            self.port_base.set_int32_param(p.pool_pre_alloc, 0, 0)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn refresh_pool_stats(&mut self) -> AsynResult<()> {
-        const MEGABYTE: f64 = 1_048_576.0;
-        let p = self.nd_params;
-        self.port_base.set_float64_param(
-            p.pool_max_memory,
-            0,
-            self.pool.max_memory() as f64 / MEGABYTE,
-        )?;
-        self.port_base.set_float64_param(
-            p.pool_used_memory,
-            0,
-            self.pool.allocated_bytes() as f64 / MEGABYTE,
-        )?;
-        self.port_base.set_int32_param(
-            p.pool_alloc_buffers,
-            0,
-            self.pool.num_alloc_buffers() as i32,
-        )?;
-        self.port_base.set_int32_param(
-            p.pool_free_buffers,
-            0,
-            self.pool.num_free_buffers() as i32,
-        )?;
-        Ok(())
-    }
-
     /// Attach a downstream plugin to one asyn address' NDArray stream.
-    pub fn connect_downstream(&self, addr: usize, mut sender: NDArraySender) {
+    pub fn connect_downstream(&self, addr: usize, sender: NDArraySender) {
         let Some(out) = self.outputs.get(addr) else {
             asyn_print!(
                 self.port_base,
@@ -1203,7 +1140,6 @@ impl QuadEmBase {
             );
             return;
         };
-        sender.set_queued_counter(self.queued[addr].clone());
         out.lock().add(sender);
     }
 }
@@ -1219,6 +1155,7 @@ pub struct CallbackContext {
     pub params: QuadEmParams,
     pub nd_params: NDArrayDriverParams,
     pub outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
+    pub pool: DriverPool,
     pub shared: Arc<QuadEmShared>,
     /// Index of `ADAcquire` on this port, written to stop a finished
     /// multiple/single acquisition.
@@ -1254,27 +1191,34 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     for s in &samples {
         flat.extend_from_slice(s);
     }
-    let mut all = NDArray::with_data(
+    // C dereferences a refused alloc unchecked (drvQuadEM.cpp:333, :351); here
+    // that array is dropped after the pool's limit line.
+    if let Ok(mut all) = ctx.pool.wrap(
         vec![NDDimension::new(QE_MAX_DATA), NDDimension::new(num_read)],
         NDDataBuffer::F64(flat),
-    );
-    all.unique_id = counter;
-    all.timestamp = ts;
-    all.time_stamp = time_stamp;
-    ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
-        .publish(Arc::new(all))
-        .await;
+    ) {
+        all.unique_id = counter;
+        all.timestamp = ts;
+        all.time_stamp = time_stamp;
+        ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
+            .publish(all)
+            .await;
+    }
 
     // Addresses 0-10: one [numRead] array per data item.
     for item in 0..QE_MAX_DATA {
         let column: Vec<f64> = samples.iter().map(|s| s[item]).collect();
-        let mut single =
-            NDArray::with_data(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column));
+        let Ok(mut single) = ctx
+            .pool
+            .wrap(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column))
+        else {
+            continue;
+        };
         single.unique_id = counter;
         single.timestamp = ts;
         single.time_stamp = time_stamp;
         ArrayPublisher::new(ctx.outputs[item].clone())
-            .publish(Arc::new(single))
+            .publish(single)
             .await;
     }
 
@@ -1368,6 +1312,7 @@ pub fn start_callback_task(ctx: CallbackContext) -> std::thread::JoinHandle<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::TraceMask;
 
     fn unit_cfg(geometry: QeGeometry) -> PositionConfig {
         PositionConfig {
@@ -1599,7 +1544,7 @@ mod tests {
         let mut m = FakeMeter::new(&[("set_range", AsynStatus::Disconnected)]);
         let range = m.base.params.range;
         assert_eq!(
-            failed_with(m.qe_write_int32(range, 0, 3)),
+            failed_with(m.qe_write_int32(&AsynUser::new(range).with_addr(0), 3)),
             (
                 AsynStatus::Disconnected,
                 format!("drvQuadEM:writeInt32: status=4, function={range}, name=QE_RANGE, value=3")
@@ -1614,7 +1559,7 @@ mod tests {
         let mut m = FakeMeter::new(&[("read_status", AsynStatus::Timeout)]);
         let bias_voltage = m.base.params.bias_voltage;
         assert_eq!(
-            failed_with(m.qe_write_float64(bias_voltage, 0, 50.0)),
+            failed_with(m.qe_write_float64(&AsynUser::new(bias_voltage).with_addr(0), 50.0)),
             (
                 AsynStatus::Timeout,
                 format!(
@@ -1637,7 +1582,7 @@ mod tests {
         m.base.port_base.set_int32_param(acquire, 0, 1).unwrap();
         let single = QeAcquireMode::Single as i32;
         assert_eq!(
-            failed_with(m.qe_write_int32(acquire_mode, 0, single)),
+            failed_with(m.qe_write_int32(&AsynUser::new(acquire_mode).with_addr(0), single)),
             (
                 AsynStatus::Error,
                 format!(
@@ -1649,6 +1594,79 @@ mod tests {
         assert_eq!(m.calls, ["set_acquire", "set_acquire_mode", "read_status"]);
         assert_eq!(m.base.port_base.get_int32_param(acquire, 0).unwrap(), 0);
         assert_eq!(m.shared.acq.lock().acquire_mode, single);
+    }
+
+    /// drvQuadEM never fills pArrays[0], so asynNDArrayDriver::preAllocateBuffers
+    /// prints its error line (asynNDArrayDriver.cpp:716-721).
+    #[test]
+    fn a_pre_alloc_prints_cs_no_template_line() {
+        use epics_rs::asyn::trace::TraceFile;
+        let mut m = FakeMeter::new(&[]);
+        let path = std::env::temp_dir().join(format!("qe-prealloc-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .set_trace_file(
+                Some("QE_FAKE_DISPATCH"),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+        let pre_alloc = m.base.nd_params.pool_pre_alloc;
+        m.qe_write_int32(&AsynUser::new(pre_alloc).with_addr(0), 1)
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(
+                "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first"
+            ),
+            "{text:?}"
+        );
+        assert_eq!(m.base.port_base.get_int32_param(pre_alloc, 0).unwrap(), 0);
+    }
+
+    /// drvQuadEM.cpp:512-513 runs asynNDArrayDriver::writeInt32, and both
+    /// writes close with drvQuadEM's own line (:524-526, :579-581).
+    #[test]
+    fn writes_print_the_c_io_driver_lines() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "QE_FAKE_DISPATCH";
+        let mut m = FakeMeter::new(&[]);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("qe-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let traced = |reason| {
+            let mut user = AsynUser::new(reason);
+            user.trace = Some(UserTrace {
+                manager: manager.clone(),
+                port: port.into(),
+            });
+            user
+        };
+        let poll = m.base.nd_params.pool_poll_stats;
+        let bias = m.base.params.bias_voltage;
+        m.qe_write_int32(&traced(poll), 1).unwrap();
+        m.qe_write_float64(&traced(bias), 50.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for line in [
+            format!(
+                "asynNDArrayDriver:writeInt32: function={poll}, paramName=POOL_POLL_STATS, value=1"
+            ),
+            format!("drvQuadEM:writeInt32: function={poll}, name=POOL_POLL_STATS, value=1"),
+            format!(
+                "drvQuadEM:writeFloat64: function={bias}, name=QE_BIAS_VOLTAGE, value=50.000000"
+            ),
+        ] {
+            assert!(text.contains(&line), "{line}: {text:?}");
+        }
     }
 
     #[test]
@@ -1671,7 +1689,8 @@ mod tests {
             ("read_status", AsynStatus::Disconnected),
         ]);
         let range = m.base.params.range;
-        let (status, message) = failed_with(m.qe_write_int32(range, 0, 1));
+        let (status, message) =
+            failed_with(m.qe_write_int32(&AsynUser::new(range).with_addr(0), 1));
         assert_eq!(status, AsynStatus::Error);
         assert!(message.contains("status=6,"), "{message}");
     }
@@ -1686,10 +1705,12 @@ mod tests {
     fn acquire_busy_follows_acquire_without_wait_for_plugins() {
         let mut m = FakeMeter::new(&[]);
         let acquire = m.base.nd_params.acquire;
-        m.qe_write_int32(acquire, 0, 1).unwrap();
+        m.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 1)
+            .unwrap();
         assert_eq!(acquire_busy(&m), 1);
-        m.base.queued[3].increment();
-        m.qe_write_int32(acquire, 0, 0).unwrap();
+        m.base.owner.queued().increment();
+        m.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 0)
+            .unwrap();
         assert_eq!(acquire_busy(&m), 0);
     }
 
@@ -1698,14 +1719,18 @@ mod tests {
         let mut m = FakeMeter::new(&[]);
         let (acquire, wait) = (m.base.nd_params.acquire, m.base.nd_params.wait_for_plugins);
         m.base.port_base.set_int32_param(wait, 0, 1).unwrap();
-        m.qe_write_int32(acquire, 0, 1).unwrap();
-        m.base.queued[3].increment();
-        m.qe_write_int32(acquire, 0, 0).unwrap();
+        m.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 1)
+            .unwrap();
+        m.base.owner.queued().increment();
+        m.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 0)
+            .unwrap();
         assert_eq!(acquire_busy(&m), 1);
 
-        m.qe_write_int32(acquire, 0, 1).unwrap();
-        m.base.queued[3].decrement();
-        m.qe_write_int32(acquire, 0, 0).unwrap();
+        m.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 1)
+            .unwrap();
+        m.base.owner.queued().decrement();
+        m.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 0)
+            .unwrap();
         assert_eq!(acquire_busy(&m), 0);
     }
 
@@ -1713,9 +1738,13 @@ mod tests {
     fn leaving_continuous_mode_clears_acquire_busy() {
         let mut m = FakeMeter::new(&[]);
         let (acquire, acquire_mode) = (m.base.nd_params.acquire, m.base.params.acquire_mode);
-        m.qe_write_int32(acquire, 0, 1).unwrap();
-        m.qe_write_int32(acquire_mode, 0, QeAcquireMode::Single as i32)
+        m.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 1)
             .unwrap();
+        m.qe_write_int32(
+            &AsynUser::new(acquire_mode).with_addr(0),
+            QeAcquireMode::Single as i32,
+        )
+        .unwrap();
         assert_eq!(acquire_busy(&m), 0);
     }
 
@@ -1723,8 +1752,10 @@ mod tests {
     fn a_channel_range_goes_to_the_per_channel_setter() {
         let mut m = FakeMeter::new(&[]);
         let range = m.base.params.range;
-        m.qe_write_int32(range, 0, 1).unwrap();
-        m.qe_write_int32(range, 2, 1).unwrap();
+        m.qe_write_int32(&AsynUser::new(range).with_addr(0), 1)
+            .unwrap();
+        m.qe_write_int32(&AsynUser::new(range).with_addr(2), 1)
+            .unwrap();
         assert_eq!(
             m.calls,
             [
