@@ -37,10 +37,12 @@ fn arg_string(args: &[ArgValue], i: usize) -> Result<Option<String>, String> {
     }
 }
 
-fn arg_int(args: &[ArgValue], i: usize) -> Option<i64> {
+/// `iocshArgBuf::ival`: C iocsh passes 0 for a missing Int arg, and
+/// `configCallFunc` forwards it unchecked (`drvAmptek.cpp:1111-1114`).
+fn arg_ival(args: &[ArgValue], i: usize) -> i64 {
     match args.get(i) {
-        Some(ArgValue::Int(n)) => Some(*n),
-        _ => None,
+        Some(ArgValue::Int(n)) => *n,
+        _ => 0,
     }
 }
 
@@ -93,9 +95,9 @@ async fn main() -> CaResult<()> {
              create an Amptek DP5 asyn port (interface must be 0, Ethernet)",
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let port_name = arg_string(args, 0)?.ok_or("portName required")?;
-                let interface = arg_int(args, 1).ok_or("interface required")? as i32;
+                let interface = arg_ival(args, 1) as i32;
                 let address_info = arg_string(args, 2)?.ok_or("addressInfo required")?;
-                let direct_mode = arg_int(args, 3).unwrap_or(0) != 0;
+                let direct_mode = arg_ival(args, 3) != 0;
 
                 let driver = AmptekDriver::new(&port_name, interface, &address_info, direct_mode)
                     .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
@@ -120,4 +122,17 @@ async fn main() -> CaResult<()> {
     app = dev_mca_asyn::register_dev_mca_asyn(app);
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_int_args_read_as_zero() {
+        let args = [ArgValue::String("P".into()), ArgValue::Missing];
+        assert_eq!(arg_ival(&args, 1), 0);
+        assert_eq!(arg_ival(&args, 3), 0);
+        assert_eq!(arg_ival(&[ArgValue::Int(1)], 0), 1);
+    }
 }
