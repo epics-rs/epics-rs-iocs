@@ -132,8 +132,11 @@ impl FaulhaberController {
 
     /// Send a query to `node` and return its reply, trimmed of framing.
     fn query(&self, node: usize, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(node, cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C send_mess/recv_mess write then read with no flush, so one stray
+        // line shifts every later reply; write_read flushes first.
+        let raw = self
+            .handle
+            .write_read(0, &Self::framed(node, cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text
             .trim_matches(|c: char| c.is_control() || c.is_whitespace())
