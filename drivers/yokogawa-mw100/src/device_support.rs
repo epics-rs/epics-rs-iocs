@@ -777,6 +777,19 @@ impl DeviceSupport for MwDevice {
             return Ok(WriteStart::Completed);
         };
         let command = output_command(*op, record)?;
+        // devMW100_bo.c:194-197: REC_TRIG and REC_ERROR drop VAL back to 0
+        // on the completing pass. Completion re-enters no device code, so
+        // it is cleared here, still before the cycle's monitor.
+        if matches!(
+            op,
+            Operation::InputTrig
+                | Operation::OutputTrig
+                | Operation::InfoTrig
+                | Operation::StatTrig
+                | Operation::ErrorClearSet
+        ) {
+            record.put_field("VAL", EpicsValue::Enum(0))?;
+        }
         if instrument.submit_write(command, done.write_done()) {
             Ok(WriteStart::Pending)
         } else {
@@ -891,7 +904,7 @@ pub fn factory(
 mod tests {
     use super::*;
     use crate::instrument::test_support::{
-        connect_default_fixture, connect_fixture_then, one_record_fd1_binary,
+        connect_default_fixture, connect_fixture_then, empty_fo1_binary, one_record_fd1_binary,
     };
     use epics_rs::base::runtime::task::test_block_on;
     use epics_rs::base::server::database::{PvDatabase, WriteDone};
@@ -1411,6 +1424,26 @@ mod tests {
                 device_thread.join().unwrap().last().unwrap(),
                 "FD1,001,A300\r\n"
             );
+        });
+    }
+
+    #[test]
+    fn trigger_and_error_clear_reset_val_alarm_ack_does_not() {
+        test_block_on(async {
+            for (link, reply, expect) in [
+                ("mw100dev INP_TRIG", one_record_fd1_binary(), 0),
+                ("mw100dev OUT_TRIG", empty_fo1_binary(), 0),
+                ("mw100dev ERROR_CLEAR", b"E0\r\n".to_vec(), 0),
+                ("mw100dev OPMODE", b"E0\r\n".to_vec(), 1),
+            ] {
+                let (db, device_thread) =
+                    wired_output(Box::new(BoRecord::new(0)), link, vec![reply]).await;
+                put_and_complete(&db, EpicsValue::Enum(1)).await;
+                device_thread.join().unwrap();
+                let rec = db.get_record("TEST").unwrap();
+                let val = rec.read().record.get_field("VAL");
+                assert_eq!(val, Some(EpicsValue::Enum(expect)), "{link}");
+            }
         });
     }
 
