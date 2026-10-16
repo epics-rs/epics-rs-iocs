@@ -310,6 +310,34 @@ impl MythenDriver {
     }
 }
 
+/// C's `int status` in `writeInt32` / `writeFloat64`: `status |= step()` keeps
+/// going after a failed step, and the write returns the OR of every status.
+#[derive(Default)]
+struct StatusOr {
+    bits: i32,
+    err: Option<AsynError>,
+}
+
+impl StatusOr {
+    /// `status |= step`.
+    fn or(&mut self, step: AsynResult<()>) {
+        if let Err(e) = step {
+            self.bits |= e.status() as i32;
+            self.err = Some(e);
+        }
+    }
+
+    /// `status = step`.
+    fn set(&mut self, step: AsynResult<()>) {
+        *self = Self::default();
+        self.or(step);
+    }
+
+    fn into_result(self) -> AsynResult<()> {
+        self.err.map_or(Ok(()), Err)
+    }
+}
+
 impl PortDriver for MythenDriver {
     fn base(&self) -> &PortDriverBase {
         &self.ad.port_base
@@ -336,48 +364,50 @@ impl PortDriver for MythenDriver {
             });
         }
 
-        self.ad.port_base.set_int32_param(reason, addr, value)?;
+        let mut status = StatusOr::default();
+        status.or(self.ad.port_base.set_int32_param(reason, addr, value));
 
         if reason == acquire {
             let read_mode = self.int_param(self.p.read_mode);
             self.det.state.read_mode.store(read_mode, Ordering::Release);
-            self.set_acquire(value)?;
+            status.or(self.set_acquire(value));
         } else {
             let image_mode = self.int_param(self.ad.params.image_mode);
             if reason == self.p.setting {
-                self.det.load_settings(value)?;
+                status.or(self.det.load_settings(value));
             } else if reason == self.p.use_flat_field {
-                self.det.set_flat_field_correction(value)?;
+                status.or(self.det.set_flat_field_correction(value));
             } else if reason == self.p.use_count_rate {
-                self.det.set_rate_correction(value)?;
+                status.or(self.det.set_rate_correction(value));
             } else if reason == self.p.use_bad_chan_intrpl {
-                self.det.set_bad_chan_intrpl(value)?;
+                status.or(self.det.set_bad_chan_intrpl(value));
             } else if reason == self.p.bit_depth {
-                self.det.set_bit_depth(value)?;
+                status.or(self.det.set_bit_depth(value));
             } else if reason == self.p.num_gates {
-                self.det.set_num_gates(value)?;
+                status.set(self.det.set_num_gates(value));
             } else if reason == self.p.use_gates {
-                self.det.set_use_gates(value)?;
+                status.set(self.det.set_use_gates(value));
             } else if reason == self.p.num_frames {
-                self.det.set_frames(value, image_mode)?;
+                status.or(self.det.set_frames(value, image_mode));
             } else if reason == self.p.trigger {
-                self.det.set_trigger(value)?;
+                status.or(self.det.set_trigger(value));
             } else if reason == self.p.reset {
                 // C flips SD_RESET on for the duration of the reset
                 // (mythen.cpp:665-673).
-                self.ad.port_base.set_int32_param(self.p.reset, 0, 1)?;
-                self.ad.port_base.call_param_callbacks(0)?;
-                self.det.reset()?;
-                self.ad.port_base.set_int32_param(self.p.reset, 0, 0)?;
+                let _ = self.ad.port_base.set_int32_param(self.p.reset, 0, 1);
+                let _ = self.ad.port_base.call_param_callbacks(0);
+                status.or(self.det.reset());
+                let _ = self.ad.port_base.set_int32_param(self.p.reset, 0, 0);
             } else if reason == self.ad.params.image_mode {
                 // The frame count the detector needs depends on the image mode.
                 let frames = self.det.state.frames.load(Ordering::Acquire);
-                self.det.set_frames(frames, value)?;
+                status.or(self.det.set_frames(frames, value));
             }
-            self.refresh_settings()?;
+            status.or(self.refresh_settings());
         }
 
-        self.ad.port_base.call_param_callbacks(addr)
+        status.or(self.ad.port_base.call_param_callbacks(addr));
+        status.into_result()
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -394,31 +424,37 @@ impl PortDriver for MythenDriver {
             });
         }
 
-        self.ad.port_base.set_float64_param(reason, addr, value)?;
+        let mut status = StatusOr::default();
+        status.set(self.ad.port_base.set_float64_param(reason, addr, value));
 
         if reason == self.ad.params.acquire_time {
-            self.det.set_exposure_time(value)?;
+            status.or(self.det.set_exposure_time(value));
         } else if reason == self.p.delay_time {
-            self.det.set_delay_after_trigger(value)?;
+            status.or(self.det.set_delay_after_trigger(value));
         } else if reason == self.p.threshold {
-            self.det.set_kthresh(value)?;
+            status.or(self.det.set_kthresh(value));
         } else if reason == self.p.energy {
-            self.det.set_energy(value)?;
+            status.or(self.det.set_energy(value));
         } else if reason == self.p.tau {
             // C zeroes the parameter and errors out on a value that is neither
             // -1 nor positive (mythen.cpp:361-368).
-            if !self.det.set_tau(value)? {
-                self.ad.port_base.set_float64_param(self.p.tau, 0, 0.0)?;
-                self.ad.port_base.call_param_callbacks(addr)?;
-                return Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("mythen: tau must be -1 or > 0, got {value}"),
-                });
-            }
+            status.or(match self.det.set_tau(value) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let _ = self.ad.port_base.set_float64_param(self.p.tau, 0, 0.0);
+                    let _ = self.ad.port_base.call_param_callbacks(addr);
+                    Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("mythen: tau must be -1 or > 0, got {value}"),
+                    })
+                }
+                Err(e) => Err(e),
+            });
         }
 
-        self.refresh_settings()?;
-        self.ad.port_base.call_param_callbacks(addr)
+        status.or(self.refresh_settings());
+        status.or(self.ad.port_base.call_param_callbacks(addr));
+        status.into_result()
     }
 
     /// `mythen::writeOctet` (mythen.cpp:1062-1085) handles no octet of its
