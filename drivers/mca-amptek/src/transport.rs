@@ -114,7 +114,7 @@ impl AmptekUdpTransport {
         Self::bind_on_command_port(DP5_COMMAND_PORT)
     }
 
-    fn bind_on_command_port(command_port: u16) -> io::Result<Self> {
+    pub(crate) fn bind_on_command_port(command_port: u16) -> io::Result<Self> {
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         socket.set_broadcast(true)?;
         Ok(AmptekUdpTransport {

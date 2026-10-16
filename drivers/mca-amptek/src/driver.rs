@@ -383,7 +383,20 @@ impl AmptekDriver {
                  by this port (USB/Serial are feasibility-gated -- see the mca-amptek crate doc)"
             )));
         }
+        Self::with_transport(
+            port_name,
+            address_info,
+            direct_mode,
+            AmptekUdpTransport::bind()?,
+        )
+    }
 
+    fn with_transport(
+        port_name: &str,
+        address_info: &str,
+        direct_mode: bool,
+        transport: AmptekUdpTransport,
+    ) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
             MAX_SCAS,
@@ -397,7 +410,6 @@ impl AmptekDriver {
 
         let mca = McaReason::create_params(&mut base)?;
         let amptek = AmptekReason::create_params(&mut base)?;
-        let transport = AmptekUdpTransport::bind()?;
 
         Ok(AmptekDriver {
             base,
@@ -562,7 +574,9 @@ impl AmptekDriver {
         self.base.set_int32_param(
             self.amptek[AmptekReason::SerialNumber as usize],
             0,
-            self.last_status.serial_number.unwrap_or(0) as i32,
+            // C stores `(unsigned long)-1` for an invalid serial; the int
+            // param reads it as -1 (`DP5Status.cpp:51-55`).
+            self.last_status.serial_number.map_or(-1, |n| n as i32),
         )?;
         let build = if self.last_status.firmware > 0x65 {
             i32::from(self.last_status.build)
@@ -1196,6 +1210,103 @@ impl PortDriver for AmptekDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::net::UdpSocket;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A loopback DP5: answers each request with `reply(request)`.
+    struct FakeDp5 {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeDp5 {
+        fn spawn(mut reply: impl FnMut(&[u8]) -> Option<Vec<u8>> + Send + 'static) -> (Self, u16) {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop2 = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                while !stop2.load(Ordering::Relaxed) {
+                    let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                        continue;
+                    };
+                    if let Some(r) = reply(&buf[..n]) {
+                        for chunk in r.chunks(1024) {
+                            socket.send_to(chunk, from).unwrap();
+                        }
+                    }
+                }
+            });
+            (
+                FakeDp5 {
+                    stop,
+                    thread: Some(thread),
+                },
+                port,
+            )
+        }
+    }
+
+    impl Drop for FakeDp5 {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn netfinder_reply() -> Vec<u8> {
+        let mut data = vec![0u8; 24];
+        data[20..24].copy_from_slice(&[127, 0, 0, 1]);
+        let mut raw = vec![protocol::SYNC1, protocol::SYNC2, 0x82, 0x08, 0, 24];
+        raw.extend_from_slice(&data);
+        raw.extend_from_slice(&[0, 0]);
+        raw
+    }
+
+    /// The default reply for each request `drvAmptek` sends; `status` is
+    /// the 64-byte status block.
+    fn default_reply(req: &[u8], status: &[u8; 64]) -> Option<Vec<u8>> {
+        match (req[2], req[3]) {
+            (0x03, 0x07) => Some(netfinder_reply()),
+            (0x01, 0x01) => Some(protocol::pack_out(0x80, 0x01, status)),
+            (0x20, 0x03) => Some(protocol::pack_out(0x82, 0x07, b"CLCK=AUTO;MCAC=1024;")),
+            (0x20, 0x02) | (0xF0, _) | (0x02, 0x04) => Some(protocol::pack_out(0xFF, 0, &[])),
+            _ => None,
+        }
+    }
+
+    /// A direct-mode driver wired to a [`FakeDp5`] on loopback.
+    fn driver_with_fake(
+        reply: impl FnMut(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+    ) -> (AmptekDriver, FakeDp5) {
+        let (fake, port) = FakeDp5::spawn(reply);
+        let transport = AmptekUdpTransport::bind_on_command_port(port).unwrap();
+        let driver = AmptekDriver::with_transport("fake", "127.0.0.1", true, transport).unwrap();
+        (driver, fake)
+    }
+
+    fn connect(driver: &mut AmptekDriver) -> AsynResult<()> {
+        PortDriver::connect(driver, &AsynUser::new(0))
+    }
+
+    /// `SerialNumber = -1` when `RAW[29] >= 128` (`DP5Status.cpp:51-55`).
+    #[test]
+    fn invalid_serial_number_reads_minus_one() {
+        let mut status = [0u8; 64];
+        status[29] = 0x80;
+        let (mut driver, _fake) = driver_with_fake(move |req| default_reply(req, &status));
+        connect(&mut driver).unwrap();
+        let idx = driver.amptek[AmptekReason::SerialNumber as usize];
+        assert_eq!(driver.base.get_int32_param(idx, 0).unwrap(), -1);
+    }
 
     #[test]
     fn all_covers_every_reason_in_declaration_order() {
