@@ -129,13 +129,11 @@ impl PortDriver for Mar345Driver {
         let params = self.ad.params;
         let p = self.p;
 
-        // C: `setIntegerParam(function, value)` for every function.
-        self.ad
-            .port_base
-            .set_int32_param(function, user.addr, value)?;
+        // C: `status = setIntegerParam(function, value)` for every function,
+        // on list 0; it stands unless the base class replaces it.
+        let mut status = self.ad.port_base.set_int32_param(function, 0, value);
 
         let idle = self.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
-        let mut status = Ok(());
         if function == params.acquire {
             if value != 0 && idle {
                 // Wake the mar345 task to acquire.
@@ -413,6 +411,17 @@ pub(crate) mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         std::mem::forget(det);
+    }
+
+    /// mar345.cpp:602: setIntegerParam(function, value) is list 0 whatever
+    /// the address.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let mut d = driver("MAR345_LIST0", 0);
+        let reason = d.p.num_erase;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        d.write_int32(&mut user, 3).unwrap();
+        assert_eq!(d.ad.port_base.get_int32_param(reason, 0).unwrap(), 3);
     }
 
     /// A non-detector mode is ADDriver::setShutter inside the write
