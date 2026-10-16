@@ -209,7 +209,7 @@ impl PortDriver for MarccdDriver {
                 line!(),
                 format_args!(
                     "marCCD:writeInt32: error, status={} function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -244,7 +244,7 @@ impl PortDriver for MarccdDriver {
                 line!(),
                 format_args!(
                     "marCCD:writeFloat64: error, status={} function={function}, value={value:.6}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -481,6 +481,43 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(d.ad.port_base.get_int32_param(int, 0).unwrap(), 3);
         assert_eq!(d.ad.port_base.get_float64_param(float, 0).unwrap(), 2.5);
+    }
+
+    /// marCCD.cpp:1316-1319, :1352-1355 print asynParamWrongType for a write
+    /// of the other type.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MARCCD_STATUS";
+        let mut d = driver(port);
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let user = |reason| {
+            let mut user = AsynUser::new(reason);
+            user.trace = Some(UserTrace {
+                manager: manager.clone(),
+                port: port.into(),
+            });
+            user
+        };
+        let (float, int) = (d.p.tiff_timeout, d.p.gate_mode);
+        assert!(d.write_int32(&mut user(float), 1).is_err());
+        assert!(d.write_float64(&mut user(int), 1.0).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        for line in [
+            format!("marCCD:writeInt32: error, status=8 function={float}, value=1"),
+            format!("marCCD:writeFloat64: error, status=8 function={int}, value=1.000000"),
+        ] {
+            assert!(text.contains(&line), "{line}: {text}");
+        }
     }
 
     /// Build the detector on `name`'s fake server, then send it a `set_bin`.
