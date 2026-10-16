@@ -27,7 +27,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -348,8 +348,17 @@ impl AsynMotor for Esp300Axis {
         // C passes the gain through its uniform `dval * drive_resolution`
         // conversion even though the gain is dimensionless; kept bug-for-bug
         // so the wire bytes match.
+        // C's ESP300 axis divides FR? by a QS? that can read 0, so its gain
+        // write sends `inf`/`nan`; that C defect is not copied.
+        let value = gain * self.drive_resolution;
+        if !value.is_finite() {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("ESP300 axis {a}: drive resolution is not finite"),
+            });
+        }
         let ctrl = self.lock();
-        ctrl.write(&format!("{a}{cc}{:.6};{a}UF", gain * self.drive_resolution))
+        ctrl.write(&format!("{a}{cc}{value:.6};{a}UF"))
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
@@ -435,9 +444,10 @@ impl AsynMotor for Esp300Axis {
 mod tests {
     use super::*;
 
-    /// Answers `VE?` and fails every other read.
+    /// Answers `VE?` and the commands in `replies`; fails every other read.
     struct IdentOnly {
         base: epics_rs::asyn::port::PortDriverBase,
+        replies: &'static [(&'static str, &'static str)],
         reply: Vec<u8>,
     }
 
@@ -449,10 +459,14 @@ mod tests {
             &mut self.base
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-            self.reply = if data == b"VE?" {
-                b"ESP300 Version 3.08 09/09/02".to_vec()
-            } else {
-                Vec::new()
+            let cmd = String::from_utf8_lossy(data);
+            self.reply = match cmd.as_ref() {
+                "VE?" => b"ESP300 Version 3.08 09/09/02".to_vec(),
+                c => self
+                    .replies
+                    .iter()
+                    .find(|(k, _)| *k == c)
+                    .map_or_else(Vec::new, |(_, v)| v.as_bytes().to_vec()),
             };
             Ok(data.len())
         }
@@ -479,6 +493,7 @@ mod tests {
 
         let port = IdentOnly {
             base: PortDriverBase::new("esp300IdentOnly", 1, PortFlags::default()),
+            replies: &[],
             reply: Vec::new(),
         };
         let (rt, _actor) = create_port_runtime(
@@ -496,6 +511,45 @@ mod tests {
         assert_eq!(ctrl.num_axes(), ESP300_MAX_AXES);
         let axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         assert!(!axis.encoder_present);
+    }
+
+    /// A QS? of 0 keeps the axis, as C does, with an infinite resolution
+    /// that the gain write refuses rather than sending `inf`.
+    #[test]
+    fn a_non_finite_resolution_never_reaches_the_wire() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = IdentOnly {
+            base: PortDriverBase::new("esp300ZeroQs", 1, PortFlags::default()),
+            replies: &[
+                ("TB?", "9, 0, AXIS NUMBER OUT OF RANGE"),
+                ("01ZB?", "200"),
+                ("01FR?", "0.001"),
+                ("01QS?", "0"),
+            ],
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("esp300ZeroQs").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Esp300Controller::new(io).unwrap();
+        let mut axis = Esp300Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        assert!(axis.drive_resolution.is_infinite());
+        let user = AsynUser::default();
+        assert!(
+            axis.set_pid_gain(&user, PidGainKind::Proportional, 0.5)
+                .is_err()
+        );
     }
 
     #[test]
