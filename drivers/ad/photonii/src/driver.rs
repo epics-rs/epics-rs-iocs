@@ -160,11 +160,11 @@ impl PortDriver for PhotonIIDetector {
             .port_base
             .set_int32_param(reason, user.addr, value)?;
 
-        let mut status = Ok(());
+        let status: AsynResult<()> = Ok(());
         if reason == self.ad.params.acquire {
             self.set_acquire(value, was_acquiring)?;
         } else if reason == self.params.shutter {
-            status = self.ad.set_shutter(value != 0);
+            self.ad.set_shutter(value != 0);
         } else if reason == self.params.dr_sum_enable {
             self.command(&protocol::set_dr_summation(value))?;
         } else if reason == self.ad.params.trigger_mode {

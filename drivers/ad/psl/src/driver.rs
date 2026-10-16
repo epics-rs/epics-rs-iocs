@@ -521,7 +521,8 @@ impl PortDriver for PslDetector {
         } else if reason < self.params.camera_name {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
             if reason == p.shutter_control {
-                self.ad.set_shutter(value != 0)
+                self.ad.set_shutter(value != 0);
+                Ok(())
             } else {
                 self.ad.write_int32_pool(reason, value).map(drop)
             }

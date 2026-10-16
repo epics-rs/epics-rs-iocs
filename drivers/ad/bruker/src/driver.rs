@@ -192,11 +192,12 @@ impl BrukerDetector {
     }
 
     /// BIS drives the shutter itself when the shutter is wired to the detector
-    /// (C `BISDetector::setShutter`).
-    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+    /// (C `BISDetector::setShutter`, void like `ADDriver::setShutter`).
+    fn set_shutter(&mut self, open: bool) {
         let p = self.ad.params;
         if ShutterMode::from_i32(self.get_i32(p.shutter_mode)) != Some(ShutterMode::DetectorOnly) {
-            return self.ad.set_shutter(open);
+            self.ad.set_shutter(open);
+            return;
         }
 
         let open_delay = self
@@ -223,8 +224,7 @@ impl BrukerDetector {
         if delay > 0.0 {
             std::thread::sleep(std::time::Duration::from_secs_f64(delay));
         }
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
     }
 }
 
@@ -278,14 +278,14 @@ impl PortDriver for BrukerDetector {
                 });
             }
         } else if reason == p.shutter_control {
-            self.set_shutter(value != 0)?;
+            self.set_shutter(value != 0);
         } else if reason == q.start_scan {
             self.start_scan()?;
         } else if reason == q.epics_shutter {
             // C called `ADDriver::setShutter` from the acquisition task, going
             // past its own override on purpose: in EPICS shutter mode the
             // shutter is not BIS's to drive.
-            self.ad.set_shutter(value != 0)?;
+            self.ad.set_shutter(value != 0);
         } else {
             status = self.ad.write_int32_pool(reason, value).map(|_| ());
         }

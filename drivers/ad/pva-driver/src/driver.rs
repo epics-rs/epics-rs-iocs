@@ -108,11 +108,11 @@ impl PortDriver for PvaDriver {
         } else if reason < self.pva_params.overrun_counter {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`. C
             // overwrites its status with `callParamCallbacks()`'s.
-            let _ = if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0)
+            if reason == self.ad.params.shutter_control {
+                self.ad.set_shutter(value != 0);
             } else {
-                self.ad.write_int32_pool(reason, value).map(|_| ())
-            };
+                let _ = self.ad.write_int32_pool(reason, value);
+            }
         }
 
         self.ad.port_base.call_param_callbacks(0)?;

@@ -109,7 +109,8 @@ impl PortDriver for URLDriver {
         } else if reason < self.url_params.url_name {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
             if reason == self.ad.params.shutter_control {
-                self.ad.set_shutter(value != 0)
+                self.ad.set_shutter(value != 0);
+                Ok(())
             } else {
                 self.ad.write_int32_pool(reason, value).map(|_| ())
             }
