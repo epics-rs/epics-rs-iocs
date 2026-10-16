@@ -448,7 +448,13 @@ mod tests {
         assert_eq!(f.get_f64(s.period, 0), 1.0);
         assert_eq!(f.get_f64(s.phase, 0), 0.0);
         assert_eq!(f.get_f64(s.noise, 0), 0.0);
-        assert_eq!(f.get_i32(f.det.nd.array_callbacks, 0), 1);
+        // ADCSimDetector.cpp:97-104 and asynNDArrayDriver leave
+        // NDArrayCallbacks to the ArrayCallbacks record's PINI.
+        let callbacks = f.det.nd.array_callbacks;
+        assert!(matches!(
+            f.det.port_base.get_int32_param(callbacks, 0),
+            Err(AsynError::ParamUndefined(r)) if r == callbacks
+        ));
         assert_eq!(
             f.det
                 .port_base
