@@ -107,16 +107,16 @@ impl WaveDigScan {
     }
 }
 
-/// Start the waveform digitizer (analog input scan). C `startWaveDig`;
-/// `Ok` carries the parameters it sets, the error the uldaq status it
-/// reported.
+/// Start the waveform digitizer (analog input scan). C `startWaveDig`:
+/// the uldaq status it reported, and the parameters it set on the way, which
+/// include DWELL_ACTUAL even when AInScan refused.
 pub fn start_wave_dig(
     device: &DaqDevice,
     state: &mut WaveDigState,
     params: &MultiFunctionParams,
     scan: &WaveDigScan,
     trace: &SelfTrace,
-) -> Result<Vec<ParamSetValue>, UlError> {
+) -> (UlError, Vec<ParamSetValue>) {
     const FUNCTION: &str = "startWaveDig";
     let WaveDigScan {
         first_chan,
@@ -155,7 +155,7 @@ pub fn start_wave_dig(
         "Calling ALoadQueue",
     );
     if status != 0 {
-        return Err(status);
+        return (status, Vec::new());
     }
 
     let mut rate = if dwell > 0.0 { 1.0 / dwell } else { 1000.0 };
@@ -191,12 +191,22 @@ pub fn start_wave_dig(
         &mut rate,
         &mut state.scan_buffer,
     );
+    // C converts the rate back to the dwell whatever the scan returned, and
+    // shows a rate the device refused as -9999.
+    state.dwell_actual = 1.0 / rate;
+    let dwell_actual = ParamSetValue::new(
+        params.wave_dig_dwell_actual,
+        0,
+        ParamValue::Float64(match result {
+            Err(ref e) if e.code == ERR_BAD_RATE => -9999.0,
+            _ => state.dwell_actual,
+        }),
+    );
     let status = trace.report(&result, FUNCTION, "Calling AInScan");
     if status != 0 {
-        return Err(status);
+        return (status, vec![dwell_actual]);
     }
 
-    state.dwell_actual = 1.0 / rate;
     state.running = true;
     let last_chan = first_chan as i32 + num_chans as i32 - 1;
     trace.print(
@@ -207,20 +217,19 @@ pub fn start_wave_dig(
         ),
     );
 
-    Ok(vec![
-        ParamSetValue::new(params.wave_dig_current_point, 0, ParamValue::Int32(0)),
-        ParamSetValue::new(
-            params.wave_dig_dwell_actual,
-            0,
-            ParamValue::Float64(state.dwell_actual),
-        ),
-        ParamSetValue::new(params.wave_dig_run, 0, ParamValue::Int32(1)),
-        ParamSetValue::new(
-            params.wave_dig_total_time,
-            0,
-            ParamValue::Float64(state.dwell_actual * num_points as f64),
-        ),
-    ])
+    (
+        0,
+        vec![
+            ParamSetValue::new(params.wave_dig_current_point, 0, ParamValue::Int32(0)),
+            dwell_actual,
+            ParamSetValue::new(params.wave_dig_run, 0, ParamValue::Int32(1)),
+            ParamSetValue::new(
+                params.wave_dig_total_time,
+                0,
+                ParamValue::Float64(state.dwell_actual * num_points as f64),
+            ),
+        ],
+    )
 }
 
 /// Number of complete scan points behind `current_index`.
@@ -303,10 +312,8 @@ pub fn stop_wave_dig(
         "stopWaveDig",
         "Stopping AIn scan",
     );
-    if let Some(scan) = restart
-        && let Ok(started) = start_wave_dig(device, state, params, scan, trace)
-    {
-        updates.extend(started);
+    if let Some(scan) = restart {
+        updates.extend(start_wave_dig(device, state, params, scan, trace).1);
     }
     updates
 }

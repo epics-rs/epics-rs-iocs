@@ -628,13 +628,10 @@ impl PortDriver for MultiFunctionDriver {
                     |r, a| self.base.get_int32_param(r, a),
                     |r, a| self.base.get_float64_param(r, a),
                 )?;
-                match wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace)
-                {
-                    Ok(started) => wave_arrays = started,
-                    Err(code) => {
-                        status = code;
-                        self.base.params.set_int32(reason, addr, 0)?;
-                    }
+                (status, wave_arrays) =
+                    wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace);
+                if status != 0 {
+                    self.base.params.set_int32(reason, addr, 0)?;
                 }
             } else if value == 0 && st.wave_dig.running {
                 let restart = WaveDigScan::read_restart(
