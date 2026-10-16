@@ -1,26 +1,88 @@
-//! `motorSimCreateController` / `motorSimConfigAxis` iocsh commands for the
-//! simulated motor driver.
+//! `motorSimCreateController` / `motorSimConfigAxis` (motorSimDriver.cpp)
+//! and `motorSimCreate` (drvMotorSim.c) iocsh commands for the simulated
+//! motor driver.
 //!
 //! `motorSimConfigAxis` reconfigures an axis *after* its controller was
 //! created, so [`MotorSimHolder`] keeps the concrete [`MotorSimAxis`]
 //! handles, the same allocations the pollers drive, keyed by port and axis.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
 use motor_common::iocsh::{arg_int_opt, arg_int_req, arg_str_req, req_int, req_string};
-use motor_common::{asyn_user, install, register_port};
+use motor_common::model1::{Model1, c_int};
+use motor_common::{asyn_user, install, model1_device, register_port};
 
 use crate::motorsim::{
-    DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, MotorSimAxis,
+    DEFAULT_HI_LIMIT, DEFAULT_HOME, DEFAULT_LOW_LIMIT, DEFAULT_START, DrvMotorSimAxis, MotorSimAxis,
 };
 
 /// C's `motorSimTask` updates every axis each `DELTA` (motorSimDriver.cpp:244),
 /// moving or not.
 const POLL_MS: u64 = 100;
+
+/// `device(motor,VME_IO,devMotorSim,"Motor Simulation")`
+/// (motorSimSupport.dbd:1).
+static DEV_MOTOR_SIM: DevSup = model1_device("devMotorSim", "Motor Simulation");
+
+/// drvMotorSim.c has no `Setup`; its task calls back every `DELTA`.
+static MOTOR_SIM: Model1 = Model1::new(&DEV_MOTOR_SIM, i32::MAX, (1000 / POLL_MS) as i32);
+
+/// `motorSimCreate(card, signal, lowLimit, hiLimit, home, nCards, nSignals,
+/// startPosn)`: axes `signal..signal+nSignals` of cards `card..card+nCards`
+/// for `DTYP "Motor Simulation"`, `OUT "#C card S signal @motorSim"`.
+pub fn motor_sim_create_command() -> CommandDef {
+    MOTOR_SIM.register_row();
+    let created: Mutex<HashSet<(i32, i32)>> = Mutex::new(HashSet::new());
+    CommandDef::new(
+        "motorSimCreate",
+        vec![
+            arg_int_req("Card"),
+            arg_int_req("Signal"),
+            // C labels these "High limit", "Low limit" but passes them to
+            // motorSimCreate(card, axis, lowLimit, hiLimit, ...), and every
+            // startup file gives low first.
+            arg_int_req("Low limit"),
+            arg_int_req("High limit"),
+            arg_int_req("Home position"),
+            arg_int_req("Num cards"),
+            arg_int_req("Num signals"),
+            arg_int_req("Start posn"),
+        ],
+        "motorSimCreate(card, signal, lowLimit, hiLimit, home, nCards, nSignals, startPosn)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            let signal = c_int(args, 1);
+            let low = c_int(args, 2);
+            let hi = c_int(args, 3);
+            let home = c_int(args, 4);
+            let num_cards = c_int(args, 5).max(1);
+            let num_signals = c_int(args, 6).max(1);
+            println!(
+                "Creating motor simulator: card: {card}, axis: {signal}, hi: {hi}, low {low}, home: {home}, ncards: {num_cards}, naxis: {num_signals}"
+            );
+            let mut created = created.lock().unwrap_or_else(|e| e.into_inner());
+            for c in card..card.saturating_add(num_cards) {
+                for s in signal..signal.saturating_add(num_signals) {
+                    if !created.insert((c, s)) {
+                        println!("Motor for card {c}, signal {s} already exists");
+                        continue;
+                    }
+                    let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(
+                        DrvMotorSimAxis::new(low as f64, hi as f64, home as f64),
+                    ));
+                    MOTOR_SIM.install(ctx, c, s, motor)?;
+                    println!("Created motor for card {c}, signal {s} OK");
+                }
+            }
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
 
 /// The concrete axes keyed by `"{portName}:{axis}"` for `motorSimConfigAxis`.
 pub struct MotorSimHolder {
