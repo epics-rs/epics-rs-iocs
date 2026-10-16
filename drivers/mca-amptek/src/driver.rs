@@ -356,6 +356,8 @@ pub struct AmptekDriver {
     acquiring: bool,
     /// `drvAmptek::failedSends_`.
     failed_sends: u32,
+    /// `CConsoleHelper::NumDevices`: devices the last connect attempt found.
+    num_devices: usize,
     /// `CConsoleHelper::DP5Stat.m_DP5_Status`, the last successfully
     /// decoded status block. Initialized from an all-zero block (matching
     /// a zero-initialized C struct member) rather than `Option` -- every
@@ -425,6 +427,7 @@ impl AmptekDriver {
             target: None,
             acquiring: false,
             failed_sends: 0,
+            num_devices: 0,
             last_status: status::process_status(&[0u8; 64]),
             spectrum: Vec::new(),
             hw_cfg_dp5: String::new(),
@@ -447,6 +450,7 @@ impl AmptekDriver {
             return;
         }
         self.target = None;
+        self.num_devices = 0;
         self.base.set_connected(false);
         let _ = self.set_params_alarm(alarm_status::COMM_ALARM, AlarmSeverity::Invalid as u16);
     }
@@ -529,16 +533,24 @@ impl AmptekDriver {
             protocol_error(format!("Cannot resolve address: {}", self.address_info))
         })?;
 
-        let (confirmed, _num_devices) = if self.direct_mode {
-            self.transport.connect_direct(ip)?
+        if self.direct_mode {
+            let (confirmed, num_devices) = self.transport.connect_direct(ip)?;
+            self.num_devices = num_devices;
+            if !confirmed {
+                return Err(protocol_error(format!(
+                    "Network DPP device {} not found",
+                    self.address_info
+                )));
+            }
         } else {
-            self.transport.connect_default(ip)?
-        };
-        if !confirmed {
-            return Err(protocol_error(format!(
-                "DPP device {} not found",
-                self.address_info
-            )));
+            let (confirmed, num_devices) = self.transport.connect_default(ip)?;
+            self.num_devices = num_devices;
+            if !confirmed {
+                return Err(protocol_error(format!(
+                    "DPP device {} not found, total devices found={}",
+                    self.address_info, self.num_devices
+                )));
+            }
         }
 
         // `CH_.DP5Stat.m_DP5_Status.SerialNumber = 0;` before the status
@@ -1049,6 +1061,7 @@ impl PortDriver for AmptekDriver {
             }
             Err(e) => {
                 self.target = None;
+                self.num_devices = 0;
                 Err(e)
             }
         }
@@ -1479,6 +1492,24 @@ mod tests {
         let user = AsynUser::new(driver.mca[McaReason::Acquiring as usize]);
         assert!(driver.read_int32(&user).is_err());
         assert!(driver.acquiring);
+    }
+
+    /// C's two "not found" texts (`drvAmptek.cpp:315-326`).
+    #[test]
+    fn connect_not_found_texts_match_c() {
+        let (mut driver, _fake) = driver_with_fake(|_| None);
+        let err = connect(&mut driver).unwrap_err();
+        assert_eq!(err_message(&err), "Network DPP device 127.0.0.1 not found");
+
+        // No broadcast interface: the search finds nothing.
+        let transport = AmptekUdpTransport::bind_on_command_port(1).unwrap();
+        let mut driver =
+            AmptekDriver::with_transport("fake", "127.0.0.1", false, transport).unwrap();
+        let err = connect(&mut driver).unwrap_err();
+        assert_eq!(
+            err_message(&err),
+            "DPP device 127.0.0.1 not found, total devices found=0"
+        );
     }
 
     #[test]
