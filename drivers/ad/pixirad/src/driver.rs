@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -75,7 +76,8 @@ impl PixiradDetector {
         max_memory: usize,
         shared: Arc<SharedState>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad =
+            ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory, ASYN_CANBLOCK)?;
         let params = PixiradParams::create(&mut ad.port_base)?;
         let p = ad.params;
 
