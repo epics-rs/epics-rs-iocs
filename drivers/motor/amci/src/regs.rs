@@ -35,7 +35,6 @@ const MODBUS_READ: &str = "MODBUS_READ";
 pub struct ModbusRegs {
     handle: PortHandle,
     data_reason: usize,
-    read_reason: usize,
     timeout: Duration,
 }
 
@@ -51,14 +50,9 @@ impl ModbusRegs {
             .drv_user_create_blocking(&DrvUserRequest::new(MODBUS_DATA, 0))
             .map_err(|e| e.to_string())?
             .reason;
-        let read_reason = handle
-            .drv_user_create_blocking(&DrvUserRequest::new(MODBUS_READ, 0))
-            .map_err(|e| e.to_string())?
-            .reason;
         Ok(Self {
             handle,
             data_reason,
-            read_reason,
             timeout,
         })
     }
@@ -99,14 +93,151 @@ impl ModbusRegs {
         )?;
         Ok(())
     }
+}
 
-    /// Force an immediate synchronous poll cycle on this (read) port (C
+/// C `pasynUserForceRead_`: one per axis, a `pasynInt32SyncIO` user on the
+/// input port with drvInfo `"MODBUS_READ"`. As C's `connect`, a missing port
+/// leaves it unconnected and a refused drvInfo leaves it on reason 0.
+pub struct ForceRead {
+    handle: Option<PortHandle>,
+    reason: usize,
+    addr: i32,
+    timeout: Duration,
+    connected: bool,
+}
+
+impl ForceRead {
+    pub fn connect(port_name: &str, addr: i32, timeout: Duration) -> Self {
+        let handle = get_port(port_name).map(|entry| entry.handle);
+        let reason = handle.as_ref().and_then(|h| {
+            h.drv_user_create_blocking(&DrvUserRequest::new(MODBUS_READ, addr))
+                .ok()
+                .map(|r| r.reason)
+        });
+        Self {
+            connected: reason.is_some(),
+            handle,
+            reason: reason.unwrap_or(0),
+            addr,
+            timeout,
+        }
+    }
+
+    /// Whether C's `pasynInt32SyncIO->connect` would have returned success.
+    pub fn connected(&self) -> bool {
+        self.connected
+    }
+
+    /// C `pasynUserForceRead_->reason`.
+    pub fn reason(&self) -> usize {
+        self.reason
+    }
+
+    /// Force an immediate synchronous poll cycle (C
     /// `pasynInt32SyncIO->write(pasynUserForceRead_, 1, ...)`).
-    pub fn force_read(&self) -> AsynResult<()> {
-        self.handle.submit_blocking(
+    pub fn write(&self) -> AsynResult<()> {
+        let handle = self.handle.as_ref().ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynManager::queueLockPort not connected".into(),
+        })?;
+        handle.submit_blocking(
             RequestOp::Int32Write { value: 1 },
-            self.user(self.read_reason, 0),
+            AsynUser::new(self.reason)
+                .with_addr(self.addr)
+                .with_timeout(self.timeout),
         )?;
         Ok(())
+    }
+}
+
+/// A stand-in for a modbus-rs port that records every force-read it takes.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::sync::{Arc, Mutex};
+
+    use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::param::ParamType;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::user::AsynUser;
+
+    use super::{MODBUS_DATA, MODBUS_READ};
+
+    /// `(reason, addr)` of each `MODBUS_READ` write.
+    pub type Taken = Arc<Mutex<Vec<(usize, i32)>>>;
+
+    struct Modbus {
+        base: PortDriverBase,
+        read_reason: usize,
+        taken: Taken,
+    }
+
+    impl PortDriver for Modbus {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn read_int32(&mut self, _user: &AsynUser) -> AsynResult<i32> {
+            Ok(0)
+        }
+        fn write_int32(&mut self, user: &mut AsynUser, _value: i32) -> AsynResult<()> {
+            if user.reason == self.read_reason {
+                self.taken.lock().unwrap().push((user.reason, user.addr));
+            }
+            Ok(())
+        }
+        fn write_int32_array(&mut self, _user: &AsynUser, _data: &[i32]) -> AsynResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Publish port `name`; returns its `MODBUS_READ` reason and the record.
+    pub fn publish(name: &str) -> (usize, Taken) {
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let mut base = PortDriverBase::new(name, 100, flags);
+        base.create_param(MODBUS_DATA, ParamType::Int32).unwrap();
+        let read_reason = base.create_param(MODBUS_READ, ParamType::Int32).unwrap();
+        let taken = Taken::default();
+        let driver = Modbus {
+            base,
+            read_reason,
+            taken: taken.clone(),
+        };
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        std::mem::forget(rt);
+        (read_reason, taken)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_force_read_writes_modbus_read_at_its_address() {
+        let (reason, taken) = fake::publish("amciForceReadIn");
+        let fr = ForceRead::connect("amciForceReadIn", 0, Duration::from_secs(1));
+        assert!(fr.connected());
+        assert_eq!(fr.reason(), reason);
+        fr.write().unwrap();
+        assert_eq!(*taken.lock().unwrap(), [(reason, 0)]);
+    }
+
+    #[test]
+    fn a_missing_port_leaves_the_force_read_unconnected_on_reason_0() {
+        let fr = ForceRead::connect("amciForceReadMissing", 0, Duration::from_secs(1));
+        assert!(!fr.connected());
+        assert_eq!(fr.reason(), 0);
+        assert!(fr.write().is_err());
     }
 }

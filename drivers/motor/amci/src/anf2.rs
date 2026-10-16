@@ -40,7 +40,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
 
-use crate::regs::ModbusRegs;
+use crate::regs::{ForceRead, ModbusRegs};
 
 /// C `AXIS_REG_OFFSET` — asyn-address stride per axis on both ports.
 pub const AXIS_REG_OFFSET: i32 = 10;
@@ -71,6 +71,8 @@ const ZERO5: [i32; 5] = [0; 5];
 /// axis-created gate (C `axesCreated_`, guards `poll` until every axis
 /// configured on the controller has been constructed).
 pub struct Anf2Controller {
+    /// C `inputDriver_`, which each axis connects its force-read user to.
+    in_port: String,
     in_regs: ModbusRegs,
     out_regs: ModbusRegs,
     num_axes: usize,
@@ -83,6 +85,7 @@ impl Anf2Controller {
     /// `pasynInt32ArraySyncIO` connect loop).
     pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> Result<Self, String> {
         Ok(Self {
+            in_port: in_port.to_string(),
             in_regs: ModbusRegs::connect(in_port, TIMEOUT)?,
             out_regs: ModbusRegs::connect(out_port, TIMEOUT)?,
             num_axes,
@@ -108,16 +111,13 @@ impl Anf2Controller {
         self.out_regs
             .write_array(axis_no * AXIS_REG_OFFSET, data.to_vec())
     }
-
-    fn force_read(&self) -> AsynResult<()> {
-        self.in_regs.force_read()
-    }
 }
 
 /// One ANF2 axis. Implements [`AsynMotor`].
 pub struct Anf2Axis {
     controller: Arc<Mutex<Anf2Controller>>,
     axis_no: i32,
+    force_read: ForceRead,
     /// C `baseSpeed_` — used by [`Self::correct_accel`].
     base_speed: i32,
     /// C `jogging_` — `stop` skips the hold-move write while a jog is active.
@@ -145,9 +145,21 @@ impl Anf2Axis {
         base_speed: i32,
         homing_timeout: i32,
     ) -> AsynResult<Self> {
+        let in_port = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_port
+            .clone();
+        let force_read = ForceRead::connect(&in_port, 0, TIMEOUT);
+        if !force_read.connected() {
+            println!(
+                "{in_port}: Error, unable to connect pasynUserForceRead_ to Modbus input driver"
+            );
+        }
         let mut ax = Self {
             controller,
             axis_no,
+            force_read,
             base_speed,
             jogging: false,
             has_encoder: false,
@@ -389,7 +401,7 @@ impl AsynMotor for Anf2Axis {
         // `read_val`), and always return Ok so the framework publishes.
         let last = self.last.clone();
 
-        let _ = ctrl.force_read();
+        let _ = self.force_read.write();
 
         let position = ctrl
             .read32(self.axis_no, POS_RD_UPR)
