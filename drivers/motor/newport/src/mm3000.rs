@@ -35,6 +35,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, is_unsolicited_limit_error, nint};
 
@@ -88,9 +89,9 @@ pub enum AxisType {
 /// Parse the `RC` reply, e.g. `"1=stepper1.5M 2=dc 3=unused"` (C
 /// `motor_init` strtok loop): each `=`-separated segment's first
 /// space-delimited word is an axis type; `unused` ends the scan but is still
-/// counted. An unrecognized word is reported and counted as [`AxisType::
-/// Unused`] (C leaves the slot uninitialized and keeps going — the
-/// deterministic port choice is the inert type).
+/// counted. An unrecognized word is errlogged as C does and counted as
+/// [`AxisType::Unused`] (C leaves the slot uninitialized and keeps going —
+/// the deterministic port choice is the inert type).
 fn parse_rc_types(reply: &str) -> Vec<AxisType> {
     let mut types = Vec::new();
     for segment in reply.split('=').skip(1) {
@@ -103,7 +104,9 @@ fn parse_rc_types(reply: &str) -> Vec<AxisType> {
         } else if word.starts_with("dc") {
             types.push(AxisType::Dc);
         } else {
-            eprintln!("MM3000: invalid RC response segment = {word}");
+            errlog_vprintf(format_args!(
+                "drvMM3000:motor_init() - invalid RC response = {word}\n"
+            ));
             types.push(AxisType::Unused);
         }
     }
@@ -160,26 +163,24 @@ pub struct Mm3000Controller {
 impl Mm3000Controller {
     /// Connect and identify an MM3000 (C `motor_init` per-card block): probe
     /// with `VE` (existence), stop all motors (`ST`), read the ident (`VE`),
-    /// then read the axis configuration (`RC`). Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    /// then read the axis configuration (`RC`). `None` is C dropping a card
+    /// that never answers `VE`, without a word; past that C ignores every
+    /// status and a failed read is an empty reply. Performs blocking serial
+    /// I/O.
+    pub fn new(handle: SyncIOHandle) -> Option<Self> {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
             axis_types: Vec::new(),
             comm_state: CommState::Normal,
         };
-        let probe = ctrl.write_read("VE")?;
-        if probe.is_empty() {
-            return Err(mm_err("MM3000: no response to VE identity query".into()));
+        if ctrl.write_read("VE").unwrap_or_default().is_empty() {
+            return None;
         }
-        ctrl.write("ST")?; // stop all motors; the ST command has no reply
-        ctrl.ident = ctrl.write_read("VE")?;
-        let rc = ctrl.write_read("RC")?;
-        ctrl.axis_types = parse_rc_types(&rc);
-        if ctrl.axis_types.is_empty() {
-            return Err(mm_err(format!("MM3000: no axes in RC response \"{rc}\"")));
-        }
-        Ok(ctrl)
+        let _ = ctrl.write("ST"); // stop all motors; the ST command has no reply
+        ctrl.ident = ctrl.write_read("VE").unwrap_or_default();
+        ctrl.axis_types = parse_rc_types(&ctrl.write_read("RC").unwrap_or_default());
+        Some(ctrl)
     }
 
     /// Identity string from `VE`.
@@ -208,14 +209,20 @@ impl Mm3000Controller {
     /// Apply C `recv_mess`'s two retry rules to the first reply: an unsolicited
     /// hard-travel-limit error (`E35`..`E42`, an unconfirmed MM3000 firmware
     /// bug) is flushed with one extra read, and any other reply starting with
-    /// `E` is reported and re-read (C recurses; the retry normally times out,
-    /// which surfaces here as the read error).
+    /// `E` is reported through C's `errPrintf` and re-read (C recurses; the
+    /// retry normally times out, which surfaces here as the read error).
     fn read_reply(&self, mut reply: String) -> AsynResult<String> {
         if is_unsolicited_limit_error(&reply) {
             reply = self.read_once()?;
         }
         while reply.starts_with('E') {
-            eprintln!("MM3000 error response: {reply}");
+            // errPrintf(-1, ...): no errSym name, then a space for the nonzero
+            // status. The file and line are ours.
+            errlog_vprintf(format_args!(
+                " filename=\"{}\" line number={} {reply}\n",
+                file!(),
+                line!()
+            ));
             reply = self.read_once()?;
         }
         Ok(reply)
@@ -254,17 +261,13 @@ impl Mm3000Axis {
     /// quirk note — C always ends up with `encoder_present = YES`). Performs
     /// blocking serial I/O under the controller lock; on encoderless axes
     /// the probe costs one read timeout, as it does in C.
-    pub fn new(controller: Arc<Mutex<Mm3000Controller>>, axis: usize) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<Mm3000Controller>>, axis: usize) -> Self {
         let axis_type = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let axis_type = *ctrl
-                .axis_types()
-                .get(axis - 1)
-                .ok_or_else(|| mm_err(format!("MM3000 axis {axis}: not present in RC response")))?;
             let _ = ctrl.write_read(&format!("{axis}TPE"));
-            axis_type
+            ctrl.axis_types()[axis - 1]
         };
-        Ok(Self {
+        Self {
             controller,
             axis,
             axis_type,
@@ -272,7 +275,7 @@ impl Mm3000Axis {
             high_limit: None,
             low_limit: None,
             last_status: MotorStatus::default(),
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Mm3000Controller> {
@@ -506,6 +509,64 @@ impl AsynMotor for Mm3000Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers `VE` and fails every other read.
+    struct IdentOnly {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Vec<u8>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for IdentOnly {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.reply = if data == b"VE" {
+                b"MM3000 Version 2.4".to_vec()
+            } else {
+                Vec::new()
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            if reply.is_empty() {
+                return Err(mm_err("timeout".into()));
+            }
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// C keeps a card that answers `VE` whatever its `RC` read returns; a
+    /// failed one is an empty buffer and so no axes.
+    #[test]
+    fn an_unanswered_rc_keeps_the_controller_with_no_axes() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = IdentOnly {
+            base: PortDriverBase::new("mm3000IdentOnly", 1, PortFlags::default()),
+            reply: Vec::new(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("mm3000IdentOnly").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        assert!(ctrl.axis_types().is_empty());
+    }
 
     #[test]
     fn rc_reply_parses_types_and_counts_trailing_unused() {

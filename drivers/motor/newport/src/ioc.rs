@@ -1679,13 +1679,17 @@ pub fn mm3000_setup_command() -> CommandDef {
 /// controller's `RC` reports, including the trailing `unused` slot C counts.
 pub fn mm3000_config_command() -> CommandDef {
     model1_config_command("MM3000Config", &MM3000, |ctx, card, port| {
-        let handle = connect_serial(port, MM3000_TIMEOUT)?;
-        let controller = Mm3000Controller::new(handle).map_err(|e| format!("MM3000Config: {e}"))?;
+        // C drops a card it cannot connect to without a word.
+        let Ok(handle) = connect_serial(port, MM3000_TIMEOUT) else {
+            return Ok(());
+        };
+        let Some(controller) = Mm3000Controller::new(handle) else {
+            return Ok(());
+        };
         let num_axes = controller.axis_types().len();
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let ax = Mm3000Axis::new(controller.clone(), axis)
-                .map_err(|e| format!("MM3000Config: axis {axis}: {e}"))?;
+            let ax = Mm3000Axis::new(controller.clone(), axis);
             MM3000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
