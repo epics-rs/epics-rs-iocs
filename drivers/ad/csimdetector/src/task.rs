@@ -16,7 +16,6 @@ use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::driver::LastArray;
 use crate::params::CSimParams;
 use crate::rng::Rng;
 use crate::signals::compute_arrays;
@@ -32,7 +31,6 @@ pub(crate) struct CSimTaskContext {
     /// Index 0 publishes the 2-D array; `1..=MAX_SIGNALS` the 1-D signals.
     pub publishers: Vec<ArrayPublisher>,
     pub pool: DriverPool,
-    pub last_array: LastArray,
     pub nd: NDArrayDriverParams,
     pub sim: CSimParams,
 }
@@ -124,6 +122,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             NDDimension::new(MAX_SIGNALS),
             NDDimension::new(cfg.num_time_points),
         ];
+        // C releases pArrays[0] just before the alloc (ADCSimDetector.cpp:150-151).
+        ctx.pool.owner().store_array(0, None);
         let Ok(mut image) = ctx.pool.alloc(dims, cfg.data_type) else {
             continue;
         };
@@ -148,7 +148,7 @@ async fn sim_task(mut ctx: CSimTaskContext) {
         // attached.
 
         let image = image.share();
-        *ctx.last_array.lock() = Some(image.array().clone());
+        ctx.pool.owner().store_array(0, Some(image.array().clone()));
 
         // `doCallbacksGenericPointer(pImage, NDArrayData, 0)` — unconditional:
         // ADCSimDetector never tests `NDArrayCallbacks`.
