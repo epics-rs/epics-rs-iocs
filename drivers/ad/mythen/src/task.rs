@@ -9,7 +9,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAt
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::{DriverPool, PublishedArray};
+use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -62,16 +62,14 @@ pub fn start(
     mut start_rx: rt::CommandReceiver<()>,
 ) -> std::thread::JoinHandle<()> {
     rt::run_thread_named("mythenAcquisitionTask", move || async move {
-        // C `pArrays[0]`: the last image stays charged until the next one.
-        let mut last_image = None;
         while start_rx.recv().await.is_some() {
-            acquire(&shared, &mut last_image).await;
+            acquire(&shared).await;
         }
     })
 }
 
 /// One acquisition, from the start signal to the last frame.
-async fn acquire(s: &Arc<Shared>, last_image: &mut Option<PublishedArray>) {
+async fn acquire(s: &Arc<Shared>) {
     let det = &s.det;
     let read_mode = det.state.read_mode.load(Ordering::Acquire);
     let nbits = det.state.nbits.load(Ordering::Acquire);
@@ -104,7 +102,7 @@ async fn acquire(s: &Arc<Shared>, last_image: &mut Option<PublishedArray>) {
     while status != ADStatus::Error {
         match det.readout(expect, timeout) {
             Ok(reply) if reply.len() == expect.get() => {
-                if !publish(s, last_image, &reply, nmodules, decode_nbits).await {
+                if !publish(s, &reply, nmodules, decode_nbits).await {
                     status = read_status(s).await;
                 }
             }
@@ -164,13 +162,7 @@ async fn read_status(s: &Arc<Shared>) -> ADStatus {
 ///
 /// Returns false when the detector answered with an error word, which is what
 /// makes the caller re-read the status.
-async fn publish(
-    s: &Arc<Shared>,
-    last_image: &mut Option<PublishedArray>,
-    reply: &[u8],
-    nmodules: usize,
-    nbits: i32,
-) -> bool {
+async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> bool {
     let words = words_from_bytes(reply);
     match words.first() {
         // C `pData[0] < 0` — the detector reports a failed readout in the
@@ -220,6 +212,6 @@ async fn publish(
             .await;
     }
     // C releases the previous pArrays[0] after the callbacks (mythen.cpp:1010-1011).
-    *last_image = Some(array);
+    s.pool.owner().store_array(0, Some(array.array().clone()));
     true
 }

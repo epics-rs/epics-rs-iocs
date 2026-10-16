@@ -142,3 +142,28 @@ fn a_failed_get_settings_is_an_error_status() {
     let err = driver.write_int32(&mut user, 3).unwrap_err();
     assert_eq!(err.status(), AsynStatus::Error);
 }
+
+/// Every write below FIRST_SD_PARAM goes to `ADDriver::writeInt32`
+/// (mythen.cpp:1153), so PoolPreAllocBuffers copies the driver's pArrays[0].
+#[test]
+fn a_base_class_int32_write_reaches_the_ndarray_pool() {
+    use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+
+    let (mut driver, _received) = driver("MYTHEN_WS_POOL");
+    let image = driver
+        .ad
+        .pool
+        .alloc(vec![NDDimension::new(4)], NDDataType::UInt32)
+        .unwrap();
+    driver
+        .ad
+        .pool
+        .owner()
+        .store_array(0, Some(image.share().array().clone()));
+    let base = driver.ad.params.base;
+    let mut user = AsynUser::new(base.pool_num_pre_alloc_buffers);
+    driver.write_int32(&mut user, 2).unwrap();
+    let mut user = AsynUser::new(base.pool_pre_alloc);
+    driver.write_int32(&mut user, 1).unwrap();
+    assert_eq!(driver.ad.pool.num_free_buffers(), 2);
+}

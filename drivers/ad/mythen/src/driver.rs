@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::ad_core::runtime as rt;
@@ -343,6 +343,15 @@ impl StatusOr {
     }
 }
 
+impl ADDriver for MythenDriver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
+    }
+}
+
 impl PortDriver for MythenDriver {
     fn base(&self) -> &PortDriverBase {
         &self.ad.port_base
@@ -408,6 +417,9 @@ impl PortDriver for MythenDriver {
                 // The frame count the detector needs depends on the image mode.
                 let frames = self.det.state.frames.load(Ordering::Acquire);
                 status.or(self.det.set_frames(frames, value));
+            } else if reason < self.p.setting {
+                // `FIRST_SD_PARAM` is SDSetting (mythen.cpp:100, :1153).
+                status.set(ADDriver::ad_write_int32(self, user, value));
             }
             status.or(self.refresh_settings());
         }
