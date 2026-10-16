@@ -340,9 +340,9 @@ impl PortDriver for PilatusDriver {
         let payload = data.split(|&b| b == 0).next().unwrap_or(&[]);
         let value = String::from_utf8_lossy(payload).into_owned();
 
-        // C's setStringParam(function, value): list 0, and its status stands
-        // unless ADDriver::writeOctet replaces it.
-        let mut status = self
+        // C's setStringParam and ADDriver::writeOctet statuses are both
+        // overwritten by callParamCallbacks() (pilatusDetector.cpp:1630).
+        let _ = self
             .ad
             .port_base
             .set_string_param(function, 0, value.clone());
@@ -357,10 +357,10 @@ impl PortDriver for PilatusDriver {
         } else if function == p.cbf_template_file {
             self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
         } else if function < p.first() {
-            status = self.ad.write_octet(user, data).map(|_| ());
+            let _ = self.ad.write_octet(user, data);
         }
 
-        let _ = self.ad.port_base.call_param_callbacks(0);
+        let status = self.ad.port_base.call_param_callbacks(0);
         if let Err(e) = status {
             return Err(AsynError::Status {
                 status: e.status(),
@@ -578,8 +578,9 @@ mod tests {
         assert_eq!(base.get_string_param(p.header_string, 0).unwrap(), b"h");
     }
 
-    /// pilatusDetector.cpp:1441, :1578, :1633 carry the param library's
-    /// asynParamWrongType for a write of the other type.
+    /// pilatusDetector.cpp:1441, :1578 carry the param library's
+    /// asynParamWrongType for a write of the other type; writeOctet's is
+    /// overwritten by callParamCallbacks() (:1630), so it succeeds.
     #[test]
     fn a_refused_write_prints_the_param_librarys_status() {
         use epics_rs::asyn::services::PortServices;
@@ -612,7 +613,7 @@ mod tests {
         let (float, int) = (det.p.delay_time, det.p.pixel_cutoff);
         assert!(det.write_int32(&mut user(float), 1).is_err());
         assert!(det.write_float64(&mut user(int), 1.0).is_err());
-        let octet = det.write_octet(&mut user(int), b"x").unwrap_err();
+        assert_eq!(det.write_octet(&mut user(int), b"x").unwrap(), 1);
         let text = std::fs::read_to_string(&log).unwrap();
         let _ = std::fs::remove_file(&log);
         for line in [
@@ -621,12 +622,6 @@ mod tests {
         ] {
             assert!(text.contains(&line), "{line}: {text}");
         }
-        assert!(
-            octet.to_string().contains(&format!(
-                "pilatusDetector:writeOctet: status=8, function={int}, value=x"
-            )),
-            "{octet}"
-        );
     }
 
     #[test]
