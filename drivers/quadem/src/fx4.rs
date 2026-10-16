@@ -25,7 +25,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -58,10 +58,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// C++ `waitForConnection`'s `epicsThreadSleep(0.01)` poll.
 const CONNECT_POLL: Duration = Duration::from_millis(10);
 
-fn error(message: impl Into<String>) -> AsynError {
+/// C++ `reconnectWebSocket`'s `epicsThreadSleep(0.1)` between stop and start.
+const RESTART_PAUSE: Duration = Duration::from_millis(100);
+
+/// How long a write waits for the reconnect it asked for: the pause and the
+/// five-second wait of `reconnectWebSocket`, with a second to spare.
+const RECONNECT_WAIT: Duration = Duration::from_millis(6100);
+
+/// The bare `asynError` C returns: no `errorMessage` is set.
+fn refused() -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
-        message: message.into(),
+        message: String::new(),
     }
 }
 
@@ -74,6 +82,12 @@ fn error(message: impl Into<String>) -> AsynError {
 /// settings C++ keeps in `triggerMode_` / `triggerPolarity_` / `numAverage_`.
 pub struct Fx4Link {
     connected: AtomicBool,
+    /// A write's request for an immediate reconnect.
+    kick: tokio::sync::Notify,
+    /// Reconnect attempts the socket thread has finished, for the write
+    /// waiting on one.
+    attempts: parking_lot::Mutex<u64>,
+    attempt_done: parking_lot::Condvar,
     out_tx: tokio_mpsc::UnboundedSender<String>,
     cache: parking_lot::Mutex<Fx4Cache>,
     trigger_mode: AtomicI32,
@@ -85,6 +99,9 @@ impl Fx4Link {
     fn new(out_tx: tokio_mpsc::UnboundedSender<String>) -> Self {
         Self {
             connected: AtomicBool::new(false),
+            kick: tokio::sync::Notify::new(),
+            attempts: parking_lot::Mutex::new(0),
+            attempt_done: parking_lot::Condvar::new(),
             out_tx,
             cache: parking_lot::Mutex::new(Fx4Cache::new()),
             trigger_mode: AtomicI32::new(0),
@@ -99,6 +116,30 @@ impl Fx4Link {
 
     fn set_connected(&self, value: bool) {
         self.connected.store(value, Ordering::Release);
+    }
+
+    /// C++ `reconnectWebSocket` called from a write. The socket thread owns
+    /// the socket, so the write asks it for an attempt and blocks on the
+    /// outcome, as C's synchronous reconnect does.
+    fn reconnect(&self) {
+        let mut done = self.attempts.lock();
+        let seen = *done;
+        self.kick.notify_one();
+        let deadline = Instant::now() + RECONNECT_WAIT;
+        while *done == seen {
+            if self
+                .attempt_done
+                .wait_until(&mut done, deadline)
+                .timed_out()
+            {
+                break;
+            }
+        }
+    }
+
+    fn attempt_finished(&self) {
+        *self.attempts.lock() += 1;
+        self.attempt_done.notify_all();
     }
 
     /// C++ `sendEventData`: a message sent while the socket is down is dropped.
@@ -161,14 +202,13 @@ impl Fx4Driver {
         self.base.params
     }
 
-    /// C++ `drvFX4::setAcquireParams`.
-    ///
-    /// Upstream first tries to reconnect the socket and errors out when it is
-    /// still down; here the socket thread reconnects on its own, so this only
-    /// refuses to compute settings the meter cannot be told about.
+    /// C++ `drvFX4::setAcquireParams`: reconnect first, refuse while down.
     fn set_acquire_params(&mut self) -> AsynResult<()> {
         if !self.link.is_connected() {
-            return Err(error("FX4: not connected"));
+            self.link.reconnect();
+        }
+        if !self.link.is_connected() {
+            return Err(refused());
         }
         let p = self.params();
         let base = &mut self.base.port_base;
@@ -229,7 +269,10 @@ impl QuadEmDevice for Fx4Driver {
             return Ok(());
         }
         if value != 0 && !self.link.is_connected() {
-            return Err(error("FX4: not connected"));
+            self.link.reconnect();
+        }
+        if value != 0 && !self.link.is_connected() {
+            return Err(refused());
         }
 
         if value != 0 {
@@ -341,33 +384,57 @@ fn socket_thread(ctx: SocketContext) {
     };
 
     runtime.block_on(async move {
-        // The constructor reports its own first-attempt timeout; only
-        // pollThread's later attempts print `reconnect timeout`.
-        let mut reconnect = false;
+        // The constructor's startWebSocket; create_fx4 waits for it and
+        // prints its own timeout.
+        let mut stream = attempt(&uri, &link, &shared).await;
         loop {
-            match connect(&uri).await {
-                Ok(stream) => {
-                    link.set_connected(true);
-                    // C++ reconnectWebSocket: an acquisition in progress has to
-                    // be re-subscribed and re-polled on the new socket.
-                    if shared.is_acquiring() {
-                        link.send_subscribe();
-                        link.send_get();
-                    }
-                    run_session(stream, &mut out_rx, &in_tx, &link, &shared).await;
-                    link.set_connected(false);
-                }
-                Err(reason) => {
-                    eprintln!("drvFX4: WebSocket error: {reason}");
-                    if reconnect {
-                        eprintln!("drvFX4: reconnect timeout to {uri}");
-                    }
-                }
+            if let Some(s) = stream.take() {
+                run_session(s, &mut out_rx, &in_tx, &link, &shared).await;
+                link.set_connected(false);
             }
-            reconnect = true;
-            tokio::time::sleep(POLL_INTERVAL).await;
+            // pollThread's sleep, cut short by a write's reconnectWebSocket.
+            tokio::select! {
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
+                () = link.kick.notified() => {}
+            }
+            // reconnectWebSocket: stop, pause, start, waitForConnection(5.0),
+            // which waits out the five seconds even after a prompt failure.
+            tokio::time::sleep(RESTART_PAUSE).await;
+            let started = tokio::time::Instant::now();
+            stream = attempt(&uri, &link, &shared).await;
+            if stream.is_none() {
+                tokio::time::sleep_until(started + CONNECT_TIMEOUT).await;
+                eprintln!("drvFX4: reconnect timeout to {uri}");
+            }
+            // A write that asked during this attempt is answered by it; its
+            // stored permit must not cut the next poll sleep short.
+            let _ = link.kick.notified().now_or_never();
+            link.attempt_finished();
         }
     });
+}
+
+/// One `startWebSocket` + `waitForConnection(5.0)`. An attempt still pending
+/// at the deadline is stopped by the next reconnect with `wsStopping_` set,
+/// so C never prints its error.
+async fn attempt(uri: &str, link: &Fx4Link, shared: &QuadEmShared) -> Option<Fx4Stream> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect(uri)).await {
+        Ok(Ok(stream)) => {
+            link.set_connected(true);
+            // reconnectWebSocket: an acquisition in progress has to be
+            // re-subscribed and re-polled on the new socket.
+            if shared.is_acquiring() {
+                link.send_subscribe();
+                link.send_get();
+            }
+            Some(stream)
+        }
+        Ok(Err(reason)) => {
+            eprintln!("drvFX4: WebSocket error: {reason}");
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 type Fx4Stream = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
@@ -705,12 +772,55 @@ mod tests {
         let Err(reason) = rt.block_on(connect(&format!("ws://127.0.0.1:{port}"))) else {
             panic!("nothing listens");
         };
-        let refused = strerror(&std::io::Error::from_raw_os_error(libc::ECONNREFUSED));
+        let text = strerror(&std::io::Error::from_raw_os_error(libc::ECONNREFUSED));
         assert_eq!(
             reason,
-            format!(
-                "Unable to connect to 127.0.0.1 on port {port}, error: Connect error: {refused}"
-            )
+            format!("Unable to connect to 127.0.0.1 on port {port}, error: Connect error: {text}")
         );
+    }
+
+    /// setAcquire / setAcquireParams reconnect before refusing: a meter that
+    /// came back is reached by the write itself, not at the next poll.
+    #[test]
+    fn a_write_reconnects_before_refusing() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let (shared, _trigger_rx) = QuadEmShared::new(16);
+        let (out_tx, out_rx) = tokio_mpsc::unbounded_channel();
+        let (in_tx, _in_rx) = std_mpsc::channel();
+        let link = Arc::new(Fx4Link::new(out_tx));
+        let ctx = SocketContext {
+            uri: format!("ws://127.0.0.1:{port}"),
+            link: link.clone(),
+            shared,
+            out_rx,
+            in_tx,
+        };
+        thread::spawn(move || socket_thread(ctx));
+        // The constructor's attempt finds nothing listening.
+        thread::sleep(Duration::from_millis(300));
+        assert!(!link.is_connected());
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind");
+        thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let _ws = tungstenite_accept(sock);
+            thread::sleep(Duration::from_secs(10));
+        });
+        let started = Instant::now();
+        link.reconnect();
+        assert!(link.is_connected());
+        // Well inside the poll sleep the socket thread would otherwise wait.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    fn tungstenite_accept(sock: std::net::TcpStream) -> impl Sized {
+        tokio_tungstenite::tungstenite::accept(sock).expect("handshake")
     }
 }
