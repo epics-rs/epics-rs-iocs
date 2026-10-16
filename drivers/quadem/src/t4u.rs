@@ -45,6 +45,7 @@ use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
+use crate::asyn_print;
 use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QuadEmBase, QuadEmDevice, QuadEmParams,
     QuadEmShared,
@@ -322,6 +323,29 @@ impl T4uDriver {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
         let t4u = T4uParams::create(&mut base.port_base, variant)?;
 
+        // C++ `currRange_`, set before the ports are configured.
+        state.lock().range = match variant {
+            T4uVariant::Middle => 0,
+            T4uVariant::Direct => proto::NUM_RANGES as i32 - 1,
+        };
+        let full = calibration.map(|c| c.cw).unwrap_or_default();
+
+        // C++ returns from the constructor at the first port that will not
+        // configure: the port stays, with drvQuadEM's defaults and no meter.
+        if let Err(line) = &spec.transport.link {
+            asyn_print!(base.port_base, ERROR, "{line}");
+            return Ok(Self {
+                base,
+                shared,
+                state,
+                t4u,
+                variant,
+                cmd,
+                calibration,
+                full,
+            });
+        }
+
         let p = base.params;
         let sample_time = match variant {
             T4uVariant::Middle => MIDDLE_SAMPLE_TIME,
@@ -348,16 +372,7 @@ impl T4uDriver {
             acq.values_per_read = DEFAULT_VALUES_PER_READ;
             acq.num_channels = QE_MAX_INPUTS as i32;
         }
-        {
-            let mut st = state.lock();
-            st.sample_time = sample_time;
-            st.range = match variant {
-                T4uVariant::Middle => 0,
-                T4uVariant::Direct => proto::NUM_RANGES as i32 - 1,
-            };
-        }
-
-        let full = calibration.map(|c| c.cw).unwrap_or_default();
+        state.lock().sample_time = sample_time;
 
         let mut this = Self {
             base,
@@ -1043,8 +1058,8 @@ pub struct T4uRuntime {
     /// The sub-ports the driver built; dropping them closes the sockets. C++
     /// registers them by name, so `st.cmd` can trace them.
     pub sub_ports: Vec<PortRuntimeHandle>,
-    _cmd_thread: thread::JoinHandle<()>,
-    _data_thread: thread::JoinHandle<()>,
+    /// The meter threads; absent when a port would not configure.
+    _meter_threads: Option<[thread::JoinHandle<()>; 2]>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -1055,9 +1070,28 @@ impl T4uRuntime {
 }
 
 struct Transport {
-    cmd_io: OctetIo,
-    data_io: OctetIo,
+    /// The command and data sockets, or the `asynPrint` line C++ gives for
+    /// the port that would not configure.
+    link: Result<(OctetIo, OctetIo), String>,
     runtimes: Vec<PortRuntimeHandle>,
+}
+
+/// C++ `drvAsynIPPortConfigure` of one sub-port, with the constructor's error
+/// line when it fails (`status` is the configure call's -1).
+fn sub_port(
+    name: &str,
+    host: &str,
+    timeout: Duration,
+    runtimes: &mut Vec<PortRuntimeHandle>,
+    describe: impl FnOnce(&str, &str) -> String,
+) -> Result<OctetIo, String> {
+    match create_ip_port(name, host, timeout, false, false) {
+        Ok((io, runtime)) => {
+            runtimes.push(runtime);
+            Ok(io)
+        }
+        Err(_) => Err(describe(name, host)),
+    }
 }
 
 /// Everything the two `create_*` entry points differ in.
@@ -1079,9 +1113,16 @@ fn command_port(
     port_name: &str,
     host: &str,
     variant: T4uVariant,
-) -> AsynResult<(OctetIo, PortRuntimeHandle)> {
+    runtimes: &mut Vec<PortRuntimeHandle>,
+) -> Result<OctetIo, String> {
     let name = format!("TCP_Command_{port_name}");
-    let port = create_ip_port(&name, host, variant.timeout(), false, false);
+    let port = sub_port(&name, host, variant.timeout(), runtimes, |name, host| {
+        format!(
+            "{}::drvT4U_EM error calling drvAsynIPPortConfigure for command port={name}, \
+             IP={host}, status=-1",
+            variant.name()
+        )
+    });
     println!(
         "Attempted command port: {name} connection to: {host}\nStatus: {}",
         if port.is_ok() { 0 } else { -1 }
@@ -1103,34 +1144,46 @@ pub fn create_t4u_em(
     max_memory: usize,
 ) -> AsynResult<T4uRuntime> {
     let variant = T4uVariant::Middle;
-    let (cmd_io, cmd_runtime) = command_port(
+    let mut runtimes = Vec::new();
+    let link = command_port(
         port_name,
         &format!("{qt_host_address}:{base_port_num}"),
         variant,
-    )?;
-    let (data_io, data_runtime) = create_ip_port(
-        &format!("TCP_Data_{port_name}"),
-        &format!("{qt_host_address}:{}", base_port_num + 1),
-        variant.timeout(),
-        false,
-        false,
-    )?;
+        &mut runtimes,
+    )
+    .and_then(|cmd_io| {
+        let data_io = sub_port(
+            &format!("TCP_Data_{port_name}"),
+            &format!("{qt_host_address}:{}", u32::from(base_port_num) + 1),
+            variant.timeout(),
+            &mut runtimes,
+            |name, host| {
+                format!(
+                    "drvT4U_EM::drvT4U_EM error calling drvAsynIPPortConfigure for data \
+                     port={name}, IP={host}, status=-1"
+                )
+            },
+        )?;
+        Ok((cmd_io, data_io))
+    });
+    // An unlinked port has no socket to write to; C++ dereferences a null
+    // asynUser there.
+    let cmd = match &link {
+        Ok((cmd_io, _)) => cmd_io.clone(),
+        Err(_) => OctetIo::unbound(variant.timeout()),
+    };
 
     build(
         Build {
             port_name: port_name.to_string(),
             variant,
-            transport: Transport {
-                cmd_io: cmd_io.clone(),
-                data_io,
-                runtimes: vec![cmd_runtime, data_runtime],
-            },
+            transport: Transport { link, runtimes },
             queue: None,
             calibration: None,
             ring_buffer_size,
             max_memory,
         },
-        CmdSink::Immediate(cmd_io),
+        CmdSink::Immediate(cmd),
     )
 }
 
@@ -1155,25 +1208,35 @@ pub fn create_t4u_direct_em(
     let calibration =
         proto::parse_calibration(&text).map_err(|e| error(format!("T4U: {cfg_file_name}: {e}")))?;
 
-    // The C++ host spec is "127.0.0.1:base-1:base UDP": the driver binds the
-    // local port the T4U streams to, and the remote endpoint only gives the
-    // socket a peer.
-    let remote_port = base_port_num
-        .checked_sub(1)
-        .ok_or_else(|| error("T4U: the UDP data port must be at least 1"))?;
-
-    let (cmd_io, cmd_runtime) = command_port(
+    let mut runtimes = Vec::new();
+    let link = command_port(
         port_name,
         &format!("{t4u_address}:{}", proto::T4U_CMD_PORT),
         variant,
-    )?;
-    let (data_io, data_runtime) = create_ip_port(
-        &format!("UDP_Data_{port_name}"),
-        &format!("127.0.0.1:{remote_port}:{base_port_num} UDP"),
-        variant.timeout(),
-        false,
-        false,
-    )?;
+        &mut runtimes,
+    )
+    .and_then(|cmd_io| {
+        // The C++ host spec is "127.0.0.1:base-1:base UDP": the driver binds
+        // the local port the T4U streams to, and the remote endpoint only
+        // gives the socket a peer. `base_port_num` is unsigned in C++, so 0
+        // gives a remote port that will not parse.
+        let data_io = sub_port(
+            &format!("UDP_Data_{port_name}"),
+            &format!(
+                "127.0.0.1:{}:{base_port_num} UDP",
+                u32::from(base_port_num).wrapping_sub(1)
+            ),
+            variant.timeout(),
+            &mut runtimes,
+            |name, host| {
+                format!(
+                    "drvT4UDirect_EM::drvT4U_EM error calling drvAsynIPPortConfigure for UDP \
+                     data port={name}, IP={host}, status=-1"
+                )
+            },
+        )?;
+        Ok((cmd_io, data_io))
+    });
 
     let (cmd_tx, cmd_rx) = sync_channel::<String>(proto::CMD_QUEUE_LEN);
 
@@ -1181,11 +1244,7 @@ pub fn create_t4u_direct_em(
         Build {
             port_name: port_name.to_string(),
             variant,
-            transport: Transport {
-                cmd_io,
-                data_io,
-                runtimes: vec![cmd_runtime, data_runtime],
-            },
+            transport: Transport { link, runtimes },
             queue: Some(cmd_rx),
             calibration: Some(calibration),
             ring_buffer_size,
@@ -1227,32 +1286,35 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
         state: state.clone(),
     };
 
-    let cmd_ctx = CmdContext {
-        io: transport.cmd_io,
-        regs: regs.clone(),
-        variant,
-        queue,
-    };
-    let cmd_thread_handle = thread::Builder::new()
-        .name(format!("{}_Cmd_Task", variant.name()))
-        .spawn(move || cmd_thread(cmd_ctx))
-        .expect("failed to spawn the T4U command thread");
+    let meter_threads = transport.link.ok().map(|(cmd_io, data_io)| {
+        let cmd_ctx = CmdContext {
+            io: cmd_io,
+            regs: regs.clone(),
+            variant,
+            queue,
+        };
+        let cmd_thread_handle = thread::Builder::new()
+            .name(format!("{}_Cmd_Task", variant.name()))
+            .spawn(move || cmd_thread(cmd_ctx))
+            .expect("failed to spawn the T4U command thread");
 
-    let data_ctx = DataContext {
-        io: transport.data_io,
-        handle: handle.clone(),
-        params,
-        shared: shared.clone(),
-        state,
-        regs,
-    };
-    let data_thread_handle = thread::Builder::new()
-        .name(format!("{}_Data_Task", variant.name()))
-        .spawn(move || match variant {
-            T4uVariant::Middle => middle_data_thread(data_ctx),
-            T4uVariant::Direct => direct_data_thread(data_ctx),
-        })
-        .expect("failed to spawn the T4U data thread");
+        let data_ctx = DataContext {
+            io: data_io,
+            handle: handle.clone(),
+            params,
+            shared: shared.clone(),
+            state,
+            regs,
+        };
+        let data_thread_handle = thread::Builder::new()
+            .name(format!("{}_Data_Task", variant.name()))
+            .spawn(move || match variant {
+                T4uVariant::Middle => middle_data_thread(data_ctx),
+                T4uVariant::Direct => direct_data_thread(data_ctx),
+            })
+            .expect("failed to spawn the T4U data thread");
+        [cmd_thread_handle, data_thread_handle]
+    });
 
     let callback_thread = qe::start_callback_task(CallbackContext {
         trigger_rx,
@@ -1271,8 +1333,31 @@ fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
         pool,
         outputs,
         sub_ports: transport.runtimes,
-        _cmd_thread: cmd_thread_handle,
-        _data_thread: data_thread_handle,
+        _meter_threads: meter_threads,
         _callback_thread: callback_thread,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C++ returns from the constructor when `drvAsynIPPortConfigure` fails:
+    /// the port exists with drvQuadEM's defaults, and no meter thread runs.
+    #[test]
+    fn a_command_port_that_will_not_configure_keeps_the_port() {
+        let rt = create_t4u_em("QE_T4U_BADHOST", "[bad", 4, 5000, 0).unwrap();
+        assert!(rt._meter_threads.is_none());
+        assert!(rt.sub_ports.is_empty());
+        // drvQuadEM never sets P_Model; only the linked constructor does.
+        let model = rt.port_handle().read_int32_blocking(rt.params.model, 0);
+        assert!(
+            matches!(model, Err(AsynError::ParamUndefined(_))),
+            "{model:?}"
+        );
+        // writeReadMeter's status is ignored, as on a linked port.
+        rt.port_handle()
+            .write_int32_blocking(rt.params.range, 0, 1)
+            .unwrap();
+    }
 }
