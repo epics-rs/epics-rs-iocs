@@ -16,11 +16,10 @@
 //!
 //! ## Units
 //!
-//! `PPU` (pulses per engineering unit) is read from the controller — it is a
-//! real hardware conversion, not a cancelling scale: the position registers hold
-//! pulses (counts) while `JOG` commands take engineering units, so commanded
-//! values are divided by `PPU` and readback is left in counts. The driver
-//! boundary is therefore counts with `MRES` = 1.
+//! `PPU` (pulses per engineering unit) is read from the controller: the
+//! position registers hold the record's steps (pulses) while `JOG` and `RES`
+//! take engineering units, so commanded steps are divided by `PPU` and sent
+//! `%f`, as C.
 //!
 //! ## Kill clear
 //!
@@ -173,11 +172,15 @@ impl AcrAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         ctrl.write_only(&format!(
-            "{} JOG ACC {}",
+            "{} JOG ACC {:.6}",
             self.name,
             self.scaled(acceleration)?
         ))?;
-        ctrl.write_only(&format!("{} JOG VEL {}", self.name, self.scaled(velocity)?))
+        ctrl.write_only(&format!(
+            "{} JOG VEL {:.6}",
+            self.name,
+            self.scaled(velocity)?
+        ))
     }
 }
 
@@ -199,7 +202,7 @@ impl AsynMotor for AcrAxis {
         let ctrl = self.lock();
         self.set_jog_speed(&ctrl, velocity, acceleration)?;
         ctrl.write_only(&format!(
-            "{CTL_Y}:{} JOG ABS {}",
+            "{CTL_Y}:{} JOG ABS {:.6}",
             self.name,
             self.scaled(position)?
         ))
@@ -216,7 +219,7 @@ impl AsynMotor for AcrAxis {
         let ctrl = self.lock();
         self.set_jog_speed(&ctrl, velocity, acceleration)?;
         ctrl.write_only(&format!(
-            "{CTL_Y}:{} JOG INC {}",
+            "{CTL_Y}:{} JOG INC {:.6}",
             self.name,
             self.scaled(distance)?
         ))
@@ -267,7 +270,7 @@ impl AsynMotor for AcrAxis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write_only(&format!("{} RES {}", self.name, self.scaled(position)?))?;
+        ctrl.write_only(&format!("{} RES {:.6}", self.name, self.scaled(position)?))?;
         ctrl.write_only(&format!("{} JOG REN", self.name))
     }
 
