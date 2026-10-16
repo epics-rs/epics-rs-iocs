@@ -112,7 +112,7 @@ pub fn format_configuration(f: &ConfigFields) -> String {
 pub struct ScaFields {
     pub low_channel: i32,
     pub high_channel: i32,
-    pub output_level: u8,
+    pub output_level: i32,
 }
 
 /// `drvAmptek::sendSCAs` (`drvAmptek.cpp:479-508`): one `SCAI=n;SCAL=..;
@@ -127,7 +127,11 @@ pub fn format_scas(scas: &[ScaFields; MAX_SCAS]) -> String {
         let _ = write!(
             s,
             "SCAO={};",
-            SCA_OUTPUT_LEVEL_STRINGS[sca.output_level as usize]
+            // C indexes out of bounds here (UB); emit nothing instead.
+            usize::try_from(sca.output_level)
+                .ok()
+                .and_then(|i| SCA_OUTPUT_LEVEL_STRINGS.get(i))
+                .unwrap_or(&"")
         );
     }
     s
