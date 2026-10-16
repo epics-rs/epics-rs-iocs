@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::time::Instant as TokioInstant;
 use tokio_tungstenite::tungstenite::Message;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -386,34 +387,56 @@ fn socket_thread(ctx: SocketContext) {
     };
 
     runtime.block_on(async move {
-        // The constructor's startWebSocket; create_fx4 waits for it and
-        // prints its own timeout.
+        // The constructor's startWebSocket + waitForConnection(5.0), which
+        // waits the five seconds out after a failure; create_fx4 waits with
+        // it and prints its own timeout. pollThread starts after it.
+        let started = TokioInstant::now();
         let mut stream = attempt(&uri, &link, &shared).await;
+        // When pollThread next passes its top.
+        let mut pass = if stream.is_some() {
+            TokioInstant::now()
+        } else {
+            started + CONNECT_TIMEOUT
+        };
         loop {
             if let Some(s) = stream.take() {
-                run_session(s, &mut out_rx, &in_tx, &link, &shared).await;
+                // Each pass while connected is the idle get.
+                pass = run_session(s, pass, &mut out_rx, &in_tx, &link, &shared).await;
                 link.set_connected(false);
             }
-            // pollThread's sleep, cut short by a write's reconnectWebSocket.
+            // Down until the next pass, which reconnects at once and then
+            // sleeps; a write's reconnectWebSocket leaves the passes alone.
             tokio::select! {
-                () = tokio::time::sleep(POLL_INTERVAL) => {}
-                () = link.kick.notified() => {}
+                () = tokio::time::sleep_until(pass) => {
+                    stream = reconnect(&uri, &link, &shared).await;
+                    pass = TokioInstant::now();
+                    if stream.is_none() {
+                        pass += POLL_INTERVAL;
+                    }
+                }
+                () = link.kick.notified() => {
+                    stream = reconnect(&uri, &link, &shared).await;
+                }
             }
-            // reconnectWebSocket: stop, pause, start, waitForConnection(5.0),
-            // which waits out the five seconds even after a prompt failure.
-            tokio::time::sleep(RESTART_PAUSE).await;
-            let started = tokio::time::Instant::now();
-            stream = attempt(&uri, &link, &shared).await;
-            if stream.is_none() {
-                tokio::time::sleep_until(started + CONNECT_TIMEOUT).await;
-                eprintln!("drvFX4: reconnect timeout to {uri}");
-            }
-            // A write that asked during this attempt is answered by it; its
-            // stored permit must not cut the next poll sleep short.
-            let _ = link.kick.notified().now_or_never();
-            link.attempt_finished();
         }
     });
+}
+
+/// C++ `reconnectWebSocket`: stop, pause, start, then `waitForConnection(5.0)`,
+/// which waits out the five seconds even after a prompt failure.
+async fn reconnect(uri: &str, link: &Fx4Link, shared: &QuadEmShared) -> Option<Fx4Stream> {
+    tokio::time::sleep(RESTART_PAUSE).await;
+    let started = TokioInstant::now();
+    let stream = attempt(uri, link, shared).await;
+    if stream.is_none() {
+        tokio::time::sleep_until(started + CONNECT_TIMEOUT).await;
+        eprintln!("drvFX4: reconnect timeout to {uri}");
+    }
+    // A write that asked during this attempt is answered by it; its stored
+    // permit must not start another.
+    let _ = link.kick.notified().now_or_never();
+    link.attempt_finished();
+    stream
 }
 
 /// One `startWebSocket` + `waitForConnection(5.0)`. An attempt still pending
@@ -451,22 +474,23 @@ async fn connect(uri: &str) -> Result<Fx4Stream, String> {
 /// and C++ `pollThread`'s idle `get` every five seconds.
 async fn run_session<S>(
     stream: tokio_tungstenite::WebSocketStream<S>,
+    mut pass: TokioInstant,
     out_rx: &mut tokio_mpsc::UnboundedReceiver<String>,
     in_tx: &std_mpsc::Sender<String>,
     link: &Fx4Link,
     shared: &QuadEmShared,
-) where
+) -> TokioInstant
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (mut sink, mut source) = stream.split();
-    let mut idle = tokio::time::interval(POLL_INTERVAL);
 
     loop {
         tokio::select! {
             frame = source.next() => match frame {
                 Some(Ok(Message::Text(text))) => {
                     if in_tx.send(text.to_string()).is_err() {
-                        return;
+                        return pass;
                     }
                 }
                 // ixwebsocket's close codes: 1005 for a close frame with no
@@ -480,35 +504,36 @@ async fn run_session<S>(
                         ),
                         None => eprintln!("drvFX4: WebSocket closed code=1005 reason=No status code"),
                     }
-                    return;
+                    return pass;
                 }
                 None => {
                     eprintln!("drvFX4: WebSocket closed code=1006 reason=Abnormal closure");
-                    return;
+                    return pass;
                 }
                 // Ping/Pong are answered by tungstenite; the FX4 sends no
                 // binary frames.
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
                     eprintln!("drvFX4: WebSocket error: {e}");
-                    return;
+                    return pass;
                 }
             },
             outgoing = out_rx.recv() => match outgoing {
                 Some(message) => {
                     if sink.send(Message::Text(message.into())).await.is_err() {
                         eprintln!("drvFX4: send failed: ");
-                        return;
+                        return pass;
                     }
                 }
-                None => return,
+                None => return pass,
             },
-            _ = idle.tick() => {
+            () = tokio::time::sleep_until(pass) => {
                 // While acquiring, the data thread's `get` after every message
                 // keeps the meter reporting; this is C++ pollThread's idle poll.
                 if !shared.is_acquiring() {
                     link.send_get();
                 }
+                pass = TokioInstant::now() + POLL_INTERVAL;
             }
         }
     }
@@ -745,6 +770,84 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// Start the socket thread against `port`; returns its link.
+    fn spawn_socket_thread(port: u16) -> Arc<Fx4Link> {
+        let (shared, _trigger_rx) = QuadEmShared::new(16);
+        let (out_tx, out_rx) = tokio_mpsc::unbounded_channel();
+        let (in_tx, in_rx) = std_mpsc::channel();
+        let link = Arc::new(Fx4Link::new(out_tx));
+        let ctx = SocketContext {
+            uri: format!("ws://127.0.0.1:{port}"),
+            link: link.clone(),
+            shared,
+            out_rx,
+            in_tx,
+        };
+        thread::spawn(move || {
+            let _in_rx = in_rx;
+            socket_thread(ctx)
+        });
+        link
+    }
+
+    fn wait_connected(link: &Fx4Link, within: Duration) -> Option<Duration> {
+        let started = Instant::now();
+        while started.elapsed() < within {
+            if link.is_connected() {
+                return Some(started.elapsed());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// pollThread starts once the constructor's five seconds are up and
+    /// reconnects at its first pass, however long the failed attempt hung.
+    #[test]
+    fn the_first_pass_after_a_hung_constructor_connect_reconnects_at_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            // The constructor's handshake gets no answer.
+            let (_silent, _) = listener.accept().expect("accept");
+            let (sock, _) = listener.accept().expect("accept");
+            let _ws = tungstenite_accept(sock);
+            thread::sleep(Duration::from_secs(10));
+        });
+        let link = spawn_socket_thread(port);
+        let at = wait_connected(&link, Duration::from_secs(9)).expect("reconnected");
+        // 5 s constructor + 0.1 s pause, not a further 5 s sleep.
+        assert!(at < Duration::from_millis(6500), "{at:?}");
+    }
+
+    /// A session that ends mid-sleep is reconnected at pollThread's next
+    /// pass, five seconds after the session's first, not five after the end.
+    #[test]
+    fn a_dropped_session_reconnects_at_the_next_pass() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let (accepted_tx, accepted_rx) = std_mpsc::channel();
+        thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let ws = tungstenite_accept(sock);
+            thread::sleep(Duration::from_secs(3));
+            drop(ws);
+            let (sock, _) = listener.accept().expect("accept");
+            accepted_tx.send(Instant::now()).expect("send");
+            let _ws = tungstenite_accept(sock);
+            thread::sleep(Duration::from_secs(10));
+        });
+        let link = spawn_socket_thread(port);
+        wait_connected(&link, Duration::from_secs(2)).expect("connected");
+        let first_pass = Instant::now();
+        let again = accepted_rx
+            .recv_timeout(Duration::from_secs(9))
+            .expect("reconnected");
+        let after = again - first_pass;
+        // The pass at 5 s plus the 0.1 s pause; the drop at 3 s would give 8.1.
+        assert!(after < Duration::from_millis(6500), "{after:?}");
     }
 
     fn tungstenite_accept(sock: std::net::TcpStream) -> impl Sized {
