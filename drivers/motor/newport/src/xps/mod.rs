@@ -16,6 +16,7 @@ pub mod corrector;
 pub(crate) mod fake;
 pub mod ftp;
 pub mod gathering;
+pub mod gpio;
 pub mod pco;
 pub mod profile;
 pub mod rpc;

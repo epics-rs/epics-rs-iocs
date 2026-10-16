@@ -52,7 +52,7 @@ use crate::pmnc::{PmncAxis, PmncController};
 use crate::smc100::Smc100Axis;
 use crate::xps::{
     ExecutionPlan, GatheringReadback, MoveMode, PcoParams, Profile, SocketMode, XpsAxis,
-    XpsController, XpsError, XpsSocket, ftp, gathering, pco, profile,
+    XpsController, XpsError, XpsSocket, ftp, gathering, gpio, pco, profile,
 };
 
 /// Per-command serial I/O timeout: SMC100 (`from_handle` default) and CONEX /
@@ -735,6 +735,69 @@ pub fn tclcall_command() -> CommandDef {
                 println!(" Error TCP_ConnectToServer");
             }
             tclcall(socket.as_ref(), &text(0)?, &text(1)?, &text(2)?);
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `XPSAuxConfig(portName, IP address, IP port, polling period)`: C
+/// `drvXPSAsynAux.c`, the XPS analog and digital I/O as asyn port `portName`,
+/// its inputs posted every `polling period` ms.
+pub fn xps_aux_config_command() -> CommandDef {
+    CommandDef::new(
+        "XPSAuxConfig",
+        vec![
+            arg_str_opt("portName"),
+            arg_str_opt("IP address"),
+            arg_int_opt("IP port"),
+            arg_int_opt("polling period"),
+        ],
+        "XPSAuxConfig(portName, IP address, IP port, polling period)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let port_name = opt_string(args, 0)?.unwrap_or_default();
+            let ip = opt_string(args, 1)?.unwrap_or_default();
+            let Some(handle) = connect_to_server(ctx, &ip, c_int(args, 2)) else {
+                println!("drvXPSAsynAuxConfig: error calling TCP_ConnectToServer");
+                return Ok(CommandOutcome::Continue);
+            };
+            let period = Duration::from_millis(c_int(args, 3).max(0) as u64);
+            let socket = XpsSocket::new(
+                handle.clone(),
+                handle.port_name(),
+                SocketMode::Query,
+                gpio::TCP_TIMEOUT,
+            );
+            let registered = gpio::XpsGpio::new(&port_name, socket)
+                .ok()
+                .and_then(|driver| {
+                    let claim = claim_port(&port_name).ok()?;
+                    let (rt, _jh) =
+                        create_port_runtime(&claim, driver, RuntimeConfig::default()).ok()?;
+                    match claim.publish(
+                        rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    ) {
+                        Ok(()) => Some(rt.port_handle().clone()),
+                        Err(_) => {
+                            rt.shutdown();
+                            None
+                        }
+                    }
+                });
+            let Some(port) = registered else {
+                eprintln!("XPSAuxConfig ERROR: Can't register port");
+                return Ok(CommandOutcome::Continue);
+            };
+            if spawn_dedicated_thread(
+                "XPSAuxPoller".into(),
+                ThreadPriority::Medium,
+                StackSizeClass::Medium,
+                move || gpio::run_poller(port, period),
+            )
+            .is_err()
+            {
+                eprintln!("XPSAuxConfig, epicsThreadCreate failed");
+            }
             Ok(CommandOutcome::Continue)
         },
     )

@@ -14,12 +14,14 @@ use super::rpc::{SocketMode, XpsSocket};
 
 pub type Fail = Arc<Mutex<&'static str>>;
 pub type Log = Arc<Mutex<Vec<String>>>;
+pub type Digital = Arc<Mutex<u16>>;
 
 struct FakeXps {
     base: PortDriverBase,
     reply: Option<String>,
     fail: Fail,
     log: Log,
+    digital: Digital,
 }
 
 impl PortDriver for FakeXps {
@@ -33,8 +35,15 @@ impl PortDriver for FakeXps {
         let cmd = String::from_utf8_lossy(data);
         let name = cmd.split('(').next().unwrap_or("").trim();
         self.log.lock().unwrap().push(cmd.trim().to_string());
+        let digital;
         let values = match name {
             _ if name == *self.fail.lock().unwrap() => "-3",
+            "GPIOAnalogGet" => "0,1.5,2.5,3.5,4.5",
+            "GPIOAnalogGainGet" => "0,4",
+            "GPIODigitalGet" => {
+                digital = format!("0,{}", self.digital.lock().unwrap());
+                &digital
+            }
             "GroupStatusGet" => "0,12",
             "GroupPositionCurrentGet" if cmd.contains(".P2,") => "0,2.5",
             "GroupPositionCurrentGet" => "0,1.5",
@@ -61,17 +70,21 @@ pub struct FakeLine {
     rt: PortRuntimeHandle,
     pub fail: Fail,
     pub log: Log,
+    /// What `GPIODigitalGet` reads.
+    pub digital: Digital,
 }
 
 impl FakeLine {
     pub fn new(port: &str, fail: &'static str) -> Self {
         let fail = Arc::new(Mutex::new(fail));
         let log = Log::default();
+        let digital = Digital::default();
         let line = FakeXps {
             base: PortDriverBase::new(port, 1, PortFlags::default()),
             reply: None,
             fail: fail.clone(),
             log: log.clone(),
+            digital: digital.clone(),
         };
         let (rt, _jh) =
             create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
@@ -81,6 +94,7 @@ impl FakeLine {
             rt,
             fail,
             log,
+            digital,
         }
     }
 
