@@ -455,8 +455,7 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
 }
 
 /// C reads into `pFlatField` and publishes it (pilatusDetector.cpp:290,
-/// :316). `None` with no flat-field array or a refused refill, which leaves
-/// FlatFieldValid 0; the pool printed its reached-limit line.
+/// :316). `None` with no flat-field array, which leaves FlatFieldValid 0.
 fn refill_flat_field(
     s: &mut Shared,
     data: &[i32],
@@ -464,7 +463,7 @@ fn refill_flat_field(
     average: f64,
 ) -> Option<PublishedArray> {
     let flat = s.flat_field.as_mut()?;
-    let array = flat.refill().ok()?;
+    let array = flat.refill();
     let NDDataBuffer::I32(pixels) = &mut array.data else {
         unreachable!("allocated as NDInt32")
     };
@@ -1047,23 +1046,32 @@ mod tests {
         let (pool, mut s) = flat_field_pool(8);
         let first = refill_flat_field(&mut s, &[5, 6], Some("d".into()), 5.5).unwrap();
         assert!(matches!(&first.data, NDDataBuffer::I32(v) if v == &[5, 6]));
-        let first_ptr = Arc::as_ptr(first.array());
         drop(first);
         let second = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
-        assert_eq!(Arc::as_ptr(second.array()), first_ptr);
+        assert!(matches!(&second.data, NDDataBuffer::I32(v) if v == &[7, 8]));
         assert!(second.attributes.get("TIFFImageDescription").is_some());
-        assert_eq!((pool.num_alloc_buffers(), s.average_flat_field), (1, 7.5));
+        assert_eq!(s.average_flat_field, 7.5);
+        assert_eq!(
+            (
+                pool.num_alloc_buffers(),
+                pool.num_free_buffers(),
+                pool.allocated_bytes()
+            ),
+            (1, 0, 8)
+        );
     }
 
-    /// A refused refill publishes nothing, so FlatFieldValid stays 0, and the
-    /// last flat field and its average are kept.
+    /// C refills `pFlatField` in place while a plugin still holds it, so a
+    /// held publish neither refuses the read nor charges a second buffer.
     #[test]
-    fn a_refused_flat_field_refill_publishes_nothing() {
-        let (_pool, mut s) = flat_field_pool(8);
+    fn a_held_flat_field_is_still_refilled() {
+        let (pool, mut s) = flat_field_pool(8);
         let held = refill_flat_field(&mut s, &[5, 6], None, 5.5).unwrap();
-        assert!(refill_flat_field(&mut s, &[7, 8], None, 7.5).is_none());
+        let next = refill_flat_field(&mut s, &[7, 8], None, 7.5).unwrap();
+        assert!(matches!(&next.data, NDDataBuffer::I32(v) if v == &[7, 8]));
         assert!(matches!(&held.data, NDDataBuffer::I32(v) if v == &[5, 6]));
-        assert_eq!(s.average_flat_field, 5.5);
+        assert_eq!(s.average_flat_field, 7.5);
+        assert_eq!((pool.num_alloc_buffers(), pool.allocated_bytes()), (1, 8));
         assert!(refill_flat_field(&mut Shared::default(), &[1, 2], None, 1.0).is_none());
     }
 
