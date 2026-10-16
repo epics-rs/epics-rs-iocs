@@ -758,16 +758,22 @@ impl Actor {
                 if record.data_type != 1 {
                     continue;
                 }
-                let module_idx = (record.address as usize).saturating_sub(1) / 100;
-                if !cache.modules[module_idx].use_flag {
+                let address = record.address as usize;
+                if !cache.modules.get(address / 100).is_some_and(|m| m.use_flag) {
                     continue;
                 }
-                let idx = (record.address - 1) as usize;
+                // C indexes `[address - 1]` unchecked; out of range is UB there.
+                let Some(idx) = address.checked_sub(1) else {
+                    continue;
+                };
                 let cd = match record.channel_type {
-                    1 => &mut cache.meas_data[idx],
-                    2 => &mut cache.calc_data[idx],
-                    3 => &mut cache.comm_data[idx],
-                    _ => continue,
+                    1 => cache.meas_data.get_mut(idx),
+                    2 => cache.calc_data.get_mut(idx),
+                    3 => cache.comm_data.get_mut(idx),
+                    _ => None,
+                };
+                let Some(cd) = cd else {
+                    continue;
                 };
                 cd.data_status = DataStatus::from_wire(record.status);
                 cd.value = if cd.data_status == DataStatus::Normal {
@@ -923,23 +929,31 @@ pub(crate) mod test_support {
         out
     }
 
+    /// An `FData` frame of `(channel_type, address, status, alarms, value)`
+    /// records, all `data_type` 1.
+    pub(crate) fn fdata_binary(records: &[(u8, u16, u8, [u8; 4], i32)]) -> Vec<u8> {
+        let mut raw = vec![b'E', b'B', 0, 0];
+        raw.extend_from_slice(&0u32.to_be_bytes());
+        raw.extend_from_slice(&[0u8; 10]);
+        raw.extend_from_slice(&(16 + 12 * records.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&[0u8; 16]);
+        for &(channel_type, address, status, alarms, value) in records {
+            raw.push((1 << 4) | channel_type);
+            raw.push(status);
+            raw.extend_from_slice(&address.to_be_bytes());
+            raw.extend_from_slice(&alarms);
+            raw.extend_from_slice(&value.to_be_bytes());
+        }
+        let total = (raw.len() - 8) as u32;
+        raw[4..8].copy_from_slice(&total.to_be_bytes());
+        raw
+    }
+
     /// One `FData` record: meas channel 1 (address=1), normal status,
     /// value 1234, no alarms (byte layout matches
     /// `codec::tests::fdata_binary_decodes_one_record`).
     pub(crate) fn one_record_fdata_binary() -> Vec<u8> {
-        let mut raw = vec![b'E', b'B', 0, 0];
-        raw.extend_from_slice(&0u32.to_be_bytes());
-        raw.extend_from_slice(&[0u8; 10]);
-        raw.extend_from_slice(&28u16.to_be_bytes());
-        raw.extend_from_slice(&[0u8; 16]);
-        raw.push((1 << 4) | 1);
-        raw.push(0);
-        raw.extend_from_slice(&1u16.to_be_bytes());
-        raw.extend_from_slice(&[0, 0, 0, 0]);
-        raw.extend_from_slice(&1234i32.to_be_bytes());
-        let total = (raw.len() - 8) as u32;
-        raw[4..8].copy_from_slice(&total.to_be_bytes());
-        raw
+        fdata_binary(&[(1, 1, 0, [0; 4], 1234)])
     }
 
     /// One present module (index 0), `GX90XA-06` = `InputAnalog`, 6
@@ -1126,5 +1140,24 @@ mod tests {
             received[received.len() - 2..],
             ["OMath,3\r\n", "ORec,1\r\n"]
         );
+    }
+
+    #[test]
+    fn fdata_module_gate_is_address_over_100() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(fdata_binary(&[
+            (1, 99, 0, [0; 4], 77),
+            (1, 100, 0, [0; 4], 55),
+            (1, 0, 0, [0; 4], 33),
+        ]));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ReadAllData);
+        device.join().unwrap();
+        let cache = instrument.cache();
+        assert_eq!(cache.meas_data[98].value, 77);
+        assert_eq!(cache.meas_data[99].value, 0);
     }
 }

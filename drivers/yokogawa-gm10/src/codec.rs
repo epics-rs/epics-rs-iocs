@@ -615,7 +615,7 @@ pub fn parse_srangemath(payload: &[u8]) -> Vec<ExprLine> {
 /// in this order, exactly as `load_data_values` does:
 /// 1. Drop the record unless `data_type == 1` (`drvGM10.c:995`) — other
 ///    values are never stored.
-/// 2. Drop the record unless `Cache::modules[(address-1)/100].use_flag`
+/// 2. Drop the record unless `Cache::modules[address/100].use_flag`
 ///    (same line — applied uniformly, even to Math/Comm channel_types).
 /// 3. Select the target array by `channel_type` (1=meas,2=calc,3=comm),
 ///    index `address - 1`.
