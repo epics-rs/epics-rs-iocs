@@ -9,8 +9,8 @@
 //! cannot interleave with another context's.
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::request::{RequestOp, RequestResult};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -100,8 +100,12 @@ impl MarccdDriver {
     /// port's trace mask gates it.
     fn trace_server_error(&self, message: &str) {
         self.server
-            .trace()
-            .output(self.server.port_name(), TraceMask::ERROR, message);
+            .print(0, TraceMask::ERROR, format_args!("{message}"));
+    }
+
+    /// One request on C `pasynUserServer`, which fails when it has no port.
+    fn server_submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        self.server.port()?.submit_blocking(op, user)
     }
 
     // --- server ------------------------------------------------------------
@@ -109,14 +113,12 @@ impl MarccdDriver {
     /// C `writeServer`: flush stale input, write with `MARCCD_SERVER_TIMEOUT`,
     /// then publish the command on `ADStringToServer`.
     pub fn write_server(&mut self, output: &str) -> CamStatus {
-        let _ = self
-            .server
-            .submit_blocking(RequestOp::Flush, AsynUser::default().with_addr(SERVER_ADDR));
+        let _ = self.server_submit(RequestOp::Flush, AsynUser::default().with_addr(SERVER_ADDR));
 
         let user = AsynUser::default()
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(MARCCD_SERVER_TIMEOUT));
-        let status = match self.server.submit_blocking(
+        let status = match self.server_submit(
             RequestOp::OctetWrite {
                 data: output.as_bytes().to_vec(),
             },
@@ -143,7 +145,7 @@ impl MarccdDriver {
         let user = AsynUser::default()
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(timeout));
-        let status = match self.server.submit_blocking(
+        let status = match self.server_submit(
             RequestOp::OctetRead {
                 buf_size: MAX_MESSAGE_SIZE,
             },
