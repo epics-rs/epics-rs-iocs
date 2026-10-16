@@ -51,7 +51,7 @@ use crate::conex::ConexAxis;
 use crate::esp300::{self, Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
-use crate::mm4000::{self, Mm4000Axis, Mm4000Controller};
+use crate::mm4000::{self, Mm4000Axis, Mm4000Controller, Mm4000Refusal};
 use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
 use crate::smc100::Smc100Axis;
@@ -1717,9 +1717,9 @@ pub fn mm4000_setup_command() -> CommandDef {
             let num_cards = c_int(args, 0);
             if !(1..=MM4000_NUM_CARDS).contains(&num_cards) {
                 std::thread::sleep(Duration::from_secs(5));
-                eprintln!(
-                    "\n*** ERROR *** Number specified ({num_cards}) exceeds maximum allowed ({MM4000_NUM_CARDS}).\n"
-                );
+                errlog_vprintf(format_args!(
+                    "\n*** ERROR *** Number specified ({num_cards}) exceeds maximum allowed ({MM4000_NUM_CARDS}).\n\n"
+                ));
                 std::thread::sleep(Duration::from_secs(5));
             }
             MM4000.setup(num_cards, c_int(args, 1));
@@ -1732,12 +1732,22 @@ pub fn mm4000_setup_command() -> CommandDef {
 /// `TP;` reports.
 pub fn mm4000_config_command() -> CommandDef {
     model1_config_command("MM4000Config", &MM4000, |ctx, card, port| {
-        let handle = connect_serial(port, MM4000_TIMEOUT)?;
+        // C drops a card it cannot connect to without a word.
+        let Ok(handle) = connect_serial(port, MM4000_TIMEOUT) else {
+            return Ok(());
+        };
         // Six per-axis polls share one controller-wide exchange: cache for
         // half the default scan period.
         let cache_ttl = Duration::from_millis(1000 / SCAN_RATE as u64 / 2);
-        let Some(controller) = Mm4000Controller::new(handle, port, port, 0, cache_ttl) else {
-            return Ok(());
+        let controller = match Mm4000Controller::new(handle, port, port, 0, cache_ttl) {
+            Ok(controller) => controller,
+            Err(Mm4000Refusal::InvalidModel(ident)) => {
+                errlog_vprintf(format_args!(
+                    "drvMM4000.c:motor_init() - invalid model = {ident}\n"
+                ));
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
         };
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
@@ -1817,10 +1827,25 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-            let Some(controller) =
-                Mm4000Controller::new(handle, &port_name, &port_name, num_axes as usize, cache_ttl)
-            else {
-                return Ok(CommandOutcome::Continue);
+            let controller = match Mm4000Controller::new(
+                handle,
+                &port_name,
+                &port_name,
+                num_axes as usize,
+                cache_ttl,
+            ) {
+                Ok(controller) => controller,
+                Err(Mm4000Refusal::NoAnswer) => return Ok(CommandOutcome::Continue),
+                Err(Mm4000Refusal::InvalidModel(firmware)) => {
+                    println!("MM4000AsynConfig: invalid model = {firmware}");
+                    return Ok(CommandOutcome::Continue);
+                }
+                Err(Mm4000Refusal::TooFewAxes { total_axes }) => {
+                    println!(
+                        "MM4000AsynConfig: actual number of axes={total_axes} < numAxes={num_axes}"
+                    );
+                    return Ok(CommandOutcome::Continue);
+                }
             };
             let controller = Arc::new(Mutex::new(controller));
             let axes = (1..=num_axes as usize)

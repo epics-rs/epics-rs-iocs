@@ -157,21 +157,32 @@ pub struct Mm4000Controller {
     cache_ttl: Duration,
 }
 
+/// Why [`Mm4000Controller::new`] refused a controller.
+#[derive(Debug)]
+pub enum Mm4000Refusal {
+    /// `VE;` failed three times.
+    NoAnswer,
+    /// The firmware string (past `VE`) names no MM4000/4005/4006.
+    InvalidModel(String),
+    /// `TP;` reported fewer fields than the axes asked for.
+    TooFewAxes { total_axes: usize },
+}
+
 impl Mm4000Controller {
     /// Connect and identify an MM4000/4005/4006 (C `MM4000AsynConfig`):
     /// `VE;` up to 3 tries → firmware/model, then `TP;` — the number of
     /// comma-separated fields is the axis count on the wire, which must
     /// cover `num_axes`; a `num_axes` of 0 takes them all, as the model-1
-    /// driver does. `None` is C's refused config: a failed `VE;` says
-    /// nothing, the other refusals print C's line. Performs blocking serial
-    /// I/O.
+    /// driver does. The refusal is returned for the caller to print, as
+    /// drvMM4000.cc and drvMM4000Asyn.c word it differently. Performs
+    /// blocking serial I/O.
     pub fn new(
         handle: SyncIOHandle,
         serial_port: &str,
         motor_port: &str,
         num_axes: usize,
         cache_ttl: Duration,
-    ) -> Option<Self> {
+    ) -> Result<Self, Mm4000Refusal> {
         let mut ctrl = Self {
             handle,
             serial_port: serial_port.to_owned(),
@@ -183,11 +194,12 @@ impl Mm4000Controller {
             fetched_at: None,
             cache_ttl,
         };
-        let ve = (0..3).find_map(|_| ctrl.write_read("VE;").ok())?;
+        let ve = (0..3)
+            .find_map(|_| ctrl.write_read("VE;").ok())
+            .ok_or(Mm4000Refusal::NoAnswer)?;
         ctrl.firmware = ve.get(2..).unwrap_or("").to_string(); // skip "VE"
         let Some(model) = detect_model(&ctrl.firmware) else {
-            println!("MM4000AsynConfig: invalid model = {}", ctrl.firmware);
-            return None;
+            return Err(Mm4000Refusal::InvalidModel(ctrl.firmware));
         };
         ctrl.model = model;
 
@@ -195,13 +207,12 @@ impl Mm4000Controller {
         let tp = ctrl.write_read("TP;").unwrap_or_default();
         let total_axes = strtok_count(&tp);
         if total_axes < num_axes {
-            println!("MM4000AsynConfig: actual number of axes={total_axes} < numAxes={num_axes}");
-            return None;
+            return Err(Mm4000Refusal::TooFewAxes { total_axes });
         }
         if num_axes == 0 {
             ctrl.num_axes = total_axes;
         }
-        Some(ctrl)
+        Ok(ctrl)
     }
 
     /// The axes this controller serves.
@@ -649,6 +660,7 @@ mod tests {
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let ctrl = Mm4000Controller::new(io, "mm4000_dead", "mm4000_dead_motor", 1, Duration::ZERO)
+            .ok()
             .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
@@ -686,7 +698,7 @@ mod tests {
             let io =
                 SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
             assert!(
-                Mm4000Controller::new(io, name, name, num_axes, Duration::ZERO).is_none(),
+                Mm4000Controller::new(io, name, name, num_axes, Duration::ZERO).is_err(),
                 "{name}"
             );
         }
