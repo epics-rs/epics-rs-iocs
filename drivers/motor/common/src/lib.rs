@@ -5,13 +5,15 @@
 //! same shape: a C-named create command connects an octet port, builds one
 //! [`epics_rs::asyn::interfaces::motor::AsynMotor`] per axis, and registers
 //! each where a record's OUT reaches it — `@asyn(PORT,ADDR)` for an asyn
-//! driver, `#C card S signal` for a model-1 one — as motor-rs's
+//! or model-2 driver, `#C card S signal` for a model-1 one — as motor-rs's
 //! [`devices`] binds them at `init_record`. This crate factors out everything
 //! that is not protocol-specific:
 //!
 //! - [`install`] — wires one axis through motor-rs's [`MotorBuilder`],
 //!   registers it and starts its poller.
 //! - [`model1::Model1`] — a model-1 driver's `Setup` and card table.
+//! - [`model2::Model2`] — a model-2 driver's cards, opened by
+//!   `drvAsynMotorConfigure`.
 //! - [`iocsh`] — argument parsing helpers for the create commands.
 //! - [`connect`] — octet-port connect helpers ([`connect_serial`],
 //!   [`connect_ip`]).
@@ -26,6 +28,7 @@
 pub mod connect;
 pub mod iocsh;
 pub mod model1;
+pub mod model2;
 pub mod util;
 
 use std::sync::{Arc, Mutex};
