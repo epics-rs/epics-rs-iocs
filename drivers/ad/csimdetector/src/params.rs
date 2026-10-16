@@ -125,7 +125,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let nd = NDArrayDriverParams::create(&mut base).unwrap();
+        let (nd, _) = NDArrayDriverParams::create(&mut base).unwrap();
         let sim = CSimParams::create(&mut base).unwrap();
         (base, nd, sim)
     }
