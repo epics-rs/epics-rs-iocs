@@ -18,10 +18,8 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 #drvAsynSerialPortConfigure("$(IPPORT)", "/dev/ttyUSB0", 0, 0, 0)
 #asynSetOption("$(IPPORT)", -1, "baud", "38400")
 
-# OMS framing: the controller terminates replies with "\n\r"; the driver owns
-# the "\n" output terminator, so only the input EOS is set here. Do NOT set an
-# output EOS.
-asynOctetSetInputEos("$(IPPORT)", 0, "\n\r")
+# omsMAXnetConfig defaults the EOS to "\n\r" in, "\n" out where it is unset;
+# set either here to override it.
 
 # ---- MAXnet controller ----
 # omsMAXnetConfig(controllerName, asynPort, [initString], [movingPollMs],

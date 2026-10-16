@@ -6,8 +6,7 @@
 //! probes and attaches each axis to a `DTYP`-keyed motor device support
 //! (`OMS_{controllerName}_{axis}`). The controller is looked up by name from a
 //! registry shared by the commands. Both port kinds (`drvAsynIPPort` /
-//! `drvAsynSerialPort`) work, so `connect_ip` is used (the lookup is
-//! transport-agnostic).
+//! `drvAsynSerialPort`) work.
 //!
 //! `omsMAXnetConfig` and `omsMXAConfig` differ only in the controller label
 //! (and, in the C driver, a minimum-firmware value used to select command
@@ -18,11 +17,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_ip;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, poll_intervals,
     req_int, req_string,
@@ -93,7 +94,7 @@ fn oms_config_command(
                     "{cmd_name}: controller '{name}' already registered"
                 ));
             }
-            let handle = connect_ip(
+            let handle = connect_with_default_eos(
                 &asyn_port,
                 Duration::from_millis(timeout_ms.max(0.0) as u64),
             )?;
@@ -158,4 +159,33 @@ fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> Co
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// Connect to the octet port, giving it the OMS EOS (input `"\n\r"`, output
+/// `"\n"`) only where st.cmd left that direction empty, as
+/// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`.
+fn connect_with_default_eos(port_name: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
+    let port = get_port(port_name).ok_or_else(|| format!("asyn port '{port_name}' not found"))?;
+    let user = || AsynUser::new(0).with_addr(0);
+    let handle = &port.handle;
+    let eos_err = |e| format!("EOS on '{port_name}': {e}");
+    if handle
+        .get_input_eos_blocking(user())
+        .map_err(eos_err)?
+        .is_empty()
+    {
+        handle
+            .set_input_eos_blocking(user(), b"\n\r")
+            .map_err(eos_err)?;
+    }
+    if handle
+        .get_output_eos_blocking(user())
+        .map_err(eos_err)?
+        .is_empty()
+    {
+        handle
+            .set_output_eos_blocking(user(), b"\n")
+            .map_err(eos_err)?;
+    }
+    Ok(SyncIOHandle::from_handle(handle.clone(), 0, timeout))
 }

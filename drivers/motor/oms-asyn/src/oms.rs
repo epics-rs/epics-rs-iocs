@@ -12,8 +12,8 @@
 //!
 //! Commands are `;`-separated OMS mnemonics prefixed with an axis selector:
 //! `A<char>` selects one axis (chars `X Y Z T U V R S W K` for axes 0..9), `AM`
-//! addresses all. The driver appends the `"\n"` command terminator; the startup
-//! script sets the input EOS (`"\n\r"`, the OMS reply terminator). Accepted
+//! addresses all. Commands go out bare and are framed by the port EOS (see
+//! `crate::ioc` for the defaults). Accepted
 //! commands are acknowledged with a leading `0x06` (stripped here).
 //!
 //! The controller also emits unsolicited `"%000 ..."` *notification* lines when
@@ -62,9 +62,6 @@ use motor_common::util::atoi;
 /// Reply read buffer size (C `OMSINPUTBUFFERLEN` = 12*10 + 2).
 const READ_BUF: usize = 256;
 
-/// Command terminator appended by the driver (C output EOS `"\n"`).
-const TERMINATOR: &[u8] = b"\n";
-
 /// Per-axis command selector characters (C `axisChrArr`).
 const AXIS_CHARS: [char; 10] = ['X', 'Y', 'Z', 'T', 'U', 'V', 'R', 'S', 'W', 'K'];
 
@@ -109,23 +106,16 @@ impl OmsController {
         self.controller_type
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command expecting no reply (C `sendOnly`).
     pub fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Send a command and read one reply, skipping any notification lines and
     /// stripping the leading ACK/CR/LF (C `sendReceive`).
     pub fn send_receive(&self, cmd: &str) -> AsynResult<String> {
-        let mut raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let mut raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         // A move notification may sit ahead of the real reply; skip it. Bound
         // the retries so a chatty controller cannot spin forever.
         for _ in 0..12 {
@@ -458,11 +448,6 @@ mod tests {
         assert_eq!(OmsAxis::nint(-1.4), -1);
         assert_eq!(OmsAxis::nint(-1.5), -2);
         assert_eq!(OmsAxis::nint(0.0), 0);
-    }
-
-    #[test]
-    fn framed_appends_terminator() {
-        assert_eq!(OmsController::framed("AX;RP;"), b"AX;RP;\n");
     }
 
     #[test]
