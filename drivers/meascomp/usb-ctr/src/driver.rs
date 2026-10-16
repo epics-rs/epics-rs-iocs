@@ -489,6 +489,15 @@ impl PortDriver for CtrDriver {
         if reason == self.params.mca_preset_real {
             // C readMCS reads the preset on every pass.
             self.state.lock().unwrap().mcs.preset_real_time = value;
+        } else if reason == self.params.mca_dwell_time {
+            let num_points = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
+            let mut st = self.state.lock().unwrap();
+            let times = mcs::compute_times(&mut st.mcs, num_points.max(0) as usize, value);
+            self.base
+                .params
+                .set_float32_array(self.params.mcs_time_wf, 0, times)?;
+            drop(st);
+            self.base.call_param_callbacks(0)?;
         }
 
         // Restart pulse generator if period or duty cycle changes while running

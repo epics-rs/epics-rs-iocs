@@ -20,7 +20,6 @@ pub struct McsState {
     pub current_point: usize,
     pub start_time: f64,
     pub preset_real_time: f64,
-    pub dwell_time: f64,
 
     /// Scan buffer for ulDaqInScan (f64 values).
     pub scan_buffer: Vec<f64>,
@@ -51,7 +50,6 @@ impl McsState {
             current_point: 0,
             start_time: 0.0,
             preset_real_time: 0.0,
-            dwell_time: 0.001,
             scan_buffer: Vec::new(),
             mcs_buffers,
             abs_time_buffer: vec![0.0; max_points],
@@ -82,11 +80,14 @@ pub fn erase_mcs(state: &mut McsState, num_points: usize) {
     state.start_time = current_time_secs();
 }
 
-/// Compute the time waveform based on dwell time.
-pub fn compute_times(state: &mut McsState) {
-    for i in 0..state.max_points {
-        state.time_buffer[i] = (i as f64 * state.dwell_time) as f32;
+/// Fill the first `num_points` of the time base with `i * dwell` and return
+/// them. C `USBCTR::computeMCSTimes`.
+pub fn compute_times(state: &mut McsState, num_points: usize, dwell: f64) -> &[f32] {
+    let n = num_points.min(state.time_buffer.len());
+    for (i, t) in state.time_buffer[..n].iter_mut().enumerate() {
+        *t = (i as f64 * dwell) as f32;
     }
+    &state.time_buffer[..n]
 }
 
 /// C `MCSPoint0Action_t`.
@@ -135,7 +136,6 @@ pub fn start_mcs(
         prescale_counter,
         point0_action,
     } = *scan;
-    state.dwell_time = dwell_time;
     state.counter_enable = counter_enable;
 
     let mut chan_descs = Vec::new();
@@ -276,8 +276,6 @@ pub fn start_mcs(
     state.running = true;
     state.current_point = 0;
     state.start_time = current_time_secs();
-
-    compute_times(state);
     1.0 / rate
 }
 
