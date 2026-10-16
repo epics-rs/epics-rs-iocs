@@ -179,11 +179,12 @@ impl SpecsAnalyserDriver {
     fn reconnect(&mut self) -> AsynResult<()> {
         let first_connect = self.first_connect;
         let outcome = self.with_wire(move |link| {
-            let mut connection = link.connect().map(|_| ());
+            let connect = link.connect();
+            let mut connection = Ok(());
             let mut visible_name = None;
             let mut discovered = Vec::new();
             let mut non_energy_channels = None;
-            if connection.is_ok() && first_connect {
+            if connect.is_ok() && first_connect {
                 connection = link.read_device_visible_name().map(|name| {
                     visible_name = Some(name);
                 });
@@ -201,6 +202,7 @@ impl SpecsAnalyserDriver {
             let scan_ranges = link.read_spectrum_parameter("ScanRange");
             let run_modes = wire::read_run_modes();
             ReconnectOutcome {
+                connect,
                 connection,
                 visible_name,
                 discovered,
@@ -211,7 +213,28 @@ impl SpecsAnalyserDriver {
             }
         });
 
-        if outcome.connection.is_ok() {
+        let base = &mut self.ad.port_base;
+        match &outcome.connect {
+            Ok(info) => {
+                let _ = base.set_string_param(self.p.server_name, 0, info.server_name.clone());
+                let _ = base.set_string_param(
+                    self.p.protocol_version,
+                    0,
+                    info.protocol_version.clone(),
+                );
+                let _ = base.set_int32_param(self.p.connected, 0, 1);
+                let _ =
+                    base.set_string_param(self.ad.params.status_message, 0, "Connected to SPECS");
+                let _ = base.set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32);
+            }
+            Err(_) => {
+                let _ = base.set_int32_param(self.p.connected, 0, 0);
+                let _ = base.set_int32_param(self.ad.params.status, 0, ADStatus::Error as i32);
+            }
+        }
+        let _ = base.call_param_callbacks(0);
+
+        if outcome.connect.is_ok() && outcome.connection.is_ok() {
             if let Some(name) = outcome.visible_name {
                 let _ = self
                     .ad
@@ -284,6 +307,7 @@ impl SpecsAnalyserDriver {
         );
 
         let failures = [
+            outcome.connect.err(),
             outcome.connection.err(),
             outcome.lens_modes.err(),
             outcome.scan_ranges.err(),
@@ -502,7 +526,9 @@ impl SpecsAnalyserDriver {
 }
 
 struct ReconnectOutcome {
-    /// `makeConnection`'s status.
+    /// `connect`'s status.
+    connect: Result<wire::ConnectInfo, wire::WireError>,
+    /// The status of `makeConnection`'s first-connect steps.
     connection: Result<(), wire::WireError>,
     visible_name: Option<String>,
     discovered: Vec<wire::DiscoveredParam>,

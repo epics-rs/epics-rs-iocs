@@ -243,7 +243,10 @@ impl WireLink<'_> {
     pub fn connect(&mut self) -> Result<ConnectInfo, WireError> {
         *self.wire_state.lock().unwrap() = 0;
         self.connected.store(true, Ordering::SeqCst);
-        let data = self.command_response("Connect")?;
+        // `SpecsAnalyser::connect` clears it on failure (`specsAnalyser.cpp:228-233`).
+        let data = self
+            .command_response("Connect")
+            .inspect_err(|_| self.connected.store(false, Ordering::SeqCst))?;
         Ok(ConnectInfo {
             server_name: clean_string(
                 data.get("ServerName").map(String::as_str).unwrap_or(""),

@@ -152,6 +152,22 @@ impl Fake {
             .unwrap()
     }
 
+    fn string(&self, reason: usize) -> String {
+        let bytes = self
+            .runtime
+            .port_handle()
+            .get_string_param_blocking(reason, 0, 256)
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn int32(&self, reason: usize) -> i32 {
+        self.runtime
+            .port_handle()
+            .read_int32_blocking(reason, 0)
+            .unwrap()
+    }
+
     /// The counter of the last request the server has seen.
     fn last_heard(&self) -> u32 {
         self.heard.try_iter().last().unwrap_or(0)
@@ -202,6 +218,21 @@ fn connect_returns_the_or_of_the_step_statuses() {
     ]);
     let connect = fake.runtime.specs_params.connect;
     assert_eq!(fake.write_int32(connect, 1), Err(AsynStatus::Error));
+}
+
+/// connect() records the connection and asynPortConnect the server's
+/// answer (specsAnalyser.cpp:236-238, 1861-1868), so a Connect write while
+/// connected sends nothing (:801-803).
+#[test]
+fn a_connect_while_connected_is_skipped() {
+    let fake = Fake::start("SPECS_WS_CONNECTED");
+    let p = &fake.runtime.specs_params;
+    assert_eq!(fake.int32(p.connected), 1);
+    assert_eq!(fake.string(p.server_name), "fake");
+    assert_eq!(fake.string(p.protocol_version), "1.11");
+    let before = fake.last_heard();
+    fake.write_int32(p.connect, 1).unwrap();
+    assert_eq!(fake.heard.try_iter().last(), None, "after {before}");
 }
 
 #[test]
