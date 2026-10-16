@@ -22,8 +22,8 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
-use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::ndarray_pool::DriverPool;
+use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use parking_lot::Mutex;
@@ -48,6 +48,9 @@ pub struct Mar345Driver {
     abort: Arc<Event>,
     /// C `mar345Mode_t mode`, shared with the worker.
     mode: Arc<AtomicI32>,
+    /// C `pData` (mar345.cpp:741-747): allocated once and never read, so it
+    /// stays charged on the pool for the driver's life.
+    _raw_buffer: Option<DriverArray>,
 }
 
 /// The handles the driver shares with its worker thread.
@@ -85,6 +88,14 @@ impl Mar345Driver {
         base.set_int32_param(p.num_erased, 0, 0)?;
         base.set_int32_param(p.erase, 0, 0)?;
 
+        let raw_buffer = ad.pool.alloc(
+            vec![
+                NDDimension::new(MAX_DIM as usize),
+                NDDimension::new(MAX_DIM as usize),
+            ],
+            NDDataType::Int16,
+        );
+
         Ok(Self {
             ad,
             p,
@@ -92,6 +103,7 @@ impl Mar345Driver {
             stop: links.stop,
             abort: links.abort,
             mode: links.mode,
+            _raw_buffer: raw_buffer.ok(),
         })
     }
 }
@@ -283,4 +295,36 @@ pub fn create_mar345_detector(
         array_output,
         tasks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver(name: &str, max_memory: usize) -> Mar345Driver {
+        Mar345Driver::new(
+            name,
+            max_memory,
+            DriverLinks {
+                start: Arc::new(Event::new()),
+                stop: Arc::new(Event::new()),
+                abort: Arc::new(Event::new()),
+                mode: Arc::new(AtomicI32::new(0)),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_raw_buffer_is_charged_at_construction() {
+        let d = driver("MAR345_RAW", 0);
+        assert_eq!(d.ad.pool.num_alloc_buffers(), 1);
+        assert_eq!(d.ad.pool.allocated_bytes(), 3450 * 3450 * 2);
+    }
+
+    #[test]
+    fn a_pool_without_room_for_the_raw_buffer_still_builds_the_driver() {
+        let d = driver("MAR345_RAW_REFUSED", 1000);
+        assert_eq!(d.ad.pool.num_alloc_buffers(), 0);
+    }
 }
