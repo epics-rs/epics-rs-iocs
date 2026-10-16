@@ -20,6 +20,36 @@ pub fn register_vac_dbd() {
     }
 }
 
+/// `recGblGetGraphicDouble` / `recGblGetControlDouble` — the two are one
+/// body — for a field the record's rset does not list: the declared type's
+/// range, 0/0 for a type with none. `None` for a field that is not one of the
+/// record's own `fields` (a dbCommon field), which base routes the same way.
+///
+/// vac's rsets answer every field themselves, so a record type base has no
+/// table for never reaches base's guess at which fields it lists.
+pub(crate) fn rec_gbl_range(
+    fields: &'static [epics_rs::base::server::record::FieldDesc],
+    field: &str,
+) -> Option<(f64, f64)> {
+    let desc = fields.iter().find(|f| f.name == field)?;
+    Some(
+        epics_rs::base::server::recgbl::rec_gbl_get_control_double(desc.declared_dbf)
+            .unwrap_or((0.0, 0.0)),
+    )
+}
+
+/// `recGblGetAlarmDouble` for one of the record's own `fields`; `None` for a
+/// dbCommon field, as [`rec_gbl_range`].
+pub(crate) fn rec_gbl_alarm(
+    fields: &'static [epics_rs::base::server::record::FieldDesc],
+    field: &str,
+) -> Option<(f64, f64, f64, f64)> {
+    fields
+        .iter()
+        .any(|f| f.name == field)
+        .then(epics_rs::base::server::recgbl::rec_gbl_get_alarm_double)
+}
+
 /// Generate a record's scalar `get_field` / `put_field` bodies from one list.
 ///
 /// Each entry is `"NAME": Variant = struct_field`, where `Variant` is the

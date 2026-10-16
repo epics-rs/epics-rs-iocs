@@ -11,7 +11,7 @@ use epics_rs::base::server::record::{
 use epics_rs::base::types::EpicsValue;
 
 use super::dbd_generated::VS_FIELDS;
-use super::{record_fields, set_sevr, severity_of};
+use super::{rec_gbl_alarm, rec_gbl_range, record_fields, set_sevr, severity_of};
 
 /// `chgc` bits — `vsRecord.c:60-66`. `special()` sets one per `SPC_MOD` field
 /// touched since the last process; `readWrite_vs` consumes them.
@@ -481,12 +481,12 @@ impl Record for VsRecord {
             "LPRS" => Some((self.hlpr as f64, self.llpr as f64)),
             "LCAP" => Some((self.halr as f64, self.lalr as f64)),
             "LCBP" => Some((self.hblr as f64, self.lblr as f64)),
-            _ => None,
+            _ => rec_gbl_range(VS_FIELDS, field),
         };
 
         let ctrl_limits = match field {
             "VAL" | "PRES" | "CGAP" | "CGBP" => Some((self.hopr as f64, self.lopr as f64)),
-            _ => None,
+            _ => rec_gbl_range(VS_FIELDS, field),
         };
 
         // Alarm limits are published only while an ion gauge is switched on;
@@ -500,7 +500,7 @@ impl Record for VsRecord {
                 self.lolo as f64,
             )),
             "VAL" | "PRES" => Some((0.0, 0.0, 0.0, 0.0)),
-            _ => None,
+            _ => rec_gbl_alarm(VS_FIELDS, field),
         };
 
         Some(FieldMetadataOverride {
@@ -752,9 +752,11 @@ mod tests {
                 1e-12f32 as f64
             ))
         );
-        assert_eq!(
-            r.field_metadata_override("CGAP").unwrap().alarm_limits,
-            None
-        );
+        let (a, b, c, d) = r
+            .field_metadata_override("CGAP")
+            .unwrap()
+            .alarm_limits
+            .unwrap();
+        assert!([a, b, c, d].iter().all(|v| v.is_nan()));
     }
 }

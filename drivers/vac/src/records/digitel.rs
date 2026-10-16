@@ -11,7 +11,7 @@ use epics_rs::base::server::record::{
 use epics_rs::base::types::{EpicsValue, PvString};
 
 use super::dbd_generated::DIGITEL_FIELDS;
-use super::{record_fields, set_sevr, severity_of};
+use super::{rec_gbl_alarm, rec_gbl_range, record_fields, set_sevr, severity_of};
 
 /// `SPC_MOD` clamp limits (`digitelRecord.c:96-99`).
 const DIGITEL_MAXSP: f64 = 1e-3;
@@ -701,21 +701,22 @@ impl Record for DigitelRecord {
                 "CRNT" => Some((self.hctr as f64, self.lctr as f64)),
                 "LVAL" => Some((self.hlpr as f64, self.llpr as f64)),
                 "VOLT" => Some((self.hvtr as f64, self.lvtr as f64)),
-                _ => None,
+                _ => rec_gbl_range(DIGITEL_FIELDS, field),
             }
         };
 
+        // VAL is not listed: C hands it to `recGblGetControlDouble`.
         let ctrl_limits = if matches!(indexed(field), Some(("SnHS", _))) {
             Some((DIGITEL_MAXHY, DIGITEL_MINHY))
         } else if matches!(indexed(field), Some(("SPnS", _))) {
             Some((DIGITEL_MAXSP, DIGITEL_MINSP))
         } else {
-            None
+            rec_gbl_range(DIGITEL_FIELDS, field)
         };
 
         let alarm_limits = match field {
             "VAL" => Some((self.hihi, self.high, self.low, self.lolo)),
-            _ => None,
+            _ => rec_gbl_alarm(DIGITEL_FIELDS, field),
         };
 
         Some(FieldMetadataOverride {
@@ -947,9 +948,17 @@ mod tests {
             r.field_metadata_override("VAL").unwrap().alarm_limits,
             Some((1e-6, 1e-7, 2e-12, 1e-12))
         );
+        // Unlisted: `recGblGetAlarmDouble`'s four NaN.
+        let (a, b, c, d) = r
+            .field_metadata_override("CRNT")
+            .unwrap()
+            .alarm_limits
+            .unwrap();
+        assert!([a, b, c, d].iter().all(|v| v.is_nan()));
+        // VAL's control limits are `recGblGetControlDouble`'s DBF_DOUBLE range.
         assert_eq!(
-            r.field_metadata_override("CRNT").unwrap().alarm_limits,
-            None
+            r.field_metadata_override("VAL").unwrap().ctrl_limits,
+            Some((1e300, -1e300))
         );
     }
 
