@@ -1,5 +1,5 @@
-# Parker OEM750: one motor record per axis. Load once per axis with N = 0-based
-# axis index (DTYP OEM_$(CARD)_$(N)); the controller unit address is N + 1.
+# Parker OEM750: one motor record per axis. Load once per axis with ADDR = 0-based
+# axis index of port PORT; the controller unit address is ADDR + 1.
 #
 # The driver reports positions in controller counts (the motor resolution MR is
 # set to 1 and the velocity scale cancels), so MRES = 1 and EGU = counts. Done,
@@ -7,7 +7,8 @@
 # zeroes the position at the home switch.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "OEM_$(CARD)_$(N)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10000)")
     field(ACCL, "$(ACCL=0.5)")
