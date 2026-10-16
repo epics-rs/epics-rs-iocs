@@ -223,6 +223,38 @@ impl SweepState {
         updates
     }
 
+    /// C `dataCallback(newData, nelem)` (`drvFastSweep.cpp:221-246`):
+    /// accumulate/average, then [`Self::next_point`].
+    fn data_callback(
+        &mut self,
+        new_data: &[i32],
+        reasons: &[usize; McaReason::COUNT],
+        current_channel_reason: usize,
+    ) -> Vec<ParamSetValue> {
+        if !self.acquiring {
+            return Vec::new();
+        }
+        if self.num_average == 1 {
+            return self.next_point(new_data, reasons, current_channel_reason);
+        }
+        for (i, &v) in new_data.iter().take(self.max_signals).enumerate() {
+            self.average_store[i] += f64::from(v);
+        }
+        self.accumulated += 1;
+        if self.accumulated < self.num_average {
+            return Vec::new();
+        }
+        let averaged: Vec<i32> = self
+            .average_store
+            .iter()
+            .map(|&sum| (sum / f64::from(self.accumulated)).round() as i32)
+            .collect();
+        let updates = self.next_point(&averaged, reasons, current_channel_reason);
+        self.average_store.iter_mut().for_each(|v| *v = 0.0);
+        self.accumulated = 0;
+        updates
+    }
+
     /// C `readInt32Array`'s copy (`drvFastSweep.cpp:351-354`), with the
     /// buffer overflow fixed at source: C ignores the caller's `maxChans`
     /// capacity entirely and always `memcpy`s `numPoints_` ints, an
@@ -544,29 +576,11 @@ fn spawn_data_thread(
                     };
                     let reasons = shared.reasons;
                     let current_channel_reason = shared.current_channel_reason;
-                    let updates = {
-                        let mut state = shared.state.lock().unwrap();
-                        if state.num_average == 1 {
-                            state.next_point(&new_data, &reasons, current_channel_reason)
-                        } else {
-                            for (i, &v) in new_data.iter().take(state.max_signals).enumerate() {
-                                state.average_store[i] += f64::from(v);
-                            }
-                            state.accumulated += 1;
-                            if state.accumulated >= state.num_average {
-                                let averaged: Vec<i32> = state
-                                    .average_store
-                                    .iter()
-                                    .map(|&sum| (sum / f64::from(state.accumulated)).round() as i32)
-                                    .collect();
-                                state.average_store.iter_mut().for_each(|v| *v = 0.0);
-                                state.accumulated = 0;
-                                state.next_point(&averaged, &reasons, current_channel_reason)
-                            } else {
-                                Vec::new()
-                            }
-                        }
-                    };
+                    let updates = shared.state.lock().unwrap().data_callback(
+                        &new_data,
+                        &reasons,
+                        current_channel_reason,
+                    );
                     if !updates.is_empty() {
                         let _ = handle.set_params_and_notify_blocking(0, updates);
                     }
@@ -682,6 +696,25 @@ mod tests {
         let updates = state.next_point(&[1, 2], &reasons, 999);
         assert!(updates.is_empty());
         assert_eq!(state.num_acquired, 0);
+    }
+
+    /// C `dataCallback`'s first statement, `if (!acquiring_) return;`
+    /// (`drvFastSweep.cpp:225`): samples arriving while stopped are not
+    /// averaged into the next sweep's first channel.
+    #[test]
+    fn data_callback_does_not_accumulate_while_not_acquiring() {
+        let mut state = SweepState::new(1, 4);
+        state.num_average = 2;
+        state.num_points = 4;
+        let reasons = dummy_reasons();
+        state.data_callback(&[100], &reasons, 999);
+        assert_eq!(state.accumulated, 0);
+        assert_eq!(state.average_store, [0.0]);
+
+        state.acquiring = true;
+        state.data_callback(&[2], &reasons, 999);
+        state.data_callback(&[4], &reasons, 999);
+        assert_eq!(state.p_data[0], 3);
     }
 
     /// C `nextPoint`'s per-signal write + always-publish current channel /
