@@ -657,6 +657,22 @@ impl AdsShared {
         Ok(())
     }
 
+    /// C `adsReadParam` on a bound parameter: read it through the address it
+    /// has, or resolve it first when it has none.
+    fn reread_param(&self, reason: usize) -> Result<(), AdsError> {
+        let resolved = {
+            let params = self.params.lock();
+            let p = param_ref(&params, reason)?;
+            (!p.refresh_needed).then(|| (p.info.ams_port, p.wire_address(), p.plc_size))
+        };
+        let Some((ams_port, Some((group, offset)), size)) = resolved else {
+            return self.refresh_param(reason);
+        };
+        let data = self.read_param(&*self.client()?, ams_port, group, offset, size)?;
+        self.publish(reason, &data, 0);
+        Ok(())
+    }
+
     /// The read of C `adsReadParam`, with its error lines.
     fn read_param(
         &self,
@@ -1367,7 +1383,18 @@ impl PortDriver for AdsPortDriver {
     /// own type decides, which is C's `asynParamNotDefined` default with the
     /// guesswork removed.
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        // C (:1085-1095) reads an already-bound drvInfo again, so every record
+        // on a symbol the PLC refuses fails, not only the first.
         if let Some(reason) = self.base.find_param(&req.drv_info) {
+            let source = param_ref(&self.shared.params.lock(), reason)
+                .map_err(|e| asyn_err(e.to_string()))?
+                .info
+                .data_source;
+            if source != DataSource::AmsState && self.shared.is_connected() {
+                self.shared
+                    .reread_param(reason)
+                    .map_err(|e| asyn_err(format!("drvInfo '{}': {e}", req.drv_info)))?;
+            }
             return Ok(DrvUserInfo::from_reason(reason));
         }
 
@@ -2469,6 +2496,8 @@ mod tests {
         connect_refusing_plc(&d, 0x710); // ADSERR_DEVICE_SYMBOLNOTFOUND
         let req = DrvUserRequest::new("ADSPORT=851/MAIN.nope?", 0).with_iface(InterfaceType::Int32);
         assert!(d.drv_user_create(&req).is_err());
+        // A second record on the same drvInfo is refused too.
+        assert!(d.drv_user_create(&req).is_err());
         // C keeps the parameter it created before asking the PLC.
         let reason = d.base.find_param("ADSPORT=851/MAIN.nope?").unwrap();
         assert!(
@@ -2477,6 +2506,19 @@ mod tests {
                 .unwrap()
                 .refresh_needed
         );
+    }
+
+    #[test]
+    fn re_binding_a_resolved_drvinfo_reads_it_again() {
+        let mut d = driver();
+        let reason = bind(&mut d, ".ADR.16#4020,16#0,4,3?", InterfaceType::Int32);
+        d.shared.params.lock()[reason]
+            .as_mut()
+            .unwrap()
+            .refresh_needed = false;
+        connect_refusing_plc(&d, 0x701); // ADSERR_DEVICE_SRVNOTSUPP
+        let req = DrvUserRequest::new(".ADR.16#4020,16#0,4,3?", 0).with_iface(InterfaceType::Int32);
+        assert!(d.drv_user_create(&req).is_err());
     }
 
     #[test]
