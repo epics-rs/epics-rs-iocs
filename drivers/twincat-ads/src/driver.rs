@@ -26,6 +26,8 @@
 //!   previously-connected AMS port drops, killing the whole IOC (every other
 //!   device support on it included) because one PLC rebooted. Here the
 //!   supervisor drops the socket, alarms the parameters and reconnects.
+//!   `adsGetSymInfoByName`'s `exit(1)` on `GLOBALERR_TARGET_PORT` (:3561)
+//!   is kept, so a lookup that finds the AMS port gone still ends the IOC.
 //! * `adsAsynPortDriver.cpp:3223` — `writeFloat64Array` passes
 //!   `nElements * nElements * sizeof(epicsFloat64)` as the byte count; a
 //!   2-element waveform writes 32 bytes from a 16-byte buffer. Rust sizes the
@@ -71,10 +73,13 @@ use asyn_rs::user::AsynUser;
 use epics_rs::base::server::recgbl::alarm_status;
 
 use crate::ads::defs::{
-    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, LOCAL_PORT_BASE, error_to_string,
+    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, GLOBALERR_TARGET_PORT, LOCAL_PORT_BASE,
+    error_to_string,
 };
 use crate::ads::sumup::{self, SumEntry};
-use crate::ads::{AdsClient, AdsError, AdsState, AdsType, AmsAddr, AmsNetId, NotificationSample};
+use crate::ads::{
+    AdsClient, AdsError, AdsState, AdsType, AmsAddr, AmsNetId, NotificationSample, SymbolEntry,
+};
 use crate::convert::{self, ConvertError, WriteValue};
 use crate::drvinfo::{DataSource, DrvInfo, DrvInfoDefaults, PlcAddress, TimeBase};
 use crate::octet::{self, Command, OctetError};
@@ -277,6 +282,37 @@ impl AdsShared {
         self.client.lock().clone().ok_or(AdsError::NotConnected)
     }
 
+    /// C `adsGetSymInfoByName`, which every symbolic lookup goes through:
+    /// a `GLOBALERR_TARGET_PORT` reply ends the process, as C's `exit(1)`.
+    fn symbol_info(
+        &self,
+        client: &AdsClient,
+        ams_port: u16,
+        name: &str,
+    ) -> Result<SymbolEntry, AdsError> {
+        const FUNCTION: &str = "adsGetSymInfoByName";
+        self.print(
+            TraceMask::FLOW,
+            format_args!("{DRIVER_NAME}:{FUNCTION}: Variable name: {name}, amsPort: {ams_port}."),
+        );
+        client.get_symbol_info(ams_port, name).inspect_err(|e| {
+            self.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}: Get symbolic information failed for {name} with: {}",
+                    CStatus(e)
+                ),
+            );
+            if e.code() == Some(GLOBALERR_TARGET_PORT) {
+                self.print(
+                    TraceMask::ERROR,
+                    format_args!("{DRIVER_NAME}:{FUNCTION}: Port error, giving up!"),
+                );
+                std::process::exit(1);
+            }
+        })
+    }
+
     fn is_connected(&self) -> bool {
         self.client
             .lock()
@@ -449,15 +485,7 @@ impl AdsShared {
         // Symbolic: the PLC tells us the type and size; `.ADR.` carries both.
         let mut handle = None;
         if let Some(name) = &symbol {
-            let entry = client.get_symbol_info(ams_port, name).inspect_err(|e| {
-                self.print(
-                    TraceMask::ERROR,
-                    format_args!(
-                        "{DRIVER_NAME}:adsGetSymInfoByName: Get symbolic information failed for {name} with: {}",
-                        CStatus(e)
-                    ),
-                )
-            })?;
+            let entry = self.symbol_info(&client, ams_port, name)?;
             plc_type = entry.data_type;
             plc_size = entry.size;
 
@@ -1140,7 +1168,7 @@ impl AdsPortDriver {
             Command::Features => "ads;stv1".to_string(),
             Command::Bad => "Error: Bad command".to_string(),
             Command::ReadSymbol { ams_port, name } => {
-                let info = client.get_symbol_info(ams_port, &name)?;
+                let info = self.shared.symbol_info(&client, ams_port, &name)?;
                 let data = client.read(ams_port, info.index_group, info.index_offset, info.size)?;
                 octet_reply(octet::binary_to_ascii(
                     &data,
@@ -1155,7 +1183,7 @@ impl AdsPortDriver {
                 name,
                 value,
             } => {
-                let info = client.get_symbol_info(ams_port, &name)?;
+                let info = self.shared.symbol_info(&client, ams_port, &name)?;
                 match octet::ascii_to_binary(&value, info.data_type, info.size as usize) {
                     Ok(bytes) => {
                         let n = bytes.len().min(info.size as usize);
@@ -1560,8 +1588,9 @@ impl AdsPortDriver {
                         info.raw
                     ))
                 })?;
-                let entry = client
-                    .get_symbol_info(info.ams_port, &name)
+                let entry = self
+                    .shared
+                    .symbol_info(&client, info.ams_port, &name)
                     .map_err(|e| asyn_err(format!("symbol info for '{name}': {e}")))?;
                 (entry.data_type, entry.size)
             }
