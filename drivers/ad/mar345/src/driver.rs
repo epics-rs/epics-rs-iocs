@@ -25,7 +25,6 @@ use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArrayS
 use parking_lot::Mutex;
 
 use crate::params::Mar345Params;
-use crate::server::Server;
 use crate::task::{Worker, start_task};
 use crate::types::{EraseMode, Event, Mode, Resolution, ScanSize, Status, TriggerMode};
 
@@ -288,10 +287,12 @@ pub fn create_mar345_detector(
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));
 
-    let server = Server::new(handle, server_handle, ad_params);
     let worker = Worker {
-        server,
+        port: handle,
+        server_port: server_handle,
+        ad: ad_params,
         p: mar345_params,
+        from: String::new(),
         start,
         stop,
         abort,
