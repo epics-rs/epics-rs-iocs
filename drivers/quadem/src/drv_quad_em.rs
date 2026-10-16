@@ -373,8 +373,8 @@ pub fn compute_positions(raw: &[f64; QE_MAX_INPUTS], cfg: &PositionConfig) -> [f
 }
 
 /// `getIntegerParam` as the quadEM drivers call it, status ignored: a param
-/// nothing has set yet reads as zero, which stands for the uninitialised
-/// variable C reads into.
+/// nothing has set yet reads as zero, as C's getter stores it
+/// (asynPortDriver.cpp:304).
 pub fn int_param(base: &PortDriverBase, index: usize, addr: i32) -> i32 {
     base.get_int32_param(index, addr).unwrap_or(0)
 }
@@ -953,21 +953,10 @@ pub trait QuadEmDevice {
     fn base_reset(&mut self) -> AsynResult<()> {
         let p = self.qe_base().params;
         let acquire_param = self.qe_base().nd_params.acquire;
-        // C's `iValue` / `dValue`: an unset param leaves the previous read's
-        // value in them.
-        let (mut i, mut d) = (0, 0.0);
-        let mut int = |s: &mut Self, index| {
-            if let Ok(v) = s.qe_base().port_base.get_int32_param(index, 0) {
-                i = v;
-            }
-            i
-        };
-        let mut double = |s: &mut Self, index| {
-            if let Ok(v) = s.qe_base().port_base.get_float64_param(index, 0) {
-                d = v;
-            }
-            d
-        };
+        // C's getters zero `iValue` / `dValue` before an unset param fails
+        // (asynPortDriver.cpp:304,386).
+        let int = |s: &mut Self, index| int_param(&s.qe_base().port_base, index, 0);
+        let double = |s: &mut Self, index| double_param(&s.qe_base().port_base, index, 0);
 
         let v = int(self, p.range);
         let _ = self.set_range(v);
@@ -1480,6 +1469,7 @@ mod tests {
         shared: Arc<QuadEmShared>,
         calls: Vec<&'static str>,
         failing: &'static [&'static str],
+        bias_interlocks: Vec<i32>,
     }
 
     impl FakeMeter {
@@ -1489,6 +1479,7 @@ mod tests {
                 shared: QuadEmShared::new(16).0,
                 calls: Vec::new(),
                 failing,
+                bias_interlocks: Vec::new(),
             }
         }
 
@@ -1525,6 +1516,10 @@ mod tests {
         }
         fn set_bias_voltage(&mut self, _value: f64) -> AsynResult<()> {
             self.step("set_bias_voltage")
+        }
+        fn set_bias_interlock(&mut self, value: i32) -> AsynResult<()> {
+            self.bias_interlocks.push(value);
+            Ok(())
         }
         fn read_status(&mut self) -> AsynResult<()> {
             self.step("read_status")
@@ -1574,6 +1569,17 @@ mod tests {
         assert_eq!(m.calls, ["set_acquire", "set_acquire_mode", "read_status"]);
         assert_eq!(m.base.port_base.get_int32_param(acquire, 0).unwrap(), 0);
         assert_eq!(m.shared.acq.lock().acquire_mode, single);
+    }
+
+    #[test]
+    fn a_reset_sends_zero_for_an_unset_setting_not_the_previous_read() {
+        let mut m = FakeMeter::new(&[]);
+        // QE_BIAS_INTERLOCK has no constructor default and is read right
+        // after QE_BIAS_STATE.
+        let bias_state = m.base.params.bias_state;
+        m.base.port_base.set_int32_param(bias_state, 0, 1).unwrap();
+        m.base_reset().unwrap();
+        assert_eq!(m.bias_interlocks, [0]);
     }
 
     fn acquire_busy(m: &FakeMeter) -> i32 {
