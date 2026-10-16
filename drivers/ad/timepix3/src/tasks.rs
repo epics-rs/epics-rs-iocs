@@ -1297,6 +1297,26 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ADDR,
             )
             .await;
+
+            // histogram_io.cpp:720-830: every frame also goes to the plugins on
+            // addresses 4-7, the window sum only on the frames it was updated.
+            if ctx
+                .handle
+                .read_int32(ctx.ad.base.array_callbacks, 0)
+                .await
+                .unwrap_or(0)
+                != 0
+            {
+                let time_ms = h.time_axis_ms();
+                let arrays = HstArrays {
+                    window: update.sum_n.map(|w| (w, update.frames_summed as u64)),
+                    running: update.running,
+                    frame_count: frames,
+                    current: Some(h.counts),
+                    time_ms,
+                };
+                publish_hst_arrays(ctx, arrays, HstOutput::Sum).await;
+            }
         }
         // The decoder is created for the channel, so this cannot happen.
         _ => {}
@@ -2000,5 +2020,50 @@ mod tests {
             avg5.attributes.get("ADTimePixCountUnits").map(|a| &a.value),
             Some(&NDAttrValue::String("counts/frame".into()))
         );
+    }
+
+    /// C `processPrvHstFrame` hands every PrvHst frame to the plugins on
+    /// addresses 4-7 as well (histogram_io.cpp:720-830).
+    #[tokio::test]
+    async fn a_prv_hst_frame_arrives_on_addresses_4_to_7() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+
+        let ctx = Arc::new(idle_ctx("TPX_HST_FRAME"));
+        let mut sinks = Vec::new();
+        for addr in 4..=7 {
+            let (tx, rx) = ndarray_channel(&format!("TPX_HST_FRAME_{addr}"), 4);
+            ctx.outputs[addr].lock().add(tx);
+            sinks.push(rx);
+        }
+        ctx.set_int(ctx.ad.base.array_callbacks, 0, 1).await;
+        for counts in [vec![1, 2], vec![3, 4]] {
+            let frame = Frame::Histogram(crate::stream::HistogramFrame {
+                bin_width: 2,
+                bin_offset: 1,
+                frame_number: 1,
+                time_at_frame: 0.0,
+                counts,
+            });
+            handle_frame(&ctx, StreamKind::PrvHst, frame).await;
+        }
+
+        let mut got = Vec::new();
+        for rx in &mut sinks {
+            let mut last = None;
+            for _ in 0..2 {
+                last = Some(
+                    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                        .await
+                        .expect("no array")
+                        .unwrap(),
+                );
+            }
+            got.push(last.unwrap());
+        }
+        assert!(matches!(&got[0].data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
+        assert!(matches!(&got[1].data, NDDataBuffer::U64(v) if *v == vec![4, 6]));
+        assert!(matches!(&got[2].data, NDDataBuffer::U32(v) if *v == vec![3, 4]));
+        let t = crate::stream::TDC_CLOCK_PERIOD_SEC * 1e3;
+        assert!(matches!(&got[3].data, NDDataBuffer::F64(v) if *v == vec![t, 3.0 * t]));
     }
 }
