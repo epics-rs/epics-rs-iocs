@@ -383,6 +383,12 @@ impl AmptekDriver {
         address_info: &str,
         direct_mode: bool,
     ) -> AsynResult<Self> {
+        if !(0..=2).contains(&interface_type) {
+            // `drvAmptek.cpp:148-152`; the constructor then stops half-built.
+            return Err(protocol_error(format!(
+                "drvAmptek::drvAmptek unknown interface type={interface_type}"
+            )));
+        }
         if interface_type != DPP_INTERFACE_ETHERNET {
             return Err(protocol_error(format!(
                 "unsupported interface type={interface_type}: only Ethernet (0) is supported \
@@ -434,12 +440,27 @@ impl AmptekDriver {
         })
     }
 
-    /// `drvAmptek::checkFailedComm` (`drvAmptek.cpp:250-258`).
-    fn check_failed_comm(&mut self) {
+    /// `drvAmptek::checkFailedComm` (`drvAmptek.cpp:250-258`);
+    /// `function_name` is the caller's, as C passes it.
+    fn check_failed_comm(&mut self, function_name: &str) {
         self.failed_sends += 1;
         if self.failed_sends > MAX_FAILED_SENDS {
+            self.trace_error(&format!(
+                "drvAmptek::{function_name} too many failed status queries, disconnecting"
+            ));
             self.do_disconnect();
         }
+    }
+
+    /// `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "...\n")`.
+    fn trace_error(&self, msg: &str) {
+        self.base.trace_print(TraceMask::ERROR, &format!("{msg}\n"));
+    }
+
+    /// `asynPrint(pasynUserSelf, ASYN_TRACEIO_DRIVER, "...\n")`.
+    fn trace_io(&self, msg: &str) {
+        self.base
+            .trace_print(TraceMask::IO_DRIVER, &format!("{msg}\n"));
     }
 
     /// The disconnect transition itself, shared by [`PortDriver::disconnect`]
@@ -494,12 +515,19 @@ impl AmptekDriver {
         let target = self.target.ok_or_else(disconnected_error)?;
         let raw = self.raw_send(target, cmd)?;
         if raw.is_empty() {
-            self.check_failed_comm();
-            return Err(protocol_error(format!(
-                "error calling CH_.SendCommand({cmd:?})"
-            )));
+            let msg = format!(
+                "drvAmptek::sendCommand error calling CH_.SendCommand({})",
+                cmd as i32
+            );
+            self.trace_error(&msg);
+            self.check_failed_comm("sendCommand");
+            return Err(protocol_error(msg));
         }
         self.failed_sends = 0;
+        self.trace_io(&format!(
+            "drvAmptek::sendCommand called CH_.SendCommand({}) OK",
+            cmd as i32
+        ));
         Ok(raw)
     }
 
@@ -542,6 +570,10 @@ impl AmptekDriver {
                     self.address_info
                 )));
             }
+            self.trace_io(&format!(
+                "drvAmptek::connectDevice DPP device {} connected",
+                self.address_info
+            ));
         } else {
             let (confirmed, num_devices) = self.transport.connect_default(ip)?;
             self.num_devices = num_devices;
@@ -551,6 +583,10 @@ impl AmptekDriver {
                     self.address_info, self.num_devices
                 )));
             }
+            self.trace_io(&format!(
+                "drvAmptek::connectDevice DPP device {} connected, total devices found={}",
+                self.address_info, self.num_devices
+            ));
         }
 
         // `CH_.DP5Stat.m_DP5_Status.SerialNumber = 0;` before the status
@@ -614,21 +650,31 @@ impl AmptekDriver {
     /// `drvAmptek::sendCommandString` (`drvAmptek.cpp:437-477`).
     fn send_command_string(&mut self, command_string: &str) -> AsynResult<()> {
         let target = self.target.ok_or_else(disconnected_error)?;
+        self.trace_io(&format!(
+            "drvAmptek::sendCommandString sending configuration string:\n{command_string}"
+        ));
         let packet = protocol::build_config_packet_ex(command_string);
         let send_status: AsynResult<()> = match self.raw_config_round_trip(target, packet) {
             Ok(raw) if raw.is_empty() => {
-                self.check_failed_comm();
-                Err(protocol_error(format!(
-                    "error calling CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, {command_string})"
-                )))
+                let msg = format!(
+                    "drvAmptek::sendCommandString error calling \
+                     CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, {command_string})"
+                );
+                self.trace_error(&msg);
+                self.check_failed_comm("sendCommandString");
+                Err(protocol_error(msg))
             }
             Ok(raw) => {
                 self.failed_sends = 0;
                 match self.receive_data(&raw) {
-                    None => Err(protocol_error(format!(
-                        "error in response for CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, \
-                         {command_string})"
-                    ))),
+                    None => {
+                        let msg = format!(
+                            "drvAmptek::sendCommandString error in response for \
+                             CH_.SendCommand_Config(XMTPT_SEND_CONFIG_PACKET_EX, {command_string})"
+                        );
+                        self.trace_error(&msg);
+                        Err(protocol_error(msg))
+                    }
                     Some(ReceivedPacket::Ack { status, data }) => {
                         let source = protocol::pid2_text_to_string("Send config", status);
                         let error = protocol::parse_cmd(&source, status, &data);
@@ -636,7 +682,7 @@ impl AmptekDriver {
                             Ok(())
                         } else {
                             let msg = format!("drvAmptek::sendCommandString ACK error {error}");
-                            self.base.trace_print(TraceMask::ERROR, &format!("{msg}\n"));
+                            self.trace_error(&msg);
                             Err(protocol_error(msg))
                         }
                     }
@@ -665,8 +711,12 @@ impl AmptekDriver {
     /// `drvAmptek::saveConfigurationFile` (`drvAmptek.cpp:384-398`).
     fn save_configuration_file(&self, file_name: &str) -> AsynResult<()> {
         let content = format!("[DP5 Configuration File]\r\n{}", self.hw_cfg_dp5);
-        std::fs::write(file_name, content)?;
-        Ok(())
+        std::fs::write(file_name, content).map_err(|e| {
+            self.trace_error(&format!(
+                "drvAmptek::saveConfigurationFile Couldn't open {file_name} for writing."
+            ));
+            AsynError::from(e)
+        })
     }
 
     /// `drvAmptek::sendConfigurationFile` (`drvAmptek.cpp:400-435`).
@@ -687,6 +737,7 @@ impl AmptekDriver {
 
         if cfg.len() > 512 {
             let split = ascii_cmd::get_cmd_chunk(&cfg);
+            println!("\t\t\tConfiguration Split at: {split}");
             // C discards the first half's status unconditionally
             // (`drvAmptek.cpp:429-433`, a plain reassignment) -- see the
             // module doc's "Preserved upstream quirks" note.
@@ -839,7 +890,14 @@ impl AmptekDriver {
     /// unchanged, matching C only calling `set*Param` on success.
     fn apply_parsed_configuration(&mut self) -> AsynResult<()> {
         let dpp_type = self.last_status.dpp_type;
-        let parsed = config::parse_configuration(&self.hw_cfg_dp5, dpp_type);
+        self.trace_io(&format!(
+            "drvAmptek::parseConfiguration configuration string from device:\n{}",
+            self.hw_cfg_dp5
+        ));
+        let (parsed, errors) = config::parse_configuration(&self.hw_cfg_dp5, dpp_type);
+        for msg in &errors {
+            self.trace_error(msg);
+        }
         let a = &self.amptek;
         let m = &self.mca;
 
@@ -957,9 +1015,10 @@ impl AmptekDriver {
             std::thread::sleep(Duration::from_millis(10));
         }
         if !sent {
-            return Err(protocol_error(
-                "error calling SendCommand_Config() for XMTPT_FULL_READ_CONFIG_PACKET",
-            ));
+            let msg = "drvAmptek::readConfigurationFromHardware error calling \
+                       SendCommand_Config() for XMTPT_FULL_READ_CONFIG_PACKET";
+            self.trace_error(msg);
+            return Err(protocol_error(msg));
         }
         self.failed_sends = 0;
 
@@ -969,10 +1028,11 @@ impl AmptekDriver {
                 self.apply_parsed_configuration()
             }
             None => {
-                self.check_failed_comm();
-                Err(protocol_error(
-                    "error calling ReceiveData() for XMTPT_FULL_READ_CONFIG_PACKET",
-                ))
+                let msg = "drvAmptek::readConfigurationFromHardware error calling \
+                           ReceiveData() for XMTPT_FULL_READ_CONFIG_PACKET";
+                self.trace_error(msg);
+                self.check_failed_comm("readConfigurationFromHardware");
+                Err(protocol_error(msg))
             }
             // `ReceiveData()==true` but `HwCfgReady` was never set --
             // matches C falling through to `return asynError` when the
@@ -1029,7 +1089,7 @@ impl AmptekDriver {
                 Ok(())
             }
             None => {
-                self.check_failed_comm();
+                self.check_failed_comm("writeInt32");
                 Err(protocol_error(
                     "calling ReceiveData() for XMTPT_SEND_STATUS",
                 ))
@@ -1241,10 +1301,10 @@ impl PortDriver for AmptekDriver {
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         let raw = self.send_command(TransmitPacketType::SendSpectrumStatus)?;
         if self.receive_data(&raw).is_none() {
-            self.check_failed_comm();
-            return Err(protocol_error(
-                "error calling ReceiveData() for XMTPT_SEND_SPECTRUM_STATUS",
-            ));
+            let msg = "drvAmptek::readInt32Array error calling ReceiveData() for XMTPT_SEND_SPECTRUM_STATUS";
+            self.trace_error(msg);
+            self.check_failed_comm("readInt32Array");
+            return Err(protocol_error(msg));
         }
         let n = self.spectrum.len().min(buf.len());
         buf[..n].copy_from_slice(&self.spectrum[..n]);

@@ -142,44 +142,57 @@ pub fn format_scas(scas: &[ScaFields; MAX_SCAS]) -> String {
 
 /// `drvAmptek::parseConfigDouble`/`parseConfigInt`/`parseConfigEnum`'s
 /// shared lookup: find the first occurrence of `KEY=` anywhere in `cfg`
-/// (`strstr`), not just at a field boundary.
-fn find_value_after<'a>(cfg: &'a str, key: &str) -> Option<&'a str> {
-    let pos = cfg.find(key)?;
-    Some(&cfg[pos + key.len()..])
+/// (`strstr`), not just at a field boundary. `Err` is C's "string %s not
+/// found" print (`drvAmptek.cpp:671,702,732`).
+fn find_value_after<'a>(cfg: &'a str, key: &str, function_name: &str) -> Result<&'a str, String> {
+    match cfg.find(key) {
+        Some(pos) => Ok(&cfg[pos + key.len()..]),
+        None => Err(format!(
+            "drvAmptek::{function_name} string {key} not found in configuration"
+        )),
+    }
+}
+
+/// C's "value for %s not found" print (`drvAmptek.cpp:682,713,744`).
+fn value_not_found(key: &str, function_name: &str) -> String {
+    format!("drvAmptek::{function_name} value for {key} not found in configuration")
 }
 
 /// `drvAmptek::parseConfigDouble` (`drvAmptek.cpp:661-690`): `"OFF"` ->
-/// `0.0`, else `sscanf(pos, "%lf")`; `None` if `key` isn't present or
-/// nothing converts (C's two `asynError` returns, collapsed here since
-/// both leave the target param unchanged).
-fn parse_config_double(cfg: &str, key: &str) -> Option<f64> {
-    let rest = find_value_after(cfg, key)?;
+/// `0.0`, else `sscanf(pos, "%lf")`. `Err` carries C's error print.
+fn parse_config_double(cfg: &str, key: &str) -> Result<f64, String> {
+    let rest = find_value_after(cfg, key, "parseConfigDouble")?;
     if rest.starts_with("OFF") {
-        return Some(0.0);
+        return Ok(0.0);
     }
     let parsed = strtod(rest.as_bytes());
-    (parsed.len > 0).then_some(parsed.value)
+    if parsed.len > 0 {
+        Ok(parsed.value)
+    } else {
+        Err(value_not_found(key, "parseConfigDouble"))
+    }
 }
 
 /// `drvAmptek::parseConfigInt` (`drvAmptek.cpp:692-721`): as
 /// [`parse_config_double`] but `sscanf(pos, "%d")`.
-fn parse_config_int(cfg: &str, key: &str) -> Option<i32> {
-    let rest = find_value_after(cfg, key)?;
+fn parse_config_int(cfg: &str, key: &str) -> Result<i32, String> {
+    let rest = find_value_after(cfg, key, "parseConfigInt")?;
     if rest.starts_with("OFF") {
-        return Some(0);
+        return Ok(0);
     }
-    sscanf_int(rest)
+    sscanf_int(rest).ok_or_else(|| value_not_found(key, "parseConfigInt"))
 }
 
 /// `drvAmptek::parseConfigEnum` (`drvAmptek.cpp:723-748`): the index of
 /// the first `choices` entry that `rest` (the text right after `KEY=`)
 /// starts with.
-fn parse_config_enum(cfg: &str, key: &str, choices: &[&str]) -> Option<u8> {
-    let rest = find_value_after(cfg, key)?;
+fn parse_config_enum(cfg: &str, key: &str, choices: &[&str]) -> Result<u8, String> {
+    let rest = find_value_after(cfg, key, "parseConfigEnum")?;
     choices
         .iter()
         .position(|c| rest.starts_with(c))
         .map(|i| i as u8)
+        .ok_or_else(|| value_not_found(key, "parseConfigEnum"))
 }
 
 /// Each field of [`ConfigFields`] parsed independently, `None` where
@@ -221,44 +234,52 @@ pub struct ParsedConfig {
     pub connect2: Option<u8>,
 }
 
-/// `drvAmptek::parseConfiguration` (`drvAmptek.cpp:750-844`).
-pub fn parse_configuration(cfg: &str, dpp_type: DppType) -> ParsedConfig {
-    ParsedConfig {
-        clock: parse_config_enum(cfg, "CLCK=", CLOCK_STRINGS),
-        input_polarity: parse_config_enum(cfg, "AINP=", POLARITY_STRINGS),
-        peaking_time: parse_config_double(cfg, "TPEA="),
-        fast_peaking_time: parse_config_enum(cfg, "TPFA=", FAST_PEAKING_TIME_STRINGS),
-        flat_top_time: parse_config_double(cfg, "TFLA="),
-        gain: parse_config_double(cfg, "GAIN="),
-        slow_threshold: parse_config_double(cfg, "THSL="),
-        fast_threshold: parse_config_double(cfg, "THFA="),
-        num_channels: parse_config_int(cfg, "MCAC="),
-        gate: if dpp_type == DppType::Dp5 || dpp_type == DppType::Mca8000D {
-            parse_config_enum(cfg, "GATE=", GATE_STRINGS)
-        } else {
-            None
-        },
-        preset_real_time: parse_config_double(cfg, "PRER="),
-        preset_live_time: parse_config_double(cfg, "PRET="),
-        preset_counts: parse_config_double(cfg, "PREC="),
-        preset_low_channel: parse_config_int(cfg, "PRCL="),
-        preset_high_channel: parse_config_int(cfg, "PRCH="),
-        mca_source: parse_config_enum(cfg, "MCAS=", MCA_SOURCE_STRINGS),
-        pur_enable: parse_config_enum(cfg, "PURE=", PUR_ENABLE_STRINGS),
-        set_high_voltage: parse_config_int(cfg, "HVSE="),
-        set_det_temp: if dpp_type == DppType::Dp5 || dpp_type == DppType::Px5 {
-            parse_config_double(cfg, "TECS=")
-        } else {
-            None
-        },
-        mcs_low_channel: parse_config_int(cfg, "MCSL="),
-        mcs_high_channel: parse_config_int(cfg, "MCSH="),
-        dwell_time: parse_config_double(cfg, "MCST="),
-        aux_out1: parse_config_enum(cfg, "AUO1=", AUX_OUTPUT_STRINGS),
-        aux_out2: parse_config_enum(cfg, "AUO2=", AUX_OUTPUT_STRINGS),
-        connect1: parse_config_enum(cfg, "CON1=", CONNECT1_STRINGS),
-        connect2: parse_config_enum(cfg, "CON2=", CONNECT2_STRINGS),
+/// `drvAmptek::parseConfiguration` (`drvAmptek.cpp:750-844`), with the
+/// `ASYN_TRACE_ERROR` text of every failed field, in C's order.
+pub fn parse_configuration(cfg: &str, dpp_type: DppType) -> (ParsedConfig, Vec<String>) {
+    let mut errors = Vec::new();
+    macro_rules! keep {
+        ($r:expr) => {
+            $r.map_err(|e| errors.push(e)).ok()
+        };
     }
+    let parsed = ParsedConfig {
+        clock: keep!(parse_config_enum(cfg, "CLCK=", CLOCK_STRINGS)),
+        input_polarity: keep!(parse_config_enum(cfg, "AINP=", POLARITY_STRINGS)),
+        peaking_time: keep!(parse_config_double(cfg, "TPEA=")),
+        fast_peaking_time: keep!(parse_config_enum(cfg, "TPFA=", FAST_PEAKING_TIME_STRINGS)),
+        flat_top_time: keep!(parse_config_double(cfg, "TFLA=")),
+        gain: keep!(parse_config_double(cfg, "GAIN=")),
+        slow_threshold: keep!(parse_config_double(cfg, "THSL=")),
+        fast_threshold: keep!(parse_config_double(cfg, "THFA=")),
+        num_channels: keep!(parse_config_int(cfg, "MCAC=")),
+        gate: if dpp_type == DppType::Dp5 || dpp_type == DppType::Mca8000D {
+            keep!(parse_config_enum(cfg, "GATE=", GATE_STRINGS))
+        } else {
+            None
+        },
+        preset_real_time: keep!(parse_config_double(cfg, "PRER=")),
+        preset_live_time: keep!(parse_config_double(cfg, "PRET=")),
+        preset_counts: keep!(parse_config_double(cfg, "PREC=")),
+        preset_low_channel: keep!(parse_config_int(cfg, "PRCL=")),
+        preset_high_channel: keep!(parse_config_int(cfg, "PRCH=")),
+        mca_source: keep!(parse_config_enum(cfg, "MCAS=", MCA_SOURCE_STRINGS)),
+        pur_enable: keep!(parse_config_enum(cfg, "PURE=", PUR_ENABLE_STRINGS)),
+        set_high_voltage: keep!(parse_config_int(cfg, "HVSE=")),
+        set_det_temp: if dpp_type == DppType::Dp5 || dpp_type == DppType::Px5 {
+            keep!(parse_config_double(cfg, "TECS="))
+        } else {
+            None
+        },
+        mcs_low_channel: keep!(parse_config_int(cfg, "MCSL=")),
+        mcs_high_channel: keep!(parse_config_int(cfg, "MCSH=")),
+        dwell_time: keep!(parse_config_double(cfg, "MCST=")),
+        aux_out1: keep!(parse_config_enum(cfg, "AUO1=", AUX_OUTPUT_STRINGS)),
+        aux_out2: keep!(parse_config_enum(cfg, "AUO2=", AUX_OUTPUT_STRINGS)),
+        connect1: keep!(parse_config_enum(cfg, "CON1=", CONNECT1_STRINGS)),
+        connect2: keep!(parse_config_enum(cfg, "CON2=", CONNECT2_STRINGS)),
+    };
+    (parsed, errors)
 }
 
 #[cfg(test)]
@@ -327,7 +348,8 @@ mod tests {
     fn parse_configuration_round_trips_through_format_for_dp5() {
         let fields = sample_fields();
         let cfg = format_configuration(&fields);
-        let parsed = parse_configuration(&cfg, DppType::Dp5);
+        let (parsed, errors) = parse_configuration(&cfg, DppType::Dp5);
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(parsed.clock, Some(fields.clock));
         assert_eq!(parsed.input_polarity, Some(fields.input_polarity));
         assert_eq!(parsed.peaking_time, Some(fields.peaking_time));
@@ -342,49 +364,72 @@ mod tests {
     #[test]
     fn parse_configuration_gates_gate_and_tecs_by_device_type() {
         let cfg = format_configuration(&sample_fields());
-        let parsed = parse_configuration(&cfg, DppType::Dp5G);
+        let (parsed, _) = parse_configuration(&cfg, DppType::Dp5G);
         assert_eq!(parsed.gate, None);
         assert_eq!(parsed.set_det_temp, None);
     }
 
     #[test]
     fn parse_config_double_off_maps_to_zero() {
-        assert_eq!(parse_config_double("TECS=OFF;", "TECS="), Some(0.0));
+        assert_eq!(parse_config_double("TECS=OFF;", "TECS=").ok(), Some(0.0));
     }
 
     #[test]
     fn parse_config_double_missing_key_is_none() {
-        assert_eq!(parse_config_double("CLCK=AUTO;", "TPEA="), None);
+        assert_eq!(parse_config_double("CLCK=AUTO;", "TPEA=").ok(), None);
     }
 
     #[test]
     fn parse_config_enum_matches_first_prefix() {
         assert_eq!(
-            parse_config_enum("MCAS=FAST;", "MCAS=", MCA_SOURCE_STRINGS),
+            parse_config_enum("MCAS=FAST;", "MCAS=", MCA_SOURCE_STRINGS).ok(),
             Some(2)
         );
         assert_eq!(
-            parse_config_enum("MCAS=NOPE;", "MCAS=", MCA_SOURCE_STRINGS),
+            parse_config_enum("MCAS=NOPE;", "MCAS=", MCA_SOURCE_STRINGS).ok(),
             None
         );
     }
 
     #[test]
     fn parse_config_int_stops_at_non_digit() {
-        assert_eq!(parse_config_int("MCAC=1024;NEXT=1;", "MCAC="), Some(1024));
+        assert_eq!(
+            parse_config_int("MCAC=1024;NEXT=1;", "MCAC=").ok(),
+            Some(1024)
+        );
     }
 
     /// The full `%lf`/`%d` grammar: leading space, exponent, `inf`
     /// (`drvAmptek.cpp:677,708`).
     #[test]
     fn parse_config_numbers_follow_sscanf() {
-        assert_eq!(parse_config_double("TPEA= 1.5e1;", "TPEA="), Some(15.0));
         assert_eq!(
-            parse_config_double("GAIN=inf;", "GAIN="),
+            parse_config_double("TPEA= 1.5e1;", "TPEA=").ok(),
+            Some(15.0)
+        );
+        assert_eq!(
+            parse_config_double("GAIN=inf;", "GAIN=").ok(),
             Some(f64::INFINITY)
         );
-        assert_eq!(parse_config_double("GAIN=.;", "GAIN="), None);
-        assert_eq!(parse_config_int("MCAC= 12.5;", "MCAC="), Some(12));
-        assert_eq!(parse_config_int("MCAC=x;", "MCAC="), None);
+        assert_eq!(parse_config_double("GAIN=.;", "GAIN=").ok(), None);
+        assert_eq!(parse_config_int("MCAC= 12.5;", "MCAC=").ok(), Some(12));
+        assert_eq!(parse_config_int("MCAC=x;", "MCAC=").ok(), None);
+    }
+
+    /// C's two error prints (`drvAmptek.cpp:671-684,744-746`).
+    #[test]
+    fn parse_config_errors_carry_c_text() {
+        assert_eq!(
+            parse_config_double("CLCK=AUTO;", "TPEA="),
+            Err("drvAmptek::parseConfigDouble string TPEA= not found in configuration".into())
+        );
+        assert_eq!(
+            parse_config_int("MCAC=x;", "MCAC="),
+            Err("drvAmptek::parseConfigInt value for MCAC= not found in configuration".into())
+        );
+        assert_eq!(
+            parse_config_enum("MCAS=NOPE;", "MCAS=", MCA_SOURCE_STRINGS),
+            Err("drvAmptek::parseConfigEnum value for MCAS= not found in configuration".into())
+        );
     }
 }

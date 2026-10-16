@@ -118,19 +118,20 @@ impl AckStatus {
 /// `sendCommandString` via `sendConfigurationFile`/`sendSCAs`/
 /// `sendConfiguration`, and `readConfigurationFromHardware`). See the
 /// module doc's "Restructuring vs. C" note on why this is a small subset
-/// of C's `TRANSMIT_PACKET_TYPE`.
+/// of C's `TRANSMIT_PACKET_TYPE`. The discriminants are C's enum values,
+/// which `drvAmptek::sendCommand` prints with `%d` (`DP5Protocol.h:5-50`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransmitPacketType {
     /// `XMTPT_SEND_STATUS` (`drvAmptek.cpp:331,874`).
-    SendStatus,
+    SendStatus = 0,
     /// `XMTPT_SEND_SPECTRUM_STATUS` (`drvAmptek.cpp:1006`).
-    SendSpectrumStatus,
+    SendSpectrumStatus = 3,
     /// `XMTPT_SEND_CLEAR_SPECTRUM_STATUS` (`drvAmptek.cpp:870`).
-    SendClearSpectrumStatus,
+    SendClearSpectrumStatus = 4,
     /// `XMTPT_ENABLE_MCA_MCS` (`drvAmptek.cpp:860`).
-    EnableMcaMcs,
+    EnableMcaMcs = 40,
     /// `XMTPT_DISABLE_MCA_MCS` (`drvAmptek.cpp:867,941`).
-    DisableMcaMcs,
+    DisableMcaMcs = 41,
 }
 
 /// Build the fixed-shape (no ASCII payload) request packets
@@ -649,5 +650,15 @@ mod tests {
     fn netfinder_direct_request_matches_the_c_literal() {
         const C_LITERAL: [u8; 8] = [0xF5, 0xFA, 0x03, 0x07, 0x00, 0x00, 0xFE, 0x07];
         assert_eq!(build_netfinder_direct_request(), C_LITERAL);
+    }
+
+    /// `TRANSMIT_PACKET_TYPE` positions (`DP5Protocol.h:5-50`).
+    #[test]
+    fn transmit_packet_type_values_match_c_enum() {
+        assert_eq!(TransmitPacketType::SendStatus as i32, 0);
+        assert_eq!(TransmitPacketType::SendSpectrumStatus as i32, 3);
+        assert_eq!(TransmitPacketType::SendClearSpectrumStatus as i32, 4);
+        assert_eq!(TransmitPacketType::EnableMcaMcs as i32, 40);
+        assert_eq!(TransmitPacketType::DisableMcaMcs as i32, 41);
     }
 }
