@@ -88,9 +88,9 @@ impl PortDriver for URLDriver {
     /// idle or not); every other Int32 param goes to `ADDriver::writeInt32`.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        // C keeps setIntegerParam's status unless ADDriver::writeInt32
-        // replaces it, and acts on the write either way.
-        let mut status = self.ad.port_base.set_int32_param(reason, user.addr, value);
+        // C's setIntegerParam(function, value) is list 0 whatever the address;
+        // its status stands unless ADDriver::writeInt32 replaces it.
+        let mut status = self.ad.port_base.set_int32_param(reason, 0, value);
 
         if reason == self.ad.params.acquire {
             let adstatus = self
@@ -209,7 +209,6 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
-    use epics_rs::asyn::error::AsynError;
 
     #[test]
     fn a_base_class_write_reaches_addriver() {
@@ -232,21 +231,21 @@ mod tests {
         );
     }
 
-    /// URLDriver.cpp:305-319: setIntegerParam's refusal is the write's
-    /// status, and the acquire event is still signalled.
+    /// URLDriver.cpp:305-319: setIntegerParam(function, value) is list 0,
+    /// so an acquire at another address sets list 0 and starts.
     #[test]
-    fn a_refused_acquire_set_still_starts_and_fails_the_write() {
+    fn an_acquire_at_another_address_sets_list_zero_and_starts() {
         let (acq_tx, mut acq_rx) = rt::command_channel(1);
-        let mut det = URLDriver::new("URL_REFUSED_SET", 1 << 20, acq_tx).unwrap();
-        let mut user = AsynUser::new(det.ad.params.acquire).with_addr(1);
-        assert!(matches!(
-            det.write_int32(&mut user, 1),
-            Err(AsynError::ParamInvalidList(1))
-        ));
+        let mut det = URLDriver::new("URL_LIST_ZERO", 1 << 20, acq_tx).unwrap();
+        let acquire = det.ad.params.acquire;
+        let mut user = AsynUser::new(acquire).with_addr(1);
+        assert!(det.write_int32(&mut user, 1).is_ok());
+        assert_eq!(det.ad.port_base.get_int32_param(acquire, 0).unwrap(), 1);
         assert!(matches!(acq_rx.try_recv(), Ok(AcqCommand::Start)));
     }
 
-    /// URLDriver.cpp:327-330 prints setIntegerParam's asynParamInvalidList.
+    /// URLDriver.cpp:327-330 prints asynPortDriver::writeInt32's
+    /// asynParamWrongType for an int written to a float param.
     #[test]
     fn a_refused_write_prints_the_param_librarys_status() {
         use epics_rs::asyn::services::PortServices;
@@ -262,8 +261,8 @@ mod tests {
             Some(port),
             TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
         );
-        let reason = det.ad.params.acquire;
-        let mut user = AsynUser::new(reason).with_addr(1);
+        let reason = det.ad.params.acquire_time;
+        let mut user = AsynUser::new(reason);
         user.trace = Some(UserTrace {
             manager,
             port: port.into(),
@@ -273,7 +272,7 @@ mod tests {
         let _ = std::fs::remove_file(&log);
         assert!(
             text.contains(&format!(
-                "URLDriver:writeInt32 error, status=11 function={reason}, value=1"
+                "URLDriver:writeInt32 error, status=8 function={reason}, value=1"
             )),
             "{text}"
         );
