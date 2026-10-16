@@ -23,7 +23,7 @@
 //! boundary instead; passing that C value here would scale moves wrongly.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -93,6 +93,12 @@ fn parse_error(what: &str) -> AsynError {
 }
 
 impl AsynMotor for Smc100Axis {
+    /// C `SMC100Axis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (SMC100Driver.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

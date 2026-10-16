@@ -46,7 +46,7 @@ use crate::conex::ConexAxis;
 use crate::esp300::{self, Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
-use crate::mm4000::{Mm4000Axis, Mm4000Controller};
+use crate::mm4000::{self, Mm4000Axis, Mm4000Controller};
 use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
 use crate::smc100::Smc100Axis;
@@ -1583,7 +1583,7 @@ pub fn mm4000_config_command() -> CommandDef {
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let ax = Mm4000Axis::new(controller.clone(), axis);
+            let ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
             MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
@@ -1666,7 +1666,11 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
             let controller = Arc::new(Mutex::new(controller));
             let axes = (1..=num_axes as usize)
                 .map(|axis| Model2Axis {
-                    motor: Arc::new(Mutex::new(Mm4000Axis::new(controller.clone(), axis))),
+                    motor: Arc::new(Mutex::new(Mm4000Axis::new(
+                        controller.clone(),
+                        axis,
+                        mm4000::MODEL2_POLL_FAILURE,
+                    ))),
                     moving_poll_ms,
                     idle_poll_ms,
                 })

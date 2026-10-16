@@ -36,7 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -284,6 +284,11 @@ fn parse_frequency(reply: &str) -> Option<i64> {
 }
 
 impl AsynMotor for Anc150Axis {
+    /// C `ANC150Poller` sets only `motorAxisCommError` when `getFreq` fails.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::COMMS_ERROR
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

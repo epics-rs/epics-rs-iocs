@@ -41,7 +41,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -168,6 +168,12 @@ fn ramp_time(velocity: f64, min_velocity: f64, acceleration: f64) -> f64 {
 }
 
 impl AsynMotor for OemAxis {
+    /// C `OEMAxis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (OEMMotorDriver.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

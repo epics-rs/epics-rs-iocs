@@ -44,7 +44,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -283,6 +283,12 @@ impl McsAxis {
 }
 
 impl AsynMotor for McsAxis {
+    /// C `MCSAxis::poll`'s `bail` label sets `motorStatusProblem_` and
+    /// `motorStatusCommsError_`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

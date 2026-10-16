@@ -38,7 +38,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -299,6 +299,12 @@ impl AgUcAxis {
 }
 
 impl AsynMotor for AgUcAxis {
+    /// C `AG_UCAxis::poll`'s `skip` label sets only `motorStatusProblem_`
+    /// (AG_UC.cpp).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

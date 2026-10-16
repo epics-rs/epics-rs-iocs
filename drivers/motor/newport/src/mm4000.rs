@@ -39,7 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -343,7 +343,16 @@ pub struct Mm4000Axis {
     /// writes — kept bug-for-bug.
     low_limit: f64,
     high_limit: f64,
+    /// What the C driver that created the axis posts on a failed poll.
+    poll_failure: PollFailure,
 }
+
+/// C model-1 `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
+/// `RA_PROBLEM` (drvMM4000.cc; its first failure's silent RETRY is not
+/// modelled); model-2 `MM4000Poller` only `motorAxisCommError`
+/// (drvMM4000Asyn.c).
+pub const MODEL1_POLL_FAILURE: PollFailure = PollFailure::PROBLEM_AND_COMMS_ERROR;
+pub const MODEL2_POLL_FAILURE: PollFailure = PollFailure::COMMS_ERROR;
 
 impl Mm4000Axis {
     /// Construct axis `axis` (1-based), running the C per-axis init queries:
@@ -352,7 +361,11 @@ impl Mm4000Axis {
     /// `TL`/`TR` (travel limits). C checks none of these replies, so a
     /// failed one reads as an empty buffer (`atof` → 0). Performs blocking
     /// serial I/O under the controller lock.
-    pub fn new(controller: Arc<Mutex<Mm4000Controller>>, axis: usize) -> Self {
+    pub fn new(
+        controller: Arc<Mutex<Mm4000Controller>>,
+        axis: usize,
+        poll_failure: PollFailure,
+    ) -> Self {
         let (model, digits, home_preset, low_limit, high_limit) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C `atof(&inputBuff[3])`: skip the echoed `nCC` prefix.
@@ -381,6 +394,7 @@ impl Mm4000Axis {
             home_preset,
             low_limit,
             high_limit,
+            poll_failure,
         }
     }
 
@@ -397,6 +411,10 @@ impl Mm4000Axis {
 }
 
 impl AsynMotor for Mm4000Axis {
+    fn poll_failure(&self) -> PollFailure {
+        self.poll_failure
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
@@ -632,7 +650,7 @@ mod tests {
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let ctrl = Mm4000Controller::new(io, "mm4000_dead", "mm4000_dead_motor", 1, Duration::ZERO)
             .unwrap();
-        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1, MODEL2_POLL_FAILURE);
         let user = AsynUser::default();
         assert_eq!(axis.poll(&user).unwrap().position, 5.0);
 

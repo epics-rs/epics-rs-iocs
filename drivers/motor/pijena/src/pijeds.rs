@@ -46,7 +46,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -224,6 +224,13 @@ impl PiJedsAxis {
 }
 
 impl AsynMotor for PiJedsAxis {
+    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` (drvPIJEDS.cc). Its first failure's silent RETRY is not modelled:
+    /// a transport error raises both at once.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

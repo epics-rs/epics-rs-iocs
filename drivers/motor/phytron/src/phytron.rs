@@ -76,7 +76,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -359,6 +359,12 @@ impl PhytronAxis {
 }
 
 impl AsynMotor for PhytronAxis {
+    /// C `phytronAxis::poll` sets only `motorStatusProblem_` on a failed
+    /// exchange.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM
+    }
+
     /// C `phytronAxis::setEncoderRatio` (phytronAxisMotor.cpp:1759-1779):
     /// read the encoder (`P22R`), then set the conversion factor `P39` to
     /// `1/ratio`.

@@ -31,7 +31,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::controller::{PmacController, pmac_err};
@@ -211,6 +211,12 @@ impl PmacAxis {
 }
 
 impl AsynMotor for PmacAxis {
+    /// C `pmacAxis::getAxisStatus` sets no status bit on a failed read; the
+    /// failure goes to the controller's `PMAC_C_COMMSERROR`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

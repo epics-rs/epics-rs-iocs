@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -187,6 +187,12 @@ impl PmacCsAxis {
 }
 
 impl AsynMotor for PmacCsAxis {
+    /// C `motorAxisWriteRead` sets only `motorAxisCommError`
+    /// (pmacAsynCoord.c).
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::COMMS_ERROR
+    }
+
     /// C `motorAxisMove`: set the CS feed rate (`I{cs+50}89`, EGU/s) and
     /// acceleration time (`I{cs+50}87`, msec), write the demand into `Q7{n}`,
     /// and — unless moves are deferred or the CS has no program — abort and run

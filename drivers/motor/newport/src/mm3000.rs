@@ -32,7 +32,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -285,6 +285,13 @@ impl Mm3000Axis {
 }
 
 impl AsynMotor for Mm3000Axis {
+    /// C `set_status`'s COMM_ERR branch raises `CNTRL_COMM_ERR` and
+    /// `RA_PROBLEM` (drvMM3000.cc). Its first failure's silent RETRY is not modelled:
+    /// a transport error raises both at once.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::PROBLEM_AND_COMMS_ERROR
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

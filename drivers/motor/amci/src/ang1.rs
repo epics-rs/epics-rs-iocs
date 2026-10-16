@@ -28,7 +28,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
@@ -223,6 +223,11 @@ impl Ang1Axis {
 }
 
 impl AsynMotor for Ang1Axis {
+    /// C `ANG1Axis::poll` ignores each read's status and sets no status bit.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,

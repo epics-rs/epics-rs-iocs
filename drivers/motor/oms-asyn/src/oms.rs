@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
@@ -294,6 +294,12 @@ impl OmsAxis {
 }
 
 impl AsynMotor for OmsAxis {
+    /// C `omsBaseController`'s poller skips the pass (`continue`) on a failed
+    /// read, posting nothing.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::NONE
+    }
+
     /// C `omsBaseAxis::setEncoderRatio` (omsBaseAxis.h:37): stored for the
     /// encoder sync before each move.
     fn set_encoder_ratio(&mut self, _user: &AsynUser, ratio: f64) -> AsynResult<()> {

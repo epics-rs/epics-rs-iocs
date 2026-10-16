@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::trace::MotorTrace;
@@ -441,6 +441,11 @@ impl StatusFlags {
 }
 
 impl AsynMotor for XpsAxis {
+    /// C `XPSAxis::poll`'s `done` label sets only `motorStatusCommsError_`.
+    fn poll_failure(&self) -> PollFailure {
+        PollFailure::COMMS_ERROR
+    }
+
     fn move_absolute(
         &mut self,
         _user: &AsynUser,
