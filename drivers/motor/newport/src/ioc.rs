@@ -244,12 +244,18 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             register_port(ctx, &port_name, 1)?;
-            let Ok(handle) = connect_serial(&serial_port, CONEX_TIMEOUT) else {
-                eprintln!(
+            // C returns from the constructor here: the port has no axis.
+            let (handle, connected) = connect_controller(
+                &serial_port,
+                CONEX_TIMEOUT,
+                &port_name,
+                format_args!(
                     "AG_CONEXController::AG_CONEXController: cannot connect to CONEX controller"
-                );
+                ),
+            );
+            if connected.is_err() {
                 return Ok(CommandOutcome::Continue);
-            };
+            }
             let Some(axis) = ConexAxis::new(handle, controller_id) else {
                 return Ok(CommandOutcome::Continue);
             };
