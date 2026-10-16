@@ -10,7 +10,7 @@ use crate::types::*;
 /// Everything that can go wrong reading a p2util line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
-    /// The line is not the "wrote N bytes to <file>" message.
+    /// The line is not the `"wrote N bytes to <file>"` message.
     NotFileWritten,
     /// The message is the right kind but carries no quoted path.
     NoQuotedPath,
@@ -91,7 +91,7 @@ pub fn is_file_written(line: &str) -> bool {
     line.contains(FILE_WRITTEN_MARKER)
 }
 
-/// Pull the file name out of a "... bytes to "<path>"" message.
+/// Pull the file name out of a `... bytes to "<path>"` message.
 ///
 /// C ran `strchr`/`strrchr` for the quotes and used the result without
 /// checking: a message with no quote dereferenced NULL, and one with a single
