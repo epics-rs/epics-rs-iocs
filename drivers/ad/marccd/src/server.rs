@@ -149,11 +149,8 @@ impl Server {
     /// C `getStringParam` truncated to `max_chars`.
     pub async fn get_str(&mut self, reason: usize, max_chars: usize) -> String {
         self.flush().await;
-        match self.handle.read_octet(reason, 0, max_chars).await {
-            Ok(bytes) => {
-                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                String::from_utf8_lossy(&bytes[..end]).into_owned()
-            }
+        match self.handle.get_string_param(reason, 0, max_chars).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(_) => String::new(),
         }
     }
