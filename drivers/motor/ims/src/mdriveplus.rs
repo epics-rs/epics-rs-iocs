@@ -13,10 +13,9 @@
 //!
 //! ## Framing
 //!
-//! The driver owns the output terminator; `st.cmd` sets only the input EOS
-//! (`\n`). The output terminator is `\r\n` by default, but a Lexium MDrive
-//! (`LMD`) uses `\r` without a device name or `\n` with one (C
-//! `readHomeAndLimitConfig` switches `setOutputEos` after reading `PR VR`). The
+//! The port EOS is set at connect as C does ([`INPUT_EOS`]/[`OUTPUT_EOS`]); a
+//! Lexium MDrive (`LMD`) then switches the output EOS to `\r` without a device
+//! name or `\n` with one (C `readHomeAndLimitConfig` after `PR VR`). The
 //! device name, when set, is prepended to every command with no separator.
 //!
 //! ## Units
@@ -44,6 +43,7 @@
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -52,6 +52,10 @@ use motor_common::util::{atof, atoi};
 /// Reply read buffer size (C `MAX_BUFF_LEN`).
 const READ_BUF: usize = 80;
 
+/// Port EOS set at connect (ImsMDrivePlusMotorController.cpp:81-82).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\r\n";
+
 fn ims_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -59,12 +63,11 @@ fn ims_err(message: impl Into<String>) -> AsynError {
     }
 }
 
-/// Build the on-wire command: device name (party mode) + command + terminator.
-fn frame(device_name: &str, cmd: &str, terminator: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(device_name.len() + cmd.len() + terminator.len());
+/// Build the on-wire command: device name (party mode) + command.
+fn frame(device_name: &str, cmd: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(device_name.len() + cmd.len());
     out.extend_from_slice(device_name.as_bytes());
     out.extend_from_slice(cmd.as_bytes());
-    out.extend_from_slice(terminator);
     out
 }
 
@@ -75,8 +78,6 @@ pub struct ImsMDrivePlusAxis {
     /// Device name (`DN`) prepended to every command for party mode; empty when
     /// not in party mode.
     device_name: String,
-    /// Output terminator (`\r\n`, or `\r`/`\n` for a Lexium MDrive).
-    terminator: Vec<u8>,
     /// I/O input number configured as the home switch (C `homeSwitchInput`).
     home_switch: Option<i32>,
     /// I/O input number configured as the positive-limit switch.
@@ -91,25 +92,25 @@ pub struct ImsMDrivePlusAxis {
 
 impl ImsMDrivePlusAxis {
     /// Connect an axis on `handle`, addressing it by `device_name` (empty for no
-    /// party mode). Probes the firmware version (to pick the terminator and,
+    /// party mode). `port` is the octet port under `handle`, whose output EOS a
+    /// Lexium MDrive switches. Probes the firmware version (to pick the EOS and,
     /// on MForce, the S1-S4 switch config) and the encoder flag.
-    pub fn new(handle: SyncIOHandle, device_name: String) -> AsynResult<Self> {
+    pub fn new(handle: SyncIOHandle, port: &PortHandle, device_name: String) -> AsynResult<Self> {
         let mut axis = Self {
             handle,
             device_name,
-            terminator: b"\r\n".to_vec(),
             home_switch: None,
             pos_limit_switch: None,
             neg_limit_switch: None,
             has_encoder: false,
             homing: false,
         };
-        axis.setup()?;
+        axis.setup(port)?;
         Ok(axis)
     }
 
     fn framed(&self, cmd: &str) -> Vec<u8> {
-        frame(&self.device_name, cmd, &self.terminator)
+        frame(&self.device_name, cmd)
     }
 
     /// Write a set command; the controller sends no reply (C `writeController`).
@@ -126,7 +127,7 @@ impl ImsMDrivePlusAxis {
         Ok(s.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }
 
-    fn setup(&mut self) -> AsynResult<()> {
+    fn setup(&mut self, port: &PortHandle) -> AsynResult<()> {
         // Firmware version: retry a few times, require a plausible reply (C
         // requires strlen >= 2). MForce 1 answers `PR VR` with an error, so a
         // short/failed reply is not necessarily fatal — but a total silence is.
@@ -147,12 +148,13 @@ impl ImsMDrivePlusAxis {
 
         let vlow = version.to_lowercase();
         if vlow.contains("lmd") {
-            // Lexium MDrive: terminator depends on party mode.
-            self.terminator = if self.device_name.is_empty() {
-                b"\r".to_vec()
+            // Lexium MDrive: output EOS depends on party mode.
+            let eos: &[u8] = if self.device_name.is_empty() {
+                b"\r"
             } else {
-                b"\n".to_vec()
+                b"\n"
             };
+            port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos)?;
         }
 
         if vlow.contains("lmm") || vlow.contains("lmd") {
@@ -352,14 +354,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_prepends_device_name_and_terminator() {
-        // Party mode: device name prepended with no separator, `\r\n` terminator.
-        assert_eq!(frame("M06", "MA 100", b"\r\n"), b"M06MA 100\r\n");
-    }
-
-    #[test]
-    fn frame_no_device_name_lexium_terminator() {
-        // No party mode, Lexium MDrive `\r` terminator.
-        assert_eq!(frame("", "PR P", b"\r"), b"PR P\r");
+    fn frame_prepends_device_name() {
+        // Party mode: device name prepended with no separator.
+        assert_eq!(frame("M06", "MA 100"), b"M06MA 100");
+        assert_eq!(frame("", "PR P"), b"PR P");
     }
 }
