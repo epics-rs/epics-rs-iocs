@@ -46,8 +46,8 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::drv_quad_em::{
-    self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QuadEmBase, QuadEmDevice,
-    QuadEmParams, QuadEmShared,
+    self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QuadEmBase, QuadEmDevice, QuadEmParams,
+    QuadEmShared,
 };
 use crate::octet::{OctetIo, create_ip_port};
 use crate::t4u_proto::{self as proto, CalTable, Calibration, ChannelCal, CmdName, DirectFrame};
@@ -383,10 +383,6 @@ impl T4uDriver {
         self.base.params
     }
 
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
-    }
-
     /// C++ `writeReadMeter`. As upstream, a failed send is ignored and the
     /// write still succeeds: the parameter is already in the library and the
     /// meter will be re-synchronised by the next register dump.
@@ -463,7 +459,7 @@ impl T4uDriver {
     /// C++ `P_AveragingTime` in `writeFloat64`: `NumAverage = int(averagingTime
     /// / sampleTime)`. Unlike the other quadEM drivers this truncates rather
     /// than rounding, because the T4U has no `readStatus` to recompute it.
-    fn set_averaging_time(&mut self, value: f64) -> AsynResult<()> {
+    fn write_averaging_time(&mut self, value: f64) -> AsynResult<()> {
         let num_average = {
             let mut st = self.state.lock();
             st.averaging_time = value;
@@ -474,70 +470,6 @@ impl T4uDriver {
             .set_int32_param(self.params().num_average, 0, num_average)?;
         self.shared.acq.lock().num_average = num_average;
         Ok(())
-    }
-
-    /// The `function < FIRST_T4U_COMMAND` fallthrough into
-    /// `drvQuadEM::writeInt32`.
-    ///
-    /// Every `drvQuadEM` hook the T4U could override is a no-op, so only the
-    /// branches with an effect of their own are left: the ring flush, the
-    /// acquire-mode stop, and the caches the callback task and the read threads
-    /// consume.
-    fn base_write_int32(&mut self, reason: usize, value: i32) -> AsynResult<()> {
-        let p = self.params();
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.shared.acq.lock().acquire_mode = value;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks(&self.base.port_base);
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-        } else if reason == p.values_per_read {
-            self.shared.acq.lock().values_per_read = value;
-        } else if reason == p.num_channels {
-            self.shared.acq.lock().num_channels = value;
-        } else if reason == p.trigger_mode {
-            self.shared.acq.lock().trigger_mode = value;
-        } else {
-            self.base.write_int32_pool(reason)?;
-        }
-        Ok(())
-    }
-
-    /// Mirror a parameter write into the shared position snapshot the read
-    /// threads consume.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
     }
 }
 
@@ -557,6 +489,11 @@ impl QuadEmDevice for T4uDriver {
     /// C++ `drvT4U_EM::setAcquire` / `drvT4UDirect_EM::setAcquire`: the meter
     /// streams unconditionally, so there is nothing to start or stop.
     fn set_acquire(&mut self, _value: i32) -> AsynResult<()> {
+        Ok(())
+    }
+
+    /// C++ `drvT4U_EM::reset` / `drvT4UDirect_EM::reset` do nothing.
+    fn reset(&mut self) -> AsynResult<()> {
         Ok(())
     }
 }
@@ -658,11 +595,11 @@ impl PortDriver for T4uDriver {
             self.send(proto::cmd_write(proto::REG_READS_PER_PACKET, value));
         }
 
+        // C++ returns here for its own functions, without callbacks; their
+        // readbacks post when the meter's register dump comes back.
         if reason < t.first {
-            self.base_write_int32(reason, value)?;
+            return self.qe_write_int32(reason, channel, value);
         }
-
-        self.base.port_base.call_param_callbacks(channel)?;
         Ok(())
     }
 
@@ -676,7 +613,6 @@ impl PortDriver for T4uDriver {
         self.base
             .port_base
             .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
 
         if let Some(index) = t.pid_index(reason) {
             let reg = &proto::PID_REGS[index];
@@ -687,17 +623,12 @@ impl PortDriver for T4uDriver {
         } else if reason == t.bias_p_voltage {
             self.send(proto::cmd_write(proto::REG_BIAS_P_VOLTAGE, value as i32));
         } else if reason == p.averaging_time {
-            self.set_averaging_time(value)?;
+            self.write_averaging_time(value)?;
         }
 
-        // The `function < FIRST_T4U_COMMAND` fallthrough into
-        // drvQuadEM::writeFloat64. Every hook it would call is a no-op for the
-        // T4U, so only the averaging-time ring flush is left.
-        if reason < t.first && reason == p.averaging_time {
-            self.shared.ring.lock().flush();
+        if reason < t.first {
+            return self.qe_write_float64(reason, channel, value);
         }
-
-        self.base.port_base.call_param_callbacks(channel)?;
         Ok(())
     }
 }

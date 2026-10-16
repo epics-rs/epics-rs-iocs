@@ -30,8 +30,8 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
 use crate::drv_quad_em::{
-    self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QuadEmBase, QuadEmDevice,
-    QuadEmParams, QuadEmShared, num_average_from,
+    self as qe, CallbackContext, QE_MAX_INPUTS, QeModel, QuadEmBase, QuadEmDevice, QuadEmParams,
+    QuadEmShared, num_average_from,
 };
 use crate::nsls_em_proto::{self as proto, PingPong};
 use crate::octet::{OctetIo, create_ip_port};
@@ -190,10 +190,6 @@ pub struct NslsEmDriver {
 impl NslsEmDriver {
     fn params(&self) -> QuadEmParams {
         self.base.params
-    }
-
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
     }
 
     /// C++ `writeReadMeter`.
@@ -395,6 +391,11 @@ impl QuadEmDevice for NslsEmDriver {
     fn read_status(&mut self) -> AsynResult<()> {
         self.read_status_inner()
     }
+
+    /// C++ `drvNSLS_EM::reset` is the base class's.
+    fn reset(&mut self) -> AsynResult<()> {
+        self.base_reset()
+    }
 }
 
 // ===========================================================================
@@ -410,128 +411,16 @@ impl PortDriver for NslsEmDriver {
         &mut self.base.port_base
     }
 
-    /// C++ `drvQuadEM::writeInt32` with the NSLS_EM overrides bound in.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_int32_param(reason, channel, value)?;
-
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-            self.set_acquire(value)?;
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.set_acquire(0)?;
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.shared.acq.lock().acquire_mode = value;
-            self.read_status()?;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.range {
-            // drvQuadEM::writeInt32 sends the per-channel range only when the
-            // driver overrides it; drvNSLS_EM has a single meter-wide range.
-            if channel == 0 {
-                self.set_range(value)?;
-            }
-            self.read_status()?;
-        } else if reason == p.values_per_read {
-            self.shared.acq.lock().values_per_read = value;
-            self.set_values_per_read(value)?;
-            self.read_status()?;
-        } else if reason == p.ping_pong {
-            self.set_ping_pong(value)?;
-            self.read_status()?;
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-            self.read_status()?;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks(&self.base.port_base);
-        } else if reason == p.read_status {
-            if !self.shared.is_acquiring() {
-                self.read_status()?;
-            }
-        } else if reason == p.reset {
-            self.base_reset()?;
-            self.read_status()?;
-        } else if reason == p.trigger_mode
-            || reason == p.trigger_polarity
-            || reason == p.bias_state
-            || reason == p.bias_interlock
-            || reason == p.num_channels
-            || reason == p.resolution
-            || reason == p.read_format
-        {
-            // drvQuadEM dummies for this meter: it has no bias supply, no
-            // external trigger, four fixed channels and one read format.
-            self.read_status()?;
-        } else if self.base.write_int32_pool(reason)? {
-            // Handled by the NDArray pool controls.
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_int32(user.reason, user.addr, value)
     }
 
-    /// C++ `drvQuadEM::writeFloat64` with the NSLS_EM overrides bound in.
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
-
-        if reason == p.averaging_time {
-            self.shared.ring.lock().flush();
-            self.read_status()?;
-        } else if reason == p.integration_time {
-            self.set_integration_time(value)?;
-            self.read_status()?;
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_float64(user.reason, user.addr, value)
     }
 }
 
-impl NslsEmDriver {
-    /// Mirror a parameter write into the shared position snapshot the read
-    /// thread consumes.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
-    }
-}
+impl NslsEmDriver {}
 
 // ===========================================================================
 // Read thread

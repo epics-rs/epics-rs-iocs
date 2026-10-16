@@ -38,8 +38,8 @@ use epics_rs::asyn::user::AsynUser;
 
 use crate::asyn_print;
 use crate::drv_quad_em::{
-    self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeTriggerMode,
-    QeTriggerPolarity, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
+    self as qe, CallbackContext, QeModel, QeTriggerMode, QeTriggerPolarity, QuadEmBase,
+    QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
 use crate::fx4_proto::{self as proto, Fx4Action, Fx4Cache, TriggerConfig};
 
@@ -160,10 +160,6 @@ impl Fx4Driver {
         self.base.params
     }
 
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
-    }
-
     /// C++ `drvFX4::setAcquireParams`.
     ///
     /// Upstream first tries to reconnect the socket and errors out when it is
@@ -209,32 +205,6 @@ impl Fx4Driver {
             .store(trigger_polarity, Ordering::Relaxed);
         self.link.num_average.store(num_average, Ordering::Relaxed);
         Ok(())
-    }
-
-    /// Mirror a parameter write into the shared position snapshot the data
-    /// thread consumes.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
     }
 }
 
@@ -288,6 +258,18 @@ impl QuadEmDevice for Fx4Driver {
     fn set_values_per_read(&mut self, _value: i32) -> AsynResult<()> {
         self.set_acquire_params()
     }
+
+    fn set_num_acquire(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_trigger_polarity(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+
+    /// C++ `drvFX4::reset` does nothing.
+    fn reset(&mut self) -> AsynResult<()> {
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -303,70 +285,12 @@ impl PortDriver for Fx4Driver {
         &mut self.base.port_base
     }
 
-    /// C++ `drvQuadEM::writeInt32` with the FX4 overrides bound in. The
-    /// meter's range, bias, resolution and read format are set through the CA
-    /// links of `FX4.template`, not through this port, so those branches are
-    /// `drvQuadEM`'s dummies; `readStatus` and `reset` are no-ops for the FX4.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_int32_param(reason, channel, value)?;
-
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-            self.set_acquire(value)?;
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.set_acquire(0)?;
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.set_acquire_mode(value)?;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-            // C++ drvFX4::setNumAcquire is setAcquireParams.
-            self.set_acquire_params()?;
-        } else if reason == p.trigger_mode || reason == p.trigger_polarity {
-            self.set_acquire_params()?;
-        } else if reason == p.values_per_read {
-            self.set_values_per_read(value)?;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks(&self.base.port_base);
-        } else if self.base.write_int32_pool(reason)? {
-            // Handled by the NDArray pool controls.
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_int32(user.reason, user.addr, value)
     }
 
-    /// C++ `drvQuadEM::writeFloat64` with the FX4 overrides bound in.
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
-
-        if reason == p.averaging_time {
-            self.set_averaging_time(value)?;
-            self.shared.ring.lock().flush();
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_float64(user.reason, user.addr, value)
     }
 }
 

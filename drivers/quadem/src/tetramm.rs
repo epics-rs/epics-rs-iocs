@@ -133,10 +133,6 @@ impl TetrAmmDriver {
             .set_string_param(idx, 0, self.firmware_version.clone())?;
         Ok(())
     }
-
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
-    }
 }
 
 // ===========================================================================
@@ -292,6 +288,41 @@ impl QuadEmDevice for TetrAmmDriver {
         }
         Ok(())
     }
+
+    fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_num_acquire(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_trigger_polarity(&mut self, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+    fn set_channel_range(&mut self, _channel: i32, _value: i32) -> AsynResult<()> {
+        self.set_acquire_params()
+    }
+
+    /// C++ `drvTetrAMM::reset`.
+    fn reset(&mut self) -> AsynResult<()> {
+        self.set_acquire(0)?;
+        let _ = self.send_command("HWRESET");
+        let mut came_back = false;
+        for _ in 0..RESET_WAIT_LOOPS {
+            thread::sleep(Duration::from_secs(1));
+            if self.write_read_meter("VER:?").is_ok() {
+                came_back = true;
+                break;
+            }
+        }
+        if !came_back {
+            asyn_print!(
+                self.base.port_base,
+                ERROR,
+                "drvTetrAMM::reset: error, no response from meter after {RESET_WAIT_LOOPS} seconds"
+            );
+        }
+        self.base_reset()
+    }
 }
 
 impl TetrAmmDriver {
@@ -356,28 +387,6 @@ impl TetrAmmDriver {
             self.set_acquire(1)?;
         }
         Ok(())
-    }
-
-    /// C++ `drvTetrAMM::reset`.
-    fn reset(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
-        let _ = self.send_command("HWRESET");
-        let mut came_back = false;
-        for _ in 0..RESET_WAIT_LOOPS {
-            thread::sleep(Duration::from_secs(1));
-            if self.write_read_meter("VER:?").is_ok() {
-                came_back = true;
-                break;
-            }
-        }
-        if !came_back {
-            asyn_print!(
-                self.base.port_base,
-                ERROR,
-                "drvTetrAMM::reset: error, no response from meter after {RESET_WAIT_LOOPS} seconds"
-            );
-        }
-        self.base_reset()
     }
 
     fn read_status_inner(&mut self, last: &mut trace::StatusExchange) -> AsynResult<()> {
@@ -459,32 +468,6 @@ impl TetrAmmDriver {
         self.shared.acq.lock().num_average = num_average;
         Ok(())
     }
-
-    /// Mirror a parameter write into the shared position snapshot the read
-    /// thread consumes.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
-    }
 }
 
 impl PortDriver for TetrAmmDriver {
@@ -496,115 +479,12 @@ impl PortDriver for TetrAmmDriver {
         &mut self.base.port_base
     }
 
-    /// C++ `drvQuadEM::writeInt32` with the TetrAMM overrides bound in.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_int32_param(reason, channel, value)?;
-
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-            self.set_acquire(value)?;
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.set_acquire(0)?;
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.shared.acq.lock().acquire_mode = value;
-            self.set_acquire_params()?;
-            self.read_status()?;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.bias_state {
-            self.set_bias_state(value)?;
-            self.read_status()?;
-        } else if reason == p.bias_interlock {
-            self.set_bias_interlock(value)?;
-            self.read_status()?;
-        } else if reason == p.num_channels {
-            self.set_num_channels(value)?;
-            self.read_status()?;
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-            self.set_acquire_params()?;
-            self.read_status()?;
-        } else if reason == p.ping_pong {
-            // drvQuadEM::setPingPong is a no-op on the TetrAMM.
-            self.read_status()?;
-        } else if reason == p.range {
-            if channel == 0 {
-                self.set_range(value)?;
-            } else {
-                self.set_acquire_params()?;
-            }
-            self.read_status()?;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks(&self.base.port_base);
-        } else if reason == p.resolution {
-            // drvQuadEM::setResolution is a no-op on the TetrAMM.
-            self.read_status()?;
-        } else if reason == p.trigger_mode {
-            self.set_trigger_mode(value)?;
-            self.read_status()?;
-        } else if reason == p.trigger_polarity {
-            self.set_acquire_params()?;
-            self.read_status()?;
-        } else if reason == p.values_per_read {
-            self.shared.acq.lock().values_per_read = value;
-            self.set_values_per_read(value)?;
-            self.read_status()?;
-        } else if reason == p.read_format {
-            self.set_read_format(value)?;
-            self.read_status()?;
-        } else if reason == p.read_status {
-            // C++ skips this while acquiring: too disruptive.
-            if !self.shared.is_acquiring() {
-                self.read_status()?;
-            }
-        } else if reason == p.reset {
-            self.reset()?;
-            self.read_status()?;
-        } else if self.base.write_int32_pool(reason)? {
-            // Handled by the NDArray pool controls.
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_int32(user.reason, user.addr, value)
     }
 
-    /// C++ `drvQuadEM::writeFloat64` with the TetrAMM overrides bound in.
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
-
-        if reason == p.averaging_time {
-            self.set_averaging_time(value)?;
-            self.shared.ring.lock().flush();
-            self.read_status()?;
-        } else if reason == p.bias_voltage {
-            self.set_bias_voltage(value)?;
-            self.read_status()?;
-        } else if reason == p.integration_time {
-            // drvQuadEM::setIntegrationTime is a no-op on the TetrAMM.
-            self.read_status()?;
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_float64(user.reason, user.addr, value)
     }
 }
 

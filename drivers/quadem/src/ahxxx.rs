@@ -124,10 +124,6 @@ impl AhxxxDriver {
         self.base.params
     }
 
-    fn acquire_param(&self) -> usize {
-        self.base.nd_params.acquire
-    }
-
     /// C++ `AH401Series_`.
     fn is_ah401(&self) -> bool {
         self.ah401_series.load(Ordering::Acquire)
@@ -162,43 +158,6 @@ impl AhxxxDriver {
             self.set_acquire(1)?;
         }
         Ok(())
-    }
-
-    /// C++ `drvAHxxx::reset`.
-    fn reset(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
-        self.firmware_version = "Unknown".into();
-        if let Ok(resp) = self.write_read_meter("VER ?") {
-            self.firmware_version = resp;
-        }
-        let p = self.params();
-        self.base
-            .port_base
-            .set_string_param(p.firmware, 0, self.firmware_version.clone())?;
-
-        if self.model == QeModel::Unknown {
-            match proto::model_from_firmware(&self.firmware_version) {
-                Some(m) => {
-                    self.model = m;
-                    self.base.port_base.set_int32_param(p.model, 0, m as i32)?;
-                }
-                None => {
-                    asyn_print!(
-                        self.base.port_base,
-                        ERROR,
-                        "drvAHxxx:reset: unknown firmware version = {}",
-                        self.firmware_version
-                    );
-                    return Err(error(format!(
-                        "AHxxx: unknown firmware version {}",
-                        self.firmware_version
-                    )));
-                }
-            }
-        }
-        self.ah401_series
-            .store(proto::is_ah401_series(self.model), Ordering::Release);
-        self.base_reset()
     }
 
     /// C++ `drvAHxxx::readStatus`.
@@ -482,6 +441,43 @@ impl QuadEmDevice for AhxxxDriver {
         }
         Ok(())
     }
+
+    /// C++ `drvAHxxx::reset`.
+    fn reset(&mut self) -> AsynResult<()> {
+        self.set_acquire(0)?;
+        self.firmware_version = "Unknown".into();
+        if let Ok(resp) = self.write_read_meter("VER ?") {
+            self.firmware_version = resp;
+        }
+        let p = self.params();
+        self.base
+            .port_base
+            .set_string_param(p.firmware, 0, self.firmware_version.clone())?;
+
+        if self.model == QeModel::Unknown {
+            match proto::model_from_firmware(&self.firmware_version) {
+                Some(m) => {
+                    self.model = m;
+                    self.base.port_base.set_int32_param(p.model, 0, m as i32)?;
+                }
+                None => {
+                    asyn_print!(
+                        self.base.port_base,
+                        ERROR,
+                        "drvAHxxx:reset: unknown firmware version = {}",
+                        self.firmware_version
+                    );
+                    return Err(error(format!(
+                        "AHxxx: unknown firmware version {}",
+                        self.firmware_version
+                    )));
+                }
+            }
+        }
+        self.ah401_series
+            .store(proto::is_ah401_series(self.model), Ordering::Release);
+        self.base_reset()
+    }
 }
 
 // ===========================================================================
@@ -497,140 +493,16 @@ impl PortDriver for AhxxxDriver {
         &mut self.base.port_base
     }
 
-    /// C++ `drvQuadEM::writeInt32` with the AHxxx overrides bound in.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_int32_param(reason, channel, value)?;
-
-        if reason == self.acquire_param() {
-            if value != 0 {
-                self.shared.ring.lock().flush();
-            }
-            self.set_acquire(value)?;
-        } else if reason == p.acquire_mode {
-            if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
-                self.set_acquire(0)?;
-                self.base
-                    .port_base
-                    .set_int32_param(self.acquire_param(), 0, 0)?;
-            }
-            self.shared.acq.lock().acquire_mode = value;
-            self.read_status()?;
-        } else if reason == p.geometry {
-            self.shared.pos.lock().geometry = value;
-        } else if reason == p.bias_state {
-            self.set_bias_state(value)?;
-            self.read_status()?;
-        } else if reason == p.num_channels {
-            self.set_num_channels(value)?;
-            self.read_status()?;
-        } else if reason == p.resolution {
-            self.set_resolution(value)?;
-            self.read_status()?;
-        } else if reason == p.bias_interlock
-            || reason == p.trigger_mode
-            || reason == p.trigger_polarity
-        {
-            // setBiasInterlock, setTriggerMode and setTriggerPolarity are
-            // drvQuadEM dummies for this driver: only readStatus runs.
-            self.read_status()?;
-        } else if reason == p.num_acquire {
-            self.shared.acq.lock().num_acquire = value;
-            self.read_status()?;
-        } else if reason == p.ping_pong {
-            self.set_ping_pong(value)?;
-            self.read_status()?;
-        } else if reason == p.range {
-            // drvQuadEM::writeInt32 calls the per-channel setRange for a
-            // non-zero address; drvAHxxx does not override it, so only the
-            // whole-meter range reaches the wire.
-            if channel == 0 {
-                self.set_range(value)?;
-            }
-            self.read_status()?;
-        } else if reason == p.read_data {
-            self.shared.trigger_callbacks(&self.base.port_base);
-        } else if reason == p.values_per_read {
-            self.shared.acq.lock().values_per_read = value;
-            self.read_status()?;
-        } else if reason == p.read_format {
-            self.set_read_format(value)?;
-            self.read_status()?;
-        } else if reason == p.read_status {
-            // C++ skips this while acquiring: too disruptive.
-            if !self.shared.is_acquiring() {
-                self.read_status()?;
-            }
-        } else if reason == p.reset {
-            self.reset()?;
-            self.read_status()?;
-        } else if self.base.write_int32_pool(reason)? {
-            // Handled by the NDArray pool controls.
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_int32(user.reason, user.addr, value)
     }
 
-    /// C++ `drvQuadEM::writeFloat64` with the AHxxx overrides bound in.
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let channel = user.addr;
-        let p = self.params();
-
-        self.base
-            .port_base
-            .set_float64_param(reason, channel, value)?;
-        self.cache_position_param(reason, channel, value);
-
-        if reason == p.averaging_time {
-            self.shared.ring.lock().flush();
-            self.read_status()?;
-        } else if reason == p.bias_voltage {
-            self.set_bias_voltage(value)?;
-            self.read_status()?;
-        } else if reason == p.integration_time {
-            self.set_integration_time(value)?;
-            self.read_status()?;
-        }
-
-        self.base.port_base.call_param_callbacks(channel)?;
-        Ok(())
+        self.qe_write_float64(user.reason, user.addr, value)
     }
 }
 
-impl AhxxxDriver {
-    /// Mirror a parameter write into the shared position snapshot the read
-    /// thread consumes.
-    fn cache_position_param(&mut self, reason: usize, addr: i32, value: f64) {
-        let p = self.params();
-        let i = addr.clamp(0, QE_MAX_INPUTS as i32 - 1) as usize;
-        let j = addr.clamp(0, 1) as usize;
-        let mut pos = self.shared.pos.lock();
-        if reason == p.current_offset {
-            pos.current_offset[i] = value;
-        } else if reason == p.current_scale {
-            pos.current_scale[i] = value;
-        } else if reason == p.position_offset {
-            pos.position_offset[j] = value;
-        } else if reason == p.position_scale {
-            pos.position_scale[j] = value;
-        } else if reason == p.weight_xsum {
-            pos.weight_xsum[i] = value;
-        } else if reason == p.weight_ysum {
-            pos.weight_ysum[i] = value;
-        } else if reason == p.weight_xdelta {
-            pos.weight_xdelta[i] = value;
-        } else if reason == p.weight_ydelta {
-            pos.weight_ydelta[i] = value;
-        }
-    }
-}
+impl AhxxxDriver {}
 
 // ===========================================================================
 // Read thread
