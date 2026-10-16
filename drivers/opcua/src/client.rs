@@ -89,16 +89,18 @@ pub trait UaConnection: Send + Sync {
 /// Opens sessions. The driver holds one; a test holds a double.
 #[async_trait]
 pub trait UaConnector: Send + Sync {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String>;
+    async fn connect(
+        &self,
+        config: &SessionConfig,
+        identity: &Identity,
+    ) -> Result<Arc<dyn UaConnection>, String>;
 }
 
 /// The `async-opcua` client.
 ///
-/// Accepted-and-documented: the C's `sec-id`/`ident-file` option selects an
-/// identity from a credentials file and its `opcuaSaveRejected` command writes
-/// rejected server certificates to a directory. `async-opcua` owns its own PKI
-/// (`pki_dir`, with `rejected/` and `trusted/` beneath it) and takes the identity
-/// directly, so the identity is configured here as an [`Identity`] and the
+/// Accepted-and-documented: the C's `opcuaSaveRejected` command writes rejected
+/// server certificates to a directory. `async-opcua` owns its own PKI
+/// (`pki_dir`, with `rejected/` and `trusted/` beneath it), so the
 /// rejected-certificate directory is fixed by the PKI layout instead of being
 /// separately settable.
 pub struct AsyncOpcuaConnector {
@@ -160,7 +162,11 @@ impl Default for AsyncOpcuaConnector {
 
 #[async_trait]
 impl UaConnector for AsyncOpcuaConnector {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        config: &SessionConfig,
+        identity: &Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         // The session's own options win over the client-wide ones; what neither
         // sets falls back to the `async-opcua` default PKI location.
         let client = self.security();
@@ -196,7 +202,7 @@ impl UaConnector for AsyncOpcuaConnector {
         })?;
 
         let endpoint = config.endpoint_description();
-        let identity = config.identity.token()?;
+        let identity = identity.token()?;
         let (session, event_loop) = client
             .connect_to_matching_endpoint(endpoint, identity)
             .await
@@ -346,7 +352,8 @@ pub fn security_policy_string(uri: &str) -> String {
     }
 }
 
-/// How the client authenticates (`sec-id`, `SessionOpen62541.cpp:159-260`).
+/// How the client authenticates: what
+/// [`SessionConfig::setup_identity`] read from the `sec-id` credentials file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Identity {
     #[default]
@@ -363,15 +370,6 @@ pub enum Identity {
 }
 
 impl Identity {
-    /// What `opcuaShowSecurity` prints. A password is never shown.
-    pub fn describe(&self) -> String {
-        match self {
-            Identity::Anonymous => "anonymous".to_string(),
-            Identity::UserName { user, .. } => format!("username '{user}'"),
-            Identity::Certificate { certificate, .. } => format!("certificate '{certificate}'"),
-        }
-    }
-
     fn token(&self) -> Result<IdentityToken, String> {
         Ok(match self {
             Identity::Anonymous => IdentityToken::Anonymous,

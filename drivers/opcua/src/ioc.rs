@@ -187,7 +187,7 @@ pub fn show_security(registry: &Registry, client: &ClientSecurity, session: &str
             handle.name,
             config.security_mode,
             config.security_policy.as_deref().unwrap_or("(best)"),
-            config.identity.describe(),
+            config.identity_file.as_deref().unwrap_or("anonymous"),
         ));
     }
     out

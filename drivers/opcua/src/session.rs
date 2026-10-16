@@ -52,7 +52,9 @@ pub struct SessionConfig {
     pub write_timeout_max: f64,
     pub security_mode: SecurityMode,
     pub security_policy: Option<String>,
-    pub identity: Identity,
+    /// `sec-id`: the credentials file [`Self::setup_identity`] reads at every
+    /// connect.
+    pub identity_file: Option<String>,
     /// `None` — the client's PKI store (`opcuaSetupPKI`), or the default.
     pub pki_dir: Option<String>,
     pub certificate_path: Option<String>,
@@ -78,12 +80,95 @@ impl SessionConfig {
             write_timeout_max: 0.0,
             security_mode: SecurityMode::Best,
             security_policy: None,
-            identity: Identity::Anonymous,
+            identity_file: None,
             pki_dir: None,
             certificate_path: None,
             private_key_path: None,
             trust_server_certs: false,
             namespace_map: HashMap::new(),
+        }
+    }
+
+    /// The identity token the next connect presents
+    /// (`SessionOpen62541::setupIdentity`): what the `sec-id` credentials file
+    /// holds, or anonymous when there is none or it is unusable.
+    pub fn setup_identity(&self) -> Identity {
+        let Some(file) = &self.identity_file else {
+            if self.debug > 0 {
+                println!(
+                    "Session {}: (setupIdentity) setting Anonymous token",
+                    self.name
+                );
+            }
+            return Identity::Anonymous;
+        };
+        // C goes on parsing the stream that failed to open, which reads nothing.
+        let text = std::fs::read_to_string(file).unwrap_or_else(|_| {
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: cannot open credentials file {file}\n",
+                self.name
+            ));
+            String::new()
+        });
+        let (mut user, mut pass, mut cert, mut key) = ("", "", "", "");
+        for line in text.lines() {
+            let Some(equ) = line.find('=') else { continue };
+            if line.find('#').is_some_and(|hash| hash < equ) {
+                continue;
+            }
+            let value = &line[equ + 1..];
+            match &line[..equ] {
+                "user" => user = value,
+                "pass" => pass = value,
+                "cert" => cert = value,
+                "key" => key = value,
+                _ => {}
+            }
+        }
+
+        if !user.is_empty() && !pass.is_empty() {
+            if self.debug > 0 {
+                println!(
+                    "Session {}: (setupIdentity) setting Username token ({user}/*****)",
+                    self.name
+                );
+            }
+            Identity::UserName {
+                user: user.to_string(),
+                password: pass.to_string(),
+            }
+        } else if !cert.is_empty() && !key.is_empty() {
+            if self.debug > 0 {
+                println!(
+                    "Session {}: (setupIdentity) loading identity certificate {cert}",
+                    self.name
+                );
+            }
+            match std::fs::metadata(cert) {
+                Ok(meta) if meta.len() > 0 => Identity::Certificate {
+                    certificate: cert.to_string(),
+                    private_key: key.to_string(),
+                },
+                result => {
+                    let reason = match result {
+                        Err(e) => strerror(&e),
+                        // `loadFile` of an empty file leaves errno at 0.
+                        Ok(_) => "Success".to_string(),
+                    };
+                    errlog_vprintf(format_args!(
+                        "OPC UA Session {}: loading client certificate {cert} failed: {reason}\n",
+                        self.name
+                    ));
+                    Identity::Anonymous
+                }
+            }
+        } else {
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: credentials file {file} does not contain settings for \
+                 Username token (user + pass) or Certificate token (cert + key [+ pass])\n",
+                self.name
+            ));
+            Identity::Anonymous
         }
     }
 
@@ -122,7 +207,7 @@ impl SessionConfig {
                     .ok_or_else(|| format!("invalid security mode '{value}'"))?;
             }
             "sec-policy" => self.security_policy = Some(value.to_string()),
-            "sec-id" => self.identity = parse_identity(value)?,
+            "sec-id" => self.identity_file = Some(value.to_string()),
             "pki-dir" => self.pki_dir = Some(value.to_string()),
             "cert" => self.certificate_path = Some(value.to_string()),
             "key" => self.private_key_path = Some(value.to_string()),
@@ -179,29 +264,6 @@ fn batch_size(server_limit: u32, session_limit: u32) -> usize {
         (0, 0) => usize::MAX,
         (m, 0) | (0, m) => m as usize,
         (a, b) => a.min(b) as usize,
-    }
-}
-
-/// `sec-id` names an identity: a user name and password, or an X.509 identity
-/// certificate and its key.
-fn parse_identity(value: &str) -> Result<Identity, String> {
-    match value.split_once(':') {
-        Some(("cert", rest)) => match rest.split_once(':') {
-            Some((certificate, private_key)) => Ok(Identity::Certificate {
-                certificate: certificate.to_string(),
-                private_key: private_key.to_string(),
-            }),
-            None => Err(format!(
-                "identity 'cert:{rest}' needs a certificate and a key, 'cert:<cert>:<key>'"
-            )),
-        },
-        Some((user, password)) => Ok(Identity::UserName {
-            user: user.to_string(),
-            password: password.to_string(),
-        }),
-        None => Err(format!(
-            "identity '{value}' must be '<user>:<password>' or 'cert:<cert>:<key>'"
-        )),
     }
 }
 
@@ -386,8 +448,8 @@ impl SessionWorker {
     }
 
     /// The `ACTIVATED` arm's first lines (`SessionOpen62541.cpp:2432-2445`).
-    fn report_connected(&self, config: &SessionConfig, endpoint: &EndpointDescription) {
-        let (user, token) = match &config.identity {
+    fn report_connected(&self, identity: &Identity, endpoint: &EndpointDescription) {
+        let (user, token) = match identity {
             Identity::Anonymous => ("Anonymous", ""),
             Identity::UserName { user, .. } => (user.as_str(), " (username token)"),
             Identity::Certificate { .. } => ("Certificate user", " (certificate token)"),
@@ -413,9 +475,10 @@ impl SessionWorker {
 
     async fn connect(&mut self) -> Result<(), String> {
         let config = self.handle.config.lock().clone();
-        let connection = self.connector.connect(&config).await?;
+        let identity = config.setup_identity();
+        let connection = self.connector.connect(&config, &identity).await?;
         if let Some(endpoint) = connection.endpoint() {
-            self.report_connected(&config, &endpoint);
+            self.report_connected(&identity, &endpoint);
         }
         // C reads each capability on its own and keeps its default when the
         // read fails, with no print (`SessionOpen62541.cpp:2447-2484`).
@@ -1001,4 +1064,13 @@ fn is_connection_error(status: StatusCode) -> bool {
             | StatusCode::BadSecureChannelClosed
             | StatusCode::BadTimeout
     )
+}
+
+/// C `strerror(errno)`: the message without Rust's `(os error N)` suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
 }

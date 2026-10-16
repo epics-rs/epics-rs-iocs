@@ -45,7 +45,11 @@ struct NoConnector;
 
 #[async_trait]
 impl UaConnector for NoConnector {
-    async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        _config: &SessionConfig,
+        _identity: &opcua::client::Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         Err("no server".to_string())
     }
 }

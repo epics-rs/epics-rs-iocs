@@ -72,7 +72,11 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        config: &SessionConfig,
+        _identity: &opcua::client::Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         self.0.connects.lock().push(config.clone());
         Ok(self.0.clone())
     }
@@ -324,7 +328,7 @@ fn session_options_are_parsed() {
     config.set_option("nodes-max", "100").unwrap();
     config.set_option("read-timeout-min", "5.5").unwrap();
     config.set_option("sec-mode", "SignAndEncrypt").unwrap();
-    config.set_option("sec-id", "user:secret").unwrap();
+    config.set_option("sec-id", "/etc/opcua/creds").unwrap();
     config.set_option("pki-dir", "/etc/pki").unwrap();
 
     assert_eq!(config.debug, 2);
@@ -335,13 +339,7 @@ fn session_options_are_parsed() {
         config.security_mode,
         opcua::client::SecurityMode::SignAndEncrypt
     );
-    assert_eq!(
-        config.identity,
-        opcua::client::Identity::UserName {
-            user: "user".into(),
-            password: "secret".into()
-        }
-    );
+    assert_eq!(config.identity_file.as_deref(), Some("/etc/opcua/creds"));
     assert_eq!(config.pki_dir.as_deref(), Some("/etc/pki"));
 }
 
@@ -352,20 +350,64 @@ fn an_unknown_session_option_is_rejected() {
     assert!(config.set_option("nodes-max", "x").is_err());
 }
 
-#[test]
-fn an_x509_identity_names_a_certificate_and_a_key() {
+/// `setupIdentity` on a credentials file holding `contents`.
+fn identity_from(contents: &str) -> opcua::client::Identity {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = std::env::temp_dir().join(format!("opcua-creds-{}-{n}", std::process::id()));
+    std::fs::write(&file, contents).unwrap();
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config
-        .set_option("sec-id", "cert:/tmp/id.der:/tmp/id.pem")
-        .unwrap();
+    config.identity_file = Some(file.to_string_lossy().into_owned());
+    let identity = config.setup_identity();
+    std::fs::remove_file(file).unwrap();
+    identity
+}
+
+#[test]
+fn no_credentials_file_is_the_anonymous_token() {
+    let config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(config.setup_identity(), opcua::client::Identity::Anonymous);
+}
+
+#[test]
+fn a_credentials_file_with_user_and_pass_is_a_username_token() {
     assert_eq!(
-        config.identity,
+        identity_from("# operator\nuser=op\npass=se=cret\n"),
+        opcua::client::Identity::UserName {
+            user: "op".into(),
+            password: "se=cret".into()
+        }
+    );
+}
+
+#[test]
+fn a_credentials_file_with_cert_and_key_is_a_certificate_token() {
+    let cert = std::env::temp_dir().join(format!("opcua-id-{}.der", std::process::id()));
+    std::fs::write(&cert, b"der").unwrap();
+    let identity = identity_from(&format!("cert={}\nkey=/tmp/id.pem\n", cert.display()));
+    std::fs::remove_file(&cert).unwrap();
+    assert_eq!(
+        identity,
         opcua::client::Identity::Certificate {
-            certificate: "/tmp/id.der".into(),
+            certificate: cert.to_string_lossy().into_owned(),
             private_key: "/tmp/id.pem".into()
         }
     );
-    assert!(config.set_option("sec-id", "cert:only-one").is_err());
+}
+
+#[test]
+fn an_unusable_credentials_file_falls_back_to_the_anonymous_token() {
+    use opcua::client::Identity::Anonymous;
+    // A commented-out setting, a lone user, a certificate that cannot be loaded.
+    assert_eq!(identity_from("#user=op\n#pass=secret\n"), Anonymous);
+    assert_eq!(identity_from("user=op\n"), Anonymous);
+    assert_eq!(
+        identity_from("cert=/nonexistent/id.der\nkey=/tmp/id.pem\n"),
+        Anonymous
+    );
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.identity_file = Some("/nonexistent/creds".into());
+    assert_eq!(config.setup_identity(), Anonymous);
 }
 
 #[test]

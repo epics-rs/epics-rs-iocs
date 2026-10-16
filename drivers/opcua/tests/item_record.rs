@@ -53,7 +53,11 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        _config: &SessionConfig,
+        _identity: &opcua::client::Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         Ok(self.0.clone())
     }
 }
@@ -129,7 +133,11 @@ fn offline() -> Arc<Registry> {
     struct Offline;
     #[async_trait]
     impl UaConnector for Offline {
-        async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+        async fn connect(
+            &self,
+            _config: &SessionConfig,
+            _identity: &opcua::client::Identity,
+        ) -> Result<Arc<dyn UaConnection>, String> {
             Err("no server".to_string())
         }
     }
