@@ -18,7 +18,7 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
-use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
+use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, handle_pool_write_int32};
 use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
@@ -40,8 +40,6 @@ pub const DRIVER_VERSION: &str = "1.3.0";
 /// never the drop point under the non-blocking (default) plugin callbacks; see
 /// the deviation note in the crate docs.
 const PUBLISH_QUEUE: usize = 1024;
-
-const MEGABYTE: f64 = 1_048_576.0;
 
 fn pool_err(e: impl std::fmt::Display) -> AsynError {
     AsynError::Status {
@@ -350,52 +348,6 @@ impl NdStdArraysDriver {
         Ok(())
     }
 
-    /// The pool branch of `asynNDArrayDriver::writeInt32`
-    /// (asynNDArrayDriver.cpp:684-694), reproduced over the public
-    /// `NDArrayPool` API. `pArrays[0]` is the pre-allocation template.
-    fn write_int32_pool(&mut self, reason: usize) -> AsynResult<bool> {
-        if reason == self.params.base.pool_empty_free_list {
-            self.pool.empty_free_list();
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if reason == self.params.base.pool_poll_stats {
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if reason == self.params.base.pool_pre_alloc {
-            if self.current.is_some() {
-                let count = self
-                    .get_i32(self.params.base.pool_num_pre_alloc_buffers)
-                    .max(0) as usize;
-                let template = self.current.as_ref().unwrap();
-                self.pool
-                    .pre_allocate_buffers(template, count)
-                    .map_err(pool_err)?;
-                self.refresh_pool_stats()?;
-            }
-            self.port_base
-                .set_int32_param(self.params.base.pool_pre_alloc, 0, 0)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn refresh_pool_stats(&mut self) -> AsynResult<()> {
-        let max_memory = self.pool.max_memory() as f64 / MEGABYTE;
-        let used = self.pool.allocated_bytes() as f64 / MEGABYTE;
-        let alloc = self.pool.num_alloc_buffers() as i32;
-        let free = self.pool.num_free_buffers() as i32;
-        self.port_base
-            .set_float64_param(self.params.base.pool_max_memory, 0, max_memory)?;
-        self.port_base
-            .set_float64_param(self.params.base.pool_used_memory, 0, used)?;
-        self.port_base
-            .set_int32_param(self.params.base.pool_alloc_buffers, 0, alloc)?;
-        self.port_base
-            .set_int32_param(self.params.base.pool_free_buffers, 0, free)?;
-        Ok(())
-    }
-
     fn write_array_input(&mut self, input: Vec<f64>) -> AsynResult<()> {
         self.write_array_data(&input)
     }
@@ -436,8 +388,15 @@ impl PortDriver for NdStdArraysDriver {
                 let _ = self.set_array_complete();
             }
         } else if self.ndsa.belongs_to_base(reason) {
-            // ADDriver::writeInt32 — only the pool operations act.
-            let _ = self.write_int32_pool(reason);
+            // ADDriver::writeInt32 — only the pool operations act; `pArrays[0]`
+            // is the pre-allocation template.
+            let _ = handle_pool_write_int32(
+                &mut self.port_base,
+                &self.params.base,
+                &self.pool,
+                reason,
+                self.current.as_deref(),
+            );
         }
 
         // A failure here reaches C's errorMessage only, never the console.
@@ -636,8 +595,49 @@ mod tests {
             .unwrap();
         assert!(det.current.is_some());
 
+        let trace = trace_to_file("NDSAPREALLOC");
         det.write_int32(&mut AsynUser::new(p.base.pool_pre_alloc), 1)
             .expect("C returns callParamCallbacks' status");
+        let text = read_trace(&trace);
+        assert!(
+            text.contains("asynNDArrayDriver::preAllocateBuffers: ERROR, "),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_alloc_before_any_array_prints_cs_error_line() {
+        let (publish_tx, _publish_rx) = rt::command_channel::<PublishedArray>(PUBLISH_QUEUE);
+        let mut det = NdStdArraysDriver::new("NDSANOTEMPLATE", 0, publish_tx).unwrap();
+        let trace = trace_to_file("NDSANOTEMPLATE");
+        det.write_int32(&mut AsynUser::new(det.params.base.pool_pre_alloc), 1)
+            .unwrap();
+        let text = read_trace(&trace);
+        assert!(
+            text.contains(
+                "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first"
+            ),
+            "{text:?}"
+        );
+    }
+
+    fn trace_to_file(port: &str) -> std::path::PathBuf {
+        use epics_rs::asyn::trace::TraceFile;
+        let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .set_trace_file(
+                Some(port),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+        path
+    }
+
+    fn read_trace(path: &std::path::Path) -> String {
+        let text = std::fs::read_to_string(path).unwrap();
+        let _ = std::fs::remove_file(path);
+        text
     }
 
     #[test]
