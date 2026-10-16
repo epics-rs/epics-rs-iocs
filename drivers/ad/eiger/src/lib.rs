@@ -25,6 +25,7 @@ pub mod rest;
 pub mod stream;
 pub mod tasks;
 pub mod tiff;
+pub mod trace;
 
 use crate::driver::EigerDriver;
 use crate::params::Model;
@@ -90,12 +91,8 @@ pub fn create_eiger_detector_on_port(
     // catch, and the IOC dies on an uncaught exception — where the very next
     // thing C's own constructor does (the `state` fetch below) is careful to
     // log and carry on.
-    if let Err(e) = rest.negotiate_api_version() {
-        log::error!(
-            "eiger: cannot read the SIMPLON API version from {hostname}: {e}; the port is created \
-             with the detector disconnected"
-        );
-    }
+    // The failed GET has printed RestAPI::get's lines; C's throw follows them.
+    let _ = rest.negotiate_api_version();
     let api = rest.api_version();
 
     // The model decides which parameters exist, so it has to be known before any
@@ -108,12 +105,8 @@ pub fn create_eiger_detector_on_port(
     // full 20 s timeout. Nothing here needs to know that; the gate is uniform.
     let description = rest
         .get_value(rest::Sys::DetConfig, "description")
-        .unwrap_or_else(|e| {
-            log::warn!("eiger: cannot read the detector description: {e}");
-            String::new()
-        });
+        .unwrap_or_default();
     let model = Model::from_description(&description);
-    log::info!("eiger: {hostname} is a {model:?} on SIMPLON API {api:?}");
 
     let (signals, ctl_rx, init_rx, restart_rx) = tasks::signals();
 

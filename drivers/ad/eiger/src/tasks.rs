@@ -64,9 +64,7 @@ pub struct Signals {
 
 impl Signals {
     pub fn start(&self) {
-        if self.ctl_tx.try_send(CtlCommand::Start).is_err() {
-            log::error!("eiger: control task is not running");
-        }
+        let _ = self.ctl_tx.try_send(CtlCommand::Start);
     }
 
     pub fn stop(&self) {
@@ -78,15 +76,11 @@ impl Signals {
     }
 
     pub fn initialize(&self) {
-        if self.init_tx.try_send(()).is_err() {
-            log::error!("eiger: initialize task is not running");
-        }
+        let _ = self.init_tx.try_send(());
     }
 
     pub fn restart(&self) {
-        if self.restart_tx.try_send(()).is_err() {
-            log::error!("eiger: restart task is not running");
-        }
+        let _ = self.restart_tx.try_send(());
     }
 }
 
@@ -153,6 +147,10 @@ impl Shared {
         &self.ops.rest
     }
 
+    fn trace(&self) -> &crate::trace::Trace {
+        &self.ops.trace
+    }
+
     async fn apply(&self, updates: Vec<ParamUpdate>) {
         if updates.is_empty() {
             return;
@@ -200,9 +198,8 @@ impl Shared {
 
     /// Fetch a remote parameter and push the result into the param library.
     async fn fetch(&self, reason: usize) {
-        match self.ops.fetch(reason) {
-            Ok(updates) => self.apply(updates).await,
-            Err(e) => log::warn!("eiger: fetch failed: {e}"),
+        if let Ok(updates) = self.ops.fetch(reason) {
+            self.apply(updates).await;
         }
     }
 
@@ -213,9 +210,8 @@ impl Shared {
     }
 
     async fn put_int(&self, reason: usize, value: i32) {
-        match self.ops.put_int(reason, value) {
-            Ok(updates) => self.apply(updates).await,
-            Err(e) => log::error!("eiger: write failed: {e}"),
+        if let Ok(updates) = self.ops.put_int(reason, value) {
+            self.apply(updates).await;
         }
     }
 
@@ -373,15 +369,19 @@ pub fn start(
 /// Both are long REST commands that must not block the control task, and both
 /// clear their own push-button parameter when they are done.
 async fn command_task(s: Arc<Shared>, mut rx: rt::CommandReceiver<()>, which: &str) {
+    let (task, failed) = match which {
+        "initialize" => ("initializeTask", "Failed to initialize"),
+        _ => ("restartTask", "Failed to restart"),
+    };
     while rx.recv().await.is_some() {
-        log::warn!("eiger: sending the {which} command");
+        s.trace().warning(task, &format!("Sending {which} command"));
         let (result, param) = match which {
             "initialize" => (s.rest().initialize(), s.p.initialize),
             _ => (s.rest().restart(), s.p.restart),
         };
         s.set_int(param, 0).await;
-        if let Err(e) = result {
-            log::error!("eiger: {which} failed: {e}");
+        if result.is_err() {
+            s.trace().err(task, failed);
         }
     }
 }
@@ -452,7 +452,10 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         }
     }
     if let Some(err) = err {
-        log::error!("eiger: {err}");
+        // C prints only the file-path refusal.
+        if err == "Invalid file path" {
+            s.trace().err("controlTask", err);
+        }
         s.set_int(s.ad.acquire, 0).await;
         s.set_int(s.ad.status, ADStatus::Error as i32).await;
         s.set_str(s.ad.status_message, err).await;
@@ -470,8 +473,8 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
     s.set_str(s.ad.status_message, "Arming").await;
     let sequence_id = match s.rest().arm() {
         Ok(id) => id,
-        Err(e) => {
-            log::error!("eiger: failed to arm the detector: {e}");
+        Err(_) => {
+            s.trace().err("controlTask", "Failed to arm the detector");
             s.set_int(s.ad.acquire, 0).await;
             s.set_int(s.ad.status, ADStatus::Error as i32).await;
             s.set_str(s.ad.status_message, "Failed to arm the detector")
@@ -506,20 +509,12 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
             remove_files,
             perms: (file_perms & 0o777) as u32,
         };
-        if ch.poll_tx.try_send(acq).is_ok() {
-            wait_poll = true;
-        } else {
-            log::error!("eiger: poll task is not running");
-        }
+        wait_poll = ch.poll_tx.try_send(acq).is_ok();
     }
 
     if data_source == SOURCE_STREAM {
         s.stream_complete.store(false, Ordering::Release);
-        if ch.stream_start_tx.try_send(()).is_ok() {
-            wait_stream = true;
-        } else {
-            log::error!("eiger: stream task is not running");
-        }
+        wait_stream = ch.stream_start_tx.try_send(()).is_ok();
     }
 
     let msg = if trigger_mode == TRIGGER_MODE_EXTS || trigger_mode == TRIGGER_MODE_EXTE {
@@ -562,9 +557,7 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
             if do_trigger {
                 let exposure = (trigger_mode == TRIGGER_MODE_INTE).then_some(acquire_time);
                 let timeout = Duration::from_secs_f64(trigger_timeout.max(0.0));
-                if let Err(e) = s.rest().trigger(timeout, exposure) {
-                    log::error!("eiger: trigger failed: {e}");
-                }
+                let _ = s.rest().trigger(timeout, exposure);
                 triggers += 1;
             }
         }
@@ -587,14 +580,11 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         }
     }
 
-    if let Err(e) = s.rest().disarm() {
-        log::error!("eiger: disarm failed: {e}");
-    }
+    let _ = s.rest().disarm();
 
     s.put_int(p.armed, 0).await;
     s.set_str(s.ad.status_message, "Processing files").await;
 
-    let mut success = true;
     if wait_poll {
         // Let the FileWriter finish writing before telling the poll task to stop.
         loop {
@@ -606,16 +596,11 @@ async fn acquire(s: &Arc<Shared>, ch: &mut TaskChannels) -> bool {
         rt::sleep(Duration::from_millis(500)).await;
 
         s.poll_stop.store(true, Ordering::Release);
-        let complete = ch.poll_done_rx.recv().await.unwrap_or(false);
-        success = success && complete;
+        let _ = ch.poll_done_rx.recv().await;
     }
 
     if wait_stream {
-        let complete = ch.stream_done_rx.recv().await.unwrap_or(false);
-        success = success && complete;
-    }
-    if !success {
-        log::warn!("eiger: acquisition did not complete cleanly");
+        let _ = ch.stream_done_rx.recv().await;
     }
 
     if saved_num_images != num_images {
@@ -706,13 +691,10 @@ async fn poll_task(
                     if file.save || file.parse {
                         s.add_pending(1).await;
                         if download_tx.send(file.clone()).await.is_err() {
-                            log::error!("eiger: download task is not running");
                             s.add_pending(-1).await;
                         }
-                    } else if file.remove.load(Ordering::Acquire)
-                        && let Err(e) = s.rest().delete_file(&file.name)
-                    {
-                        log::error!("eiger: delete of {} failed: {e}", file.name);
+                    } else if file.remove.load(Ordering::Acquire) {
+                        let _ = s.rest().delete_file(&file.name);
                     }
                     i += 1;
                 }
@@ -724,8 +706,7 @@ async fn poll_task(
                         retries += 1;
                     }
                 }
-                Err(e) => {
-                    log::error!("eiger: waiting for {} failed: {e}", file.name);
+                Err(_) => {
                     if s.poll_stop.load(Ordering::Acquire) {
                         retries += 1;
                     } else {
@@ -754,8 +735,11 @@ async fn download_task(
 ) {
     while let Some(file) = rx.recv().await {
         match s.rest().get_file(&file.name) {
-            Err(e) => {
-                log::error!("eiger: download of {} failed: {e}", file.name);
+            Err(_) => {
+                s.trace().err(
+                    "downloadTask",
+                    &format!("underlying getFile({}) failed", file.name),
+                );
                 // The file was never fetched, so no consumer will ever see it:
                 // hand it straight to the reaper, which owns the pending count.
                 // Its refcount is still `save + parse`, so drop it to one first.
@@ -782,22 +766,23 @@ async fn parse_task(
 ) {
     while let Some(file) = rx.recv().await {
         let data = file.data.lock().clone();
-        match data {
-            Some(data) => {
-                if let Err(e) = parse_h5(&s, &data).await {
-                    log::error!("eiger: parsing {} failed: {e}", file.name);
-                }
-            }
-            None => log::error!("eiger: {} arrived at the parse task empty", file.name),
+        if let Some(data) = data
+            && parse_h5(&s, &data).await.is_err()
+        {
+            s.trace().err(
+                "parseTask",
+                &format!("underlying parseH5File({}) failed", file.name),
+            );
         }
         let _ = reap_tx.send(file).await;
     }
 }
 
 /// Publish every image in one FileWriter data file (C `parseH5File`).
-async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), String> {
+async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
     let signed_data = s.get_int(s.p.signed_data).await != 0;
-    let frames = h5::parse(data, signed_data)?;
+    let trace = s.trace();
+    let frames = h5::parse(data, signed_data, &mut |msg| trace.err("parseH5File", msg))?;
 
     // The thresholds that were enabled for this acquisition, in order — the
     // Nth frame of a 4-D dataset belongs to the Nth *active* threshold.
@@ -871,7 +856,6 @@ async fn save_task(
     while let Some(file) = rx.recv().await {
         let data = file.data.lock().clone();
         let Some(data) = data else {
-            log::error!("eiger: {} arrived at the save task empty", file.name);
             let _ = reap_tx.send(file).await;
             continue;
         };
@@ -888,8 +872,7 @@ async fn save_task(
         ])
         .await;
 
-        if let Err(e) = write_file(&full, &data, file.perms) {
-            log::error!("eiger: writing {full} failed: {e}");
+        if !write_file(&s, &file.name, &full, &data, file.perms) {
             // The local copy failed, so the detector's copy is the only one left:
             // do not let the reaper delete it.
             file.remove.store(false, Ordering::Release);
@@ -906,9 +889,14 @@ async fn save_task(
 /// libc-dependent path with no portable Rust equivalent; it is not ported. The
 /// two PVs still exist and hold their strings, but they do not change the owner
 /// of the written file.
-fn write_file(path: &str, data: &[u8], perms: u32) -> std::io::Result<()> {
+///
+/// Returns whether the whole file was written. Failures print C's
+/// `saveTask` lines and the `perror` that follows each; a failed `fchmod`
+/// is reported and the write goes on, as in C.
+fn write_file(s: &Shared, name: &str, path: &str, data: &[u8], perms: u32) -> bool {
     use std::io::Write;
 
+    let perror = |call: &str, e: &std::io::Error| eprintln!("{call}: {}", strerror(e));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -916,21 +904,62 @@ fn write_file(path: &str, data: &[u8], perms: u32) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(perms);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(data)?;
+    let mut f = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            s.trace().err(
+                "saveTask",
+                &format!("[file={name}] unable to open file to be written\n[{path}]"),
+            );
+            perror("open", &e);
+            return false;
+        }
+    };
     // An existing file keeps its old mode through `open`, so set it explicitly
     // (C calls fchmod for the same reason). POSIX mode bits have no portable
     // Windows equivalent, so on non-unix the file is left at the OS default.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(perms))?;
+        if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(perms)) {
+            s.trace().err(
+                "saveTask",
+                &format!("[file={name}] failed to set permissions {perms:o}"),
+            );
+            perror("fchmod", &e);
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = perms;
     }
-    Ok(())
+    let mut written = 0;
+    while written < data.len() {
+        match f.write(&data[written..]) {
+            Ok(n) if n > 0 => written += n,
+            result => {
+                s.trace().err(
+                    "saveTask",
+                    &format!("[file={name}] failed to write to local file ({written} written)"),
+                );
+                let e = result
+                    .err()
+                    .unwrap_or_else(|| std::io::ErrorKind::WriteZero.into());
+                perror("write", &e);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `perror`'s text: the OS message without Rust's ` (os error N)` suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(i) => text[..i].to_string(),
+        None => text,
+    }
 }
 
 /// Drop one reference to a file; the last one deletes it from the detector
@@ -939,10 +968,8 @@ async fn reap(s: &Arc<Shared>, file: Arc<FileJob>) {
     if file.refs.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
     }
-    if file.remove.load(Ordering::Acquire)
-        && let Err(e) = s.rest().delete_file(&file.name)
-    {
-        log::error!("eiger: delete of {} failed: {e}", file.name);
+    if file.remove.load(Ordering::Acquire) {
+        let _ = s.rest().delete_file(&file.name);
     }
     s.fetch(s.p.fw_free).await;
     *file.data.lock() = None;
@@ -965,8 +992,10 @@ async fn monitor_task(s: Arc<Shared>) {
         let enabled = s.get_int(s.p.monitor_enable).await != 0;
         if enabled {
             let timeout = s.get_int(s.p.monitor_timeout).await.max(0) as u32;
-            match s.rest().get_monitor_image(timeout) {
-                Ok(buf) => match tiff::decode(&buf) {
+            // No new image within the long-poll window is the normal case
+            // (C ignores the failure, eigerDetector.cpp:1384).
+            if let Ok(buf) = s.rest().get_monitor_image(timeout) {
+                match tiff::decode(&buf) {
                     Ok(image) => {
                         let array = build_array(
                             image.dims,
@@ -980,11 +1009,11 @@ async fn monitor_task(s: Arc<Shared>) {
                             .publish(Arc::new(array))
                             .await;
                     }
-                    Err(e) => log::error!("eiger: couldn't parse the monitor image: {e}"),
-                },
-                // No new image within the long-poll window is the normal case
-                // (C ignores the failure, eigerDetector.cpp:1384).
-                Err(e) => log::debug!("eiger: no monitor image: {e}"),
+                    Err(e) => {
+                        s.trace().err("parseTiffFile", &e.0);
+                        s.trace().err("monitorTask", "couldn't parse file");
+                    }
+                }
             }
         }
         rt::sleep(MONITOR_PERIOD).await;
@@ -1004,11 +1033,8 @@ async fn stream_task(
 
     while start_rx.recv().await.is_some() {
         let version = s.get_int(s.p.stream_version).await;
+        // Stream2 (CBOR) is not ported.
         if version != STREAM_VERSION_STREAM {
-            log::error!(
-                "eiger: stream format {version} (stream2/CBOR) is not implemented; \
-                 set STREAM_VERSION to 0 (stream)"
-            );
             let _ = done_tx.send(false).await;
             continue;
         }
@@ -1016,8 +1042,9 @@ async fn stream_task(
         if api.is_none() {
             match StreamApi::connect(&s.hostname).await {
                 Ok(a) => api = Some(a),
-                Err(e) => {
-                    log::error!("eiger: cannot connect to the zmq stream: {e}");
+                Err(_) => {
+                    s.trace()
+                        .err("streamTask", "mStreamAPI is null, Stream API not enabled?");
                     let _ = done_tx.send(false).await;
                     continue;
                 }
@@ -1044,14 +1071,15 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
             Ok(Some(StreamMessage::Header(_))) => break,
             Ok(Some(StreamMessage::End)) => return true,
             Ok(Some(StreamMessage::Image(_))) => {
-                log::error!("eiger: got an image before the series header, ignoring");
+                s.trace().err("streamTask", "got stray packet, ignoring");
             }
             Ok(None) => {}
             Err(crate::stream::StreamError::WrongHtype(h)) => {
-                log::error!("eiger: got stray packet ({h}), ignoring");
+                eprintln!("StreamApi::getHeader: wrong header type, htype={h}");
+                s.trace().err("streamTask", "got stray packet, ignoring");
             }
-            Err(e) => {
-                log::error!("eiger: failed to get the header packet: {e}");
+            Err(_) => {
+                s.trace().err("streamTask", "failed to get header packet");
                 return false;
             }
         }
@@ -1067,25 +1095,20 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
         let msg = match stream.recv(timeout, decompress).await {
             Ok(Some(m)) => m,
             Ok(None) => continue,
-            Err(crate::stream::StreamError::WrongHtype(h)) => {
-                log::error!("eiger: got stray packet ({h}), ignoring");
-                continue;
-            }
+            Err(crate::stream::StreamError::WrongHtype(_)) => continue,
             // UPSTREAM DEFECT (streamApi.cpp:1503-1507 in the caller): C assigns
             // `err = mStreamAPI->getFrame(&pArray, ...)` and then dereferences
             // `pArray` without ever testing `err`, so a failed decode reads an
             // uninitialised pointer. Here a failed frame ends the series.
-            Err(e) => {
-                log::error!("eiger: failed to get a frame packet: {e}");
+            Err(_) => {
+                s.trace().err("streamTask", "failed to get frame packet");
                 return false;
             }
         };
 
         match msg {
             StreamMessage::End => return true,
-            StreamMessage::Header(_) => {
-                log::error!("eiger: got a second series header, ignoring");
-            }
+            StreamMessage::Header(_) => {}
             StreamMessage::Image(frame) => {
                 // Stream v1 carries one image per message and no threshold axis
                 // (C `numThresholds` stays 1 on this path, eigerDetector.cpp:1422),

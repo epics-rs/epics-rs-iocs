@@ -49,10 +49,7 @@ pub fn layout_of(dims: &[u64]) -> Result<Layout, String> {
             height: *h,
             width: *w,
         }),
-        _ => Err(format!(
-            "number of dimensions must be 3 or 4, got {}",
-            d.len()
-        )),
+        _ => Err("number of dimensions must be 3 or 4".into()),
     }
 }
 
@@ -63,7 +60,7 @@ pub fn layout_of(dims: &[u64]) -> Result<Layout, String> {
 /// reinterprets the same bytes as signed (C, eigerDetector.cpp:1782-1794).
 pub fn data_type_of(dtype: &Datatype, signed_data: bool) -> Result<NDDataType, String> {
     let Datatype::FixedPoint { size, .. } = dtype else {
-        return Err(format!("invalid data type {dtype:?}"));
+        return Err("invalid data type".into());
     };
     Ok(match (size, signed_data) {
         (1, false) => NDDataType::UInt8,
@@ -72,7 +69,7 @@ pub fn data_type_of(dtype: &Datatype, signed_data: bool) -> Result<NDDataType, S
         (2, true) => NDDataType::Int16,
         (4, false) => NDDataType::UInt32,
         (4, true) => NDDataType::Int32,
-        _ => return Err(format!("invalid data type {dtype:?}")),
+        _ => return Err("invalid data type".into()),
     })
 }
 
@@ -108,33 +105,47 @@ pub struct H5Frame {
     pub threshold: usize,
 }
 
+/// A failure whose line `parse` has already printed.
+#[derive(Debug)]
+pub struct Reported;
+
+fn report(err: &mut dyn FnMut(&str), msg: &str) -> Reported {
+    err(msg);
+    Reported
+}
+
 /// Read every image out of an in-memory `_data_*.h5` blob.
 ///
 /// C reads one hyperslab at a time straight into a pooled NDArray; this reads
 /// the same hyperslabs and hands each back as an owned buffer for the caller to
 /// publish.
-pub fn parse(buf: &[u8], signed_data: bool) -> Result<Vec<H5Frame>, String> {
+///
+/// `err` receives the lines C's `parseH5File` prints, in its words; `Err(Reported)`
+/// means one of them ended the parse.
+pub fn parse(
+    buf: &[u8],
+    signed_data: bool,
+    err: &mut dyn FnMut(&str),
+) -> Result<Vec<H5Frame>, Reported> {
     let options = OpenOptions {
         filter_registry: Some(filter_registry()),
         ..Default::default()
     };
     let file = Hdf5File::from_bytes_with_options(buf, options)
-        .map_err(|e| format!("unable to open memory as file: {e}"))?;
+        .map_err(|_| report(err, "unable to open memory as file"))?;
 
-    let mut last_err = String::new();
-    let dataset = DATA_PATHS
-        .iter()
-        .find_map(|path| match file.dataset(path) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                last_err = format!("unable to open '{path}': {e}");
-                None
-            }
-        })
-        .ok_or_else(|| format!("no data dataset ({last_err})"))?;
+    let [data_data, data] = DATA_PATHS;
+    let dataset = match file.dataset(data_data) {
+        Ok(d) => d,
+        Err(_) => {
+            err("unable to open '/entry/data/data'. Will try '/entry/data'");
+            file.dataset(data)
+                .map_err(|_| report(err, "unable to open '/entry/data' dataset"))?
+        }
+    };
 
-    let layout = layout_of(dataset.shape())?;
-    let data_type = data_type_of(dataset.dtype(), signed_data)?;
+    let layout = layout_of(dataset.shape()).map_err(|e| report(err, &e))?;
+    let data_type = data_type_of(dataset.dtype(), signed_data).map_err(|e| report(err, &e))?;
     let n_dims = dataset.ndim();
 
     let mut frames = Vec::with_capacity(layout.n_images * layout.n_thresh);
@@ -157,7 +168,7 @@ pub fn parse(buf: &[u8], signed_data: bool) -> Result<Vec<H5Frame>, String> {
             let selection = SliceInfo { selections };
 
             let data = read_slice(&dataset, &selection, data_type)
-                .map_err(|e| format!("couldn't read image {i}/{j}: {e}"))?;
+                .map_err(|_| report(err, "couldn't read image"))?;
             frames.push(H5Frame {
                 dims: [layout.width, layout.height],
                 data,

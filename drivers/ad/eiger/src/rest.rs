@@ -21,6 +21,8 @@ pub const TIMEOUT_INIT: Duration = Duration::from_secs(240);
 pub const TIMEOUT_ARM: Duration = Duration::from_secs(120);
 /// Timeout for the one request that decides whether the detector is there.
 pub const TIMEOUT_PROBE: Duration = Duration::from_secs(10);
+/// C `DEFAULT_TIMEOUT_CONNECT`.
+const TIMEOUT_CONNECT: Duration = Duration::from_secs(1);
 
 const DATA_NATIVE: &str = "application/json; charset=utf-8";
 const DATA_TIFF: &str = "application/tiff";
@@ -223,6 +225,21 @@ impl std::error::Error for RestError {}
 
 pub type RestResult<T> = Result<T, RestError>;
 
+/// restApi.cpp's `ERR`/`ERR_ARGS`, which print to stderr.
+fn rest_err(function: &str, msg: &str) {
+    eprintln!("RestApi::{function}: {msg}");
+}
+
+/// `epicsSocketConvertErrnoToString`: the OS text without Rust's
+/// ` (os error N)` suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(i) => text[..i].to_string(),
+        None => text,
+    }
+}
+
 /// Blocking SIMPLON REST client.
 ///
 /// Cloneable and shared across the driver's tasks; `ureq::Agent` is internally
@@ -232,6 +249,8 @@ pub type RestResult<T> = Result<T, RestError>;
 pub struct RestApi {
     agent: ureq::Agent,
     origin: String,
+    host: String,
+    port: u16,
     api: ApiVersion,
     /// Whether the detector is answering.
     ///
@@ -256,11 +275,16 @@ impl RestApi {
             // "not there yet", not as a transport failure.
             .http_status_as_error(false)
             .timeout_global(Some(DEFAULT_TIMEOUT))
+            // C `connect` waits DEFAULT_TIMEOUT_CONNECT for a socket that is
+            // still in progress.
+            .timeout_connect(Some(TIMEOUT_CONNECT))
             .build()
             .new_agent();
         Self {
             agent,
             origin: format!("http://{hostname}:{port}"),
+            host: hostname.to_string(),
+            port,
             api: ApiVersion::V1_6_0,
             // Optimistic: the first request is what finds out.
             connected: Arc::new(AtomicBool::new(true)),
@@ -283,7 +307,7 @@ impl RestApi {
         if !self.is_connected() {
             return Err(RestError::Disconnected(what.to_string()));
         }
-        self.exchange(what, call)
+        self.exchange(call)
     }
 
     /// Run one request and let its outcome own the connection state.
@@ -291,22 +315,14 @@ impl RestApi {
     /// The only writer of `connected`. Only a transport failure means the
     /// detector is not there: an error status code or a body the driver cannot
     /// parse both came *from* the detector, which is therefore answering.
-    fn exchange<T>(&self, what: &str, call: impl FnOnce() -> RestResult<T>) -> RestResult<T> {
+    fn exchange<T>(&self, call: impl FnOnce() -> RestResult<T>) -> RestResult<T> {
         let result = call();
         match &result {
             Ok(_) | Err(RestError::Status { .. }) | Err(RestError::Parse(_)) => {
-                if !self.connected.swap(true, Ordering::AcqRel) {
-                    log::warn!("eiger: [{what}] answered; the detector is connected again");
-                }
+                self.connected.store(true, Ordering::Release);
             }
-            Err(e @ RestError::Transport(_)) => {
-                if self.connected.swap(false, Ordering::AcqRel) {
-                    log::error!(
-                        "eiger: [{what}] did not answer ({e}); the detector is marked \
-                         disconnected and no further request will be made until an acquisition \
-                         probes it"
-                    );
-                }
+            Err(RestError::Transport(_)) => {
+                self.connected.store(false, Ordering::Release);
             }
             // Never produced by a real request: `guarded` returns it instead of
             // calling one.
@@ -320,7 +336,7 @@ impl RestApi {
     /// (C's `RestAPI` constructor, restApi.cpp:258-274).
     pub fn probe(&self) -> RestResult<ApiVersion> {
         let url = self.url(Sys::ApiVersion, "");
-        let body = self.exchange(&url, || self.raw_get(&url, DATA_NATIVE, TIMEOUT_PROBE))?;
+        let body = self.exchange(|| self.raw_get(&url, "", DATA_NATIVE, TIMEOUT_PROBE))?;
         parse_api_version(&body)
     }
 
@@ -359,12 +375,23 @@ impl RestApi {
     /// GET a parameter, returning the raw JSON body (C `RestAPI::get`).
     pub fn get(&self, sys: Sys, param: &str, timeout: Duration) -> RestResult<String> {
         let url = self.url(sys, param);
-        self.guarded(&url, || self.raw_get(&url, DATA_NATIVE, timeout))
+        self.guarded(&url, || self.raw_get(&url, param, DATA_NATIVE, timeout))
     }
 
     /// The GET itself, with no gate around it — [`RestApi::probe`] is the only
     /// caller that is allowed to reach the network unconditionally.
-    fn raw_get(&self, url: &str, accept: &str, timeout: Duration) -> RestResult<String> {
+    fn raw_get(
+        &self,
+        url: &str,
+        param: &str,
+        accept: &str,
+        timeout: Duration,
+    ) -> RestResult<String> {
+        let failed = |e: ureq::Error| {
+            self.report_transport(&e, None);
+            rest_err("get", &format!("[param={param}] request failed"));
+            RestError::Transport(format!("GET {url}: {e}"))
+        };
         let mut resp = self
             .agent
             .get(url)
@@ -373,17 +400,77 @@ impl RestApi {
             .timeout_global(Some(timeout))
             .build()
             .call()
-            .map_err(|e| RestError::Transport(format!("GET {url}: {e}")))?;
+            .map_err(failed)?;
         let code = resp.status().as_u16();
         if code != 200 {
+            rest_err(
+                "get",
+                &format!("[param={param}] server returned error code {code}"),
+            );
             return Err(RestError::Status {
                 path: url.to_string(),
                 code,
             });
         }
-        resp.body_mut()
-            .read_to_string()
-            .map_err(|e| RestError::Transport(format!("GET {url}: reading body: {e}")))
+        resp.body_mut().read_to_string().map_err(failed)
+    }
+
+    /// The lines C's `connect` and `doRequest` (or `getBlob`, which carries
+    /// its own copy of the socket code) print for an exchange that got no
+    /// reply. `blob` is getBlob's `sys` and file name.
+    fn report_transport(&self, e: &ureq::Error, blob: Option<(Sys, &str)>) {
+        use std::io::ErrorKind as K;
+        let function = if blob.is_some() {
+            "getBlob"
+        } else {
+            "doRequest"
+        };
+        let connect = |reason: &str| {
+            rest_err(
+                "connect",
+                &format!(
+                    "failed to connect to {}:{} [{reason}]",
+                    self.host, self.port
+                ),
+            );
+            rest_err(function, "failed to reconnect socket");
+        };
+        match e {
+            ureq::Error::Timeout(ureq::Timeout::Connect) => connect("TIMEOUT"),
+            ureq::Error::Io(io)
+                if matches!(
+                    io.kind(),
+                    K::ConnectionRefused
+                        | K::HostUnreachable
+                        | K::NetworkUnreachable
+                        | K::AddrNotAvailable
+                        | K::PermissionDenied
+                ) =>
+            {
+                connect(&strerror(io))
+            }
+            ureq::Error::Protocol(_) => match blob {
+                None => rest_err(function, "failed to parseHeader"),
+                Some((sys, name)) => rest_err(
+                    function,
+                    &format!(
+                        "[sys={} file={name}] underlying parseResponse failed",
+                        sys as i32
+                    ),
+                ),
+            },
+            ureq::Error::Timeout(_) if blob.is_none() => rest_err(function, "timed out"),
+            _ => match blob {
+                None => rest_err(function, "failed to recv"),
+                Some((sys, name)) => rest_err(
+                    function,
+                    &format!(
+                        "[sys={} file={name}] failed to receive first part",
+                        sys as i32
+                    ),
+                ),
+            },
+        }
     }
 
     /// PUT a parameter, returning the reply body — the detector lists the other
@@ -398,7 +485,25 @@ impl RestApi {
         raw_value: &str,
         timeout: Duration,
     ) -> RestResult<String> {
+        self.put_as("put", sys, param, raw_value, timeout)
+    }
+
+    /// [`RestApi::put`], with the function name C prints its failures under:
+    /// `arm` builds its own request.
+    fn put_as(
+        &self,
+        function: &str,
+        sys: Sys,
+        param: &str,
+        raw_value: &str,
+        timeout: Duration,
+    ) -> RestResult<String> {
         let url = self.url(sys, param);
+        let failed = |e: ureq::Error| {
+            self.report_transport(&e, None);
+            rest_err(function, &format!("[param={param}] request failed"));
+            RestError::Transport(format!("PUT {url}: {e}"))
+        };
         let body = if raw_value.is_empty() {
             String::new()
         } else {
@@ -414,17 +519,19 @@ impl RestApi {
                 .timeout_global(Some(timeout))
                 .build()
                 .send(&body)
-                .map_err(|e| RestError::Transport(format!("PUT {url}: {e}")))?;
+                .map_err(failed)?;
             let code = resp.status().as_u16();
             if code != 200 {
+                rest_err(
+                    function,
+                    &format!("[param={param}] server returned error code {code}"),
+                );
                 return Err(RestError::Status {
                     path: url.clone(),
                     code,
                 });
             }
-            resp.body_mut()
-                .read_to_string()
-                .map_err(|e| RestError::Transport(format!("PUT {url}: reading body: {e}")))
+            resp.body_mut().read_to_string().map_err(failed)
         })
     }
 
@@ -442,7 +549,7 @@ impl RestApi {
 
     /// Arm and return the sequence id of the new series.
     pub fn arm(&self) -> RestResult<i32> {
-        let reply = self.put(Sys::Command, "arm", "", TIMEOUT_ARM)?;
+        let reply = self.put_as("arm", Sys::Command, "arm", "", TIMEOUT_ARM)?;
         parse_sequence_id(&reply)
     }
 
@@ -503,15 +610,22 @@ impl RestApi {
         let start = std::time::Instant::now();
         self.guarded(&url, || {
             loop {
-                let resp = self
-                    .agent
-                    .head(&url)
-                    .call()
-                    .map_err(|e| RestError::Transport(format!("HEAD {url}: {e}")))?;
+                let resp = self.agent.head(&url).call().map_err(|e| {
+                    self.report_transport(&e, None);
+                    rest_err(
+                        "waitFile",
+                        &format!("[file={filename}] HEAD request failed"),
+                    );
+                    RestError::Transport(format!("HEAD {url}: {e}"))
+                })?;
                 match resp.status().as_u16() {
                     200 => return Ok(true),
                     404 => {}
                     code => {
+                        rest_err(
+                            "waitFile",
+                            &format!("[file={filename}] server returned error code {code}"),
+                        );
                         return Err(RestError::Status {
                             path: url.clone(),
                             code,
@@ -534,13 +648,20 @@ impl RestApi {
     pub fn delete_file(&self, filename: &str) -> RestResult<()> {
         let url = self.url(Sys::Data, filename);
         self.guarded(&url, || {
-            let resp = self
-                .agent
-                .delete(&url)
-                .call()
-                .map_err(|e| RestError::Transport(format!("DELETE {url}: {e}")))?;
+            let resp = self.agent.delete(&url).call().map_err(|e| {
+                self.report_transport(&e, None);
+                rest_err(
+                    "deleteFile",
+                    &format!("[file={filename}] DELETE request failed"),
+                );
+                RestError::Transport(format!("DELETE {url}: {e}"))
+            })?;
             let code = resp.status().as_u16();
             if code != 204 {
+                rest_err(
+                    "deleteFile",
+                    &format!("[file={filename}] DELETE returned code {code}"),
+                );
                 return Err(RestError::Status {
                     path: url.clone(),
                     code,
@@ -572,9 +693,18 @@ impl RestApi {
                 .get(&url)
                 .header("Accept", accept)
                 .call()
-                .map_err(|e| RestError::Transport(format!("GET {url}: {e}")))?;
+                .map_err(|e| {
+                    self.report_transport(&e, Some((sys, name)));
+                    RestError::Transport(format!("GET {url}: {e}"))
+                })?;
             let code = resp.status().as_u16();
             if code != 200 {
+                if sys != Sys::MonImages {
+                    rest_err(
+                        "getBlob",
+                        &format!("[sys={} file={name}] file not found", sys as i32),
+                    );
+                }
                 return Err(RestError::Status {
                     path: url.clone(),
                     code,
@@ -587,7 +717,16 @@ impl RestApi {
                 .with_config()
                 .limit(u64::MAX)
                 .read_to_vec()
-                .map_err(|e| RestError::Transport(format!("GET {url}: reading body: {e}")))
+                .map_err(|e| {
+                    rest_err(
+                        "getBlob",
+                        &format!(
+                            "[sys={} file={name}] failed to receive second part",
+                            sys as i32
+                        ),
+                    );
+                    RestError::Transport(format!("GET {url}: reading body: {e}"))
+                })
         })
     }
 }

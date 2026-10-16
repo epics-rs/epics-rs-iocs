@@ -11,7 +11,6 @@ epics-rs = { workspace = true, features = ["asyn", "ad"] }
 # driver passes compressed frames through undecoded.
 ad-plugins-rs = { workspace = true }
 parking_lot = "0.12"
-log = "0.4"
 serde_json = "1.0"
 # Plain-HTTP only: the SIMPLON REST API is served over http on port 80, so no
 # TLS stack is pulled in.

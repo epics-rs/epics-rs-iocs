@@ -1220,7 +1220,6 @@ dependencies = [
  "ad-plugins-rs",
  "epics-rs",
  "hdf5-reader",
- "log",
  "lz4_flex",
  "parking_lot",
  "serde_json",
