@@ -149,7 +149,10 @@ pub fn process_status(raw: &[u8]) -> Dp5Status {
     // sign-extend an 8-bit value: DP5_TEMP = RAW[34] - (RAW[34]&128)*2
     let dp5_temp = f64::from(raw[34]) - f64::from(raw[34] & 128) * 2.0;
     let preset_rt_done = raw[35] & 128 != 0;
-    let preset_lt_done = raw[35] & 64 != 0;
+    // MCA8000D fw >= 6.07 only; on every other device RAW[35] bit 6 is
+    // AFAST_LOCKED, not a preset (`DP5Status.cpp:41-45,69-78`).
+    let dmca_live_time = dpp_type == DppType::Mca8000D && firmware >= 0x67;
+    let preset_lt_done = dmca_live_time && raw[35] & 64 != 0;
     let mca_enabled = raw[35] & 32 != 0;
     let precnt_reached = raw[35] & 16 != 0;
     let mcs_done = raw[36] & 64 != 0;
@@ -276,11 +279,25 @@ mod tests {
         raw[38] = 128;
         let s = process_status(&raw);
         assert!(s.preset_rt_done);
-        assert!(s.preset_lt_done);
+        assert!(!s.preset_lt_done); // a DP5: bit 6 is AFAST_LOCKED
         assert!(s.mca_enabled);
         assert!(s.precnt_reached);
         assert!(s.mcs_done);
         assert!(s.pc5_present);
+    }
+
+    /// `bDMCA_LiveTime`: MCA8000D with firmware >= 0x67.
+    #[test]
+    fn preset_lt_done_needs_mca8000d_firmware_0x67() {
+        let mut raw = raw_fixture();
+        raw[35] = 64;
+        raw[39] = 3;
+        raw[24] = 0x66;
+        assert!(!process_status(&raw).preset_lt_done);
+        raw[24] = 0x67;
+        assert!(process_status(&raw).preset_lt_done);
+        raw[39] = 1; // PX5, same firmware
+        assert!(!process_status(&raw).preset_lt_done);
     }
 
     #[test]
