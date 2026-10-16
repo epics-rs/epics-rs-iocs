@@ -646,16 +646,12 @@ async fn det_loop(w: Worker) {
     }
 }
 
-/// Set `ADAcquire` (and `ADAcquireBusy`) to 0 at acquisition completion. C's
-/// literal `setIntegerParam(ADAcquire, 0)` runs through
-/// `asynNDArrayDriver::setIntegerParam`, which also clears `ADAcquireBusy` when
-/// no plugins are being waited on; this port clears both directly (the
-/// `ADWaitForPlugins` interaction is not modelled from the worker side).
+/// C `setIntegerParam(ADAcquire, 0)` at acquisition completion; ADAcquireBusy
+/// follows that store, WaitForPlugins included (asynNDArrayDriver.cpp:636-663).
 async fn set_acquire_off(w: &Worker) {
     let mut guard = w.server.lock().await;
     let srv = &mut *guard;
     srv.set_i32(srv.ad.acquire, 0);
-    srv.set_i32(srv.ad.acquire_busy, 0);
 }
 
 /// C `collectNormal`.
@@ -823,7 +819,6 @@ async fn collect_normal(w: &Worker) {
         let num_images_counter = srv.get_i32(srv.ad.num_images_counter).await;
         if num_images_counter >= num_images {
             srv.set_i32(srv.ad.acquire, 0);
-            srv.set_i32(srv.ad.acquire_busy, 0);
         }
     }
     if image_mode == ImageMode::Single as i32 {
@@ -1066,7 +1061,6 @@ async fn finish_series(
         let mut guard = w.server.lock().await;
         let srv = &mut *guard;
         srv.set_i32(srv.ad.acquire, 0);
-        srv.set_i32(srv.ad.acquire_busy, 0);
         srv.callbacks().await;
     }
 }
