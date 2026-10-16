@@ -1182,8 +1182,6 @@ impl PortDriver for AmptekDriver {
     /// `drvAmptek::readInt32Array` (`drvAmptek.cpp:997-1026`).
     fn read_int32_array(&mut self, _user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
         let target = self.target.ok_or_else(disconnected_error)?;
-        self.send_command(TransmitPacketType::SendSpectrumStatus)?;
-
         match self.send_and_receive(target, TransmitPacketType::SendSpectrumStatus)? {
             ReceivedPacket::Spectrum { pid2, data } => {
                 let (channels, values) = protocol::decode_spectrum(pid2, &data);
@@ -1212,12 +1210,14 @@ mod tests {
     use super::*;
 
     use std::net::UdpSocket;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
-    /// A loopback DP5: answers each request with `reply(request)`.
+    /// A loopback DP5: answers each request with `reply(request)` and logs
+    /// every request it received.
     struct FakeDp5 {
         stop: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -1229,13 +1229,15 @@ mod tests {
                 .unwrap();
             let port = socket.local_addr().unwrap().port();
             let stop = Arc::new(AtomicBool::new(false));
-            let stop2 = stop.clone();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let (stop2, requests2) = (stop.clone(), requests.clone());
             let thread = std::thread::spawn(move || {
                 let mut buf = [0u8; 2048];
                 while !stop2.load(Ordering::Relaxed) {
                     let Ok((n, from)) = socket.recv_from(&mut buf) else {
                         continue;
                     };
+                    requests2.lock().unwrap().push(buf[..n].to_vec());
                     if let Some(r) = reply(&buf[..n]) {
                         for chunk in r.chunks(1024) {
                             socket.send_to(chunk, from).unwrap();
@@ -1246,10 +1248,19 @@ mod tests {
             (
                 FakeDp5 {
                     stop,
+                    requests,
                     thread: Some(thread),
                 },
                 port,
             )
+        }
+    }
+
+    impl FakeDp5 {
+        /// `(PID1, PID2)` of every request received so far.
+        fn pids(&self) -> Vec<(u8, u8)> {
+            let requests = self.requests.lock().unwrap();
+            requests.iter().map(|r| (r[2], r[3])).collect()
         }
     }
 
@@ -1306,6 +1317,36 @@ mod tests {
         connect(&mut driver).unwrap();
         let idx = driver.amptek[AmptekReason::SerialNumber as usize];
         assert_eq!(driver.base.get_int32_param(idx, 0).unwrap(), -1);
+    }
+
+    /// A 256-channel spectrum packet; an even `pid2` appends `status`.
+    fn spectrum_reply(pid2: u8, status: &[u8; 64]) -> Vec<u8> {
+        let mut data: Vec<u8> = (0..256u32).flat_map(|i| [i as u8, 0, 0]).collect();
+        if pid2 & 1 == 0 {
+            data.extend_from_slice(status);
+        }
+        protocol::pack_out(0x81, pid2, &data)
+    }
+
+    /// `readInt32Array` sends `XMTPT_SEND_SPECTRUM_STATUS` once
+    /// (`drvAmptek.cpp:1003-1008`).
+    #[test]
+    fn read_int32_array_sends_spectrum_request_once() {
+        let status = [0u8; 64];
+        let (mut driver, fake) = driver_with_fake(move |req| match (req[2], req[3]) {
+            (0x02, 0x03) => Some(spectrum_reply(0x01, &status)),
+            _ => default_reply(req, &status),
+        });
+        connect(&mut driver).unwrap();
+        let before = fake.pids().len();
+
+        let mut buf = vec![0i32; 300];
+        let n = driver
+            .read_int32_array(&AsynUser::new(0), &mut buf)
+            .unwrap();
+        assert_eq!(n, 256);
+        assert_eq!(buf[5], 5);
+        assert_eq!(fake.pids()[before..], [(0x02, 0x03)]);
     }
 
     #[test]
