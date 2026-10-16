@@ -29,7 +29,7 @@ use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
-use crate::connection::BisServer;
+use crate::connection::{BisServer, Exchange};
 use crate::filename;
 use crate::params::BrukerParams;
 use crate::protocol;
@@ -114,11 +114,15 @@ impl BrukerDetector {
         Ok(det)
     }
 
-    /// Send one command; publish both sides of it (C `writeBIS`). No caller
-    /// of C's `writeBIS` looks at its status: a failure is the trace line.
+    /// Send one command; publish both sides of it (C `writeBIS`,
+    /// BISDetector.cpp:309-330). No caller of C's `writeBIS` looks at its
+    /// status: a failure is the trace line.
     fn command(&mut self, command: &str, timeout: std::time::Duration) {
-        let exchange = self.server.command(command, timeout);
-        if let Err(e) = exchange.result {
+        let (reply, status) = match self.server.command(command, timeout) {
+            Exchange::NotSent(e) => (None, Err(e)),
+            Exchange::Read { reply, status } => (Some(reply), status),
+        };
+        if let Err(e) = status {
             self.trace_error(&format!(
                 "BISDetector:writeBIS, status={}, sent\n{command}",
                 e.c_status_code()
@@ -127,7 +131,10 @@ impl BrukerDetector {
         let p = self.ad.params;
         let base = &mut self.ad.port_base;
         let _ = base.set_string_param(p.string_to_server, 0, command);
-        let _ = base.set_string_param(p.string_from_server, 0, exchange.reply);
+        // fromBIS is what the read left; a failure before it keeps the last.
+        if let Some(reply) = reply {
+            let _ = base.set_string_param(p.string_from_server, 0, reply);
+        }
     }
 
     fn trace_error(&self, message: &str) {

@@ -456,23 +456,25 @@ fn a_base_class_write_runs_both_base_class_write_int32s() {
 }
 
 /// A detector whose BIS sockets refuse every connection.
+/// An IP port whose peer is gone.
+fn closed_port(name: &str) -> PortHandle {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    drop(listener);
+    let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+    let (runtime, _) =
+        create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+            .expect("ip port runtime");
+    let handle = runtime.port_handle().clone();
+    std::mem::forget(runtime);
+    handle
+}
+
 fn dead_detector(name: &str) -> BrukerRuntime {
-    let closed = |name: &str| {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-        drop(listener);
-        let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
-        let (runtime, _) =
-            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
-                .expect("ip port runtime");
-        let handle = runtime.port_handle().clone();
-        std::mem::forget(runtime);
-        handle
-    };
     create_bruker_detector(
         &claim_port(name).unwrap(),
-        user(closed(&format!("{name}_COMMAND"))),
-        user(closed(&format!("{name}_STATUS"))),
+        user(closed_port(&format!("{name}_COMMAND"))),
+        user(closed_port(&format!("{name}_STATUS"))),
         0,
     )
     .expect("the detector port")
@@ -551,4 +553,44 @@ fn a_detector_whose_socket_ports_are_missing_still_boots() {
 
     sync.write_int32(ad.bin_x, 2).expect("binning 2");
     assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
+}
+
+/// BISDetector.cpp:316-327: writeBIS sets StringFromServer from `fromBIS`,
+/// which a writeRead that fails before its read leaves holding the last
+/// reply.
+#[test]
+fn an_exchange_that_never_reads_keeps_the_last_reply() {
+    let detector = dead_detector("BISSTALE");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let ad = detector.ad_params;
+    sync.write_octet(ad.string_from_server, b"old").unwrap();
+    sync.write_int32(ad.bin_x, 2).unwrap();
+    assert_eq!(
+        sync.read_octet(ad.string_from_server, 64).unwrap(),
+        b"old\0"
+    );
+    assert!(sync.read_octet(ad.string_to_server, 64).unwrap().len() > 1);
+}
+
+/// A read that times out leaves in `fromBIS` what it received: nothing.
+#[test]
+fn an_exchange_whose_read_times_out_publishes_what_it_read() {
+    let command = TcpListener::bind("127.0.0.1:0").expect("command listener");
+    let command_addr = format!("127.0.0.1:{}", command.local_addr().unwrap().port());
+    std::thread::spawn(move || {
+        let held: Vec<TcpStream> = command.incoming().filter_map(Result::ok).collect();
+        drop(held);
+    });
+    let detector = create_bruker_detector(
+        &claim_port("BISSILENT").unwrap(),
+        user(ip_port("BISSILENT_COMMAND", &command_addr, b"]", b"")),
+        user(closed_port("BISSILENT_STATUS")),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let ad = detector.ad_params;
+    sync.write_octet(ad.string_from_server, b"old").unwrap();
+    sync.write_int32(ad.bin_x, 2).unwrap();
+    assert_eq!(sync.read_octet(ad.string_from_server, 64).unwrap(), b"\0");
 }
