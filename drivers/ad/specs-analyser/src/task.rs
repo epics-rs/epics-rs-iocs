@@ -123,9 +123,7 @@ impl Worker {
 
     async fn callbacks(&mut self) {
         let updates = std::mem::take(&mut self.batch);
-        if let Err(e) = self.self_handle.set_params_and_notify(0, updates).await {
-            log::error!("specs-analyser: callParamCallbacks failed: {e}");
-        }
+        let _ = self.self_handle.set_params_and_notify(0, updates).await;
     }
 
     async fn flush(&mut self) {
