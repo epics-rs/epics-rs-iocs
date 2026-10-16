@@ -14,8 +14,9 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 
 const PORT: u16 = 34434;
 
@@ -99,43 +100,47 @@ struct Job {
     done: Completion,
 }
 
-/// Handle to a connected GM10 unit. Cheap to clone (`Arc`-backed); one
-/// instance per `gm10Init` handle, looked up by name from [`Instrument::connect`]'s
-/// registry.
+/// One `gm10Init` handle (C `struct devqueue`), looked up by name from the
+/// [`Registry`].
 pub struct Instrument {
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
-    tx: mpsc::Sender<Job>,
+    /// The `queue_func` thread's queue; unset when `init_gm10` failed after
+    /// registering, which leaves C's `dq` with no thread to drain it.
+    tx: OnceLock<mpsc::Sender<Job>>,
     /// `gm10_system_info(which=0, ...)` (`drvGM10.c:1620-1631`): the
-    /// address this handle connected to, formatted once at connect time.
+    /// configured address, as `inet_ntop` prints it.
     pub peer_address: String,
 }
 
 impl Instrument {
-    /// `init_gm10` (`drvGM10.c:1378-1465`): connect, read the unsolicited
-    /// post-connect `E0` greeting, then run the fixed load sequence —
-    /// modules must load first, everything else indexes off it.
-    pub fn connect(address: &str) -> io::Result<Arc<Self>> {
-        let stream = TcpStream::connect((address, PORT))?;
-        Self::connect_stream(stream)
+    fn new(peer_address: String) -> Arc<Self> {
+        Arc::new(Self {
+            cache: Arc::new(Mutex::new(Cache::default())),
+            interrupts: Arc::new(Interrupts::default()),
+            tx: OnceLock::new(),
+            peer_address,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn connect_to(addr: std::net::SocketAddr) -> io::Result<Arc<Self>> {
-        Self::connect_stream(TcpStream::connect(addr)?)
+        let instrument = Self::new(addr.ip().to_string());
+        instrument.start(TcpStream::connect(addr)?)?;
+        Ok(instrument)
     }
 
-    fn connect_stream(stream: TcpStream) -> io::Result<Arc<Self>> {
-        let peer_address = stream.peer_addr()?.ip().to_string();
-        let cache = Arc::new(Mutex::new(Cache::default()));
-        let interrupts = Arc::new(Interrupts::default());
+    /// The tail of `init_gm10` (`drvGM10.c:1446-1461`): read the unsolicited
+    /// post-connect `E0` greeting, run the fixed load sequence (modules
+    /// first, everything else indexes off it), then start the queue thread.
+    fn start(&self, stream: TcpStream) -> io::Result<()> {
         let mut actor = Actor {
             stream,
-            cache: cache.clone(),
-            interrupts: interrupts.clone(),
+            cache: self.cache.clone(),
+            interrupts: self.interrupts.clone(),
         };
 
-        match wire::read_response(&mut actor.stream)? {
+        match actor.read_response()? {
             RawResponse::Ok => {}
             _ => {
                 return Err(io::Error::new(
@@ -154,15 +159,9 @@ impl Instrument {
         let (tx, rx) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("gm10-instrument".to_string())
-            .spawn(move || actor.run(rx))
-            .map_err(|e| io::Error::other(e.to_string()))?;
-
-        Ok(Arc::new(Self {
-            cache,
-            interrupts,
-            tx,
-            peer_address,
-        }))
+            .spawn(move || actor.run(rx))?;
+        let _ = self.tx.set(tx);
+        Ok(())
     }
 
     pub fn register_interrupt(
@@ -175,7 +174,9 @@ impl Instrument {
     /// C `qmesg` (`drvGM10.c:1342-1373`): queue `command` behind every
     /// earlier one; `done` runs after it. A gone actor drops `done` un-run.
     pub fn enqueue(&self, command: Command, done: Completion) {
-        let _ = self.tx.send(Job { command, done });
+        if let Some(tx) = self.tx.get() {
+            let _ = tx.send(Job { command, done });
+        }
     }
 
     /// Block until the actor thread has finished processing `command`. C's
@@ -885,6 +886,99 @@ impl Actor {
     }
 }
 
+/// `init_gm10` (`drvGM10.c:1376-1465`), the `gm10Init` command. Every
+/// failure is silent, as in C. The handle is registered before the connect,
+/// so a unit that fails to connect or load still resolves for records.
+pub fn gm10_init(registry: &Registry, device: Option<&[u8]>, address: Option<&[u8]>) {
+    init_on_port(registry, device, address, PORT);
+}
+
+fn init_on_port(registry: &Registry, device: Option<&[u8]>, address: Option<&[u8]>, port: u16) {
+    let Some(device) = device.filter(|d| valid_device_name(d)) else {
+        return;
+    };
+    // Validated ASCII.
+    let name = String::from_utf8_lossy(device).into_owned();
+    if registry.get(&name).is_some() {
+        return;
+    }
+    // C frees `dq` here but leaves it listed (a use-after-free); not
+    // registering is the safe reading.
+    let Some(ip) = address.and_then(inet_aton) else {
+        return;
+    };
+    let instrument = Instrument::new(ip.to_string());
+    let _ = registry.insert(name, instrument.clone());
+    if let Ok(stream) = TcpStream::connect(SocketAddrV4::new(ip, port)) {
+        let _ = instrument.start(stream);
+    }
+}
+
+/// A letter, then letters, digits or underscores (`drvGM10.c:1389-1400`).
+fn valid_device_name(name: &[u8]) -> bool {
+    match name.split_first() {
+        Some((first, rest)) => {
+            first.is_ascii_alphabetic()
+                && rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        }
+        None => false,
+    }
+}
+
+/// glibc `inet_aton`: one to four `strtoul(.., 0)` parts, the last filling
+/// the remaining bytes, optionally followed by whitespace and anything.
+fn inet_aton(cp: &[u8]) -> Option<Ipv4Addr> {
+    const MAX: [u64; 4] = [0xffff_ffff, 0xff_ffff, 0xffff, 0xff];
+    let mut parts: Vec<u64> = Vec::with_capacity(3);
+    let mut i = 0;
+    loop {
+        if !cp.get(i).is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        let (radix, start) = match (cp[i], cp.get(i + 1)) {
+            (b'0', Some(b'x' | b'X')) if cp.get(i + 2).is_some_and(u8::is_ascii_hexdigit) => {
+                (16, i + 2)
+            }
+            (b'0', _) => (8, i),
+            _ => (10, i),
+        };
+        let end = start
+            + cp[start..]
+                .iter()
+                .take_while(|b| (**b as char).is_digit(radix))
+                .count();
+        let mut val: u64 = 0;
+        for &b in &cp[start..end] {
+            val = val * radix as u64 + (b as char).to_digit(radix)? as u64;
+            if val > 0xffff_ffff {
+                return None;
+            }
+        }
+        i = end;
+        if cp.get(i) == Some(&b'.') {
+            if parts.len() > 2 || val > 0xff {
+                return None;
+            }
+            parts.push(val);
+            i += 1;
+        } else {
+            if let Some(&c) = cp.get(i)
+                && !matches!(c, 0 | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+            {
+                return None;
+            }
+            if val > MAX[parts.len()] {
+                return None;
+            }
+            let mut word = val as u32;
+            for (k, p) in parts.iter().enumerate() {
+                word |= (*p as u32) << (24 - 8 * k);
+            }
+            return Some(Ipv4Addr::from(word));
+        }
+    }
+}
+
 /// `gm10_connect` (`drvGM10.c:1539-1552`): a name-keyed registry populated
 /// by the `gm10Init` iocsh command.
 #[derive(Default)]
@@ -915,7 +1009,7 @@ impl Registry {
 
 /// Fake-device fixtures shared with `device_support`'s tests: building a
 /// `GmDevice` for tests requires a live `Arc<Instrument>`, which requires
-/// running the full `connect_stream` init sequence against a fake device.
+/// running the full `Instrument::start` init sequence against a fake device.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -1159,5 +1253,62 @@ mod tests {
         let cache = instrument.cache();
         assert_eq!(cache.meas_data[98].value, 77);
         assert_eq!(cache.meas_data[99].value, 0);
+    }
+
+    #[test]
+    fn inet_aton_matches_glibc() {
+        let ok = |s: &str| inet_aton(s.as_bytes()).map(|a| a.to_string());
+        assert_eq!(ok("192.168.2.10").as_deref(), Some("192.168.2.10"));
+        assert_eq!(ok("127.1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ok("10.1.258").as_deref(), Some("10.1.1.2"));
+        assert_eq!(ok("0x7f.0.0.01").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ok("3232236042").as_deref(), Some("192.168.2.10"));
+        assert_eq!(ok("1.2.3.4 trailing").as_deref(), Some("1.2.3.4"));
+        for bad in [
+            "",
+            " 1.2.3.4",
+            "1.2.3.256",
+            "1.2.3.4.5",
+            "08.1.1.1",
+            "1.2.3.4x",
+            "localhost",
+            "4294967296",
+            "1..2",
+            "1.2.3.",
+        ] {
+            assert_eq!(ok(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn gm10_init_rejects_bad_names_duplicates_and_addresses_silently() {
+        let registry = Registry::new();
+        for name in ["", "1dev", "dev-1", "dev 1"] {
+            init_on_port(&registry, Some(name.as_bytes()), Some(b"127.0.0.1"), 1);
+            assert!(registry.get(name).is_none(), "{name:?}");
+        }
+        init_on_port(&registry, Some(b"dev"), Some(b"localhost"), 1);
+        assert!(registry.get("dev").is_none());
+        init_on_port(&registry, Some(b"dev"), None, 1);
+        assert!(registry.get("dev").is_none());
+    }
+
+    #[test]
+    fn gm10_init_registers_before_a_failed_connect() {
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let registry = Registry::new();
+        init_on_port(&registry, Some(b"gm_1"), Some(b"127.1"), port);
+        let instrument = registry
+            .get("gm_1")
+            .expect("registered despite the refused connect");
+        assert_eq!(instrument.peer_address, "127.0.0.1");
+        assert!(instrument.tx.get().is_none());
+        init_on_port(&registry, Some(b"gm_1"), Some(b"10.0.0.1"), port);
+        assert_eq!(registry.get("gm_1").unwrap().peer_address, "127.0.0.1");
+        // No queue thread: the command is dropped and submit returns.
+        instrument.submit(Command::ReadAllData);
     }
 }

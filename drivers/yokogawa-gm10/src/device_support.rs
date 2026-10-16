@@ -479,22 +479,7 @@ impl GmDevice {
         }
     }
 
-    fn resolved(&self) -> CaResult<&Resolved> {
-        self.resolved
-            .as_ref()
-            .ok_or_else(|| CaError::LinkError("GM10 device support not initialized".into()))
-    }
-}
-
-impl DeviceSupport for GmDevice {
-    fn dtyp(&self) -> &str {
-        DTYP
-    }
-
-    // Every C init_record failure here is a bare `return 1` — no pact,
-    // no alarm (`devGM10_ai.c:104-169`) — so the record scans on: that is the
-    // `Err` shape, and every `?` below keeps it.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+    fn resolve(&self, record: &mut dyn Record) -> CaResult<Resolved> {
         let parsed = link::parse_link(&self.link_text).ok_or_else(|| {
             CaError::LinkError(format!("malformed GM10 link: '{}'", self.link_text))
         })?;
@@ -508,7 +493,25 @@ impl DeviceSupport for GmDevice {
             &instrument,
         )?;
         seed_initial_value(&instrument, op, record)?;
-        self.resolved = Some(Resolved { instrument, op });
+        Ok(Resolved { instrument, op })
+    }
+}
+
+impl DeviceSupport for GmDevice {
+    fn dtyp(&self) -> &str {
+        DTYP
+    }
+
+    /// A failed C `init_record` returns 1 with `invalid_flag` set and prints
+    /// nothing; read and write then return 0 untouched and the record has
+    /// no I/O Intr source (`devGM10_ai.c:104-187`). `resolved == None` is
+    /// that state.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        self.resolved = self.resolve(record).ok();
+        let Some(Resolved { op, .. }) = self.resolved else {
+            // C's status 1 converts nothing (boRecord.c:159, mbboRecord.c:143).
+            return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        };
         // devGM10_ao.c:92-99 returns 2 and defines the VAL it seeded.
         if record.record_type() == "ao" {
             let udf = match op {
@@ -531,7 +534,9 @@ impl DeviceSupport for GmDevice {
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
-        let Resolved { instrument, op } = self.resolved()?;
+        let Some(Resolved { instrument, op }) = &self.resolved else {
+            return Ok(DeviceReadOutcome::ok());
+        };
         let is_io_intr = self.is_io_intr;
         match *op {
             Operation::AnalogVal(addr) => {
@@ -656,8 +661,12 @@ impl DeviceSupport for GmDevice {
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        let command = self.output_command(record)?;
-        self.resolved()?.instrument.submit(command);
+        let Some(command) = self.output_command(record)? else {
+            return Ok(());
+        };
+        if let Some(Resolved { instrument, .. }) = &self.resolved {
+            instrument.submit(command);
+        }
         Ok(())
     }
 
@@ -668,9 +677,13 @@ impl DeviceSupport for GmDevice {
         record: &mut dyn Record,
         done: &WriteDoneSource<'_>,
     ) -> CaResult<WriteStart> {
-        let command = self.output_command(record)?;
+        let (Some(Resolved { instrument, .. }), Some(command)) =
+            (&self.resolved, self.output_command(record)?)
+        else {
+            return Ok(WriteStart::Completed);
+        };
         let (write_done, priority) = (done.write_done(), done.priority());
-        self.resolved()?.instrument.enqueue(
+        instrument.enqueue(
             command,
             Box::new(move || {
                 let _ = write_done.complete(priority, Ok(()));
@@ -681,9 +694,11 @@ impl DeviceSupport for GmDevice {
 }
 
 impl GmDevice {
-    /// The command an output record's write queues.
-    fn output_command(&self, record: &mut dyn Record) -> CaResult<Command> {
-        let Resolved { op, .. } = self.resolved()?;
+    /// The command an output record's write queues; `None` while invalid.
+    fn output_command(&self, record: &mut dyn Record) -> CaResult<Option<Command>> {
+        let Some(Resolved { op, .. }) = &self.resolved else {
+            return Ok(None);
+        };
         // devGM10_bo.c:194-197 zeroes VAL of a trigger or ERROR_CLEAR bo on
         // the completing pass.
         if matches!(
@@ -696,7 +711,7 @@ impl GmDevice {
         ) {
             record.put_field("VAL", EpicsValue::Enum(0))?;
         }
-        Ok(match *op {
+        Ok(Some(match *op {
             Operation::AnalogSet(addr) => {
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::Double(v)) => v,
@@ -764,7 +779,7 @@ impl GmDevice {
                     "GM10 device support: this operation is read-only".into(),
                 ));
             }
-        })
+        }))
     }
 }
 
@@ -1296,5 +1311,36 @@ mod tests {
         assert_eq!(record.fields.get("VAL"), Some(&EpicsValue::Enum(0)));
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "FData,1\r\n");
+    }
+
+    #[test]
+    fn failed_init_is_silent_and_inert() {
+        let registry = registry_with("gm10dev", connect_default_fixture());
+        let f = factory(registry);
+        for (record_type, inp, out) in [
+            ("ai", "gm10dev VAL:7", ""),
+            ("ai", "nosuchdev VAL:1", ""),
+            ("bo", "", "gm10dev BOGUS"),
+        ] {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp: DTYP,
+                inp,
+                out,
+            };
+            let mut device = f(&ctx).unwrap();
+            let mut record = FakeRecord::new(record_type);
+            assert_eq!(
+                device.init(&mut record).unwrap(),
+                DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched)
+            );
+            assert!(device.io_intr_receiver().is_none());
+            if record_type == "ai" {
+                assert!(!device.read(&mut record).unwrap().did_compute());
+            } else {
+                device.write(&mut record).unwrap();
+            }
+            assert!(record.fields.is_empty(), "{inp}{out}");
+        }
     }
 }

@@ -3,10 +3,10 @@
 //! GM10's wire protocol is a proprietary TCP ASCII/binary framing (port
 //! 34434), not Modbus — so this IOC wires a dynamic `DeviceSupport` factory
 //! (`yokogawa_gm10::device_support::factory`) instead of an asyn port. The
-//! `gm10Init` startup command mirrors the C `gm10Init(netDevice, address)`
-//! iocsh command: it connects, then registers the resulting `Instrument`
-//! under `netDevice` in a shared name-keyed `Registry` that every record's
-//! `@netDevice CMD:ADDRESS` link resolves against at `iocInit`.
+//! `gm10Init` startup command is the C `gm10Init(netDevice, address)` iocsh
+//! command: it registers an `Instrument` under `netDevice` in a shared
+//! name-keyed `Registry` that every record's `@netDevice CMD:ADDRESS` link
+//! resolves against at `iocInit`, then connects.
 //!
 //! Usage:
 //!   cargo run -p yokogawa-gm10-ioc -- st.cmd
@@ -18,7 +18,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
 use yokogawa_gm10::device_support;
-use yokogawa_gm10::instrument::{Instrument, Registry};
+use yokogawa_gm10::instrument::{Registry, gm10_init};
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
@@ -51,20 +51,12 @@ async fn main() -> CaResult<()> {
         ],
         "gm10Init netDevice address",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let net_device = match &args[0] {
-                ArgValue::String(s) => s.to_str()?.to_owned(),
-                _ => return Err("netDevice required".into()),
+            let arg = |v: &ArgValue| match v {
+                ArgValue::String(s) => Some(s.as_bytes().to_vec()),
+                _ => None,
             };
-            let address = match &args[1] {
-                ArgValue::String(s) => s.to_str()?.to_owned(),
-                _ => return Err("address required".into()),
-            };
-
-            let instrument = Instrument::connect(&address)
-                .map_err(|e| format!("gm10Init: connect to {address} failed: {e}"))?;
-            registry
-                .insert(net_device.clone(), instrument)
-                .map_err(|e| format!("gm10Init: {net_device}: {e}"))?;
+            let (net_device, address) = (arg(&args[0]), arg(&args[1]));
+            gm10_init(&registry, net_device.as_deref(), address.as_deref());
             Ok(CommandOutcome::Continue)
         },
     ));
