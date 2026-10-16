@@ -446,23 +446,25 @@ impl PortDriver for NdStdArraysDriver {
         // ADAcquire/NDNumQueuedArrays intercept lives here.
         self.set_integer_param(addr, reason, value)?;
 
+        // C overwrites every status here with callParamCallbacks'
+        // (NDDriverStdArrays.cpp:373), so none of these fail the write.
         if reason == self.params.acquire {
             if value == 1 {
-                self.port_base
-                    .set_int32_param(self.params.num_images_counter, 0, 0)?;
+                let _ = self
+                    .port_base
+                    .set_int32_param(self.params.num_images_counter, 0, 0);
             }
         } else if reason == self.ndsa.do_callbacks {
-            self.do_callbacks()?;
+            let _ = self.do_callbacks();
         } else if reason == self.ndsa.new_array {
-            self.port_base
-                .set_int32_param(self.ndsa.next_element, 0, 0)?;
+            let _ = self.port_base.set_int32_param(self.ndsa.next_element, 0, 0);
         } else if reason == self.ndsa.array_complete {
             if self.get_i32(self.ndsa.append_mode, 0) != 0 {
-                self.set_array_complete()?;
+                let _ = self.set_array_complete();
             }
         } else if self.ndsa.belongs_to_base(reason) {
             // ADDriver::writeInt32 — only the pool operations act.
-            self.write_int32_pool(reason)?;
+            let _ = self.write_int32_pool(reason);
         }
 
         self.port_base.call_param_callbacks(addr)?;
@@ -634,6 +636,32 @@ mod tests {
             NDDataBuffer::F64(v) => v.clone(),
             other => panic!("expected F64, got {:?}", other.data_type()),
         }
+    }
+
+    #[test]
+    fn a_failed_pool_pre_alloc_does_not_fail_the_write() {
+        let (publish_tx, _publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
+        // Room for one 6-element Float64 array and no more.
+        let mut det = NdStdArraysDriver::new("NDSAPREALLOC", 64, publish_tx).unwrap();
+        let p = det.params;
+        let base = &mut det.port_base;
+        base.set_int32_param(p.base.data_type, 0, NDDataType::Float64 as u8 as i32)
+            .unwrap();
+        base.set_int32_param(p.base.n_dimensions, 0, 1).unwrap();
+        base.set_int32_param(det.ndsa.append_mode, 0, 1).unwrap();
+        base.set_int32_param(p.image_mode, 0, ImageMode::Continuous as i32)
+            .unwrap();
+        base.set_int32_param(p.base.pool_num_pre_alloc_buffers, 0, 2)
+            .unwrap();
+        det.write_int32_array(&AsynUser::new(p.base.array_dimensions), &[6])
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(p.acquire), 1).unwrap();
+        det.write_float64_array(&AsynUser::new(det.ndsa.array_data), &[1.0])
+            .unwrap();
+        assert!(det.current.is_some());
+
+        det.write_int32(&mut AsynUser::new(p.base.pool_pre_alloc), 1)
+            .expect("C returns callParamCallbacks' status");
     }
 
     #[test]
