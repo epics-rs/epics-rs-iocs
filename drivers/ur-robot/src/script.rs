@@ -232,7 +232,7 @@ impl ScriptClient {
     pub fn connect(&mut self) -> UrResult<()> {
         // script_client.cpp has no catch: the asio system_error's what().
         let sock = crate::net::connect_tcp(&self.hostname, self.port, None)
-            .map_err(|e| UrError::Connect(format!("connect: {e}")))?;
+            .map_err(|e| UrError::Connect(crate::net::asio_connect_what(&e)))?;
         sock.set_nodelay(true).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();
         self.socket = Some(sock);

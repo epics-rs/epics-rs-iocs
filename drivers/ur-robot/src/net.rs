@@ -38,3 +38,38 @@ pub(crate) fn connect_tcp(
     }
     Err(last)
 }
+
+/// What a failed blocking connect's `boost::system::system_error::what()`
+/// says, e.g. `connect: No route to host [system:113]` — C's text minus the
+/// boost header path asio appends after the code.
+pub(crate) fn asio_connect_what(e: &io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => {
+            let text = e.to_string();
+            let reason = text
+                .strip_suffix(&format!(" (os error {code})"))
+                .unwrap_or(&text);
+            format!("connect: {reason} [system:{code}]")
+        }
+        None => format!("connect: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_connect_reads_as_asio_what() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let e = connect_tcp("127.0.0.1", port, None).expect_err("nothing listens");
+        let code = e.raw_os_error().expect("an OS error");
+        let what = asio_connect_what(&e);
+        assert!(what.starts_with("connect: "), "{what}");
+        assert!(what.ends_with(&format!(" [system:{code}]")), "{what}");
+        assert!(!what.contains("os error"), "{what}");
+    }
+}
