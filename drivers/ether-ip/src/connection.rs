@@ -131,6 +131,35 @@ impl Connection {
         self.buffer_limit
     }
 
+    /// `EIP_dump_connection`. C keeps its `EIPConnection` while disconnected,
+    /// socket 0; `None` prints that with the driver's current settings.
+    pub fn dump(c: Option<&Connection>, buffer_limit: usize, timeout_ms: u32) {
+        #[cfg(unix)]
+        let sock = c.map_or(0, |c| {
+            use std::os::fd::AsRawFd;
+            i64::from(c.stream.as_raw_fd())
+        });
+        #[cfg(not(unix))]
+        let sock = 0;
+        let (limit, ms) = c.map_or((buffer_limit, timeout_ms), |c| {
+            let ms = c.stream.read_timeout().ok().flatten();
+            (
+                c.buffer_limit,
+                ms.map_or(timeout_ms, |d| d.as_millis() as u32),
+            )
+        });
+        println!("EIPConnection:");
+        println!("    SOCKET          : {sock}");
+        println!("    buffer_limit    : {limit}");
+        println!("    millisec_timeout: {ms}");
+        println!("    CN_UDINT session: 0x{:08X}", c.map_or(0, |c| c.session));
+        println!(
+            "    buffer location : 0x{:X}",
+            c.map_or(0, |c| c as *const Connection as usize)
+        );
+        println!("    buffer size     : {}", encap::BUFFER_SIZE);
+    }
+
     /// `UnRegisterSession`, best effort; the socket closes on drop either way.
     /// `EIP_shutdown`. Consuming the connection is what keeps the
     /// UnRegisterSession single: [`Drop`] sends it.
@@ -372,6 +401,75 @@ impl Connection {
                 crate::eip_printf!(1, "{who}: No response\n");
                 None
             }
+        }
+    }
+
+    /// `EIP_list_tags`: print every tag the PLC publishes, asking from the
+    /// last ID seen while the reply says it is partial (MR status 6).
+    pub fn list_tags(&mut self) -> bool {
+        const WHO: &str = "EIP_list_tags";
+        crate::eip_printf!(9, "EIP list tags\n");
+        let mut tag_id = 0u32;
+        loop {
+            let mut msg = Vec::new();
+            msg.push(cip::service::GET_INSTANCE_ATTR_LIST);
+            msg.push(cip::cia_path_words(tag_id, 0) as u8);
+            cip::encode_cia_path(&mut msg, CipClass::Symbol, tag_id, 0);
+            // Two attributes: 1 the symbol name, 2 its type.
+            for v in [2u16, 1, 2] {
+                msg.extend_from_slice(&v.to_le_bytes());
+            }
+            let Some(response) = self.diagnostic_request(WHO, &msg) else {
+                return false;
+            };
+            let Some(r) = cip::MrResponse::parse(&response) else {
+                crate::eip_printf!(1, "{WHO}: No response\n");
+                return false;
+            };
+            if r.service & 0x7F != cip::service::GET_INSTANCE_ATTR_LIST {
+                crate::eip_printf!(
+                    1,
+                    "{WHO}: Got response 0x{:X}, not S_Get_Instance_Attr_List\n",
+                    r.service
+                );
+                return false;
+            }
+            let complete = r.general_status == 0;
+            if r.general_status == 0x06 {
+                crate::eip_printf!(9, "Partial S_Get_Instance_Attr_List response\n");
+            } else if !complete {
+                crate::eip_printf!(1, "Error in S_Get_Instance_Attr_List response\n");
+                return false;
+            } else {
+                crate::eip_printf!(9, "Complete S_Get_Instance_Attr_List response\n");
+            }
+            // A sequence of { UDINT id, UINT length, name, UINT type }.
+            let data = r.data(response.len());
+            let mut at = 0;
+            while at < data.len() {
+                tag_id = cip::rd_u32(data, at).unwrap_or(0);
+                let len = usize::from(cip::rd_u16(data, at + 4).unwrap_or(0));
+                at += 6;
+                let mut used = len;
+                if used >= 99 {
+                    used = 99;
+                    crate::eip_printf!(2, "Tag name with length of {len} is shortened to {used}\n");
+                }
+                let name = data.get(at..(at + used).min(data.len())).unwrap_or(&[]);
+                let name = String::from_utf8_lossy(name);
+                at += len;
+                let tag_type = cip::rd_u16(data, at).unwrap_or(0);
+                at += 2;
+                crate::eip_printf!(
+                    1,
+                    "Tag 0x{tag_id:04X}, Type {}: {name}\n",
+                    cip::decode_extended_type(tag_type)
+                );
+            }
+            if complete {
+                return true;
+            }
+            tag_id += 1;
         }
     }
 
