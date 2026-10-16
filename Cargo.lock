@@ -3204,7 +3204,6 @@ name = "photonii"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 

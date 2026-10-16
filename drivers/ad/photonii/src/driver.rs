@@ -9,11 +9,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
@@ -25,7 +26,7 @@ use epics_rs::ad_core::plugin::channel::{
 };
 use epics_rs::ad_core::runtime as rt;
 
-use crate::connection::P2Util;
+use crate::connection::{ChannelError, P2Util};
 use crate::params::PhotonIIParams;
 use crate::protocol;
 use crate::raw;
@@ -99,7 +100,17 @@ impl PhotonIIDetector {
         let reply = match self.p2.write_read(command, COMMAND_TIMEOUT) {
             Ok(reply) => reply,
             Err(e) => {
-                log::error!("photonii: '{command}' failed: {e}");
+                let status = match &e {
+                    ChannelError::Timeout => AsynStatus::Timeout,
+                    ChannelError::Transport(e) => e.status(),
+                };
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    &format!(
+                        "PhotonII::writePhotonII, status={}, sent\n{command}",
+                        status as i32
+                    ),
+                );
                 String::new()
             }
         };
@@ -115,9 +126,7 @@ impl PhotonIIDetector {
 
     fn set_acquire(&mut self, value: i32, was_acquiring: bool) -> AsynResult<()> {
         if value != 0 && !was_acquiring {
-            if self.commands.try_send(TaskCommand::Start).is_err() {
-                log::error!("photonii: the acquisition task is not accepting commands");
-            }
+            let _ = self.commands.try_send(TaskCommand::Start);
         } else if value == 0 && was_acquiring {
             self.shared.stop_requested.store(true, Ordering::Release);
             self.command(&protocol::abort())?;
@@ -151,19 +160,16 @@ impl PortDriver for PhotonIIDetector {
         } else if reason == self.params.dr_sum_enable {
             self.command(&protocol::set_dr_summation(value))?;
         } else if reason == self.ad.params.trigger_mode {
-            match TriggerSource::from_i32(value) {
-                Some(source) => self.command(&protocol::set_trigger_source(source))?,
-                None => log::error!("photonii: unknown TriggerMode {value}"),
+            if let Some(source) = TriggerSource::from_i32(value) {
+                self.command(&protocol::set_trigger_source(source))?;
             }
         } else if reason == self.params.trigger_type {
-            match TriggerType::from_i32(value) {
-                Some(t) => self.command(&protocol::set_trigger_type(t))?,
-                None => log::error!("photonii: unknown TriggerType {value}"),
+            if let Some(t) = TriggerType::from_i32(value) {
+                self.command(&protocol::set_trigger_type(t))?;
             }
         } else if reason == self.params.trigger_edge {
-            match TriggerEdge::from_i32(value) {
-                Some(e) => self.command(&protocol::set_trigger_edge(e))?,
-                None => log::error!("photonii: unknown TriggerEdge {value}"),
+            if let Some(e) = TriggerEdge::from_i32(value) {
+                self.command(&protocol::set_trigger_edge(e))?;
             }
         } else if reason == self.params.num_subframes {
             self.command(&protocol::set_num_subframes(value))?;
