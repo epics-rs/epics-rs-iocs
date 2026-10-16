@@ -479,7 +479,7 @@ impl DeviceSupport for VacSen {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
-    use epics_rs::asyn::manager::PortManager;
+    use epics_rs::asyn::manager::{PortManager, claim_port_driver};
     use epics_rs::asyn::port::PortDriver;
     use epics_rs::asyn::registry::open_owner;
     use epics_rs::asyn::trace::TraceFile;
@@ -493,10 +493,11 @@ mod tests {
     #[test]
     fn a_refused_queue_request_raises_comm_and_prints_its_line() {
         let port = "VSREFUSED";
+        let claim = claim_port_driver(port).unwrap();
         let mut driver = DrvAsynIPPort::new(port, "127.0.0.1:1").unwrap();
         driver.base_mut().init_auto_connect(false);
         let runtime = PortManager::new()
-            .register_port(driver, &open_owner())
+            .register_port(claim, driver, &open_owner())
             .unwrap();
         let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
