@@ -381,6 +381,16 @@ impl PortDriver for DataDriver {
         &mut self.base
     }
 
+    /// C `report` (`capaNCDT6200Sup.c:525`), the whole of it at every level.
+    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
+        let communicating = self.shared.lock().unwrap().is_communicating;
+        let _ = writeln!(
+            out,
+            " capaNCDT6200 RBK {}communicating",
+            if communicating { "" } else { "NOT " }
+        );
+    }
+
     /// No `asynDrvUser` interface in C at all -- every addr resolves to
     /// *some* reason (see [`resolve_reason`]), never rejected at bind time.
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
@@ -819,6 +829,18 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 2 * MAX_CHANNELS);
+    }
+
+    #[test]
+    fn the_report_says_whether_the_rbk_link_communicates() {
+        let (driver, _keep_alive) = make_test_driver();
+        let mut out = String::new();
+        driver.report(&mut out, 1);
+        assert_eq!(out, " capaNCDT6200 RBK NOT communicating\n");
+        driver.shared.lock().unwrap().is_communicating = true;
+        out.clear();
+        driver.report(&mut out, 0);
+        assert_eq!(out, " capaNCDT6200 RBK communicating\n");
     }
 
     #[test]
