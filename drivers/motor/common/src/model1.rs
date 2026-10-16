@@ -45,8 +45,8 @@ impl Model1 {
         CommandDef::new(
             name,
             vec![
-                arg_int_req("Maximum # of cards"),
-                arg_int_req("Polling rate (HZ)"),
+                arg_int_req("Max. controller count"),
+                arg_int_req("Polling rate"),
             ],
             format!("{name}(num_cards, scan_rate)"),
             move |args: &[ArgValue], _ctx: &CommandContext| {

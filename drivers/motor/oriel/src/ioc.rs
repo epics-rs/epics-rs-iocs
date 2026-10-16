@@ -1,68 +1,53 @@
 //! `EMC18011Setup` / `EMC18011Config` iocsh commands for the Oriel Encoder
-//! Mike 18011.
+//! Mike 18011, C's model-1 interface: records reach axis `signal` of `card`
+//! through `DTYP "EMC18011"` and `OUT "#C card S signal"`.
 //!
-//! Mirrors C `EMC18011Config(card, port)`: connect the serial octet port,
-//! identify the controller ([`Emc18011Controller::new`]), and register its fixed
-//! three axes behind a `DTYP`-keyed motor device support
-//! (`EMC18011_{card}_{index}`, 0-based). `EMC18011Setup` (which only sized a
-//! controller array in C) is accepted as a no-op for startup-script parity.
+//! Config connects and identifies the controller at once, where C's
+//! `motor_init` does so at iocInit; the controller has a fixed three axes.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
 use motor_common::connect::{EosRefusal, connect_with_eos};
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
-};
-use motor_common::{MotorHolder, TraceUser};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
+use motor_common::model1::{Model1, SCAN_RATE};
+use motor_common::model1_device;
 
 use crate::emc18011::{Emc18011Axis, Emc18011Controller};
 
 /// Serial command timeout (C `TIMEOUT` 1 s).
 const EMC18011_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Build the `EMC18011Setup(maxControllers, [scanRate])` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `EMC18011Config`).
+/// `device(motor,VME_IO,devEMC18011,"EMC18011")` (devOriel.dbd:2).
+static DEV_EMC18011: DevSup = model1_device("devEMC18011", "EMC18011");
+
+/// `EMC18011_NUM_CARDS` (drvEMC18011.cc:66).
+static EMC18011: Model1 = Model1::new(&DEV_EMC18011, 16, SCAN_RATE);
+
+/// `EMC18011Setup(num_cards, scan_rate)`.
 pub fn emc18011_setup_command() -> CommandDef {
-    CommandDef::new(
-        "EMC18011Setup",
-        vec![arg_int_req("maxControllers"), arg_int_opt("scanRate")],
-        "EMC18011Setup(maxControllers, [scanRate]) - Accepted for parity; EMC18011Config allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("EMC18011Setup: maxControllers must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    EMC18011.setup_command("EMC18011Setup")
 }
 
-/// Build the `EMC18011Config(card, asynPort, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`.
-pub fn emc18011_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `EMC18011Config(card, name)`.
+pub fn emc18011_config_command() -> CommandDef {
     CommandDef::new(
         "EMC18011Config",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
         ],
-        "EMC18011Config(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create an Oriel Encoder Mike 18011 controller (DTYP EMC18011_{card}_{0..2}); \
-         the controller has a fixed three axes",
+        "EMC18011Config(card, name)",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("EMC18011Config: card must be >= 0".into());
+            if !EMC18011.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let handle = connect_with_eos(
                 &asyn_port,
@@ -73,29 +58,14 @@ pub fn emc18011_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             )?;
             let controller =
                 Emc18011Controller::new(handle).map_err(|e| format!("EMC18011Config: {e}"))?;
-            let ident = controller.ident().to_string();
             let num_axes = controller.num_axes();
             let controller = Arc::new(Mutex::new(controller));
 
             for index in 0..num_axes {
                 let ax = Emc18011Axis::new(controller.clone(), index);
-                let dtyp_key = format!("EMC18011_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                EMC18011.install(ctx, card, index as i32, motor)?;
             }
-            println!(
-                "EMC18011Config: card={card} asynPort={asyn_port} axes={num_axes} \
-                 ident=\"{ident}\" poll=[{moving_poll_ms}/{idle_poll_ms}]ms \
-                 (DTYP=EMC18011_{card}_{{0..{}}})",
-                num_axes - 1
-            );
             Ok(CommandOutcome::Continue)
         },
     )
