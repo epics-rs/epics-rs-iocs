@@ -1141,6 +1141,139 @@ async fn prv_hst_accumulating(ctx: &Ctx) -> bool {
         != 0
 }
 
+/// The window half of C `processImgFrame` / `processPrvHstFrame`
+/// (serval_stream.cpp:1005-1043, :1132-1164; histogram_io.cpp:356-395,
+/// :607-632): a reconfiguration posts the effective frames and the retention
+/// status, a refused frame its failure, and every frame FramesSummed.
+async fn post_window(ctx: &Ctx, which: Accum, update: &Update) {
+    use crate::window::RollingSumStatus;
+    let p = &ctx.p;
+    let (effective, summed, status, tag, configure, process) = match which {
+        Accum::Img => (
+            p.img_effective_frames,
+            p.img_frames_summed,
+            p.img_retention_status,
+            "Img",
+            adlog::CONFIGURE_IMG_ROLLING_WINDOW,
+            adlog::PROCESS_IMG_FRAME,
+        ),
+        Accum::PrvHst => (
+            p.prv_hst_effective_frames,
+            p.prv_hst_frames_summed,
+            p.prv_hst_retention_status,
+            "PrvHst",
+            adlog::CONFIGURE_PRV_HST_ROLLING_WINDOW,
+            adlog::PROCESS_PRV_HST_FRAME,
+        ),
+    };
+    let int = |reason, v: usize| {
+        ParamSetValue::new(
+            reason,
+            ADDR,
+            ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
+        )
+    };
+    let text = |reason, t: String| {
+        ParamSetValue::new(reason, ADDR, ParamValue::Octet(t.into_bytes().into()))
+    };
+    let mut updates = Vec::new();
+    if let Some(c) = update.window_config {
+        let mb = c.budget_bytes / (1024 * 1024);
+        if c.status != RollingSumStatus::Ok {
+            let message = format!("Unavailable: {}", c.status.name());
+            ctx.trace(
+                TraceMask::WARNING,
+                &adlog::warn(
+                    configure,
+                    &format!(
+                        "{tag} rolling window unavailable: {message}; geometry={}, budget={mb} MiB",
+                        c.element_count
+                    ),
+                ),
+            );
+            updates.extend([int(effective, 0), text(status, message)]);
+        } else {
+            let message = if c.limited {
+                let message = format!(
+                    "Capped: {}/{} frames, {mb} MiB",
+                    c.effective_frames, c.requested_frames
+                );
+                ctx.trace(
+                    TraceMask::WARNING,
+                    &adlog::warn(configure, &format!("{tag} rolling window {message}")),
+                );
+                message
+            } else {
+                format!("OK: {} frames, {mb} MiB", c.effective_frames)
+            };
+            updates.extend([int(effective, c.effective_frames), text(status, message)]);
+        }
+    }
+    if let Some(push) = update.window_push.filter(|&s| s != RollingSumStatus::Ok) {
+        if push == RollingSumStatus::NumericOverflow {
+            let range = which
+                .get(&ctx.shared)
+                .lock()
+                .report_range(RangeState::AccumulatorSaturated);
+            let (saturated, range_status) = which.range_params(p);
+            ctx.post_range(saturated, range_status, range).await;
+        }
+        let message = format!("Update failed: {}", push.name());
+        ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(
+                process,
+                &format!("{tag} rolling window update failed: {message}"),
+            ),
+        );
+        updates.push(text(status, message));
+    }
+    updates.push(int(summed, update.frames_summed));
+    ctx.set(ADDR, updates).await;
+}
+
+/// C `IMG_MEMORY_UPDATE_INTERVAL_SEC` (ADTimePix.h:986).
+const MEMORY_UPDATE_INTERVAL_SEC: f64 = 5.0;
+
+/// The processing-time and memory half of C `processImgFrame` and
+/// `updateImgPerformanceMetrics` (serval_stream.cpp:1222-1255, :1346-1375).
+async fn post_img_metrics(ctx: &Ctx, started: f64) {
+    let now = EpicsTimestamp::now().as_f64();
+    let (time, memory) = {
+        let mut img = ctx.shared.img.lock();
+        let time = img.record_processing_time((now - started) * 1e3, now);
+        let memory = img
+            .memory_due(now, MEMORY_UPDATE_INTERVAL_SEC)
+            .then(|| img_memory_mb(&img));
+        (time, memory)
+    };
+    let p = &ctx.p;
+    let updates: Vec<_> = time
+        .map(|t| (p.img_processing_time, t))
+        .into_iter()
+        .chain(memory.map(|m| (p.img_memory_usage, m)))
+        .map(|(reason, v)| ParamSetValue::new(reason, ADDR, ParamValue::Float64(v)))
+        .collect();
+    if !updates.is_empty() {
+        ctx.set(ADDR, updates).await;
+    }
+}
+
+/// C `calculateImgMemoryUsageMB` (serval_stream.cpp:1377-1415). Before the
+/// first frame C's current frame is the constructor's 512x512 UINT16
+/// (ADTimePix.cpp:1441).
+pub(crate) fn img_memory_mb(img: &crate::accum::Accumulator) -> f64 {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let (current, value_bytes) = img
+        .current_frame()
+        .map_or((512 * 512, 2), |c| (c.len(), img.value_bytes()));
+    let running = img.elements();
+    let max_pixels = if running > 0 { running } else { current };
+    (running * 8 + current * value_bytes + img.window().memory_bytes()) as f64 / MIB
+        + (max_pixels * (8 + 8 + 4)) as f64 / MIB
+        + 0.1
+}
+
 /// C `detectorImageFrameLimits` from the detector params
 /// (serval_stream.cpp:520-527).
 async fn image_limits(ctx: &Ctx) -> ImageLimits {
@@ -1335,15 +1468,20 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 .unwrap_or(0)
                 != 0;
             if enabled && f.threshold_id != 1 {
-                let update = ctx
-                    .shared
-                    .img
-                    .lock()
-                    .add_shaped(&f.pixels, &[f.width, f.height]);
+                let started = EpicsTimestamp::now().as_f64();
+                // C's ImageData holds a uint8 frame as UINT16.
+                let value_bytes = f.format.bytes().max(2);
+                let update =
+                    ctx.shared
+                        .img
+                        .lock()
+                        .add_shaped(&f.pixels, &[f.width, f.height], value_bytes);
+                post_window(ctx, Accum::Img, &update).await;
                 let (counts, frames) = {
                     let img = ctx.shared.img.lock();
                     (img.total_counts(), img.frame_count())
                 };
+                post_img_metrics(ctx, started).await;
                 ctx.set(
                     ADDR,
                     vec![ParamSetValue::new(
@@ -2309,6 +2447,73 @@ mod tests {
                 assert!(ok, "{kind:?} {format:?}: {:?}", array.data.data_type());
             }
         }
+        std::mem::forget(runtime);
+    }
+
+    /// C `processImgFrame` posts the rolling window's configuration,
+    /// FramesSummed and the memory estimate (serval_stream.cpp:1005-1043,
+    /// :1132-1164, :1346-1375).
+    #[tokio::test]
+    async fn an_img_frame_posts_the_window_and_memory_usage() {
+        use crate::stream::PixelFormat;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let driver = crate::driver::TimePix3Driver::new(
+            "TPXIMGWIN",
+            http.clone(),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXIMGWIN").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            outputs: new_outputs(),
+            pool: DriverPool::standalone(0),
+        });
+        ctx.set_int(p.img_accumulation_enable, 0, 1).await;
+        let frame = Frame::Image(crate::stream::ImageFrame {
+            width: 2,
+            height: 1,
+            format: PixelFormat::UInt16,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            threshold_id: 0,
+            integration_size: 0,
+            pixels: vec![1, 200],
+        });
+        handle_frame(&ctx, StreamKind::Img, frame).await;
+
+        let h = &ctx.handle;
+        assert_eq!(h.read_int32(p.img_effective_frames, 0).await.unwrap(), 10);
+        assert_eq!(h.read_int32(p.img_frames_summed, 0).await.unwrap(), 1);
+        assert_eq!(
+            h.read_octet(p.img_retention_status, 0, 64).await.unwrap(),
+            b"OK: 10 frames, 512 MiB\0"
+        );
+        // 2 u64 running + 2 UINT16 current + the window's 2 u64 and one
+        // 2-pixel u32 frame + 2 pixels of waveforms (8 + 8 + 4).
+        let mib = 1024.0 * 1024.0;
+        let expected = f64::from(16 + 4 + 24 + 40) / mib + 0.1;
+        assert_eq!(
+            h.read_float64(p.img_memory_usage, 0).await.unwrap(),
+            expected
+        );
         std::mem::forget(runtime);
     }
 

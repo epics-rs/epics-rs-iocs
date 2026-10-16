@@ -6,6 +6,8 @@
 //! pixel array, the other a 1-D bin array — so both use this one accumulator
 //! and the geometry lives in the caller.
 
+use std::collections::VecDeque;
+
 use crate::window::{Configuration, RollingSumStatus, RollingWindowSum};
 
 /// C clamps `imgFramesToSum_` / `prvHstFramesToSum_` into this range
@@ -14,6 +16,8 @@ pub const MIN_FRAMES_TO_SUM: usize = 1;
 pub const MAX_FRAMES_TO_SUM: usize = 100_000;
 /// C `DEFAULT_RETENTION_LIMIT_MB` (ADTimePix.h:987).
 pub const DEFAULT_RETENTION_LIMIT_MB: usize = 512;
+/// C `IMG_MAX_PROCESSING_TIME_SAMPLES` (ADTimePix.h:985).
+const PROCESSING_TIME_SAMPLES: usize = 10;
 
 /// What one frame produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +91,12 @@ pub struct Accumulator {
     range: RangeState,
     /// The caller's geometry of the last frame (C `get_width`/`get_height`).
     shape: Vec<usize>,
+    value_bytes: usize,
+    /// The last processing times, in ms (C `imgProcessingTimeSamples_`).
+    processing_ms: VecDeque<f64>,
+    /// When the processing time and memory usage were last posted.
+    processing_posted: f64,
+    memory_posted: f64,
 }
 
 impl Default for Accumulator {
@@ -111,7 +121,50 @@ impl Accumulator {
             total_counts: 0,
             range: RangeState::Ok,
             shape: Vec::new(),
+            value_bytes: 4,
+            processing_ms: VecDeque::new(),
+            processing_posted: 0.0,
+            memory_posted: 0.0,
         }
+    }
+
+    /// serval_stream.cpp:1222-1252: the mean of the last ten processing
+    /// times, returned when C posts it (a second since the last post, or a
+    /// full sample set).
+    pub fn record_processing_time(&mut self, ms: f64, now: f64) -> Option<f64> {
+        self.processing_ms.push_back(ms);
+        if self.processing_ms.len() > PROCESSING_TIME_SAMPLES {
+            self.processing_ms.pop_front();
+        }
+        let mean = self.processing_ms.iter().sum::<f64>() / self.processing_ms.len() as f64;
+        (now - self.processing_posted >= 1.0 || self.processing_ms.len() >= PROCESSING_TIME_SAMPLES)
+            .then(|| {
+                self.processing_posted = now;
+                mean
+            })
+    }
+
+    /// serval_stream.cpp:1360-1371: memory usage is posted every
+    /// `interval` seconds, and on every frame while the window is full.
+    pub fn memory_due(&mut self, now: f64, interval: f64) -> bool {
+        let full = self.window.effective_frames() > 0
+            && self.window.frame_count() >= self.window.effective_frames();
+        let due = now - self.memory_posted >= interval || full;
+        if due {
+            self.memory_posted = now;
+        }
+        due
+    }
+
+    /// Elements per frame; 0 before the first frame and after a reset.
+    pub fn elements(&self) -> usize {
+        self.len
+    }
+
+    /// Bytes per value of the last frame `add_shaped` recorded (C's
+    /// `ImageData` holds a uint8 frame as UINT16).
+    pub fn value_bytes(&self) -> usize {
+        self.value_bytes
     }
 
     /// The geometry `add_shaped` last recorded; empty after a reset.
@@ -211,22 +264,25 @@ impl Accumulator {
         (!self.current.is_empty()).then_some(self.current.as_slice())
     }
 
+    /// C `resetImgAccumulation` / `resetPrvHstAccumulation`: the last frame
+    /// and the window's configuration survive.
     pub fn reset(&mut self) {
         self.running.clear();
-        self.current.clear();
         self.window.reset();
         self.len = 0;
         self.since_update = 0;
         self.frame_count = 0;
         self.total_counts = 0;
         self.shape.clear();
+        self.processing_ms.clear();
     }
 
     /// `add`, recording the frame's geometry for the arrays built later from
-    /// the accumulation.
-    pub fn add_shaped(&mut self, frame: &[u32], shape: &[usize]) -> Update {
+    /// the accumulation and its storage for the memory estimate.
+    pub fn add_shaped(&mut self, frame: &[u32], shape: &[usize], value_bytes: usize) -> Update {
         let update = self.add(frame);
         self.shape = shape.to_vec();
+        self.value_bytes = value_bytes;
         update
     }
 
@@ -426,7 +482,7 @@ mod tests {
         assert_eq!(a.frame_count(), 0);
         assert_eq!(a.total_counts(), 0);
         assert_eq!(a.buffered_frames(), 0);
-        assert!(a.current_frame().is_none());
+        assert_eq!(a.current_frame(), Some(&[1, 2][..]));
         let u = a.add(&[9, 9]);
         assert_eq!(u.running, vec![9, 9]);
     }

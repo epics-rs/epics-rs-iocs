@@ -22,6 +22,11 @@ pub const PROCESS_PRV_IMG_DATA_LINE: &str =
 pub const PROCESS_PREVIEW_JSONIMAGE_LINE: &str = "bool ADTimePix::processPreviewJsonimageLine(\
     const ADTimePix::PreviewJsonimageStream&, char*, char*, size_t)";
 pub const PROCESS_IMG_DATA_LINE: &str = "bool ADTimePix::processImgDataLine(char*, char*, size_t)";
+pub const CONFIGURE_IMG_ROLLING_WINDOW: &str = "bool ADTimePix::configureImgRollingWindow(size_t)";
+pub const PROCESS_IMG_FRAME: &str = "void ADTimePix::processImgFrame(const ImageData&)";
+pub const CONFIGURE_PRV_HST_ROLLING_WINDOW: &str =
+    "bool ADTimePix::configurePrvHstRollingWindow(size_t)";
+pub const PROCESS_PRV_HST_FRAME: &str = "void ADTimePix::processPrvHstFrame(const HistogramData&)";
 pub const VALIDATE_DESTINATION: &str =
     "asynStatus ADTimePix::validateDestination(const std::string&)";
 pub const CHECK_IMG_PATH: &str = "asynStatus ADTimePix::checkImgPath()";

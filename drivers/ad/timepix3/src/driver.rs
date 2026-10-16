@@ -43,12 +43,6 @@ pub const MAX_ADDR: usize = 8;
 /// ADTIMEPIX_VERSION.REVISION.MODIFICATION (ADTimePix.h:20-22).
 const DRIVER_VERSION: &str = "1.6.4";
 
-/// C `calculateImgMemoryUsageMB()` before the first frame (ADTimePix.cpp:1545):
-/// the 512x512 UINT16 current frame, the 512x512 default for the two Int64 and
-/// one Int32 waveforms, plus the fixed 0.1 MB overhead.
-const INITIAL_IMG_MEMORY_MB: f64 =
-    (512.0 * 512.0 * (2.0 + 8.0 + 8.0 + 4.0)) / (1024.0 * 1024.0) + 0.1;
-
 /// The per-chip DAC names Serval takes on `/detector/chips/<n>/dacs/`
 /// (ADTimePix.cpp:1123-1147). These are on-wire names, not display names.
 type DacParam = fn(&TimePixParams) -> usize;
@@ -415,7 +409,12 @@ impl TimePix3Driver {
         base.set_int32_param(p.img_sum_update_interval_frames, 0, 1)?;
         base.set_int64_param(p.img_total_counts, 0, 0)?;
         base.set_float64_param(p.img_processing_time, 0, 0.0)?;
-        base.set_float64_param(p.img_memory_usage, 0, INITIAL_IMG_MEMORY_MB)?;
+        // C `calculateImgMemoryUsageMB()` before the first frame (ADTimePix.cpp:1545).
+        base.set_float64_param(
+            p.img_memory_usage,
+            0,
+            crate::tasks::img_memory_mb(&crate::accum::Accumulator::new()),
+        )?;
         base.set_int32_param(p.write_processed_img, 0, 0)?;
         base.set_int32_param(p.processed_img_output_type, 0, 0)?;
         base.set_int32_param(p.write_processed_hst, 0, 0)?;
@@ -1853,14 +1852,23 @@ impl PortDriver for TimePix3Driver {
         } else if reason == p.img_image_data_reset {
             if value == 1 {
                 // C resetImgAccumulation (serval_stream.cpp:1421).
-                let range = {
+                let (range, memory) = {
                     let mut img = self.shared.img.lock();
                     img.reset();
-                    img.report_range(RangeState::Ok)
+                    (
+                        img.report_range(RangeState::Ok),
+                        crate::tasks::img_memory_mb(&img),
+                    )
                 };
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(p.img_frames_summed, 0, 0)?;
                 if let Some(range) = range {
                     self.set_range(p.img_range_saturated, p.img_range_status, range)?;
                 }
+                let base = &mut self.ad.port_base;
+                base.set_int64_param(p.img_total_counts, 0, 0)?;
+                base.set_float64_param(p.img_processing_time, 0, 0.0)?;
+                base.set_float64_param(p.img_memory_usage, 0, memory)?;
                 self.ad
                     .port_base
                     .set_int32_param(p.img_image_data_reset, 0, 0)?;
@@ -2400,6 +2408,46 @@ mod tests {
             det.write_int32(&mut AsynUser::new(reason), 7).unwrap();
             assert_eq!(det.int(reason, 0), 0);
         }
+    }
+
+    /// C `resetImgAccumulation` zeroes FramesSummed, TotalCounts and the
+    /// processing time and re-posts the memory estimate
+    /// (serval_stream.cpp:1421-1440).
+    #[test]
+    fn an_img_reset_posts_the_cleared_metrics() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let shared = Arc::new(Shared::new());
+        let mut det = TimePix3Driver::new(
+            "TPX_IMG_RESET",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        shared.img.lock().add_shaped(&[1, 2], &[2, 1], 2);
+        let base = &mut det.ad.port_base;
+        base.set_int32_param(p.img_frames_summed, 0, 1).unwrap();
+        base.set_int64_param(p.img_total_counts, 0, 3).unwrap();
+        base.set_float64_param(p.img_processing_time, 0, 1.5)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(p.img_image_data_reset), 1)
+            .unwrap();
+        let base = &det.ad.port_base;
+        assert_eq!(det.int(p.img_frames_summed, 0), 0);
+        assert_eq!(base.get_int64_param(p.img_total_counts, 0).unwrap(), 0);
+        assert_eq!(
+            base.get_float64_param(p.img_processing_time, 0).unwrap(),
+            0.0
+        );
+        // The kept 2-pixel UINT16 current frame, the window's zeroed 2-u64
+        // sum and 2 pixels of waveforms.
+        let expected = f64::from(4 + 16 + 40) / (1024.0 * 1024.0) + 0.1;
+        assert_eq!(
+            base.get_float64_param(p.img_memory_usage, 0).unwrap(),
+            expected
+        );
     }
 
     /// A Serval that answers `{}` to everything but a request line holding
