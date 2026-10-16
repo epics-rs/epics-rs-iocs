@@ -60,6 +60,20 @@ pub fn connect_controller(
     (handle, status)
 }
 
+/// `pasynOctetSyncIO->setInputEos` then `setOutputEos` on a
+/// [`connect_controller`] user, both statuses ignored as the model-3
+/// constructors that call them right after the connect ignore them
+/// (OEMMotorDriver.cpp:54-55, smarActMCS2MotorDriver.cpp:64-65). On a user
+/// of a missing port both are refused at `lockPort`.
+pub fn set_eos_ignored(handle: &SyncIOHandle, input_eos: &[u8], output_eos: &[u8]) {
+    let Ok(port) = handle.port() else {
+        return;
+    };
+    let user = || AsynUser::new(0).with_addr(SERIAL_ADDR);
+    let _ = port.set_input_eos_blocking(user(), input_eos);
+    let _ = port.set_output_eos_blocking(user(), output_eos);
+}
+
 /// What a refused EOS set does to a controller's create, and the order the
 /// two are set in — each C driver decides both for itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
