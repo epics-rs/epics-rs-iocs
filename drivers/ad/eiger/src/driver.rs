@@ -104,6 +104,10 @@ impl EigerDriver {
     fn init_params(&mut self) -> AsynResult<()> {
         self.set_driver_version()?;
 
+        // Cleared here because this runs again on every reconnect: a detector
+        // that came back must not leave the operator reading "FAILED TO
+        // CONNECT" off a working port. The initialization below may set it again.
+        self.status_message("")?;
         let mut q = BootRequests::default();
 
         // C tests the detector with a single fetch of `state` before it touches
@@ -112,6 +116,9 @@ impl EigerDriver {
         // what C does, it is what stops an unreachable detector from costing
         // the 20 s request timeout a few hundred times over.
         if q.run(self.fetch(self.p.state)) {
+            if !self.initialize_if_needed()? {
+                return self.ad.port_base.call_param_callbacks(0);
+            }
             self.fetch_and_default(&mut q)?;
         } else {
             self.ops.trace.err(
@@ -123,11 +130,40 @@ impl EigerDriver {
         if q.failed {
             return self.boot_disconnected();
         }
-        // Cleared here because this runs again on every reconnect: a detector
-        // that came back must not leave the operator reading "FAILED TO
-        // CONNECT" off a working port.
-        self.status_message("")?;
         self.ad.port_base.call_param_callbacks(0)
+    }
+
+    /// A detector reporting `state` "na" has not been initialized since power
+    /// on: initialize it and arm/disarm once (eigerDetector.cpp:239-263).
+    /// Returns false when the initialize failed, where C abandons the rest of
+    /// the constructor.
+    fn initialize_if_needed(&mut self) -> AsynResult<bool> {
+        let state = self.ad.port_base.get_string_param(self.p.state, 0)?;
+        if state != b"na" {
+            return Ok(true);
+        }
+        let trace = self.ops.trace.clone();
+        trace.err(
+            "eigerDetector",
+            "Eiger seems to be uninitialized\nInitializing... (may take a while)",
+        );
+        if self.ops.rest.initialize().is_err() {
+            trace.err("eigerDetector", "Eiger FAILED TO INITIALIZE");
+            self.status_message("Eiger FAILED TO INITIALIZE")?;
+            return Ok(false);
+        }
+        // C stores the arm's sequence id here, but `initParams` zeroes it
+        // before anything can read it (eigerDetector.cpp:1660).
+        if self.ops.rest.arm().is_err() {
+            trace.err(
+                "eigerDetector",
+                "Failed to arm the detector for the first time",
+            );
+            self.status_message("Eiger failed to arm for the first time")?;
+        } else {
+            let _ = self.ops.rest.disarm();
+        }
+        Ok(true)
     }
 
     /// Report the detector as unusable while keeping the port, so the IOC still
