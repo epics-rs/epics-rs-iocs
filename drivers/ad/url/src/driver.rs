@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
@@ -41,7 +42,7 @@ impl URLDriver {
         max_memory: usize,
         acq_tx: rt::CommandSender<AcqCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory, ASYN_NONE)?;
         let url_params = URLParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
