@@ -294,6 +294,16 @@ fn a_refused_safe_state_reports_the_code_and_message() {
     assert_eq!(fake.status_message(), "7: refused");
 }
 
+/// An ERROR 3 reply disconnects (specsAnalyser.cpp:2021-2024, 1882).
+#[test]
+fn a_not_connected_reply_clears_the_connected_param() {
+    let fake = Fake::start("SPECS_WS_ERR3");
+    fake.refuse(3, &["SetSafeState"]);
+    let p = &fake.runtime.specs_params;
+    assert_eq!(fake.write_int32(p.safe_state, 1), Ok(()));
+    assert_eq!(fake.int32(p.connected), 0);
+}
+
 #[test]
 fn a_refused_validate_reports_the_code_and_message() {
     let fake = Fake::start("SPECS_WS_VALMSG");

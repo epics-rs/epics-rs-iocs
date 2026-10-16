@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -162,6 +162,9 @@ impl SpecsAnalyserDriver {
         .join()
         .expect("specs-analyser wire thread panicked");
         let base = &mut self.ad.port_base;
+        // An ERROR 3 reply disconnects (specsAnalyser.cpp:2021-2024, 1882).
+        let connected = self.connected.load(Ordering::SeqCst) as i32;
+        let _ = base.set_int32_param(self.p.connected, 0, connected);
         if let Some(counter) = trail.msg_counter {
             let _ = base.set_int32_param(self.p.msg_counter, 0, counter as i32);
         }
@@ -222,13 +225,11 @@ impl SpecsAnalyserDriver {
                     0,
                     info.protocol_version.clone(),
                 );
-                let _ = base.set_int32_param(self.p.connected, 0, 1);
                 let _ =
                     base.set_string_param(self.ad.params.status_message, 0, "Connected to SPECS");
                 let _ = base.set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32);
             }
             Err(_) => {
-                let _ = base.set_int32_param(self.p.connected, 0, 0);
                 let _ = base.set_int32_param(self.ad.params.status, 0, ADStatus::Error as i32);
             }
         }
