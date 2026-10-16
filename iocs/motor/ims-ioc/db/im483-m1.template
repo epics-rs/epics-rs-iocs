@@ -1,0 +1,18 @@
+# The model-1 IMS drivers (drvIM483PL.cc, ...): one motor record per axis,
+# signal S of card C as in C's basic_motor.db. DTYP names the driver.
+#
+# Positions and speeds go to the controller in raw steps, so MRES = 1 and
+# EGU = steps.
+
+record(motor, "$(P)$(M)") {
+    field(DTYP, "$(DTYP)")
+    field(OUT,  "#C$(C) S$(S) @")
+    field(SCAN, "Passive")
+    field(VELO, "$(VELO=1000.0)")
+    field(ACCL, "$(ACCL=0.2)")
+    field(DHLM, "$(HLM=1000000.0)")
+    field(DLLM, "$(LLM=-1000000.0)")
+    field(MRES, "$(MRES=1.0)")
+    field(EGU,  "$(EGU=steps)")
+    field(PREC, "$(PREC=0)")
+}
