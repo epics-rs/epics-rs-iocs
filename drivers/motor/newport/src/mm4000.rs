@@ -155,12 +155,25 @@ pub struct Mm4000Controller {
     cache: Mm4000PollData,
     fetched_at: Option<Instant>,
     cache_ttl: Duration,
+    driver: Mm4000Driver,
+}
+
+/// Which C driver this controller follows. Only drvMM4000Asyn.c prints its
+/// exchange and poller errors; drvMM4000.cc's send_mess/recv_mess are silent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mm4000Driver {
+    Asyn,
+    /// `status_normal` is C's `cntrl->status == NORMAL` after
+    /// `start_status`, which decides whether `set_status` asks `TE;`.
+    Model1 {
+        status_normal: bool,
+    },
 }
 
 /// Why [`Mm4000Controller::new`] refused a controller.
 #[derive(Debug)]
 pub enum Mm4000Refusal {
-    /// `VE;` failed three times.
+    /// `VE;` (asyn) or `TH;` (model 1) failed three times.
     NoAnswer,
     /// The firmware string (past `VE`) names no MM4000/4005/4006.
     InvalidModel(String),
@@ -172,10 +185,8 @@ impl Mm4000Controller {
     /// Connect and identify an MM4000/4005/4006 (C `MM4000AsynConfig`):
     /// `VE;` up to 3 tries → firmware/model, then `TP;` — the number of
     /// comma-separated fields is the axis count on the wire, which must
-    /// cover `num_axes`; a `num_axes` of 0 takes them all, as the model-1
-    /// driver does. The refusal is returned for the caller to print, as
-    /// drvMM4000.cc and drvMM4000Asyn.c word it differently. Performs
-    /// blocking serial I/O.
+    /// cover `num_axes`. The refusal is returned for the caller to print.
+    /// Performs blocking serial I/O.
     pub fn new(
         handle: SyncIOHandle,
         serial_port: &str,
@@ -193,6 +204,7 @@ impl Mm4000Controller {
             cache: Mm4000PollData::default(),
             fetched_at: None,
             cache_ttl,
+            driver: Mm4000Driver::Asyn,
         };
         let ve = (0..3)
             .find_map(|_| ctrl.write_read("VE;").ok())
@@ -209,10 +221,72 @@ impl Mm4000Controller {
         if total_axes < num_axes {
             return Err(Mm4000Refusal::TooFewAxes { total_axes });
         }
-        if num_axes == 0 {
-            ctrl.num_axes = total_axes;
-        }
         Ok(ctrl)
+    }
+
+    /// drvMM4000.cc `motor_init` for one card, up to its per-axis block: `TH;`
+    /// until it answers (3 tries), `ST;`, `VE;` for the model, `TH;` again
+    /// for the axis count, then `start_status` (`MS;`, and `TH;` + `TP;` only
+    /// when `MS;` answered). C ignores every status here; a failed read is
+    /// an empty buffer. Performs blocking serial I/O.
+    pub fn new_model1(
+        handle: SyncIOHandle,
+        serial_port: &str,
+        cache_ttl: Duration,
+    ) -> Result<Self, Mm4000Refusal> {
+        let mut ctrl = Self {
+            handle,
+            serial_port: serial_port.to_owned(),
+            motor_port: serial_port.to_owned(),
+            firmware: String::new(),
+            model: Mm4000Model::Mm4000,
+            num_axes: 0,
+            cache: Mm4000PollData::default(),
+            fetched_at: None,
+            cache_ttl,
+            driver: Mm4000Driver::Model1 {
+                status_normal: false,
+            },
+        };
+        let read = |ctrl: &Self, cmd: &str| ctrl.write_read(cmd).unwrap_or_default();
+        if !(0..3).any(|_| !read(&ctrl, "TH;").is_empty()) {
+            return Err(Mm4000Refusal::NoAnswer);
+        }
+        let _ = ctrl.write("ST;");
+        let ve = read(&ctrl, "VE;");
+        ctrl.firmware = ve.get(2..).unwrap_or("").to_string(); // skip "VE"
+        let Some(model) = detect_model(&ctrl.firmware) else {
+            return Err(Mm4000Refusal::InvalidModel(ctrl.firmware));
+        };
+        ctrl.model = model;
+        ctrl.num_axes = strtok_count(&read(&ctrl, "TH;"));
+
+        let status_normal = !read(&ctrl, "MS;").is_empty();
+        if status_normal {
+            read(&ctrl, "TH;");
+            read(&ctrl, "TP;");
+        }
+        ctrl.driver = Mm4000Driver::Model1 { status_normal };
+        Ok(ctrl)
+    }
+
+    /// The `set_status` that ends drvMM4000.cc's per-axis init: it asks
+    /// `TE;` only when `start_status` left the card NORMAL.
+    pub fn model1_init_status(&self) {
+        if self.driver
+            == (Mm4000Driver::Model1 {
+                status_normal: true,
+            })
+        {
+            let _ = self.write_read("TE;");
+        }
+    }
+
+    /// `asynPrint(.., ASYN_TRACE_ERROR, ..)`, which only drvMM4000Asyn.c has.
+    fn print_error(&self, port: &str, addr: i32, args: std::fmt::Arguments<'_>) {
+        if self.driver == Mm4000Driver::Asyn {
+            print_error(port, addr, args);
+        }
     }
 
     /// The axes this controller serves.
@@ -238,7 +312,7 @@ impl Mm4000Controller {
             Err(e) => (e.partial_write().unwrap_or(0), e),
         };
         let e = c_exchange_error(e, sent, cmd.len());
-        print_error(
+        self.print_error(
             &self.serial_port,
             0,
             format_args!(
@@ -260,7 +334,7 @@ impl Mm4000Controller {
             _ => e.partial_write().unwrap_or(0),
         };
         let e = c_exchange_error(e, written, cmd.len());
-        print_error(
+        self.print_error(
             &self.serial_port,
             0,
             format_args!(
@@ -304,7 +378,7 @@ impl Mm4000Controller {
                     Ok(te) => {
                         if !te_ok(&te) {
                             for axis in 0..self.num_axes {
-                                print_error(
+                                self.print_error(
                                     &self.motor_port,
                                     axis as i32,
                                     format_args!("MM4000Poller: controller error {te}\n"),
@@ -320,7 +394,7 @@ impl Mm4000Controller {
             // parameter keeps the last value read.
             Err(e) => {
                 for axis in 0..self.num_axes {
-                    print_error(
+                    self.print_error(
                         &self.motor_port,
                         axis as i32,
                         format_args!("MM4000Poller: error reading status={}\n", e.status() as i32),
@@ -634,6 +708,118 @@ mod tests {
             buf[..n].copy_from_slice(&self.reply);
             Ok(n)
         }
+    }
+
+    /// A two-axis MM4000 that records every command and stays silent on the
+    /// ones in `silent`.
+    struct Scripted {
+        base: epics_rs::asyn::port::PortDriverBase,
+        silent: &'static [&'static str],
+        reply: Vec<u8>,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for Scripted {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).trim_end().to_owned();
+            self.sent.lock().unwrap().push(cmd.clone());
+            self.reply = match cmd.as_str() {
+                c if self.silent.contains(&c) => Vec::new(),
+                "VE;" => b"VEMM4005 Version 2.04".to_vec(),
+                "TH;" => b"1TH0.0000,2TH0.0000".to_vec(),
+                "TP;" => b"1TP0.0000,2TP0.0000".to_vec(),
+                "MS;" => b"1MS@,2MS@".to_vec(),
+                "TE;" => b"TE@".to_vec(),
+                c => format!("{c}0.001").into_bytes(),
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            if reply.is_empty() {
+                return Err(mm_err("timeout".into()));
+            }
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// Run drvMM4000.cc's motor_init for one card on a scripted line and
+    /// return what it put on the wire.
+    fn model1_init(name: &str, silent: &'static [&'static str]) -> (bool, Vec<String>) {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let line = Scripted {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            silent,
+            reply: Vec::new(),
+            sent: sent.clone(),
+        };
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
+                .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+        let Ok(ctrl) = Mm4000Controller::new_model1(io, name, Duration::ZERO) else {
+            return (false, sent.lock().unwrap().clone());
+        };
+        let num_axes = ctrl.num_axes();
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        for axis in 1..=num_axes {
+            Mm4000Axis::new(ctrl.clone(), axis, MODEL1_POLL_FAILURE);
+            ctrl.lock().unwrap().model1_init_status();
+        }
+        let wire = sent.lock().unwrap().clone();
+        (true, wire)
+    }
+
+    /// drvMM4000.cc:700-811: TH; probe, ST;, VE;, TH; count, start_status,
+    /// then TC/TU/XH/TL/TR and set_status's TE; per axis.
+    #[test]
+    fn model1_init_puts_drv_mm4000_sequence_on_the_wire() {
+        let (kept, wire) = model1_init("mm4000_m1_seq", &[]);
+        assert!(kept);
+        let axis = |a: usize| {
+            ["TC", "TU", "XH", "TL", "TR"]
+                .iter()
+                .map(move |cc| format!("{a}{cc}"))
+                .chain(["TE;".to_owned()])
+        };
+        let expected: Vec<String> = ["TH;", "ST;", "VE;", "TH;", "MS;", "TH;", "TP;"]
+            .iter()
+            .map(|c| c.to_string())
+            .chain(axis(1))
+            .chain(axis(2))
+            .collect();
+        assert_eq!(wire, expected);
+    }
+
+    /// An unanswered MS; leaves the card RETRY: start_status skips TH;/TP;
+    /// and set_status asks no TE;.
+    #[test]
+    fn model1_init_without_ms_asks_no_te() {
+        let (kept, wire) = model1_init("mm4000_m1_noms", &["MS;"]);
+        assert!(kept);
+        assert_eq!(&wire[..5], ["TH;", "ST;", "VE;", "TH;", "MS;"]);
+        assert_eq!(&wire[5..7], ["1TC", "1TU"]);
+        assert!(!wire.iter().any(|c| c == "TE;" || c == "TP;"));
+    }
+
+    /// The TH; probe gets three tries; a card that never answers is dropped
+    /// before ST;.
+    #[test]
+    fn model1_init_drops_a_card_silent_on_th() {
+        let (kept, wire) = model1_init("mm4000_m1_silent", &["TH;"]);
+        assert!(!kept);
+        assert_eq!(wire, ["TH;", "TH;", "TH;"]);
     }
 
     /// C MM4000Poller only raises motorAxisCommError on a failed `MS;`/`TP;`

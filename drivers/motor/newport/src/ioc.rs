@@ -1729,7 +1729,7 @@ pub fn mm4000_setup_command() -> CommandDef {
 }
 
 /// `MM4000Config(card, name, addr)`: one signal per axis the controller's
-/// `TP;` reports.
+/// `TH;` reports.
 pub fn mm4000_config_command() -> CommandDef {
     model1_config_command("MM4000Config", &MM4000, |ctx, card, port| {
         // C drops a card it cannot connect to without a word.
@@ -1739,7 +1739,7 @@ pub fn mm4000_config_command() -> CommandDef {
         // Six per-axis polls share one controller-wide exchange: cache for
         // half the default scan period.
         let cache_ttl = Duration::from_millis(1000 / SCAN_RATE as u64 / 2);
-        let controller = match Mm4000Controller::new(handle, port, port, 0, cache_ttl) {
+        let controller = match Mm4000Controller::new_model1(handle, port, cache_ttl) {
             Ok(controller) => controller,
             Err(Mm4000Refusal::InvalidModel(ident)) => {
                 errlog_vprintf(format_args!(
@@ -1753,6 +1753,10 @@ pub fn mm4000_config_command() -> CommandDef {
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
             let ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
+            controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .model1_init_status();
             MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
