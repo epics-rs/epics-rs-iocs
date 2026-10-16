@@ -5,16 +5,17 @@
 //! Each axis owns a [`Route`] trajectory ([`crate::route`]) and integrates its
 //! motion forward in real time. The C driver runs a dedicated 0.1 s background
 //! thread (`motorSimTask`) that calls `process(delta)`; the asyn-rs port folds
-//! that into [`poll`](AsynMotor::poll), whose cadence (the record's
-//! moving/idle poll interval) supplies the elapsed `delta` from a monotonic
-//! clock. There is no hardware and no unit scaling — positions and velocities
-//! are dimensionless record EGU.
+//! that into [`advance`](MotorSimAxis::advance), which every driver entry
+//! point calls first: it integrates the wall time elapsed since the last call
+//! in `DELTA` steps, so a command acts on the position the axis has at that
+//! instant and the hard-limit check runs at C's step size however sparse the
+//! polls are. There is no hardware and no unit scaling — positions and
+//! velocities are dimensionless record EGU.
 //!
 //! ## Deviations from C (documented)
 //!
-//! - The 0.1 s task + its `[DELTA/4, 4·DELTA]` clock-sanity window is replaced
-//!   by integrating the true elapsed time each poll (the poll cadence *is* the
-//!   integration step), so no fixed-step window is imposed.
+//! - C drops a task period outside `[DELTA/4, 4·DELTA]` as a clock step; here
+//!   there is no task to stall, so every elapsed interval is integrated.
 //! - `movesDeferred` is controller-wide in C (`writeInt32(motorDeferMoves)`
 //!   applies every axis's deferred move); here it is per-axis, which is
 //!   equivalent for the simulator (its axes have no inter-axis coupling).
@@ -35,6 +36,8 @@ pub const DEFAULT_HI_LIMIT: f64 = 10000.0;
 /// C `DEFAULT_HOME` / `DEFAULT_START`.
 pub const DEFAULT_HOME: f64 = 0.0;
 pub const DEFAULT_START: f64 = 0.0;
+/// C `DELTA`: the `motorSimTask` integration step, in seconds.
+const DELTA: f64 = 0.1;
 
 fn sim_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -58,7 +61,8 @@ pub struct MotorSimAxis {
     deferred_move: bool,
     deferred_position: f64,
     moves_deferred: bool,
-    last_poll: Option<Instant>,
+    /// The instant the trajectory has been integrated up to.
+    clock: Instant,
     last_status: MotorStatus,
 }
 
@@ -88,7 +92,7 @@ impl MotorSimAxis {
             deferred_move: false,
             deferred_position: 0.0,
             moves_deferred: false,
-            last_poll: None,
+            clock: Instant::now(),
             last_status: MotorStatus::default(),
         };
         axis.last_status = axis.snapshot(true);
@@ -164,6 +168,18 @@ impl MotorSimAxis {
         Ok(())
     }
 
+    /// Integrate the trajectory up to `now` in `DELTA` steps (C
+    /// `motorSimTask`), so commands and polls see the current position.
+    fn advance(&mut self, now: Instant) {
+        let mut elapsed = now.saturating_duration_since(self.clock).as_secs_f64();
+        self.clock = now;
+        while elapsed > 0.0 {
+            let step = elapsed.min(DELTA);
+            self.process(step);
+            elapsed -= step;
+        }
+    }
+
     /// C `motorSimAxis::process`: propagate the motion forward by `delta`
     /// seconds and refresh the reported status.
     fn process(&mut self, delta: f64) {
@@ -237,6 +253,7 @@ impl AsynMotor for MotorSimAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.advance(Instant::now());
         self.do_move(position, false, velocity, acceleration)
     }
 
@@ -248,6 +265,7 @@ impl AsynMotor for MotorSimAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.advance(Instant::now());
         self.do_move(distance, true, velocity, acceleration)
     }
 
@@ -258,6 +276,7 @@ impl AsynMotor for MotorSimAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
+        self.advance(Instant::now());
         self.set_velocity(velocity, acceleration)
     }
 
@@ -269,6 +288,7 @@ impl AsynMotor for MotorSimAxis {
         acceleration: f64,
         forward: bool,
     ) -> AsynResult<()> {
+        self.advance(Instant::now());
         let status = self.set_velocity(if forward { velocity } else { -velocity }, acceleration);
         self.homing = true;
         self.homed = false;
@@ -276,17 +296,20 @@ impl AsynMotor for MotorSimAxis {
     }
 
     fn stop(&mut self, _user: &AsynUser, acceleration: f64) -> AsynResult<()> {
+        self.advance(Instant::now());
         let _ = self.set_velocity(0.0, acceleration);
         self.deferred_move = false;
         Ok(())
     }
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
+        self.advance(Instant::now());
         self.enc_offset = position - self.nextpoint.p;
         Ok(())
     }
 
     fn set_deferred_moves(&mut self, _user: &AsynUser, defer: bool) -> AsynResult<()> {
+        self.advance(Instant::now());
         // C processDeferredMoves, reduced to this axis (module Deviations).
         if !defer && self.moves_deferred && self.deferred_move {
             let position = self.deferred_position;
@@ -303,14 +326,7 @@ impl AsynMotor for MotorSimAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let now = Instant::now();
-        if let Some(prev) = self.last_poll {
-            let delta = now.duration_since(prev).as_secs_f64();
-            if delta > 0.0 {
-                self.process(delta);
-            }
-        }
-        self.last_poll = Some(now);
+        self.advance(Instant::now());
         Ok(self.last_status.clone())
     }
 }
@@ -371,6 +387,22 @@ mod tests {
             axis.last_status.position
         );
         assert!(axis.last_status.high_limit, "high-limit flag not set");
+    }
+
+    #[test]
+    fn sparse_poll_still_stops_at_hard_limit() {
+        // One poll 30 s after a move past the limit: the step-wise
+        // integration must clamp at the limit, not land on the target.
+        let mut axis = MotorSimAxis::new(-100.0, 100.0, 0.0, 0.0);
+        axis.move_absolute(&user(), 150.0, 0.0, 5.0, 10.0).unwrap();
+        let later = axis.clock + std::time::Duration::from_secs(30);
+        axis.advance(later);
+        assert!(
+            axis.last_status.position <= 100.0 + 1e-6,
+            "position {} passed the hard limit",
+            axis.last_status.position
+        );
+        assert!(axis.last_status.high_limit);
     }
 
     #[test]
