@@ -40,6 +40,10 @@ impl ScalerDriver for CtrScalerDriver {
         let dev = self.device.lock().unwrap();
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
+        // C writeInt32 leaves the scaler alone while the MCS runs.
+        if st.mcs.running {
+            return Ok(());
+        }
         scaler::reset_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);
         st.scaler.presets = [0; MAX_COUNTERS];
         st.scaler.done.call_callbacks();
@@ -67,6 +71,9 @@ impl ScalerDriver for CtrScalerDriver {
         let dev = self.device.lock().unwrap();
         let mut guard = self.state.lock().unwrap();
         let st = &mut *guard;
+        if st.mcs.running {
+            return Ok(());
+        }
         if start {
             // C `writeInt32` ignores `startScaler`'s status; it prints its own.
             let _ = scaler::start_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);

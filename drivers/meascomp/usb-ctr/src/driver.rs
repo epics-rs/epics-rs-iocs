@@ -226,12 +226,35 @@ impl PortDriver for CtrDriver {
                 );
             }
         } else if reason == self.params.mca_start_acquire {
-            let already_running = self.state.lock().unwrap().mcs.running;
-            if value != 0 && !already_running {
+            let (scaler_running, mcs_running) = {
+                let st = self.state.lock().unwrap();
+                (st.scaler.running, st.mcs.running)
+            };
+            let num_channels = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
+            let current_point = self
+                .base
+                .get_int32_param(self.params.mcs_current_point, 0)?;
+            if scaler_running {
+                status = -1;
+            } else if mcs_running {
+                // Already acquiring.
+            } else if current_point >= num_channels {
+                // Already complete: toggle MCA_ACQUIRING so the SNL program
+                // clears Acquiring.
+                self.base
+                    .params
+                    .set_int32(self.params.mca_acquiring, 0, 1)?;
+                self.base.call_param_callbacks(0)?;
+                self.base
+                    .params
+                    .set_int32(self.params.mca_acquiring, 0, 0)?;
+            } else {
+                self.base
+                    .params
+                    .set_int32(self.params.mca_acquiring, 0, 1)?;
+                let num_channels = num_channels.max(0) as usize;
                 let dev = self.device.lock().unwrap();
                 let mut st = self.state.lock().unwrap();
-                let num_channels =
-                    self.base.get_int32_param(self.params.mca_num_channels, 0)? as usize;
                 let dwell = self.base.get_float64_param(self.params.mca_dwell_time, 0)?;
                 let ch_adv = self
                     .base
@@ -271,16 +294,13 @@ impl PortDriver for CtrDriver {
                 self.base
                     .params
                     .set_int32(self.params.mcs_current_point, 0, 0)?;
-                self.base
-                    .params
-                    .set_int32(self.params.mca_acquiring, 0, 1)?;
             }
         } else if reason == self.params.mca_stop_acquire {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
             let num_counters = st.num_counters;
-            // C stops only a running scan.
-            let pass = if st.mcs.running {
+            // C stops only a running scan, and leaves it to a running scaler.
+            let pass = if st.mcs.running && !st.scaler.running {
                 mcs::stop_mcs(&dev, &mut st.mcs, &trace)
             } else {
                 None
