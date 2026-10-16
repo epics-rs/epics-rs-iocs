@@ -11,6 +11,7 @@ use crate::cache::*;
 use crate::codec::*;
 use crate::link::ChannelFamily;
 use crate::wire::{self, RawResponse};
+use epics_rs::base::server::database::WriteDone;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io;
@@ -92,9 +93,16 @@ pub enum Command {
     AcknowledgeAlarms,
 }
 
+/// Who `queue_func` hands the finished command back to: a blocking caller,
+/// or the record whose `process()` it re-runs (drvMW100.c:1418-1424).
+enum Done {
+    Wait(mpsc::Sender<()>),
+    Process(WriteDone),
+}
+
 struct Job {
     command: Command,
-    done: mpsc::Sender<io::Result<()>>,
+    done: Done,
 }
 
 /// Handle to a connected MW100 unit. Cheap to clone (`Arc`-backed); one
@@ -180,16 +188,19 @@ impl Instrument {
     /// (`queue_func`, drvMW100.c:1398-1424), so a device or wire error cannot alarm.
     pub fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Job {
-                command,
-                done: done_tx,
-            })
-            .is_ok()
-        {
+        if self.send(command, Done::Wait(done_tx)) {
             let _ = done_rx.recv();
         }
+    }
+
+    /// C `qmesg(dq, precord, ...)`: queue `command` and return at once; the
+    /// actor completes `done` when it has run. `false` if the actor is gone.
+    pub fn submit_write(&self, command: Command, done: WriteDone) -> bool {
+        self.send(command, Done::Process(done))
+    }
+
+    fn send(&self, command: Command, done: Done) -> bool {
+        self.tx.send(Job { command, done }).is_ok()
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -496,8 +507,15 @@ pub struct Actor {
 impl Actor {
     fn run(mut self, rx: mpsc::Receiver<Job>) {
         while let Ok(job) = rx.recv() {
-            let result = self.process(job.command);
-            let _ = job.done.send(result);
+            let _ = self.process(job.command);
+            match job.done {
+                Done::Wait(tx) => {
+                    let _ = tx.send(());
+                }
+                Done::Process(done) => {
+                    let _ = done.complete(done.priority(), Ok(()));
+                }
+            }
         }
     }
 
@@ -1118,9 +1136,19 @@ pub(crate) mod test_support {
     /// channel (e.g. 7) is `ChannelType::None` — "channel does not exist"
     /// gate tests use it directly.
     pub(crate) fn connect_default_fixture() -> Arc<Instrument> {
+        let (instrument, device) = connect_fixture_then(Vec::new());
+        device.join().unwrap();
+        instrument
+    }
+
+    /// [`connect_default_fixture`], with the device then answering `extra`
+    /// in order; join the handle for every command line it received.
+    pub(crate) fn connect_fixture_then(
+        extra: Vec<Vec<u8>>,
+    ) -> (Arc<Instrument>, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let responses = vec![
+        let mut responses = vec![
             b"E0\r\n".to_vec(),             // BO1
             cf0_one_input_analog_module(),  // CF0
             is0_all_zero(),                 // IS0
@@ -1134,10 +1162,10 @@ pub(crate) mod test_support {
             ascii_frame(b"xxx001,-7.5\nE"), // CM?
             ascii_frame(b"xxx01,12.5\nE"),  // SK?
         ];
+        responses.extend(extra);
         let device = spawn_fake_device(listener, responses);
         let instrument = Instrument::connect_to(addr).unwrap();
-        device.join().unwrap();
-        instrument
+        (instrument, device)
     }
 }
 
