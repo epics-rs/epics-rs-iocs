@@ -1,10 +1,9 @@
-//! nPoint C300-series piezo controller driver.
-//!
-//! The nPoint `motorNPoint` module ships two controllers: the **C300** (ASCII
-//! SCPI-style protocol, ported here) and the **LC400** (a binary struct
-//! protocol over TCP — a planned addition to this crate).
+//! nPoint piezo controller drivers, `motorNPoint`'s two: the **C300** (an
+//! ASCII SCPI-style protocol) and the **LC400** (binary register frames).
 
 pub mod c300;
 pub mod ioc;
+pub mod ioc_lc400;
+pub mod lc400;
 
 pub use c300::{C300Axis, C300Controller};
