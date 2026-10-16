@@ -15,6 +15,7 @@ use epics_rs::ad_core::runtime as rt;
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
+use crate::trace::{self, TraceMask};
 use crate::types::{AcqCommand, CameraCapabilities, DirtyFlags, StreamMode, default_mode_index};
 
 // ============================================================================
@@ -173,7 +174,9 @@ impl PortDriver for D435iColorDriver {
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Start).is_err() {
-                    log::error!("D435i: acquisition task is not running");
+                    self.ad
+                        .port_base
+                        .trace_print(TraceMask::ERROR, "D435i: acquisition task is not running");
                     self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
                         0,
@@ -189,7 +192,9 @@ impl PortDriver for D435iColorDriver {
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Stop).is_err() {
-                    log::error!("D435i: acquisition task is not running");
+                    self.ad
+                        .port_base
+                        .trace_print(TraceMask::ERROR, "D435i: acquisition task is not running");
                 }
             } else {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
@@ -229,9 +234,12 @@ impl PortDriver for D435iColorDriver {
                 )?;
                 self.dirty.lock().reconfigure_pipeline = true;
             } else {
-                log::warn!(
-                    "D435i: invalid stream mode index {value}, this camera offers {}",
-                    self.stream_modes.len()
+                self.ad.port_base.trace_print(
+                    TraceMask::WARNING,
+                    &format!(
+                        "D435i: invalid stream mode index {value}, this camera offers {}",
+                        self.stream_modes.len()
+                    ),
                 );
             }
         } else {
@@ -458,12 +466,16 @@ pub fn create_d435i_detector(
 
     // Ask the camera which modes it has before the records are built: the
     // RSStreamMode enum is served from this list.
-    let caps = CameraCapabilities::discover(serial);
-    log::info!(
-        "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}",
-        caps.modes.len(),
-        caps.has_imu,
-        caps.has_emitter
+    let caps = CameraCapabilities::discover(port_name, serial);
+    trace::print(
+        port_name,
+        TraceMask::FLOW,
+        &format!(
+            "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}",
+            caps.modes.len(),
+            caps.has_imu,
+            caps.has_emitter
+        ),
     );
 
     // --- Color port ---

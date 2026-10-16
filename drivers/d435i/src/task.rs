@@ -31,6 +31,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 
 use crate::params::{D435iConfigSnapshot, D435iParams};
+use crate::trace::{self, TraceMask};
 use crate::types::CameraCapabilities;
 use crate::types::{AcqCommand, DirtyFlags};
 
@@ -78,6 +79,11 @@ pub(crate) struct AcquisitionContext {
 }
 
 impl AcquisitionContext {
+    /// Lines of the acquisition task, printed on the colour (main) port.
+    fn trace(&self, mask: TraceMask, msg: &str) {
+        trace::print(self.color_handle.port_name(), mask, msg);
+    }
+
     async fn end_acquisition(&self, wait_for_plugins: bool) {
         if wait_for_plugins {
             self.color_queued.wait_until_zero(Duration::from_secs(5));
@@ -109,16 +115,21 @@ pub(crate) fn start_acquisition_task(ctx: AcquisitionContext) -> std::thread::Jo
 
 /// Open a fresh context and start a pipeline for `config`.
 fn start_pipeline(
+    port: &str,
     config: &D435iConfigSnapshot,
     caps: &CameraCapabilities,
 ) -> anyhow::Result<realsense_rust::pipeline::ActivePipeline> {
     let rs_ctx = Context::new()?;
     let rs_pipeline = InactivePipeline::try_from(&rs_ctx)?;
-    let rs_config = build_config(config, caps)?;
+    let rs_config = build_config(port, config, caps)?;
     rs_pipeline.start(Some(rs_config))
 }
 
-fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyhow::Result<Config> {
+fn build_config(
+    port: &str,
+    config: &D435iConfigSnapshot,
+    caps: &CameraCapabilities,
+) -> anyhow::Result<Config> {
     let mut cfg = Config::new();
     let w = config.res_x as usize;
     let h = config.res_y as usize;
@@ -133,7 +144,11 @@ fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyh
         cfg.enable_stream(Rs2StreamKind::Accel, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
         cfg.enable_stream(Rs2StreamKind::Gyro, None, 0, 0, Rs2Format::MotionXyz32F, 0)?;
     } else {
-        log::info!("D435i: no IMU on this camera; streaming colour and depth only");
+        trace::print(
+            port,
+            TraceMask::FLOW,
+            "D435i: no IMU on this camera; streaming colour and depth only",
+        );
     }
 
     if !config.serial.is_empty() {
@@ -150,17 +165,31 @@ fn build_config(config: &D435iConfigSnapshot, caps: &CameraCapabilities) -> anyh
 /// Options are not uniform across the D400 family, and a discarded error here
 /// is indistinguishable from a setting that took effect -- the readback record
 /// echoes the requested value either way.
-fn set_sensor_option(sensor: &mut realsense_rust::sensor::Sensor, option: Rs2Option, value: f32) {
+fn set_sensor_option(
+    port: &str,
+    sensor: &mut realsense_rust::sensor::Sensor,
+    option: Rs2Option,
+    value: f32,
+) {
     if !sensor.supports_option(option) {
-        log::warn!("D435i: this camera has no {option:?} option; ignoring");
+        trace::print(
+            port,
+            TraceMask::WARNING,
+            &format!("D435i: this camera has no {option:?} option; ignoring"),
+        );
         return;
     }
     if let Err(e) = sensor.set_option(option, value) {
-        log::warn!("D435i: camera refused {option:?}={value}: {e}");
+        trace::print(
+            port,
+            TraceMask::WARNING,
+            &format!("D435i: camera refused {option:?}={value}: {e}"),
+        );
     }
 }
 
 fn apply_sensor_options(
+    port: &str,
     composite: &CompositeFrame,
     config: &D435iConfigSnapshot,
     caps: &CameraCapabilities,
@@ -173,11 +202,16 @@ fn apply_sensor_options(
         && let Ok(mut sensor) = FrameEx::sensor(color_frame)
     {
         if config.auto_exposure {
-            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 1.0);
+            set_sensor_option(port, &mut sensor, Rs2Option::EnableAutoExposure, 1.0);
         } else {
-            set_sensor_option(&mut sensor, Rs2Option::EnableAutoExposure, 0.0);
-            set_sensor_option(&mut sensor, Rs2Option::Exposure, config.exposure as f32);
-            set_sensor_option(&mut sensor, Rs2Option::Gain, config.gain as f32);
+            set_sensor_option(port, &mut sensor, Rs2Option::EnableAutoExposure, 0.0);
+            set_sensor_option(
+                port,
+                &mut sensor,
+                Rs2Option::Exposure,
+                config.exposure as f32,
+            );
+            set_sensor_option(port, &mut sensor, Rs2Option::Gain, config.gain as f32);
         }
     }
 
@@ -190,12 +224,14 @@ fn apply_sensor_options(
         && let Ok(mut sensor) = FrameEx::sensor(depth_frame)
     {
         set_sensor_option(
+            port,
             &mut sensor,
             Rs2Option::EmitterEnabled,
             if config.emitter_enabled { 1.0 } else { 0.0 },
         );
         if config.emitter_enabled {
             set_sensor_option(
+                port,
                 &mut sensor,
                 Rs2Option::LaserPower,
                 config.laser_power as f32,
@@ -662,6 +698,8 @@ async fn process_imu(composite: &CompositeFrame, ctx: &AcquisitionContext) {
 
 /// Depth post-processing filter chain, created once per acquisition session.
 struct DepthFilterChain {
+    /// The port the filter failures are printed on.
+    port: String,
     decimation: Decimation,
     spatial: SpatialFilter,
     temporal: TemporalFilter,
@@ -669,8 +707,9 @@ struct DepthFilterChain {
 }
 
 impl DepthFilterChain {
-    fn new() -> anyhow::Result<Self> {
+    fn new(port: &str) -> anyhow::Result<Self> {
         Ok(Self {
+            port: port.to_string(),
             decimation: Decimation::new(1)?,
             spatial: SpatialFilter::new(1)?,
             temporal: TemporalFilter::new(1)?,
@@ -712,7 +751,11 @@ impl DepthFilterChain {
                     f = $filter
                         .wait(timeout)
                         .map_err(|e| {
-                            log::warn!("D435i: {} wait failed: {e}", $name);
+                            trace::print(
+                                &self.port,
+                                TraceMask::WARNING,
+                                &format!("D435i: {} wait failed: {e}", $name),
+                            );
                         })
                         .ok()?;
                 }
@@ -755,17 +798,23 @@ async fn try_connect_pipeline(
             return None;
         }
 
-        let result = start_pipeline(config, &ctx.caps);
+        let result = start_pipeline(ctx.color_handle.port_name(), config, &ctx.caps);
 
         match result {
             Ok(p) => return Some(p),
             Err(e) => {
                 retry_count += 1;
                 if retry_count == 1 || retry_count.is_multiple_of(5) {
-                    log::warn!("D435i: connection attempt {retry_count} failed: {e}");
+                    ctx.trace(
+                        TraceMask::WARNING,
+                        &format!("D435i: connection attempt {retry_count} failed: {e}"),
+                    );
                 }
                 if retry_count >= MAX_CONNECT_RETRIES {
-                    log::error!("D435i: giving up after {retry_count} connection attempts");
+                    ctx.trace(
+                        TraceMask::ERROR,
+                        &format!("D435i: giving up after {retry_count} connection attempts"),
+                    );
                     write_string(
                         &ctx.color_handle,
                         ctx.color_ad.status_message,
@@ -841,7 +890,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         {
             Ok(cfg) => cfg,
             Err(e) => {
-                log::error!("D435i: failed to read config: {e}");
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to read config: {e}"),
+                );
                 ctx.end_acquisition(false).await;
                 continue;
             }
@@ -873,10 +925,13 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .await;
 
         // Create processing blocks
-        let mut depth_filters = match DepthFilterChain::new() {
+        let mut depth_filters = match DepthFilterChain::new(ctx.color_handle.port_name()) {
             Ok(f) => f,
             Err(e) => {
-                log::error!("D435i: failed to create depth filters: {e}");
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to create depth filters: {e}"),
+                );
                 ctx.end_acquisition(false).await;
                 continue;
             }
@@ -886,7 +941,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         let mut align = match Align::new(Rs2StreamKind::Color, 1) {
             Ok(a) => a,
             Err(e) => {
-                log::error!("D435i: failed to create align block: {e}");
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to create align block: {e}"),
+                );
                 ctx.end_acquisition(false).await;
                 continue;
             }
@@ -895,7 +953,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         let mut pc_block = match PointCloud::new(1) {
             Ok(p) => p,
             Err(e) => {
-                log::error!("D435i: failed to create pointcloud block: {e}");
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &format!("D435i: failed to create pointcloud block: {e}"),
+                );
                 ctx.end_acquisition(false).await;
                 continue;
             }
@@ -926,7 +987,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                 };
 
                 drop(pipeline.stop());
-                pipeline = match start_pipeline(&config, &ctx.caps) {
+                pipeline = match start_pipeline(ctx.color_handle.port_name(), &config, &ctx.caps) {
                     Ok(p) => p,
                     Err(e) => {
                         // RSStreamMode offers every mode the D435i supports,
@@ -934,7 +995,10 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         // stream over a refused mode is the wrong answer:
                         // report it, go back to the mode that was running, and
                         // only give up if that fails too.
-                        log::error!("D435i: stream mode refused by the camera: {e}");
+                        ctx.trace(
+                            TraceMask::ERROR,
+                            &format!("D435i: stream mode refused by the camera: {e}"),
+                        );
                         write_string(
                             &ctx.color_handle,
                             ctx.color_ad.status_message,
@@ -954,10 +1018,15 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                                 )],
                             )
                             .await;
-                        match start_pipeline(&config, &ctx.caps) {
+                        match start_pipeline(ctx.color_handle.port_name(), &config, &ctx.caps) {
                             Ok(p) => p,
                             Err(e) => {
-                                log::error!("D435i: could not fall back to the previous mode: {e}");
+                                ctx.trace(
+                                    TraceMask::ERROR,
+                                    &format!(
+                                        "D435i: could not fall back to the previous mode: {e}"
+                                    ),
+                                );
                                 write_string(
                                     &ctx.color_handle,
                                     ctx.color_ad.status_message,
@@ -1028,14 +1097,20 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
                     // Log first error, then every 10th to avoid spam
                     if consecutive_errors == 1 || consecutive_errors.is_multiple_of(10) {
-                        log::warn!("D435i: frame wait error ({consecutive_errors}x): {e}");
+                        ctx.trace(
+                            TraceMask::WARNING,
+                            &format!("D435i: frame wait error ({consecutive_errors}x): {e}"),
+                        );
                     }
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        log::error!("D435i: {} consecutive frame errors", consecutive_errors);
+                        ctx.trace(
+                            TraceMask::ERROR,
+                            &format!("D435i: {consecutive_errors} consecutive frame errors"),
+                        );
 
                         // Continuous mode: attempt reconnection
                         if config.image_mode == ImageMode::Continuous {
-                            log::info!("D435i: attempting reconnection...");
+                            ctx.trace(TraceMask::FLOW, "D435i: attempting reconnection...");
                             write_string(
                                 &ctx.color_handle,
                                 ctx.color_ad.status_message,
@@ -1127,7 +1202,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
 
             // Apply sensor options on first frame after config change
             if !sensor_options_applied {
-                apply_sensor_options(&composite, &config, &ctx.caps);
+                apply_sensor_options(ctx.color_handle.port_name(), &composite, &config, &ctx.caps);
                 sensor_options_applied = true;
             }
 
