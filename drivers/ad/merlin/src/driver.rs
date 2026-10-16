@@ -598,7 +598,13 @@ impl PortDriver for MerlinDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        let old = self.ad.port_base.get_float64_param(reason, user.addr)?;
+        // C ignores the status and restores 0 on a failed write
+        // (merlinDetector.cpp:1206,1290-1294).
+        let old = self
+            .ad
+            .port_base
+            .get_float64_param(reason, user.addr)
+            .unwrap_or(0.0);
         self.ad
             .port_base
             .set_float64_param(reason, user.addr, value)?;
@@ -829,6 +835,18 @@ mod tests {
         assert_eq!(
             det.ad.port_base.get_float64_param(threshold, 0).unwrap(),
             7.5
+        );
+    }
+
+    #[test]
+    fn a_refused_write_to_an_unset_threshold_restores_zero() {
+        let mut det = detector("MERLIN_UNSET_THRESHOLD");
+        let threshold = det.params.thresholds[1];
+        let mut user = AsynUser::new(threshold);
+        assert!(det.write_float64(&mut user, 9.0).is_err());
+        assert_eq!(
+            det.ad.port_base.get_float64_param(threshold, 0).unwrap(),
+            0.0
         );
     }
 }
