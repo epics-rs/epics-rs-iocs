@@ -516,9 +516,10 @@ fn resolve_operation(
 }
 
 /// Records whose C `init_record` seeds an initial value directly
-/// (`devMW100_ao.c`: VAL via `mw100_analog_get`; `devMW100_bo.c`: RVAL via
-/// `mw100_binary_get`, asymmetrically — VAL is left at the record's default
-/// since C's `init_record` never calls `process()`).
+/// (`devMW100_ao.c:146-150`: VAL via `mw100_analog_get`;
+/// `devMW100_bo.c:178-185`: RVAL via `mw100_binary_get`, then `return 0`,
+/// so `boRecord.c:156-161` sets `val = rval ? 1 : 0`). The bo record's own
+/// init tail derives RVAL from VAL, so bo is seeded through VAL.
 fn seed_initial_value(
     instrument: &Instrument,
     op: Operation,
@@ -531,7 +532,7 @@ fn seed_initial_value(
         }
         Operation::BinarySet(channel) => {
             let v = instrument.binary_get(channel);
-            record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
+            record.put_field("VAL", EpicsValue::Enum(u16::from(v != 0)))?;
         }
         _ => {}
     }
@@ -905,7 +906,8 @@ pub fn factory(
 mod tests {
     use super::*;
     use crate::instrument::test_support::{
-        connect_default_fixture, connect_fixture_then, empty_fo1_binary, one_record_fd1_binary,
+        ascii_frame, connect_default_fixture, connect_fixture_then, empty_fo1_binary,
+        fe1_one_signal_channel, is0_all_zero, one_record_fd1_binary, spawn_fake_device,
     };
     use epics_rs::base::runtime::task::test_block_on;
     use epics_rs::base::server::database::{PvDatabase, WriteDone};
@@ -914,6 +916,7 @@ mod tests {
     use epics_rs::base::server::records::bo::BoRecord;
     use epics_rs::base::server::records::mbbo::MbboRecord;
     use std::collections::HashMap;
+    use std::net::TcpListener;
     use std::time::Duration;
 
     struct FakeRecord {
@@ -1342,11 +1345,19 @@ mod tests {
     /// A record named `TEST` carrying `link` as its OUT, wired to a device
     /// whose fixture then answers `extra`.
     async fn wired_output(
-        mut record: Box<dyn Record>,
+        record: Box<dyn Record>,
         link: &str,
         extra: Vec<Vec<u8>>,
     ) -> (PvDatabase, std::thread::JoinHandle<Vec<String>>) {
         let (instrument, device_thread) = connect_fixture_then(extra);
+        (wire_record(record, link, instrument).await, device_thread)
+    }
+
+    async fn wire_record(
+        mut record: Box<dyn Record>,
+        link: &str,
+        instrument: Arc<Instrument>,
+    ) -> PvDatabase {
         let f = factory(registry_with("mw100dev", instrument));
         let ctx = DeviceSupportContext {
             record_type: record.record_type(),
@@ -1363,7 +1374,46 @@ mod tests {
         inst.common.dtyp = DTYP.into();
         inst.device = Some(device);
         drop(inst);
-        (db, device_thread)
+        db
+    }
+
+    #[test]
+    fn relay_bo_seeds_val_from_the_relay_state() {
+        test_block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let cf0 = b"0xxxMX125-MKC-M10xxxMX125-MKC-M10x\r\nE";
+            // FO1: channel 1 relay on.
+            let mut fo1 = vec![b'E', b'B', 0, 0];
+            fo1.extend_from_slice(&30u32.to_le_bytes());
+            fo1.extend_from_slice(&[0u8; 20]);
+            fo1.extend_from_slice(&1u16.to_le_bytes());
+            fo1.extend_from_slice(&[0u8; 2]);
+            fo1.extend_from_slice(&1u32.to_le_bytes());
+            fo1.extend_from_slice(&[0u8; 2]);
+            let responses = vec![
+                b"E0\r\n".to_vec(),
+                ascii_frame(cf0),
+                is0_all_zero(),
+                fe1_one_signal_channel(),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+                empty_fo1_binary(), // FD1: no input records
+                fo1,
+                ascii_frame(b"E"),
+                ascii_frame(b"E"),
+            ];
+            let device_thread = spawn_fake_device(listener, responses);
+            let instrument = Instrument::connect_to(addr).unwrap();
+            device_thread.join().unwrap();
+            let db = wire_record(Box::new(BoRecord::new(0)), "mw100dev VAL:1", instrument).await;
+            let rec = db.get_record("TEST").unwrap();
+            let inst = rec.read();
+            assert_eq!(inst.record.get_field("VAL"), Some(EpicsValue::Enum(1)));
+            assert_eq!(inst.record.get_field("RVAL"), Some(EpicsValue::ULong(1)));
+        });
     }
 
     /// Put `val` and wait for the queued write to end the cycle.
