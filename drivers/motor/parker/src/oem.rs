@@ -2,8 +2,8 @@
 //!
 //! Ported from `motorParker/parkerApp/src/OEMMotorDriver.cpp` (a model-3
 //! `asynMotorController`/`asynMotorAxis` pair). Commands are ASCII, prefixed by
-//! the 1-based unit address (`<addr>` = axis + 1), CR-terminated (the startup
-//! script sets the input EOS; the driver owns output framing). Connects over a
+//! the 1-based unit address (`<addr>` = axis + 1), CR-terminated by the port
+//! EOS, CR both ways as the C constructor sets it. Connects over a
 //! `drvAsynIPPort`.
 //!
 //! ## Reply model
@@ -50,9 +50,6 @@ use motor_common::util::{atof, leading_hex};
 /// Response buffer size.
 const READ_BUF: usize = 64;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
-
 /// 2^32, subtracted to sign-extend a negative 32-bit step count (C).
 const TWO_POW_32: f64 = 4_294_967_296.0;
 
@@ -67,17 +64,10 @@ pub struct OemController {
 
 impl OemController {
     /// Wrap a connected octet handle. The C controller constructor connects,
-    /// sets the CR EOS, creates the axes and starts the poller; here the EOS is
-    /// set by the startup script and axes are created by the ioc command.
+    /// sets the CR EOS, creates the axes and starts the poller; here
+    /// `OEMCreateController` sets the EOS and creates the axes.
     pub fn new(handle: SyncIOHandle) -> Self {
         Self { handle }
-    }
-
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
     }
 
     fn trimmed(raw: &[u8]) -> String {
@@ -88,13 +78,13 @@ impl OemController {
 
     /// Send a command and read its single acknowledgement line.
     fn command(&self, cmd: &str) -> AsynResult<()> {
-        let _ack = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let _ack = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(())
     }
 
     /// Send a query and read the echo line then the data line (returned).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let _echo = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let _echo = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let raw = self.handle.read_octet(0, READ_BUF)?;
         Ok(Self::trimmed(&raw))
     }

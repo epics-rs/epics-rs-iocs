@@ -16,11 +16,6 @@ epicsEnvSet("NAXES",  "1")
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# OEM framing: the driver appends the CR command terminator, so only the input
-# EOS is configured here. Do not set an output EOS — the port would append it a
-# second time.
-asynOctetSetInputEos("$(IPPORT)", 0, "\r")
-
 # ---- OEM750 controller ----
 # OEMCreateController(card, oemPort, numAxes, [movingPollMs], [idlePollMs]).
 OEMCreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
