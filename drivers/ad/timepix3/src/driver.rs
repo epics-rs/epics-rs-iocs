@@ -14,6 +14,7 @@ use serde_json::json;
 
 use crate::adlog;
 use crate::calibration::PathPolicy;
+use crate::destination;
 use crate::family::DetectorFamily;
 use crate::http::{HttpError, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
 use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
@@ -171,6 +172,7 @@ pub struct TimePix3Driver {
     pub shared: Arc<Shared>,
     cmd_tx: rt::CommandSender<Command>,
     calibration: PathPolicy,
+    destinations: destination::Policy,
 }
 
 impl TimePix3Driver {
@@ -204,12 +206,52 @@ impl TimePix3Driver {
             shared,
             cmd_tx,
             calibration: PathPolicy::default(),
+            destinations: destination::Policy::default(),
         };
         driver.init_params()?;
         driver.configure_calibration(
             &std::env::var("ADTIMEPIX_CALIBRATION_ROOT").unwrap_or_default(),
         )?;
+        driver.configure_destinations(
+            &std::env::var("ADTIMEPIX_DESTINATION_ALLOWLIST").unwrap_or_default(),
+        )?;
         Ok(driver)
+    }
+
+    /// C `ADTimePixConfig`'s ADTIMEPIX_DESTINATION_ALLOWLIST, permissive when
+    /// unset (ADTimePix.cpp:76-78, :1612-1625).
+    fn configure_destinations(&mut self, allowlist: &str) -> AsynResult<()> {
+        let status = self.destinations.configure(if allowlist.is_empty() {
+            destination::PERMISSIVE
+        } else {
+            allowlist
+        });
+        let policy = match status {
+            Ok(()) if self.destinations.permissive() => "Permissive".to_string(),
+            Ok(()) => "Enforced".to_string(),
+            Err(e) => format!("Blocked: {}", e.message()),
+        };
+        let description = self.destinations.description().to_string();
+        self.set_text(self.p.destination_allowlist, &description)?;
+        self.set_text(self.p.destination_policy, &policy)
+    }
+
+    /// C `validateDestination` (ADTimePix.cpp:171-182).
+    fn validate_destination(&mut self, destination: &str) -> AsynResult<()> {
+        if self.destinations.allows(destination) {
+            return Ok(());
+        }
+        let message = format!("Destination blocked by startup allowlist: {destination}");
+        self.set_text(self.p.write_msg, &message)?;
+        self.ad.port_base.trace_print(
+            TraceMask::ERROR,
+            format_args!("{}", adlog::err(adlog::VALIDATE_DESTINATION, &message)),
+        );
+        self.ad.port_base.call_param_callbacks(0)?;
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        })
     }
 
     /// C `checkChannelPath` (ADTimePix.cpp:217-280), plus the `tcp://` parse
@@ -642,6 +684,19 @@ impl TimePix3Driver {
     /// C `fileWriter` (serval_http.cpp:2095).
     fn file_writer(&mut self) -> AsynResult<()> {
         let dest = self.destination();
+        // Every enabled channel's Base passes the allowlist before anything
+        // is sent (serval_http.cpp:1782, :1866, :2096).
+        let bases: Vec<String> = dest
+            .raw
+            .iter()
+            .map(|c| c.base.clone())
+            .chain(dest.image.iter().map(|c| c.base.clone()))
+            .chain(dest.preview_image.iter().map(|c| c.base.clone()))
+            .chain(dest.preview_histogram.iter().map(|h| h.image.base.clone()))
+            .collect();
+        for base in &bases {
+            self.validate_destination(base)?;
+        }
         let body = serval::destination_body(&dest).map_err(|m| AsynError::Status {
             status: AsynStatus::Error,
             message: format!("timepix3: /server/destination: {m}"),
@@ -1672,6 +1727,48 @@ mod tests {
         assert_eq!(
             det.text(p.calibration_policy, 0),
             "Blocked: calibration root is not absolute"
+        );
+    }
+
+    /// The destination allowlist reads back at startup and refuses a
+    /// channel Base before WriteData sends anything (ADTimePix.cpp:171-182,
+    /// :1612-1625).
+    #[test]
+    fn the_destination_allowlist_refuses_a_channel_base() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_DEST_POLICY",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        assert_eq!(
+            det.text(p.destination_allowlist, 0),
+            "file:/*,tcp://*,http://*"
+        );
+        assert_eq!(det.text(p.destination_policy, 0), "Permissive");
+        det.configure_destinations("tcp://localhost:8085").unwrap();
+        assert_eq!(det.text(p.destination_policy, 0), "Enforced");
+        det.ad
+            .port_base
+            .set_string_param(p.raw_base, 0, "file:/data")
+            .unwrap();
+        det.ad.port_base.set_int32_param(p.write_raw, 0, 1).unwrap();
+        let e = det
+            .write_int32(&mut AsynUser::new(p.write_data), 1)
+            .unwrap_err();
+        assert!(e.to_string().contains("Destination blocked"), "{e}");
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            "Destination blocked by startup allowlist: file:/data"
+        );
+        det.configure_destinations("tcp://*x").unwrap();
+        assert_eq!(
+            det.text(p.destination_policy, 0),
+            "Blocked: destination allowlist contains an invalid entry"
         );
     }
 

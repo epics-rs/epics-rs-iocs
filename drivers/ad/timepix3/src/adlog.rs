@@ -17,6 +17,8 @@ pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
 pub const PROCESS_PRV_IMG_DATA_LINE: &str =
     "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)";
 pub const PROCESS_IMG_DATA_LINE: &str = "bool ADTimePix::processImgDataLine(char*, char*, size_t)";
+pub const VALIDATE_DESTINATION: &str =
+    "asynStatus ADTimePix::validateDestination(const std::string&)";
 pub const CHECK_IMG_PATH: &str = "asynStatus ADTimePix::checkImgPath()";
 pub const CHECK_PRV_IMG_PATH: &str = "asynStatus ADTimePix::checkPrvImgPath()";
 pub const CHECK_PRV_IMG1_PATH: &str = "asynStatus ADTimePix::checkPrvImg1Path()";
