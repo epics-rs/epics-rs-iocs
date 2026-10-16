@@ -63,8 +63,7 @@ pub fn ims_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
             );
             let port =
                 get_port(&io_port).ok_or_else(|| format!("IP port '{io_port}' not found"))?;
-            let axis = ImsMDrivePlusAxis::new(handle, &port.handle, device_name)
-                .map_err(|e| format!("ImsMDrivePlusCreateController: axis setup failed: {e}"))?;
+            let axis = ImsMDrivePlusAxis::new(handle, &port.handle, &motor_port, device_name);
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             holder.install(
