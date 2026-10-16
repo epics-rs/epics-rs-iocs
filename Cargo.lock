@@ -179,7 +179,6 @@ dependencies = [
  "anyhow",
  "epics-rs",
  "image",
- "log",
  "parking_lot",
  "ureq 2.12.1",
 ]

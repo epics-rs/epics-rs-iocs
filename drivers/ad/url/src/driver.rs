@@ -101,14 +101,9 @@ impl PortDriver for URLDriver {
                 .get_int32_param(self.ad.params.status, 0)
                 .unwrap_or(ADStatus::Idle as i32);
             if value != 0 && status == ADStatus::Idle as i32 {
-                if self.acq_tx.try_send(AcqCommand::Start).is_err() {
-                    log::error!("ad-url: acquisition task is not running");
-                }
-            } else if value == 0
-                && status != ADStatus::Idle as i32
-                && self.acq_tx.try_send(AcqCommand::Stop).is_err()
-            {
-                log::error!("ad-url: acquisition task is not running");
+                let _ = self.acq_tx.try_send(AcqCommand::Start);
+            } else if value == 0 && status != ADStatus::Idle as i32 {
+                let _ = self.acq_tx.try_send(AcqCommand::Stop);
             }
         }
 
