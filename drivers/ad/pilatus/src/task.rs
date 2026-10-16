@@ -967,7 +967,6 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
 
         w.ctx.set_shutter(false).await;
         w.ctx.set_i32(w.ctx.ad.acquire, 0);
-        w.ctx.set_i32(w.ctx.ad.acquire_busy, 0);
         w.ctx.set_i32(w.ctx.p.armed, 0);
         w.ctx.callbacks().await;
     }
