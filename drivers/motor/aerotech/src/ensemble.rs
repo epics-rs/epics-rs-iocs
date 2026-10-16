@@ -57,6 +57,11 @@ use motor_common::util::{atof, atoi, atol};
 /// Reply read buffer size (C `BUFFER_SIZE`).
 const READ_BUF: usize = 128;
 
+fn trim_line(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    s.trim_end_matches(['\r', '\n', '\0']).to_string()
+}
+
 /// Command terminator appended by the driver (C `ASCII_EOS_STR`).
 const TERMINATOR: &[u8] = b"\n";
 
@@ -129,15 +134,18 @@ impl EnsembleController {
     }
 
     fn read_line(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
-        let s = String::from_utf8_lossy(&raw);
-        Ok(s.trim_end_matches(['\r', '\n', '\0']).to_string())
+        Ok(trim_line(&self.handle.read_octet(0, READ_BUF)?))
     }
 
     /// Write a command and read one reply line.
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        self.read_line()
+        // C sendAndReceive: pasynOctetSyncIO->writeRead; plain reads follow
+        // only for the value line after a bare ACK.
+        Ok(trim_line(&self.handle.write_read(
+            0,
+            &Self::framed(cmd),
+            READ_BUF,
+        )?))
     }
 
     /// Send a command that returns only an ACK. Errors on NAK/fault/timeout/empty.
