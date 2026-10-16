@@ -6,7 +6,7 @@
 //! how the C++ actually uses it — every call is synchronous).
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::{UrError, UrResult};
@@ -37,7 +37,9 @@ pub struct Session {
     state: ConnState,
     /// Bytes read but not yet consumed as whole packages.
     buffer: Vec<u8>,
-    /// The registered output recipe; data packages decode against it.
+    /// The registered output recipe; data packages decode against it, and the
+    /// controller's setup-outputs reply is checked against its names (C++
+    /// `output_names_`).
     recipe: OutputRecipe,
 }
 
@@ -66,14 +68,13 @@ impl Session {
 
     pub fn connect(&mut self) -> UrResult<()> {
         self.buffer.clear(); // rtde.cpp:63 — reconnect must not reuse stale bytes.
-        let addr = (self.hostname.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| UrError::Connect(format!("resolve {}: {e}", self.hostname)))?
-            .next()
-            .ok_or_else(|| UrError::Connect(format!("no address for {}", self.hostname)))?;
-
-        let sock = TcpStream::connect_timeout(&addr, self.timeout).map_err(|e| {
-            UrError::Connect(format!("could not connect to {addr}, verify the IP: {e}"))
+        // rtde.cpp:85 prints the asio error to cerr before throwing its own.
+        let sock = crate::net::connect_tcp(&self.hostname, self.port, None).map_err(|e| {
+            eprintln!("{}", crate::net::asio_connect_what(&e));
+            UrError::Connect(format!(
+                "Error: Could not connect to: {} at {}, verify the IP",
+                self.hostname, self.port
+            ))
         })?;
         sock.set_nodelay(true).ok();
         sock.set_read_timeout(Some(self.timeout)).ok();
@@ -131,12 +132,16 @@ impl Session {
         Ok((header.cmd, body))
     }
 
-    /// Send a package and consume the controller's reply, applying it.
-    fn exchange(&mut self, frame: &[u8]) -> UrResult<(u8, Vec<u8>)> {
+    /// Send a request and consume the next package, whatever it is.
+    ///
+    /// C++ `receive()` reads one package per request and acts on that
+    /// package's own type, not on the request's: a controller that queues an
+    /// unsolicited text message shifts every later reply by one package, and
+    /// each is then handled where it lands.
+    fn exchange(&mut self, frame: &[u8]) -> UrResult<()> {
         self.write_frame(frame)?;
         let (cmd, body) = self.read_package()?;
-        self.apply_control_package(cmd, &body)?;
-        Ok((cmd, body))
+        self.apply_control_package(cmd, &body)
     }
 
     /// Handle the non-data control packages (`RTDE::receive`'s switch).
@@ -149,22 +154,28 @@ impl Session {
                     return Err(UrError::InputRegistersInUse);
                 }
             }
+            rtde::cmd::CONTROL_PACKAGE_SETUP_OUTPUTS => {
+                if let Some(reply) = rtde::OutputSetupReply::decode(body) {
+                    let missing = reply.not_found(self.recipe.names());
+                    if !missing.is_empty() {
+                        return Err(UrError::VariablesNotFound(missing.join(", ")));
+                    }
+                }
+            }
+            // A refused start or pause is printed, not thrown (rtde.cpp:458,473);
+            // the caller sees it as a state that did not change.
             rtde::cmd::CONTROL_PACKAGE_START => {
                 if rtde::decode_success(body) {
                     self.state = ConnState::Started;
                 } else {
-                    return Err(UrError::Protocol(
-                        "unable to start RTDE synchronization".into(),
-                    ));
+                    eprintln!("Unable to start synchronization");
                 }
             }
             rtde::cmd::CONTROL_PACKAGE_PAUSE => {
                 if rtde::decode_success(body) {
                     self.state = ConnState::Paused;
                 } else {
-                    return Err(UrError::Protocol(
-                        "unable to pause RTDE synchronization".into(),
-                    ));
+                    eprintln!("Unable to pause synchronization");
                 }
             }
             _ => {}
@@ -174,8 +185,7 @@ impl Session {
 
     /// `RTDE::negotiateProtocolVersion`.
     pub fn negotiate_protocol_version(&mut self) -> UrResult<()> {
-        self.exchange(&rtde::encode_protocol_version())?;
-        Ok(())
+        self.exchange(&rtde::encode_protocol_version())
     }
 
     /// `RTDE::getControllerVersion`.
@@ -190,45 +200,27 @@ impl Session {
     }
 
     /// `RTDE::sendOutputSetup`. Registers the recipe used to decode every later
-    /// data package, and rejects names the controller could not resolve.
+    /// data package; the controller's reply is checked wherever it lands.
     pub fn send_output_setup(&mut self, names: &[String], frequency: f64) -> UrResult<()> {
-        let recipe = OutputRecipe::new(names);
-        let requested = recipe.names().to_vec();
-        let (_, body) = self.exchange(&rtde::encode_output_setup(&requested, frequency))?;
-
-        let reply = rtde::OutputSetupReply::decode(&body)
-            .ok_or_else(|| UrError::Protocol("empty output-setup reply".into()))?;
-        let missing = reply.not_found(&requested);
-        if !missing.is_empty() {
-            return Err(UrError::VariablesNotFound(missing.join(", ")));
-        }
-
-        self.recipe = recipe;
-        Ok(())
+        self.recipe = OutputRecipe::new(names);
+        let frame = rtde::encode_output_setup(self.recipe.names(), frequency);
+        self.exchange(&frame)
     }
 
-    /// `RTDE::sendInputSetup`. Returns the recipe id the controller assigned.
-    ///
-    /// The C++ ignores the returned id and hard-codes recipe numbers by
-    /// registration order (rtde_io_interface.cpp:97 onwards). The id is returned
-    /// here so a caller can assert the controller agrees.
-    pub fn send_input_setup(&mut self, names: &[String]) -> UrResult<u8> {
-        let (_, body) = self.exchange(&rtde::encode_input_setup(names))?;
-        body.first()
-            .copied()
-            .ok_or_else(|| UrError::Protocol("empty input-setup reply".into()))
+    /// `RTDE::sendInputSetup`. The controller's recipe id is not read: the
+    /// C++ addresses recipes by registration order (rtde_io_interface.cpp:97).
+    pub fn send_input_setup(&mut self, names: &[String]) -> UrResult<()> {
+        self.exchange(&rtde::encode_input_setup(names))
     }
 
     /// `RTDE::sendStart`.
     pub fn send_start(&mut self) -> UrResult<()> {
-        self.exchange(&rtde::encode_start())?;
-        Ok(())
+        self.exchange(&rtde::encode_start())
     }
 
     /// `RTDE::sendPause`.
     pub fn send_pause(&mut self) -> UrResult<()> {
-        self.exchange(&rtde::encode_pause())?;
-        Ok(())
+        self.exchange(&rtde::encode_pause())
     }
 
     /// `RTDE::send` — transmit one robot command on its input recipe.
@@ -283,7 +275,6 @@ impl Session {
         self.buffer.extend_from_slice(&chunk[..n]);
 
         let mut latest: Option<HashMap<String, Value>> = None;
-        let mut pending: Vec<(u8, Vec<u8>)> = Vec::new();
 
         // Split the buffer into whole packages, leaving any partial tail behind.
         loop {
@@ -301,16 +292,12 @@ impl Session {
             let package: Vec<u8> = self.buffer.drain(..total).collect();
             let body = package[rtde::HEADER_SIZE..].to_vec();
 
+            // Keep only the newest sample. Any other package is C++'s
+            // "skipping package(2)": a handshake reply that landed here after
+            // a shifted handshake is dropped, not acted on.
             if header.cmd == rtde::cmd::DATA_PACKAGE {
-                // Keep only the newest; older samples are superseded.
                 latest = Some(self.recipe.decode(&body)?);
-            } else {
-                pending.push((header.cmd, body));
             }
-        }
-
-        for (cmd, body) in pending {
-            self.apply_control_package(cmd, &body)?;
         }
 
         Ok(latest)
@@ -448,6 +435,12 @@ mod tests {
             matches!(&err, UrError::VariablesNotFound(v) if v == "payload_inertia"),
             "got {err:?}"
         );
+        assert!(
+            err.to_string().starts_with(
+                "The following variables was not found by the controller: [payload_inertia],\n"
+            ),
+            "{err}"
+        );
         jh.join().unwrap();
     }
 
@@ -467,18 +460,64 @@ mod tests {
         jh.join().unwrap();
     }
 
+    /// URSim queues "SafetySetup has not been confirmed yet" behind the
+    /// protocol reply. C++ reads one package per request, so the first version
+    /// query gets the text message (all-zero version), the second gets the
+    /// first answer, and every later reply lands one request late: the output
+    /// setup's NOT_FOUND check runs on the start request, and the start reply
+    /// is never read during the handshake.
     #[test]
-    fn input_setup_returns_the_recipe_id() {
+    fn a_queued_text_message_shifts_every_reply_by_one_package() {
+        let mut version_body = Vec::new();
+        for v in [5u32, 26, 0, 0] {
+            version_body.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut text = vec![74u8];
+        text.extend_from_slice(b"SafetySetup has not been confirmed yet");
+        let mut setup_reply = vec![1u8];
+        setup_reply.extend_from_slice(b"DOUBLE,NOT_FOUND");
+        let frame = rtde::encode_frame;
+
         let (port, jh) = spawn_controller(
-            vec![(rtde::cmd::CONTROL_PACKAGE_SETUP_INPUTS, vec![3, b'I'])],
-            vec![],
+            vec![
+                (rtde::cmd::REQUEST_PROTOCOL_VERSION, vec![1]),
+                (rtde::cmd::TEXT_MESSAGE, text),
+                (rtde::cmd::GET_URCONTROL_VERSION, version_body.clone()),
+                (rtde::cmd::GET_URCONTROL_VERSION, version_body),
+                (rtde::cmd::CONTROL_PACKAGE_SETUP_INPUTS, vec![1, b'I']),
+                (rtde::cmd::CONTROL_PACKAGE_SETUP_OUTPUTS, setup_reply),
+            ],
+            vec![frame(rtde::cmd::CONTROL_PACKAGE_START, &[1])],
         );
         let mut s = session_on(port);
+        // The protocol reply and the text message arrive together.
+        s.negotiate_protocol_version().unwrap();
         assert_eq!(
-            s.send_input_setup(&["input_int_register_0".into()])
-                .unwrap(),
-            3
+            s.controller_version().unwrap(),
+            ControllerVersion::default()
         );
+        let v = s.controller_version().unwrap();
+        assert_eq!((v.major, v.minor), (5, 26));
+        s.send_output_setup(&["timestamp".into(), "robot_mode".into()], 125.0)
+            .unwrap();
+        s.send_input_setup(&["input_int_register_0".into()])
+            .unwrap();
+        let err = s.send_start().unwrap_err();
+        assert!(
+            matches!(&err, UrError::VariablesNotFound(v) if v == "robot_mode"),
+            "got {err:?}"
+        );
+        assert!(!s.is_started());
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_start_is_printed_not_returned() {
+        let (port, jh) =
+            spawn_controller(vec![(rtde::cmd::CONTROL_PACKAGE_START, vec![0])], vec![]);
+        let mut s = session_on(port);
+        s.send_start().unwrap();
+        assert!(!s.is_started());
         jh.join().unwrap();
     }
 

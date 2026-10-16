@@ -6,6 +6,12 @@
 
 # autosave state written at runtime by create_monitor_set
 /iocs/*/autosave/
+# quadEM ships each IOC its autosave dir with a README placeholder, as C does
+/iocs/quadem/*/autosave/*
+!/iocs/quadem/*/autosave/README
+# so do the areaDetector IOCs, as C's iocBoot dirs do
+/iocs/ad/*/autosave/*
+!/iocs/ad/*/autosave/README
 
 # procServ console log written at runtime by the systemd units
 /iocs/*/procServ-*.log

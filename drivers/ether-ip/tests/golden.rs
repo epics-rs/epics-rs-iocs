@@ -424,16 +424,44 @@ fn decode_negative_int() {
     assert_eq!(get_double(&i, 0), Some(-3.0)); // C: 65533
 }
 
-/// UPSTREAM FIX (`ether_ip.c:1277-1281` and `:1361-1365`): SINT is read through
-/// an unsigned `CN_USINT` in BOTH `get_CIP_double` and `get_CIP_DINT`, even
-/// though `ether_ip.h:197` declares `typedef signed char CN_SINT`. A SINT of -2
-/// reaches an `ai` record as 254 in the C.
+/// `get_CIP_DINT` reads SINT through an unsigned `CN_USINT`
+/// (ether_ip.c:1361-1365), so a SINT of -2 reaches an `ai` record as 254.
 #[test]
 fn decode_negative_sint() {
     let s = raw(CipType::Sint, &[0xFE]);
-    assert_eq!(get_dint(&s, 0), Some(-2)); // C: 254
+    assert_eq!(get_dint(&s, 0), Some(254));
     assert_eq!(get_double(&s, 0), Some(-2.0)); // C: 254
     assert_eq!(get_usint(&s, 0), Some(0xFE)); // the raw byte, for waveforms
+}
+
+/// `get_CIP_DINT` (ether_ip.c:1366-1384): UINT through a signed `CN_INT`,
+/// floats by x86 C cast, no LINT.
+#[test]
+fn get_dint_converts_as_get_cip_dint() {
+    assert_eq!(get_dint(&raw(CipType::Uint, &[0xFF, 0xFF]), 0), Some(-1));
+    assert_eq!(
+        get_dint(&raw(CipType::Real, &3e9f32.to_le_bytes()), 0),
+        Some(i32::MIN)
+    );
+    assert_eq!(
+        get_dint(&raw(CipType::Lreal, &(-7.9f64).to_le_bytes()), 0),
+        Some(-7)
+    );
+    assert_eq!(get_dint(&raw(CipType::Lint, &5i64.to_le_bytes()), 0), None);
+}
+
+/// `get_CIP_UDINT` (ether_ip.c:1331-1338) casts floats as x86 C does: the
+/// 64-bit convert, low 32 bits.
+#[test]
+fn get_udint_casts_floats_as_get_cip_udint() {
+    assert_eq!(
+        get_udint(&raw(CipType::Real, &(-1.0f32).to_le_bytes()), 0),
+        Some(u32::MAX)
+    );
+    assert_eq!(
+        get_udint(&raw(CipType::Lreal, &5e9f64.to_le_bytes()), 0),
+        Some(705_032_704)
+    );
 }
 
 #[test]

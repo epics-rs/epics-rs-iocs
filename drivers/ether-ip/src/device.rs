@@ -15,16 +15,20 @@ use std::sync::Arc;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, IoIntrAction,
+    WriteStart,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
-use epics_rs::base::server::recgbl::alarm_status;
-use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType, menu_scan};
+use epics_rs::base::server::recgbl::{alarm_status, rec_gbl_record_error};
+use epics_rs::base::server::record::{
+    AlarmSeverity, CommonFields, ProcessContext, Record, SCAN_1ST_PERIODIC, ScanType, menu_scan,
+};
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
-use crate::driver::{self, Plc, TagInfo};
+use crate::driver::{self, Listener, Plc, TagInfo};
 
 pub const DTYP: &str = "EtherIP";
 pub const DTYP_RESET: &str = "EtherIPReset";
@@ -69,8 +73,9 @@ pub struct Link {
     /// First bit of interest, for the (multi-)bit records.
     pub mask: u32,
     pub special: u32,
-    /// Explicit `S <period>`; None means "take the record's SCAN".
-    pub period: Option<f64>,
+    /// The scan period: the `S` flag's, else the record's SCAN, else the
+    /// default rate.
+    pub period: f64,
     /// How many elements the driver must fetch for this record.
     pub elements: usize,
 }
@@ -84,130 +89,228 @@ impl Link {
     }
 }
 
-/// Parse `@PLC tag[element] flags...`.
+/// C `special_options`, matched in this order as a prefix of the rest of the
+/// link: `S ` and `B ` need the space, every other flag matches any token it
+/// begins.
+const SPECIAL_OPTIONS: [(&str, u32); 13] = [
+    ("E", spco::READ_SINGLE_ELEMENT),
+    ("S ", spco::SCAN_PERIOD),
+    ("B ", spco::BIT),
+    ("FORCE", spco::FORCE),
+    ("PLC_ERRORS", spco::PLC_ERRORS),
+    ("PLC_TASK_SLOW", spco::PLC_TASK_SLOW),
+    ("LIST_ERRORS", spco::LIST_ERRORS),
+    ("LIST_TICKS", spco::LIST_TICKS),
+    ("LIST_SCAN_TIME", spco::LIST_SCAN_TIME),
+    ("LIST_MIN_SCAN_TIME", spco::LIST_MIN_SCAN_TIME),
+    ("LIST_MAX_SCAN_TIME", spco::LIST_MAX_SCAN_TIME),
+    ("TAG_TRANSFER_TIME", spco::TAG_TRANSFER_TIME),
+    ("LIST_TIME", spco::LIST_TIME),
+];
+
+/// C `find_token`: skip spaces, then the token runs to the next space.
+fn find_token(text: &str, from: usize) -> Option<(usize, usize)> {
+    let start = from + text[from..].len() - text[from..].trim_start_matches(' ').len();
+    if start >= text.len() {
+        return None;
+    }
+    let end = text[start..].find(' ').map_or(text.len(), |n| start + n);
+    Some((start, end))
+}
+
+/// C `analyze_link` on `@PLC tag[element] flags...`, failing with the text C
+/// prints after `devEtherIP (<record>): `.
 ///
 /// `count` is the number of array elements the record wants (1, or NELM for a
 /// waveform); `bits` is >0 for the (multi-)bit records and is then the number
-/// of bits (NOBT, or 1 for bi/bo).
-pub fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String> {
+/// of bits (NOBT, or 1 for bi/bo). C resolves the period and finds the PLC
+/// between its parsing steps, so a link that fails later still printed those
+/// steps' lines first: `period_of` runs when no positive `S` period was
+/// given, `find_plc` once the tag is split.
+pub fn analyze_link<P>(
+    text: &str,
+    count: usize,
+    bits: usize,
+    period_of: impl FnOnce() -> f64,
+    find_plc: impl FnOnce(&str) -> Option<P>,
+) -> Result<(Link, P), String> {
     let text = text.strip_prefix('@').unwrap_or(text);
-    let tokens: Vec<&str> = text.split_whitespace().collect();
-
-    let plc_name = (*tokens.first().ok_or("missing PLC in link")?).to_string();
-    let tag_text = *tokens.get(1).ok_or("missing tag in link")?;
+    let (p, end) = find_token(text, 0).ok_or_else(|| format!("Missing PLC in link '{text}'"))?;
+    let plc_name = text[p..end].to_string();
+    let (p, mut end) =
+        find_token(text, end).ok_or_else(|| format!("Missing tag in link '{text}'"))?;
+    let tag_text = &text[p..end];
 
     let mut special = 0u32;
-    let mut period = None;
-    let mut bit = 0u32;
-
-    let mut i = 2;
-    while i < tokens.len() {
-        let t = tokens[i];
-        match t {
-            "E" => {
+    let mut period = 0.0f64;
+    let mut bit = 0usize;
+    let mut single_element = false;
+    while let Some((p, e)) = find_token(text, end) {
+        end = e;
+        let rest = &text[p..];
+        let Some(&(_, mask)) = SPECIAL_OPTIONS.iter().find(|(o, _)| rest.starts_with(o)) else {
+            return Err(format!("Invalid flag '{rest}' in link '{text}'"));
+        };
+        special |= mask;
+        match mask {
+            spco::READ_SINGLE_ELEMENT => {
                 if count != 1 {
-                    return Err(format!("array record cannot use the 'E' flag ('{text}')"));
+                    return Err(format!("Array record cannot use 'E' flag ('{text}')"));
                 }
-                special |= spco::READ_SINGLE_ELEMENT;
+                single_element = true;
             }
-            "S" => {
-                let v = tokens.get(i + 1).ok_or("'S' flag needs a scan period")?;
-                period = Some(
-                    v.parse::<f64>()
-                        .map_err(|_| format!("bad scan period '{v}' in link '{text}'"))?,
-                );
-                special |= spco::SCAN_PERIOD;
-                i += 1;
+            // strtod: no number leaves 0 and resumes the scan right after the
+            // flag, so the unparsed text comes back as the next token.
+            spco::SCAN_PERIOD => {
+                let (v, n) = strtod(&text[p + 2..]);
+                if v.is_infinite() {
+                    return Err(format!("Error in scan flag in link '{text}'"));
+                }
+                period = v;
+                end = p + 2 + n;
             }
-            "B" => {
-                let v = tokens.get(i + 1).ok_or("'B' flag needs a bit number")?;
-                bit = v
-                    .parse::<u32>()
-                    .map_err(|_| format!("bad bit number '{v}' in link '{text}'"))?;
-                special |= spco::BIT;
-                i += 1;
+            // C tests `period` here, not `bit` (devEtherIP.c:974), and an
+            // infinite period already failed above: a bit flag never fails.
+            spco::BIT => {
+                let (v, n) = strtod(&text[p + 2..]);
+                // Only the low five bits reach the mask.
+                bit = size_t_from_double(v) as usize;
+                end = p + 2 + n;
             }
-            "FORCE" => special |= spco::FORCE,
-            "PLC_ERRORS" => special |= spco::PLC_ERRORS,
-            "PLC_TASK_SLOW" => special |= spco::PLC_TASK_SLOW,
-            "LIST_ERRORS" => special |= spco::LIST_ERRORS,
-            "LIST_TICKS" => special |= spco::LIST_TICKS,
-            "LIST_SCAN_TIME" => special |= spco::LIST_SCAN_TIME,
-            "LIST_MIN_SCAN_TIME" => special |= spco::LIST_MIN_SCAN_TIME,
-            "LIST_MAX_SCAN_TIME" => special |= spco::LIST_MAX_SCAN_TIME,
-            "TAG_TRANSFER_TIME" => special |= spco::TAG_TRANSFER_TIME,
-            "LIST_TIME" => special |= spco::LIST_TIME,
-            other => return Err(format!("invalid flag '{other}' in link '{text}'")),
+            _ => {}
         }
-        i += 1;
+    }
+
+    // C keeps a NaN period (`period <= 0.0` is false); a NaN cannot schedule
+    // a scan list here, so it falls through like any non-positive one.
+    if period <= 0.0 || period.is_nan() {
+        period = period_of();
     }
 
     // Split "array_tag[el]" into "array_tag" + el, unless 'E' asked for the
     // element to stay in the tag path (so the PLC does the indexing).
-    let single_element = special & spco::READ_SINGLE_ELEMENT != 0;
     let mut string_tag = tag_text.to_string();
     let mut element = 0usize;
-
-    if !single_element && string_tag.ends_with(']') {
-        let open = string_tag
-            .rfind('[')
-            .ok_or_else(|| format!("malformed array tag in '{text}'"))?;
-        if open == 0 {
-            return Err(format!("malformed array tag in '{text}'"));
+    if tag_text.ends_with(']') && !single_element {
+        let malformed = || format!("malformed array tag in '{text}'");
+        let open = match tag_text[..tag_text.len() - 1].rfind('[') {
+            Some(open) if open > 0 => open,
+            _ => return Err(malformed()),
+        };
+        let (v, n) = strtol(&tag_text[open + 1..]);
+        if n == 0 || v == i64::MAX || v == i64::MIN {
+            return Err(malformed());
         }
-        let idx = &string_tag[open + 1..string_tag.len() - 1];
-        element = idx
-            .parse::<usize>()
-            .map_err(|_| format!("malformed array tag in '{text}'"))?;
+        // A negative index wraps as C's size_t does.
+        element = v as usize;
         special |= spco::INDEX_INCLUDED;
         string_tag.truncate(open);
     }
 
+    let plc = find_plc(&plc_name).ok_or_else(|| format!("unknown PLC '{plc_name}'"))?;
+
     if count > 1 && (bits > 0 || special & spco::BIT != 0) {
-        return Err(format!("cannot access bits for array records ('{text}')"));
+        return Err("cannot access bits for array records".to_string());
     }
 
     let mask;
     let last_element;
     if bits > 0 && special & spco::BIT == 0 {
-        // A binary record with no explicit bit number: the tag is a BOOL array,
-        // which Logix packs into UDINTs. The requested element is a *bit*
-        // index, so it folds into a UDINT index plus a mask.
-        //
-        // UPSTREAM FIX: the C (`devEtherIP.c:1094`) uses `mask = 255` for the
-        // no-index case regardless of `bits`. That is only meaningful for a
-        // single bit -- get_bits then reads "any of the low 8 bits set", the
-        // 0/0xFF BOOL encoding -- and `get_bits` carries a matching
-        // `if (bits == 1)` special case. For NOBT > 1 the mask is shifted left
-        // each iteration, so bit 1 is selected by 0x1FE: it aliases eight bits
-        // at once and cannot represent "bit i" at all. There is exactly one
-        // mask that can: 1. Setting it here makes `get_bits`/`put_bits` a
-        // single uniform rule with no `bits == 1` boundary case.
+        // A binary record with no explicit bit number: an indexed tag is a
+        // BOOL array, which Logix packs into UDINTs, so the bit index folds
+        // into a UDINT index plus a mask; an unindexed one reads from bit 0.
+        // C defect not copied: devEtherIP.c:1101 masks it 255, so bit 0 of a
+        // bi read as the OR of bits 0-7 and a bo wrote 255.
         mask = if special & spco::INDEX_INCLUDED != 0 {
             1u32 << (element & 0x1F)
-        } else if bits == 1 {
-            0xFF
         } else {
             1
         };
-        last_element = (element + bits - 1) >> 5;
+        last_element = element.wrapping_add(bits - 1) >> 5;
         element >>= 5;
     } else {
         // No binary record, or an explicit bit number: the element is a real
-        // array index and the bit is selected by `B <bit>`.
+        // array index and the bit is selected by `B <bit>` (x86 `shl` takes
+        // the count mod 32).
         last_element = element;
-        mask = 1u32 << bit;
+        mask = 1u32.wrapping_shl(bit as u32);
     }
 
-    Ok(Link {
+    let link = Link {
         plc_name,
         string_tag,
         element,
         mask,
         special,
         period,
-        elements: last_element + count,
-    })
+        elements: last_element.wrapping_add(count),
+    };
+    Ok((link, plc))
+}
+
+/// C's `size_t bit = strtod(...)` as gcc compiles it for x86-64: a negative
+/// value wraps (so `B -1` selects bit 31 through `1U << bit`), and NaN or
+/// anything past 2^64 becomes 2^63.
+fn size_t_from_double(v: f64) -> u64 {
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if v > -TWO_63 && v < TWO_63 {
+        v as i64 as u64
+    } else if (TWO_63..2.0 * TWO_63).contains(&v) {
+        ((v - TWO_63) as i64 as u64) | (1 << 63)
+    } else {
+        1 << 63
+    }
+}
+
+/// C `strtod`: the value and how many bytes it took, `(0.0, 0)` when it
+/// takes nothing.
+fn strtod(text: &str) -> (f64, usize) {
+    let t = text.trim_start();
+    let skipped = text.len() - t.len();
+    (1..=t.len())
+        .rev()
+        .filter(|&n| t.is_char_boundary(n))
+        .find_map(|n| t[..n].parse::<f64>().ok().map(|v| (v, skipped + n)))
+        .unwrap_or((0.0, 0))
+}
+
+/// C `strtol(text, &end, 0)`: the value, saturated to `i64::MIN..=MAX` as
+/// `LONG_MIN`/`LONG_MAX`, and how many bytes it took (0 for none).
+fn strtol(text: &str) -> (i64, usize) {
+    let b = text.as_bytes();
+    let mut i = b.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    let negative = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let (radix, digits_at) = match (b.get(i), b.get(i + 1)) {
+        (Some(b'0'), Some(b'x' | b'X')) if b.get(i + 2).is_some_and(u8::is_ascii_hexdigit) => {
+            (16, i + 2)
+        }
+        (Some(b'0'), _) => (8, i),
+        _ => (10, i),
+    };
+    let n = b[digits_at..]
+        .iter()
+        .take_while(|c| (**c as char).is_digit(radix))
+        .count();
+    if n == 0 {
+        return (0, 0);
+    }
+    let digits = &text[digits_at..digits_at + n];
+    let v = i128::from_str_radix(digits, radix).unwrap_or(i128::MAX);
+    let v = if negative { -v } else { v };
+    (
+        v.clamp(i64::MIN.into(), i64::MAX.into()) as i64,
+        digits_at + n,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -216,14 +319,12 @@ pub fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String>
 
 /// Gather `bits` consecutive bits out of the BOOL array starting at
 /// `element`/`mask`, packing them into an RVAL.
-///
-/// A multi-bit read tests its first bit as `(value & 0x1) & mask`
-/// (devEtherIP.c:209-216), so RVAL bit 0 is 0 unless `mask` covers bit 0.
 fn get_bits(raw: &[u8], mut element: usize, mut mask: u32, bits: usize) -> Option<u32> {
     let mut value = cip::get_udint(raw, element)?;
     let mut rval = 0u32;
-    let first = if bits == 1 { value } else { value & 0x1 };
-    if first & mask != 0 {
+    // C defect not copied: devEtherIP.c:213-215 tests a multi-bit read's
+    // first bit as `(value & 0x1) & mask`, bit 0 instead of the mask's bit.
+    if value & mask != 0 {
         rval |= 1;
     }
     for i in 1..bits {
@@ -292,6 +393,7 @@ pub struct EtherIpDevice {
     link: Option<Link>,
     plc: Option<Arc<Plc>>,
     tag: Option<Arc<TagInfo>>,
+    listener: Option<Arc<Listener>>,
     io_intr_rx: Option<mpsc::Receiver<()>>,
     alarm: Option<(u16, u16)>,
 }
@@ -307,6 +409,7 @@ impl EtherIpDevice {
             link: None,
             plc: None,
             tag: None,
+            listener: None,
             io_intr_rx: None,
             alarm: None,
         }
@@ -346,7 +449,8 @@ impl EtherIpDevice {
         if s & spco::TAG_TRANSFER_TIME != 0 {
             return Some(tag.data.lock().transfer_time);
         }
-        let stats = tag.list_stats.lock();
+        let stats = tag.list_stats();
+        let stats = stats.lock();
         if s & spco::LIST_ERRORS != 0 {
             return Some(stats.list_errors as f64);
         }
@@ -387,8 +491,9 @@ fn get_period(name: &str, scan: ScanType) -> Option<f64> {
     let label = menu_scan().label_at(index)?;
     let period = label
         .contains("second")
-        .then(|| strtod_prefix(label))
-        .flatten()
+        .then(|| strtod(label))
+        .filter(|&(_, n)| n > 0)
+        .map(|(v, _)| v)
         .filter(|p| p.is_finite());
     crate::eip_printf!(
         8,
@@ -396,16 +501,6 @@ fn get_period(name: &str, scan: ScanType) -> Option<f64> {
         period.unwrap_or(-1.0)
     );
     period
-}
-
-/// The number `strtod` takes off the front of `text`, or None when it takes
-/// nothing.
-fn strtod_prefix(text: &str) -> Option<f64> {
-    let t = text.trim_start();
-    (1..=t.len())
-        .rev()
-        .filter(|&n| t.is_char_boundary(n))
-        .find_map(|n| t[..n].parse::<f64>().ok())
 }
 
 impl DeviceSupport for EtherIpDevice {
@@ -424,7 +519,7 @@ impl DeviceSupport for EtherIpDevice {
 
     // Every C init_record/analyze_link failure returns an `S_*` status after
     // an errlogPrintf, never touching pact (`devEtherIP.c:884-1007,1183-1205`)
-    // — the record scans on: the `Err` shape, kept by every `?` below.
+    // — the record scans on: the `Err` shape.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         // C's mbbi/mbbo(Direct) `init_record` zero SHFT (devEtherIP.c:1331,
         // 1355,1563,1597): the tag's NOBT bits are the raw value, unshifted.
@@ -435,51 +530,52 @@ impl DeviceSupport for EtherIpDevice {
             record.put_field("SHFT", EpicsValue::UShort(0))?;
         }
         let (bits, count) = record_shape(record);
-        let link = parse_link(&self.link_text, count, bits)
-            .map_err(|e| CaError::InvalidValue(format!("devEtherIP: {e}")))?;
+        let name = self.name.clone();
+        let fail = |msg: String| {
+            errlog_vprintf(format_args!("devEtherIP ({name}): {msg}\n"));
+            Err(CaError::InvalidValue(msg))
+        };
+        if !driver::initialized() {
+            return fail("Failed to all drvEtherIP_init()".to_string());
+        }
+        let (link, plc) = match analyze_link(
+            &self.link_text,
+            count,
+            bits,
+            // devEtherIP.c:1021-1035: a non-positive period at each step
+            // falls through to the next.
+            || {
+                get_period(&name, self.scan)
+                    .filter(|p| *p > 0.0)
+                    .or_else(|| Some(driver::default_rate()).filter(|p| *p > 0.0))
+                    .unwrap_or_else(|| {
+                        errlog_vprintf(format_args!(
+                            "devEtherIP ({name}): cannot decode SCAN field, no scan flag given\n"
+                        ));
+                        errlog_vprintf(format_args!(
+                            "Device support will use the default of 1 secs, "
+                        ));
+                        errlog_vprintf(format_args!("please complete the record configuration\n"));
+                        1.0
+                    })
+            },
+            driver::find_plc,
+        ) {
+            Ok(found) => found,
+            Err(msg) => return fail(msg),
+        };
 
-        let plc = driver::find_plc(&link.plc_name).ok_or_else(|| {
-            CaError::InvalidValue(format!("devEtherIP: unknown PLC '{}'", link.plc_name))
-        })?;
-
-        // devEtherIP.c:1021-1035: a non-positive period at each step falls
-        // through to the next.
-        let positive = |p: &f64| *p > 0.0;
-        let period = link
-            .period
-            .filter(positive)
-            .or_else(|| get_period(&self.name, self.scan).filter(positive))
-            .or_else(
-                || match driver::DEFAULT_RATE_MS.load(std::sync::atomic::Ordering::Relaxed) {
-                    0 => None,
-                    ms => Some(ms as f64 / 1000.0),
-                },
-            )
-            .unwrap_or_else(|| {
-                errlog_vprintf(format_args!(
-                    "devEtherIP ({}): cannot decode SCAN field, no scan flag given\n",
-                    self.name
-                ));
-                errlog_vprintf(format_args!(
-                    "Device support will use the default of 1 secs, "
-                ));
-                errlog_vprintf(format_args!("please complete the record configuration\n"));
-                1.0
-            });
-
-        let tag = plc
-            .add_tag(period, &link.string_tag, link.elements)
-            .ok_or_else(|| {
-                CaError::InvalidValue(format!(
-                    "devEtherIP: cannot register tag '{}'",
-                    link.string_tag
-                ))
-            })?;
+        let Some(tag) = plc.add_tag(link.period, &link.string_tag, link.elements) else {
+            return fail(format!(
+                "cannot register tag '{}' with driver",
+                link.string_tag
+            ));
+        };
 
         // One I/O Intr pulse per new tag value. Depth 1: a pending pulse
         // already says "re-read", and the record reads the current value.
         let (tx, rx) = mpsc::channel(1);
-        tag.add_listener(tx);
+        self.listener = Some(tag.add_listener(tx));
         self.io_intr_rx = Some(rx);
 
         self.link = Some(link);
@@ -504,6 +600,49 @@ impl DeviceSupport for EtherIpDevice {
         self.is_output
     }
 
+    /// C `check_ao_callback` & friends (devEtherIP.c:326-437): copy a new
+    /// PLC value into the record, then process it only if it changed and is
+    /// not periodic (`scanOnce` for `scan < SCAN_1ST_PERIODIC`). A failed
+    /// get, or an unchanged value, leaves the record alone.
+    fn io_intr_callback(
+        &mut self,
+        record: &mut dyn Record,
+        common: &mut CommonFields,
+    ) -> IoIntrAction {
+        // Inputs: C's scan_callback is a bare scanIoRequest.
+        if !self.is_output {
+            return IoIntrAction::Process;
+        }
+        // A write in flight ends on the driver's transfer callback; the
+        // readback pass bails on PACT as before.
+        if self
+            .listener
+            .as_ref()
+            .is_some_and(|l| l.write_done.lock().is_some())
+        {
+            return IoIntrAction::Process;
+        }
+        let refresh = common.udf != 0 || common.sevr == AlarmSeverity::Invalid;
+        let follow = match self.follow_plc(record, refresh, common.udf == 0, false) {
+            Ok(follow) => follow,
+            Err(_) => return IoIntrAction::Skip,
+        };
+        let process = match follow {
+            Follow::NoData => return IoIntrAction::Process,
+            Follow::GetFailed | Follow::Same => false,
+            Follow::Copied => {
+                common.udf = 0;
+                true
+            }
+            Follow::Forced => true,
+        };
+        if process && common.scan.to_u16() < SCAN_1ST_PERIODIC {
+            IoIntrAction::Process
+        } else {
+            IoIntrAction::Skip
+        }
+    }
+
     fn last_alarm(&self) -> Option<DeviceAlarm<'_>> {
         let (stat, sevr) = self.alarm?;
         Some(DeviceAlarm {
@@ -518,8 +657,17 @@ impl DeviceSupport for EtherIpDevice {
             return self.readback(record);
         }
 
-        // Driver statistics do not touch the tag's value at all.
+        // Driver statistics do not touch the tag's value, but C reads them
+        // inside `lock_data` (devEtherIP.c:1642), so a tag without data fails
+        // them like any read: READ_ALARM and status 0, which converts RVAL.
         if self.link.as_ref().is_some_and(Link::is_statistic) {
+            let has_data = self.bound().is_some_and(|(tag, link)| {
+                tag.data.lock().has_value() && *tag.elements.lock() > link.element
+            });
+            if !has_data {
+                self.read_alarm();
+                return Ok(DeviceReadOutcome::ok());
+            }
             return match self.statistic() {
                 Some(v) => {
                     self.no_alarm();
@@ -558,9 +706,6 @@ impl DeviceSupport for EtherIpDevice {
                             .map(|v| (EpicsValue::Long(v), false))
                             .ok_or(()),
                     },
-                    "longin" => cip::get_dint(raw, element)
-                        .map(|v| (EpicsValue::Long(v), true))
-                        .ok_or(()),
                     "int64in" => cip::get_lint(raw, element)
                         .map(|v| (EpicsValue::Int64(v), true))
                         .ok_or(()),
@@ -576,7 +721,15 @@ impl DeviceSupport for EtherIpDevice {
                     "lsi" => cip::get_string(raw, element, count_field(record, "SIZV"))
                         .map(|s| (EpicsValue::String(s.into()), true))
                         .ok_or(()),
-                    "waveform" => read_waveform(raw, element, record).map(|v| (v, true)),
+                    "waveform" => match read_waveform(raw, elements, record, &self.name) {
+                        Ok(Some(v)) => Ok((v, true)),
+                        Ok(None) => {
+                            drop(data);
+                            self.no_alarm();
+                            return Ok(DeviceReadOutcome::ok());
+                        }
+                        Err(()) => Err(()),
+                    },
                     _ => Err(()),
                 }
             }
@@ -589,10 +742,9 @@ impl DeviceSupport for EtherIpDevice {
                     record.set_val(value)?;
                     // C parity: ai_read, si_read and lsi_read write
                     // udf = FALSE on a good read; int64in_read and wf_read
-                    // never touch udf. longin has no C dset and follows
-                    // its LINT twin int64in.
+                    // never touch udf.
                     let udf = match rtype {
-                        "longin" | "int64in" | "waveform" => DeviceUdf::Untouched,
+                        "int64in" | "waveform" => DeviceUdf::Untouched,
                         _ => DeviceUdf::Defined,
                     };
                     Ok(DeviceReadOutcome::computed(udf))
@@ -609,9 +761,35 @@ impl DeviceSupport for EtherIpDevice {
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        self.stage_write(record, None).map(|_| ())
+    }
+
+    /// C's `*_write` first pass: a staged write leaves the record PACT until
+    /// the driver's next transfer ends it, without a readback.
+    fn write_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        Ok(if self.stage_write(record, Some(done))? {
+            WriteStart::Pending
+        } else {
+            WriteStart::Completed
+        })
+    }
+}
+
+impl EtherIpDevice {
+    /// Stage the record's value in the tag buffer and flag the write; true
+    /// when a write was flagged and `done` now waits on the next transfer.
+    fn stage_write(
+        &mut self,
+        record: &mut dyn Record,
+        done: Option<&DeviceDoneSource<'_>>,
+    ) -> CaResult<bool> {
         let Some((tag, link)) = self.bound() else {
             self.write_alarm();
-            return Ok(());
+            return Ok(false);
         };
         let (element, mask) = (link.element, link.mask);
         let rtype = record.record_type();
@@ -621,7 +799,7 @@ impl DeviceSupport for EtherIpDevice {
         if !data.has_value() || elements <= element {
             drop(data);
             self.write_alarm();
-            return Ok(());
+            return Ok(false);
         }
 
         // Stage the record's value in the tag buffer, but only when it differs
@@ -646,14 +824,6 @@ impl DeviceSupport for EtherIpDevice {
                     }
                 }
             },
-            "longout" => {
-                let val = i32_field(record, "VAL");
-                match cip::get_dint(&data.buf, element) {
-                    Some(cur) if cur == val => false,
-                    Some(_) => cip::put_dint(&mut data.buf, element, val),
-                    None => false,
-                }
-            }
             "int64out" => {
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::Int64(v)) => v,
@@ -689,203 +859,240 @@ impl DeviceSupport for EtherIpDevice {
             _ => {
                 drop(data);
                 self.write_alarm();
-                return Ok(());
+                return Ok(false);
             }
         };
 
         if changed {
             tag.request_write(&mut data, &self.name);
+            if let (Some(done), Some(listener)) = (done, &self.listener) {
+                *listener.write_done.lock() = Some((done.device_done(), done.priority()));
+            }
         }
         drop(data);
         self.no_alarm();
-        Ok(())
+        Ok(changed && done.is_some())
+    }
+
+    /// The readback pass of an output record the callback asked to process:
+    /// C's `ao_write` & co. on a record that already holds the PLC's value,
+    /// or, with `FORCE`, stages the record's value for the next scan.
+    ///
+    /// With no data C's callback processes the record, so that failure is the
+    /// one `ao_write` & co. raise: WRITE_ALARM (devEtherIP.c:1949,1993). A get
+    /// that fails on data raises nothing (devEtherIP.c:360,386).
+    fn readback(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+        let forced = self.udf == 0;
+        match self.follow_plc(record, false, forced, true)? {
+            Follow::NoData => {
+                self.write_alarm();
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
+            }
+            Follow::GetFailed => {
+                self.alarm = None;
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched))
+            }
+            // C's check_*_callbacks write udf = FALSE only when they copy the
+            // PLC value in, but their update condition includes `rec->udf`, so
+            // every pass that got this far ends with udf == 0: udf = 1 forces
+            // the copy branch (FORCE requires !udf), and the skip/force paths
+            // only run with udf already 0.
+            Follow::Same | Follow::Copied | Follow::Forced => {
+                self.no_alarm();
+                Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
+            }
+        }
     }
 }
 
+/// What [`EtherIpDevice::follow_plc`] found.
+#[derive(Debug, PartialEq, Eq)]
+enum Follow {
+    /// No tag, no value yet, or the element is past the tag's end.
+    NoData,
+    /// The tag holds data the record's type cannot be read from.
+    GetFailed,
+    Same,
+    /// The PLC's value was copied into the record.
+    Copied,
+    /// The PLC differs and FORCE keeps the record's value.
+    Forced,
+}
+
 impl EtherIpDevice {
-    /// The output half of the driver callback: a new PLC value arrived, so the
-    /// record follows it (C `check_ao_callback` & friends). With `FORCE` the
-    /// record wins instead -- its value is staged for the next scan.
-    fn readback(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
+    /// Compare the PLC's value with the record's, `refresh` counting as a
+    /// difference (C's `rec->udf || rec->sevr == INVALID_ALARM`). A
+    /// difference is copied into the record unless the link's `FORCE`
+    /// applies (`udf_clear`, C's `!rec->udf`); then `stage` writes the
+    /// record's value to the PLC, which C leaves to `ao_write` & co.
+    fn follow_plc(
+        &mut self,
+        record: &mut dyn Record,
+        refresh: bool,
+        udf_clear: bool,
+        stage: bool,
+    ) -> CaResult<Follow> {
         let Some((tag, link)) = self.bound() else {
-            self.read_alarm();
-            return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
+            return Ok(Follow::NoData);
         };
-        let (element, mask, forced) = (link.element, link.mask, link.forced());
+        let (element, mask) = (link.element, link.mask);
+        let force = link.forced() && udf_clear;
         let rtype = record.record_type();
 
         let mut data = tag.data.lock();
         let elements = *tag.elements.lock();
         if !data.has_value() || elements <= element {
-            drop(data);
-            self.read_alarm();
-            return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
+            return Ok(Follow::NoData);
         }
 
-        let force = forced && self.udf == 0;
+        // Per type: the PLC's value, whether it differs, how to copy it in,
+        // and how to stage the record's own value instead.
+        macro_rules! follow {
+            ($plc:expr, $differs:expr, $stage:expr, $copy:expr) => {{
+                let Some(plc) = $plc else {
+                    return Ok(Follow::GetFailed);
+                };
+                if !(refresh || $differs(&plc)) {
+                    return Ok(Follow::Same);
+                }
+                if force {
+                    if stage && $differs(&plc) {
+                        $stage(&mut data.buf);
+                        tag.request_write(&mut data, &self.name);
+                    }
+                    return Ok(Follow::Forced);
+                }
+                drop(data);
+                $copy(plc)?;
+                return Ok(Follow::Copied);
+            }};
+        }
 
         match rtype {
             "ao" => match cip::typecode(&data.buf) {
                 Some(CipType::Real) | Some(CipType::Lreal) => {
-                    let Some(plc) = cip::get_double(&data.buf, element) else {
-                        drop(data);
-                        self.read_alarm();
-                        return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-                    };
                     let val = f64_field(record, "VAL");
-                    if plc != val {
-                        if force {
-                            cip::put_double(&mut data.buf, element, val);
-                            tag.request_write(&mut data, &self.name);
-                        } else {
-                            record.set_val(EpicsValue::Double(plc))?;
-                        }
-                    }
+                    follow!(
+                        cip::get_double(&data.buf, element),
+                        |plc: &f64| *plc != val,
+                        |buf: &mut Vec<u8>| cip::put_double(buf, element, val),
+                        |plc: f64| record.set_val(EpicsValue::Double(plc))
+                    )
                 }
                 _ => {
-                    let Some(plc) = cip::get_dint(&data.buf, element) else {
-                        drop(data);
-                        self.read_alarm();
-                        return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-                    };
                     let rval = i32_field(record, "RVAL");
-                    if plc != rval {
-                        if force {
-                            cip::put_dint(&mut data.buf, element, rval);
-                            tag.request_write(&mut data, &self.name);
-                        } else if !record.apply_raw_readback(plc) {
-                            record.set_val(EpicsValue::Long(plc))?;
+                    follow!(
+                        cip::get_dint(&data.buf, element),
+                        |plc: &i32| *plc != rval,
+                        |buf: &mut Vec<u8>| cip::put_dint(buf, element, rval),
+                        |plc: i32| if record.apply_raw_readback(plc) {
+                            Ok(())
+                        } else {
+                            record.set_val(EpicsValue::Long(plc))
                         }
-                    }
+                    )
                 }
             },
-            "longout" => {
-                let Some(plc) = cip::get_dint(&data.buf, element) else {
-                    drop(data);
-                    self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-                };
-                let val = i32_field(record, "VAL");
-                if plc != val {
-                    if force {
-                        cip::put_dint(&mut data.buf, element, val);
-                        tag.request_write(&mut data, &self.name);
-                    } else {
-                        record.set_val(EpicsValue::Long(plc))?;
-                    }
-                }
-            }
             "int64out" => {
-                let Some(plc) = cip::get_lint(&data.buf, element) else {
-                    drop(data);
-                    self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-                };
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::Int64(v)) => v,
                     _ => 0,
                 };
-                if plc != val {
-                    if force {
-                        cip::put_lint(&mut data.buf, element, val);
-                        tag.request_write(&mut data, &self.name);
-                    } else {
-                        record.set_val(EpicsValue::Int64(plc))?;
-                    }
-                }
+                follow!(
+                    cip::get_lint(&data.buf, element),
+                    |plc: &i64| *plc != val,
+                    |buf: &mut Vec<u8>| cip::put_lint(buf, element, val),
+                    |plc: i64| record.set_val(EpicsValue::Int64(plc))
+                )
             }
             "bo" | "mbbo" | "mbboDirect" => {
                 let bits = if rtype == "bo" { 1 } else { nobt(record) };
-                let Some(plc) = get_bits(&data.buf, element, mask, bits) else {
-                    drop(data);
-                    self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-                };
                 let rval = i32_field(record, "RVAL") as u32;
-                if plc != rval {
-                    if force {
-                        put_bits(&mut data.buf, element, mask, bits, rval);
-                        tag.request_write(&mut data, &self.name);
-                    } else if !record.apply_raw_readback(plc as i32) {
-                        record.set_val(EpicsValue::Long(plc as i32))?;
+                follow!(
+                    get_bits(&data.buf, element, mask, bits),
+                    |plc: &u32| *plc != rval,
+                    |buf: &mut Vec<u8>| put_bits(buf, element, mask, bits, rval),
+                    |plc: u32| if record.apply_raw_readback(plc as i32) {
+                        Ok(())
+                    } else {
+                        record.set_val(EpicsValue::Long(plc as i32))
                     }
-                }
+                )
             }
             "stringout" | "lso" => {
                 let max = data.buf.len();
-                let Some(plc) = cip::get_string(&data.buf, element, max) else {
-                    drop(data);
-                    self.read_alarm();
-                    return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-                };
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::String(s)) => s.to_string(),
                     _ => String::new(),
                 };
-                if plc != val {
-                    if force {
-                        cip::put_string(&mut data.buf, &val);
-                        tag.request_write(&mut data, &self.name);
-                    } else {
-                        record.set_val(EpicsValue::String(plc.into()))?;
-                    }
-                }
+                follow!(
+                    cip::get_string(&data.buf, element, max),
+                    |plc: &String| *plc != val,
+                    |buf: &mut Vec<u8>| cip::put_string(buf, &val),
+                    |plc: String| record.set_val(EpicsValue::String(plc.into()))
+                )
             }
-            _ => {
-                drop(data);
-                self.read_alarm();
-                return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
-            }
+            _ => Ok(Follow::GetFailed),
         }
-
-        drop(data);
-        self.no_alarm();
-        // C's check_*_callbacks write udf = FALSE only when they copy the
-        // PLC value in, but their update condition includes `rec->udf`, so
-        // every pass that got this far ends with udf == 0: udf = 1 forces
-        // the copy branch (FORCE requires !udf), and the skip/force paths
-        // only run with udf already 0. The no-data and failed-get returns
-        // above never touch udf in C, hence Untouched there.
-        Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
 }
 
-/// C `wf_read`. The CIP type picks the array type; the record coerces it to
-/// FTVL.
-///
-/// UPSTREAM FIX: the C reads elements `0 .. NELM`, ignoring the element index
-/// the link supplied -- even though `analyze_link` deliberately registers
-/// `last_element + count` elements with the driver, which is only meaningful if
-/// the read starts at `last_element`. `@PLC arr[5]` on a waveform with NELM=10
-/// therefore hands back `arr[0..10]` in the C. We read `arr[5..15]`, the range
-/// the registration reserves. Identical behaviour for the (usual) unindexed
-/// link, where `element == 0`.
-fn read_waveform(raw: &[u8], element: usize, record: &dyn Record) -> Result<EpicsValue, ()> {
+/// C `wf_read` (devEtherIP.c:1838-1925): elements `0..NELM`, whatever index
+/// the link named, typed by the tag's CIP type against FTVL. `Ok(None)` is
+/// C's silent pass when the tag holds fewer than NELM elements.
+fn read_waveform(
+    raw: &[u8],
+    elements: usize,
+    record: &dyn Record,
+    name: &str,
+) -> Result<Option<EpicsValue>, ()> {
+    const CHAR: i16 = 1;
+    const UCHAR: i16 = 2;
+    const LONG: i16 = 5;
+    const DOUBLE: i16 = 10;
     let nelm = count_field(record, "NELM");
-    match cip::typecode(raw) {
-        Some(CipType::Real) | Some(CipType::Lreal) => {
-            let mut v = Vec::with_capacity(nelm);
-            for i in 0..nelm {
-                v.push(cip::get_double(raw, element + i).ok_or(())?);
+    if elements < nelm {
+        return Ok(None);
+    }
+    let ftvl = f64_field(record, "FTVL") as i16;
+    let refuse = |message: &str| {
+        rec_gbl_record_error("Illegal field value", name, message);
+        Err(())
+    };
+    let value = match cip::typecode(raw) {
+        Some(CipType::Real | CipType::Lreal) => {
+            if ftvl != DOUBLE {
+                return refuse(
+                    "EtherIP: tag data type REAL or LREAL requires waveform FTVL==DOUBLE",
+                );
             }
-            Ok(EpicsValue::DoubleArray(v.into()))
+            let v: Option<Vec<f64>> = (0..nelm).map(|i| cip::get_double(raw, i)).collect();
+            EpicsValue::DoubleArray(v.ok_or(())?.into())
         }
         Some(CipType::Sint) => {
-            let mut v = Vec::with_capacity(nelm);
-            for i in 0..nelm {
-                v.push(cip::get_usint(raw, element + i).ok_or(())?);
+            if ftvl != CHAR && ftvl != UCHAR {
+                return refuse("EtherIP: tag data type requires waveform FTVL==CHAR/UCHAR");
             }
-            Ok(EpicsValue::CharArray(v.into()))
+            let v: Option<Vec<u8>> = (0..nelm).map(|i| cip::get_usint(raw, i)).collect();
+            EpicsValue::CharArray(v.ok_or(())?.into())
         }
-        Some(_) => {
-            let mut v = Vec::with_capacity(nelm);
-            for i in 0..nelm {
-                v.push(cip::get_dint(raw, element + i).ok_or(())?);
+        _ => {
+            let v: Option<Vec<i32>> = (0..nelm).map(|i| cip::get_dint(raw, i)).collect();
+            match ftvl {
+                LONG => EpicsValue::LongArray(v.ok_or(())?.into()),
+                // `*(s++) = dint_val`: each DINT truncated to its low byte.
+                CHAR => EpicsValue::CharArray(
+                    v.ok_or(())?
+                        .into_iter()
+                        .map(|d| d as u8)
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                _ => return refuse("EtherIP: tag type requires waveform FTVL==LONG or CHAR"),
             }
-            Ok(EpicsValue::LongArray(v.into()))
         }
-        None => Err(()),
-    }
+    };
+    Ok(Some(value))
 }
 
 fn nobt(record: &dyn Record) -> usize {
@@ -947,23 +1154,196 @@ impl DeviceSupport for EtherIpResetDevice {
 /// The dynamic device-support factory: one DTYP for every record type, with the
 /// link text taken verbatim from INP or OUT.
 pub fn device_factory(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSupport>> {
-    match ctx.dtyp {
-        DTYP_RESET => Some(Box::new(EtherIpResetDevice::default())),
-        DTYP => {
-            let (text, is_output) = if !ctx.out.is_empty() {
-                (ctx.out, true)
-            } else {
-                (ctx.inp, false)
-            };
-            Some(Box::new(EtherIpDevice::new(text, is_output)))
+    match (ctx.dtyp, ctx.record_type) {
+        (DTYP_RESET, "bo") => Some(Box::new(EtherIpResetDevice::default())),
+        (DTYP, rtype) if INPUT_TYPES.contains(&rtype) => {
+            Some(Box::new(EtherIpDevice::new(ctx.inp, false)))
+        }
+        (DTYP, rtype) if OUTPUT_TYPES.contains(&rtype) => {
+            Some(Box::new(EtherIpDevice::new(ctx.out, true)))
         }
         _ => None,
     }
 }
 
+/// The record types `ether_ip.dbd` declares an "EtherIP" `device()` for.
+const INPUT_TYPES: &[&str] = &[
+    "ai",
+    "int64in",
+    "bi",
+    "lsi",
+    "mbbi",
+    "mbbiDirect",
+    "stringin",
+    "waveform",
+];
+const OUTPUT_TYPES: &[&str] = &[
+    "ao",
+    "int64out",
+    "bo",
+    "lso",
+    "mbbo",
+    "mbboDirect",
+    "stringout",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::base::server::records::bo::BoRecord;
+
+    /// devEtherIP.c mbbo_write / check_mbbo_callback: a staged write leaves
+    /// the record PACT, and the next transfer ends it without the readback
+    /// that would put the PLC's value back into VAL.
+    #[test]
+    fn a_staged_write_waits_for_the_next_transfer_instead_of_reading_back() {
+        use epics_rs::base::server::database::{DeviceDone, PvDatabase};
+        use epics_rs::base::server::records::mbbo::MbboRecord;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let db = PvDatabase::new();
+        rt.block_on(db.add_record("STAGED", Box::new(MbboRecord::default())))
+            .unwrap();
+        let done = DeviceDone::new(&db, &db.get_record("STAGED").unwrap().read());
+        let source = DeviceDoneSource::new(&done);
+
+        define_plc("staged", "127.0.0.1", 0);
+        let mut record = MbboRecord::default();
+        record.put_field("NOBT", EpicsValue::Short(2)).unwrap();
+        let mut dev = EtherIpDevice::new("@staged BOOLs[300]", true);
+        dev.init(&mut record).unwrap();
+        let mut rx = dev.io_intr_receiver().unwrap();
+        let tag = dev.tag.clone().unwrap();
+        {
+            let mut d = tag.data.lock();
+            d.buf = bits_buf(&[0; 10]);
+            d.valid_data_size = d.buf.len();
+        }
+
+        record.put_field("RVAL", EpicsValue::Long(3)).unwrap();
+        assert!(matches!(
+            dev.write_begin(&mut record, &source).unwrap(),
+            WriteStart::Pending
+        ));
+        assert!(tag.data.lock().do_write);
+        tag.notify();
+        assert!(
+            rx.try_recv().is_err(),
+            "the write's transfer is not a readback"
+        );
+        tag.notify();
+        assert!(rx.try_recv().is_ok(), "later transfers read back again");
+
+        // The 3 just written reads back as 3, so the next pass has nothing
+        // to write.
+        assert!(matches!(
+            dev.write_begin(&mut record, &source).unwrap(),
+            WriteStart::Completed
+        ));
+    }
+
+    /// A bo on bit 12 of the tag's UDINT 9, bound to `plc`, with its common
+    /// fields defined and passive.
+    fn bo_on_bit_300(plc: &str) -> (EtherIpDevice, BoRecord, CommonFields, Arc<TagInfo>) {
+        define_plc(plc, "127.0.0.1", 0);
+        let mut record = BoRecord::default();
+        let mut dev = EtherIpDevice::new(&format!("@{plc} BOOLs[300]"), true);
+        dev.init(&mut record).unwrap();
+        let tag = dev.tag.clone().unwrap();
+        set_words(&tag, &[0; 10]);
+        let mut common = CommonFields::default();
+        common.udf = 0;
+        (dev, record, common, tag)
+    }
+
+    fn set_words(tag: &TagInfo, words: &[u32]) {
+        let mut d = tag.data.lock();
+        d.buf = bits_buf(words);
+        d.valid_data_size = d.buf.len();
+    }
+
+    fn rval(record: &BoRecord) -> i32 {
+        i32_field(record, "RVAL")
+    }
+
+    /// devEtherIP.c:326-437: a pulse whose value the record already holds
+    /// neither copies nor processes; a new one is copied and processed.
+    #[test]
+    fn an_output_processes_only_on_a_new_plc_value() {
+        let (mut dev, mut record, mut common, tag) = bo_on_bit_300("cbsame");
+        assert_eq!(
+            dev.io_intr_callback(&mut record, &mut common),
+            IoIntrAction::Skip
+        );
+        let mut words = [0; 10];
+        words[9] = 1 << 12;
+        set_words(&tag, &words);
+        assert_eq!(
+            dev.io_intr_callback(&mut record, &mut common),
+            IoIntrAction::Process
+        );
+        assert_eq!(rval(&record), 1);
+    }
+
+    /// `rec->udf || rec->sevr == INVALID_ALARM` counts as a change.
+    #[test]
+    fn an_undefined_or_invalid_output_takes_an_unchanged_value() {
+        let (mut dev, mut record, mut common, _tag) = bo_on_bit_300("cbudf");
+        common.udf = 1;
+        assert_eq!(
+            dev.io_intr_callback(&mut record, &mut common),
+            IoIntrAction::Process
+        );
+        assert_eq!(common.udf, 0);
+        common.sevr = AlarmSeverity::Invalid;
+        assert_eq!(
+            dev.io_intr_callback(&mut record, &mut common),
+            IoIntrAction::Process
+        );
+    }
+
+    /// C copies the value but leaves a periodic record to its own scan.
+    #[test]
+    fn a_periodic_output_takes_the_value_without_processing() {
+        let (mut dev, mut record, mut common, tag) = bo_on_bit_300("cbperiodic");
+        common.scan = ScanType::from_u16(SCAN_1ST_PERIODIC);
+        let mut words = [0; 10];
+        words[9] = 1 << 12;
+        set_words(&tag, &words);
+        assert_eq!(
+            dev.io_intr_callback(&mut record, &mut common),
+            IoIntrAction::Skip
+        );
+        assert_eq!(rval(&record), 1);
+    }
+
+    /// No data processes the record (to raise WRITE_ALARM); a failed get
+    /// does nothing.
+    #[test]
+    fn no_data_processes_and_a_failed_get_does_not() {
+        let (mut dev, mut record, mut common, tag) = bo_on_bit_300("cbnodata");
+        tag.data.lock().valid_data_size = 0;
+        assert_eq!(
+            dev.io_intr_callback(&mut record, &mut common),
+            IoIntrAction::Process
+        );
+        // The BOOL typecode with no word behind it.
+        set_words(&tag, &[]);
+        assert_eq!(
+            dev.io_intr_callback(&mut record, &mut common),
+            IoIntrAction::Skip
+        );
+    }
+
+    /// `drvEtherIP_init` then `drvEtherIP_define_PLC`, as a st.cmd does.
+    fn define_plc(name: &str, ip_addr: &str, slot: u8) {
+        if !driver::initialized() {
+            driver::init();
+        }
+        driver::define_plc(name, ip_addr, slot);
+    }
 
     /// A raw BOOL-array (CIP BITS) buffer holding `words` UDINTs.
     fn bits_buf(words: &[u32]) -> Vec<u8> {
@@ -1037,7 +1417,7 @@ mod tests {
         use epics_rs::base::server::record::CommonFields;
         use epics_rs::base::server::records::ao::AoRecord;
 
-        driver::define_plc("forceudf", "127.0.0.1", 0);
+        define_plc("forceudf", "127.0.0.1", 0);
         for (udf, want_val, want_write) in [(1u8, 5.0, false), (0, 0.0, true)] {
             let mut record = AoRecord::default();
             let mut dev = EtherIpDevice::new("@forceudf REAL S 1 FORCE", true);
@@ -1059,7 +1439,166 @@ mod tests {
         }
     }
 
+    /// devEtherIP.c:1853-1915: elements 0..NELM, nothing below NELM
+    /// registered elements, and FTVL checked against the CIP type.
+    #[test]
+    fn waveform_reads_from_element_zero_as_c_wf_read_does() {
+        use epics_rs::base::server::records::waveform::WaveformRecord;
+        let mut raw = CipType::Real.code().to_le_bytes().to_vec();
+        for v in [1.5f32, 2.5, 3.5, 4.5] {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut wf = WaveformRecord::default();
+        wf.put_field("NELM", EpicsValue::ULong(3)).unwrap();
+        wf.put_field("FTVL", EpicsValue::Short(10)).unwrap();
+        assert_eq!(
+            read_waveform(&raw, 4, &wf, "wf"),
+            Ok(Some(EpicsValue::DoubleArray(vec![1.5, 2.5, 3.5].into())))
+        );
+        assert_eq!(read_waveform(&raw, 2, &wf, "wf"), Ok(None));
+        wf.put_field("FTVL", EpicsValue::Short(5)).unwrap();
+        assert_eq!(read_waveform(&raw, 4, &wf, "wf"), Err(()));
+    }
+
+    /// ether_ip.dbd declares no longin/longout dset and EtherIPReset only on bo.
+    #[test]
+    fn factory_serves_only_the_dbd_declared_record_types() {
+        let ctx = |record_type, dtyp| DeviceSupportContext {
+            record_type,
+            dtyp,
+            inp: "@plc1 DINT",
+            out: "@plc1 DINT",
+        };
+        assert!(device_factory(&ctx("ai", DTYP)).is_some());
+        assert!(device_factory(&ctx("stringout", DTYP)).is_some());
+        assert!(device_factory(&ctx("bo", DTYP_RESET)).is_some());
+        assert!(device_factory(&ctx("longin", DTYP)).is_none());
+        assert!(device_factory(&ctx("longout", DTYP)).is_none());
+        assert!(device_factory(&ctx("ao", DTYP_RESET)).is_none());
+    }
+
+    /// A disconnected tag leaves an output in WRITE_ALARM, as C's ao_write.
+    #[test]
+    fn an_output_without_data_raises_write_alarm() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        define_plc("nodata", "127.0.0.1", 0);
+        let mut record = AoRecord::default();
+        let mut dev = EtherIpDevice::new("@nodata REAL S 1", true);
+        dev.init(&mut record).unwrap();
+        dev.read(&mut record).unwrap();
+        let alarm = dev.last_alarm().unwrap();
+        assert_eq!(alarm.stat, alarm_status::WRITE_ALARM);
+    }
+
+    /// A get that fails on data the tag does hold: C's check_ao_callback
+    /// does not process the record, so nothing is raised.
+    #[test]
+    fn an_output_whose_readback_get_fails_raises_nothing() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        define_plc("shortdata", "127.0.0.1", 0);
+        let mut record = AoRecord::default();
+        let mut dev = EtherIpDevice::new("@shortdata DINT S 1", true);
+        dev.init(&mut record).unwrap();
+        let tag = dev.tag.clone().unwrap();
+        {
+            let mut d = tag.data.lock();
+            // The DINT typecode and no value behind it.
+            d.buf = CipType::Dint.code().to_le_bytes().to_vec();
+            d.valid_data_size = d.buf.len();
+        }
+        dev.read(&mut record).unwrap();
+        assert!(dev.last_alarm().is_none());
+    }
+
+    /// devEtherIP.c:1642: statistics are read under lock_data, so a tag
+    /// without data fails them.
+    #[test]
+    fn a_statistic_without_tag_data_raises_read_alarm() {
+        use epics_rs::base::server::records::ai::AiRecord;
+        define_plc("statnodata", "127.0.0.1", 0);
+        let mut record = AiRecord::default();
+        let mut dev = EtherIpDevice::new("@statnodata REAL PLC_ERRORS", false);
+        dev.init(&mut record).unwrap();
+        dev.read(&mut record).unwrap();
+        assert_eq!(dev.last_alarm().unwrap().stat, alarm_status::READ_ALARM);
+    }
+
     // -- link parsing --------------------------------------------------------
+
+    /// `analyze_link` with every PLC known and no SCAN period.
+    fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String> {
+        analyze_link(text, count, bits, || 0.0, |_| Some(())).map(|(l, ())| l)
+    }
+
+    /// devEtherIP.c:884-1007: C's texts, and the steps that ran before a
+    /// late failure have printed.
+    #[test]
+    fn analyze_link_fails_in_cs_order_with_cs_texts() {
+        let err = |text, count, bits| {
+            let mut asked = false;
+            let e = analyze_link(
+                text,
+                count,
+                bits,
+                || {
+                    asked = true;
+                    0.0
+                },
+                |_| None::<()>,
+            )
+            .unwrap_err();
+            (e, asked)
+        };
+        assert_eq!(err("", 1, 0).0, "Missing PLC in link ''");
+        assert_eq!(err("@plc1", 1, 0).0, "Missing tag in link 'plc1'");
+        assert_eq!(
+            err("@plc1 Cnt NOPE x", 1, 0),
+            (
+                "Invalid flag 'NOPE x' in link 'plc1 Cnt NOPE x'".into(),
+                false
+            )
+        );
+        assert_eq!(
+            err("@plc1 A[1] E", 2, 0).0,
+            "Array record cannot use 'E' flag ('plc1 A[1] E')"
+        );
+        assert_eq!(
+            err("@plc1 Cnt S 1e999", 1, 0).0,
+            "Error in scan flag in link 'plc1 Cnt S 1e999'"
+        );
+        // The period was resolved before the tag failed.
+        assert_eq!(
+            err("@plc1 A[x]", 1, 0),
+            ("malformed array tag in 'plc1 A[x]'".into(), true)
+        );
+        assert_eq!(err("@plc1 A", 1, 0).0, "unknown PLC 'plc1'");
+        // The PLC is looked up before the bits check.
+        assert_eq!(err("@plc1 A", 10, 1).0, "unknown PLC 'plc1'");
+        assert_eq!(
+            parse_link("@plc1 A", 10, 1).unwrap_err(),
+            "cannot access bits for array records"
+        );
+    }
+
+    /// strtod/strtol/prefix matching as C reads them.
+    #[test]
+    fn analyze_link_reads_flags_and_index_as_c_does() {
+        // A bad period leaves 0 and its text becomes the next token.
+        assert_eq!(
+            parse_link("@plc1 Cnt S x", 1, 0).unwrap_err(),
+            "Invalid flag 'x' in link 'plc1 Cnt S x'"
+        );
+        // A bad bit never fails: bit 0, then the text is the next token.
+        assert_eq!(parse_link("@plc1 Cnt B FORCE", 1, 0).unwrap().mask, 1);
+        // Flags match as prefixes; 'S' without its space does not.
+        assert!(parse_link("@plc1 Cnt FORCED", 1, 0).unwrap().forced());
+        assert!(parse_link("@plc1 Cnt S", 1, 0).is_err());
+        // strtol base 0.
+        assert_eq!(parse_link("@plc1 A[0x10]", 1, 0).unwrap().element, 16);
+        assert_eq!(parse_link("@plc1 A[010]", 1, 0).unwrap().element, 8);
+        assert_eq!(parse_link("@plc1 A[3x]", 1, 0).unwrap().element, 3);
+        assert_eq!(parse_link("@plc1 Cnt S 0.5", 1, 0).unwrap().period, 0.5);
+    }
 
     #[test]
     fn plain_scalar_link() {
@@ -1068,7 +1607,7 @@ mod tests {
         assert_eq!(l.string_tag, "REALS");
         assert_eq!(l.element, 0);
         assert_eq!(l.elements, 1);
-        assert_eq!(l.period, None);
+        assert_eq!(l.period, 0.0);
         assert_eq!(l.special, 0);
     }
 
@@ -1098,9 +1637,17 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_bit_selects_bit_31_as_cs_size_t_does() {
+        let l = parse_link("@plc1 Cnt B -1", 1, 0).unwrap();
+        assert_eq!(l.mask, 1 << 31);
+        let l = parse_link("@plc1 Cnt B -30", 1, 0).unwrap();
+        assert_eq!(l.mask, 1 << 2);
+    }
+
+    #[test]
     fn scan_and_bit_flags_take_a_value() {
         let l = parse_link("@plc1 Cnt S 0.5 B 3", 1, 0).unwrap();
-        assert_eq!(l.period, Some(0.5));
+        assert_eq!(l.period, 0.5);
         assert_eq!(l.mask, 1 << 3);
         assert!(l.special & spco::BIT != 0);
         assert!(l.special & spco::SCAN_PERIOD != 0);
@@ -1140,15 +1687,15 @@ mod tests {
         assert_eq!(l.elements, 2);
     }
 
-    /// UPSTREAM FIX (`devEtherIP.c:1094`): the C sets mask 255 for an
-    /// un-indexed binary link regardless of NOBT. For a bi that is the intended
-    /// "any low byte bit set" BOOL test; for NOBT > 1 it makes bit 1 select
-    /// 0x1FE, which aliases eight bits. The only mask that can address bit i by
-    /// shifting is 1.
+    /// An unindexed binary link reads from bit 0, as test.db's biDINT says;
+    /// C's mask of 255 made a bi on a DINT of 2 read 1.
     #[test]
-    fn unindexed_binary_link_mask() {
-        assert_eq!(parse_link("@plc1 aBool", 1, 1).unwrap().mask, 0xFF);
-        assert_eq!(parse_link("@plc1 aWord", 1, 4).unwrap().mask, 1); // C: 255
+    fn unindexed_binary_link_reads_from_bit_zero() {
+        let bi = parse_link("@plc1 aBool", 1, 1).unwrap();
+        let mbbi = parse_link("@plc1 aWord", 1, 4).unwrap();
+        let raw = bits_buf(&[0b0110]);
+        assert_eq!(get_bits(&raw, bi.element, bi.mask, 1), Some(0));
+        assert_eq!(get_bits(&raw, mbbi.element, mbbi.mask, 4), Some(0b0110));
     }
 
     #[test]
@@ -1176,17 +1723,18 @@ mod tests {
 
     #[test]
     fn get_bits_across_a_udint_boundary() {
-        // Bits 30,31 of word 0 are 1,0; bits 0,1 of word 1 are 1,1. C's
-        // first-bit test reads bit 30 as 0, so 4 bits give 0b1100.
+        // Bits 30,31 of word 0 are 1,0; bits 0,1 of word 1 are 1,1.
         let raw = bits_buf(&[1 << 30, 0b11]);
-        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1100));
+        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1101));
     }
 
-    /// mbbi NOBT=2 on BOOLs[300] with bits 300 and 301 set: C reads 2, not 3.
+    /// mbbi NOBT=2 on BOOLs[300] with bits 300 and 301 set reads 3; C reads
+    /// 2, taking the first bit from bit 0.
     #[test]
-    fn multi_bit_read_takes_cs_first_bit_from_bit_zero() {
+    fn multi_bit_read_takes_its_first_bit_from_the_mask() {
         let raw = bits_buf(&[0x3000]);
-        assert_eq!(get_bits(&raw, 0, 1 << 12, 2), Some(2));
+        assert_eq!(get_bits(&raw, 0, 1 << 12, 2), Some(3));
+        assert_eq!(get_bits(&bits_buf(&[0x1]), 0, 1 << 12, 2), Some(0));
         assert_eq!(get_bits(&raw, 0, 1 << 12, 1), Some(1));
         assert_eq!(get_bits(&bits_buf(&[0b11]), 0, 1, 2), Some(3));
     }
@@ -1202,8 +1750,7 @@ mod tests {
     fn put_bits_round_trips() {
         let mut raw = bits_buf(&[0xFFFF_FFFF]);
         assert!(put_bits(&mut raw, 0, 1 << 4, 4, 0b0101));
-        // C reads the first bit back from bit 0 (set here), not bit 4.
-        assert_eq!(get_bits(&raw, 0, 1 << 4, 4), Some(0b0100));
+        assert_eq!(get_bits(&raw, 0, 1 << 4, 4), Some(0b0101));
         // Neighbouring bits are untouched.
         assert_eq!(cip::get_udint(&raw, 0), Some(0xFFFF_FF5F));
     }
@@ -1214,7 +1761,7 @@ mod tests {
         assert!(put_bits(&mut raw, 0, 1 << 30, 4, 0b1101));
         assert_eq!(cip::get_udint(&raw, 0), Some(1 << 30));
         assert_eq!(cip::get_udint(&raw, 1), Some(0b11));
-        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1100));
+        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1101));
     }
 
     #[test]

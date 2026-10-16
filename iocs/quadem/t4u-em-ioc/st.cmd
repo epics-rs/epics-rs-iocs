@@ -2,40 +2,51 @@
 #============================================================
 # st.cmd — Sydor T4U electrometer IOC, through the Qt middle layer
 #
-# Usage:
-#   cargo run -p t4u-em-ioc -- iocs/quadem/t4u-em-ioc/st.cmd
+# Usage (from this directory, as C runs from iocBoot/iocT4U_EM):
+#   ../../../target/debug/t4u-em-ioc st.cmd
 #
-# Mirrors quadEM's iocBoot/iocT4U_EM/T4U_EM.cmd.
+# Port of quadEM iocBoot/iocT4U_EM/st.cmd + T4U_EM.cmd. dbLoadDatabase and
+# registerRecordDeviceDriver have no epics-rs counterpart; $(QUADEM) is set
+# to iocs/quadem by ioc_support.
 #============================================================
 
-epicsEnvSet("PREFIX",     "QE1_")
-epicsEnvSet("RECORD",     "T4U_EM_")
-epicsEnvSet("PORT",       "T4U_EM")
-epicsEnvSet("TEMPLATE",   "T4U_EM")
-epicsEnvSet("RING_SIZE",  "10000")
-epicsEnvSet("TSPOINTS",   "1000")
-epicsEnvSet("QTHOST",     "127.0.0.1")
-epicsEnvSet("QTBASEPORT", "15001")
+errlogInit(5000)
 
-# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
-# at IOC startup; every quadEM template lives in its db/ subdir.
-
-# The driver opens the command port ($(QTBASEPORT)) and the data port
-# ($(QTBASEPORT) + 1) on the middle-layer host itself, as TCP_Command_$(PORT)
-# and TCP_Data_$(PORT).
-drvT4U_EMConfigure("$(PORT)", "$(QTHOST)", $(RING_SIZE), $(QTBASEPORT))
-
-# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
-# ...) resolve through the db search path; direct dbLoad paths stay explicit.
+# The search path for database files
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
 
-dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
+epicsEnvSet("PREFIX",    "QE1_")
+epicsEnvSet("RECORD",    "T4U_EM_")
+epicsEnvSet("PORT",      "T4U_EM")
+epicsEnvSet("TEMPLATE",  "T4U_EM")
+epicsEnvSet("QSIZE",     "20")
+epicsEnvSet("RING_SIZE", "10000")
+epicsEnvSet("TSPOINTS",  "1000")
+epicsEnvSet("QTHOST", "127.0.0.1")
+epicsEnvSet("QTBASEPORT", "15001")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
-# Example interactive commands:
-#   dbl                              # List all PVs
-#   dbpf QE1_T4U_EM_Range 2          # Select the 47 ohm range
-#   dbpf QE1_T4U_EM_Updater 1        # Dump registers 100-107
-#   dbgf QE1_T4U_EM_Current1:MeanValue_RBV
-#   asynReport                       # Show port/plugin status
+# Load asynRecord record
+dbLoadRecords("$(ASYN)/db/asynRecord.db", "P=$(PREFIX), R=asyn1,PORT=TCP_Command_$(PORT),ADDR=0,OMAX=256,IMAX=256")
+
+drvT4U_EMConfigure("$(PORT)", "$(QTHOST)", $(RING_SIZE), $(QTBASEPORT))
+
+#asynSetTraceIOMask("UDP_$(PORT)", 0, 2)
+#asynSetTraceMask("UDP_$(PORT)", 0, 9)
+asynSetTraceIOMask("TCP_Command_$(PORT)", 0, 2)
+asynSetTraceMask("TCP_Command_$(PORT)", 0, 9)
+#asynSetTraceIOMask("TCP_Data_$(PORT)", 0, 2)
+#asynSetTraceMask("TCP_Data_$(PORT)", 0, 9)
+
+dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT),ADDR=0,TIMEOUT=1")
+
+< $(QUADEM)/quadEM_Plugins.cmd
+
+asynSetTraceIOMask("$(PORT)",0,2)
+#asynSetTraceMask("$(PORT)",  0,0x29)
+
+< $(QUADEM)/saveRestore.cmd
+
+iocInit()
+
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req",30,"P=$(PREFIX), R=$(RECORD)")

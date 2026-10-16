@@ -16,6 +16,7 @@ use std::collections::VecDeque;
 use serde_json::{Map, Value, json};
 
 use crate::drv_quad_em::{QeTriggerMode, QeTriggerPolarity};
+use crate::trace::TraceMask;
 
 /// C++ `FX4_NUM_CHANS`.
 pub const FX4_NUM_CHANS: usize = 4;
@@ -125,7 +126,7 @@ pub enum Fx4Action {
 }
 
 /// C++ `ADCSample`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct AdcSample {
     val: f64,
     time: f64,
@@ -155,9 +156,9 @@ pub struct Fx4Cache {
     timestamp_mismatch: bool,
     trigger_active: bool,
     num_trigger_values: i32,
-    /// C++ `onMessageEvent`'s `ASYN_TRACE_ERROR` lines, for the caller to
-    /// print on the driver port.
-    errors: Vec<String>,
+    /// C++ `onMessageEvent`'s `asynPrint` lines with their masks, for the
+    /// caller to print on the driver port.
+    trace: Vec<(TraceMask, String)>,
 }
 
 impl Fx4Cache {
@@ -178,9 +179,13 @@ impl Fx4Cache {
         self.num_trigger_values = 0;
     }
 
-    /// The error lines the last [`Fx4Cache::ingest`] calls produced.
-    pub fn take_errors(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.errors)
+    /// The trace lines the last [`Fx4Cache::ingest`] calls produced.
+    pub fn take_trace(&mut self) -> Vec<(TraceMask, String)> {
+        std::mem::take(&mut self.trace)
+    }
+
+    fn print(&mut self, mask: TraceMask, line: String) {
+        self.trace.push((mask, line));
     }
 
     pub fn gate_level(&self) -> GateLevel {
@@ -211,7 +216,12 @@ impl Fx4Cache {
         // sorts ahead of an ADC event with the same timestamp.
         let mut events: Vec<TimedEvent> = Vec::new();
 
-        for (path, values) in object {
+        // nlohmann::json keeps an object in a std::map, so C walks the paths
+        // sorted; serde_json may keep wire order. The first timestamp seen
+        // becomes startTime_, so the walk order is observable.
+        let mut paths: Vec<_> = object.iter().collect();
+        paths.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (path, values) in paths {
             let is_gate = path == GATE_PATH;
             let chan = ADC_PATHS.iter().position(|p| p == path);
             if !is_gate && chan.is_none() {
@@ -246,6 +256,14 @@ impl Fx4Cache {
                         time: timestamp,
                         kind: EventKind::Gate(level),
                     });
+                    if let Some(last) = self.adc[0].back() {
+                        let line = format!(
+                            "Gate event, value={:.6}, time={timestamp:.6}, ADC1 last time={:.6}",
+                            f64::from(u8::from(level)),
+                            last.time
+                        );
+                        self.print(TraceMask::IO_DRIVER, line);
+                    }
                 } else {
                     let Some(val) = pair[0].as_f64() else {
                         continue;
@@ -272,18 +290,57 @@ impl Fx4Cache {
         if self.adc[0].is_empty() {
             return;
         }
+        let [a, b, c, d] = &self.adc;
+        let edge = |q: &VecDeque<AdcSample>, newest: bool| {
+            // Only channel 1 is known non-empty; C reads the others unchecked.
+            let s = if newest { q.back() } else { q.front() };
+            s.copied().unwrap_or_default()
+        };
+        let line = format!(
+            "drvFX4::onMessageEvent: Samples={} {} {} {}\n    ADCs oldest={:.6} {:.6} {:.6} {:.6}\n   Times oldest={:.6} {:.6} {:.6} {:.6}\n    ADCs newest={:.6} {:.6} {:.6} {:.6}\n   Times newest={:.6} {:.6} {:.6} {:.6}",
+            a.len(),
+            b.len(),
+            c.len(),
+            d.len(),
+            edge(a, false).val,
+            edge(b, false).val,
+            edge(c, false).val,
+            edge(d, false).val,
+            edge(a, false).time,
+            edge(b, false).time,
+            edge(c, false).time,
+            edge(d, false).time,
+            edge(a, true).val,
+            edge(b, true).val,
+            edge(c, true).val,
+            edge(d, true).val,
+            edge(a, true).time,
+            edge(b, true).time,
+            edge(c, true).time,
+            edge(d, true).time,
+        );
+        self.print(TraceMask::IO_DRIVER, line);
         let min_size = self.adc.iter().map(|q| q.len()).min().unwrap_or(0);
         let max_size = self.adc.iter().map(|q| q.len()).max().unwrap_or(0);
+        let line = format!(
+            "drvFX4::onMessageEvent minimum size={min_size}, size={} {} {} {}",
+            self.adc[0].len(),
+            self.adc[1].len(),
+            self.adc[2].len(),
+            self.adc[3].len()
+        );
+        self.print(TraceMask::IO_DRIVER, line);
 
         if min_size != max_size {
             if !self.synchronized {
-                self.errors.push(format!(
+                let line = format!(
                     "drvFX4::onMessageEvent not synchronized and different number of samples per channel={} {} {} {}",
                     self.adc[0].len(),
                     self.adc[1].len(),
                     self.adc[2].len(),
                     self.adc[3].len()
-                ));
+                );
+                self.print(TraceMask::ERROR, line);
                 for q in &mut self.adc {
                     q.clear();
                 }
@@ -304,15 +361,18 @@ impl Fx4Cache {
 
             if times[1..].iter().any(|t| *t != times[0]) {
                 if !self.timestamp_mismatch {
-                    self.errors.push(format!(
+                    let line = format!(
                         "drvFX4::onMessageEvent timestamps are not the same for sample {i} {:.6} {:.6} {:.6} {:.6}",
                         times[0], times[1], times[2], times[3]
-                    ));
+                    );
+                    self.print(TraceMask::ERROR, line);
                     self.timestamp_mismatch = true;
                 }
             } else if self.timestamp_mismatch {
-                self.errors
-                    .push("drvFX4::onMessageEvent timestamps back to normal".to_string());
+                self.print(
+                    TraceMask::ERROR,
+                    "drvFX4::onMessageEvent timestamps back to normal".to_string(),
+                );
                 self.timestamp_mismatch = false;
             }
 
@@ -340,12 +400,21 @@ impl Fx4Cache {
                         QeTriggerMode::ExtTrigger
                             if self.gate_level == active_level(cfg.polarity) =>
                         {
+                            let line = format!(
+                                "trigger event: gateLevel={}, triggerActive={}, numTriggerValues={}",
+                                self.gate_level as i32,
+                                i32::from(self.trigger_active),
+                                self.num_trigger_values
+                            );
+                            self.print(TraceMask::IO_DRIVER, line);
                             self.trigger_active = true;
                             self.num_trigger_values = 0;
                         }
                         QeTriggerMode::ExtBulb
                             if self.gate_level == inactive_level(cfg.polarity) =>
                         {
+                            let line = format!("bulb event: gateLevel={}", self.gate_level as i32);
+                            self.print(TraceMask::IO_DRIVER, line);
                             actions.push(Fx4Action::BulbTrigger);
                         }
                         _ => {}
@@ -498,6 +567,59 @@ mod tests {
         );
         // Every cached sample was consumed.
         assert_eq!(cache.adc.iter().map(|q| q.len()).sum::<usize>(), 0);
+    }
+
+    /// The `ASYN_TRACEIO_DRIVER` lines of onMessageEvent, which the shipped
+    /// FX4.cmd turns on with `asynSetTraceMask(PORT, 0, ERROR | DRIVER)`.
+    #[test]
+    fn an_update_prints_c_trace_io_driver_lines() {
+        let cfg = TriggerConfig {
+            mode: QeTriggerMode::ExtTrigger,
+            polarity: QeTriggerPolarity::Positive,
+            num_average: 1,
+        };
+        let mut cache = Fx4Cache::new();
+        let one = |v: f64| [(v, 1_000_000_000)];
+        let data = update(
+            [&one(1.0), &one(2.0), &one(3.0), &one(4.0)],
+            &[(true, 1_000_500_000)],
+        );
+        cache.ingest(&data, &cfg);
+        let lines: Vec<(TraceMask, String)> = cache.take_trace();
+        let io = |s: &str| (TraceMask::IO_DRIVER, s.to_string());
+        assert_eq!(
+            lines,
+            vec![
+                io("Gate event, value=1.000000, time=0.000500, ADC1 last time=0.000000"),
+                io("drvFX4::onMessageEvent: Samples=1 1 1 1\n    \
+                    ADCs oldest=1.000000 2.000000 3.000000 4.000000\n   \
+                    Times oldest=0.000000 0.000000 0.000000 0.000000\n    \
+                    ADCs newest=1.000000 2.000000 3.000000 4.000000\n   \
+                    Times newest=0.000000 0.000000 0.000000 0.000000"),
+                io("drvFX4::onMessageEvent minimum size=1, size=1 1 1 1"),
+                io("trigger event: gateLevel=1, triggerActive=0, numTriggerValues=0"),
+            ]
+        );
+    }
+
+    /// A gate path sent ahead of the ADC paths is still walked after them, as
+    /// C's sorted nlohmann object is: channel 1's timestamp is startTime_.
+    #[test]
+    fn the_update_paths_are_walked_in_sorted_order() {
+        let mut map = Map::new();
+        map.insert(GATE_PATH.to_string(), json!([[true, 1_000_000_000_i64]]));
+        for (i, path) in ADC_PATHS.iter().enumerate() {
+            map.insert(path.to_string(), json!([[i as f64, 2_000_000_000_i64]]));
+        }
+        let mut cache = Fx4Cache::new();
+        cache.ingest(&Value::Object(map), &free_run());
+        assert_eq!(
+            cache.take_trace()[0],
+            (
+                TraceMask::IO_DRIVER,
+                "Gate event, value=1.000000, time=-1.000000, ADC1 last time=0.000000".to_string()
+            )
+        );
     }
 
     #[test]

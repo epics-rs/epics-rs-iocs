@@ -15,8 +15,8 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::dashboard::DashboardClient;
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::registry::{self, DashboardHandle, DashboardState};
 use crate::session::DEFAULT_TIMEOUT;
 use crate::spdlog;
@@ -137,6 +137,14 @@ pub struct DashboardDriver {
 
 impl DashboardDriver {
     pub fn new(port_name: &str, robot_ip: &str) -> AsynResult<Self> {
+        Self::with_client(
+            port_name,
+            robot_ip,
+            DashboardClient::new(robot_ip, DEFAULT_TIMEOUT),
+        )
+    }
+
+    fn with_client(port_name: &str, robot_ip: &str, client: DashboardClient) -> AsynResult<Self> {
         let mut base = PortDriverBase::new(
             port_name,
             1,
@@ -148,11 +156,12 @@ impl DashboardDriver {
         );
         let params = DashboardParams::create(&mut base)?;
 
-        let client = Arc::new(Mutex::new(DashboardClient::new(robot_ip, DEFAULT_TIMEOUT)));
+        let client = Arc::new(Mutex::new(client));
         let shared = DashboardHandle::new(robot_ip);
-        registry::register_dashboard(port_name, shared.clone()).map_err(asyn_error)?;
 
-        // The C++ constructor connects, then reads the three static strings.
+        // The C++ constructor connects, then reads the three static strings;
+        // any of those reads throws out of the constructor
+        // (dashboard_driver.cpp:73-75), e.g. getSerialNumber below PolyScope 5.6.
         {
             let mut c = client.lock();
             match c.connect() {
@@ -163,7 +172,8 @@ impl DashboardDriver {
                 Err(e) => spdlog::error(format_args!("{e}")),
             }
             if c.is_connected() {
-                let version = c.polyscope_version().unwrap_or_default();
+                let thrown = |e: crate::error::UrError| asyn_error(e.to_string());
+                let version = c.polyscope_version().map_err(thrown)?;
                 base.set_string_param(
                     params.polyscope_version,
                     0,
@@ -172,20 +182,19 @@ impl DashboardDriver {
                         version.major, version.minor, version.patch, version.build
                     ),
                 )?;
-                if let Ok(serial) = c.serial_number(version) {
-                    base.set_string_param(params.serial_number, 0, serial)?;
-                }
-                if let Ok(model) = c.robot_model() {
-                    base.set_string_param(params.robot_model, 0, model)?;
-                }
+                let serial = c.serial_number().map_err(thrown)?;
+                base.set_string_param(params.serial_number, 0, serial)?;
+                let model = c.robot_model().map_err(thrown)?;
+                base.set_string_param(params.robot_model, 0, model)?;
                 base.set_int32_param(params.is_connected, 0, 1)?;
                 shared.set(DashboardState {
                     connected: true,
-                    robot_mode: String::new(),
-                    polyscope: version,
+                    robot_mode: None,
+                    polyscope: Some(version),
                 });
             }
         }
+        registry::register_dashboard(port_name, shared.clone()).map_err(asyn_error)?;
 
         Ok(Self {
             base,
@@ -254,17 +263,13 @@ impl PortDriver for DashboardDriver {
                 let mut s = self.shared.get();
                 s.connected = ok;
                 self.shared.set(s);
-                return if ok {
-                    Ok(())
-                } else {
-                    Err(asyn_error("could not connect to the dashboard server"))
-                };
+                return if ok { Ok(()) } else { Err(refused()) };
             }
 
             let mut client = self.client.lock();
             if !client.is_connected() {
                 spdlog::debug(format_args!("Dashboard is disconnected. No action taken"));
-                return Err(asyn_error("the dashboard is not connected"));
+                return Err(refused());
             }
 
             let debug = |what: &str| spdlog::debug(format_args!("{what}"));
@@ -313,7 +318,7 @@ impl PortDriver for DashboardDriver {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     spdlog::error(format_args!("{e}"));
-                    Err(asyn_error("dashboard command failed"))
+                    Err(refused())
                 }
             }
         })();
@@ -333,7 +338,7 @@ impl PortDriver for DashboardDriver {
             let mut client = self.client.lock();
             if !client.is_connected() {
                 spdlog::debug(format_args!("Dashboard is disconnected. No action taken"));
-                return Err(asyn_error("the dashboard is not connected"));
+                return Err(refused());
             }
 
             let result = if reason == p.popup {
@@ -350,7 +355,7 @@ impl PortDriver for DashboardDriver {
                 Ok(()) => Ok(data.len()),
                 Err(e) => {
                     spdlog::error(format_args!("{e}"));
-                    Err(asyn_error("dashboard command failed"))
+                    Err(refused())
                 }
             }
         })();
@@ -370,7 +375,6 @@ pub fn start_poller(
     std::thread::Builder::new()
         .name("ur-dashboard-poll".into())
         .spawn(move || {
-            ready.wait();
             let alarm_targets = params.alarm_targets();
             // Starts true so an IOC that boots with the dashboard down
             // raises the COMM alarm on its first cycle.
@@ -382,11 +386,11 @@ pub fn start_poller(
                 {
                     let mut c = client.lock();
                     if c.is_connected() {
-                        match poll_once(&mut c, params, state.polyscope) {
+                        match poll_once(&mut c, params) {
                             Ok((u, mode)) => {
                                 updates = u;
                                 state.connected = true;
-                                state.robot_mode = mode;
+                                state.robot_mode = Some(mode);
                             }
                             Err(e) => {
                                 spdlog::error(format_args!(
@@ -416,13 +420,15 @@ pub fn start_poller(
                     }
                 }
 
-                updates.extend(crate::drivers::health_transition(
-                    &alarm_targets,
-                    state.connected,
-                    &mut was_healthy,
-                ));
+                if ready.is_open() {
+                    updates.extend(crate::drivers::health_transition(
+                        &alarm_targets,
+                        state.connected,
+                        &mut was_healthy,
+                    ));
+                    let _ = handle.set_params_and_notify_blocking(0, updates);
+                }
                 shared.set(state);
-                let _ = handle.set_params_and_notify_blocking(0, updates);
                 std::thread::sleep(poll_period);
             }
         })
@@ -433,7 +439,6 @@ pub fn start_poller(
 fn poll_once(
     client: &mut DashboardClient,
     params: DashboardParams,
-    polyscope: crate::dashboard::PolyScopeVersion,
 ) -> crate::UrResult<(Vec<ParamSetValue>, String)> {
     let running = client.running()?;
     let program_state = client.program_state()?;
@@ -441,7 +446,7 @@ fn poll_once(
     let loaded_program = client.loaded_program()?;
     let safety_status = client.safety_status()?;
     let program_saved = client.is_program_saved()?;
-    let remote = client.is_in_remote_control(polyscope)?;
+    let remote = client.is_in_remote_control()?;
 
     let updates = vec![
         ParamSetValue::new(params.is_connected, 0, ParamValue::Int32(1)),
@@ -483,6 +488,47 @@ fn poll_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::error::AsynError;
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+
+    /// Below PolyScope 5.6 the C++ constructor's getSerialNumber throws, so
+    /// URDashboardConfig reports that text and no dashboard is left behind
+    /// for a control or gripper port to find.
+    #[test]
+    fn a_pre_5_6_dashboard_fails_construction_with_the_serial_number_text() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut w = sock.try_clone().unwrap();
+            let mut r = StdBufReader::new(sock);
+            w.write_all(b"Connected: Universal Robots Dashboard Server\n")
+                .unwrap();
+            for _ in 0..2 {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                w.write_all(b"URSoftware 5.4.0.80651 (Mar 23 2019)\n")
+                    .unwrap();
+            }
+        });
+        let mut client = DashboardClient::new("127.0.0.1", DEFAULT_TIMEOUT);
+        client.set_port(port);
+
+        let Err(AsynError::Status { message, .. }) =
+            DashboardDriver::with_client("DASH_PRE56", "127.0.0.1", client)
+        else {
+            panic!("construction throws");
+        };
+        assert_eq!(
+            message,
+            "getSerialNumber() function is not supported on the dashboard server for \
+             PolyScope versions less than 5.6.0"
+        );
+        assert!(registry::dashboard("DASH_PRE56").is_none());
+        server.join().unwrap();
+    }
 
     /// The octet pair is the interesting negative: `POPUP` and `LOAD_URP`
     /// look like commands but their payload is the request, and they never

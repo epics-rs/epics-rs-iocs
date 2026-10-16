@@ -17,16 +17,16 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::control::ControlInterface;
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::error::{UrError, UrResult};
 use crate::registry::{self, DashboardHandle, ReceiveHandle};
+use crate::script::{SCRIPT_PORT, ScriptClient, wrap_custom_script};
+use crate::session::DEFAULT_TIMEOUT;
 use crate::spdlog;
 
 pub const NUM_JOINTS: usize = 6;
 
-/// The safety word the control interface will act in: NORMAL only.
-const SAFETY_NORMAL: i32 = 1;
 /// `poll_custom_script()` blocks until the control script is running again,
 /// with this bound (rtde_control_driver.cpp:133).
 const REUPLOAD_TIMEOUT: Duration = Duration::from_secs(1);
@@ -324,17 +324,37 @@ pub struct ControlDriver {
     robot_ip: String,
     dashboard: DashboardHandle,
     receive: ReceiveHandle,
+    /// C's `script_client_`, connected by the constructor and used only for
+    /// custom scripts (rtde_control_driver.cpp:226-227,536-552).
+    script: ScriptClient,
 }
 
 impl ControlDriver {
     /// `dashboard_port` supplies the robot IP and the RUNNING check;
     /// `receive_port` supplies the safety word and the custom-script counter.
+    ///
+    /// Fails, as C's constructor throws, when the dashboard never published a
+    /// PolyScope version or the script server refuses the connection.
     pub fn new(port_name: &str, dashboard_port: &str, receive_port: &str) -> AsynResult<Self> {
+        Self::with_script_port(port_name, dashboard_port, receive_port, SCRIPT_PORT)
+    }
+
+    fn with_script_port(
+        port_name: &str,
+        dashboard_port: &str,
+        receive_port: &str,
+        script_port: u16,
+    ) -> AsynResult<Self> {
         let dashboard = registry::dashboard(dashboard_port).ok_or_else(|| {
             asyn_error(format!(
                 "no URDashboard port named {dashboard_port}; configure it before the control port"
             ))
         })?;
+        if dashboard.get().polyscope.is_none() {
+            return Err(asyn_error("Failed to parse Polyscope version"));
+        }
+        let mut script = ScriptClient::new(&dashboard.ip, script_port, DEFAULT_TIMEOUT);
+        script.connect().map_err(|e| asyn_error(e.to_string()))?;
         let receive = registry::receive(receive_port).ok_or_else(|| {
             asyn_error(format!(
                 "no RTDEReceive port named {receive_port}; configure it before the control port"
@@ -359,6 +379,7 @@ impl ControlDriver {
             robot_ip: dashboard.ip.clone(),
             dashboard,
             receive,
+            script,
         };
         me.try_connect();
         Ok(me)
@@ -385,17 +406,18 @@ impl ControlDriver {
     /// reconnect, so RECONNECT on a healthy link returns asynError).
     fn try_connect(&self) -> bool {
         let receive = self.receive.get();
-        if receive.safety_status_bits != SAFETY_NORMAL {
+        if !receive.safety_normal() {
             spdlog::error(format_args!(
                 "Cannot connect to control interface in current safety state. \
                  Clear safeguard stop, E-stop, etc. then try again.\n"
             ));
             return false;
         }
-        if !receive.connected {
+        // An undefined mode fails C's readOnce, which returns silently.
+        let Some(running) = self.dashboard.get().robot_running() else {
             return false;
-        }
-        if !self.dashboard.get().robot_running() {
+        };
+        if !running {
             spdlog::error(format_args!(
                 "Unable to connect to control interface in current mode. \
                  Ensure robot is on, in normal mode, and brakes released, then try again.\n"
@@ -439,31 +461,45 @@ impl ControlDriver {
     }
 
     /// Launch a custom URScript (from a file or inline) on the controller.
-    fn run_custom_script(&mut self, body: &str, source: &str) -> AsynResult<()> {
+    ///
+    /// `body` is read only after the motion and script-client checks, and a
+    /// `None` (an unopenable file) is skipped silently; every skip succeeds,
+    /// as C's `goto skip` with `comm_ok` still true
+    /// (rtde_control_driver.cpp:531-545).
+    fn run_custom_script(
+        &mut self,
+        source: &str,
+        body: impl FnOnce() -> Option<String>,
+    ) -> AsynResult<()> {
         let p = self.params;
         let mut inner = self.inner.lock();
         if inner.pending_motion.is_some() && inner.motion_status != MotionStatus::WaitingAction {
             spdlog::warn(format_args!("Motion task in progress. Cannot run script."));
-            return Err(asyn_error(
-                "a motion task is in progress; the URScript was not run",
-            ));
+            return Ok(());
         }
+        if !self.script.is_connected() {
+            spdlog::error(format_args!("ScriptClient not connected!"));
+            return Ok(());
+        }
+        let Some(body) = body() else {
+            return Ok(());
+        };
+        let body = body.as_str();
         let start_count = self.receive.get().output_int_register_12;
         let timeout = inner.custom_script_timeout;
 
-        if !inner.connected() {
-            print_unusable(&inner);
-        }
-        let iface = inner
-            .iface_mut()
-            .map_err(|e| asyn_error(format!("cannot run the URScript: {e}")))?;
         match source {
             "(inline)" => spdlog::debug(format_args!("Running inline URScript: {body}")),
             path => spdlog::debug(format_args!("Running custom URScript: {path}")),
         }
+        let iface = inner.iface_mut().map_err(|_| refused())?;
         iface
-            .send_custom_script(body)
-            .map_err(|e| asyn_error(format!("failed to run the URScript {source}: {e}")))?;
+            .stop_script()
+            .and_then(|()| self.script.send(&wrap_custom_script(body)))
+            .map_err(|e| {
+                spdlog::error(format_args!("{e}"));
+                refused()
+            })?;
 
         inner.custom_script = Some(CustomScript {
             started: Instant::now(),
@@ -506,7 +542,10 @@ impl PortDriver for ControlDriver {
             let index = usize::try_from(addr)
                 .ok()
                 .filter(|i| *i < limit)
-                .ok_or_else(|| asyn_error(format!("address {addr} is out of range")))?;
+                .ok_or_else(|| {
+                    spdlog::error(format_args!("address {addr} is out of range"));
+                    refused()
+                })?;
 
             // Every arm below stages IOC-local state, so none of them needs the
             // link up — PINI processes these records at boot, before any connect
@@ -551,7 +590,10 @@ impl PortDriver for ControlDriver {
                     inner
                         .iface_mut()
                         .and_then(|i| i.set_tcp(&offset))
-                        .map_err(|e| asyn_error(format!("setTcp failed: {e}")))?;
+                        .map_err(|e| {
+                            spdlog::error(format_args!("{e}"));
+                            refused()
+                        })?;
                 }
             } else if reason == p.joint_speed {
                 inner.joint_speed = deg_to_rad(value);
@@ -609,25 +651,14 @@ impl PortDriver for ControlDriver {
                 return if self.try_connect() {
                     Ok(())
                 } else {
-                    Err(asyn_error(
-                        "could not connect to the RTDE control interface",
-                    ))
+                    Err(refused())
                 };
             }
 
             if reason == p.run_custom_script_file {
                 let path = self.inner.lock().custom_script_path.clone();
-                let body = std::fs::read_to_string(&path).map_err(|e| {
-                    asyn_error(format!("could not read the URScript file {path}: {e}"))
-                });
-                let body = match body {
-                    Ok(body) => body,
-                    Err(e) => {
-                        self.base.set_int32_param(p.custom_script_error, 0, 1)?;
-                        return Err(e);
-                    }
-                };
-                return self.run_custom_script(&body, &path);
+                return self
+                    .run_custom_script(&path.clone(), || std::fs::read_to_string(&path).ok());
             }
 
             let mut inner = self.inner.lock();
@@ -641,7 +672,7 @@ impl PortDriver for ControlDriver {
                     }
                     None => {
                         spdlog::error(format_args!("RTDE Control interface not initialized"));
-                        return Err(asyn_error("the RTDE control interface is not initialised"));
+                        return Err(refused());
                     }
                 }
             }
@@ -658,7 +689,7 @@ impl PortDriver for ControlDriver {
 
             if !inner.connected() {
                 print_unusable(&inner);
-                return Err(asyn_error("the RTDE control interface is not connected"));
+                return Err(refused());
             }
 
             let mut updates: Vec<ParamSetValue> = Vec::new();
@@ -791,7 +822,10 @@ impl PortDriver for ControlDriver {
                     self.base.set_int32_param(reason, addr, value)?;
                 }
             }
-            result.map_err(|e| asyn_error(format!("RTDE control command failed: {e}")))
+            result.map_err(|e| {
+                spdlog::error(format_args!("{e}"));
+                refused()
+            })
         })();
         if result.is_err() {
             spdlog::debug(format_args!(
@@ -826,7 +860,7 @@ impl PortDriver for ControlDriver {
             }
 
             if reason == p.custom_inline_script {
-                self.run_custom_script(&text, "(inline)")?;
+                self.run_custom_script("(inline)", || Some(text.clone()))?;
                 return Ok(data.len());
             }
 
@@ -853,40 +887,41 @@ pub fn start_poller(
     std::thread::Builder::new()
         .name("ur-control-poll".into())
         .spawn(move || {
-            ready.wait();
+            let alarm_targets = params.alarm_targets();
             // Starts true so an IOC that boots with the robot down raises
             // the COMM alarm on its first cycle.
             let mut was_healthy = true;
             loop {
-                let updates = {
+                let (mut updates, healthy_now) = {
                     let mut guard = inner.lock();
-                    poll_once(params, &mut guard, &receive, &mut was_healthy)
+                    poll_once(params, &mut guard, &receive)
                 };
-                let _ = handle.set_params_and_notify_blocking(0, updates);
+                if ready.is_open() {
+                    updates.extend(crate::drivers::health_transition(
+                        &alarm_targets,
+                        healthy_now,
+                        &mut was_healthy,
+                    ));
+                    let _ = handle.set_params_and_notify_blocking(0, updates);
+                }
                 std::thread::sleep(poll_period);
             }
         })
         .expect("failed to spawn the RTDE control poll thread")
 }
 
-/// One pass of the control poll loop. `was_healthy` is the poll thread's
-/// health-edge memory for the COMM alarm on `ControlParams::alarm_targets`.
+/// One pass of the control poll loop: the parameter updates, and whether the
+/// link is healthy for the COMM alarm on `ControlParams::alarm_targets`.
 pub fn poll_once(
     p: ControlParams,
     inner: &mut ControlInner,
     receive: &ReceiveHandle,
-    was_healthy: &mut bool,
-) -> Vec<ParamSetValue> {
+) -> (Vec<ParamSetValue>, bool) {
     let mut updates = Vec::new();
 
     if !inner.connected() {
         updates.push(ParamSetValue::new(p.is_connected, 0, ParamValue::Int32(0)));
-        updates.extend(crate::drivers::health_transition(
-            &p.alarm_targets(),
-            false,
-            was_healthy,
-        ));
-        return updates;
+        return (updates, false);
     }
     // IS_CONNECTED reflects aliveness, not just the socket: a stale stream
     // (open socket, packages stopped) reads 0. Unlike receive, control never
@@ -900,11 +935,6 @@ pub fn poll_once(
         p.is_connected,
         0,
         ParamValue::Int32(i32::from(alive)),
-    ));
-    updates.extend(crate::drivers::health_transition(
-        &p.alarm_targets(),
-        alive,
-        was_healthy,
     ));
 
     let is_steady = if inner.custom_script.is_some() {
@@ -922,12 +952,12 @@ pub fn poll_once(
     ));
 
     // A safety event aborts whatever motion is in flight.
-    if receive.get().safety_status_bits != SAFETY_NORMAL {
+    if !receive.get().safety_normal() {
         if inner.pending_motion.is_some() {
             spdlog::debug(format_args!("Motion stopped due to safety."));
             inner.motion_task_done(p, &mut updates);
         }
-        return updates;
+        return (updates, alive);
     }
 
     if inner.pending_motion.is_some() {
@@ -935,7 +965,7 @@ pub fn poll_once(
     } else if inner.custom_script.is_some() {
         poll_custom_script(p, inner, receive, &mut updates);
     }
-    updates
+    (updates, alive)
 }
 
 /// The asynchronous-motion state machine.
@@ -1087,6 +1117,8 @@ fn wait_for_program(iface: &mut ControlInterface, timeout: Duration) -> UrResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dashboard::PolyScopeVersion;
+    use crate::registry::DashboardState;
 
     fn params() -> ControlParams {
         let mut n = 0usize;
@@ -1154,23 +1186,8 @@ mod tests {
         let mut inner = ControlInner::default();
         let receive = ReceiveHandle::new();
 
-        // The first cycle to see the outage also raises the COMM alarm on
-        // the alarm targets (IS_STEADY).
-        let mut was_healthy = true;
-        let updates = poll_once(p, &mut inner, &receive, &mut was_healthy);
-        assert_eq!(updates.len(), 2);
-        assert_eq!(int_update(&updates, p.is_connected), Some(0));
-        assert!(updates.iter().any(|u| matches!(
-            u,
-            ParamSetValue::Status {
-                reason,
-                status: epics_rs::asyn::error::AsynStatus::Disconnected,
-                ..
-            } if *reason == p.is_steady
-        )));
-
-        // A steady outage publishes IS_CONNECTED alone.
-        let updates = poll_once(p, &mut inner, &receive, &mut was_healthy);
+        let (updates, healthy) = poll_once(p, &mut inner, &receive);
+        assert!(!healthy);
         assert_eq!(updates.len(), 1);
         assert_eq!(int_update(&updates, p.is_connected), Some(0));
     }
@@ -1191,8 +1208,7 @@ mod tests {
     fn receive_with_counter(count: i32) -> ReceiveHandle {
         let receive = ReceiveHandle::new();
         receive.set(registry::ReceiveState {
-            connected: true,
-            safety_status_bits: 1,
+            safety_status_bits: Some(1),
             output_int_register_12: count,
         });
         receive
@@ -1233,11 +1249,18 @@ mod tests {
     /// without a link, so the next reconnect can retry it.
     #[test]
     fn a_boot_time_tcp_offset_stages_until_a_connect_can_deliver_it() {
-        registry::register_dashboard("CTRL_B3_DASH", DashboardHandle::new("127.0.0.1"))
-            .expect("fresh port name");
+        let dash = DashboardHandle::new("127.0.0.1");
+        dash.set(DashboardState {
+            polyscope: Some(PolyScopeVersion::default()),
+            ..Default::default()
+        });
+        registry::register_dashboard("CTRL_B3_DASH", dash).expect("fresh port name");
         registry::register_receive("CTRL_B3_RECV", ReceiveHandle::new()).expect("fresh port name");
+        let script_server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let script_port = script_server.local_addr().expect("addr").port();
         let mut drv =
-            ControlDriver::new("CTRL_B3", "CTRL_B3_DASH", "CTRL_B3_RECV").expect("driver");
+            ControlDriver::with_script_port("CTRL_B3", "CTRL_B3_DASH", "CTRL_B3_RECV", script_port)
+                .expect("driver");
         let p = drv.params();
 
         // Never written: nothing staged, and a connect must leave the
@@ -1278,12 +1301,23 @@ mod tests {
     /// fail, not silently pass because 1 < NUM_JOINTS).
     #[test]
     fn a_scalar_float_write_takes_address_zero_only() {
-        registry::register_dashboard("CTRL_B3_ADDR_DASH", DashboardHandle::new("127.0.0.1"))
-            .expect("fresh port name");
+        let dash = DashboardHandle::new("127.0.0.1");
+        dash.set(DashboardState {
+            polyscope: Some(PolyScopeVersion::default()),
+            ..Default::default()
+        });
+        registry::register_dashboard("CTRL_B3_ADDR_DASH", dash).expect("fresh port name");
         registry::register_receive("CTRL_B3_ADDR_RECV", ReceiveHandle::new())
             .expect("fresh port name");
-        let mut drv = ControlDriver::new("CTRL_B3_ADDR", "CTRL_B3_ADDR_DASH", "CTRL_B3_ADDR_RECV")
-            .expect("driver");
+        let script_server = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let script_port = script_server.local_addr().expect("addr").port();
+        let mut drv = ControlDriver::with_script_port(
+            "CTRL_B3_ADDR",
+            "CTRL_B3_ADDR_DASH",
+            "CTRL_B3_ADDR_RECV",
+            script_port,
+        )
+        .expect("driver");
         let p = drv.params();
 
         assert!(
@@ -1298,6 +1332,49 @@ mod tests {
             drv.write_float64(&mut AsynUser::new(p.tcp_offset).with_addr(6), 0.1)
                 .is_err()
         );
+    }
+
+    /// C's constructor throws before the port is usable when the dashboard
+    /// never published a version or the script server refuses
+    /// (rtde_control_driver.cpp:96,227); the Config command prints `what()`.
+    #[test]
+    fn construction_fails_as_the_c_constructor_throws() {
+        let message = |r: AsynResult<ControlDriver>| match r {
+            Err(epics_rs::asyn::error::AsynError::Status { message, .. }) => message,
+            Err(e) => panic!("unexpected error {e}"),
+            Ok(_) => panic!("construction must fail"),
+        };
+        registry::register_receive("CTRL_THROW_RECV", ReceiveHandle::new())
+            .expect("fresh port name");
+
+        let unversioned = DashboardHandle::new("127.0.0.1");
+        registry::register_dashboard("CTRL_THROW_DASH0", unversioned).expect("fresh port name");
+        assert_eq!(
+            message(ControlDriver::new(
+                "CTRL_THROW0",
+                "CTRL_THROW_DASH0",
+                "CTRL_THROW_RECV"
+            )),
+            "Failed to parse Polyscope version"
+        );
+
+        let versioned = DashboardHandle::new("127.0.0.1");
+        versioned.set(DashboardState {
+            polyscope: Some(PolyScopeVersion::default()),
+            ..Default::default()
+        });
+        registry::register_dashboard("CTRL_THROW_DASH1", versioned).expect("fresh port name");
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        let refused = message(ControlDriver::with_script_port(
+            "CTRL_THROW1",
+            "CTRL_THROW_DASH1",
+            "CTRL_THROW_RECV",
+            closed,
+        ));
+        assert!(refused.starts_with("connect: "), "{refused}");
     }
 
     /// A move whose start returns `Err` — a `CommandRefused` and a transport

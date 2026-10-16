@@ -2,11 +2,18 @@
 #============================================================
 # st.cmd — Elettra/CaenEls AH501 series picoammeter IOC
 #
-# Usage:
-#   cargo run -p ah501-ioc -- iocs/quadem/ah501-ioc/st.cmd
+# Usage (from this directory, as C runs from iocBoot/iocAH501):
+#   ../../../target/debug/ah501-ioc st.cmd
 #
-# Mirrors quadEM's iocBoot/iocAH501/AH501.cmd + iocBoot/AHxxx.cmd.
+# Port of quadEM iocBoot/iocAH501/st.cmd + AH501.cmd. dbLoadDatabase and
+# registerRecordDeviceDriver have no epics-rs counterpart; $(QUADEM) is set
+# to iocs/quadem by ioc_support.
 #============================================================
+
+errlogInit(5000)
+
+# The search path for database files
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
 
 epicsEnvSet("PREFIX",    "QE1:")
 epicsEnvSet("RECORD",    "AH501:")
@@ -14,31 +21,16 @@ epicsEnvSet("PORT",      "AH501")
 epicsEnvSet("TEMPLATE",  "AH501")
 #epicsEnvSet("MODEL",     "AH501D")
 epicsEnvSet("MODEL",     "AH501BE")
+epicsEnvSet("QSIZE",     "20")
 epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "1000")
 epicsEnvSet("IP",        "164.54.160.206:10001")
 
-# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
-# at IOC startup; every quadEM template lives in its db/ subdir.
+< $(QUADEM)/AHxxx.cmd
 
-# drvAsynIPPortConfigure("portName","hostInfo",priority,noAutoConnect,
-#                        noProcessEos)
-drvAsynIPPortConfigure("IP_$(PORT)", "$(IP)", 0, 0, 0)
-asynOctetSetInputEos("IP_$(PORT)",  0, "\r\n")
-asynOctetSetOutputEos("IP_$(PORT)", 0, "\r")
+< $(QUADEM)/saveRestore.cmd
 
-drvAHxxxConfigure("$(PORT)", "IP_$(PORT)", $(RING_SIZE), "$(MODEL)")
+iocInit()
 
-# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
-# ...) resolve through the db search path; direct dbLoad paths stay explicit.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
-
-dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), ADDR=0, TIMEOUT=1")
-
-# iocInit is called automatically by IocApplication after this script completes.
-#
-# Example interactive commands:
-#   dbl                            # List all PVs
-#   dbpf QE1:AH501:Acquire 1       # Start acquisition
-#   dbgf QE1:AH501:Current1:MeanValue_RBV
-#   asynReport                     # Show port/plugin status
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req",30,"P=$(PREFIX), R=$(RECORD)")

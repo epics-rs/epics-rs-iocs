@@ -9,6 +9,7 @@
 //!   "Spec" = ControlNet Spec. version 2.0, Errata 1
 //!   "ENET" = AB Publication 1756-RM005A-EN-E
 
+use epics_rs::base::types::c_cast::{f64_to_i32, f64_to_u32};
 use std::fmt;
 
 /// A tag value is transported as an abbreviated type code followed by raw data.
@@ -728,23 +729,19 @@ pub fn get_double(raw: &[u8], element: usize) -> Option<f64> {
     }
 }
 
-/// Read `element` as a signed 32-bit integer.
-///
-/// UPSTREAM FIX: the C's `get_CIP_DINT` reads SINT through an unsigned char, so
-/// a SINT of -2 arrives at an `ai`/`longin` record as 254. SINT is signed; we
-/// sign-extend it. BOOL keeps its unsigned 0/non-zero meaning.
+/// Read `element` as a signed 32-bit integer, converted as C
+/// `get_CIP_DINT` converts it (ether_ip.c:1347-1385): SINT through an
+/// unsigned byte, INT/UINT through a signed `CN_INT`, floats by C cast, and
+/// no LINT.
 pub fn get_dint(raw: &[u8], element: usize) -> Option<i32> {
     let t = typecode(raw)?;
     let at = elem_off(t, element);
     match t {
-        CipType::Bool => raw.get(at).map(|&v| v as i32),
-        CipType::Sint => raw.get(at).map(|&v| v as i8 as i32),
-        CipType::Int => rd_u16(raw, at).map(|v| v as i16 as i32),
-        CipType::Uint => rd_u16(raw, at).map(|v| v as i32),
+        CipType::Bool | CipType::Sint => raw.get(at).map(|&v| v as i32),
+        CipType::Int | CipType::Uint => rd_u16(raw, at).map(|v| v as i16 as i32),
         CipType::Dint | CipType::Bits => rd_u32(raw, at).map(|v| v as i32),
-        CipType::Lint | CipType::Ulint => rd_u64(raw, at).map(|v| v as i64 as i32),
-        CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as i32),
-        CipType::Lreal => rd_u64(raw, at).map(|v| f64::from_bits(v) as i32),
+        CipType::Real => rd_u32(raw, at).map(|v| f64_to_i32(f32::from_bits(v) as f64)),
+        CipType::Lreal => rd_u64(raw, at).map(|v| f64_to_i32(f64::from_bits(v))),
         _ => {
             crate::eip_printf!(1, "EIP get_CIP_DINT: unknown type 0x{:04X}\n", t.code());
             None
@@ -763,8 +760,8 @@ pub fn get_udint(raw: &[u8], element: usize) -> Option<u32> {
         CipType::Bool | CipType::Sint => raw.get(at).map(|&v| v as u32),
         CipType::Int | CipType::Uint => rd_u16(raw, at).map(|v| v as u32),
         CipType::Dint | CipType::Bits => rd_u32(raw, at),
-        CipType::Real => rd_u32(raw, at).map(|v| f32::from_bits(v) as u32),
-        CipType::Lreal => rd_u64(raw, at).map(|v| f64::from_bits(v) as u32),
+        CipType::Real => rd_u32(raw, at).map(|v| f64_to_u32(f32::from_bits(v) as f64)),
+        CipType::Lreal => rd_u64(raw, at).map(|v| f64_to_u32(f64::from_bits(v))),
         _ => {
             crate::eip_printf!(1, "EIP get_CIP_UDINT: unknown type 0x{:04X}\n", t.code());
             None

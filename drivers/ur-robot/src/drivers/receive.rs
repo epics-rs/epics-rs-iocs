@@ -15,10 +15,10 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::receive::ReceiveInterface;
-use crate::registry::{self, ReceiveHandle, ReceiveState};
+use crate::registry::{self, ReceiveHandle};
 use crate::stream::Snapshot;
 
 pub const NUM_JOINTS: usize = 6;
@@ -349,16 +349,14 @@ impl PortDriver for ReceiveDriver {
                 return if self.try_connect() {
                     Ok(())
                 } else {
-                    Err(asyn_error(
-                        "could not connect to the RTDE receive interface",
-                    ))
+                    Err(refused())
                 };
             }
 
             let mut slot = self.iface.lock();
             let Some(iface) = slot.as_mut() else {
                 spdlog::error(format_args!("RTDE Receive interface not initialized"));
-                return Err(asyn_error("the RTDE receive interface is not initialised"));
+                return Err(refused());
             };
 
             if reason == p.disconnect {
@@ -369,7 +367,7 @@ impl PortDriver for ReceiveDriver {
 
             if !iface.is_connected() {
                 spdlog::warn(format_args!("RTDE Receive interface not connected"));
-                return Err(asyn_error("the RTDE receive interface is not connected"));
+                return Err(refused());
             }
             Ok(())
         })();
@@ -384,7 +382,7 @@ impl PortDriver for ReceiveDriver {
 
 /// The receive poll thread (`RTDEReceive::poll`).
 ///
-/// Deviation from C (which never reconnects on its own): the poll thread owns
+/// Deviation from C (which reconnects only on a RECONNECT write): the poll thread owns
 /// automatic recovery. An unhealthy stream — socket down OR stale per
 /// `STALE_AFTER` — is retried on the `RECONNECT_BACKOFF` schedule, so a
 /// monitoring IOC comes back by itself when the robot does.
@@ -400,7 +398,6 @@ pub fn start_poller(
     std::thread::Builder::new()
         .name("ur-receive-poll".into())
         .spawn(move || {
-            ready.wait();
             let mut backoff = Backoff::new();
             let alarm_targets = params.alarm_targets();
             // Starts true so an IOC that boots with the robot down raises
@@ -434,23 +431,20 @@ pub fn start_poller(
 
                 let mut updates = match &snapshot {
                     Some(snap) if !snap.is_empty() => {
-                        let state = ReceiveState {
-                            connected: true,
-                            safety_status_bits: snap
-                                .uint("safety_status_bits")
-                                .map(|b| (b & SAFETY_STATUS_BITS_MASK) as i32)
-                                .unwrap_or_default(),
-                            output_int_register_12: snap
-                                .output_int_register(12)
-                                .unwrap_or_default(),
-                        };
+                        // A param keeps its last value through an outage, as
+                        // C's does; only a received word replaces it.
+                        let mut state = shared.get();
+                        if let Some(bits) = snap.uint("safety_status_bits") {
+                            state.safety_status_bits =
+                                Some((bits & SAFETY_STATUS_BITS_MASK) as i32);
+                        }
+                        if let Some(count) = snap.output_int_register(12) {
+                            state.output_int_register_12 = count;
+                        }
                         shared.set(state);
                         publish(params, snap)
                     }
                     _ => {
-                        let mut state = shared.get();
-                        state.connected = false;
-                        shared.set(state);
                         vec![ParamSetValue::new(
                             params.is_connected,
                             0,
@@ -464,14 +458,15 @@ pub fn start_poller(
                 // recovery clears the alarm in the very batch that carries
                 // the fresh values.
                 let healthy_now = matches!(&snapshot, Some(s) if !s.is_empty());
-                updates.extend(crate::drivers::health_transition(
-                    &alarm_targets,
-                    healthy_now,
-                    &mut was_healthy,
-                ));
-
-                for (addr, batch) in by_addr(updates) {
-                    let _ = handle.set_params_and_notify_blocking(addr, batch);
+                if ready.is_open() {
+                    updates.extend(crate::drivers::health_transition(
+                        &alarm_targets,
+                        healthy_now,
+                        &mut was_healthy,
+                    ));
+                    for (addr, batch) in by_addr(updates) {
+                        let _ = handle.set_params_and_notify_blocking(addr, batch);
+                    }
                 }
                 std::thread::sleep(poll_period);
             }

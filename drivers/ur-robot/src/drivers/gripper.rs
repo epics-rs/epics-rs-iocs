@@ -16,8 +16,8 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::error::UrResult;
 use crate::gripper::{MoveMode, MoveParameter, ObjectStatus, RobotiqGripper, Unit};
 use crate::registry::{self, DashboardHandle};
@@ -313,9 +313,7 @@ impl PortDriver for GripperDriver {
                 spdlog::error(format_args!(
                     "Robot must be powered and dashboard connected on to use gripper"
                 ));
-                return Err(asyn_error(
-                    "the robot must be powered on and the dashboard connected to use the gripper",
-                ));
+                return Err(refused());
             }
 
             if reason == p.connect {
@@ -326,7 +324,7 @@ impl PortDriver for GripperDriver {
             let mut gripper = self.gripper.lock();
             if !gripper.is_connected() {
                 spdlog::error(format_args!("Robotiq gripper not connected"));
-                return Err(asyn_error("the Robotiq gripper is not connected"));
+                return Err(refused());
             }
             if reason == p.connect {
                 return Ok(());
@@ -398,7 +396,7 @@ impl PortDriver for GripperDriver {
             }
             result.map_err(|e| {
                 spdlog::error(format_args!("{e}"));
-                asyn_error(format!("gripper command failed: {e}"))
+                crate::drivers::refused()
             })
         })();
         if result.is_err() {
@@ -444,7 +442,6 @@ pub fn start_poller(
     std::thread::Builder::new()
         .name("ur-gripper-poll".into())
         .spawn(move || {
-            ready.wait();
             let alarm_targets = params.alarm_targets();
             // Starts true so an IOC that boots with the gripper down raises
             // the COMM alarm on its first cycle.
@@ -480,12 +477,14 @@ pub fn start_poller(
                         )
                     }
                 };
-                updates.extend(crate::drivers::health_transition(
-                    &alarm_targets,
-                    healthy_now,
-                    &mut was_healthy,
-                ));
-                let _ = handle.set_params_and_notify_blocking(0, updates);
+                if ready.is_open() {
+                    updates.extend(crate::drivers::health_transition(
+                        &alarm_targets,
+                        healthy_now,
+                        &mut was_healthy,
+                    ));
+                    let _ = handle.set_params_and_notify_blocking(0, updates);
+                }
                 std::thread::sleep(poll_period);
             }
         })
@@ -728,7 +727,7 @@ mod tests {
         drv.gripper().lock().set_port(port);
         dash.set(DashboardState {
             connected: true,
-            robot_mode: "Robotmode: IDLE".into(),
+            robot_mode: Some("Robotmode: IDLE".into()),
             ..Default::default()
         });
 
@@ -757,7 +756,7 @@ mod tests {
         drv.gripper().lock().set_port(port);
         dash.set(DashboardState {
             connected: true,
-            robot_mode: "Robotmode: IDLE".into(),
+            robot_mode: Some("Robotmode: IDLE".into()),
             ..Default::default()
         });
 

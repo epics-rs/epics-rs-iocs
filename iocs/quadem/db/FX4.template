@@ -1,14 +1,6 @@
 # Database for Pyramid FX4 electrometer
 #   Mark Rivers
 #   May 1, 2026
-#
-# Vendored from quadEM's quadEMApp/Db/FX4.template. One change: upstream's
-# SetRange record is named "(P)$(R)SetRange" — a missing '$' that creates a
-# record literally called "(P)FX4:SetRange" and leaves the Range mbbo without
-# an output link to the meter.
-#
-# The $(FXP) records are Channel Access links to the PV server the FX4 itself
-# publishes; they do not go through the asyn port.
 
 include "quadEM.template"
 
@@ -93,7 +85,7 @@ record(mbbi,"$(P)$(R)CurrentUnits_RBV") {
     field(INP, "$(P)$(R)CurrentUnits")
 }
 
-record(longout, "$(P)$(R)SetRange") {
+record(longout, "(P)$(R)SetRange") {
     field(DOL,  "$(P)$(R)Range.RVAL CP")
     field(OUT,  "$(FXP)/fx4/range/value")
     field(OMSL, "closed_loop")

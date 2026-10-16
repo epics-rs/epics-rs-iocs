@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
-use crate::trace::AsynPrint;
+use crate::trace::{self, AsynPrint};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
 use epics_rs::ad_core::plugin::channel::{
@@ -33,7 +33,7 @@ use epics_rs::ad_core::plugin::channel::{
 };
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
-use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriverBase, PortFlags};
@@ -571,21 +571,64 @@ pub struct QuadEmShared {
     pub array_counter: AtomicI32,
 }
 
-/// C's `int status; status |= ...`: the first failure, kept while the
-/// remaining steps still run.
+/// C's `int status; status |= ...`: the OR of every step's `asynStatus`, so
+/// a timeout and an overflow return asynError's 3.
 #[derive(Default)]
-struct StatusOr(Option<AsynError>);
+struct StatusOr(i32);
 
 impl StatusOr {
     fn add<T>(&mut self, r: AsynResult<T>) {
-        if let (None, Err(e)) = (&self.0, r) {
-            self.0 = Some(e);
+        if let Err(e) = r {
+            self.0 |= trace::status_code(&e);
         }
     }
 
-    fn into_result(self) -> AsynResult<()> {
-        self.0.map_or(Ok(()), Err)
+    /// C's `status = ...`, which drops what the earlier steps returned.
+    fn set<T>(&mut self, r: AsynResult<T>) {
+        self.0 = 0;
+        self.add(r);
     }
+
+    /// C's `return (asynStatus)status` with the errorMessage it formats; an
+    /// OR no `asynStatus` names (6, 7) is returned as asynError.
+    fn into_result(self, message: impl FnOnce(i32) -> String) -> AsynResult<()> {
+        let status = match self.0 {
+            0 => return Ok(()),
+            1 => AsynStatus::Timeout,
+            2 => AsynStatus::Overflow,
+            4 => AsynStatus::Disconnected,
+            5 => AsynStatus::Disabled,
+            _ => AsynStatus::Error,
+        };
+        Err(AsynError::Status {
+            status,
+            message: message(self.0),
+        })
+    }
+}
+
+/// The tail C's `writeInt32`/`writeFloat64` share: the errorMessage on a
+/// failure, the `ASYN_TRACEIO_DRIVER` line otherwise.
+fn qe_write_result(
+    base: &PortDriverBase,
+    status: StatusOr,
+    function_name: &str,
+    reason: usize,
+    value: &str,
+) -> AsynResult<()> {
+    let name = base.params.param_name(reason).unwrap_or("");
+    if status.0 == 0 {
+        asyn_print!(
+            *base,
+            IO_DRIVER,
+            "drvQuadEM:{function_name}: function={reason}, name={name}, value={value}"
+        );
+    }
+    status.into_result(|code| {
+        format!(
+            "drvQuadEM:{function_name}: status={code}, function={reason}, name={name}, value={value}"
+        )
+    })
 }
 
 impl QuadEmShared {
@@ -667,9 +710,9 @@ impl QuadEmShared {
     /// C++ `drvQuadEM::triggerCallbacks`. Returns `false` when nothing was
     /// pending (`rawCount_ < 1`, e.g. a Read press while idle). `port` is the
     /// driver port the failure is reported on.
-    pub fn trigger_callbacks(&self, port: &dyn AsynPrint) -> bool {
+    pub fn trigger_callbacks(&self, port: &dyn AsynPrint) -> AsynResult<()> {
         let Some(n) = self.ring.lock().take_raw_count() else {
-            return false;
+            return Ok(());
         };
         if self.trigger_tx.try_send(n).is_err() {
             asyn_print!(
@@ -677,9 +720,12 @@ impl QuadEmShared {
                 ERROR,
                 "drvQuadEM::triggerCallbacks, error calling epicsMessageQueueSend"
             );
-            return false;
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            });
         }
-        true
+        Ok(())
     }
 
     /// C++ `drvQuadEM::computePositions`: derive the sample, ring it, trigger
@@ -720,7 +766,7 @@ impl QuadEmShared {
 
         let num_average = self.acq.lock().num_average;
         if num_average > 0 && self.ring.lock().raw_count >= num_average {
-            self.trigger_callbacks(handle);
+            let _ = self.trigger_callbacks(handle);
         }
 
         // C++ sets QE_DOUBLE_DATA and fires callbacks on each of the 11
@@ -873,7 +919,7 @@ pub trait QuadEmDevice {
             }
             status.add(self.read_status());
         } else if reason == p.read_data {
-            shared.trigger_callbacks(&self.qe_base().port_base);
+            status.add(shared.trigger_callbacks(&self.qe_base().port_base));
         } else if reason == p.resolution {
             status.add(self.set_resolution(value));
             status.add(self.read_status());
@@ -897,14 +943,20 @@ pub trait QuadEmDevice {
         } else if reason == p.reset {
             status.add(self.reset());
             status.add(self.read_status());
-        } else {
-            status.add(self.qe_base().write_int32_pool(reason));
+        } else if reason < p.acquire_mode {
+            status.set(self.qe_base().write_int32_pool(reason));
         }
 
         // C's callParamCallbacks() posts address 0 only; the other addresses
         // post from computePositions while data flows.
         status.add(self.qe_base().port_base.call_param_callbacks(0));
-        status.into_result()
+        qe_write_result(
+            &self.qe_base().port_base,
+            status,
+            "writeInt32",
+            reason,
+            &value.to_string(),
+        )
     }
 
     /// C++ `drvQuadEM::writeFloat64`, with [`Self::qe_write_int32`]'s status rule.
@@ -933,7 +985,13 @@ pub trait QuadEmDevice {
         }
 
         status.add(self.qe_base().port_base.call_param_callbacks(0));
-        status.into_result()
+        qe_write_result(
+            &self.qe_base().port_base,
+            status,
+            "writeFloat64",
+            reason,
+            &format!("{value:.6}"),
+        )
     }
 
     /// `drvQuadEM::setAcquire`: starting an acquisition clears `NumAcquired`.
@@ -1468,12 +1526,12 @@ mod tests {
         base: QuadEmBase,
         shared: Arc<QuadEmShared>,
         calls: Vec<&'static str>,
-        failing: &'static [&'static str],
+        failing: &'static [(&'static str, AsynStatus)],
         bias_interlocks: Vec<i32>,
     }
 
     impl FakeMeter {
-        fn new(failing: &'static [&'static str]) -> Self {
+        fn new(failing: &'static [(&'static str, AsynStatus)]) -> Self {
             Self {
                 base: QuadEmBase::new("QE_FAKE_DISPATCH", 0).unwrap(),
                 shared: QuadEmShared::new(16).0,
@@ -1485,9 +1543,9 @@ mod tests {
 
         fn step(&mut self, name: &'static str) -> AsynResult<()> {
             self.calls.push(name);
-            if self.failing.contains(&name) {
+            if let Some(&(_, status)) = self.failing.iter().find(|(n, _)| *n == name) {
                 return Err(AsynError::Status {
-                    status: epics_rs::asyn::error::AsynStatus::Disconnected,
+                    status,
                     message: name.into(),
                 });
             }
@@ -1529,42 +1587,64 @@ mod tests {
         }
     }
 
-    fn failed_with(r: AsynResult<()>) -> String {
+    fn failed_with(r: AsynResult<()>) -> (AsynStatus, String) {
         match r {
-            Err(AsynError::Status { message, .. }) => message,
+            Err(AsynError::Status { status, message }) => (status, message),
             other => panic!("expected a status error, got {other:?}"),
         }
     }
 
     #[test]
     fn a_failed_setter_still_reads_status_and_fails_the_write() {
-        let mut m = FakeMeter::new(&["set_range"]);
+        let mut m = FakeMeter::new(&[("set_range", AsynStatus::Disconnected)]);
         let range = m.base.params.range;
-        assert_eq!(failed_with(m.qe_write_int32(range, 0, 3)), "set_range");
+        assert_eq!(
+            failed_with(m.qe_write_int32(range, 0, 3)),
+            (
+                AsynStatus::Disconnected,
+                format!("drvQuadEM:writeInt32: status=4, function={range}, name=QE_RANGE, value=3")
+            )
+        );
         assert_eq!(m.calls, ["set_range", "read_status"]);
         assert_eq!(m.base.port_base.get_int32_param(range, 0).unwrap(), 3);
     }
 
     #[test]
     fn a_failed_status_read_fails_an_accepted_setting() {
-        let mut m = FakeMeter::new(&["read_status"]);
+        let mut m = FakeMeter::new(&[("read_status", AsynStatus::Timeout)]);
         let bias_voltage = m.base.params.bias_voltage;
         assert_eq!(
             failed_with(m.qe_write_float64(bias_voltage, 0, 50.0)),
-            "read_status"
+            (
+                AsynStatus::Timeout,
+                format!(
+                    "drvQuadEM:writeFloat64: status=1, function={bias_voltage}, \
+                     name=QE_BIAS_VOLTAGE, value=50.000000"
+                )
+            )
         );
         assert_eq!(m.calls, ["set_bias_voltage", "read_status"]);
     }
 
+    /// C ORs the codes: Timeout(1) | Overflow(2) is asynError(3).
     #[test]
-    fn the_first_failure_is_the_one_reported() {
-        let mut m = FakeMeter::new(&["set_acquire", "set_acquire_mode", "read_status"]);
+    fn the_step_statuses_are_ored() {
+        let mut m = FakeMeter::new(&[
+            ("set_acquire", AsynStatus::Timeout),
+            ("set_acquire_mode", AsynStatus::Overflow),
+        ]);
         let (acquire, acquire_mode) = (m.base.nd_params.acquire, m.base.params.acquire_mode);
         m.base.port_base.set_int32_param(acquire, 0, 1).unwrap();
         let single = QeAcquireMode::Single as i32;
         assert_eq!(
             failed_with(m.qe_write_int32(acquire_mode, 0, single)),
-            "set_acquire"
+            (
+                AsynStatus::Error,
+                format!(
+                    "drvQuadEM:writeInt32: status=3, function={acquire_mode}, \
+                     name=QE_ACQUIRE_MODE, value={single}"
+                )
+            )
         );
         assert_eq!(m.calls, ["set_acquire", "set_acquire_mode", "read_status"]);
         assert_eq!(m.base.port_base.get_int32_param(acquire, 0).unwrap(), 0);
@@ -1580,6 +1660,20 @@ mod tests {
         m.base.port_base.set_int32_param(bias_state, 0, 1).unwrap();
         m.base_reset().unwrap();
         assert_eq!(m.bias_interlocks, [0]);
+    }
+
+    /// Overflow(2) | Disconnected(4) is 6, which no asynStatus names: the
+    /// message carries C's 6, the returned status is asynError.
+    #[test]
+    fn an_or_no_status_names_is_an_error() {
+        let mut m = FakeMeter::new(&[
+            ("set_range", AsynStatus::Overflow),
+            ("read_status", AsynStatus::Disconnected),
+        ]);
+        let range = m.base.params.range;
+        let (status, message) = failed_with(m.qe_write_int32(range, 0, 1));
+        assert_eq!(status, AsynStatus::Error);
+        assert!(message.contains("status=6,"), "{message}");
     }
 
     fn acquire_busy(m: &FakeMeter) -> i32 {

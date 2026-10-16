@@ -2,38 +2,40 @@
 #============================================================
 # st.cmd — Pyramid FX4 4-channel picoammeter IOC
 #
-# Usage:
-#   cargo run -p fx4-ioc -- iocs/quadem/fx4-ioc/st.cmd
+# Usage (from this directory, as C runs from iocBoot/iocFX4):
+#   ../../../target/debug/fx4-ioc st.cmd
 #
-# Mirrors quadEM's iocBoot/iocFX4/FX4.cmd.
+# Port of quadEM iocBoot/iocFX4/st.cmd + FX4.cmd. dbLoadDatabase and
+# registerRecordDeviceDriver have no epics-rs counterpart; $(QUADEM) is set
+# to iocs/quadem by ioc_support.
 #============================================================
+
+errlogInit(5000)
+
+# The search path for database files
+epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
 
 epicsEnvSet("PREFIX",    "QE1:")
 epicsEnvSet("RECORD",    "FX4:")
 epicsEnvSet("PORT",      "FX4")
 epicsEnvSet("TEMPLATE",  "FX4")
+epicsEnvSet("QSIZE",     "20")
 epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "4096")
 epicsEnvSet("IP",        "164.54.161.10")
 
-# $(QUADEM) is set to the quadem family root (iocs/quadem) by ioc_support
-# at IOC startup; every quadEM template lives in its db/ subdir.
-
-# The driver opens ws://$(IP) itself, so there is no asyn IP port to configure.
 drvFX4Configure("$(PORT)", "$(IP)", $(RING_SIZE))
-
-# $(FXP) is the prefix of the PV server the FX4 itself publishes; the template's
-# range/bias/units records are Channel Access links to it.
-# Template-internal `include` lines (ADBase.template, NDArrayBase.template,
-# ...) resolve through the db search path; direct dbLoad paths stay explicit.
-epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
-
 dbLoadRecords("$(QUADEM)/db/$(TEMPLATE).template", "P=$(PREFIX), R=$(RECORD), PORT=$(PORT), FXP=$(IP):, ADDR=0, TIMEOUT=1")
 
-# iocInit is called automatically by IocApplication after this script completes.
-#
-# Example interactive commands:
-#   dbl                          # List all PVs
-#   dbpf QE1:FX4:Acquire 1       # Start acquisition
-#   dbgf QE1:FX4:Current1:MeanValue_RBV
-#   asynReport                   # Show port/plugin status
+< $(QUADEM)/quadEM_Plugins.cmd
+
+asynSetTraceIOMask("$(PORT)",0,2)
+
+asynSetTraceMask("$(PORT)",  0, ERROR | DRIVER)
+
+< $(QUADEM)/saveRestore.cmd
+
+iocInit()
+
+# save settings every thirty seconds
+create_monitor_set("auto_settings.req",30,"P=$(PREFIX), R=$(RECORD)")

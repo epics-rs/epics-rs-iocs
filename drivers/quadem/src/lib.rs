@@ -26,6 +26,7 @@ pub mod drv_quad_em;
 pub mod fx4;
 pub mod fx4_proto;
 pub mod iocsh;
+mod ixwebsocket;
 pub mod nsls_em;
 pub mod nsls_em_proto;
 pub mod octet;

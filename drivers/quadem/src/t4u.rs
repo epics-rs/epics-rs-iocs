@@ -153,8 +153,29 @@ impl T4uVariant {
 struct T4uState {
     range: i32,
     cal: ChannelCal,
+    /// Direct driver only: C++ `fullSlope_`/`fullOffset_` — the table the
+    /// wait-state mode currently selects, written to registers 100-107 on every
+    /// range change and checked against their read-back.
+    full: Option<CalTable>,
     sample_time: f64,
     averaging_time: f64,
+}
+
+impl T4uState {
+    /// C++ `value != full*_[currRange_][channel]`, direct driver only. C++
+    /// indexes past the table for range 3 (`RANGE_SEL_MASK` is 0x3); here
+    /// that range has nothing to compare.
+    fn full_differs(
+        &self,
+        table: impl Fn(&CalTable) -> [[f32; QE_MAX_INPUTS]; proto::NUM_RANGES],
+        channel: usize,
+        value: f64,
+    ) -> bool {
+        self.full
+            .as_ref()
+            .and_then(|f| table(f).get(self.range as usize).map(|r| r[channel]))
+            .is_some_and(|expected| value != expected as f64)
+    }
 }
 
 type SharedState = Arc<parking_lot::Mutex<T4uState>>;
@@ -301,10 +322,6 @@ pub struct T4uDriver {
     cmd: CmdSink,
     /// Direct driver only: the calibration file's two tables.
     calibration: Option<Calibration>,
-    /// Direct driver only: C++ `fullSlope_`/`fullOffset_` — the table the
-    /// wait-state mode currently selects, written to registers 100-107 on every
-    /// range change.
-    full: CalTable,
 }
 
 impl T4uDriver {
@@ -327,11 +344,14 @@ impl T4uDriver {
         let t4u = T4uParams::create(&mut base.port_base, variant)?;
 
         // C++ `currRange_`, set before the ports are configured.
-        state.lock().range = match variant {
-            T4uVariant::Middle => 0,
-            T4uVariant::Direct => proto::NUM_RANGES as i32 - 1,
-        };
-        let full = calibration.map(|c| c.cw).unwrap_or_default();
+        {
+            let mut st = state.lock();
+            st.range = match variant {
+                T4uVariant::Middle => 0,
+                T4uVariant::Direct => proto::NUM_RANGES as i32 - 1,
+            };
+            st.full = calibration.map(|c| c.cw);
+        }
 
         // C++ returns from the constructor at the first port that will not
         // configure: the port stays, with drvQuadEM's defaults and no meter.
@@ -345,7 +365,6 @@ impl T4uDriver {
                 variant,
                 cmd,
                 calibration,
-                full,
             });
         }
 
@@ -385,7 +404,6 @@ impl T4uDriver {
             variant,
             cmd,
             calibration,
-            full,
         };
 
         // C++ sets acquiring_ = 1 in the constructor and calls
@@ -435,13 +453,14 @@ impl T4uDriver {
             .set_int32_param(self.params().range, channel, value)?;
         self.send(proto::cmd_write(proto::REG_T4U_RANGE, value));
 
-        if self.variant == T4uVariant::Direct {
+        let full = self.state.lock().full;
+        if let Some(full) = full {
             let range = value as usize;
             for channel in 0..QE_MAX_INPUTS {
                 // The registers hold the float's bit pattern, so C++ type-puns
                 // the float and writes the resulting int.
-                let slope = self.full.slope[range][channel].to_bits() as i32;
-                let offset = self.full.offset[range][channel].to_bits() as i32;
+                let slope = full.slope[range][channel].to_bits() as i32;
+                let offset = full.offset[range][channel].to_bits() as i32;
                 self.send(proto::cmd_write(
                     proto::TXC_CALIB_SLOPE_BASE + channel as i32,
                     slope,
@@ -476,7 +495,7 @@ impl T4uDriver {
                     proto::REG_T4U_CTRL,
                     proto::WAIT_STATE_INHIBIT_MASK,
                 ));
-                self.full = cal.cw;
+                self.state.lock().full = Some(cal.cw);
             }
             proto::WAIT_STATE_MODE_TRIGGER => {
                 self.send(proto::cmd_bits(
@@ -484,10 +503,10 @@ impl T4uDriver {
                     proto::REG_T4U_CTRL,
                     proto::WAIT_STATE_TRIGGER_MASK,
                 ));
-                self.full = cal.pulsed;
+                self.state.lock().full = Some(cal.pulsed);
             }
             // WAIT_STATE_MODE_NONE, and anything else: the bits stay cleared.
-            _ => self.full = cal.cw,
+            _ => self.state.lock().full = Some(cal.cw),
         }
     }
 
@@ -761,11 +780,19 @@ impl RegSink {
                 set_int(self.t4u.pos_track_mode, pos_track),
             ],
             CalSlope { channel, value } => {
-                self.state.lock().cal.slope[channel] = value;
+                let mut st = self.state.lock();
+                st.cal.slope[channel] = value;
+                if st.full_differs(|f| f.slope, channel, value) {
+                    println!("Slope calibration mismatch channel {channel}");
+                }
                 Vec::new()
             }
             CalOffset { channel, value } => {
-                self.state.lock().cal.offset[channel] = value;
+                let mut st = self.state.lock();
+                st.cal.offset[channel] = value;
+                if st.full_differs(|f| f.offset, channel, value) {
+                    println!("Offset calibration mismatch channel {channel}");
+                }
                 Vec::new()
             }
         };
@@ -1350,6 +1377,7 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
     let state: SharedState = Arc::new(parking_lot::Mutex::new(T4uState {
         range: 0,
         cal: ChannelCal::default(),
+        full: None,
         sample_time: MIDDLE_SAMPLE_TIME,
         averaging_time: 0.0,
     }));
@@ -1432,6 +1460,28 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
 mod tests {
     use super::*;
     use epics_rs::asyn::registry::claim_port;
+
+    /// C++ compares a read-back calibration register with the selected table
+    /// at `currRange_`; the middle driver has no table and never complains.
+    #[test]
+    fn a_calibration_read_back_is_checked_against_the_selected_range() {
+        let mut table = CalTable::default();
+        table.slope[1][2] = 0.75;
+        let mut st = T4uState {
+            range: 1,
+            cal: ChannelCal::default(),
+            full: Some(table),
+            sample_time: DIRECT_SAMPLE_TIME,
+            averaging_time: 0.0,
+        };
+        assert!(!st.full_differs(|f| f.slope, 2, 0.75));
+        assert!(st.full_differs(|f| f.slope, 2, 0.5));
+        st.range = 3;
+        assert!(!st.full_differs(|f| f.slope, 2, 0.5));
+        st.full = None;
+        st.range = 1;
+        assert!(!st.full_differs(|f| f.slope, 2, 0.5));
+    }
 
     /// C++ returns from the constructor when `drvAsynIPPortConfigure` fails:
     /// the port exists with drvQuadEM's defaults, and no meter thread runs.

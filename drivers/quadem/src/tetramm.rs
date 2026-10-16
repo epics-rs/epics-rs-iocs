@@ -622,7 +622,7 @@ fn read_thread(ctx: ReadContext) {
                     proto::Trailer::TriggerEnd => {
                         num_trig_ends += 1;
                         if trigger_mode == QeTriggerMode::ExtBulb {
-                            ctx.shared.trigger_callbacks(&ctx.handle);
+                            let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                         }
                         if next_expected_edge != 1 {
                             asyn_print!(
@@ -674,7 +674,7 @@ fn read_thread(ctx: ReadContext) {
                     proto::AsciiRecord::TriggerEnd => {
                         num_trig_ends += 1;
                         if trigger_mode == QeTriggerMode::ExtBulb {
-                            ctx.shared.trigger_callbacks(&ctx.handle);
+                            let _ = ctx.shared.trigger_callbacks(&ctx.handle);
                         }
                         if next_expected_edge != 1 {
                             asyn_print!(
@@ -1025,6 +1025,12 @@ mod tests {
             .write_int32_blocking(rt.nd_params.acquire, 0, 1)
             .unwrap_err();
         assert_eq!(err.status(), AsynStatus::Error);
-        assert_eq!(err.message(), "no input EOS");
+        assert_eq!(
+            err.message(),
+            format!(
+                "drvQuadEM:writeInt32: status=3, function={}, name=ACQUIRE, value=1",
+                rt.nd_params.acquire
+            )
+        );
     }
 }

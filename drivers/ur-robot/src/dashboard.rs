@@ -7,7 +7,7 @@
 //! Only the commands urRobot's dashboard driver actually issues are ported.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::{UrError, UrResult};
@@ -97,18 +97,22 @@ impl DashboardClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_port(&mut self, port: u16) {
+        self.port = port;
+    }
+
     pub fn is_connected(&self) -> bool {
         self.io.is_some()
     }
 
     pub fn connect(&mut self) -> UrResult<()> {
-        let addr = (self.hostname.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| UrError::Connect(format!("resolve {}: {e}", self.hostname)))?
-            .next()
-            .ok_or_else(|| UrError::Connect(format!("no address for {}", self.hostname)))?;
-        let sock = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| UrError::Connect(format!("dashboard server {addr}: {e}")))?;
+        let sock = crate::net::connect_tcp(
+            &self.hostname,
+            self.port,
+            Some(crate::net::CONNECT_TIMEOUT),
+        )
+        .map_err(|_| UrError::Connect("Timeout connecting to UR dashboard server.".into()))?;
         sock.set_nodelay(true).ok();
         sock.set_read_timeout(Some(self.timeout)).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();
@@ -158,14 +162,12 @@ impl DashboardClient {
         self.receive()
     }
 
-    /// Send a command whose reply must equal `expect`, else the command failed.
+    /// Send a command whose reply must equal `expect`; otherwise the reply
+    /// is the error, as upstream throws it.
     fn command_expect(&mut self, command: &str, expect: &str) -> UrResult<()> {
         let reply = self.command(command)?;
         if reply != expect {
-            return Err(UrError::Dashboard {
-                command: command.to_string(),
-                reply,
-            });
+            return Err(UrError::Dashboard(reply));
         }
         Ok(())
     }
@@ -175,10 +177,7 @@ impl DashboardClient {
     pub fn load_urp(&mut self, name: &str) -> UrResult<()> {
         let reply = self.command(&format!("load {name}"))?;
         if !reply.contains("Loading program:") {
-            return Err(UrError::Dashboard {
-                command: format!("load {name}"),
-                reply,
-            });
+            return Err(UrError::Dashboard(reply));
         }
         Ok(())
     }
@@ -213,6 +212,12 @@ impl DashboardClient {
 
     pub fn unlock_protective_stop(&mut self) -> UrResult<()> {
         self.command_expect("unlock protective stop", "Protective stop releasing")
+            .map_err(|e| match e {
+                UrError::Dashboard(reply) => {
+                    UrError::Dashboard(format!("Unlock protective stop failure: {reply}"))
+                }
+                e => e,
+            })
     }
 
     pub fn close_popup(&mut self) -> UrResult<()> {
@@ -268,42 +273,44 @@ impl DashboardClient {
     /// `PolyscopeVersion`, reduced to the version numbers.
     pub fn polyscope_version(&mut self) -> UrResult<PolyScopeVersion> {
         let reply = self.command("PolyscopeVersion")?;
-        parse_polyscope_version(&reply).ok_or(UrError::Dashboard {
-            command: "PolyscopeVersion".into(),
-            reply,
-        })
+        parse_polyscope_version(&reply)
+            .ok_or_else(|| UrError::Dashboard("PolyScopeVersion::parse failed".into()))
     }
 
-    /// `is in remote control` — only supported from PolyScope 5.6.
-    ///
-    /// The caller passes the version it already knows, rather than upstream's
-    /// habit of re-querying `PolyscopeVersion` on every single call
-    /// (dashboard_client.cpp:323), which doubles the dashboard round-trips in
-    /// the poll loop.
-    pub fn is_in_remote_control(&mut self, version: PolyScopeVersion) -> UrResult<bool> {
-        if !version.supports_remote_control_query() {
+    /// `is in remote control` — only supported from PolyScope 5.6. Like
+    /// upstream it asks for the version on every call
+    /// (dashboard_client.cpp:323), so a dashboard that first connects after
+    /// boot still answers from the live version.
+    pub fn is_in_remote_control(&mut self) -> UrResult<bool> {
+        if !self.polyscope_version()?.supports_remote_control_query() {
+            eprintln!(
+                "Warning! isInRemoteControl() function is not supported on the dashboard \
+                 server for PolyScope versions less than 5.6.0"
+            );
             return Ok(false);
         }
         let reply = self.command("is in remote control")?;
         Ok(reply.contains("true"))
     }
 
-    /// `get serial number` — only supported from PolyScope 5.6.
-    pub fn serial_number(&mut self, version: PolyScopeVersion) -> UrResult<String> {
-        if !version.supports_remote_control_query() {
-            return Err(UrError::Dashboard {
-                command: "get serial number".into(),
-                reply: "not supported before PolyScope 5.6".into(),
-            });
+    /// `get serial number` — only supported from PolyScope 5.6; asks for the
+    /// version first, as upstream (dashboard_client.cpp:392).
+    pub fn serial_number(&mut self) -> UrResult<String> {
+        if !self.polyscope_version()?.supports_remote_control_query() {
+            return Err(UrError::Dashboard(
+                "getSerialNumber() function is not supported on the dashboard server for \
+                 PolyScope versions less than 5.6.0"
+                    .into(),
+            ));
         }
         let reply = self.command("get serial number")?;
         if reply.chars().all(|c| c.is_ascii_digit()) && !reply.is_empty() {
             Ok(reply)
         } else {
-            Err(UrError::Dashboard {
-                command: "get serial number".into(),
-                reply,
-            })
+            Err(UrError::Dashboard(format!(
+                "getSerialNumber() function did not return a number. The following was \
+                 returned: {reply}"
+            )))
         }
     }
 }
@@ -408,8 +415,7 @@ mod tests {
         let mut c = client_on(port);
         let err = c.play().unwrap_err();
         assert!(
-            matches!(&err, UrError::Dashboard { command, reply }
-                if command == "play" && reply == "Failed to execute: play"),
+            matches!(&err, UrError::Dashboard(what) if what == "Failed to execute: play"),
             "got {err:?}"
         );
         jh.join().unwrap();
@@ -445,33 +451,40 @@ mod tests {
 
     #[test]
     fn remote_control_skips_the_wire_on_old_polyscope() {
-        // No reply is scripted: on CB3 the command must not be sent at all.
-        let (port, jh) = spawn_dashboard(vec![]);
+        // Only the version is scripted: on CB3 the query must not be sent.
+        let (port, jh) = spawn_dashboard(vec!["URSoftware 3.15.8.106339 (Jan 1 2023)"]);
         let mut c = client_on(port);
-        let cb3 = PolyScopeVersion {
-            major: 3,
-            minor: 15,
-            ..Default::default()
-        };
-        assert!(!c.is_in_remote_control(cb3).unwrap());
-        assert!(jh.join().unwrap().is_empty());
+        assert!(!c.is_in_remote_control().unwrap());
+        assert_eq!(jh.join().unwrap(), vec!["PolyscopeVersion"]);
+    }
+
+    /// A client that never saw the version (the dashboard was down at boot)
+    /// still answers from the live controller.
+    #[test]
+    fn remote_control_asks_the_live_version() {
+        let (port, jh) = spawn_dashboard(vec![
+            "URSoftware 5.11.3.108355 (Aug 09 2021)",
+            "Remote control: true",
+        ]);
+        let mut c = client_on(port);
+        assert!(c.is_in_remote_control().unwrap());
+        assert_eq!(
+            jh.join().unwrap(),
+            vec!["PolyscopeVersion", "is in remote control"]
+        );
     }
 
     #[test]
     fn serial_number_must_be_numeric() {
-        let v = PolyScopeVersion {
-            major: 5,
-            minor: 11,
-            ..Default::default()
-        };
-        let (port, jh) = spawn_dashboard(vec!["20195500926"]);
+        let v511 = "URSoftware 5.11.3.108355 (Aug 09 2021)";
+        let (port, jh) = spawn_dashboard(vec![v511, "20195500926"]);
         let mut c = client_on(port);
-        assert_eq!(c.serial_number(v).unwrap(), "20195500926");
+        assert_eq!(c.serial_number().unwrap(), "20195500926");
         jh.join().unwrap();
 
-        let (port, jh) = spawn_dashboard(vec!["not a number"]);
+        let (port, jh) = spawn_dashboard(vec![v511, "not a number"]);
         let mut c = client_on(port);
-        assert!(c.serial_number(v).is_err());
+        assert!(c.serial_number().is_err());
         jh.join().unwrap();
     }
 
@@ -481,5 +494,13 @@ mod tests {
         let mut c = client_on(port);
         assert!(c.unlock_protective_stop().is_ok());
         assert_eq!(jh.join().unwrap(), vec!["unlock protective stop"]);
+
+        let (port, jh) = spawn_dashboard(vec!["Cannot unlock protective stop until 5s after"]);
+        let mut c = client_on(port);
+        assert_eq!(
+            c.unlock_protective_stop().unwrap_err().to_string(),
+            "Unlock protective stop failure: Cannot unlock protective stop until 5s after"
+        );
+        jh.join().unwrap();
     }
 }

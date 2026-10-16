@@ -5,7 +5,7 @@
 //! keeps the returned [`UrPortRuntime`] alive for the life of the process.
 //!
 //! Each factory also arms the [`ioc_ready`] gate before it starts the thread,
-//! and the thread holds its first parameter flush until `iocInit` opens it —
+//! and the thread holds its parameter flushes until `iocInit` opens it —
 //! see that module for what a pre-`iocInit` flush costs.
 
 use std::time::Duration;

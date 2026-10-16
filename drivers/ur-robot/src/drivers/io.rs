@@ -12,7 +12,7 @@ use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
-use crate::drivers::asyn_error;
+use crate::drivers::refused;
 use crate::io::IoInterface;
 use crate::spdlog;
 
@@ -123,14 +123,16 @@ impl PortDriver for IoDriver {
             let p = self.params;
             self.base.set_int32_param(reason, addr, value)?;
 
-            let channel = u8::try_from(addr)
-                .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
+            let channel = u8::try_from(addr).map_err(|_| {
+                spdlog::error(format_args!("I/O channel {addr} is out of range"));
+                refused()
+            })?;
             let level = value != 0;
 
             let mut slot = self.iface.lock();
             let Some(iface) = slot.as_mut() else {
                 spdlog::error(format_args!("RTDE IO interface not initialized"));
-                return Err(asyn_error("the RTDE I/O interface is not initialised"));
+                return Err(refused());
             };
 
             let state = if value == 1 { "high" } else { "low" };
@@ -150,11 +152,11 @@ impl PortDriver for IoDriver {
             } else {
                 return Ok(());
             };
-            result.map_err(|e| {
+            result.map_err(|_| {
                 spdlog::error(format_args!(
                     "RTDE communication error in RTDEInOut::writeInt32"
                 ));
-                asyn_error(format!("RTDE I/O write failed: {e}"))
+                refused()
             })
         })();
         crate::drivers::flush_after(&mut self.base, addr, result)
@@ -168,13 +170,15 @@ impl PortDriver for IoDriver {
             let p = self.params;
             self.base.set_float64_param(reason, addr, value)?;
 
-            let channel = u8::try_from(addr)
-                .map_err(|_| asyn_error(format!("I/O channel {addr} is out of range")))?;
+            let channel = u8::try_from(addr).map_err(|_| {
+                spdlog::error(format_args!("I/O channel {addr} is out of range"));
+                refused()
+            })?;
 
             let mut slot = self.iface.lock();
             let Some(iface) = slot.as_mut() else {
                 spdlog::error(format_args!("RTDE IO interface not initialized"));
-                return Err(asyn_error("the RTDE I/O interface is not initialised"));
+                return Err(refused());
             };
 
             let result = if reason == p.speed_slider {
@@ -196,11 +200,11 @@ impl PortDriver for IoDriver {
             } else {
                 return Ok(());
             };
-            result.map_err(|e| {
+            result.map_err(|_| {
                 spdlog::error(format_args!(
                     "RTDE communication error in RTDEInOut::writeFloat64"
                 ));
-                asyn_error(format!("RTDE I/O write failed: {e}"))
+                refused()
             })
         })();
         crate::drivers::flush_after(&mut self.base, addr, result)

@@ -21,6 +21,7 @@ pub mod drivers;
 pub mod error;
 pub mod gripper;
 pub mod io;
+mod net;
 pub mod receive;
 pub mod registry;
 pub mod rtde;

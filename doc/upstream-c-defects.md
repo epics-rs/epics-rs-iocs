@@ -285,7 +285,7 @@ remain open upstream defects the port did not guess at.
 | 136 | `drvT4U_EM.cpp:1063,764` (+direct twin) — `new char[]` freed with `delete` | fixed-in-port (not reproducible in Rust) |
 | 137 | `drvT4U_EM.cpp:375,393` (+direct twin) — `enable_cmd[value]` indexes a 2-element array with an unchecked epicsInt32 | fixed-in-port (`value != 0`) |
 | 138 | `Db/T4U_EM.template:6` — Model readback initial VAL is 14 (FX4); the T4U reports 13 | fixed-in-port (13) |
-| 139 | `Db/T4U_EM.template:394-443` — shared template binds QE_WSMODE/QE_RPP, created only by the direct driver: middle-layer IOC loads 4 records with no parameters | fixed-in-port (split into T4UDirect_EM.template) |
+| 139 | `Db/T4U_EM.template:394-443` — shared template binds QE_WSMODE/QE_RPP, created only by the direct driver: middle-layer IOC loads 4 records with no parameters | preserved (`10e69e74`: both IOCs load C's template) |
 | 140 | `Db/FX4.template:88` — `record(longout, "(P)$(R)SetRange")` missing `$`: record created under the literal name, Range mbbo loses its only output link | fixed-in-port (`$(P)`) |
 | 141 | `drvFX4.cpp` `onMessageEvent` — gate events of unmergeable messages discarded: `gateLevel_` stale, gate filter and trigger arming act on the wrong level | fixed-in-port (gate events always applied; ADC merge stays conditional) |
 | 142 | `drvFX4.cpp` `onMessageEvent` — ADC value read in try/catch, gate value not: malformed gate throws past `sendGetEvent`, stalling acquisition | fixed-in-port (both malformed values skipped) |

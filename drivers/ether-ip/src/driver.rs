@@ -5,9 +5,8 @@
 //! as many tag reads/writes as fit under the transfer-buffer limit into one CIP
 //! MultiRequest, sends it, and fans the results back out to the tags.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -16,7 +15,11 @@ use tokio::sync::mpsc::Sender;
 use crate::cip::{self, CipType, ParsedTag};
 use crate::connection::{Connection, EipError};
 use crate::encap::{self, ETHERIP_PORT};
+use chrono::TimeZone;
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::task::CallbackPriority;
+use epics_rs::base::server::database::DeviceDone;
+use epics_rs::base::server::ioc_app::InitHookState;
 use epics_rs::base::server::records::printf::format_g;
 
 /// `EIP_TIMEOUT` -- default connect / response timeout.
@@ -39,8 +42,17 @@ const EPICS_EPOCH_OFFSET: f64 = 631_152_000.0;
 pub static TIMEOUT_MS: AtomicU32 = AtomicU32::new(DEFAULT_TIMEOUT_MS);
 /// `EIP_buffer_limit`.
 pub static BUFFER_LIMIT: AtomicU32 = AtomicU32::new(encap::DEFAULT_BUFFER_LIMIT as u32);
-/// `drvEtherIP_default_rate` (seconds), scaled by 1000 to stay in an atomic.
-pub static DEFAULT_RATE_MS: AtomicU32 = AtomicU32::new(0);
+/// `drvEtherIP_default_rate` (seconds), as f64 bits.
+static DEFAULT_RATE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// `drvEtherIP_default_rate`.
+pub fn default_rate() -> f64 {
+    f64::from_bits(DEFAULT_RATE_BITS.load(Ordering::Relaxed))
+}
+
+pub fn set_default_rate(secs: f64) {
+    DEFAULT_RATE_BITS.store(secs.to_bits(), Ordering::Relaxed);
+}
 
 fn timeout() -> Duration {
     Duration::from_millis(TIMEOUT_MS.load(Ordering::Relaxed) as u64)
@@ -76,33 +88,61 @@ impl TagData {
     }
 }
 
+/// A bound record's end of a tag's callbacks.
+pub struct Listener {
+    tx: Sender<()>,
+    /// Set while the record's write is PACT; the next transfer completes it.
+    pub write_done: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+}
+
 pub struct TagInfo {
     pub string_tag: String,
     pub tag: ParsedTag,
     /// How many elements to request; grows as records register interest.
     pub elements: Mutex<usize>,
     pub data: Mutex<TagData>,
-    /// I/O Intr pulses, one per bound record (C `TagInfo.callbacks`).
-    listeners: Mutex<Vec<Sender<()>>>,
+    /// One per bound record (C `TagInfo.callbacks`).
+    listeners: Mutex<Vec<Arc<Listener>>>,
     /// The stats of the list this tag lives in -- the statistics device
     /// support reads them through the tag (C `TagInfo.scanlist`).
-    pub list_stats: Arc<Mutex<ListStats>>,
+    /// Swapped when `add_tag` moves the tag to a faster list.
+    list_stats: Mutex<Arc<Mutex<ListStats>>>,
 }
 
 impl TagInfo {
-    /// Notify every bound record that this tag's value (or validity) changed.
+    /// The stats of the list this tag lives in -- the statistics device
+    /// support reads them through the tag (C `TagInfo.scanlist`).
+    pub fn list_stats(&self) -> Arc<Mutex<ListStats>> {
+        self.list_stats.lock().clone()
+    }
+
+    /// C's callback loop after every transfer: a record whose write is
+    /// pending ends that write's cycle (`if (rec->pact) process`), every
+    /// other record gets an I/O Intr pulse.
     ///
     /// Never blocks: a full channel already has a pending pulse, and the record
     /// reads the *current* value when it processes, so coalescing is correct.
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         let listeners = self.listeners.lock();
-        for tx in listeners.iter() {
-            let _ = tx.try_send(());
+        for l in listeners.iter() {
+            match l.write_done.lock().take() {
+                Some((done, prio)) => {
+                    let _ = done.complete(prio, Ok(()));
+                }
+                None => {
+                    let _ = l.tx.try_send(());
+                }
+            }
         }
     }
 
-    pub fn add_listener(&self, tx: Sender<()>) {
-        self.listeners.lock().push(tx);
+    pub fn add_listener(&self, tx: Sender<()>) -> Arc<Listener> {
+        let l = Arc::new(Listener {
+            tx,
+            write_done: Mutex::new(None),
+        });
+        self.listeners.lock().push(l.clone());
+        l
     }
 
     /// Device support side of the write handshake: stage the value in the tag
@@ -121,7 +161,7 @@ impl TagInfo {
 // Scan lists
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ListStats {
     pub list_errors: u32,
     pub last_scan_time: f64,
@@ -152,8 +192,8 @@ pub struct PlcStats {
 
 pub struct Plc {
     pub name: String,
-    pub ip_addr: String,
-    pub slot: u8,
+    /// `ip_addr` and `slot`; `drvEtherIP_define_PLC` may redefine them.
+    pub addr: Mutex<(String, u8)>,
     pub scanlists: Mutex<Vec<Arc<ScanList>>>,
     pub stats: Mutex<PlcStats>,
     pub connected: AtomicBool,
@@ -169,8 +209,7 @@ impl Plc {
     fn new(name: &str, ip_addr: &str, slot: u8) -> Plc {
         Plc {
             name: name.to_string(),
-            ip_addr: ip_addr.to_string(),
-            slot,
+            addr: Mutex::new((ip_addr.to_string(), slot)),
             scanlists: Mutex::new(Vec::new()),
             stats: Mutex::new(PlcStats::default()),
             connected: AtomicBool::new(false),
@@ -181,38 +220,46 @@ impl Plc {
         }
     }
 
-    /// Register a tag for scanning at `period`, requesting at least `elements`
-    /// elements. If the tag already exists in *any* list of this PLC, the
-    /// existing one is reused and its element count maximized -- the C
-    /// (`drvEtherIP_add_tag`) does the same, so the first period a tag is
-    /// registered at wins.
+    /// `drvEtherIP_add_tag`: register a tag for scanning at `period`,
+    /// requesting at least `elements` elements. A tag already in a slower
+    /// list moves to the list at `period`; the list it leaves stays.
     pub fn add_tag(&self, period: f64, string_tag: &str, elements: usize) -> Option<Arc<TagInfo>> {
         let mut lists = self.scanlists.lock();
+        let get_list =
+            |lists: &mut Vec<Arc<ScanList>>| match lists.iter().find(|l| l.period == period) {
+                Some(l) => l.clone(),
+                None => {
+                    let l = Arc::new(ScanList {
+                        period,
+                        enabled: AtomicBool::new(true),
+                        tags: Mutex::new(Vec::new()),
+                        stats: Arc::new(Mutex::new(ListStats::default())),
+                        scheduled: Mutex::new(Instant::now()),
+                    });
+                    lists.push(l.clone());
+                    l
+                }
+            };
 
-        for list in lists.iter() {
+        let found = lists.iter().find_map(|list| {
             let tags = list.tags.lock();
-            if let Some(info) = tags.iter().find(|t| t.string_tag == string_tag) {
-                let mut n = info.elements.lock();
-                *n = (*n).max(elements);
-                return Some(info.clone());
+            let info = tags.iter().find(|t| t.string_tag == string_tag)?.clone();
+            Some((list.clone(), info))
+        });
+        if let Some((list, info)) = found {
+            if list.period > period {
+                list.tags.lock().retain(|t| !Arc::ptr_eq(t, &info));
+                let faster = get_list(&mut lists);
+                *info.list_stats.lock() = faster.stats.clone();
+                faster.tags.lock().push(info.clone());
             }
+            let mut n = info.elements.lock();
+            *n = (*n).max(elements);
+            drop(n);
+            return Some(info);
         }
 
-        let list = match lists.iter().find(|l| l.period == period) {
-            Some(l) => l.clone(),
-            None => {
-                let l = Arc::new(ScanList {
-                    period,
-                    enabled: AtomicBool::new(true),
-                    tags: Mutex::new(Vec::new()),
-                    stats: Arc::new(Mutex::new(ListStats::default())),
-                    scheduled: Mutex::new(Instant::now()),
-                });
-                lists.push(l.clone());
-                l
-            }
-        };
-
+        let list = get_list(&mut lists);
         let tag = ParsedTag::parse(string_tag)?;
         let info = Arc::new(TagInfo {
             string_tag: string_tag.to_string(),
@@ -220,7 +267,7 @@ impl Plc {
             elements: Mutex::new(elements),
             data: Mutex::new(TagData::default()),
             listeners: Mutex::new(Vec::new()),
-            list_stats: list.stats.clone(),
+            list_stats: Mutex::new(list.stats.clone()),
         });
         list.tags.lock().push(info.clone());
         Some(info)
@@ -248,11 +295,11 @@ impl Plc {
 
     pub fn reset_statistics(&self) {
         *self.stats.lock() = PlcStats::default();
+        // C `reset_ScanList`; a zero `scheduled_time` is due at once.
         for list in self.scanlists.lock().iter() {
-            let mut s = list.stats.lock();
-            s.list_errors = 0;
-            s.min_scan_time = 0.0;
-            s.max_scan_time = 0.0;
+            list.enabled.store(true, Ordering::Relaxed);
+            *list.stats.lock() = ListStats::default();
+            *list.scheduled.lock() = Instant::now();
         }
     }
 
@@ -265,27 +312,29 @@ impl Plc {
 // Registry
 // ---------------------------------------------------------------------------
 
-static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Plc>>>> = OnceLock::new();
+/// C's PLC list: definition order, which every diagnostic walks in.
+static REGISTRY: Mutex<Vec<Arc<Plc>>> = Mutex::new(Vec::new());
 
-fn registry() -> &'static Mutex<HashMap<String, Arc<Plc>>> {
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// `drvEtherIP_define_PLC`.
+/// `drvEtherIP_define_PLC`: a second definition replaces the address.
 pub fn define_plc(name: &str, ip_addr: &str, slot: u8) -> Arc<Plc> {
-    let mut reg = registry().lock();
-    reg.entry(name.to_string())
-        .or_insert_with(|| Arc::new(Plc::new(name, ip_addr, slot)))
-        .clone()
+    let mut reg = REGISTRY.lock();
+    if let Some(plc) = reg.iter().find(|p| p.name == name) {
+        crate::eip_printf!(1, "Redefining IP address of PLC {name}?\n");
+        *plc.addr.lock() = (ip_addr.to_string(), slot);
+        return plc.clone();
+    }
+    let plc = Arc::new(Plc::new(name, ip_addr, slot));
+    reg.push(plc.clone());
+    plc
 }
 
 /// `drvEtherIP_find_PLC`.
 pub fn find_plc(name: &str) -> Option<Arc<Plc>> {
-    registry().lock().get(name).cloned()
+    REGISTRY.lock().iter().find(|p| p.name == name).cloned()
 }
 
 pub fn all_plcs() -> Vec<Arc<Plc>> {
-    registry().lock().values().cloned().collect()
+    REGISTRY.lock().clone()
 }
 
 /// `drvEtherIP_reset_statistics`.
@@ -295,15 +344,67 @@ pub fn reset_statistics() {
     }
 }
 
-/// Start one scan thread per defined PLC. Idempotent: a PLC whose thread is
-/// already running is skipped (C `drvEtherIP_restart` checks `scan_task_id`).
-pub fn start_scan_tasks() -> usize {
+/// `drvEtherIP_private.lock` being set: `drvEtherIP_init` has run.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// `databaseIsReady`: set at `initHookAfterScanInit`.
+static DATABASE_READY: AtomicBool = AtomicBool::new(false);
+
+/// `drvEtherIP_init`.
+pub fn init() {
+    if INITIALIZED.swap(true, Ordering::SeqCst) {
+        crate::eip_printf!(0, "drvEtherIP_init called more than once!\n");
+    }
+}
+
+/// `drvEtherIP_initialized`.
+pub fn initialized() -> bool {
+    INITIALIZED.load(Ordering::SeqCst)
+}
+
+/// The init hooks C's driver and device support act on: devEtherIP's
+/// `init(1)` (finishDevSup, before `initHookAfterFinishDevSup`) and
+/// `drvEtherIP_initHook` at `initHookAfterScanInit`. Both call
+/// `drvEtherIP_restart`; only the second finds the database ready.
+pub fn init_hook(state: InitHookState) {
+    match state {
+        InitHookState::AfterFinishDevSup => {
+            restart();
+        }
+        InitHookState::AfterScanInit if initialized() => {
+            DATABASE_READY.store(true, Ordering::SeqCst);
+            restart();
+        }
+        _ => {}
+    }
+}
+
+/// `drvEtherIP_restart`: drop every PLC's connection (its scan thread
+/// reconnects) and start the scan threads not running yet. Returns how many
+/// it started; nothing happens before `drvEtherIP_init` or while the
+/// database is not ready.
+pub fn restart() -> usize {
+    if !initialized() {
+        return 0;
+    }
+    if !DATABASE_READY.load(Ordering::SeqCst) {
+        for plc in all_plcs() {
+            crate::eip_printf!(
+                4,
+                "drvEtherIP: Delaying launch of scan task for PLC '{}' until database ready\n",
+                plc.name
+            );
+        }
+        return 0;
+    }
     let mut started = 0;
     for plc in all_plcs() {
+        // Held like C's plc->lock: a running pass finishes first.
+        let mut conn = plc.conn.lock();
+        disconnect(&plc, &mut conn);
         if plc.started.swap(true, Ordering::SeqCst) {
             continue;
         }
-        let name = format!("EIP{}", plc.name);
+        let name: String = format!("EIP{}", plc.name.chars().take(16).collect::<String>());
         let p = plc.clone();
         match std::thread::Builder::new()
             .name(name)
@@ -317,6 +418,16 @@ pub fn start_scan_tasks() -> usize {
         }
     }
     started
+}
+
+/// C `disconnect_PLC`: close a live connection and invalidate the tags.
+fn disconnect(plc: &Plc, conn: &mut Option<Connection>) {
+    if let Some(c) = conn.take() {
+        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
+        c.shutdown();
+        plc.connected.store(false, Ordering::Relaxed);
+        plc.invalidate_tags();
+    }
 }
 
 /// `drvEtherIP_describe`: describe `type_id` on every PLC, over the
@@ -391,13 +502,13 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
     if conn.is_none() {
         let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
         crate::eip_printf_time!(4, "EIP connecting {}\n", plc.name);
-        match Connection::startup(&plc.ip_addr, ETHERIP_PORT, plc.slot, timeout(), limit) {
+        let (ip_addr, slot) = plc.addr.lock().clone();
+        match Connection::startup(&ip_addr, ETHERIP_PORT, slot, timeout(), limit) {
             Ok(mut c) => {
                 *plc.identity.lock() = Some(c.identity.clone());
                 if !complete_tag_infos(plc, &mut c) {
                     errlog_vprintf(format_args!(
-                        "EIP error during scan list completion for {}:{ETHERIP_PORT}\n",
-                        plc.ip_addr
+                        "EIP error during scan list completion for {ip_addr}:{ETHERIP_PORT}\n"
                     ));
                     crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
                     c.shutdown();
@@ -410,8 +521,7 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
             }
             Err(_) => {
                 errlog_vprintf(format_args!(
-                    "EIP connection failed for {}:{ETHERIP_PORT}\n",
-                    plc.ip_addr
+                    "EIP connection failed for {ip_addr}:{ETHERIP_PORT}\n"
                 ));
                 crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
                 plc.connected.store(false, Ordering::Relaxed);
@@ -473,12 +583,7 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
 
     if failed {
         // Drop the session and reconnect on the next turn.
-        crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
-        if let Some(c) = conn.take() {
-            c.shutdown();
-        }
-        plc.connected.store(false, Ordering::Relaxed);
-        plc.invalidate_tags();
+        disconnect(plc, conn);
         return None;
     }
 
@@ -848,55 +953,311 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
 // Diagnostics (`drvEtherIP_report`)
 // ---------------------------------------------------------------------------
 
-pub fn report(level: i32) {
-    for plc in all_plcs() {
-        let ident = plc.identity.lock().clone();
+/// `ETHERIP_MAYOR` / `ETHERIP_MINOR` (drvEtherIP.h).
+const ETHERIP_MAYOR: u32 = 3;
+const ETHERIP_MINOR: u32 = 10;
+
+/// `epicsTimeToStrftime(.., "%Y/%m/%d %H:%M:%S.%04f", ..)` of seconds past
+/// the EPICS epoch, in local time.
+fn epics_strftime(epics_secs: f64) -> String {
+    let unix = epics_secs + EPICS_EPOCH_OFFSET;
+    let secs = unix.floor();
+    let nanos = ((unix - secs) * 1e9) as u32;
+    match chrono::Local.timestamp_opt(secs as i64, nanos).single() {
+        Some(t) => format!(
+            "{}.{:04}",
+            t.format("%Y/%m/%d %H:%M:%S"),
+            t.timestamp_subsec_nanos() / 100_000
+        ),
+        None => String::new(),
+    }
+}
+
+/// `dump_TagInfo`.
+fn dump_tag_info(info: &TagInfo, list: &ScanList, level: i32) {
+    println!(
+        "*** Tag '{}' @ 0x{:X}:",
+        info.string_tag, info as *const TagInfo as usize
+    );
+    let d = info.data.lock();
+    let elements = *info.elements.lock();
+    if level > 3 {
         println!(
-            "PLC '{}': IP {}, slot {}, {}",
-            plc.name,
-            plc.ip_addr,
-            plc.slot,
-            if plc.connected.load(Ordering::Relaxed) {
-                "connected"
-            } else {
-                "disconnected"
-            }
+            "  scanlist            : 0x{:X}",
+            list as *const ScanList as usize
         );
-        if let Some(id) = ident {
-            println!(
-                "  identity: '{}' vendor 0x{:04X} type 0x{:04X} rev 0x{:04X} serial 0x{:08X}",
-                id.name, id.vendor, id.device_type, id.revision, id.serial_number
-            );
+        println!(
+            "  compiled tag        : '{}', {elements} elements",
+            info.tag
+        );
+        println!("  cip read requ./resp.: {} / {}", d.r_request, d.r_response);
+        println!("  cip write req./resp.: {} / {}", d.w_request, d.w_response);
+        println!(
+            "  data_lock ID        : 0x{:X}",
+            &info.data as *const Mutex<TagData> as usize
+        );
+        println!(
+            "  data_size / valid   : {} / {}",
+            d.buf.len(),
+            d.valid_data_size
+        );
+        println!(
+            "  do_write/is_writing : {} / {}",
+            if d.do_write { "yes" } else { "no" },
+            if d.is_writing { "yes" } else { "no" }
+        );
+        crate::eip_printf!(0, "  data                : ");
+    }
+    if d.valid_data_size > 0 {
+        crate::eip_printf!(0, "{}", cip::dump_raw_cip_data(&d.buf, elements));
+    } else {
+        println!("-no data-");
+    }
+    if level > 3 {
+        println!(
+            "  transfer time       : {} secs",
+            format_g(d.transfer_time, 6)
+        );
+    }
+}
+
+/// `dump_ScanList`.
+fn dump_scan_list(list: &ScanList, level: i32) {
+    let s = list.stats.lock().clone();
+    println!(
+        "Scanlist {} secs @ 0x{:X}:",
+        format_g(list.period, 6),
+        list as *const ScanList as usize
+    );
+    println!(
+        "  Status        : {}",
+        if list.enabled.load(Ordering::Relaxed) {
+            "enabled"
+        } else {
+            "DISABLED"
         }
-        {
+    );
+    println!("  Last scan     : {}", epics_strftime(s.scan_time));
+    if level > 4 {
+        let now = Instant::now();
+        let due = *list.scheduled.lock();
+        let next = if due >= now {
+            epics_now() + (due - now).as_secs_f64()
+        } else {
+            epics_now() - (now - due).as_secs_f64()
+        };
+        println!("  Errors        : {}", s.list_errors);
+        // The monotonic schedule cannot step back, so C's schedule-error
+        // count stays 0 (see `scan_pass`).
+        println!("  Schedule Errs : 0");
+        println!("  Next scan     : {}", epics_strftime(next));
+        println!("  Min. scan time: {} secs", format_g(s.min_scan_time, 6));
+        println!("  Max. scan time: {} secs", format_g(s.max_scan_time, 6));
+        println!("  Last scan time: {} secs", format_g(s.last_scan_time, 6));
+    }
+    if level > 5 {
+        for info in list.tags.lock().iter() {
+            dump_tag_info(info, list, level);
+        }
+    }
+}
+
+/// `drvEtherIP_report`, also the driver's `dbior` report.
+pub fn report(level: i32) {
+    if level <= 0 {
+        println!(
+            "drvEtherIP V{ETHERIP_MAYOR}.{ETHERIP_MINOR} - ControlLogix 5000 PLC via EtherNet/IP"
+        );
+        return;
+    }
+    println!("drvEtherIP V{ETHERIP_MAYOR}.{ETHERIP_MINOR} report, -*- outline -*-");
+    if !initialized() {
+        println!(" drvEtherIP lock is 0, did you call drvEtherIP_init?");
+        return;
+    }
+    if level > 1 {
+        println!("  Mutex lock: 0x{:X}", &REGISTRY as *const _ as usize);
+    }
+    for plc in all_plcs() {
+        let (ip_addr, _) = plc.addr.lock().clone();
+        println!("* PLC '{}', IP '{ip_addr}'", plc.name);
+        if level > 1 {
+            let ident = plc.identity.lock().clone().unwrap_or_default();
             let s = plc.stats.lock();
-            println!("  errors: {}, slow scans: {}", s.plc_errors, s.slow_scans);
+            println!("  Interface name        : {}", ident.name);
+            println!("  Interface vendor      : 0x{:X}", ident.vendor);
+            println!("  Interface type        : 0x{:X}", ident.device_type);
+            println!("  Interface revision    : 0x{:X}", ident.revision);
+            println!("  Interface serial      : 0x{:X}", ident.serial_number);
+            println!("  scan thread slow count: {}", s.slow_scans);
+            println!("  connection errors     : {}", s.plc_errors);
         }
-        if level <= 0 {
-            continue;
-        }
-        for list in plc.scanlists.lock().iter() {
-            let s = list.stats.lock();
+        if level > 2 {
             println!(
-                "  scanlist {:.4} s: errors {}, scan time last/min/max {:.5}/{:.5}/{:.5} s",
-                list.period, s.list_errors, s.last_scan_time, s.min_scan_time, s.max_scan_time
+                "  Mutex lock            : 0x{:X}",
+                &plc.conn as *const Mutex<Option<Connection>> as usize
             );
-            if level <= 1 {
-                continue;
-            }
-            for info in list.tags.lock().iter() {
-                let d = info.data.lock();
+            if plc.started.load(Ordering::SeqCst) {
                 println!(
-                    "    tag '{}': {} elements, {} valid bytes, req/resp r {}/{} w {}/{}",
-                    info.string_tag,
-                    *info.elements.lock(),
-                    d.valid_data_size,
-                    d.r_request,
-                    d.r_response,
-                    d.w_request,
-                    d.w_response
+                    "  scan task ID          : 0x{:X} (running)",
+                    Arc::as_ptr(&plc) as usize
+                );
+            } else {
+                println!("  scan task ID          : 0x0 (-dead-)");
+            }
+            println!("  Now                   : {}", epics_strftime(epics_now()));
+            if level > 3 {
+                print!("** ");
+                Connection::dump(
+                    plc.conn.lock().as_ref(),
+                    BUFFER_LIMIT.load(Ordering::Relaxed) as usize,
+                    TIMEOUT_MS.load(Ordering::Relaxed),
                 );
             }
+            if level > 4 {
+                for list in plc.scanlists.lock().iter() {
+                    print!("** ");
+                    dump_scan_list(list, level);
+                }
+            }
         }
+    }
+    println!();
+}
+
+/// `drvEtherIP_dump`: every tag and its value.
+pub fn dump() {
+    for plc in all_plcs() {
+        println!("PLC {}", plc.name);
+        for list in plc.scanlists.lock().iter() {
+            for info in list.tags.lock().iter() {
+                crate::eip_printf!(0, "{} ", info.string_tag);
+                let d = info.data.lock();
+                if d.valid_data_size > 0 {
+                    crate::eip_printf!(
+                        0,
+                        "{}",
+                        cip::dump_raw_cip_data(&d.buf, *info.elements.lock())
+                    );
+                } else {
+                    println!(" - no data -");
+                }
+            }
+        }
+    }
+    println!();
+}
+
+/// `drvEtherIP_list`: every tag each PLC publishes, over the connection
+/// the scan thread holds between passes.
+pub fn list() {
+    for plc in all_plcs() {
+        let (ip_addr, slot) = plc.addr.lock().clone();
+        println!("Tags on PLC '{}', IP {ip_addr}, slot {slot}", plc.name);
+        match plc.conn.lock().as_mut() {
+            Some(c) => {
+                c.list_tags();
+            }
+            // C sends on the closed socket and fails there.
+            None => {
+                crate::eip_printf!(9, "EIP list tags\n");
+                crate::eip_printf!(1, "EIP_list_tags: send failed\n");
+            }
+        }
+    }
+}
+
+/// `drvEtherIP_help`.
+pub fn help() {
+    let verbosity = crate::EIP_VERBOSITY.load(Ordering::Relaxed);
+    let timeout = TIMEOUT_MS.load(Ordering::Relaxed);
+    let limit = BUFFER_LIMIT.load(Ordering::Relaxed);
+    let default_limit = encap::DEFAULT_BUFFER_LIMIT;
+    print!(
+        "drvEtherIP V{ETHERIP_MAYOR}.{ETHERIP_MINOR} diagnostics routines:
+    EIP_verbosity(0-10)
+    -  define logging detail, currently set to {verbosity}
+    -  10: Dump all protocol details
+        9: Hexdump each sent/received buffer
+        6: show driver details
+        5: show write-related operations
+        4: DEFAULT: show basic startup plus error messages
+        2: show more error info
+        1: show severe error messages
+        0: keep quiet
+    EIP_timeout(<milliseconds>)
+    -  define the default timeout for connecting to PLC and reading responses
+       (default: {timeout} ms)
+    drvEtherIP_default_rate(<seconds>)
+    -  define the default scan rate
+       (if neither SCAN nor INP/OUT provide one)
+    EIP_buffer_limit(<bytes>)
+    -  Set buffer limit enforced by driver.
+       Currently {limit}, default: {default_limit}
+       The actual PLC limit is unknown, it might depend on the PLC or ENET model.
+       Can only be set before driver starts up.
+    drvEtherIP_define_PLC(<name>, <ip_addr>, <slot>)
+    -  define a PLC name (used by EPICS records) as IP
+       (DNS name or dot-notation) and slot (0...)
+    drvEtherIP_read_tag(<ip>, <slot>, <tag>, <elm.>, <timeout>)
+    -  call to test a round-trip single tag read
+       ip: IP address (numbers or name known by IOC
+       slot: Slot of the PLC controller (not ENET). 0, 1, ...
+       timeout: milliseconds
+    drvEtherIP_report(<level>)
+    -  level = 0..10
+    drvEtherIP_dump
+    -  dump all tags and values; short version of ..._report
+    drvEtherIP_list
+    -  list all tags that the PLC publishes
+    drvEtherIP_describe(<type ID>)
+    -  describe the tag type, used to inspect custom structures
+    drvEtherIP_reset_statistics
+    -  reset error counts and min/max scan times
+    drvEtherIP_restart
+    -  in case of communication errors, driver will restart,
+       so calling this one directly shouldn't be necessary
+       but is possible
+
+"
+    );
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// drvEtherIP.c:1234: a redefinition keeps the PLC and its place in
+    /// the list but takes the new address.
+    #[test]
+    fn redefining_a_plc_keeps_its_place_and_takes_the_new_address() {
+        define_plc("regorder_b", "10.0.0.1", 0);
+        define_plc("regorder_a", "10.0.0.2", 0);
+        let again = define_plc("regorder_b", "10.0.0.3", 4);
+        assert_eq!(*again.addr.lock(), ("10.0.0.3".to_string(), 4));
+        let names: Vec<_> = all_plcs()
+            .into_iter()
+            .map(|p| p.name.clone())
+            .filter(|n| n.starts_with("regorder_"))
+            .collect();
+        assert_eq!(names, ["regorder_b", "regorder_a"]);
+    }
+
+    /// drvEtherIP.c:1278: a tag registered again at a shorter period moves
+    /// to that list, the list it left stays, and a longer period leaves it.
+    #[test]
+    fn a_faster_period_moves_the_tag_and_keeps_the_old_list() {
+        let plc = Plc::new("addtag_move", "10.0.0.9", 0);
+        let tag = plc.add_tag(1.0, "T", 1).unwrap();
+        assert!(Arc::ptr_eq(&plc.add_tag(0.5, "T", 4).unwrap(), &tag));
+        assert!(Arc::ptr_eq(&plc.add_tag(2.0, "T", 2).unwrap(), &tag));
+        let lists = plc.scanlists.lock();
+        let shape: Vec<_> = lists
+            .iter()
+            .map(|l| (l.period, l.tags.lock().len()))
+            .collect();
+        assert_eq!(shape, [(1.0, 0), (0.5, 1)]);
+        assert!(Arc::ptr_eq(&tag.list_stats(), &lists[1].stats));
+        assert_eq!(*tag.elements.lock(), 4);
     }
 }
