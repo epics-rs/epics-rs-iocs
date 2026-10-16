@@ -817,11 +817,13 @@ pub trait QuadEmDevice {
         let shared = self.qe_shared().clone();
         let mut status = StatusOr::default();
 
-        status.add(
+        status.add(if reason == acquire {
+            self.qe_base().set_ad_acquire(channel, value)
+        } else {
             self.qe_base()
                 .port_base
-                .set_int32_param(reason, channel, value),
-        );
+                .set_int32_param(reason, channel, value)
+        });
         shared.shadow_int32(&p, reason, value);
 
         if reason == acquire {
@@ -832,7 +834,7 @@ pub trait QuadEmDevice {
         } else if reason == p.acquire_mode {
             if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
                 status.add(self.set_acquire(0));
-                let _ = self.qe_base().port_base.set_int32_param(acquire, 0, 0);
+                let _ = self.qe_base().set_ad_acquire(0, 0);
             }
             status.add(self.set_acquire_mode(value));
             status.add(self.read_status());
@@ -1045,6 +1047,27 @@ impl QuadEmBase {
             outputs,
             queued,
         })
+    }
+
+    /// The `ADAcquire` branch of `asynNDArrayDriver::setIntegerParam`
+    /// (asynNDArrayDriver.cpp:639-653), which every `drvQuadEM` write of
+    /// `ADAcquire` goes through: `ADAcquireBusy` follows it, except that a stop
+    /// with `WaitForPlugins` set leaves it busy while arrays are still queued.
+    pub fn set_ad_acquire(&mut self, list: i32, value: i32) -> AsynResult<()> {
+        let p = self.nd_params;
+        let busy = if value != 0 {
+            Some(1)
+        } else if self.port_base.get_int32_param(p.wait_for_plugins, list)? == 0
+            || self.queued.iter().all(|q| q.get() == 0)
+        {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(busy) = busy {
+            self.port_base.set_int32_param(p.acquire_busy, list, busy)?;
+        }
+        self.port_base.set_int32_param(p.acquire, list, value)
     }
 
     /// Pool branch of `asynNDArrayDriver::writeInt32`, which `drvQuadEM`
@@ -1526,6 +1549,49 @@ mod tests {
         assert_eq!(m.calls, ["set_acquire", "set_acquire_mode", "read_status"]);
         assert_eq!(m.base.port_base.get_int32_param(acquire, 0).unwrap(), 0);
         assert_eq!(m.shared.acq.lock().acquire_mode, single);
+    }
+
+    fn acquire_busy(m: &FakeMeter) -> i32 {
+        let busy = m.base.nd_params.acquire_busy;
+        m.base.port_base.get_int32_param(busy, 0).unwrap()
+    }
+
+    /// `asynNDArrayDriver::setIntegerParam`: `ADAcquireBusy` follows `ADAcquire`.
+    #[test]
+    fn acquire_busy_follows_acquire_without_wait_for_plugins() {
+        let mut m = FakeMeter::new(&[]);
+        let acquire = m.base.nd_params.acquire;
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        assert_eq!(acquire_busy(&m), 1);
+        m.base.queued[3].increment();
+        m.qe_write_int32(acquire, 0, 0).unwrap();
+        assert_eq!(acquire_busy(&m), 0);
+    }
+
+    #[test]
+    fn a_stop_with_wait_for_plugins_stays_busy_while_arrays_are_queued() {
+        let mut m = FakeMeter::new(&[]);
+        let (acquire, wait) = (m.base.nd_params.acquire, m.base.nd_params.wait_for_plugins);
+        m.base.port_base.set_int32_param(wait, 0, 1).unwrap();
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        m.base.queued[3].increment();
+        m.qe_write_int32(acquire, 0, 0).unwrap();
+        assert_eq!(acquire_busy(&m), 1);
+
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        m.base.queued[3].decrement();
+        m.qe_write_int32(acquire, 0, 0).unwrap();
+        assert_eq!(acquire_busy(&m), 0);
+    }
+
+    #[test]
+    fn leaving_continuous_mode_clears_acquire_busy() {
+        let mut m = FakeMeter::new(&[]);
+        let (acquire, acquire_mode) = (m.base.nd_params.acquire, m.base.params.acquire_mode);
+        m.qe_write_int32(acquire, 0, 1).unwrap();
+        m.qe_write_int32(acquire_mode, 0, QeAcquireMode::Single as i32)
+            .unwrap();
+        assert_eq!(acquire_busy(&m), 0);
     }
 
     #[test]
