@@ -168,6 +168,12 @@ impl HxpController {
         self.poll.hexapod_positions_get(HXP_GROUP, self.is_hxpd)
     }
 
+    /// Drop the poll snapshot: a command sent since makes it stale, and C
+    /// wakes its poller after one.
+    pub fn invalidate(&mut self) {
+        self.fetched_at = None;
+    }
+
     /// The group-wide poll, refreshed when the cache window has passed
     /// (C `HXPController::poll`). On an RPC failure the firmware probe is
     /// reset and every axis reports problem + comms error until a poll
