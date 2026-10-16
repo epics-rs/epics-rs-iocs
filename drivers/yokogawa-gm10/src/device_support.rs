@@ -8,7 +8,7 @@
 //! factory's only input) carries `dtyp`/`inp`/`out` but no record-type
 //! field, so [`GmDevice`] defers command resolution to
 //! [`DeviceSupport::init`], which does receive the concrete `&mut dyn
-//! Record` and can call `record.record_type()`. [`resolve_operation`] is
+//! Record` and can call `record.record_type()`. `resolve_operation` is
 //! the single place that mirrors every `devGM10_*.c::init_record`'s
 //! command/address validation.
 

@@ -97,7 +97,7 @@ struct Job {
 }
 
 /// Handle to a connected GM10 unit. Cheap to clone (`Arc`-backed); one
-/// instance per `gm10Init` handle, looked up by name from [`connect`]'s
+/// instance per `gm10Init` handle, looked up by name from [`Instrument::connect`]'s
 /// registry.
 pub struct Instrument {
     cache: Arc<Mutex<Cache>>,

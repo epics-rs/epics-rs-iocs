@@ -613,7 +613,7 @@ pub fn parse_srangemath(payload: &[u8]) -> Vec<ExprLine> {
 ///    (same line — applied uniformly, even to Math/Comm channel_types).
 /// 3. Select the target array by `channel_type` (1=meas,2=calc,3=comm),
 ///    index `address - 1`.
-/// 4. Derive `data_status` via [`DataStatus::from_wire`]; if not `Normal`,
+/// 4. Derive `data_status` via [`DataStatus::from_wire`](crate::cache::DataStatus::from_wire); if not `Normal`,
 ///    store `value = 0` instead of the wire value (`drvGM10.c:1051-1054`).
 /// 5. Mask each alarm byte with `0x3F` before storing (`drvGM10.c:1056-1059`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
