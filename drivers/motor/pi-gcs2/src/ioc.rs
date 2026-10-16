@@ -82,8 +82,7 @@ pub fn pigcs2_config_command() -> CommandDef {
             }
             let controller = Arc::new(Mutex::new(controller));
             for (index, axis_name) in found.into_iter().take(num_axes).enumerate() {
-                let axis = PIGCS2Axis::new(controller.clone(), axis_name.clone(), index)
-                    .map_err(|e| format!("PIasynController: {e}"))?;
+                let axis = PIGCS2Axis::new(controller.clone(), axis_name, index, &port_name);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                 install(
                     ctx,
