@@ -667,7 +667,8 @@ pub fn create_pcr4(
 ) -> AsynResult<Pcr4Runtime> {
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
-    let io = connect_octet(qe_port_name, proto::PCR4_TIMEOUT)?;
+    let (io, status) = connect_octet(qe_port_name, proto::PCR4_TIMEOUT);
+    status?;
     let driver = Pcr4Driver::new(port_name, qe_port_name, io, max_memory, shared.clone())?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;

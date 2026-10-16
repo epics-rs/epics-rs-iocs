@@ -787,7 +787,8 @@ pub fn create_tetramm(
 ) -> AsynResult<TetrAmmRuntime> {
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
-    let io = connect_octet(qe_port_name, proto::TETRAMM_TIMEOUT)?;
+    let (io, status) = connect_octet(qe_port_name, proto::TETRAMM_TIMEOUT);
+    status?;
     let driver = TetrAmmDriver::new(port_name, qe_port_name, io, max_memory, shared.clone())?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;

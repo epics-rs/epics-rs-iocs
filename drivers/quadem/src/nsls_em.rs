@@ -255,7 +255,9 @@ impl NslsEmDriver {
         };
         // C++ discards the connect and first-write statuses; the writeRead
         // that follows reports the failure.
-        let _ = command.handle().connect_blocking();
+        if let Some(port) = command.handle() {
+            let _ = port.connect_blocking();
+        }
         let result = (|| -> AsynResult<String> {
             if out.len() > 1 {
                 let _ = command.write(out);
@@ -288,7 +290,9 @@ impl NslsEmDriver {
             }
             Ok(reply)
         })();
-        let _ = command.handle().disconnect_blocking();
+        if let Some(port) = command.handle() {
+            let _ = port.disconnect_blocking();
+        }
         result
     }
 

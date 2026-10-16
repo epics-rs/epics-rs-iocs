@@ -93,7 +93,25 @@ impl AhxxxDriver {
         ah401_series: Arc<AtomicBool>,
     ) -> AsynResult<Self> {
         let mut base = QuadEmBase::new(port_name, max_memory)?;
-        let io = connect_octet(qe_port_name, proto::AHXXX_TIMEOUT)?;
+        let (io, status) = connect_octet(qe_port_name, proto::AHXXX_TIMEOUT);
+        // C++ returns from its constructor here and keeps the port, with no
+        // meter link and no read thread.
+        if let Err(e) = status {
+            println!(
+                "drvAHxxx:drvAHxxx: error calling pasynOctetSyncIO->connect, status={}, error={}",
+                trace::status_code(&e),
+                e.message_display()
+            );
+            return Ok(Self {
+                base,
+                io,
+                shared,
+                model,
+                ah401_series,
+                firmware_version: String::new(),
+                qe_port_name: qe_port_name.to_string(),
+            });
+        }
         // C++ sets the input EOS in setAcquire; it is constant for the port's
         // whole life, so it is set once here. See `octet`.
         io.set_input_eos(b"\r\n")?;
@@ -732,7 +750,8 @@ pub struct AhxxxRuntime {
     pub nd_params: epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams,
     pub pool: Arc<epics_rs::ad_core::ndarray_pool::NDArrayPool>,
     pub outputs: Vec<Arc<parking_lot::Mutex<epics_rs::ad_core::plugin::channel::NDArrayOutput>>>,
-    _read_thread: thread::JoinHandle<()>,
+    /// `None` when the constructor found no QE port.
+    _read_thread: Option<thread::JoinHandle<()>>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -791,10 +810,12 @@ pub fn create_ahxxx(
         ah401_series,
         is_ah501be: model == QeModel::Ah501be,
     };
-    let read_thread_handle = thread::Builder::new()
-        .name("drvAHxxxTask".into())
-        .spawn(move || read_thread(read_ctx))
-        .expect("failed to spawn drvAHxxxTask");
+    let read_thread_handle = read_ctx.io.handle().is_some().then(|| {
+        thread::Builder::new()
+            .name("drvAHxxxTask".into())
+            .spawn(move || read_thread(read_ctx))
+            .expect("failed to spawn drvAHxxxTask")
+    });
 
     let callback_thread = qe::start_callback_task(CallbackContext {
         trigger_rx,
@@ -839,6 +860,27 @@ mod tests {
         assert_eq!(
             e.partial_read().map(|p| p.data.as_slice()),
             Some(proto::ACK_PREAMBLE)
+        );
+    }
+
+    /// C++ prints the connect failure and returns from its constructor: the
+    /// port stays, with no read thread, and a meter command fails on the
+    /// unbound asynUser.
+    #[test]
+    fn a_missing_qe_port_keeps_the_port_without_a_link() {
+        let rt = create_ahxxx("QE_AH_NOQE", "QE_AH_NOQE_IP", 4, 0, "AH501").unwrap();
+        assert!(rt._read_thread.is_none());
+        let err = rt
+            .port_handle()
+            .submit_blocking(
+                epics_rs::asyn::request::RequestOp::Int32Write { value: 1 },
+                epics_rs::asyn::user::AsynUser::new(rt.params.range),
+            )
+            .unwrap_err();
+        assert!(
+            err.message()
+                .contains("asynManager::queueLockPort not connected"),
+            "{err}"
         );
     }
 

@@ -46,26 +46,45 @@ impl ReadOutcome {
     }
 }
 
-/// Blocking octet handle bound to one asyn port at one timeout.
+/// Blocking octet handle at one timeout: the `asynUser` that
+/// `pasynOctetSyncIO->connect` returns.
 #[derive(Clone)]
 pub struct OctetIo {
-    handle: PortHandle,
+    /// `None` is the user a failed connect still hands back, bound to no port:
+    /// C drivers keep it, and every later call on it fails in asynManager.
+    handle: Option<PortHandle>,
     timeout: Duration,
 }
 
 impl OctetIo {
     pub fn new(handle: PortHandle, timeout: Duration) -> Self {
-        Self { handle, timeout }
+        Self {
+            handle: Some(handle),
+            timeout,
+        }
     }
 
-    pub fn port_name(&self) -> &str {
-        self.handle.port_name()
+    /// The user [`connect_octet`] leaves when the port does not exist.
+    pub fn unbound(timeout: Duration) -> Self {
+        Self {
+            handle: None,
+            timeout,
+        }
     }
 
-    /// The underlying port, for the asynCommon operations (`connect`,
-    /// `disconnect`, `setOutputEos`) that have no `asynOctetSyncIO` wrapper.
-    pub fn handle(&self) -> &PortHandle {
-        &self.handle
+    /// The port, or `queueLockPort`'s refusal of an unbound user
+    /// (asynManager.c:1843-1846), which every SyncIO call meets first.
+    fn port(&self) -> AsynResult<&PortHandle> {
+        self.handle.as_ref().ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynManager::queueLockPort not connected".into(),
+        })
+    }
+
+    /// The bound port, for the asynCommon operations (`connect`,
+    /// `disconnect`) that have no `asynOctetSyncIO` wrapper.
+    pub fn handle(&self) -> Option<&PortHandle> {
+        self.handle.as_ref()
     }
 
     /// The same port at another timeout — `drvNSLS_EM` reads the discovery
@@ -80,7 +99,7 @@ impl OctetIo {
     /// `asynOctetSyncIO->write` of raw bytes.
     pub fn write_bytes(&self, out: &[u8]) -> AsynResult<usize> {
         let result = self
-            .handle
+            .port()?
             .submit_blocking(RequestOp::OctetWrite { data: out.to_vec() }, self.user())?;
         Ok(result.nbytes)
     }
@@ -97,14 +116,18 @@ impl OctetIo {
         f: impl FnOnce(&mut LockedOctet<'_>) -> R + Send + 'static,
     ) -> AsynResult<R> {
         let timeout = self.timeout;
-        self.handle
-            .lock_port_blocking(move |calls| f(&mut LockedOctet { calls, timeout }))
+        // asynManager.c:1783-1786, the unbound user's refusal.
+        let port = self.handle.as_ref().ok_or_else(|| AsynError::Status {
+            status: AsynStatus::Error,
+            message: "asynManager::lockPort not connected\n".into(),
+        })?;
+        port.lock_port_blocking(move |calls| f(&mut LockedOctet { calls, timeout }))
     }
 
     /// `asynOctetSyncIO->writeRead`: flush stale input, write, read one
     /// EOS-terminated response.
     pub fn write_read(&self, out: &str, buf_size: usize) -> AsynResult<String> {
-        let result = self.handle.submit_blocking(
+        let result = self.port()?.submit_blocking(
             RequestOp::OctetWriteRead {
                 data: out.as_bytes().to_vec(),
                 buf_size,
@@ -118,7 +141,7 @@ impl OctetIo {
 
     /// `asynOctetSyncIO->write`.
     pub fn write(&self, out: &str) -> AsynResult<usize> {
-        let result = self.handle.submit_blocking(
+        let result = self.port()?.submit_blocking(
             RequestOp::OctetWrite {
                 data: out.as_bytes().to_vec(),
             },
@@ -130,7 +153,7 @@ impl OctetIo {
     /// `asynOctetSyncIO->read` with the port's input EOS active.
     pub fn read_line(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
         let result = self
-            .handle
+            .port()?
             .submit_blocking(RequestOp::OctetRead { buf_size }, self.user())?;
         Ok(ReadOutcome {
             data: result.data.unwrap_or_default(),
@@ -144,7 +167,7 @@ impl OctetIo {
     /// to this call.
     pub fn read_binary(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
         let result = self
-            .handle
+            .port()?
             .submit_blocking(RequestOp::OctetReadBinary { buf_size }, self.user())?;
         Ok(ReadOutcome {
             data: result.data.unwrap_or_default(),
@@ -179,7 +202,8 @@ impl OctetIo {
 
     /// `asynOctetSyncIO->flush`.
     pub fn flush(&self) -> AsynResult<()> {
-        self.handle.submit_blocking(RequestOp::Flush, self.user())?;
+        self.port()?
+            .submit_blocking(RequestOp::Flush, self.user())?;
         Ok(())
     }
 }
@@ -270,18 +294,21 @@ pub fn create_ip_port(
     Ok((io, runtime))
 }
 
-/// Look up a pre-configured octet port (created by `drvAsynIPPortConfigure` or
-/// `drvAsynSerialPortConfigure`) and wrap it for blocking use.
-pub fn connect_octet(port_name: &str, timeout: Duration) -> AsynResult<OctetIo> {
-    let port =
-        epics_rs::asyn::asyn_record::get_port(port_name).ok_or_else(|| AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!(
-                "octet port '{port_name}' not found \
-             (call drvAsynIPPortConfigure/drvAsynSerialPortConfigure first)"
-            ),
-        })?;
-    Ok(OctetIo::new(port.handle.clone(), timeout))
+/// `pasynOctetSyncIO->connect` to a pre-configured octet port (created by
+/// `drvAsynIPPortConfigure` or `drvAsynSerialPortConfigure`). Like C it always
+/// hands back a user — unbound on a missing port, beside `connectDevice`'s
+/// refusal (asynManager.c:1339-1342).
+pub fn connect_octet(port_name: &str, timeout: Duration) -> (OctetIo, AsynResult<()>) {
+    match epics_rs::asyn::asyn_record::get_port(port_name) {
+        Some(port) => (OctetIo::new(port.handle.clone(), timeout), Ok(())),
+        None => (
+            OctetIo::unbound(timeout),
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("asynManager:connectDevice port {port_name} not found"),
+            }),
+        ),
+    }
 }
 
 #[cfg(test)]
