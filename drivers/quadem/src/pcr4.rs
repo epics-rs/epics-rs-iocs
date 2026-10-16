@@ -83,9 +83,9 @@ impl Pcr4Driver {
             );
             return Ok(unlinked(base, io));
         }
-        // C++ sets the input EOS at the top of every setAcquire; it never
-        // changes, so it is set once here. See `octet`.
-        io.set_input_eos(b"\r\n")?;
+        // C++ sets the input EOS only in setAcquire, where a refusal fails the
+        // acquire; it is set here too so the firmware query frames on it.
+        let _ = io.set_input_eos(b"\r\n");
 
         base.port_base
             .set_int32_param(base.params.model, 0, QeModel::Pcr4 as i32)?;
@@ -300,6 +300,7 @@ impl QuadEmDevice for Pcr4Driver {
         if value == 1 && self.shared.is_acquiring() {
             return Ok(());
         }
+        trace::ensure_input_eos(&self.io, &self.base.port_base, "drvPCR4::setAcquire")?;
 
         if value == 0 {
             // Tell the read thread to stop, then wait for it to leave the read.
@@ -804,5 +805,19 @@ mod tests {
     fn a_missing_qe_port_keeps_the_port_without_a_link() {
         let rt = create_pcr4("QE_PCR4_NOQE", "QE_PCR4_NOQE_IP", 4, 0).unwrap();
         assert!(rt._read_thread.is_none());
+    }
+
+    /// C++ sets the input EOS only in setAcquire (drvPCR4.cpp:356-363): a port
+    /// that refuses it keeps the driver and fails the acquire instead.
+    #[test]
+    fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
+        let (_meter, _runtime) = crate::octet::tests::eos_refusing_port("QE_PCR4_NOEOS_IP");
+        let rt = create_pcr4("QE_PCR4_NOEOS", "QE_PCR4_NOEOS_IP", 4, 0).unwrap();
+        let err = rt
+            .port_handle()
+            .write_int32_blocking(rt.nd_params.acquire, 0, 1)
+            .unwrap_err();
+        assert_eq!(err.status(), epics_rs::asyn::error::AsynStatus::Error);
+        assert_eq!(err.message(), "no input EOS");
     }
 }
