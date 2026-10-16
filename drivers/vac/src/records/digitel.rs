@@ -170,8 +170,9 @@ pub struct DigitelRecord {
     /// Set once device support (or the simulation branch) has produced a value;
     /// C clears `pr->udf` on every such path.
     pub dev_ran: bool,
-    /// `recGblSetSevr(pr, READ_ALARM, INVALID_ALARM)` raised by device support.
-    pub read_alarm: bool,
+    /// The `recGblSetSevr(pr, <stat>, INVALID_ALARM)` device support raised:
+    /// READ_ALARM from a reply, COMM_ALARM from a refused `queueRequest`.
+    pub dev_alarm: Option<u16>,
 }
 
 impl Default for DigitelRecord {
@@ -264,7 +265,7 @@ impl Default for DigitelRecord {
             err: 0,
             ierr: 0,
             dev_ran: false,
-            read_alarm: false,
+            dev_alarm: None,
         }
     }
 }
@@ -837,8 +838,8 @@ impl Record for DigitelRecord {
     }
 
     fn check_alarms(&mut self, common: &mut CommonFields) {
-        if self.read_alarm {
-            set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
+        if let Some(stat) = self.dev_alarm {
+            set_sevr(common, stat, AlarmSeverity::Invalid);
         }
         if common.udf != 0 {
             return;
@@ -1064,7 +1065,7 @@ mod tests {
     fn a_read_alarm_is_invalid_and_survives_the_limit_chain() {
         let mut r = DigitelRecord {
             dev_ran: true,
-            read_alarm: true,
+            dev_alarm: Some(alarm_status::READ_ALARM),
             hhsv: 1, // MINOR limit cannot outrank INVALID
             hihi: 1e-6,
             val: 1e-5,

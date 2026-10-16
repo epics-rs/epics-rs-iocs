@@ -110,8 +110,9 @@ pub struct VsRecord {
     /// clears `pr->udf` on every `pact == 1` return, including both error
     /// returns, so UDF is cleared as soon as the device support has run at all.
     pub dev_ran: bool,
-    /// `recGblSetSevr(pr, READ_ALARM, INVALID_ALARM)` raised by device support.
-    pub read_alarm: bool,
+    /// The `recGblSetSevr(pr, <stat>, INVALID_ALARM)` device support raised:
+    /// READ_ALARM from a reply, COMM_ALARM from a refused `queueRequest`.
+    pub dev_alarm: Option<u16>,
 }
 
 impl Default for VsRecord {
@@ -179,7 +180,7 @@ impl Default for VsRecord {
             hyst: 0.0,
             lalm: 0.0,
             dev_ran: false,
-            read_alarm: false,
+            dev_alarm: None,
         }
     }
 }
@@ -547,8 +548,8 @@ impl Record for VsRecord {
     }
 
     fn check_alarms(&mut self, common: &mut CommonFields) {
-        if self.read_alarm {
-            set_sevr(common, alarm_status::READ_ALARM, AlarmSeverity::Invalid);
+        if let Some(stat) = self.dev_alarm {
+            set_sevr(common, stat, AlarmSeverity::Invalid);
         }
         // C returns immediately on UDF; the framework's `rec_gbl_check_udf`
         // raises `UDF_ALARM` at `UDFS`.
@@ -786,7 +787,7 @@ mod tests {
     fn a_device_read_alarm_outranks_the_limit_alarms() {
         let mut r = VsRecord {
             dev_ran: true,
-            read_alarm: true,
+            dev_alarm: Some(alarm_status::READ_ALARM),
             hhsv: 1,
             hihi: 1e-6,
             val: 1e-5,
