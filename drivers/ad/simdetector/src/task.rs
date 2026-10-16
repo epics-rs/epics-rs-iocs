@@ -135,11 +135,14 @@ impl SimTaskContext {
     /// `simDetector::computeImage` (simDetector.cpp:505-718).
     /// The error is the text of `computeImage`'s own asynPrint.
     async fn compute_image(&self, engine: &mut SimEngine) -> Result<NDArray, &'static str> {
-        let mut cfg = self
-            .sim
-            .read_config(&self.handle, &self.ad)
-            .await
-            .map_err(|_| "error getting parameters")?;
+        let (mut cfg, read_ok) = self.sim.read_config(&self.handle, &self.ad).await;
+        if !read_ok {
+            self.handle.trace().output(
+                self.handle.port_name(),
+                TraceMask::ERROR,
+                "simDetector:computeImage: error getting parameters",
+            );
+        }
 
         // "Make sure parameters are consistent, fix them if they are not" — and
         // write the corrections back, as C does with setIntegerParam.
