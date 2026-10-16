@@ -7,7 +7,7 @@
 //! (1 = ready for a command, 2 = done with the command).
 //!
 //! All 23 input recipes are registered, because the controller numbers recipes
-//! by registration order and the ones we send on (named in [`recipe`]) sit in
+//! by registration order and the ones we send on (named in `recipe`) sit in
 //! the middle of that sequence. Beyond the commands urRobot's `RTDEControl`
 //! driver issues, the surface carries the streaming commands (servoJ, speedJ,
 //! forceMode, the watchdog kick) and their support calls for planned-move

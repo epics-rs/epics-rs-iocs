@@ -386,7 +386,7 @@ impl PortDriver for ReceiveDriver {
 ///
 /// Deviation from C (which never reconnects on its own): the poll thread owns
 /// automatic recovery. An unhealthy stream — socket down OR stale per
-/// [`STALE_AFTER`] — is retried on the [`RECONNECT_BACKOFF`] schedule, so a
+/// `STALE_AFTER` — is retried on the `RECONNECT_BACKOFF` schedule, so a
 /// monitoring IOC comes back by itself when the robot does.
 pub fn start_poller(
     handle: PortHandle,

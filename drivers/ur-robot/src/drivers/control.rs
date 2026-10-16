@@ -871,7 +871,7 @@ pub fn start_poller(
 }
 
 /// One pass of the control poll loop. `was_healthy` is the poll thread's
-/// health-edge memory for the COMM alarm on [`ControlParams::alarm_targets`].
+/// health-edge memory for the COMM alarm on `ControlParams::alarm_targets`.
 pub fn poll_once(
     p: ControlParams,
     inner: &mut ControlInner,

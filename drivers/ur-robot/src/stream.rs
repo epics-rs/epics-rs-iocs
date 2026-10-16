@@ -6,7 +6,7 @@
 //!
 //! **Invariant:** once a [`StateStream`] is spawned, the reader thread is the
 //! only owner of the [`Session`]'s read half. Commands go out through a
-//! [`SessionWriter`] on the same socket (a socket is full-duplex), never through
+//! [`SessionWriter`](crate::session::SessionWriter) on the same socket (a socket is full-duplex), never through
 //! the session the reader owns.
 
 use std::collections::HashMap;
