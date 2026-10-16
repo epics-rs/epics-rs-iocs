@@ -231,7 +231,8 @@ pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrac
     state.done.set(1);
 }
 
-/// Reset all counters to zero.
+/// C `resetScaler`: stop a running scan and zero the counts; the hardware
+/// counters are left alone.
 pub fn reset_scaler(
     device: &DaqDevice,
     state: &mut ScalerState,
@@ -241,10 +242,7 @@ pub fn reset_scaler(
     if state.running {
         stop_scaler(device, state, trace);
     }
-    for i in 0..num_counters {
-        state.counts[i] = 0;
-        let _ = device.counter_clear(i as i32);
-    }
+    state.counts[..num_counters].fill(0);
 }
 
 /// C `readScaler`/`readMCS`'s `getStatus returned` line, printed whatever the
