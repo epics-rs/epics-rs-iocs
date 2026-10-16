@@ -79,6 +79,7 @@ pub fn create_mythen_detector(
         ad: ad_params,
         det: det.clone(),
         output: output.clone(),
+        pool: pool.clone(),
     });
     let task = task::start(shared, start_rx);
 

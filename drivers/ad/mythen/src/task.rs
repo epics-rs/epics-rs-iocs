@@ -8,7 +8,8 @@ use std::time::Duration;
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -32,6 +33,7 @@ pub struct Shared {
     pub ad: ADDriverParams,
     pub det: Arc<Detector>,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pub pool: Arc<NDArrayPool>,
 }
 
 impl Shared {
@@ -178,8 +180,14 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
     let width = nmodules * CHANNELS_PER_MODULE;
     debug_assert_eq!(channels.len(), width);
 
-    let counter = s.get_int(s.ad.base.array_counter).await + 1;
-    s.set_int(s.ad.base.array_counter, counter).await;
+    // C allocates before it counts (mythen.cpp:973, :993) and dereferences a
+    // refused alloc; the frame is dropped after the pool's reached-limit line.
+    let Ok(mut array) = s.pool.wrap(
+        vec![NDDimension::new(width), NDDimension::new(1)],
+        NDDataBuffer::U32(channels),
+    ) else {
+        return true;
+    };
 
     let mut attributes = NDAttributeList::new();
     attributes.add(NDAttribute::new_static(
@@ -189,10 +197,9 @@ async fn publish(s: &Arc<Shared>, reply: &[u8], nmodules: usize, nbits: i32) -> 
         NDAttrValue::Int32(NDColorMode::Mono as i32),
     ));
 
-    let mut array = NDArray::with_data(
-        vec![NDDimension::new(width), NDDimension::new(1)],
-        NDDataBuffer::U32(channels),
-    );
+    let counter = s.get_int(s.ad.base.array_counter).await + 1;
+    s.set_int(s.ad.base.array_counter, counter).await;
+
     array.unique_id = counter;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
