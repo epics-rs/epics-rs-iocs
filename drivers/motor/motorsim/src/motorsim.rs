@@ -237,7 +237,8 @@ impl MotorSimAxis {
             direction: self.nextpoint.v > 0.0,
             high_limit: self.nextpoint.p >= self.hi_hard_limit,
             low_limit: self.nextpoint.p <= self.low_hard_limit,
-            home: self.nextpoint.p == self.home,
+            // C motorStatusHome_ (EA_HOME), not motorStatusAtHome_.
+            encoder_home: self.nextpoint.p == self.home,
             homed: self.homed,
             ..MotorStatus::default()
         }

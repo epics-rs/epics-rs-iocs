@@ -322,7 +322,9 @@ impl AsynMotor for OemAxis {
             direction: new_direction,
             high_limit,
             low_limit,
+            // C sets motorStatusAtHome_ and motorStatusHome_ together.
             home,
+            encoder_home: home,
             homed: homed_status,
             ..MotorStatus::default()
         })
