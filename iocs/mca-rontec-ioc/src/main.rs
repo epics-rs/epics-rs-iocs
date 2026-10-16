@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::base::error::CaResult;
+use epics_rs::base::runtime::log::errlog_printf;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
@@ -125,12 +126,21 @@ async fn main() -> CaResult<()> {
                     _ => return Err("serialPortAddress required".into()),
                 };
 
-                let driver = RontecDriver::connect(&port_name, &serial_port, serial_addr)
-                    .map_err(|e| format!("RontecConfig: {e}"))?;
-
-                let (runtime_handle, _actor_jh) =
+                // C RontecConfig errlogPrintf's its failure and returns
+                // without failing the command (drvMcaRontec.c:174-178,224-226).
+                let driver = match RontecDriver::connect(&port_name, &serial_port, serial_addr) {
+                    Ok(driver) => driver,
+                    Err(e) => {
+                        errlog_printf(&format!("{}\n", e.message()));
+                        return Ok(CommandOutcome::Continue);
+                    }
+                };
+                let Ok((runtime_handle, _actor_jh)) =
                     create_port_runtime(driver, RuntimeConfig::default())
-                        .map_err(|e| format!("RontecConfig: {e}"))?;
+                else {
+                    errlog_printf("RontecConfig ERROR: Can't register myself.\n");
+                    return Ok(CommandOutcome::Continue);
+                };
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,
                     runtime_handle.port_handle().clone(),

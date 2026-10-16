@@ -203,9 +203,12 @@ impl RontecDriver {
         serial_port_name: &str,
         serial_port_addr: i32,
     ) -> AsynResult<Self> {
+        // C `pasynOctetSyncIO->connect` answers an unknown port with
+        // asynError (`drvMcaRontec.c:172-178`).
         let entry = get_port(serial_port_name).ok_or_else(|| {
             protocol_error(format!(
-                "RontecConfig: can't connect to serial port {serial_port_name}"
+                "RontecConfig: can't connect to serial port {serial_port_name}, status={}",
+                AsynStatus::Error as i32
             ))
         })?;
 
@@ -987,6 +990,17 @@ mod tests {
              \x20             maxChans: 4096\n\
              \x20             nchans:   1024\n\
              \x20             binning:  4\n"
+        );
+    }
+
+    #[test]
+    fn connect_to_a_missing_serial_port_fails_with_c_text() {
+        let err = RontecDriver::connect("RONTECNOPORT", "NOSUCHSERIAL", 0)
+            .err()
+            .expect("no such port");
+        assert_eq!(
+            err.message(),
+            "RontecConfig: can't connect to serial port NOSUCHSERIAL, status=3"
         );
     }
 
