@@ -1,19 +1,19 @@
-//! An offline detector must not stop the IOC from booting.
+//! What `eigerDetectorConfig` does with a detector that does not answer.
 //!
-//! `eigerDetectorConfig` used to propagate the first failed REST request out of
-//! the configure command, which left no port behind and aborted the IOC before
-//! `iocInit`. C's constructor logs "Eiger FAILED TO CONNECT" and returns
-//! (eigerDetector.cpp:229-235), leaving a usable port.
+//! The API version is read in C's `RestAPI` constructor, which throws when it
+//! cannot, so no port is made (restApi.cpp:258-275). A detector that answered
+//! that and then fails the state fetch keeps its port: C logs "Eiger FAILED TO
+//! CONNECT" and returns (eigerDetector.cpp:231-235).
 
 use std::net::TcpListener;
 
 use epics_rs::ad_core::driver::ADStatus;
 
-use eiger::create_eiger_detector_on_port;
 use eiger::driver::{EigerConfig, EigerDriver};
 use eiger::params::Model;
 use eiger::rest::{ApiVersion, RestApi};
 use eiger::tasks;
+use eiger::{ConfigError, create_eiger_detector_on_port};
 
 /// A TCP port nothing is listening on — the same thing the driver sees when the
 /// detector is powered off.
@@ -25,11 +25,15 @@ fn dead_port() -> u16 {
 }
 
 #[test]
-fn a_failed_version_negotiation_leaves_a_usable_client() {
-    let mut rest = RestApi::new("127.0.0.1", dead_port());
-    assert!(rest.negotiate_api_version().is_err());
-    // The bootstrap paths stay in place, which is what lets the caller carry on.
-    assert_eq!(rest.api_version(), ApiVersion::V1_6_0);
+fn a_failed_version_read_fails_the_client_with_cs_text() {
+    assert_eq!(
+        RestApi::open("127.0.0.1", dead_port()).err(),
+        Some("unable to parse response json")
+    );
+    assert_eq!(
+        RestApi::open("no-such-host.invalid", 80).err(),
+        Some("invalid hostname")
+    );
 }
 
 #[test]
@@ -68,10 +72,10 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
 }
 
 #[test]
-fn the_configure_command_succeeds_when_the_detector_does_not_answer() {
-    let runtime = create_eiger_detector_on_port("EIGER_OFFLINE_CFG", "127.0.0.1", dead_port(), 0)
-        .expect("eigerDetectorConfig must leave a port behind for iocInit to use");
-    // The background tasks still exist, so the driver recovers when the
-    // detector comes back.
-    assert!(runtime.num_tasks() > 0);
+fn the_configure_command_fails_when_the_detector_does_not_answer() {
+    let result = create_eiger_detector_on_port("EIGER_OFFLINE_CFG", "127.0.0.1", dead_port(), 0);
+    assert!(matches!(
+        result,
+        Err(ConfigError::Rest("unable to parse response json"))
+    ));
 }

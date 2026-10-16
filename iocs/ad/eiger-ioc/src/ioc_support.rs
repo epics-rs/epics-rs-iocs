@@ -6,7 +6,7 @@ use std::sync::Arc;
 use epics_rs::ad_core::ioc::GenericDriverContext;
 use epics_rs::base::server::iocsh::registry::*;
 
-use eiger::{EigerRuntime, create_eiger_detector};
+use eiger::{ConfigError, EigerRuntime, create_eiger_detector};
 
 /// NDArray fan-out names.
 ///
@@ -74,8 +74,12 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                let runtime = create_eiger_detector(&port_name, &hostname, max_memory)
-                    .map_err(|e| format!("failed to create the Eiger detector: {e}"))?;
+                let runtime = create_eiger_detector(&port_name, &hostname, max_memory).map_err(
+                    |e| match e {
+                        ConfigError::Rest(what) => format!("C++ error: {what}"),
+                        e => format!("failed to create the Eiger detector: {e}"),
+                    },
+                )?;
 
                 epics_rs::asyn::asyn_record::register_port(
                     &port_name,

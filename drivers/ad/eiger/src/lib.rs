@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -59,12 +59,36 @@ impl EigerRuntime {
     }
 }
 
+/// Why `eigerDetectorConfig` made no port.
+#[derive(Debug)]
+pub enum ConfigError {
+    /// What C's `RestAPI` constructor throws (restApi.cpp:244-275); iocsh
+    /// prints it as `C++ error: ...`.
+    Rest(&'static str),
+    Asyn(AsynError),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rest(what) => f.write_str(what),
+            Self::Asyn(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<AsynError> for ConfigError {
+    fn from(e: AsynError) -> Self {
+        Self::Asyn(e)
+    }
+}
+
 /// Create an Eiger detector port (C `eigerDetectorConfig`).
 pub fn create_eiger_detector(
     port_name: &str,
     hostname: &str,
     max_memory: usize,
-) -> AsynResult<EigerRuntime> {
+) -> Result<EigerRuntime, ConfigError> {
     create_eiger_detector_on_port(port_name, hostname, REST_PORT, max_memory)
 }
 
@@ -78,31 +102,15 @@ pub fn create_eiger_detector_on_port(
     hostname: &str,
     rest_port: u16,
     max_memory: usize,
-) -> AsynResult<EigerRuntime> {
-    let mut rest = RestApi::new(hostname, rest_port);
-
-    // A detector that does not answer must not stop the IOC from booting, so
-    // the version negotiation only logs and leaves the 1.6.0 bootstrap paths in
-    // place — every later request against a dead detector fails anyway, and the
-    // port comes up reporting itself disconnected.
-    //
-    // UPSTREAM DEFECT (restApi.cpp:262-274 + eigerDetector.cpp:2137): C throws
-    // out of the `RestAPI` constructor here, `eigerDetectorConfig` does not
-    // catch, and the IOC dies on an uncaught exception — where the very next
-    // thing C's own constructor does (the `state` fetch below) is careful to
-    // log and carry on.
-    // The failed GET has printed RestAPI::get's lines; C's throw follows them.
-    let _ = rest.negotiate_api_version();
+) -> Result<EigerRuntime, ConfigError> {
+    // C builds `mApi` before its constructor body runs, so a detector that
+    // cannot say which API it speaks leaves no driver at all.
+    let rest = RestApi::open(hostname, rest_port).map_err(ConfigError::Rest)?;
     let api = rest.api_version();
 
     // The model decides which parameters exist, so it has to be known before any
     // of them are created. C interleaves the two by fetching `description`
     // through a parameter it has just created; here the fetch is a plain GET.
-    //
-    // The version negotiation above is the probe: a detector that did not answer
-    // it is marked disconnected, so this GET — and every other request the
-    // constructor makes — fails at the client's gate instead of sitting out the
-    // full 20 s timeout. Nothing here needs to know that; the gate is uniform.
     let description = rest
         .get_value(rest::Sys::DetConfig, "description")
         .unwrap_or_default();

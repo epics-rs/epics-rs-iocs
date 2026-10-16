@@ -181,16 +181,15 @@ pub fn parse_sequence_id(body: &str) -> Result<i32, RestError> {
 }
 
 /// Extract the API version string from the `/detector/api/version` reply
-/// (C `RestAPI::RestAPI`, restApi.cpp:261-269).
-pub fn parse_api_version(body: &str) -> Result<ApiVersion, RestError> {
-    let v: Value = serde_json::from_str(body)
-        .map_err(|e| RestError::Parse(format!("version reply is not JSON: {e}")))?;
-    let s = v
-        .get("value")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RestError::Parse("no 'value' in version reply".into()))?;
-    ApiVersion::parse(s)
-        .ok_or_else(|| RestError::Parse(format!("unknown API '{s}', must be 1.6.0 or 1.8.0")))
+/// (C `RestAPI::RestAPI`, restApi.cpp:261-275). The error is the text C's
+/// constructor throws.
+pub fn parse_api_version(body: &str) -> Result<ApiVersion, &'static str> {
+    let v: Value = serde_json::from_str(body).map_err(|_| "unable to parse response json")?;
+    let value = v.get("value").ok_or("unable to find value token")?;
+    value
+        .as_str()
+        .and_then(ApiVersion::parse)
+        .ok_or("Unknown API, must be 1.6.0 or 1.8.0")
 }
 
 #[derive(Debug)]
@@ -262,13 +261,28 @@ pub struct RestApi {
 }
 
 impl RestApi {
-    /// Build the client. Does no I/O — the API version starts at the 1.6.0
-    /// bootstrap value, which is the only one whose paths are version-free, and
-    /// [`RestApi::negotiate_api_version`] replaces it with the detector's own.
-    ///
-    /// Construction and the first request are separate because the caller has
-    /// to be able to keep going when the detector does not answer; C fuses them
-    /// in the `RestAPI` constructor (restApi.cpp:256-289), which throws.
+    /// Open the client the way C's `RestAPI` constructor does
+    /// (restApi.cpp:237-289): resolve the host, then ask which SIMPLON API the
+    /// detector speaks. The error is the text C throws.
+    pub fn open(hostname: &str, port: u16) -> Result<Self, &'static str> {
+        use std::net::ToSocketAddrs;
+
+        if (hostname, port).to_socket_addrs().is_err() {
+            return Err("invalid hostname");
+        }
+        let mut rest = Self::new(hostname, port);
+        // A failed GET leaves C's response empty, which is what it then
+        // fails to parse.
+        let body = rest
+            .get(Sys::ApiVersion, "", TIMEOUT_PROBE)
+            .unwrap_or_default();
+        rest.api = parse_api_version(&body)?;
+        Ok(rest)
+    }
+
+    /// Build the client without touching the network, on the 1.6.0 bootstrap
+    /// paths (the only version-free ones). [`RestApi::open`] is the
+    /// constructor; this is the seam tests build a client on.
     pub fn new(hostname: &str, port: u16) -> Self {
         let agent = ureq::Agent::config_builder()
             // We inspect status codes ourselves: `wait_file` treats 404 as
@@ -337,16 +351,7 @@ impl RestApi {
     pub fn probe(&self) -> RestResult<ApiVersion> {
         let url = self.url(Sys::ApiVersion, "");
         let body = self.exchange(|| self.raw_get(&url, "", DATA_NATIVE, TIMEOUT_PROBE))?;
-        parse_api_version(&body)
-    }
-
-    /// Ask the detector which API it speaks and adopt it, which decides every
-    /// other path.
-    ///
-    /// On failure the version is left at the 1.6.0 bootstrap value.
-    pub fn negotiate_api_version(&mut self) -> RestResult<()> {
-        self.api = self.probe()?;
-        Ok(())
+        parse_api_version(&body).map_err(|what| RestError::Parse(what.into()))
     }
 
     pub fn api_version(&self) -> ApiVersion {
@@ -869,8 +874,15 @@ mod tests {
             parse_api_version(r#"{"value": "1.8.0"}"#).unwrap(),
             ApiVersion::V1_8_0
         );
-        assert!(parse_api_version(r#"{"value": "1.7.0"}"#).is_err());
-        assert!(parse_api_version(r#"{"nope": "1.6.0"}"#).is_err());
+        assert_eq!(
+            parse_api_version(r#"{"value": "1.7.0"}"#),
+            Err("Unknown API, must be 1.6.0 or 1.8.0")
+        );
+        assert_eq!(
+            parse_api_version(r#"{"nope": "1.6.0"}"#),
+            Err("unable to find value token")
+        );
+        assert_eq!(parse_api_version(""), Err("unable to parse response json"));
     }
 
     #[test]
