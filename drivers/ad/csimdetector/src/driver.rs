@@ -119,39 +119,6 @@ impl CSimDetector {
         })
     }
 
-    /// `asynNDArrayDriver::setIntegerParam(list, index, value)`
-    /// (asynNDArrayDriver.cpp:636-663): writes to `ADAcquire` and
-    /// `NDNumQueuedArrays` are intercepted to drive `ADAcquireBusy`.
-    fn set_integer_param(&mut self, addr: i32, reason: usize, value: i32) -> AsynResult<()> {
-        if reason == self.nd.acquire {
-            if value == 0 {
-                let wait_for_plugins = self
-                    .port_base
-                    .get_int32_param(self.nd.wait_for_plugins, addr)
-                    .unwrap_or(0)
-                    != 0;
-                if !wait_for_plugins || self.queued_counter.get() == 0 {
-                    self.port_base
-                        .set_int32_param(self.nd.acquire_busy, addr, 0)?;
-                }
-            } else {
-                self.port_base
-                    .set_int32_param(self.nd.acquire_busy, addr, 1)?;
-            }
-        } else if reason == self.nd.num_queued_arrays
-            && value == 0
-            && self
-                .port_base
-                .get_int32_param(self.nd.acquire, addr)
-                .unwrap_or(0)
-                == 0
-        {
-            self.port_base
-                .set_int32_param(self.nd.acquire_busy, addr, 0)?;
-        }
-        self.port_base.set_int32_param(reason, addr, value)
-    }
-
     /// `ADCSimDetector::setAcquire` (ADCSimDetector.cpp:255-266).
     fn set_acquire(&mut self, value: i32) {
         let acquiring = self.acquiring.load(Ordering::Acquire);
@@ -230,7 +197,7 @@ impl PortDriver for CSimDetector {
         let reason = user.reason;
         let addr = user.addr;
 
-        self.set_integer_param(addr, reason, value)?;
+        self.port_base.set_int32_param(reason, addr, value)?;
 
         let mut status = Ok(());
         if reason == self.nd.acquire {
@@ -352,7 +319,6 @@ pub fn create_c_sim_detector(
         acquiring,
         handle: runtime_handle.port_handle().clone(),
         publishers,
-        queued: queued_counter.clone(),
         pool: pool.clone(),
         last_array,
         nd: nd_params,

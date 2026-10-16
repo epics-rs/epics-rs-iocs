@@ -12,7 +12,7 @@ use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -31,7 +31,6 @@ pub(crate) struct CSimTaskContext {
     pub handle: PortHandle,
     /// Index 0 publishes the 2-D array; `1..=MAX_SIGNALS` the 1-D signals.
     pub publishers: Vec<ArrayPublisher>,
-    pub queued: Arc<QueuedArrayCounter>,
     pub pool: Arc<NDArrayPool>,
     pub last_array: LastArray,
     pub nd: NDArrayDriverParams,
@@ -53,23 +52,6 @@ fn float64(reason: usize, addr: i32, value: f64) -> ParamSetValue {
 impl CSimTaskContext {
     async fn notify(&self, addr: i32, updates: Vec<ParamSetValue>) {
         let _ = self.handle.set_params_and_notify(addr, updates).await;
-    }
-
-    /// The `ADAcquire` half of `asynNDArrayDriver::setIntegerParam`, for the
-    /// task's own `setIntegerParam(ADAcquire, 0)` (ADCSimDetector.cpp:206).
-    async fn acquire_off_updates(&self) -> Vec<ParamSetValue> {
-        let wait_for_plugins = self
-            .handle
-            .read_int32(self.nd.wait_for_plugins, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        let mut updates = Vec::with_capacity(2);
-        if !wait_for_plugins || self.queued.get() == 0 {
-            updates.push(int32(self.nd.acquire_busy, 0, 0));
-        }
-        updates.push(int32(self.nd.acquire, 0, 0));
-        updates
     }
 }
 
@@ -185,7 +167,8 @@ async fn sim_task(mut ctx: CSimTaskContext) {
                 updates.push(float64(ctx.sim.elapsed_time, 0, elapsed_time));
                 updates.push(int32(ctx.nd.array_counter, 0, array_counter));
                 if result.acquire_finished {
-                    updates.extend(ctx.acquire_off_updates().await);
+                    // ADCSimDetector.cpp:208; the base rule drives ADAcquireBusy.
+                    updates.push(int32(ctx.nd.acquire, 0, 0));
                 }
             }
             ctx.notify(addr, updates).await;
