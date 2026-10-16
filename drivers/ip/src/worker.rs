@@ -65,11 +65,15 @@ impl Transport {
     /// Read one EOS-delimited reply and decode it as text. The `ip` devices all
     /// speak ASCII; a non-UTF-8 byte is a framing error, not data.
     pub fn read(&self) -> Result<String, String> {
-        let raw = self
-            .io
-            .read_octet(OCTET_REASON, READ_BUF)
-            .map_err(|e| format!("read failed: {e}"))?;
+        let raw = self.read_bytes()?;
         String::from_utf8(raw).map_err(|e| format!("reply is not ASCII: {e}"))
+    }
+
+    /// Read one EOS-delimited reply, undecoded.
+    pub fn read_bytes(&self) -> Result<Vec<u8>, String> {
+        self.io
+            .read_octet(OCTET_REASON, READ_BUF)
+            .map_err(|e| format!("read failed: {e}"))
     }
 }
 
@@ -119,4 +123,47 @@ pub fn spawn<W: DeviceWorker>(
             }
         })
         .expect("failed to spawn the ip worker thread")
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::port::PortDriver;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+    use epics_rs::asyn::trace::TraceFile;
+
+    use super::*;
+
+    /// A transport on an octet port that never connects, its trace sent to a
+    /// file, so every transaction fails as a dead device's does.
+    pub fn refused_transport(port: &str) -> (Transport, PathBuf, PortRuntimeHandle) {
+        let mut driver = DrvAsynIPPort::new(port, "127.0.0.1:1").unwrap();
+        driver.base_mut().init_auto_connect(false);
+        let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        let handle = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        handle
+            .trace()
+            .set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
+        let io = SyncIOHandle::from_handle(handle.clone(), OCTET_ADDR, Duration::from_millis(200));
+        (
+            Transport::new(io, handle.trace().clone(), port),
+            path,
+            runtime,
+        )
+    }
+
+    /// The trace file's lines, with the timestamp/port prefix cut.
+    pub fn traced(path: &PathBuf) -> Vec<String> {
+        let text = std::fs::read_to_string(path).unwrap();
+        let _ = std::fs::remove_file(path);
+        text.lines()
+            .map(|l| l.split_once(' ').map_or(l, |(_, rest)| rest).to_string())
+            .collect()
+    }
 }

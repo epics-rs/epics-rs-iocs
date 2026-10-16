@@ -7,6 +7,7 @@
 
 pub mod protocol;
 
+use std::fmt;
 use std::time::Duration;
 
 use epics_rs::asyn::error::AsynResult;
@@ -17,6 +18,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
+use epics_rs::asyn::trace::TraceMask;
 
 use crate::connect::connect_octet;
 use crate::runtime::IpPortRuntime;
@@ -102,15 +104,28 @@ pub struct TelevacWorker {
 }
 
 impl TelevacWorker {
-    fn transact(&self, command: &str) -> Result<String, String> {
-        self.transport.write_read(command.as_bytes())
+    /// `devTelevacCallback`: write, read, and the one error line C prints,
+    /// for a read that returned nothing. `who` stands where C prints the
+    /// record name.
+    fn transact(&self, command: &str, who: fmt::Arguments<'_>) -> Option<String> {
+        let raw = self
+            .transport
+            .write(command.as_bytes())
+            .and_then(|()| self.transport.read_bytes())
+            .unwrap_or_default();
+        if raw.is_empty() {
+            self.transport.print(
+                TraceMask::ERROR,
+                format_args!("devTelevac::devTelevacCallback {who} message too small=0"),
+            );
+            return None;
+        }
+        String::from_utf8(raw).ok()
     }
 
     fn publish(&self, addr: i32, values: Vec<ParamSetValue>) {
-        if !values.is_empty()
-            && let Err(e) = self.handle.set_params_and_notify_blocking(addr, values)
-        {
-            log::error!("Televac: publishing address {addr} failed: {e}");
+        if !values.is_empty() {
+            let _ = self.handle.set_params_and_notify_blocking(addr, values);
         }
     }
 }
@@ -123,50 +138,52 @@ impl DeviceWorker for TelevacWorker {
 
         for station in 1..=self.stations {
             let addr = i32::from(station) - 1;
-            match self.transact(&protocol::read_pressure(station)) {
-                Ok(raw) => self.publish(
+            // The C published a stale buffer on a read error; here the
+            // parameter simply keeps its last good value.
+            if let Some(raw) = self.transact(
+                &protocol::read_pressure(station),
+                format_args!("TVAC_PRESSURE[{addr}]"),
+            ) {
+                self.publish(
                     addr,
                     vec![ParamSetValue::new(
                         p.pressure,
                         addr,
                         ParamValue::Float64(protocol::parse_pressure(&raw)),
                     )],
-                ),
-                // The C published a stale buffer on a read error; here the
-                // parameter simply keeps its last good value.
-                Err(e) => log::error!("Televac: read station {station} failed: {e}"),
+                );
             }
         }
 
-        let states = match self
-            .transact(&protocol::read_relay_states())
-            .and_then(|raw| protocol::parse_relay_states(&raw).map_err(|e| e.to_string()))
-        {
-            Ok(states) => Some(states),
-            Err(e) => {
-                log::error!("Televac: read relay states failed: {e}");
-                None
-            }
-        };
+        let states = self
+            .transact(
+                &protocol::read_relay_states(),
+                format_args!("TVAC_RELAY_STATE"),
+            )
+            .and_then(|raw| protocol::parse_relay_states(&raw).ok());
 
         for relay in 1..=self.relays {
             let addr = i32::from(relay) - 1;
             let mut values = Vec::new();
-            match self.transact(&protocol::read_relay_on(relay)) {
-                Ok(raw) => values.push(ParamSetValue::new(
+            if let Some(raw) = self.transact(
+                &protocol::read_relay_on(relay),
+                format_args!("TVAC_RELAY_ON[{addr}]"),
+            ) {
+                values.push(ParamSetValue::new(
                     p.relay_on,
                     addr,
                     ParamValue::Float64(protocol::parse_pressure(&raw)),
-                )),
-                Err(e) => log::error!("Televac: read relay {relay} ON failed: {e}"),
+                ));
             }
-            match self.transact(&protocol::read_relay_off(relay)) {
-                Ok(raw) => values.push(ParamSetValue::new(
+            if let Some(raw) = self.transact(
+                &protocol::read_relay_off(relay),
+                format_args!("TVAC_RELAY_OFF[{addr}]"),
+            ) {
+                values.push(ParamSetValue::new(
                     p.relay_off,
                     addr,
                     ParamValue::Float64(protocol::parse_pressure(&raw)),
-                )),
-                Err(e) => log::error!("Televac: read relay {relay} OFF failed: {e}"),
+                ));
             }
             if let Some(states) = states {
                 values.push(ParamSetValue::new(
@@ -216,4 +233,41 @@ pub fn create_televac(
     };
     let thread = worker::spawn(port_name, worker, rx, poll_period);
     Ok(IpPortRuntime::new(runtime_handle, thread))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::test_support::{refused_transport, traced};
+
+    /// A dead gauge prints devTelevacCallback's one error line per read.
+    #[test]
+    fn a_failed_read_prints_message_too_small() {
+        let (transport, path, runtime) = refused_transport("TVAC_TRACE");
+        let mut worker = TelevacWorker {
+            transport,
+            handle: runtime.port_handle().clone(),
+            params: TelevacParams {
+                pressure: 0,
+                relay_on: 1,
+                relay_off: 2,
+                relay_state: 3,
+            },
+            stations: 1,
+            relays: 0,
+        };
+        worker.poll();
+        let lines = traced(&path);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0]
+                .ends_with("devTelevac::devTelevacCallback TVAC_PRESSURE[0] message too small=0"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1]
+                .ends_with("devTelevac::devTelevacCallback TVAC_RELAY_STATE message too small=0"),
+            "{lines:?}"
+        );
+    }
 }
