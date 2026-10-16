@@ -796,13 +796,19 @@ mod tests {
     #[test]
     fn a_port_refusing_every_eos_set_still_configures_and_reads_status() {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let pmnc = Pmnc {
             base: PortDriverBase::new("pmncEosRefused", 1, PortFlags::default()),
             reply: Vec::new(),
         };
-        let (rt, _actor) = create_port_runtime(pmnc, RuntimeConfig::default()).unwrap();
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("pmncEosRefused").unwrap(),
+            pmnc,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
         let port = rt.port_handle().clone();
         assert!(port.set_input_eos_blocking(eos_user(), NL_EOS).is_err());
         let ctrl = PmncController::new(port, Duration::from_secs(1)).unwrap();

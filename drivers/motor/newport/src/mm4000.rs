@@ -543,6 +543,7 @@ mod tests {
     #[test]
     fn a_dead_line_keeps_the_last_position() {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let dead = Arc::new(AtomicBool::new(false));
@@ -551,7 +552,12 @@ mod tests {
             dead: dead.clone(),
             reply: Vec::new(),
         };
-        let (rt, _jh) = create_port_runtime(line, RuntimeConfig::default()).unwrap();
+        let (rt, _jh) = create_port_runtime(
+            &claim_port("mm4000_dead").unwrap(),
+            line,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let ctrl = Mm4000Controller::new(io, 1, Duration::ZERO).unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1).unwrap();
