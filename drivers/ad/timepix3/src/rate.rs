@@ -85,6 +85,10 @@ impl RateTracker {
         }
     }
 
+    pub fn sample_count(&self) -> usize {
+        self.samples.len()
+    }
+
     /// C `resetAcquisitionRuntimeState` (acquisition_runtime.cpp:108-153).
     pub fn reset(&mut self) {
         self.previous = None;

@@ -97,6 +97,13 @@ pub struct Accumulator {
     /// When the processing time and memory usage were last posted.
     processing_posted: f64,
     memory_posted: f64,
+    /// Img also posts both on a full sample set or window; PrvHst only on
+    /// its clock (serval_stream.cpp:1245-1246, :1362-1364 vs
+    /// histogram_io.cpp:869, :876).
+    posts_when_full: bool,
+    /// C `prvHstTimeMsBuffer_.size()`: grown to bins + 1, never shrunk but
+    /// by a reset (histogram_io.cpp:640-642, ADTimePix.cpp:1379).
+    time_axis_len: usize,
 }
 
 impl Default for Accumulator {
@@ -125,35 +132,60 @@ impl Accumulator {
             processing_ms: VecDeque::new(),
             processing_posted: 0.0,
             memory_posted: 0.0,
+            posts_when_full: true,
+            time_axis_len: 0,
         }
     }
 
-    /// serval_stream.cpp:1222-1252: the mean of the last ten processing
-    /// times, returned when C posts it (a second since the last post, or a
-    /// full sample set).
+    /// The PrvHst channel's accumulator.
+    pub fn prv_hst() -> Self {
+        Self {
+            posts_when_full: false,
+            ..Self::new()
+        }
+    }
+
+    /// serval_stream.cpp:1222-1252, histogram_io.cpp:848-873: the mean of
+    /// the last ten processing times, returned when C posts it (a second
+    /// since the last post, or for Img a full sample set).
     pub fn record_processing_time(&mut self, ms: f64, now: f64) -> Option<f64> {
         self.processing_ms.push_back(ms);
         if self.processing_ms.len() > PROCESSING_TIME_SAMPLES {
             self.processing_ms.pop_front();
         }
         let mean = self.processing_ms.iter().sum::<f64>() / self.processing_ms.len() as f64;
-        (now - self.processing_posted >= 1.0 || self.processing_ms.len() >= PROCESSING_TIME_SAMPLES)
-            .then(|| {
-                self.processing_posted = now;
-                mean
-            })
+        let full = self.posts_when_full && self.processing_ms.len() >= PROCESSING_TIME_SAMPLES;
+        (now - self.processing_posted >= 1.0 || full).then(|| {
+            self.processing_posted = now;
+            mean
+        })
     }
 
-    /// serval_stream.cpp:1360-1371: memory usage is posted every
-    /// `interval` seconds, and on every frame while the window is full.
+    /// serval_stream.cpp:1360-1371, histogram_io.cpp:875-881: memory usage
+    /// is posted every `interval` seconds, and for Img on every frame while
+    /// the window is full.
     pub fn memory_due(&mut self, now: f64, interval: f64) -> bool {
-        let full = self.window.effective_frames() > 0
+        let full = self.posts_when_full
+            && self.window.effective_frames() > 0
             && self.window.frame_count() >= self.window.effective_frames();
         let due = now - self.memory_posted >= interval || full;
         if due {
             self.memory_posted = now;
         }
         due
+    }
+
+    pub fn processing_samples(&self) -> usize {
+        self.processing_ms.len()
+    }
+
+    /// Grow the time axis to `len` values, as the PrvHst frame path does.
+    pub fn grow_time_axis(&mut self, len: usize) {
+        self.time_axis_len = self.time_axis_len.max(len);
+    }
+
+    pub fn time_axis_len(&self) -> usize {
+        self.time_axis_len
     }
 
     /// Elements per frame; 0 before the first frame and after a reset.
@@ -275,6 +307,7 @@ impl Accumulator {
         self.total_counts = 0;
         self.shape.clear();
         self.processing_ms.clear();
+        self.time_axis_len = 0;
     }
 
     /// `add`, recording the frame's geometry for the arrays built later from

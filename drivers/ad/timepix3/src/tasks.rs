@@ -1232,26 +1232,39 @@ async fn post_window(ctx: &Ctx, which: Accum, update: &Update) {
     ctx.set(ADDR, updates).await;
 }
 
-/// C `IMG_MEMORY_UPDATE_INTERVAL_SEC` (ADTimePix.h:986).
+/// C `IMG_MEMORY_UPDATE_INTERVAL_SEC` / `PRVHST_MEMORY_UPDATE_INTERVAL_SEC`
+/// (ADTimePix.h:986, :1038).
 const MEMORY_UPDATE_INTERVAL_SEC: f64 = 5.0;
 
-/// The processing-time and memory half of C `processImgFrame` and
-/// `updateImgPerformanceMetrics` (serval_stream.cpp:1222-1255, :1346-1375).
-async fn post_img_metrics(ctx: &Ctx, started: f64) {
+/// C `MAX_BUFFER_SIZE` (ADTimePix.h:415), the PrvHst worker's line buffer.
+pub(crate) const PRV_HST_LINE_BUFFER: usize = 32768;
+
+/// The processing-time and memory tail of C `processImgFrame` /
+/// `updateImgPerformanceMetrics` (serval_stream.cpp:1222-1255, :1346-1375)
+/// and `processPrvHstFrame` (histogram_io.cpp:848-881).
+async fn post_metrics(ctx: &Ctx, which: Accum, started: f64) {
     let now = EpicsTimestamp::now().as_f64();
+    let rate_samples = ctx.shared.rates.lock().prv_hst.sample_count();
     let (time, memory) = {
-        let mut img = ctx.shared.img.lock();
-        let time = img.record_processing_time((now - started) * 1e3, now);
-        let memory = img
+        let mut acc = which.get(&ctx.shared).lock();
+        let time = acc.record_processing_time((now - started) * 1e3, now);
+        let memory = acc
             .memory_due(now, MEMORY_UPDATE_INTERVAL_SEC)
-            .then(|| img_memory_mb(&img));
+            .then(|| match which {
+                Accum::Img => img_memory_mb(&acc),
+                Accum::PrvHst => prv_hst_memory_mb(&acc, rate_samples, PRV_HST_LINE_BUFFER),
+            });
         (time, memory)
     };
     let p = &ctx.p;
+    let (time_param, memory_param) = match which {
+        Accum::Img => (p.img_processing_time, p.img_memory_usage),
+        Accum::PrvHst => (p.prv_hst_processing_time, p.prv_hst_memory_usage),
+    };
     let updates: Vec<_> = time
-        .map(|t| (p.img_processing_time, t))
+        .map(|t| (time_param, t))
         .into_iter()
-        .chain(memory.map(|m| (p.img_memory_usage, m)))
+        .chain(memory.map(|m| (memory_param, m)))
         .map(|(reason, v)| ParamSetValue::new(reason, ADDR, ParamValue::Float64(v)))
         .collect();
     if !updates.is_empty() {
@@ -1271,6 +1284,29 @@ pub(crate) fn img_memory_mb(img: &crate::accum::Accumulator) -> f64 {
     let max_pixels = if running > 0 { running } else { current };
     (running * 8 + current * value_bytes + img.window().memory_bytes()) as f64 / MIB
         + (max_pixels * (8 + 8 + 4)) as f64 / MIB
+        + 0.1
+}
+
+/// C `calculatePrvHstMemoryUsageMB` (histogram_io.cpp:397-418); the line
+/// buffer is `PRV_HST_LINE_BUFFER` once the worker has run, else empty.
+pub(crate) fn prv_hst_memory_mb(
+    hst: &crate::accum::Accumulator,
+    rate_samples: usize,
+    line_buffer: usize,
+) -> f64 {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let bins = hst.elements();
+    let running = if bins > 0 {
+        bins * 8 + (bins + 1) * 8
+    } else {
+        0
+    };
+    (running
+        + hst.time_axis_len() * 8
+        + hst.window().memory_bytes()
+        + (rate_samples + hst.processing_samples()) * 8
+        + line_buffer) as f64
+        / MIB
         + 0.1
 }
 
@@ -1481,7 +1517,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                     let img = ctx.shared.img.lock();
                     (img.total_counts(), img.frame_count())
                 };
-                post_img_metrics(ctx, started).await;
+                post_metrics(ctx, Accum::Img, started).await;
                 ctx.set(
                     ADDR,
                     vec![ParamSetValue::new(
@@ -1530,6 +1566,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             if !prv_hst_accumulating(ctx).await {
                 return;
             }
+            let started = EpicsTimestamp::now().as_f64();
             let p = ctx.p;
             // histogram_io.cpp:251-292 tracks the rate; :574 posts it every frame.
             let hst_rate = ctx
@@ -1541,7 +1578,8 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 .rate;
             let update = ctx.shared.hst.lock().add(&h.counts);
             let (frames, counts) = {
-                let hst = ctx.shared.hst.lock();
+                let mut hst = ctx.shared.hst.lock();
+                hst.grow_time_axis(h.counts.len() + 1);
                 (hst.frame_count(), hst.total_counts())
             };
 
@@ -1603,6 +1641,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 i64::try_from(counts).unwrap_or(i64::MAX),
             )
             .await;
+            post_window(ctx, Accum::PrvHst, &update).await;
 
             publish_accumulation(
                 ctx,
@@ -1633,6 +1672,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 };
                 publish_hst_arrays(ctx, arrays, SumOutput::Sum).await;
             }
+            post_metrics(ctx, Accum::PrvHst, started).await;
         }
         // The decoder is created for the channel, so this cannot happen.
         _ => {}
@@ -2914,6 +2954,45 @@ mod tests {
         assert_eq!(
             avg5.attributes.get("ADTimePixCountUnits").map(|a| &a.value),
             Some(&NDAttrValue::String("counts/frame".into()))
+        );
+    }
+
+    /// C `processPrvHstFrame` posts the rolling window's configuration,
+    /// FramesSummed and `calculatePrvHstMemoryUsageMB`
+    /// (histogram_io.cpp:356-418, :577-610, :848-881).
+    #[tokio::test]
+    async fn a_prv_hst_frame_posts_the_window_and_memory_usage() {
+        let ctx = Arc::new(idle_ctx("TPX_HST_WIN"));
+        let p = ctx.p;
+        let frame = Frame::Histogram(crate::stream::HistogramFrame {
+            bin_width: 2,
+            bin_offset: 1,
+            frame_number: 1,
+            time_at_frame: 0.0,
+            counts: vec![1, 2],
+        });
+        handle_frame(&ctx, StreamKind::PrvHst, frame).await;
+
+        let h = &ctx.handle;
+        assert_eq!(
+            h.read_int32(p.prv_hst_effective_frames, 0).await.unwrap(),
+            10
+        );
+        assert_eq!(h.read_int32(p.prv_hst_frames_summed, 0).await.unwrap(), 1);
+        assert_eq!(
+            h.read_octet(p.prv_hst_retention_status, 0, 64)
+                .await
+                .unwrap(),
+            b"OK: 10 frames, 512 MiB\0"
+        );
+        // 2 u64 running + 3 f64 edges, a 3-value time axis, the window's
+        // 2 u64 and one 2-bin u32 frame, one processing sample (the first
+        // frame takes no rate sample) and the line buffer.
+        let bytes = 16 + 24 + 24 + 24 + 8 + PRV_HST_LINE_BUFFER;
+        let expected = bytes as f64 / (1024.0 * 1024.0) + 0.1;
+        assert_eq!(
+            h.read_float64(p.prv_hst_memory_usage, 0).await.unwrap(),
+            expected
         );
     }
 

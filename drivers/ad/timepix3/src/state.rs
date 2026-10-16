@@ -74,7 +74,7 @@ impl Shared {
     pub fn new() -> Self {
         Self {
             img: Mutex::new(Accumulator::new()),
-            hst: Mutex::new(Accumulator::new()),
+            hst: Mutex::new(Accumulator::prv_hst()),
             rates: Mutex::new(Rates::default()),
             mask: Mutex::new(Vec::new()),
             streams: Mutex::new(StreamPaths::default()),
