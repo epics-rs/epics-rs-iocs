@@ -1362,9 +1362,12 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
         threshold_index,
         timestamp,
     } = image;
-    let counter = s.get_int(s.ad.base.array_counter).await + 1;
+    // C stamps the counter before its `++imageCounter` (eigerDetector.cpp:1537,
+    // :1878), so the first array of an IOC's life is uniqueId 0.
+    let unique_id = s.get_int(s.ad.base.array_counter).await;
+    let counter = unique_id + 1;
     let array = Arc::new(build_array(
-        dims, data, codec, attributes, counter, timestamp,
+        dims, data, codec, attributes, unique_id, timestamp,
     ));
 
     if array_callbacks {
@@ -1528,5 +1531,99 @@ mod tests {
 
         let im = image(NDDataBuffer::U16(vec![1]), None).signed_if(false);
         assert!(matches!(im.data, NDDataBuffer::U16(_)));
+    }
+
+    /// A detector that answers every GET as a two-valued enum and every PUT
+    /// with an empty change list.
+    fn agreeable_detector() -> u16 {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut request = String::new();
+                if reader.read_line(&mut request).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) <= 2 {
+                        break;
+                    }
+                    if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let _ = reader.read_exact(&mut vec![0u8; length]);
+                let body = if request.starts_with("PUT") {
+                    "[]"
+                } else {
+                    r#"{"value":"disabled","value_type":"string","access_mode":"rw",
+                       "allowed_values":["disabled","enabled"]}"#
+                };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn the_unique_id_is_the_array_counter_before_its_increment() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let name = "EIGER_UNIQUE_ID";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: name.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let det = crate::driver::EigerDriver::new(cfg, rest, signals.clone()).expect("driver");
+        let (p, ad, ops) = (det.p, det.ad.params, det.ops.clone());
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default())
+                .expect("runtime");
+        let outputs = Outputs::new();
+        let (tx, mut rx) = ndarray_channel("UNIQUE_ID_SINK", 4);
+        outputs.main.lock().add(tx);
+        let s = shared(
+            ops,
+            runtime.port_handle().clone(),
+            p,
+            ad,
+            Model::Eiger1,
+            ApiVersion::V1_6_0,
+            "127.0.0.1".to_string(),
+            outputs,
+            &signals,
+        );
+
+        for _ in 0..2 {
+            publish(&s, image(NDDataBuffer::U16(vec![1, 2]), None), true).await;
+        }
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            ids.push(rx.recv().await.expect("array").unique_id);
+        }
+        assert_eq!(ids, [0, 1]);
+        assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
+        std::mem::forget(runtime);
     }
 }
