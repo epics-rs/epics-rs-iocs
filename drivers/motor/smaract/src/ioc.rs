@@ -16,7 +16,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::{EosRefusal, connect_serial, connect_with_eos};
+use motor_common::connect::{connect_controller, connect_serial, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
 use motor_common::{asyn_user, install, register_port};
@@ -67,21 +67,16 @@ pub fn mcs2_create_controller_command() -> CommandDef {
             let unused_mask = c_int(args, 5);
 
             register_port(ctx, &port_name, num_axes)?;
-            let Ok(handle) = connect_with_eos(
+            let (handle, _) = connect_controller(
                 &mcs2_port,
                 MCS2_TIMEOUT,
-                mcs2::INPUT_EOS,
-                mcs2::OUTPUT_EOS,
-                EosRefusal::Ignored,
-            ) else {
-                eprintln!(
+                &port_name,
+                format_args!(
                     "SmarActMCS2MotorDriver:MCS2Controller: cannot connect to MCS2 controller"
-                );
-                return Ok(CommandOutcome::Continue);
-            };
-            let controller = Arc::new(Mutex::new(
-                Mcs2Controller::new(handle).map_err(|e| format!("MCS2CreateController: {e}"))?,
-            ));
+                ),
+            );
+            set_eos_ignored(&handle, mcs2::INPUT_EOS, mcs2::OUTPUT_EOS);
+            let controller = Arc::new(Mutex::new(Mcs2Controller::new(handle)));
             for axis in 0..num_axes {
                 if unused_mask & (1 << axis) != 0 {
                     continue;

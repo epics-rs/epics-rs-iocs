@@ -80,7 +80,7 @@ impl Mcs2Controller {
     /// Connect to an MCS2 and read its serial number (`:DEV:SNUM?`), draining
     /// the error queue around it as the C constructor does. Performs blocking
     /// I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    pub fn new(handle: SyncIOHandle) -> Self {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
@@ -88,7 +88,7 @@ impl Mcs2Controller {
         ctrl.clear_errors();
         ctrl.ident = ctrl.query(":DEV:SNUM?").unwrap_or_default();
         ctrl.clear_errors();
-        Ok(ctrl)
+        ctrl
     }
 
     /// The controller serial-number identification string.
