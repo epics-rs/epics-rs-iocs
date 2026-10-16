@@ -4,14 +4,6 @@
 # Macros: P, DAU, HANDLE.
 # Port of yokogawaDasApp/Db/MW100_system.db.
 #
-# Upstream-defect fix #1 (devMW100_bo.c:150-ish vs MW100_system.db): the C bo
-# device support recognizes an "INFO_TRIG" command (alongside INP_TRIG/
-# OUT_TRIG/STAT_TRIG, all four dispatched by the same cmd-string switch in
-# devMW100_bo.c) but MW100_system.db never wires a record to it — a live
-# command with no PV surface. Added InfoPoll below, mirroring InputPoll/
-# OutputPoll/StatusPoll, instead of leaving the gap (same defect shape as
-# GM10's already-fixed devGM10_bo.c/GM10_system.db INFO_TRIG gap).
-#
 # Upstream-defect fix #2 (devMW100_bi.c:166 vs MW100_system.db): the C bi
 # device support recognizes a "MEASURE_MODE" command (dq->measurement_mode,
 # drvMW100.c:716-718, an independent status[4] bit alongside settings_mode
@@ -400,13 +392,6 @@ record(bo, "$(P)$(DAU):StatusPoll")
 {
     field(DTYP, "Yokogawa MW100")
     field(OUT, "@$(HANDLE) STAT_TRIG")
-    field(SCAN, "1 second")
-}
-
-record(bo, "$(P)$(DAU):InfoPoll")
-{
-    field(DTYP, "Yokogawa MW100")
-    field(OUT, "@$(HANDLE) INFO_TRIG")
     field(SCAN, "1 second")
 }
 
