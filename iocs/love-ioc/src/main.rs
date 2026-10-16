@@ -10,11 +10,12 @@ use std::time::Duration;
 use epics_rs::asyn::drivers::serial_port::DrvAsynSerialPort;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use love::connect::connect_octet;
+use love::connect::{init_serial_port, set_default_eos};
 use love::driver::{INPUT_EOS, LoveDriver, OUTPUT_EOS};
 use love::registry::{K_INSTRMAX, Model};
 
@@ -165,18 +166,9 @@ async fn main() -> CaResult<()> {
                     _ => return Err("serAddr required".into()),
                 };
 
-                let handle =
-                    connect_octet(&ser_port, ser_addr, COMMAND_TIMEOUT, INPUT_EOS, OUTPUT_EOS)
-                        .map_err(|e| format!("drvLoveInit: {e}"))?;
-                // C `setDefaultEos` (drvLove.c:647-657).
-                ctx.println(&format!(
-                    "drvLove::setDefaultEos Input EOS set to \\0{}",
-                    INPUT_EOS[0]
-                ));
-                ctx.println(&format!(
-                    "drvLove::setDefaultEos Output EOS set to \\0{}",
-                    OUTPUT_EOS[0]
-                ));
+                let port = init_serial_port(&ser_port, ser_addr)
+                    .map_err(|e| format!("drvLoveInit: {e}"))?;
+                let handle = SyncIOHandle::from_handle(port.clone(), ser_addr, COMMAND_TIMEOUT);
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
                 let driver = LoveDriver::new(&lov_port, &ser_port, handle, models.clone())
@@ -192,6 +184,15 @@ async fn main() -> CaResult<()> {
                     ctx.db().scan_control().interrupt_gate(),
                 )
                 .map_err(|e| e.to_string())?;
+
+                // C `setDefaultEos` (drvLove.c:640-660).
+                let (lines, ok) = set_default_eos(&port, ser_addr, INPUT_EOS, OUTPUT_EOS);
+                for line in &lines {
+                    ctx.println(line);
+                }
+                if !ok {
+                    ctx.println(&format!("drvLoveInit::failure to set {lov_port} EOS"));
+                }
 
                 Ok(CommandOutcome::Continue)
             },

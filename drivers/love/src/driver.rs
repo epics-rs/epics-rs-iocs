@@ -5,8 +5,9 @@
 //! for `longin`/`longout`, DTYP `asynUInt32Digital` with `@asynMask(...)`
 //! for `mbbi`/`bi`) — and does its own RS-485 ASCII/checksum framing
 //! against a *separate*, underlying octet port (found the same way the
-//! delaygen drivers find theirs: `connect_octet` wraps an already-configured
-//! serial/IP port in a blocking [`SyncIOHandle`]).
+//! delaygen drivers find theirs: `crate::connect::init_serial_port` looks up
+//! an already-configured serial/IP port, wrapped in a blocking
+//! [`SyncIOHandle`]).
 //!
 //! # EOS ownership
 //! `setDefaultEos` (`drvLove.c:640-660`) is called unconditionally at the
@@ -16,9 +17,9 @@
 //! the startup `.cmd` fragment sets EOS; neither `st.cmd.linux` nor
 //! `love.iocsh` ever call `asynOctetSetInputEos`/`asynOctetSetOutputEos`
 //! for Love). [`INPUT_EOS`]/[`OUTPUT_EOS`] carry the fixed bytes;
-//! `crate::connect::connect_octet` applies them at connect time (it needs
-//! the raw `PortHandle`, which `SyncIOHandle` does not expose an accessor
-//! back to).
+//! `crate::connect::set_default_eos` applies them after the port is
+//! registered, as C does (it needs the raw `PortHandle`, which
+//! `SyncIOHandle` does not expose an accessor back to).
 //!
 //! # Command table
 //! [`COMMANDS`] transcribes `CmdTable[]` (`drvLove.c:255-270`) verbatim: 12
@@ -354,9 +355,9 @@ pub struct LoveDriver {
 }
 
 impl LoveDriver {
-    /// C `drvLoveInit(lovPort,serPort,serAddr)`. `handle` must already have
-    /// [`INPUT_EOS`]/[`OUTPUT_EOS`] applied (`crate::connect::connect_octet`
-    /// does this). `models` is the shared per-address model table (see the
+    /// C `drvLoveInit(lovPort,serPort,serAddr)`. `handle` talks to the serial
+    /// port, which gets [`INPUT_EOS`]/[`OUTPUT_EOS`] after this port is
+    /// registered (`crate::connect::set_default_eos`). `models` is the shared per-address model table (see the
     /// `registry` module doc) -- the caller constructs it, passes a clone
     /// here, and registers another clone under `port_name` for a later
     /// `drvLoveConfig` call to find.
