@@ -75,6 +75,20 @@ pub fn dac_params(p: &TimePixParams) -> Vec<(&'static str, usize)> {
     DAC_NAMES.iter().map(|(name, f)| (*name, f(p))).collect()
 }
 
+type ParamOf = fn(&TimePixParams) -> usize;
+
+/// The accumulation settings and the range writeInt32 clamps each to
+/// (ADTimePix.cpp:758, :789, :805-806, :816, :833, :851-852;
+/// `MAX_RETENTION_LIMIT_MB`, ADTimePix.h:988).
+const ACCUMULATION_LIMITS: [(ParamOf, i32, i32); 6] = [
+    (|p| p.img_frames_to_sum, 1, 100_000),
+    (|p| p.img_retention_limit_mb, 1, 4096),
+    (|p| p.img_sum_update_interval_frames, 1, 10_000),
+    (|p| p.prv_hst_frames_to_sum, 1, 100_000),
+    (|p| p.prv_hst_retention_limit_mb, 1, 4096),
+    (|p| p.prv_hst_sum_update_interval, 1, 10_000),
+];
+
 /// One channel's `Base` PV check (C `checkRawPath` .. `checkPrvHstPath`,
 /// ADTimePix.cpp:282-398).
 struct ChannelPath {
@@ -1401,17 +1415,21 @@ impl PortDriver for TimePix3Driver {
             || reason == p.stem_radius_inner
         {
             self.send_measurement_config()
-        } else if reason == p.img_frames_to_sum {
-            self.shared.img.lock().set_frames_to_sum(value);
-            Ok(())
-        } else if reason == p.img_sum_update_interval_frames {
-            self.shared.img.lock().set_update_interval(value);
-            Ok(())
-        } else if reason == p.prv_hst_frames_to_sum {
-            self.shared.hst.lock().set_frames_to_sum(value);
-            Ok(())
-        } else if reason == p.prv_hst_sum_update_interval {
-            self.shared.hst.lock().set_update_interval(value);
+        } else if let Some(&(_, low, high)) =
+            ACCUMULATION_LIMITS.iter().find(|(f, ..)| f(&p) == reason)
+        {
+            // Each setting reads back clamped (ADTimePix.cpp:755-857).
+            let value = value.clamp(low, high);
+            self.ad.port_base.set_int32_param(reason, 0, value)?;
+            if reason == p.img_frames_to_sum {
+                self.shared.img.lock().set_frames_to_sum(value);
+            } else if reason == p.img_sum_update_interval_frames {
+                self.shared.img.lock().set_update_interval(value);
+            } else if reason == p.prv_hst_frames_to_sum {
+                self.shared.hst.lock().set_frames_to_sum(value);
+            } else if reason == p.prv_hst_sum_update_interval {
+                self.shared.hst.lock().set_update_interval(value);
+            }
             Ok(())
         } else if reason == p.processed_img_output_type || reason == p.processed_hst_output_type {
             // ADTimePix.cpp:593-597, :605-609.
@@ -2115,6 +2133,35 @@ mod tests {
         };
         assert!(at(&base) < at(&own));
         std::mem::forget(runtime);
+    }
+
+    /// An accumulation setting reads back clamped to C's range
+    /// (ADTimePix.cpp:755-857).
+    #[test]
+    fn an_accumulation_setting_reads_back_clamped() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_ACCUM_CLAMP",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        for (reason, write, read) in [
+            (p.img_frames_to_sum, 0, 1),
+            (p.img_frames_to_sum, 200_000, 100_000),
+            (p.img_retention_limit_mb, 5000, 4096),
+            (p.img_sum_update_interval_frames, 20_000, 10_000),
+            (p.prv_hst_frames_to_sum, -3, 1),
+            (p.prv_hst_retention_limit_mb, 0, 1),
+            (p.prv_hst_sum_update_interval, 0, 1),
+        ] {
+            det.write_int32(&mut AsynUser::new(reason), write).unwrap();
+            assert_eq!(det.int(reason, 0), read, "{reason} <- {write}");
+        }
+        assert_eq!(det.shared.img.lock().frames_to_sum(), 100_000);
     }
 
     /// A NumImages write in single mode is clamped to 1 and says so on
