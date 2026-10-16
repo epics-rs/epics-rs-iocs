@@ -478,7 +478,10 @@ impl PortDriver for MultiFunctionDriver {
         // helpers borrow the driver, and apply_updates needs it mutably.
         let mut wave_arrays: Vec<ParamSetValue> = Vec::new();
 
-        if reason == self.params.counter_reset {
+        if reason == self.params.wave_dig_num_points {
+            let dwell = self.base.get_float64_param(self.params.wave_dig_dwell, 0)?;
+            wave_arrays.push(wave_dig::compute_wave_dig_times(&self.params, value, dwell));
+        } else if reason == self.params.counter_reset {
             let dev = self.device.lock().unwrap();
             status = trace.report(
                 &dev.counter_load(addr, uldaq_sys::CRT_LOAD, 0),
@@ -649,6 +652,12 @@ impl PortDriver for MultiFunctionDriver {
         let mut status: UlError = 0;
         if self.wave_gen_settings().contains(&reason) {
             status = self.restart_wave_gen(&self.trace())?;
+        } else if reason == self.params.wave_dig_dwell {
+            let num_points = self
+                .base
+                .get_int32_param(self.params.wave_dig_num_points, 0)?;
+            let times = wave_dig::compute_wave_dig_times(&self.params, num_points, value);
+            self.apply_updates(vec![times])?;
         }
 
         self.base.call_param_callbacks(addr)?;

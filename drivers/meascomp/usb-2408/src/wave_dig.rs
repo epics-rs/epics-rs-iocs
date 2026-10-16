@@ -24,8 +24,6 @@ pub struct WaveDigState {
     pub channel_buffers: Vec<Vec<f64>>,
     /// Absolute time per point.
     pub abs_time_buffer: Vec<f64>,
-    /// Time waveform per point.
-    pub time_buffer: Vec<f32>,
     pub dwell_actual: f64,
 }
 
@@ -44,7 +42,6 @@ impl WaveDigState {
             scan_buffer: Vec::new(),
             channel_buffers,
             abs_time_buffer: vec![0.0; max_points],
-            time_buffer: vec![0.0; max_points],
             dwell_actual: 0.001,
         }
     }
@@ -210,10 +207,6 @@ pub fn start_wave_dig(
         ),
     );
 
-    // Compute time waveform
-    for i in 0..num_points {
-        state.time_buffer[i] = (i as f64 * state.dwell_actual) as f32;
-    }
     Ok(vec![
         ParamSetValue::new(params.wave_dig_current_point, 0, ParamValue::Int32(0)),
         ParamSetValue::new(
@@ -227,7 +220,6 @@ pub fn start_wave_dig(
             0,
             ParamValue::Float64(state.dwell_actual * num_points as f64),
         ),
-        time_wf_update(params, state),
     ])
 }
 
@@ -364,14 +356,20 @@ pub fn waveform_updates(
     updates
 }
 
-/// Array callback for the dwell-derived time base. C
-/// `MultiFunction::computeWaveDigTimes`.
-pub fn time_wf_update(params: &MultiFunctionParams, state: &WaveDigState) -> ParamSetValue {
-    let n = state.num_points.min(state.time_buffer.len());
+/// C `computeWaveDigTimes`: WAVEDIG_TIME_WF is `i * dwell` over the
+/// requested point count and dwell, posted when either is written.
+pub fn compute_wave_dig_times(
+    params: &MultiFunctionParams,
+    num_points: i32,
+    dwell: f64,
+) -> ParamSetValue {
+    let times = (0..num_points.max(0))
+        .map(|i| (f64::from(i) * dwell) as f32)
+        .collect::<Vec<_>>();
     ParamSetValue::new(
         params.wave_dig_time_wf,
         0,
-        ParamValue::Float32Array(state.time_buffer[..n].into()),
+        ParamValue::Float32Array(times.into()),
     )
 }
 
