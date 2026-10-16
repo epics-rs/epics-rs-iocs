@@ -1,10 +1,7 @@
 //! Port of `ADCSimDetector` (the `asynNDArrayDriver` half of `ADCSimDetector.cpp`).
 //!
 //! `ADCSimDetector` derives from `asynNDArrayDriver` directly, with
-//! `maxAddr = MAX_SIGNALS + 1` and `ASYN_MULTIDEVICE`. `ad-core-rs` 0.22.1's
-//! `NDArrayDriverBase::new` hardcodes `max_addr = 1` and a single-device
-//! `PortFlags`, so this driver assembles the same three pieces
-//! (`PortDriverBase` + `NDArrayDriverParams` + `NDArrayPool`) by hand.
+//! `maxAddr = MAX_SIGNALS + 1` and `ASYN_MULTIDEVICE`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +14,7 @@ use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::ndarray_driver::NDArrayDriverBase;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataType};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
@@ -74,23 +72,25 @@ impl CSimDetector {
         max_memory: usize,
         shared: SharedTaskState,
     ) -> AsynResult<Self> {
-        let mut port_base = PortDriverBase::new(
+        // asynNDArrayDriver(portName, MAX_SIGNALS+1, ..., ASYN_CANBLOCK |
+        // ASYN_MULTIDEVICE, ...), ADCSimDetector.cpp:56-59.
+        let NDArrayDriverBase {
+            mut port_base,
+            params: nd,
+            pool,
+            queued_counter,
+            ..
+        } = NDArrayDriverBase::new(
             port_name,
             MAX_ADDR,
+            max_memory,
             PortFlags {
                 can_block: true,
                 multi_device: true,
                 ..Default::default()
             },
-        );
-
-        let nd = NDArrayDriverParams::create(&mut port_base)?;
+        )?;
         let sim = CSimParams::create(&mut port_base)?;
-
-        // `asynNDArrayDriver`'s own constructor defaults, as applied by
-        // `NDArrayDriverBase::new`.
-        port_base.set_int32_param(nd.array_callbacks, 0, 1)?;
-        port_base.set_float64_param(nd.pool_max_memory, 0, max_memory as f64 / MEGABYTE)?;
 
         // ADCSimDetector.cpp:93-104.
         port_base.set_string_param(nd.driver_version, 0, DRIVER_VERSION)?;
@@ -109,8 +109,8 @@ impl CSimDetector {
             port_base,
             nd,
             sim,
-            pool: NDArrayPool::new(max_memory),
-            queued_counter: Arc::new(QueuedArrayCounter::new()),
+            pool,
+            queued_counter,
             last_array: shared.last_array,
             acquiring: shared.acquiring,
             start_tx: shared.start_tx,
