@@ -38,8 +38,9 @@ impl CtrScalerDriver {
 impl ScalerDriver for CtrScalerDriver {
     fn reset(&mut self) -> CaResult<()> {
         let dev = self.device.lock().unwrap();
-        let mut st = self.state.lock().unwrap();
-        scaler::reset_scaler(&dev, &mut st.scaler);
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        scaler::reset_scaler(&dev, &mut st.scaler, &st.trace);
         st.scaler.presets = [0; MAX_COUNTERS];
         st.scaler.done.call_callbacks();
         Ok(())
@@ -64,13 +65,13 @@ impl ScalerDriver for CtrScalerDriver {
 
     fn arm(&mut self, start: bool) -> CaResult<()> {
         let dev = self.device.lock().unwrap();
-        let mut st = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
         if start {
-            if let Err(e) = scaler::start_scaler(&dev, &mut st.scaler) {
-                log::error!("start_scaler error: {e}");
-            }
+            // C `writeInt32` ignores `startScaler`'s status; it prints its own.
+            let _ = scaler::start_scaler(&dev, &mut st.scaler, &st.trace);
         } else {
-            scaler::stop_scaler(&dev, &mut st.scaler);
+            scaler::stop_scaler(&dev, &mut st.scaler, &st.trace);
         }
         st.scaler.done.set(0);
         st.scaler.done.call_callbacks();

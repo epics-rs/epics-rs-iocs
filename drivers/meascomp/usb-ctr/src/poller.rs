@@ -3,17 +3,20 @@ use std::time::{Duration, Instant};
 
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
 use crate::mcs::{self, McsState};
 use crate::params::*;
 use crate::scaler::{self, ScalerState};
+use crate::trace::SelfTrace;
 
 /// Shared state between driver and poller.
 pub struct PollerState {
     pub scaler: ScalerState,
     pub mcs: McsState,
+    pub trace: SelfTrace,
 }
 
 /// Start the polling thread that reads DIO, counters, scaler, and MCS.
@@ -45,7 +48,6 @@ struct PollSnapshot {
     /// Seconds since the MCS scan started; C readMCS keeps
     /// mcaElapsedRealTime/LiveTime on every counter address.
     mcs_elapsed: f64,
-    errors: Vec<String>,
 }
 
 fn poller_loop(
@@ -56,6 +58,7 @@ fn poller_loop(
 ) {
     let mut prev_digital_input: u64 = 0;
     let mut force_callback = true;
+    let trace = state.lock().unwrap().trace.clone();
 
     loop {
         let start = Instant::now();
@@ -66,27 +69,32 @@ fn poller_loop(
             if let Ok(dev) = device.lock() {
                 match dev.digital_in(uldaq_sys::AUXPORT) {
                     Ok(data) => snap.digital_input = Some(data),
-                    Err(e) => snap.errors.push(format!("DIn: {e}")),
+                    Err(e) => trace.print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "USBCTR:pollerThread: ERROR calling cbDIn, status={}",
+                            e.code
+                        ),
+                    ),
                 }
 
                 if let Ok(mut st) = state.lock() {
                     if st.scaler.running {
-                        scaler::read_scaler(&dev, &mut st.scaler);
+                        scaler::read_scaler(&dev, &mut st.scaler, &trace);
                         if st.scaler.done.get() != 0 {
                             snap.scaler_done_snapshot = Some(st.scaler.counts);
                         }
                     } else if st.mcs.running {
                         let mcs_was_acquiring = st.mcs.acquiring;
-                        mcs::read_mcs(&dev, &mut st.mcs);
+                        mcs::read_mcs(&dev, &mut st.mcs, &trace);
                         snap.mcs_running = true;
                         snap.mcs_current_point = st.mcs.current_point;
                         snap.mcs_just_stopped = mcs_was_acquiring && !st.mcs.acquiring;
                         snap.mcs_elapsed = st.mcs.elapsed_secs();
                     } else {
                         for counter in 0..MAX_COUNTERS {
-                            match dev.counter_in(counter as i32) {
-                                Ok(value) => snap.counters[counter] = Some(value as i64),
-                                Err(e) => snap.errors.push(format!("CIn({counter}): {e}")),
+                            if let Ok(value) = dev.counter_in(counter as i32) {
+                                snap.counters[counter] = Some(value as i64);
                             }
                         }
                     }
@@ -95,10 +103,7 @@ fn poller_loop(
             snap
         }; // device lock released here
 
-        // ---- Phase 2: log + write results (no device lock) ----
-        for msg in &snapshot.errors {
-            log::warn!("CTR poller {msg}");
-        }
+        // ---- Phase 2: write results (no device lock) ----
 
         if let Some(data) = snapshot.digital_input {
             let changed = data ^ prev_digital_input;

@@ -2,9 +2,12 @@ use meascomp::counter::{CInScanConfig, CounterScanConfig};
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use epics_rs::asyn::trace::TraceMask;
+
 use epics_rs::scaler::device_support::scaler_asyn::DoneParam;
 
 use crate::params::*;
+use crate::trace::SelfTrace;
 
 /// Shared scaler state between the driver (arm/reset) and poller (read/done).
 pub struct ScalerState {
@@ -37,7 +40,13 @@ impl ScalerState {
 }
 
 /// Configure counters and start the continuous counter scan for scaler mode.
-pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), String> {
+/// C `USBCTR::startScaler` (drvUSBCTR.cpp:887); the preset loads are C
+/// `setScalerPresets` (:1040).
+pub fn start_scaler(
+    device: &DaqDevice,
+    state: &mut ScalerState,
+    trace: &SelfTrace,
+) -> Result<(), String> {
     let num_counters = MAX_COUNTERS as i32;
 
     // Configure each counter for counting mode
@@ -67,7 +76,16 @@ pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), S
                     flags: CF_DEFAULT,
                 },
             )
-            .map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
+            .map_err(|e| {
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "USBCTR::startScaler error calling ulCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}",
+                        e.code, e.message
+                    ),
+                );
+                format!("counter_config_scan({i}) error: {e}")
+            })?;
     }
 
     // Set presets as max limits
@@ -75,40 +93,61 @@ pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), S
         if state.presets[i] > 0 {
             device
                 .counter_load(i as i32, CRT_MAX_LIMIT, state.presets[i])
-                .map_err(|e| format!("counter_load MAX_LIMIT({i}) error: {e}"))?;
+                .map_err(|e| {
+                    trace.print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "USBCTR::setScalerPresets error calling cbCLoad32, counter={i}, presetCounts={}, status={}, error={}",
+                            state.presets[i] as i32, e.code, e.message
+                        ),
+                    );
+                    format!("counter_load MAX_LIMIT({i}) error: {e}")
+                })?;
         }
     }
 
     // Start continuous counter scan
-    let mut rate = 10000.0; // Will be adjusted by driver
+    let requested_rate = 10000.0; // Will be adjusted by driver
+    let mut rate = requested_rate;
+    let config = CInScanConfig {
+        low_counter: 0,
+        high_counter: num_counters - 1,
+        samples_per_counter: 20,
+        options: SO_CONTINUOUS | SO_SINGLEIO,
+        flags: CINSCAN_FF_CTR64_BIT,
+    };
 
     device
-        .counter_in_scan(
-            &CInScanConfig {
-                low_counter: 0,
-                high_counter: num_counters - 1,
-                samples_per_counter: 20,
-                options: SO_CONTINUOUS | SO_SINGLEIO,
-                flags: CINSCAN_FF_CTR64_BIT,
-            },
-            &mut rate,
-            &mut state.scan_buffer,
-        )
-        .map_err(|e| format!("counter_in_scan error: {e}"))?;
+        .counter_in_scan(&config, &mut rate, &mut state.scan_buffer)
+        .map_err(|e| {
+            // C prints its requested `long rate`, not the one ulCInScan returned.
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::startScaler error calling ulCInScan, firstCounter={}, lastCounter={}, samplesPerCounter={}, rate={}, options=0x{:x}, flags=0x{:x}, status={}, error={}",
+                    config.low_counter,
+                    config.high_counter,
+                    config.samples_per_counter,
+                    requested_rate as i32,
+                    config.options,
+                    config.flags,
+                    e.code,
+                    e.message
+                ),
+            );
+            format!("counter_in_scan error: {e}")
+        })?;
 
     state.running = true;
-    log::info!("Scaler started, rate={rate:.0} Hz");
     Ok(())
 }
 
 /// Read latest counter values from the scan buffer. Check for preset completion.
-pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState) {
-    let (status, xfer) = match device.counter_in_scan_status() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("scaler scan status error: {e}");
-            return;
-        }
+pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrace) {
+    let polled = device.counter_in_scan_status();
+    print_get_status(trace, "readScaler", &polled);
+    let Ok((status, xfer)) = polled else {
+        return;
     };
 
     if xfer.current_total_count == 0 {
@@ -145,16 +184,22 @@ pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState) {
     }
 
     if preset_reached || status == SS_IDLE {
-        stop_scaler(device, state);
+        stop_scaler(device, state, trace);
     }
 }
 
 /// Stop the counter scan. C `stopScaler` sets `scalerDone_` whether or not
 /// the scan was running.
-pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState) {
+pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrace) {
     if state.running {
         if let Err(e) = device.counter_in_scan_stop() {
-            log::warn!("scaler scan stop error: {e}");
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::stopScaler ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}",
+                    e.code, e.message
+                ),
+            );
         }
         state.running = false;
     }
@@ -162,14 +207,36 @@ pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState) {
 }
 
 /// Reset all counters to zero.
-pub fn reset_scaler(device: &DaqDevice, state: &mut ScalerState) {
+pub fn reset_scaler(device: &DaqDevice, state: &mut ScalerState, trace: &SelfTrace) {
     if state.running {
-        stop_scaler(device, state);
+        stop_scaler(device, state, trace);
     }
     for i in 0..MAX_COUNTERS {
         state.counts[i] = 0;
-        if let Err(e) = device.counter_clear(i as i32) {
-            log::warn!("counter_clear({i}) error: {e}");
-        }
+        let _ = device.counter_clear(i as i32);
     }
+}
+
+/// C `readScaler`/`readMCS`'s `getStatus returned` line, printed whatever the
+/// status call returned.
+pub fn print_get_status(
+    trace: &SelfTrace,
+    function_name: &str,
+    polled: &meascomp::error::Result<(i32, TransferStatus)>,
+) {
+    let (status, scan, count, index) = match polled {
+        Ok((scan, xfer)) => (
+            0,
+            *scan,
+            xfer.current_total_count as i64,
+            xfer.current_index,
+        ),
+        Err(e) => (e.code, 0, 0, 0),
+    };
+    trace.print(
+        TraceMask::FLOW,
+        format_args!(
+            "USBCTR::{function_name} getStatus returned status={status}, ctrStatus={scan}, ctrCount={count}, ctrIndex={index}"
+        ),
+    );
 }

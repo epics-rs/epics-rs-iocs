@@ -4,7 +4,11 @@ use meascomp::counter::CounterScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use epics_rs::asyn::trace::TraceMask;
+
 use crate::params::*;
+use crate::scaler::print_get_status;
+use crate::trace::SelfTrace;
 
 /// MCS (Multi-Channel Scaler) acquisition state.
 pub struct McsState {
@@ -95,7 +99,13 @@ pub struct McsScan {
 }
 
 /// Start MCS acquisition using DaqInScan.
-pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Result<(), String> {
+/// C `USBCTR::startMCS` (drvUSBCTR.cpp:520).
+pub fn start_mcs(
+    device: &DaqDevice,
+    state: &mut McsState,
+    scan: &McsScan,
+    trace: &SelfTrace,
+) -> Result<(), String> {
     let McsScan {
         num_points,
         dwell_time,
@@ -135,7 +145,16 @@ pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Re
                             flags: CF_DEFAULT,
                         },
                     )
-                    .map_err(|e| format!("counter_config_scan({i}) error: {e}"))?;
+                    .map_err(|e| {
+                        trace.print(
+                            TraceMask::ERROR,
+                            format_args!(
+                                "USBCTR::startMCS error calling cbCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}",
+                                e.code, e.message
+                            ),
+                        );
+                        format!("counter_config_scan({i}) error: {e}")
+                    })?;
             }
 
             let (channel, chan_type) = if i == DIGITAL_IO_COUNTER {
@@ -183,8 +202,17 @@ pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Re
 
     // Clear counter 0 output registers to prevent scaler presets from
     // interfering with MCS acquisition (matches C++ drvUSBCTR.cpp).
+    // C checks only the second load's status.
     let _ = device.counter_load(0, CRT_OUTPUT_VAL0, 0);
-    let _ = device.counter_load(0, CRT_OUTPUT_VAL1, 0xFFFFFFFF);
+    if let Err(e) = device.counter_load(0, CRT_OUTPUT_VAL1, 0xFFFFFFFF) {
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::startMCS error calling cbCLoad32, reg=OUTPUTVALREG, value=0, status={}, error={}",
+                e.code, e.message
+            ),
+        );
+    }
 
     device
         .daq_in_scan(
@@ -195,7 +223,20 @@ pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Re
             flags,
             &mut state.scan_buffer,
         )
-        .map_err(|e| format!("daq_in_scan error: {e}"))?;
+        .map_err(|e| {
+            // C passes `options, status, flags` to `options=, flags=, status=`.
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::startMCS error calling ulDaqInScan, numChans={}, numPoints={}, rate={rate:.6}, options=0x{options:x}, flags=0x{:x}, status={flags}, error={}",
+                    chan_descs.len(),
+                    max_pts,
+                    e.code,
+                    e.message
+                ),
+            );
+            format!("daq_in_scan error: {e}")
+        })?;
 
     state.running = true;
     state.acquiring = true;
@@ -203,11 +244,6 @@ pub fn start_mcs(device: &DaqDevice, state: &mut McsState, scan: &McsScan) -> Re
     state.start_time = current_time_secs();
 
     compute_times(state);
-    log::info!(
-        "MCS started: {} counters, {} points, dwell={dwell_time:.6}s, rate={rate:.0}",
-        state.num_counters_enabled,
-        max_pts
-    );
     Ok(())
 }
 
@@ -222,13 +258,11 @@ pub fn points_transferred(current_index: i64, n_chans: usize, max_points: usize)
 }
 
 /// Read MCS data from the scan buffer. Called from poller when running.
-pub fn read_mcs(device: &DaqDevice, state: &mut McsState) {
-    let (status, xfer) = match device.daq_in_scan_status() {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("MCS scan status error: {e}");
-            return;
-        }
+pub fn read_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) {
+    let polled = device.daq_in_scan_status();
+    print_get_status(trace, "readMCS", &polled);
+    let Ok((status, xfer)) = polled else {
+        return;
     };
 
     if xfer.current_total_count == 0 {
@@ -261,16 +295,22 @@ pub fn read_mcs(device: &DaqDevice, state: &mut McsState) {
         || (state.preset_real_time > 0.0 && elapsed >= state.preset_real_time);
 
     if done {
-        stop_mcs(device, state);
+        stop_mcs(device, state, trace);
         state.acquiring = false;
     }
 }
 
 /// Stop MCS acquisition.
-pub fn stop_mcs(device: &DaqDevice, state: &mut McsState) {
+pub fn stop_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) {
     if state.running {
         if let Err(e) = device.daq_in_scan_stop() {
-            log::warn!("MCS daq_in_scan_stop error: {e}");
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::stopMCS ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}",
+                    e.code, e.message
+                ),
+            );
         }
         state.running = false;
     }

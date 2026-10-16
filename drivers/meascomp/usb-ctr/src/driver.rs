@@ -4,21 +4,29 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use meascomp::device::DaqDevice;
+use uldaq_sys::UlError;
 
 use crate::mcs::{self, McsScan, McsState};
 use crate::params::*;
 use crate::poller::{self, PollerState};
-use crate::pulse_gen;
+use crate::pulse_gen::{self, PulseRequest};
 use crate::scaler::ScalerState;
+use crate::trace::SelfTrace;
 
 /// C `USBCTR::writeInt32`/`writeFloat64` resolve the counter number through
 /// `asynPortDriver::getAddress` (drvUSBCTR.cpp:1096, 1288), which maps the
 /// no-device addr -1 to 0 (asynPortDriver.cpp:1901-1913).
 fn device_addr(addr: i32) -> i32 {
     if addr == -1 { 0 } else { addr }
+}
+
+/// C's `status` from one uldaq call.
+fn status_of<T>(result: &meascomp::error::Result<T>) -> UlError {
+    result.as_ref().err().map_or(0, |e| e.code)
 }
 
 /// USB-CTR08 port driver.
@@ -72,10 +80,8 @@ impl CtrDriver {
             device.digital_port_io_type(0),
             Ok(uldaq_sys::DPIOT_IO) | Ok(uldaq_sys::DPIOT_BITIO)
         );
-        if dio_configurable
-            && let Err(e) = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT)
-        {
-            log::error!("digital_config_port error: {e}");
+        if dio_configurable {
+            let _ = device.digital_config_port(uldaq_sys::AUXPORT, uldaq_sys::DD_INPUT);
         }
 
         // Seed DIGITAL_INPUT so the bi records have a value to read at init.
@@ -88,6 +94,7 @@ impl CtrDriver {
         let state = Arc::new(Mutex::new(PollerState {
             scaler: ScalerState::new(),
             mcs: McsState::new(max_time_points),
+            trace: SelfTrace::default(),
         }));
 
         println!("CtrDriver: port={port_name}, model={product_name}, serial={uid}, fw={fw}");
@@ -113,7 +120,8 @@ impl PortDriver for CtrDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let mut last_error: Option<String> = None;
+        let mut status: UlError = 0;
+        let trace = self.state.lock().unwrap().trace.clone();
         let reason = user.reason;
         let addr = device_addr(user.addr);
 
@@ -128,7 +136,7 @@ impl PortDriver for CtrDriver {
             if running {
                 // Stop first if restarting due to parameter change
                 if reason != self.params.pulse_run {
-                    let _ = pulse_gen::stop(&dev, addr);
+                    status = status_of(&pulse_gen::stop(&trace, &dev, addr));
                 }
                 let period = self
                     .base
@@ -141,7 +149,14 @@ impl PortDriver for CtrDriver {
                 let idle = self
                     .base
                     .get_int32_param(self.params.pulse_idle_state, addr)?;
-                match pulse_gen::start(&dev, addr, period, duty, delay, count, idle) {
+                let request = PulseRequest {
+                    period,
+                    duty_cycle: duty,
+                    delay,
+                    count,
+                    idle_state: idle,
+                };
+                match pulse_gen::start(&trace, &dev, addr, &request) {
                     Ok((actual_period, actual_duty, actual_delay)) => {
                         // Write back actual values from hardware
                         let _ = self.base.set_float64_param(
@@ -160,24 +175,22 @@ impl PortDriver for CtrDriver {
                             actual_delay,
                         );
                     }
-                    Err(e) => last_error = Some(format!("pulse_gen start error: {e}")),
+                    Err(e) => status |= e.code,
                 }
-            } else if reason == self.params.pulse_run
-                && let Err(e) = pulse_gen::stop(&dev, addr)
-            {
-                last_error = Some(format!("pulse_gen stop error: {e}"));
+            } else if reason == self.params.pulse_run {
+                status = status_of(&pulse_gen::stop(&trace, &dev, addr));
             }
         } else if reason == self.params.counter_reset {
             if value != 0 {
                 let dev = self.device.lock().unwrap();
                 if let Err(e) = dev.counter_clear(addr) {
-                    last_error = Some(format!("counter_clear error: {e}"));
+                    status = e.code;
                 }
             }
         } else if reason == self.params.digital_output {
             let dev = self.device.lock().unwrap();
             if let Err(e) = dev.digital_out(uldaq_sys::AUXPORT, value as u64) {
-                last_error = Some(format!("digital_out error: {e}"));
+                status = e.code;
             }
         } else if reason == self.params.mca_start_acquire {
             let already_running = self.state.lock().unwrap().mcs.running;
@@ -202,7 +215,8 @@ impl PortDriver for CtrDriver {
                     .base
                     .get_int32_param(self.params.mcs_point0_action, 0)?
                     != 0;
-                if let Err(e) = mcs::start_mcs(
+                // C `writeInt32` ignores `startMCS`'s status; it prints its own.
+                let _ = mcs::start_mcs(
                     &dev,
                     &mut st.mcs,
                     &McsScan {
@@ -214,9 +228,8 @@ impl PortDriver for CtrDriver {
                         ext_trigger: trigger,
                         point0_no_clear,
                     },
-                ) {
-                    last_error = Some(format!("start_mcs error: {e}"));
-                }
+                    &trace,
+                );
                 self.base
                     .params
                     .set_int32(self.params.mca_acquiring, 0, 1)?;
@@ -224,7 +237,7 @@ impl PortDriver for CtrDriver {
         } else if reason == self.params.mca_stop_acquire {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
-            mcs::stop_mcs(&dev, &mut st.mcs);
+            mcs::stop_mcs(&dev, &mut st.mcs, &trace);
             st.mcs.acquiring = false;
             self.base
                 .params
@@ -234,10 +247,23 @@ impl PortDriver for CtrDriver {
             mcs::erase_mcs(&mut st.mcs);
         }
 
-        if let Some(msg) = last_error {
-            log::error!("{msg}");
-        }
         self.base.call_param_callbacks(addr)?;
+        let port = &self.base.port_name;
+        if status == 0 {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("USBCTR:writeInt32, port {port}, function={reason}, wrote {value} to address {addr}"),
+            );
+        } else {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("USBCTR:writeInt32, port {port}, function={reason}, ERROR writing {value} to address {addr}, status={status}"),
+            );
+        }
         Ok(())
     }
 
@@ -299,7 +325,8 @@ impl PortDriver for CtrDriver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let mut last_error: Option<String> = None;
+        let mut status: UlError = 0;
+        let trace = self.state.lock().unwrap().trace.clone();
         let reason = user.reason;
         let addr = device_addr(user.addr);
         self.base.params.set_float64(reason, addr, value)?;
@@ -316,7 +343,7 @@ impl PortDriver for CtrDriver {
                 != 0;
             if running {
                 let dev = self.device.lock().unwrap();
-                let _ = pulse_gen::stop(&dev, addr);
+                status = status_of(&pulse_gen::stop(&trace, &dev, addr));
                 let period = self
                     .base
                     .get_float64_param(self.params.pulse_period, addr)?;
@@ -328,7 +355,14 @@ impl PortDriver for CtrDriver {
                 let idle = self
                     .base
                     .get_int32_param(self.params.pulse_idle_state, addr)?;
-                match pulse_gen::start(&dev, addr, period, duty, delay, count, idle) {
+                let request = PulseRequest {
+                    period,
+                    duty_cycle: duty,
+                    delay,
+                    count,
+                    idle_state: idle,
+                };
+                match pulse_gen::start(&trace, &dev, addr, &request) {
                     Ok((actual_period, actual_duty, actual_delay)) => {
                         let _ = self.base.set_float64_param(
                             self.params.pulse_period,
@@ -346,15 +380,30 @@ impl PortDriver for CtrDriver {
                             actual_delay,
                         );
                     }
-                    Err(e) => last_error = Some(format!("pulse_gen restart error: {e}")),
+                    Err(e) => status |= e.code,
                 }
             }
         }
 
-        if let Some(msg) = last_error {
-            log::error!("{msg}");
-        }
         self.base.call_param_callbacks(addr)?;
+        let port = &self.base.port_name;
+        if status == 0 {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!(
+                    "USBCTR:writeFloat64, port {port}, wrote {value:.6} to address {addr}"
+                ),
+            );
+        } else {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("USBCTR:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}"),
+            );
+        }
         Ok(())
     }
 
@@ -364,7 +413,7 @@ impl PortDriver for CtrDriver {
         value: u32,
         mask: u32,
     ) -> AsynResult<()> {
-        let mut last_error: Option<String> = None;
+        let mut status: UlError = 0;
         let reason = user.reason;
         let addr = user.addr;
 
@@ -376,38 +425,54 @@ impl PortDriver for CtrDriver {
                     if let Err(e) =
                         dev.digital_bit_out(uldaq_sys::AUXPORT, bit as i32, bit_val != 0)
                     {
-                        last_error = Some(format!("digital_bit_out error: {e}"));
+                        status = e.code;
                     }
                 }
             }
-        } else if reason == self.params.digital_direction {
-            if !self.dio_configurable {
-                last_error =
-                    Some("digital direction is fixed on this model; ignoring write".to_string());
-            } else {
-                let dev = self.device.lock().unwrap();
-                for bit in 0..NUM_IO_BITS {
-                    if mask & (1 << bit) != 0 {
-                        let dir = if (value >> bit) & 1 != 0 {
-                            uldaq_sys::DD_OUTPUT
-                        } else {
-                            uldaq_sys::DD_INPUT
-                        };
-                        if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir)
-                        {
-                            last_error = Some(format!("digital_config_bit error: {e}"));
-                        }
+        } else if reason == self.params.digital_direction && self.dio_configurable {
+            let dev = self.device.lock().unwrap();
+            for bit in 0..NUM_IO_BITS {
+                if mask & (1 << bit) != 0 {
+                    let dir = if (value >> bit) & 1 != 0 {
+                        uldaq_sys::DD_OUTPUT
+                    } else {
+                        uldaq_sys::DD_INPUT
+                    };
+                    if let Err(e) = dev.digital_config_bit(uldaq_sys::AUXPORT, bit as i32, dir) {
+                        status = e.code;
                     }
                 }
             }
         }
 
         self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+        // C's last loop pass leaves `outValue` at bit NUM_IO_BITS-1 of `value`.
+        let out_value = if reason == self.params.digital_output {
+            (value >> (NUM_IO_BITS - 1)) & 1
+        } else {
+            0
+        };
+        let direction = self
+            .base
+            .get_uint32_param(self.params.digital_direction, 0)?;
 
-        if let Some(msg) = last_error {
-            log::error!("{msg}");
-        }
         self.base.call_param_callbacks(addr)?;
+        let port = &self.base.port_name;
+        if status == 0 {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("USBCTR:writeUInt32Digital, port {port}, wrote outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}"),
+            );
+        } else {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!("USBCTR:writeUInt32Digital, port {port}, ERROR writing outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}, status={status}"),
+            );
+        }
         Ok(())
     }
 }
@@ -446,6 +511,11 @@ pub fn create_usb_ctr(
     let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the USB-CTR port runtime: {e}"))?;
 
+    state
+        .lock()
+        .unwrap()
+        .trace
+        .bind(runtime_handle.port_handle().clone());
     let poller_handle = poller::start_poller(
         runtime_handle.port_handle().clone(),
         params,
