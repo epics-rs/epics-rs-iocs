@@ -48,9 +48,13 @@ pub(crate) fn start_udp_listener(
         .name("PixiradUDPDataTask".into())
         .spawn(move || {
             let trace_error = |message: &str| {
-                handle
-                    .trace()
-                    .output(handle.port_name(), TraceMask::ERROR, message);
+                handle.trace().output_device(
+                    handle.port_name(),
+                    Some(0),
+                    0,
+                    TraceMask::ERROR,
+                    message,
+                );
             };
             if rcvbuf != MAX_UDP_DATA_BUFFER {
                 trace_error(&format!(
@@ -152,8 +156,10 @@ async fn data_loop(ctx: DataContext) {
         ctx.shared.queued_frames.fetch_sub(1, Ordering::AcqRel);
 
         if frame.align_errors {
-            ctx.handle.trace().output(
+            ctx.handle.trace().output_device(
                 ctx.handle.port_name(),
+                Some(0),
+                0,
                 TraceMask::ERROR,
                 "pixirad:dataTask: frame has alignment errors",
             );
@@ -317,6 +323,15 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
     });
 
     array.unique_id = unique_id;
+    // C: timeStamp is the first colour's startTime, epicsTS the port's
+    // updateTimeStamp (pixirad.cpp:1063-1064).
+    let epics_ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
+    array.timestamp = epics_ts;
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
 
@@ -338,12 +353,12 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
                 ParamSetValue::new(
                     ctx.ad_params.base.epics_ts_sec,
                     0,
-                    ParamValue::Int32(ts.sec as i32),
+                    ParamValue::Int32(epics_ts.sec as i32),
                 ),
                 ParamSetValue::new(
                     ctx.ad_params.base.epics_ts_nsec,
                     0,
-                    ParamValue::Int32(ts.nsec as i32),
+                    ParamValue::Int32(epics_ts.nsec as i32),
                 ),
             ],
         )
@@ -364,9 +379,13 @@ pub(crate) struct StatusContext {
 
 impl StatusContext {
     fn trace_error(&self, message: &str) {
-        self.handle
-            .trace()
-            .output(self.handle.port_name(), TraceMask::ERROR, message);
+        self.handle.trace().output_device(
+            self.handle.port_name(),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            message,
+        );
     }
 }
 

@@ -6,8 +6,9 @@
 //! parameter access run on [`Mar345Driver`], inline or through the worker's
 //! `task::Held`, and the worker reads with the hold released.
 
-use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::request::{RequestOp, RequestResult};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -27,6 +28,16 @@ pub(crate) fn classify(err: &AsynError) -> CamStatus {
         } => CamStatus::Timeout,
         _ => CamStatus::Error,
     }
+}
+
+/// One request on C `pasynUserServer`, which has no port when the startup
+/// script named a marServer port that does not exist: then it fails.
+pub(crate) fn server_submit(
+    server: &SyncIOHandle,
+    op: RequestOp,
+    user: AsynUser,
+) -> AsynResult<RequestResult> {
+    server.port()?.submit_blocking(op, user)
 }
 
 impl Mar345Driver {
@@ -100,14 +111,17 @@ impl Mar345Driver {
     /// C `writeServer`: flush stale input, write with `MAR345_SOCKET_TIMEOUT`,
     /// then publish the command on `ADStringToServer`.
     pub fn write_server(&mut self, output: &str) -> CamStatus {
-        let _ = self
-            .server
-            .submit_blocking(RequestOp::Flush, AsynUser::default().with_addr(SERVER_ADDR));
+        let _ = server_submit(
+            &self.server,
+            RequestOp::Flush,
+            AsynUser::default().with_addr(SERVER_ADDR),
+        );
 
         let user = AsynUser::default()
             .with_addr(SERVER_ADDR)
             .with_timeout(secs(MAR345_SOCKET_TIMEOUT));
-        let status = match self.server.submit_blocking(
+        let status = match server_submit(
+            &self.server,
             RequestOp::OctetWrite {
                 data: output.as_bytes().to_vec(),
             },
@@ -116,10 +130,10 @@ impl Mar345Driver {
             Ok(_) => CamStatus::Success,
             Err(e) => {
                 // On pasynUserServer, so the server port's trace mask gates it.
-                self.server.trace().output(
-                    self.server.port_name(),
+                self.server.print(
+                    0,
                     TraceMask::ERROR,
-                    &format!(
+                    format_args!(
                         "mar345:writeServer, status={}, sent\n{output}",
                         e.status() as i32
                     ),

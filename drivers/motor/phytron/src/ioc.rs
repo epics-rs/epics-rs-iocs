@@ -6,8 +6,7 @@
 //! adds axis `module*10 + index`, which records address as
 //! `@asyn(controllerName,module*10+index)`. The controller is looked up by
 //! name from a registry shared by the three commands (the C `controllers_`
-//! list). Both port kinds (`drvAsynIPPort` / `drvAsynSerialPort`) work, so
-//! `connect_ip` is used (the lookup is transport-agnostic).
+//! list). Both port kinds (`drvAsynIPPort` / `drvAsynSerialPort`) work.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,7 +15,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::connect_ip;
+use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
@@ -162,16 +161,23 @@ fn register_controller(
             "{cmd_name}: controller '{name}' already registered"
         ));
     }
-    let handle = connect_ip(
+    register_port(ctx, &name, PHYTRON_PORT_AXES)?;
+    // C leaves a controller that misses its port out of the list
+    // phytronCreateAxis searches, and skips the reset; its port stays.
+    let (handle, connected) = connect_controller(
         &asyn_port,
         Duration::from_millis(timeout_ms.max(0.0) as u64),
-    )?;
+        &name,
+        format_args!("phytronController::phytronController: cannot connect to phytron controller"),
+    );
+    if connected.is_err() {
+        return Ok(CommandOutcome::Continue);
+    }
     let controller = PhytronController::new(handle, ctrl_type, address);
     if reset_at_boot {
-        controller.reset_at_boot();
+        controller.reset_at_boot(&name);
     }
     let controller = Arc::new(Mutex::new(controller));
-    register_port(ctx, &name, PHYTRON_PORT_AXES)?;
     registry_lock(registry).insert(
         name.clone(),
         ControllerReg {

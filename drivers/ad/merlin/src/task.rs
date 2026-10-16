@@ -256,7 +256,7 @@ pub(crate) async fn handle_frame(
 fn trace(handle: &PortHandle, msg: &str) {
     handle
         .trace()
-        .output(handle.port_name(), TraceMask::ERROR, msg);
+        .output_device(handle.port_name(), Some(0), 0, TraceMask::ERROR, msg);
 }
 
 async fn set_status_message(ctx: &AcquisitionContext, msg: &str) {

@@ -21,15 +21,20 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::{claim_port, get_port};
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 use epics_rs::motor::trace::MotorTrace;
-use motor_common::connect::{EosConnectError, EosRefusal, connect_serial, connect_with_eos};
+use motor_common::connect::{
+    EosConnectError, EosRefusal, connect_controller, connect_serial, connect_with_eos,
+};
 use motor_common::iocsh::{
     arg_double_opt, arg_double_req, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double,
     opt_int, opt_string, poll_intervals, req_double, req_string,
@@ -46,7 +51,7 @@ use crate::conex::ConexAxis;
 use crate::esp300::{self, Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
-use crate::mm4000::{self, Mm4000Axis, Mm4000Controller};
+use crate::mm4000::{self, Mm4000Axis, Mm4000Controller, Mm4000Refusal};
 use crate::pm500::{Pm500Axis, Pm500Controller};
 use crate::pmnc::{PmncAxis, PmncController};
 use crate::smc100::Smc100Axis;
@@ -183,14 +188,20 @@ pub fn smc100_create_controller_command() -> CommandDef {
             }
 
             register_port(ctx, &port_name, num_axes)?;
-            if get_port(&serial_port).is_none() {
-                eprintln!(
+            let (handle, _) = connect_controller(
+                &serial_port,
+                SMC100_TIMEOUT,
+                &port_name,
+                format_args!(
                     "SMC100Controller::SMC100Controller: cannot connect to SMC100 controller"
-                );
-                return Ok(CommandOutcome::Continue);
-            }
+                ),
+            );
+            // C builds every axis on pasynUserController_, connected or not.
+            let mut controller_user = Some(handle);
             for axis in 0..num_axes {
-                let handle = connect_serial(&serial_port, SMC100_TIMEOUT)?;
+                let handle = controller_user.take().unwrap_or_else(|| {
+                    SyncIOHandle::connect_port(&serial_port, 0, SMC100_TIMEOUT).0
+                });
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Smc100Axis::new(
                     handle,
                     (axis + 1) as u8,
@@ -235,13 +246,20 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             register_port(ctx, &port_name, 1)?;
-            let Ok(handle) = connect_serial(&serial_port, CONEX_TIMEOUT) else {
-                eprintln!(
+            // C returns from the constructor here: the port has no axis.
+            let (handle, connected) = connect_controller(
+                &serial_port,
+                CONEX_TIMEOUT,
+                &port_name,
+                format_args!(
                     "AG_CONEXController::AG_CONEXController: cannot connect to CONEX controller"
-                );
+                ),
+            );
+            if connected.is_err() {
                 return Ok(CommandOutcome::Continue);
-            };
-            let Some(axis) = ConexAxis::new(handle, controller_id) else {
+            }
+            let Some(axis) = ConexAxis::new(handle, controller_id, &MotorTrace::new(&port_name, 0))
+            else {
                 return Ok(CommandOutcome::Continue);
             };
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
@@ -272,13 +290,21 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             register_port(ctx, &port_name, agap::NUM_AXES as i32)?;
-            let Ok(handle) = connect_serial(&serial_port, AGAP_TIMEOUT) else {
-                eprintln!(
+            // C returns from the constructor here: the port has no axes.
+            let (handle, connected) = connect_controller(
+                &serial_port,
+                AGAP_TIMEOUT,
+                &port_name,
+                format_args!(
                     "AGAP_CONEXController::AGAP_CONEXController: cannot connect to CONEX controller"
-                );
+                ),
+            );
+            if connected.is_err() {
                 return Ok(CommandOutcome::Continue);
-            };
-            let Some(controller) = AgapController::new(handle, controller_id) else {
+            }
+            let Some(controller) =
+                AgapController::new(handle, controller_id, MotorTrace::new(&port_name, 0))
+            else {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
@@ -299,11 +325,10 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
 }
 
 /// A controller `AG_UCCreateController` made, for `AG_UCCreateAxis` to find
-/// by port name: `None` when its serial port could not be connected, as C's
-/// constructor then carries on without it.
+/// by port name.
 struct AgUcRegistration {
     port_name: String,
-    controller: Option<Arc<Mutex<AgUcController>>>,
+    controller: Arc<Mutex<AgUcController>>,
     moving_poll_ms: u64,
     idle_poll_ms: u64,
 }
@@ -330,15 +355,20 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             register_port(ctx, &port_name, c_int(args, 2))?;
-            let controller = match connect_serial(&serial_port, AG_UC_TIMEOUT) {
-                Ok(handle) => Some(Arc::new(Mutex::new(AgUcController::new(handle)))),
-                Err(_) => {
-                    eprintln!(
-                        "AG_UCController::AG_UCController: cannot connect to Agilis controller"
-                    );
-                    None
-                }
-            };
+            // C goes on to RS/MR/VE on the unconnected user; VE then fails and
+            // the controller is left without a poller.
+            let (handle, _) = connect_controller(
+                &serial_port,
+                AG_UC_TIMEOUT,
+                &port_name,
+                format_args!(
+                    "AG_UCController::AG_UCController: cannot connect to Agilis controller"
+                ),
+            );
+            let controller = Arc::new(Mutex::new(AgUcController::new(
+                handle,
+                &MotorTrace::new(&port_name, 0),
+            )));
             AG_UC_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -377,9 +407,6 @@ pub fn ag_uc_create_axis_command() -> CommandDef {
                     return Ok(CommandOutcome::Continue);
                 };
                 (reg.controller.clone(), reg.moving_poll_ms, reg.idle_poll_ms)
-            };
-            let Some(controller) = controller else {
-                return Ok(CommandOutcome::Continue);
             };
             let ax = AgUcAxis::new(
                 controller,
@@ -1652,13 +1679,17 @@ pub fn mm3000_setup_command() -> CommandDef {
 /// controller's `RC` reports, including the trailing `unused` slot C counts.
 pub fn mm3000_config_command() -> CommandDef {
     model1_config_command("MM3000Config", &MM3000, |ctx, card, port| {
-        let handle = connect_serial(port, MM3000_TIMEOUT)?;
-        let controller = Mm3000Controller::new(handle).map_err(|e| format!("MM3000Config: {e}"))?;
+        // C drops a card it cannot connect to without a word.
+        let Ok(handle) = connect_serial(port, MM3000_TIMEOUT) else {
+            return Ok(());
+        };
+        let Some(controller) = Mm3000Controller::new(handle) else {
+            return Ok(());
+        };
         let num_axes = controller.axis_types().len();
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let ax = Mm3000Axis::new(controller.clone(), axis)
-                .map_err(|e| format!("MM3000Config: axis {axis}: {e}"))?;
+            let ax = Mm3000Axis::new(controller.clone(), axis);
             MM3000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
@@ -1686,9 +1717,9 @@ pub fn mm4000_setup_command() -> CommandDef {
             let num_cards = c_int(args, 0);
             if !(1..=MM4000_NUM_CARDS).contains(&num_cards) {
                 std::thread::sleep(Duration::from_secs(5));
-                eprintln!(
-                    "\n*** ERROR *** Number specified ({num_cards}) exceeds maximum allowed ({MM4000_NUM_CARDS}).\n"
-                );
+                errlog_vprintf(format_args!(
+                    "\n*** ERROR *** Number specified ({num_cards}) exceeds maximum allowed ({MM4000_NUM_CARDS}).\n\n"
+                ));
                 std::thread::sleep(Duration::from_secs(5));
             }
             MM4000.setup(num_cards, c_int(args, 1));
@@ -1698,20 +1729,31 @@ pub fn mm4000_setup_command() -> CommandDef {
 }
 
 /// `MM4000Config(card, name, addr)`: one signal per axis the controller's
-/// `TP;` reports.
+/// `TH;` reports.
 pub fn mm4000_config_command() -> CommandDef {
     model1_config_command("MM4000Config", &MM4000, |ctx, card, port| {
-        let handle = connect_serial(port, MM4000_TIMEOUT)?;
+        // C drops a card it cannot connect to without a word.
+        let Ok(handle) = connect_serial(port, MM4000_TIMEOUT) else {
+            return Ok(());
+        };
         // Six per-axis polls share one controller-wide exchange: cache for
         // half the default scan period.
         let cache_ttl = Duration::from_millis(1000 / SCAN_RATE as u64 / 2);
-        let Some(controller) = Mm4000Controller::new(handle, port, port, 0, cache_ttl) else {
-            return Ok(());
+        let controller = match Mm4000Controller::new_model1(handle, port, cache_ttl) {
+            Ok(controller) => controller,
+            Err(Mm4000Refusal::InvalidModel(ident)) => {
+                errlog_vprintf(format_args!(
+                    "drvMM4000.c:motor_init() - invalid model = {ident}\n"
+                ));
+                return Ok(());
+            }
+            Err(_) => return Ok(()),
         };
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
+            let mut ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
+            ax.model1_set_status();
             MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
@@ -1786,10 +1828,25 @@ pub fn mm4000_asyn_config_command() -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-            let Some(controller) =
-                Mm4000Controller::new(handle, &port_name, &port_name, num_axes as usize, cache_ttl)
-            else {
-                return Ok(CommandOutcome::Continue);
+            let controller = match Mm4000Controller::new(
+                handle,
+                &port_name,
+                &port_name,
+                num_axes as usize,
+                cache_ttl,
+            ) {
+                Ok(controller) => controller,
+                Err(Mm4000Refusal::NoAnswer) => return Ok(CommandOutcome::Continue),
+                Err(Mm4000Refusal::InvalidModel(firmware)) => {
+                    println!("MM4000AsynConfig: invalid model = {firmware}");
+                    return Ok(CommandOutcome::Continue);
+                }
+                Err(Mm4000Refusal::TooFewAxes { total_axes }) => {
+                    println!(
+                        "MM4000AsynConfig: actual number of axes={total_axes} < numAxes={num_axes}"
+                    );
+                    return Ok(CommandOutcome::Continue);
+                }
             };
             let controller = Arc::new(Mutex::new(controller));
             let axes = (1..=num_axes as usize)
@@ -1833,8 +1890,7 @@ pub fn pm500_config_command() -> CommandDef {
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for index in 0..num_axes {
-            let ax = Pm500Axis::new(controller.clone(), index)
-                .map_err(|e| format!("PM500Config: axis {index}: {e}"))?;
+            let ax = Pm500Axis::new(controller.clone(), index);
             PM500.install(ctx, card, index as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
@@ -1855,26 +1911,37 @@ pub fn esp300_setup_command() -> CommandDef {
 /// finds (stop each axis until "axis number out of range").
 pub fn esp300_config_command() -> CommandDef {
     model1_config_command("ESP300Config", &ESP300, |ctx, card, port| {
-        let handle = connect_with_eos(
+        const ERRMSG: &str = "drvESP300.c:motor_init: ASYN";
+        let handle = match connect_with_eos(
             port,
             ESP300_TIMEOUT,
             esp300::INPUT_EOS,
             esp300::OUTPUT_EOS,
             EosRefusal::InputFatal,
-        )
-        .map_err(|e| match e {
-            EosConnectError::InputEos(_, e) => format!(
-                "drvESP300.c:motor_init: ASYN setInputEos error = {}",
-                e.status() as i32
-            ),
-            e => e.into(),
-        })?;
-        let controller = Esp300Controller::new(handle).map_err(|e| format!("ESP300Config: {e}"))?;
+        ) {
+            Ok(handle) => handle,
+            Err(EosConnectError::InputEos(_, e)) => {
+                errlog_vprintf(format_args!(
+                    "{ERRMSG} setInputEos error = {}\n",
+                    e.status() as i32
+                ));
+                return Ok(());
+            }
+            Err(_) => {
+                errlog_vprintf(format_args!(
+                    "{ERRMSG} connect error = {}\n",
+                    AsynStatus::Error as i32
+                ));
+                return Ok(());
+            }
+        };
+        let Some(controller) = Esp300Controller::new(handle) else {
+            return Ok(());
+        };
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let ax = Esp300Axis::new(controller.clone(), axis)
-                .map_err(|e| format!("ESP300Config: axis {axis}: {e}"))?;
+            let ax = Esp300Axis::new(controller.clone(), axis);
             ESP300.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())

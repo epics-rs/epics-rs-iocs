@@ -110,9 +110,9 @@ pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<Stri
 }
 
 pub struct PmacController {
-    /// `None` when the low-level port refused the connect or an EOS set: C
-    /// keeps the controller with a NULL `lowLevelPortUser_` and every command
-    /// fails.
+    /// `None` when the low-level port refused an EOS set: C keeps the
+    /// controller with a NULL `lowLevelPortUser_` and every command fails. A
+    /// missing port keeps its unconnected user, which refuses every transfer.
     handle: Option<SyncIOHandle>,
     /// Axes created with `pmacCreateAxis`/`pmacCreateAxes` (1-based; address 0
     /// is reserved for controller parameters in C and is never an axis).

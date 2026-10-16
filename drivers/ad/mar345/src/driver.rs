@@ -5,15 +5,16 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -43,8 +44,9 @@ pub struct Mar345Driver {
     abort: Arc<Event>,
     /// C `mar345Mode_t mode`, shared with the worker.
     mode: Arc<AtomicI32>,
-    /// C `pasynUserServer`: the marServer octet port.
-    pub(crate) server: PortHandle,
+    /// C `pasynUserServer`: the user of the marServer octet port, shared with
+    /// the worker.
+    pub(crate) server: Arc<SyncIOHandle>,
     /// C `pData` (mar345.cpp:741-747): allocated once and never read, so it
     /// stays charged on the pool for the driver's life.
     _raw_buffer: Option<DriverArray>,
@@ -56,7 +58,7 @@ struct DriverLinks {
     stop: Arc<Event>,
     abort: Arc<Event>,
     mode: Arc<AtomicI32>,
-    server: PortHandle,
+    server: Arc<SyncIOHandle>,
 }
 
 impl Mar345Driver {
@@ -245,18 +247,16 @@ impl Mar345Runtime {
 
 /// C `mar345Config`.
 ///
-/// `server_port` must already exist (`drvAsynIPPortConfigure`), because C
-/// connects to it with `pasynOctetSyncIO->connect` in the constructor.
+/// C connects to `server_port` with `pasynOctetSyncIO->connect` in the
+/// constructor and ignores the status (mar345.cpp:740): a port that does not
+/// exist leaves a user whose every marServer exchange fails.
 pub fn create_mar345_detector(
     claim: &PortClaim,
     server_port: &str,
     max_memory: usize,
 ) -> Result<Mar345Runtime, String> {
     let port_name = claim.name();
-    let server_entry = get_port(server_port).ok_or_else(|| {
-        format!("marServer port '{server_port}' not found (call drvAsynIPPortConfigure first)")
-    })?;
-    let server_handle = server_entry.handle.clone();
+    let server_handle = Arc::new(SyncIOHandle::connect_port(server_port, 0, Duration::ZERO).0);
 
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
@@ -350,9 +350,9 @@ pub(crate) mod tests {
         log
     }
 
-    /// The fake server port `{name}_IP`.
-    pub(crate) fn server_handle(name: &str) -> PortHandle {
-        get_port(&format!("{name}_IP")).unwrap().handle.clone()
+    /// The user of the fake server port `{name}_IP`.
+    pub(crate) fn server_user(name: &str) -> SyncIOHandle {
+        SyncIOHandle::connect_port(&format!("{name}_IP"), 0, Duration::ZERO).0
     }
 
     /// A driver on a fake server, outside any port runtime.
@@ -366,7 +366,7 @@ pub(crate) mod tests {
                 stop: Arc::new(Event::new()),
                 abort: Arc::new(Event::new()),
                 mode: Arc::new(AtomicI32::new(0)),
-                server: server_handle(name),
+                server: Arc::new(server_user(name)),
             },
         )
         .unwrap()
@@ -436,5 +436,17 @@ pub(crate) mod tests {
     fn a_pool_without_room_for_the_raw_buffer_still_builds_the_driver() {
         let d = driver("MAR345_RAW_REFUSED", 1000);
         assert_eq!(d.ad.pool.num_alloc_buffers(), 0);
+    }
+
+    /// C ignores the marServer `pasynOctetSyncIO->connect` status
+    /// (mar345.cpp:740): with no server port configured the detector port
+    /// still exists.
+    #[test]
+    fn a_detector_whose_server_port_is_missing_still_boots() {
+        let rt = create_mar345_detector(&claim_port("MAR345_NONE").unwrap(), "MAR345_NONE_SRV", 0)
+            .expect("the detector port");
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        sync.write_int32(rt.ad_params.num_images, 3).unwrap();
+        assert_eq!(sync.read_int32(rt.ad_params.num_images).unwrap(), 3);
     }
 }

@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex};
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use crate::util::{leading_hex, parse_value_at};
 
@@ -94,22 +96,28 @@ pub struct AgapController {
     controller_id: i32,
     /// Firmware string from `VE` (C `controllerVersion_`).
     version: String,
+    /// C `pasynUserSelf`, which the axes print on too.
+    trace: MotorTrace,
 }
 
 impl AgapController {
     /// Connect and identify an AGAP controller: read the firmware version
     /// (`VE`). Performs blocking serial I/O. `None` when `VE` fails, where C
     /// returns before creating the axes or the poller.
-    pub fn new(handle: SyncIOHandle, controller_id: i32) -> Option<Self> {
+    pub fn new(handle: SyncIOHandle, controller_id: i32, trace: MotorTrace) -> Option<Self> {
         let mut ctrl = Self {
             handle,
             controller_id,
             version: String::new(),
+            trace,
         };
         // C reads `&inString_[4]` for the VE reply.
         let Ok(version_resp) = ctrl.write_read(&format!("{controller_id}VE")) else {
-            eprintln!(
-                "AGAP_CONEXController::AGAP_CONEXController: cannot read version information from AGAP_CONEX controller"
+            ctrl.trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "AGAP_CONEXController::AGAP_CONEXController: cannot read version information from AGAP_CONEX controller\n"
+                ),
             );
             return None;
         };
@@ -165,9 +173,12 @@ impl AgapAxis {
                 let _ = ctrl.write_read(&format!("{id}SL{axis_name}?"));
                 let _ = ctrl.write_read(&format!("{id}SR{axis_name}?"));
             } else {
-                eprintln!(
-                    "AGAP_CONEXAxis::AGAP_CONEXAxis: unknown model, firmware string={}",
-                    ctrl.version
+                ctrl.trace.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "AGAP_CONEXAxis::AGAP_CONEXAxis: unknown model, firmware string={}\n",
+                        ctrl.version
+                    ),
                 );
             }
         }

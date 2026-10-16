@@ -13,9 +13,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::motor::trace::MotorTrace;
 
-use motor_common::connect::{EosRefusal, connect_serial, connect_with_eos};
+use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
 use motor_common::{asyn_user, install, register_port};
@@ -66,21 +68,19 @@ pub fn mcs2_create_controller_command() -> CommandDef {
             let unused_mask = c_int(args, 5);
 
             register_port(ctx, &port_name, num_axes)?;
-            let Ok(handle) = connect_with_eos(
+            let (handle, _) = connect_controller(
                 &mcs2_port,
                 MCS2_TIMEOUT,
-                mcs2::INPUT_EOS,
-                mcs2::OUTPUT_EOS,
-                EosRefusal::Ignored,
-            ) else {
-                eprintln!(
+                &port_name,
+                format_args!(
                     "SmarActMCS2MotorDriver:MCS2Controller: cannot connect to MCS2 controller"
-                );
-                return Ok(CommandOutcome::Continue);
-            };
-            let controller = Arc::new(Mutex::new(
-                Mcs2Controller::new(handle).map_err(|e| format!("MCS2CreateController: {e}"))?,
-            ));
+                ),
+            );
+            set_eos_ignored(&handle, mcs2::INPUT_EOS, mcs2::OUTPUT_EOS);
+            let controller = Arc::new(Mutex::new(Mcs2Controller::new(
+                handle,
+                &MotorTrace::new(&port_name, 0),
+            )));
             for axis in 0..num_axes {
                 if unused_mask & (1 << axis) != 0 {
                     continue;
@@ -100,11 +100,11 @@ pub fn mcs2_create_controller_command() -> CommandDef {
     )
 }
 
-/// A controller `smarAct{SCU,MCS}CreateController` made: `None` when its I/O
-/// port could not be connected, as C's constructor then carries on without it.
+/// A controller `smarAct{SCU,MCS}CreateController` made, connected to its I/O
+/// port or not, as C's constructor carries on either way.
 struct Registered<C> {
     port_name: String,
-    controller: Option<Arc<Mutex<C>>>,
+    controller: Arc<Mutex<C>>,
     moving_poll_ms: u64,
     idle_poll_ms: u64,
     axes: BTreeSet<i32>,
@@ -135,27 +135,23 @@ fn create_axis_args() -> Vec<ArgDesc> {
     ]
 }
 
-/// Register `port_name` and its controller, or print C's connect refusal:
-/// the asynPrint and the `THROW_` that, with exceptions off, only prints.
+/// Register `port_name`, then connect its controller on it, as C's
+/// asynMotorController base constructor runs before the driver's own.
 fn register<C>(
     ctx: &CommandContext,
     registry: &Registry<C>,
     args: &[ArgValue],
-    controller: Option<C>,
-    refusal: (&str, &str),
+    connect: impl FnOnce(&str) -> C,
 ) -> Result<(), String> {
     let port_name = req_string(args, 0, "Port name [string]")?;
     register_port(ctx, &port_name, c_int(args, 2))?;
-    if controller.is_none() {
-        eprintln!("{}", refusal.0);
-        println!("{}", refusal.1);
-    }
+    let controller = connect(&port_name);
     registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push(Registered {
             port_name,
-            controller: controller.map(|c| Arc::new(Mutex::new(c))),
+            controller: Arc::new(Mutex::new(controller)),
             moving_poll_ms: period_ms(args, 3),
             idle_poll_ms: period_ms(args, 4),
             axes: BTreeSet::new(),
@@ -171,7 +167,7 @@ fn create_axis<C>(
     duplicate: &str,
     args: &[ArgValue],
     ctx: &CommandContext,
-    build: impl FnOnce(Arc<Mutex<C>>, i32, i32) -> Result<Arc<Mutex<dyn AsynMotor>>, String>,
+    build: impl FnOnce(Arc<Mutex<C>>, i32, i32) -> Arc<Mutex<dyn AsynMotor>>,
 ) -> Result<(), String> {
     let controller_port = req_string(args, 0, "Controller Port name [string]")?;
     let axis = c_int(args, 1);
@@ -185,10 +181,8 @@ fn create_axis<C>(
         println!("{duplicate} failed:axis {axis} already exists");
         return Ok(());
     }
-    let Some(controller) = reg.controller.clone() else {
-        return Ok(());
-    };
-    let motor = build(controller, axis, channel).map_err(|e| format!("{command}: {e}"))?;
+    let controller = reg.controller.clone();
+    let motor = build(controller, axis, channel);
     install(
         ctx,
         asyn_user(&controller_port, axis),
@@ -208,19 +202,23 @@ pub fn scu_create_controller_command() -> CommandDef {
          idlePollPeriod)",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let io_port = req_string(args, 1, "I/O port name [string]")?;
-            let controller = connect_serial(&io_port, SCU_TIMEOUT)
-                .ok()
-                .map(ScuController::new);
-            register(
-                ctx,
-                &SCU_CONTROLLERS,
-                args,
-                controller,
-                (
-                    "SmarActSCUController:SmarActSCUController: cannot connect to SCU controller",
-                    "SmarActSCUController: unable to connect serial channel",
-                ),
-            )?;
+            register(ctx, &SCU_CONTROLLERS, args, |port_name| {
+                let (handle, connected) = connect_controller(
+                    &io_port,
+                    SCU_TIMEOUT,
+                    port_name,
+                    format_args!(
+                        "SmarActSCUController:SmarActSCUController: cannot connect to SCU controller"
+                    ),
+                );
+                // C's THROW_ without ASYN_CANDO_EXCEPTIONS: an epicsPrintf, and on.
+                if connected.is_err() {
+                    errlog_vprintf(format_args!(
+                        "SmarActSCUController: unable to connect serial channel\n"
+                    ));
+                }
+                ScuController::new(handle)
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -241,9 +239,14 @@ pub fn scu_create_axis_command() -> CommandDef {
                 args,
                 ctx,
                 |controller, axis, channel| {
-                    let ax = ScuAxis::new(controller, channel, &port, axis)
-                        .map_err(|e| e.to_string())?;
-                    Ok(Arc::new(Mutex::new(ax)))
+                    let (ax, probed) = ScuAxis::new(controller, channel, &port, axis);
+                    if let Err(e) = probed {
+                        errlog_vprintf(format_args!(
+                            "SmarActSCUAxis::SmarActSCUAxis -- channel {axis} ASYN error {}\n",
+                            e.status() as i32
+                        ));
+                    }
+                    Arc::new(Mutex::new(ax))
                 },
             )?;
             Ok(CommandOutcome::Continue)
@@ -266,30 +269,15 @@ pub fn mcs_create_controller_command() -> CommandDef {
             let io_port = req_string(args, 1, "I/O port name [string]")?;
             let disable_speed = c_int(args, 5) != 0;
             if disable_speed {
-                println!(
+                errlog_vprintf(format_args!(
                     "SmarActMCSController({port_name}): WARNING - The speed set commands have \
-                     been disabled for this controller"
-                );
+                     been disabled for this controller\n"
+                ));
             }
-            let controller = connect_with_eos(
-                &io_port,
-                MCS_TIMEOUT,
-                mcs::INPUT_EOS,
-                mcs::OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )
-            .ok()
-            .map(|handle| McsController::new(handle, disable_speed));
-            register(
-                ctx,
-                &MCS_CONTROLLERS,
-                args,
-                controller,
-                (
-                    "SmarActMCSController:SmarActMCSController: cannot connect to MCS controller",
-                    "SmarActMCSController: unable to connect serial channel",
-                ),
-            )?;
+            register(ctx, &MCS_CONTROLLERS, args, |port_name| {
+                let link = mcs::connect_link(port_name, &io_port, MCS_TIMEOUT);
+                McsController::new(link, disable_speed)
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -308,9 +296,15 @@ pub fn mcs_create_axis_command() -> CommandDef {
                 "SmarActMCSCreateAxis",
                 args,
                 ctx,
-                |controller, _axis, channel| {
-                    let ax = McsAxis::new(controller, channel).map_err(|e| e.to_string())?;
-                    Ok(Arc::new(Mutex::new(ax)))
+                |controller, axis, channel| {
+                    let (ax, probed) = McsAxis::new(controller, channel);
+                    if let Err(e) = probed {
+                        errlog_vprintf(format_args!(
+                            "SmarActMCSAxis::SmarActMCSAxis -- channel {axis} ASYN error {}\n",
+                            e.status() as i32
+                        ));
+                    }
+                    Arc::new(Mutex::new(ax))
                 },
             )?;
             Ok(CommandOutcome::Continue)

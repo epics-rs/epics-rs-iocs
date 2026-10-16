@@ -35,6 +35,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::util::{atof, is_unsolicited_limit_error, nint};
 
@@ -88,9 +89,9 @@ pub enum AxisType {
 /// Parse the `RC` reply, e.g. `"1=stepper1.5M 2=dc 3=unused"` (C
 /// `motor_init` strtok loop): each `=`-separated segment's first
 /// space-delimited word is an axis type; `unused` ends the scan but is still
-/// counted. An unrecognized word is reported and counted as [`AxisType::
-/// Unused`] (C leaves the slot uninitialized and keeps going — the
-/// deterministic port choice is the inert type).
+/// counted. An unrecognized word is errlogged as C does and counted as
+/// [`AxisType::Unused`] (C leaves the slot uninitialized and keeps going —
+/// the deterministic port choice is the inert type).
 fn parse_rc_types(reply: &str) -> Vec<AxisType> {
     let mut types = Vec::new();
     for segment in reply.split('=').skip(1) {
@@ -103,7 +104,9 @@ fn parse_rc_types(reply: &str) -> Vec<AxisType> {
         } else if word.starts_with("dc") {
             types.push(AxisType::Dc);
         } else {
-            eprintln!("MM3000: invalid RC response segment = {word}");
+            errlog_vprintf(format_args!(
+                "drvMM3000:motor_init() - invalid RC response = {word}\n"
+            ));
             types.push(AxisType::Unused);
         }
     }
@@ -160,26 +163,24 @@ pub struct Mm3000Controller {
 impl Mm3000Controller {
     /// Connect and identify an MM3000 (C `motor_init` per-card block): probe
     /// with `VE` (existence), stop all motors (`ST`), read the ident (`VE`),
-    /// then read the axis configuration (`RC`). Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    /// then read the axis configuration (`RC`). `None` is C dropping a card
+    /// that never answers `VE`, without a word; past that C ignores every
+    /// status and a failed read is an empty reply. Performs blocking serial
+    /// I/O.
+    pub fn new(handle: SyncIOHandle) -> Option<Self> {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
             axis_types: Vec::new(),
             comm_state: CommState::Normal,
         };
-        let probe = ctrl.write_read("VE")?;
-        if probe.is_empty() {
-            return Err(mm_err("MM3000: no response to VE identity query".into()));
+        if ctrl.write_read("VE").unwrap_or_default().is_empty() {
+            return None;
         }
-        ctrl.write("ST")?; // stop all motors; the ST command has no reply
-        ctrl.ident = ctrl.write_read("VE")?;
-        let rc = ctrl.write_read("RC")?;
-        ctrl.axis_types = parse_rc_types(&rc);
-        if ctrl.axis_types.is_empty() {
-            return Err(mm_err(format!("MM3000: no axes in RC response \"{rc}\"")));
-        }
-        Ok(ctrl)
+        let _ = ctrl.write("ST"); // stop all motors; the ST command has no reply
+        ctrl.ident = ctrl.write_read("VE").unwrap_or_default();
+        ctrl.axis_types = parse_rc_types(&ctrl.write_read("RC").unwrap_or_default());
+        Some(ctrl)
     }
 
     /// Identity string from `VE`.
@@ -208,14 +209,20 @@ impl Mm3000Controller {
     /// Apply C `recv_mess`'s two retry rules to the first reply: an unsolicited
     /// hard-travel-limit error (`E35`..`E42`, an unconfirmed MM3000 firmware
     /// bug) is flushed with one extra read, and any other reply starting with
-    /// `E` is reported and re-read (C recurses; the retry normally times out,
-    /// which surfaces here as the read error).
+    /// `E` is reported through C's `errPrintf` and re-read (C recurses; the
+    /// retry normally times out, which surfaces here as the read error).
     fn read_reply(&self, mut reply: String) -> AsynResult<String> {
         if is_unsolicited_limit_error(&reply) {
             reply = self.read_once()?;
         }
         while reply.starts_with('E') {
-            eprintln!("MM3000 error response: {reply}");
+            // errPrintf(-1, ...): no errSym name, then a space for the nonzero
+            // status. The file and line are ours.
+            errlog_vprintf(format_args!(
+                " filename=\"{}\" line number={} {reply}\n",
+                file!(),
+                line!()
+            ));
             reply = self.read_once()?;
         }
         Ok(reply)
@@ -251,28 +258,32 @@ pub struct Mm3000Axis {
 impl Mm3000Axis {
     /// Construct axis `axis` (1-based). Sends the C `motor_init` `TPE`
     /// encoder probe for wire parity and ignores the result (see the module
-    /// quirk note — C always ends up with `encoder_present = YES`). Performs
-    /// blocking serial I/O under the controller lock; on encoderless axes
-    /// the probe costs one read timeout, as it does in C.
-    pub fn new(controller: Arc<Mutex<Mm3000Controller>>, axis: usize) -> AsynResult<Self> {
+    /// quirk note — C always ends up with `encoder_present = YES`), then
+    /// `set_status`. Performs blocking serial I/O under the controller lock;
+    /// on encoderless axes the probe costs one read timeout, as it does in C.
+    pub fn new(controller: Arc<Mutex<Mm3000Controller>>, axis: usize) -> Self {
         let axis_type = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let axis_type = *ctrl
-                .axis_types()
-                .get(axis - 1)
-                .ok_or_else(|| mm_err(format!("MM3000 axis {axis}: not present in RC response")))?;
             let _ = ctrl.write_read(&format!("{axis}TPE"));
-            axis_type
+            ctrl.axis_types()[axis - 1]
         };
-        Ok(Self {
+        let mut ax = Self {
             controller,
             axis,
             axis_type,
             encoder_present: true,
             high_limit: None,
             low_limit: None,
-            last_status: MotorStatus::default(),
-        })
+            // C clears the status, then sets EA_PRESENT and GAIN_SUPPORT
+            // for an encoder.
+            last_status: MotorStatus {
+                gain_support: true,
+                has_encoder: true,
+                ..MotorStatus::default()
+            },
+        };
+        ax.set_status();
+        ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Mm3000Controller> {
@@ -436,9 +447,15 @@ impl AsynMotor for Mm3000Axis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Port of C `set_status`: `{axis}MS` (binary status byte) then
-        // `{axis}TP` (position), each guarded by the NORMAL/RETRY/COMM_ERR
-        // machine on an empty or failed read.
+        Ok(self.set_status())
+    }
+}
+
+impl Mm3000Axis {
+    /// Port of C `set_status`: `{axis}MS` (binary status byte) then
+    /// `{axis}TP` (position), each guarded by the NORMAL/RETRY/COMM_ERR
+    /// machine on an empty or failed read.
+    fn set_status(&mut self) -> MotorStatus {
         let controller = self.controller.clone();
         let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let a = self.axis;
@@ -465,47 +482,189 @@ impl AsynMotor for Mm3000Axis {
                 self.last_status.comms_error = true;
                 self.last_status.problem = true;
             }
-            return Ok(self.last_status.clone());
+            return self.last_status.clone();
         };
-        self.last_status.comms_error = false;
+        // C writes the MS bits into the status before asking TP, and its
+        // exit stores them even when TP goes unanswered.
         let mstat = MsBits::from_byte(ms.as_bytes()[0]);
+        let s = &mut self.last_status;
+        s.comms_error = false;
+        s.done = !mstat.in_motion;
+        s.moving = mstat.in_motion;
+        s.direction = mstat.direction;
+        s.high_limit = mstat.plus_tl;
+        s.low_limit = mstat.minus_tl;
+        s.home = mstat.home_ls;
+        s.powered = mstat.powered;
 
         let Some(tp) = exchange(&mut ctrl, &format!("{a}TP")) else {
             if ctrl.comm_state == CommState::CommErr {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
+                s.comms_error = true;
+                s.problem = true;
             }
-            return Ok(self.last_status.clone());
+            return s.clone();
         };
         drop(ctrl);
 
-        // C: first space-delimited token, `atof`, cast to integer counts.
-        let position = f64::from(nint(atof(tp.split_whitespace().next().unwrap_or(""))));
-
-        self.last_status = MotorStatus {
-            position,
-            encoder_position: if self.encoder_present { position } else { 0.0 },
-            velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
-            done: !mstat.in_motion,
-            moving: mstat.in_motion,
-            direction: mstat.direction,
-            high_limit: mstat.plus_tl,
-            low_limit: mstat.minus_tl,
-            home: mstat.home_ls,
-            powered: mstat.powered,
-            problem: false,
-            comms_error: false,
-            gain_support: self.encoder_present,
-            has_encoder: self.encoder_present,
-            ..MotorStatus::default()
-        };
-        Ok(self.last_status.clone())
+        // C: first space-delimited token, `atof`, `(epicsInt32)` cast.
+        let position = atof(tp.split_whitespace().next().unwrap_or("")).trunc();
+        s.position = position;
+        s.encoder_position = if self.encoder_present { position } else { 0.0 };
+        s.velocity = 0.0; // C: "Parse motor velocity? NEEDS WORK"
+        s.problem = false;
+        s.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers `VE` and the commands in `replies`, fails every other read,
+    /// and records every command.
+    struct IdentOnly {
+        base: epics_rs::asyn::port::PortDriverBase,
+        replies: &'static [(&'static str, &'static str)],
+        reply: Vec<u8>,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for IdentOnly {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data).into_owned();
+            self.reply = match cmd.as_str() {
+                "VE" => b"MM3000 Version 2.4".to_vec(),
+                c => self
+                    .replies
+                    .iter()
+                    .find(|(k, _)| *k == c)
+                    .map_or_else(Vec::new, |(_, v)| v.as_bytes().to_vec()),
+            };
+            self.sent.lock().unwrap().push(cmd);
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = std::mem::take(&mut self.reply);
+            if reply.is_empty() {
+                return Err(mm_err("timeout".into()));
+            }
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// C keeps a card that answers `VE` whatever its `RC` read returns; a
+    /// failed one is an empty buffer and so no axes.
+    #[test]
+    fn an_unanswered_rc_keeps_the_controller_with_no_axes() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = IdentOnly {
+            base: PortDriverBase::new("mm3000IdentOnly", 1, PortFlags::default()),
+            replies: &[],
+            reply: Vec::new(),
+            sent: Arc::default(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("mm3000IdentOnly").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        assert!(ctrl.axis_types().is_empty());
+    }
+
+    /// An MM3000 line answering `replies`: its controller, and the wire log
+    /// from after the controller was built.
+    fn mm3000_line(
+        name: &str,
+        replies: &'static [(&'static str, &'static str)],
+    ) -> (Mm3000Controller, Arc<Mutex<Vec<String>>>) {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let port = IdentOnly {
+            base: PortDriverBase::new(name, 1, PortFlags::default()),
+            replies,
+            reply: Vec::new(),
+            sent: sent.clone(),
+        };
+        let (rt, _actor) =
+            create_port_runtime(&claim_port(name).unwrap(), port, RuntimeConfig::default())
+                .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = Mm3000Controller::new(io).unwrap();
+        assert_eq!(
+            std::mem::take(&mut *sent.lock().unwrap()),
+            ["VE", "ST", "VE", "RC"]
+        );
+        (ctrl, sent)
+    }
+
+    /// drvMM3000.cc motor_init ends each axis with set_status.
+    #[test]
+    fn axis_init_runs_set_status_after_the_tpe_probe() {
+        let (ctrl, sent) = mm3000_line(
+            "mm3000InitStatus",
+            &[("RC", "1=dc 2=unused"), ("1MS", "D"), ("1TP", "1234 ")],
+        );
+        let axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        assert_eq!(*sent.lock().unwrap(), ["1TPE", "1MS", "1TP"]);
+        let s = &axis.last_status;
+        assert_eq!(s.position, 1234.0);
+        assert!(s.done && s.direction && s.powered && s.has_encoder);
+    }
+
+    /// An unanswered TP is a RETRY, but C's exit still stores the MS bits
+    /// it decoded before asking.
+    #[test]
+    fn a_silent_tp_keeps_the_ms_bits() {
+        let (ctrl, sent) = mm3000_line("mm3000SilentTp", &[("RC", "1=dc"), ("1MS", "%")]);
+        let axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        assert_eq!(*sent.lock().unwrap(), ["1TPE", "1MS", "1TP"]);
+        let s = &axis.last_status;
+        assert!(s.moving && s.direction && s.home && !s.comms_error && !s.problem);
+        assert_eq!(s.position, 0.0);
+    }
+
+    /// C stores the TP reading through an `(epicsInt32)` cast, which
+    /// truncates toward zero.
+    #[test]
+    fn the_tp_position_truncates_as_c_casts() {
+        let (ctrl, _) = mm3000_line(
+            "mm3000Trunc",
+            &[
+                ("RC", "1=dc 2=dc"),
+                ("1MS", "@"),
+                ("1TP", "12.7"),
+                ("2MS", "@"),
+                ("2TP", "-12.7"),
+            ],
+        );
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        assert_eq!(Mm3000Axis::new(ctrl.clone(), 1).last_status.position, 12.0);
+        assert_eq!(Mm3000Axis::new(ctrl, 2).last_status.position, -12.0);
+    }
 
     #[test]
     fn rc_reply_parses_types_and_counts_trailing_unused() {

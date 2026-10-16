@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::{Mutex, MutexGuard};
@@ -89,7 +89,7 @@ pub struct PslServer {
 }
 
 impl PslServer {
-    pub fn new(handle: PortHandle) -> Self {
+    pub fn new(handle: SyncIOHandle) -> Self {
         Self {
             io: Arc::new(Mutex::new(ServerIo { handle })),
         }
@@ -110,8 +110,7 @@ impl PslServer {
     pub fn trace_error(&self, message: &str) {
         let io = self.io.lock();
         io.handle
-            .trace()
-            .output(io.handle.port_name(), TraceMask::ERROR, message);
+            .print(0, TraceMask::ERROR, format_args!("{message}"));
     }
 }
 
@@ -154,17 +153,17 @@ impl Session<'_> {
 }
 
 struct ServerIo {
-    handle: PortHandle,
+    handle: SyncIOHandle,
 }
 
 impl ServerIo {
     /// C `writeReadServer`'s line, on `pasynUserServer_`: the server port's
     /// trace mask gates it.
     fn write_read_failed(&self, e: &ServerError, command: &str) {
-        self.handle.trace().output(
-            self.handle.port_name(),
+        self.handle.print(
+            0,
             TraceMask::ERROR,
-            &format!(
+            format_args!(
                 "PSL:writeReadServer, status={}, sent\n{command}",
                 e.status()
             ),
@@ -179,8 +178,10 @@ impl ServerIo {
     /// (C `pasynCommonSyncIO->disconnectDevice` + `connectDevice`).
     fn reconnect(&mut self) -> ServerResult<()> {
         self.handle
+            .port()?
             .submit_blocking(RequestOp::Disconnect, self.user(SERVER_TIMEOUT))?;
         self.handle
+            .port()?
             .submit_blocking(RequestOp::Connect, self.user(SERVER_TIMEOUT))?;
         Ok(())
     }
@@ -192,7 +193,7 @@ impl ServerIo {
         timeout: Duration,
     ) -> ServerResult<Vec<u8>> {
         self.reconnect()?;
-        let result = self.handle.submit_blocking(
+        let result = self.handle.port()?.submit_blocking(
             RequestOp::OctetWriteRead {
                 data: command.as_bytes().to_vec(),
                 buf_size,
@@ -204,7 +205,7 @@ impl ServerIo {
     }
 
     fn write(&mut self, command: &str, timeout: Duration) -> ServerResult<()> {
-        self.handle.submit_blocking(
+        self.handle.port()?.submit_blocking(
             RequestOp::OctetWrite {
                 data: command.as_bytes().to_vec(),
             },
@@ -216,6 +217,7 @@ impl ServerIo {
     fn read_binary(&mut self, buf_size: usize, timeout: Duration) -> ServerResult<Vec<u8>> {
         let result = self
             .handle
+            .port()?
             .submit_blocking(RequestOp::OctetReadBinary { buf_size }, self.user(timeout))?;
         Ok(result.data.unwrap_or_default())
     }

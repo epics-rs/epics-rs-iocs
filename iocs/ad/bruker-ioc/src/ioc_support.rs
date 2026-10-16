@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::server::iocsh::registry::*;
 
 use epics_rs::ad_core::ioc::GenericDriverContext;
@@ -82,20 +83,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 Err(e) => return Ok(ctx.cxx_error(e)),
             };
 
-            let command = get_port(&bis_port).ok_or_else(|| {
-                format!("BIS port '{bis_port}' not found (call drvAsynIPPortConfigure first)")
-            })?;
-            let status = get_port(&status_port).ok_or_else(|| {
-                format!("status port '{status_port}' not found (call drvAsynIPPortConfigure first)")
-            })?;
+            // C ignores both connect statuses (BISDetector.cpp:759-760): a
+            // missing socket port leaves a user whose every transfer fails.
+            let (command, _) = SyncIOHandle::connect_port(&bis_port, 0, Duration::ZERO);
+            let (status, _) = SyncIOHandle::connect_port(&status_port, 0, Duration::ZERO);
 
-            let rt = create_bruker_detector(
-                &claim,
-                command.handle.clone(),
-                status.handle.clone(),
-                max_memory,
-            )
-            .map_err(|e| format!("failed to create the BIS detector: {e}"))?;
+            let rt = create_bruker_detector(&claim, command, status, max_memory)
+                .map_err(|e| format!("failed to create the BIS detector: {e}"))?;
 
             claim
                 .publish(

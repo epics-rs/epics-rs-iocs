@@ -143,6 +143,9 @@ pub struct GripperDriver {
     params: GripperParams,
     gripper: Arc<Mutex<RobotiqGripper>>,
     dashboard: DashboardHandle,
+    /// The last ACTIVATE written, kept apart from the parameter so a connect
+    /// before any write reads nothing C never reads.
+    activate_wanted: bool,
 }
 
 impl GripperDriver {
@@ -175,6 +178,7 @@ impl GripperDriver {
             params,
             gripper,
             dashboard,
+            activate_wanted: false,
         };
         me.try_connect();
         Ok(me)
@@ -228,8 +232,7 @@ impl GripperDriver {
     /// gripper is already active, so a reconnect never re-runs the
     /// activation cycle.
     fn apply_pending_activation(&self, gripper: &mut RobotiqGripper) {
-        let p = self.params;
-        if self.base.get_int32_param(p.activate, 0).unwrap_or(0) == 0 {
+        if !self.activate_wanted {
             return;
         }
         if let Err(e) = gripper.activate(false) {
@@ -252,6 +255,9 @@ impl PortDriver for GripperDriver {
             let reason = user.reason;
             let p = self.params;
             self.base.set_int32_param(reason, user.addr, value)?;
+            if reason == p.activate {
+                self.activate_wanted = value != 0;
+            }
 
             if p.is_command(reason) && value == 0 {
                 return Ok(());

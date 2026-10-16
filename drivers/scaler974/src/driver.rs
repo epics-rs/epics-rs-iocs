@@ -100,7 +100,7 @@ use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::scaler::MAX_SCALER_CHANNELS;
 use epics_rs::scaler::device_support::scaler_asyn::{DoneInterrupt, DoneParam, ScalerDriver};
 
-use crate::connect::OctetLink;
+use crate::connect::{OctetLink, connect_octet};
 use crate::wire::{encode_set_count_preset, scan_show_counts};
 
 /// asyn reason used for octet transactions against the underlying serial
@@ -147,6 +147,29 @@ pub struct Scaler974Driver {
 }
 
 impl Scaler974Driver {
+    /// C's constructor from the connect on (drvScaler974.cpp:72-92): a
+    /// missing octet port is reported and leaves no driver, since C returns
+    /// before its parameters and its poll thread.
+    pub fn create(
+        serial_port: &str,
+        serial_addr: i32,
+        poll: i32,
+        timeout: Duration,
+    ) -> Option<Self> {
+        let (handle, status) = connect_octet(serial_port, serial_addr, timeout);
+        if status.is_err() {
+            handle.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "Scaler974:Scaler974: error connecting to port {serial_port} address {serial_addr}"
+                ),
+            );
+            return None;
+        }
+        let (poll_handle, _) = connect_octet(serial_port, serial_addr, timeout);
+        Some(Self::new(handle, poll_handle, poll))
+    }
+
     /// C `Scaler974::Scaler974(portName, serialPort, serialAddr, poll)`.
     /// `handle` is used for reset/arm/write_preset; `poll_handle` is moved
     /// into the background poll thread for `SHOW_COUNTS` — both must be
@@ -342,6 +365,11 @@ impl ScalerDriver for Scaler974Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_octet_port_leaves_no_driver() {
+        assert!(Scaler974Driver::create("SCALER974_NO_SERIAL", 0, 0, Duration::ZERO).is_none());
+    }
 
     fn fresh_state() -> PollState {
         PollState {

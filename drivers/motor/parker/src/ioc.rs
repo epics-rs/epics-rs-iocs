@@ -11,7 +11,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::{EosRefusal, connect_ip, connect_with_eos};
+use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -49,15 +49,21 @@ pub fn oem_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle =
-                connect_with_eos(&oem_port, OEM_TIMEOUT, b"\r", b"\r", EosRefusal::Ignored)?;
-            let controller = Arc::new(Mutex::new(OemController::new(handle)));
-
             register_port(ctx, &port_name, num_axes as i32)?;
 
+            let (handle, _) = connect_controller(
+                &oem_port,
+                OEM_TIMEOUT,
+                &port_name,
+                format_args!(
+                    "OEMMotorDriver:OEMController: cannot connect to OEM series controller"
+                ),
+            );
+            set_eos_ignored(&handle, b"\r", b"\r");
+            let controller = Arc::new(Mutex::new(OemController::new(handle)));
+
             for index in 0..num_axes as usize {
-                let ax = OemAxis::new(controller.clone(), index)
-                    .map_err(|e| format!("OEMCreateController: axis {index}: {e}"))?;
+                let ax = OemAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 install(
                     ctx,
@@ -95,14 +101,18 @@ pub fn acr_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_ip(&acr_port, ACR_TIMEOUT)?;
-            let controller = Arc::new(Mutex::new(AcrController::new(handle)));
-
             register_port(ctx, &port_name, num_axes as i32)?;
 
+            let (handle, _) = connect_controller(
+                &acr_port,
+                ACR_TIMEOUT,
+                &port_name,
+                format_args!("ACRMotorDriver:ACRController: cannot connect to ACR controller"),
+            );
+            let controller = Arc::new(Mutex::new(AcrController::new(handle)));
+
             for index in 0..num_axes as usize {
-                let ax = AcrAxis::new(controller.clone(), index)
-                    .map_err(|e| format!("ACRCreateController: axis {index}: {e}"))?;
+                let ax = AcrAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 install(
                     ctx,

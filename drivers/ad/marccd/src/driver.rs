@@ -4,15 +4,16 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
-use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -39,8 +40,9 @@ const DRIVER_VERSION: &str = "2.3.0";
 pub struct MarccdDriver {
     pub ad: ADDriverBase,
     pub p: MarccdParams,
-    /// The marServer octet port (C `pasynUserServer`).
-    pub(crate) server: PortHandle,
+    /// C `pasynUserServer`; it has no port when the startup script named a
+    /// marServer port that does not exist.
+    pub(crate) server: SyncIOHandle,
     /// C `serverMode` (1 = marCCD, 2 = high speed).
     pub(crate) server_mode: i32,
     /// C `fromServer`.
@@ -56,7 +58,7 @@ pub struct MarccdDriver {
 
 /// The handles the driver shares with its worker threads.
 struct DriverLinks {
-    server: PortHandle,
+    server: SyncIOHandle,
     start: Arc<Event>,
     stop: Arc<Event>,
 }
@@ -87,7 +89,7 @@ impl MarccdDriver {
         if self.get_server_mode().is_err() {
             let msg = format!(
                 "marCCD:marCCD: error calling getServerMode for server port {}",
-                self.server.port_name()
+                self.server.port().map_or("", PortHandle::port_name)
             );
             self.trace(TraceMask::ERROR, &msg);
             return false;
@@ -319,17 +321,16 @@ impl MarccdRuntime {
 
 /// C `marCCDConfig`.
 ///
-/// `server_port` must already exist (`drvAsynIPPortConfigure`), because C
-/// connects to it with `pasynOctetSyncIO->connect` in the constructor.
+/// C connects to `server_port` with `pasynOctetSyncIO->connect` in the
+/// constructor; when that fails the constructor returns with the port
+/// registered but no defaults and no threads (marCCD.cpp:1534-1540).
 pub fn create_marccd_detector(
     claim: &PortClaim,
     server_port: &str,
     max_memory: usize,
 ) -> Result<MarccdRuntime, String> {
     let port_name = claim.name();
-    let server_entry = get_port(server_port).ok_or_else(|| {
-        format!("marServer port '{server_port}' not found (call drvAsynIPPortConfigure first)")
-    })?;
+    let (server, connected) = SyncIOHandle::connect_port(server_port, 0, Duration::ZERO);
 
     let start = Arc::new(Event::new());
     let stop = Arc::new(Event::new());
@@ -338,12 +339,20 @@ pub fn create_marccd_detector(
         port_name,
         max_memory,
         DriverLinks {
-            server: server_entry.handle.clone(),
+            server,
             start: start.clone(),
             stop: stop.clone(),
         },
     )
     .map_err(|e| format!("failed to create marCCD driver: {e}"))?;
+    if connected.is_err() {
+        driver.trace(
+            TraceMask::ERROR,
+            &format!(
+                "marCCD:marCCD: error calling pasynOctetSyncIO->connect for server port {server_port}"
+            ),
+        );
+    }
 
     let ad_params = driver.ad.params;
     let marccd_params = driver.p;
@@ -370,9 +379,10 @@ pub fn create_marccd_detector(
         owner: owner.clone(),
     };
 
-    let started = handle
-        .with_driver_blocking::<MarccdDriver, _>(MarccdDriver::init)
-        .map_err(|e| format!("marCCD init failed: {e}"))?;
+    let started = connected.is_ok()
+        && handle
+            .with_driver_blocking::<MarccdDriver, _>(MarccdDriver::init)
+            .map_err(|e| format!("marCCD init failed: {e}"))?;
     let tasks = if started {
         vec![start_det_task(worker()), start_image_task(worker())]
     } else {
@@ -447,7 +457,9 @@ pub(crate) mod tests {
     /// A driver on a silent fake server, outside any port runtime.
     fn driver(name: &str) -> MarccdDriver {
         fake_server(name, |_| "");
-        let server = get_port(&format!("{name}_IP")).unwrap().handle.clone();
+        let (server, connected) =
+            SyncIOHandle::connect_port(&format!("{name}_IP"), 0, Duration::ZERO);
+        connected.unwrap();
         let links = DriverLinks {
             server,
             start: Arc::new(Event::new()),
@@ -581,6 +593,27 @@ pub(crate) mod tests {
             "{manufacturer:?}"
         );
         assert!(det.tasks.is_empty());
+    }
+
+    /// marCCD.cpp:1534-1540 returns at the failed server connect with the port
+    /// registered: no defaults, no threads, and writes still land.
+    #[test]
+    fn a_missing_server_port_leaves_the_port_up_without_defaults() {
+        let det = create_marccd_detector(&claim_port("MARCCD_NONE").unwrap(), "MARCCD_NONE_IP", 0)
+            .expect("the detector port");
+        assert!(det.tasks.is_empty());
+        let h = det.port_handle();
+        let manufacturer = h.get_string_param_blocking(det.ad_params.base.manufacturer, 0, 256);
+        assert!(
+            matches!(manufacturer, Err(AsynError::ParamUndefined(_))),
+            "{manufacturer:?}"
+        );
+        h.write_int32_blocking(det.ad_params.num_images, 0, 3)
+            .unwrap();
+        assert_eq!(
+            h.read_int32_blocking(det.ad_params.num_images, 0).unwrap(),
+            3
+        );
     }
 
     #[test]

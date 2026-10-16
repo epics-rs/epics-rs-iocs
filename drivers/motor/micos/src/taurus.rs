@@ -38,7 +38,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
@@ -61,13 +61,6 @@ const SWITCH_IGNORE: i32 = 0x2;
 
 /// Delay required by the controller after an `init` command.
 const INIT_DELAY: Duration = Duration::from_millis(200);
-
-fn taurus_err(message: impl Into<String>) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message: message.into(),
-    }
-}
 
 /// Shared Taurus controller endpoint owning the asyn octet handle.
 pub struct TaurusController {
@@ -114,35 +107,28 @@ pub struct TaurusAxis {
 }
 
 impl TaurusAxis {
-    /// Construct axis `axis_no` (0-based) and read its travel limits.
-    pub fn new(controller: Arc<Mutex<TaurusController>>, axis_no: usize) -> AsynResult<Self> {
+    /// Construct axis `axis_no` (0-based) and read its travel limits. C
+    /// ignores both queries' status and `sscanf`s whatever is in the reply
+    /// (SMCTaurusAxis.cpp:14-27); a limit the reply does not carry stays 0.
+    pub fn new(controller: Arc<Mutex<TaurusController>>, axis_no: usize) -> Self {
         let addr = axis_no + 1;
         let reply = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
             // C reads axisRes = clPeriod here (SMCTaurusAxis.cpp:15-18); at
             // this EGU boundary it cancels against MRES, so only the exchange
             // is kept.
-            ctrl.query(&format!("{addr} getclperiod"))?;
-            ctrl.query(&format!("{addr} getnlimit"))?
+            let _ = ctrl.query(&format!("{addr} getclperiod"));
+            ctrl.query(&format!("{addr} getnlimit")).unwrap_or_default()
         };
-        let bounds: Vec<f64> = reply
+        let mut bounds = reply
             .split_whitespace()
-            .filter_map(|tok| tok.parse::<f64>().ok())
-            .collect();
-        let (neg, pos) = match bounds.as_slice() {
-            [neg, pos, ..] => (*neg, *pos),
-            _ => {
-                return Err(taurus_err(format!(
-                    "taurus: getnlimit returned {reply:?}, expected two values"
-                )));
-            }
-        };
-        Ok(Self {
+            .map_while(|tok| tok.parse::<f64>().ok());
+        Self {
             controller,
             axis_no,
-            neg_travel_limit: neg,
-            pos_travel_limit: pos,
-        })
+            neg_travel_limit: bounds.next().unwrap_or(0.0),
+            pos_travel_limit: bounds.next().unwrap_or(0.0),
+        }
     }
 
     fn addr(&self) -> usize {
@@ -341,6 +327,14 @@ impl AsynMotor for TaurusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_axis_of_an_unanswering_controller_is_still_built() {
+        let (handle, _) = SyncIOHandle::connect_port("TAURUS_NONE", 0, Duration::ZERO);
+        let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
+        let axis = TaurusAxis::new(controller, 0);
+        assert_eq!((axis.neg_travel_limit, axis.pos_travel_limit), (0.0, 0.0));
+    }
 
     #[test]
     fn status_bits() {

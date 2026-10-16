@@ -39,10 +39,11 @@ use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::{atof, atoi};
 
@@ -58,7 +59,7 @@ const IS_READ_BUF: usize = 1024;
 const IS_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// C `DRIVER_NAME`, the prefix of the driver's console lines.
-const DRIVER_NAME: &str = "ImsMDrivePlusMotorDriver";
+pub(crate) const DRIVER_NAME: &str = "ImsMDrivePlusMotorDriver";
 
 /// Rule under the setup-config banner lines.
 const RULE: &str = "-------------------------------------------";
@@ -122,13 +123,10 @@ impl ImsMDrivePlusAxis {
     /// Connect an axis on `handle`, addressing it by `device_name` (empty for no
     /// party mode). `port` is the octet port under `handle`, whose output EOS a
     /// Lexium MDrive switches. As in C, a failed configuration is logged and the
-    /// axis is still created.
-    pub fn new(
-        handle: SyncIOHandle,
-        port: &PortHandle,
-        motor_name: &str,
-        device_name: String,
-    ) -> Self {
+    /// axis is still created. `motor_name` is the controller port, whose
+    /// `pasynUserSelf` C prints these lines on.
+    pub fn new(handle: SyncIOHandle, motor_name: &str, device_name: String) -> Self {
+        let trace = MotorTrace::new(motor_name, 0);
         let mut axis = Self {
             handle,
             device_name,
@@ -138,12 +136,15 @@ impl ImsMDrivePlusAxis {
             has_encoder: false,
             homing: false,
         };
-        if axis.config_axis() == AsynStatus::Error {
-            eprintln!(
-                "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}"
+        if axis.config_axis(&trace) == AsynStatus::Error {
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}\n"
+                ),
             );
         }
-        axis.read_home_and_limit_config(port);
+        axis.read_home_and_limit_config();
         axis
     }
 
@@ -168,11 +169,14 @@ impl ImsMDrivePlusAxis {
     /// C `configAxis`: up to three `PR VR` probes, then the `PR EE` encoder
     /// flag. An asyn error is logged and retried; any other reply shorter than
     /// two bytes ends the configuration without `PR EE`.
-    fn config_axis(&mut self) -> AsynStatus {
+    fn config_axis(&mut self, trace: &MotorTrace) -> AsynStatus {
         for _ in 0..3 {
             let resp = match self.handle.write_read(0, &self.framed("PR VR"), READ_BUF) {
                 Err(e) if e.status() == AsynStatus::Error => {
-                    eprintln!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.");
+                    trace.print_self(
+                        TraceMask::ERROR,
+                        format_args!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.\n"),
+                    );
                     continue;
                 }
                 Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
@@ -180,9 +184,12 @@ impl ImsMDrivePlusAxis {
             };
             let resp = resp.split(|&b| b == 0).next().unwrap_or_default();
             if resp.len() < 2 {
-                eprintln!(
-                    "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.",
-                    String::from_utf8_lossy(resp)
+                trace.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.\n",
+                        String::from_utf8_lossy(resp)
+                    ),
                 );
                 return AsynStatus::Error;
             }
@@ -198,7 +205,7 @@ impl ImsMDrivePlusAxis {
     }
 
     /// C `readHomeAndLimitConfig`, console lines included.
-    fn read_home_and_limit_config(&mut self, port: &PortHandle) {
+    fn read_home_and_limit_config(&mut self) {
         // MForce 1 answers `PR VR` with an error, so its status is ignored.
         let version = self.write_read("PR VR").unwrap_or_default();
         if !version.is_empty() {
@@ -221,9 +228,11 @@ impl ImsMDrivePlusAxis {
                     println!("Have device name going party modus, line ending LF.");
                     b"\n"
                 };
-                let _ = port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos);
+                if let Ok(port) = self.handle.port() {
+                    let _ = port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos);
+                }
             }
-            let block = self.read_input_setup(port).unwrap_or_default();
+            let block = self.read_input_setup().unwrap_or_default();
             let text = block.split(|&b| b == 0).next().unwrap_or_default();
             println!("{}", String::from_utf8_lossy(text));
             for (input_no, function) in parse_input_setup(&block) {
@@ -261,7 +270,8 @@ impl ImsMDrivePlusAxis {
     /// under the port lock so the read runs to the timeout and gathers every
     /// line (ImsMDrivePlusMotorController.cpp:221-237). The input EOS is put
     /// back to `\n` as C does, on every path.
-    fn read_input_setup(&self, port: &PortHandle) -> AsynResult<Vec<u8>> {
+    fn read_input_setup(&self) -> AsynResult<Vec<u8>> {
+        let port = self.handle.port()?;
         static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1 << 48);
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let user = || {
@@ -483,6 +493,24 @@ impl AsynMotor for ImsMDrivePlusAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ImsMDrivePlusMotorController.cpp:69-99: a missing IO port still builds
+    /// the axis; configAxis and readHomeAndLimitConfig run on the dead user.
+    #[test]
+    fn an_axis_of_a_missing_port_is_still_built() {
+        let (handle, status) = SyncIOHandle::connect_port("IMS_NONE", 0, Duration::from_millis(10));
+        assert!(status.is_err());
+        let axis = ImsMDrivePlusAxis::new(handle, "IMS_MOTOR", String::new());
+        assert!(!axis.has_encoder);
+        assert_eq!(
+            (
+                axis.home_switch,
+                axis.pos_limit_switch,
+                axis.neg_limit_switch
+            ),
+            (None, None, None)
+        );
+    }
 
     #[test]
     fn frame_prepends_device_name() {

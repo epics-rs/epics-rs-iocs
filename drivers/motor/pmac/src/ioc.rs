@@ -18,10 +18,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
@@ -67,8 +70,8 @@ fn find<R>(registry: &Registry, name: &str, f: impl FnOnce(&ControllerReg) -> R)
 /// Which step of C's `lowLevelPortConnect` / `motorAxisAsynConnect` failed.
 enum ConnectError {
     NoPort,
-    InputEos(String),
-    OutputEos(String),
+    InputEos(AsynError),
+    OutputEos(AsynError),
 }
 
 /// Connect a [`SyncIOHandle`] to an already-configured octet port at the given
@@ -81,11 +84,11 @@ fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
     entry
         .handle
         .set_input_eos_blocking(user(), b"\x06")
-        .map_err(|e| ConnectError::InputEos(e.to_string()))?;
+        .map_err(ConnectError::InputEos)?;
     entry
         .handle
         .set_output_eos_blocking(user(), b"\r")
-        .map_err(|e| ConnectError::OutputEos(e.to_string()))?;
+        .map_err(ConnectError::OutputEos)?;
     Ok(SyncIOHandle::from_handle(
         entry.handle.clone(),
         addr,
@@ -93,29 +96,51 @@ fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
     ))
 }
 
-/// C `pmacController`'s constructor (pmacController.cpp:194-200): a refused
-/// connect or EOS set is printed and the controller is still created, with no
-/// low-level user.
-fn low_level_port_connect(port: &str, addr: i32) -> Option<SyncIOHandle> {
-    connect_octet(port, addr)
-        .inspect_err(|e| {
-            match e {
-                ConnectError::NoPort => eprintln!(
-                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}"
+/// C `pmacController`'s constructor (pmacController.cpp:194-200) and its
+/// `lowLevelPortConnect`: a missing port keeps the unconnected user, a refused
+/// EOS set disconnects it (`None`); either is printed and the controller is
+/// still created.
+fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<SyncIOHandle> {
+    let trace = MotorTrace::new(self_port, 0);
+    let (handle, connected) = SyncIOHandle::connect_port(port, addr, PMAC_TIMEOUT);
+    let kept = match connected.and_then(|()| handle.port()) {
+        Err(_) => {
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}\n"
                 ),
-                ConnectError::InputEos(e) => {
-                    eprintln!("pmacController: unable to set input EOS on {port}: {e}")
-                }
-                ConnectError::OutputEos(e) => {
-                    eprintln!("pmacController: unable to set output EOS on {port}: {e}")
-                }
-            }
-            println!(
-                "pmacController::pmacController: Failed to connect to low level \
-                 asynOctetSyncIO port {port}"
             );
-        })
-        .ok()
+            Some(handle)
+        }
+        Ok(entry) => {
+            let user = || AsynUser::new(0).with_addr(addr);
+            let refused = entry
+                .set_input_eos_blocking(user(), b"\x06")
+                .map_err(|e| ("input", e))
+                .and_then(|()| {
+                    entry
+                        .set_output_eos_blocking(user(), b"\r")
+                        .map_err(|e| ("output", e))
+                });
+            let Err((which, e)) = refused else {
+                return Some(handle);
+            };
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "pmacController: unable to set {which} EOS on {port}: {}\n",
+                    e.message_display()
+                ),
+            );
+            None
+        }
+    };
+    println!(
+        "pmacController::pmacController: Failed to connect to low level \
+         asynOctetSyncIO port {port}"
+    );
+    kept
 }
 
 /// Every PMAC iocsh command but `drvAsynMotorConfigure`, which the IOC builds
@@ -162,7 +187,7 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
             let controller = Arc::new(Mutex::new(PmacController::new(
-                low_level_port_connect(&low_level_port, low_level_addr),
+                low_level_port_connect(&name, &low_level_port, low_level_addr),
                 POLL_CACHE_TTL,
             )));
             let params = PmacControllerParams::new(controller.clone());
@@ -427,61 +452,102 @@ fn pmac_asyn_coord_create_command() -> CommandDef {
         ],
         "pmacAsynCoordCreate(port, address, C.S. no, reference, program)",
         move |args: &[ArgValue], _ctx: &CommandContext| {
-            let port = req_string(args, 0, "port")?;
-            let addr = c_int(args, 1);
-            let cs = c_int(args, 2);
-            let reference = c_int(args, 3);
-            let program = c_int(args, 4);
-
-            if !(1..=16).contains(&cs) {
-                println!("Invalid co-ordinate system number: {cs}");
-                return Ok(CommandOutcome::Continue);
-            }
-            let mut systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
-            if systems
-                .iter()
-                .any(|(r, p, a, c)| *r == reference || (*p == port && *a == addr && *c == cs))
-            {
-                println!("C.S. reference {reference} already exists");
-                return Ok(CommandOutcome::Continue);
-            }
-            let handle = match connect_octet(&port, addr) {
-                Ok(handle) => handle,
-                Err(ConnectError::NoPort) => {
-                    println!("drvPmacCreate: unable to connect to port {port}");
-                    return Ok(CommandOutcome::Continue);
-                }
-                Err(ConnectError::InputEos(e)) => {
-                    eprintln!("drvPmacCreate: unable to set input EOS on {port}: {e}");
-                    return Ok(CommandOutcome::Continue);
-                }
-                Err(ConnectError::OutputEos(e)) => {
-                    eprintln!("drvPmacCreate: unable to set output EOS on {port}: {e}");
-                    return Ok(CommandOutcome::Continue);
-                }
-            };
-            let system = Arc::new(Mutex::new(PmacCoordSystem::new(
-                handle,
-                cs,
-                program,
-                POLL_CACHE_TTL,
-            )));
-            let axes = (1..=CS_AXES)
-                .map(|axis| {
-                    let motor: Arc<Mutex<dyn AsynMotor>> =
-                        Arc::new(Mutex::new(PmacCsAxis::new(system.clone(), axis)?));
-                    Ok(Model2Axis {
-                        motor,
-                        moving_poll_ms: COORD_MOVING_POLL_MS,
-                        idle_poll_ms: COORD_IDLE_POLL_MS,
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            PMAC_ASYN_COORD.set_card(reference, axes);
-            systems.push((reference, port, addr, cs));
+            coord_create(
+                &req_string(args, 0, "port")?,
+                c_int(args, 1),
+                c_int(args, 2),
+                c_int(args, 3),
+                c_int(args, 4),
+            )?;
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// C `pmacAsynCoordCreate`'s body. A refused connect is printed as C's
+/// `motorAxisAsynConnect` prints it and creates no driver.
+fn coord_create(
+    port: &str,
+    addr: i32,
+    cs: i32,
+    reference: i32,
+    program: i32,
+) -> Result<(), String> {
+    if !(1..=16).contains(&cs) {
+        println!("Invalid co-ordinate system number: {cs}");
+        return Ok(());
+    }
+    let mut systems = COORD_SYSTEMS.lock().unwrap_or_else(|e| e.into_inner());
+    if systems
+        .iter()
+        .any(|(r, p, a, c)| *r == reference || (p == port && *a == addr && *c == cs))
+    {
+        println!("C.S. reference {reference} already exists");
+        return Ok(());
+    }
+    // drvPrint with no log parameter prints whatever the mask.
+    println!(
+        "Creating PMAC co-ordinate system driver on port {port}, address {addr}, cs: {cs} \
+         (ref = {reference})"
+    );
+    let trace = MotorTrace::new(port, addr);
+    let handle = match connect_octet(port, addr) {
+        Ok(handle) => handle,
+        Err(ConnectError::NoPort) => {
+            println!("drvPmacCreate: unable to connect to port {port}");
+            return Ok(());
+        }
+        Err(ConnectError::InputEos(e)) => {
+            trace.print(
+                TraceMask::ERROR,
+                0,
+                format_args!(
+                    "drvPmacCreate: unable to set input EOS on {port}: {}\n",
+                    e.message_display()
+                ),
+            );
+            return Ok(());
+        }
+        Err(ConnectError::OutputEos(e)) => {
+            trace.print(
+                TraceMask::ERROR,
+                0,
+                format_args!(
+                    "drvPmacCreate: unable to set output EOS on {port}: {}\n",
+                    e.message_display()
+                ),
+            );
+            return Ok(());
+        }
+    };
+    let system = Arc::new(Mutex::new(PmacCoordSystem::new(
+        handle,
+        cs,
+        program,
+        POLL_CACHE_TTL,
+    )));
+    let axes = (1..=CS_AXES)
+        .map(|axis| {
+            let motor: Arc<Mutex<dyn AsynMotor>> =
+                Arc::new(Mutex::new(PmacCsAxis::new(system.clone(), axis)?));
+            trace.print(
+                TraceMask::FLOW,
+                0,
+                format_args!(
+                    "Created motor for ref {reference}, C.S. {cs}, signal {} OK\n",
+                    axis - 1
+                ),
+            );
+            Ok(Model2Axis {
+                motor,
+                moving_poll_ms: COORD_MOVING_POLL_MS,
+                idle_poll_ms: COORD_IDLE_POLL_MS,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    PMAC_ASYN_COORD.set_card(reference, axes);
+    systems.push((reference, port.to_string(), addr, cs));
+    Ok(())
 }
 
 /// C `pmacSetCoordMovingPollPeriod` / `pmacSetCoordIdlePollPeriod(ref,
@@ -506,9 +572,11 @@ fn pmac_set_coord_poll_period_command(name: &'static str, period: &'static str) 
 mod tests {
     use super::*;
     use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
-    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::trace::TraceFile;
 
     /// A port with no EOS support of its own: both sets are refused.
     struct Bare(PortDriverBase);
@@ -522,8 +590,40 @@ mod tests {
         }
     }
 
+    fn publish_bare(name: &str) -> PortRuntimeHandle {
+        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
+        rt
+    }
+
+    fn coord_exists(reference: i32) -> bool {
+        COORD_SYSTEMS
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(r, ..)| *r == reference)
+    }
+
+    #[test]
+    fn a_refused_eos_set_creates_no_coordinate_system() {
+        let _rt = publish_bare("pmacCoordEosRefused");
+        coord_create("pmacCoordEosRefused", 0, 2, 9101, 10).unwrap();
+        assert!(!coord_exists(9101));
+    }
+
+    #[test]
+    fn a_missing_port_creates_no_coordinate_system() {
+        coord_create("pmacCoordNoSuchPort", 0, 2, 9102, 10).unwrap();
+        assert!(!coord_exists(9102));
+    }
+
     fn controller_on(port: &str) -> PmacController {
-        PmacController::new(low_level_port_connect(port, 0), POLL_CACHE_TTL)
+        PmacController::new(low_level_port_connect("pmacTest", port, 0), POLL_CACHE_TTL)
     }
 
     #[test]
@@ -603,6 +703,27 @@ mod tests {
 
     #[test]
     fn a_missing_low_level_port_leaves_a_controller_whose_commands_fail() {
+        // C keeps the unconnected user; only a refused EOS set clears it.
+        assert!(low_level_port_connect("pmacTest", "pmacNoSuchPort", 0).is_some());
         assert!(controller_on("pmacNoSuchPort").write_read("I100").is_err());
+    }
+
+    #[test]
+    fn a_refused_eos_set_prints_through_the_controller_trace() {
+        let _self_rt = publish_bare("pmacTraceSelf");
+        let _low_rt = publish_bare("pmacTraceLow");
+        let path = std::env::temp_dir().join(format!("pmacTraceSelf-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        PortManager::global().trace_manager().set_trace_file(
+            Some("pmacTraceSelf"),
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
+        assert!(low_level_port_connect("pmacTraceSelf", "pmacTraceLow", 0).is_none());
+        let trace = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            trace.contains("pmacController: unable to set input EOS on pmacTraceLow: "),
+            "{trace:?}"
+        );
     }
 }

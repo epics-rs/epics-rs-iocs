@@ -12,12 +12,17 @@ use std::sync::Arc;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::ad_core::runtime as rt;
-use epics_rs::asyn::asyn_record;
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use std::time::Duration;
+
+use epics_rs::ad_core::driver::ADDriverBase;
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
+use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 
 pub mod detector;
 pub mod driver;
@@ -26,7 +31,7 @@ pub mod task;
 pub mod transport;
 
 use crate::detector::Detector;
-use crate::driver::MythenDriver;
+use crate::driver::{MythenDriver, SENSOR_SIZE_X, SENSOR_SIZE_Y};
 use crate::transport::Transport;
 
 /// Everything an IOC needs to keep alive and to wire plugins to.
@@ -34,6 +39,13 @@ pub struct MythenRuntime {
     pub runtime_handle: PortRuntimeHandle,
     pub pool: DriverPool,
     pub output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    /// `None` when the IP port was missing and C's constructor returned
+    /// before it created its parameters and its acquisition task.
+    pub acquisition: Option<Acquisition>,
+}
+
+/// The detector and the acquisition task C's constructor ends by starting.
+pub struct Acquisition {
     pub detector: Arc<Detector>,
     _task: std::thread::JoinHandle<()>,
 }
@@ -57,11 +69,19 @@ pub fn create_mythen_detector(
     max_memory: usize,
 ) -> AsynResult<MythenRuntime> {
     let port_name = claim.name();
-    let ip_port = asyn_record::get_port(ip_port_name).ok_or_else(|| AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!("mythen: no asyn port named {ip_port_name}"),
-    })?;
-    let det = Arc::new(Detector::new(Transport::new(ip_port.handle), port_name));
+    let (meter, connected) = SyncIOHandle::connect_port(ip_port_name, 0, Duration::ZERO);
+    if let Err(e) = connected {
+        // mythen.cpp:1300-1305 prints this on stdout and returns from the
+        // constructor: the port exists with only ADDriver's parameters.
+        println!(
+            "mythen:mythen: error calling pasynOctetSyncIO->connect, status={}, error={}",
+            e.status() as i32,
+            e.message_display()
+        );
+        return create_unconnected(claim, max_memory);
+    }
+    let ip_port = meter.port()?.clone();
+    let det = Arc::new(Detector::new(Transport::new(ip_port), port_name));
 
     let (start_tx, start_rx) = rt::command_channel::<()>(1);
     let driver = MythenDriver::new(port_name, det.clone(), max_memory, start_tx)?;
@@ -87,7 +107,48 @@ pub fn create_mythen_detector(
         runtime_handle,
         pool,
         output,
-        detector: det,
-        _task: task,
+        acquisition: Some(Acquisition {
+            detector: det,
+            _task: task,
+        }),
+    })
+}
+
+/// The `mythen` C leaves registered when its IP port is missing: `ADDriver`
+/// built, nothing of its own.
+struct UnconnectedDriver {
+    ad: ADDriverBase,
+}
+
+impl PortDriver for UnconnectedDriver {
+    fn base(&self) -> &PortDriverBase {
+        &self.ad.port_base
+    }
+
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.ad.port_base
+    }
+}
+
+fn create_unconnected(claim: &PortClaim, max_memory: usize) -> AsynResult<MythenRuntime> {
+    let ad = ADDriverBase::new(
+        claim.name(),
+        1,
+        SENSOR_SIZE_X,
+        SENSOR_SIZE_Y,
+        max_memory,
+        PortFlags {
+            multi_device: true,
+            ..ASYN_CANBLOCK
+        },
+    )?;
+    let pool = ad.pool.clone();
+    let (runtime_handle, _) =
+        create_port_runtime(claim, UnconnectedDriver { ad }, RuntimeConfig::default())?;
+    Ok(MythenRuntime {
+        runtime_handle,
+        pool,
+        output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        acquisition: None,
     })
 }

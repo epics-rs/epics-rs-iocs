@@ -108,7 +108,7 @@ pub struct OemAxis {
 impl OemAxis {
     /// Construct axis `axis_no` (0-based; unit address = axis_no + 1) and run the
     /// controller configuration sequence, matching the C `OEMAxis` constructor.
-    pub fn new(controller: Arc<Mutex<OemController>>, axis_no: usize) -> AsynResult<Self> {
+    pub fn new(controller: Arc<Mutex<OemController>>, axis_no: usize) -> Self {
         let axis = Self {
             controller,
             address: axis_no as i32 + 1,
@@ -117,8 +117,9 @@ impl OemAxis {
             position: 0.0,
             direction: false,
         };
-        axis.lock().configure(axis.address)?;
-        Ok(axis)
+        // C ignores configureController's status (OEMMotorDriver.cpp:208).
+        let _ = axis.lock().configure(axis.address);
+        axis
     }
 
     fn lock(&self) -> MutexGuard<'_, OemController> {
@@ -341,6 +342,13 @@ fn switch_from_is(is: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_axis_of_a_missing_port_is_still_built() {
+        let (handle, _) = SyncIOHandle::connect_port("OEM_NONE", 0, std::time::Duration::ZERO);
+        let controller = Arc::new(Mutex::new(OemController::new(handle)));
+        assert_eq!(OemAxis::new(controller, 0).address, 1);
+    }
 
     #[test]
     fn ramp_time_is_delta_v_over_a() {

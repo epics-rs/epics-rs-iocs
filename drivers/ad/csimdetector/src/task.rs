@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -139,9 +139,13 @@ async fn sim_task(mut ctx: CSimTaskContext) {
             .unwrap_or(0)
             + 1;
 
-        let now = EpicsTimestamp::now();
-        image.time_stamp = now.sec as f64 + now.nsec as f64 / 1.0e9;
-        image.timestamp = now;
+        image.time_stamp = EpicsTimestamp::now().as_f64();
+        image.timestamp = ctx
+            .handle
+            .update_time_stamp()
+            .await
+            .unwrap_or_else(|_| SystemTime::now())
+            .into();
         // DEVIATION: C calls `getAttributes(pImage->pAttributeList)` here. The
         // `NDAttributesFile` machinery lives in `NDArrayDriverBase`, which this
         // driver cannot use (it hardcodes `max_addr = 1`), so no attributes are

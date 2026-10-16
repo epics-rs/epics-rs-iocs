@@ -215,8 +215,10 @@ fn read_frame(ctx: &AcquisitionContext) -> Result<(ImageHeader, Vec<u8>), Abort>
     while payload.len() < header.data_len {
         let want = (header.data_len - payload.len()).min(MAX_MESSAGE_SIZE);
         let block = session.read_image_block(want).map_err(|e| {
-            ctx.handle.trace().output(
+            ctx.handle.trace().output_device(
                 ctx.handle.port_name(),
+                Some(0),
+                0,
                 TraceMask::ERROR,
                 &format!(
                     "PSL:getImage: error reading image, status={}, dataLen={}, nCopied={}, \
@@ -258,7 +260,15 @@ async fn publish_frame(
         Err(_) => return,
     };
 
-    let ts = EpicsTimestamp::now();
+    // C reads the clock for timeStamp, then takes the port's moved stamp as
+    // epicsTS (PSL.cpp:606-609).
+    let now = EpicsTimestamp::now();
+    let ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
     let dims: Vec<NDDimension> = header.dims().into_iter().map(NDDimension::new).collect();
     let n_dims = dims.len();
     let mut attributes = epics_rs::ad_core::attributes::NDAttributeList::new();
@@ -277,7 +287,7 @@ async fn publish_frame(
     };
     array.unique_id = unique_id;
     array.timestamp = ts;
-    array.time_stamp = ts.as_f64();
+    array.time_stamp = now.as_f64();
     array.attributes = attributes;
 
     set_params(

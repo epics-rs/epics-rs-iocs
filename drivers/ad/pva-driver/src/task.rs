@@ -119,8 +119,10 @@ async fn try_connect(
 
 /// `connectPv`'s exception line (pvaDriver.cpp:133).
 fn connect_error(handle: &PortHandle, e: &impl std::fmt::Display) {
-    handle.trace().output(
+    handle.trace().output_device(
         handle.port_name(),
+        Some(0),
+        0,
         TraceMask::ERROR,
         &format!("pvaDriver::connectPv exception initializing monitor: {e}"),
     );
@@ -296,8 +298,7 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
     let array = match decode_nt_nd_array(&ctx.pool, &raw) {
         Ok(a) => a,
         Err(ConvertError::PoolExhausted) => {
-            ctx.handle.trace().output(
-                ctx.handle.port_name(),
+            ctx.handle.trace().output_device(ctx.handle.port_name(), Some(0), 0,
                 TraceMask::ERROR,
                 &format!(
                     "pvaDriver::monitorEvent failed to alloc new NDArray - memory pool exhausted? (free: {})",
@@ -307,8 +308,10 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
             return;
         }
         Err(e) => {
-            ctx.handle.trace().output(
+            ctx.handle.trace().output_device(
                 ctx.handle.port_name(),
+                Some(0),
+                0,
                 TraceMask::ERROR,
                 &format!("pvaDriver::monitorEvent failed to convert NTNDArray into NDArray: {e}"),
             );

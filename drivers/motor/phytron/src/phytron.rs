@@ -78,7 +78,9 @@ use std::time::{Duration, Instant};
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::{atof, atoi, nint};
 
@@ -240,16 +242,28 @@ impl PhytronController {
 
     /// Reset the controller at boot (C constructor, unless `noResetAtBoot`):
     /// send `CR`, wait, then poll `S` until it answers (capped at 120 s). Never
-    /// fails construction — matches the C behaviour of logging and continuing.
-    pub fn reset_at_boot(&self) {
+    /// fails construction — matches the C behaviour of logging and continuing
+    /// on `pasynUserSelf` of controller port `name`.
+    pub fn reset_at_boot(&self, name: &str) {
+        let trace = MotorTrace::new(name, 0);
         if self.command("CR").is_err() {
-            eprintln!("phytron: could not reset controller");
+            trace.print_self(
+                TraceMask::WARNING,
+                format_args!(
+                    "phytronController::phytronController: Could not reset controller {name}\n"
+                ),
+            );
         }
         std::thread::sleep(Duration::from_secs(5));
         let started = Instant::now();
         while self.command("S").is_err() {
             if started.elapsed() >= Duration::from_secs(120) {
-                eprintln!("phytron: no valid answer after controller reset");
+                trace.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "phytronController::phytronController: no valid answer after controller reset {name}\n"
+                    ),
+                );
                 break;
             }
             std::thread::sleep(Duration::from_millis(500));

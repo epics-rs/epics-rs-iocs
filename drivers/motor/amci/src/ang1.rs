@@ -33,7 +33,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
 
-use crate::regs::ModbusRegs;
+use crate::regs::{ForceRead, ModbusRegs};
 
 /// C `DEFAULT_CONTROLLER_TIMEOUT`.
 const TIMEOUT: Duration = Duration::from_millis(2000);
@@ -70,18 +70,25 @@ fn unpack1000(upper: i16, lower: i16) -> i32 {
 
 /// Shared controller state: the in/out Modbus register handles.
 pub struct Ang1Controller {
+    /// C `inputDriver_`, which each axis connects its force-read user to.
+    in_port: String,
     in_regs: ModbusRegs,
     out_regs: ModbusRegs,
 }
 
 impl Ang1Controller {
     /// Connect the In/Out Modbus ports previously created by
-    /// `drvModbusAsynConfigure`.
-    pub fn new(in_port: &str, out_port: &str) -> Result<Self, String> {
-        Ok(Self {
-            in_regs: ModbusRegs::connect(in_port, TIMEOUT)?,
-            out_regs: ModbusRegs::connect(out_port, TIMEOUT)?,
-        })
+    /// `drvModbusAsynConfigure`. C keeps the controller either way; the
+    /// output connect's status, the only one C checks, is returned.
+    pub fn new(in_port: &str, out_port: &str) -> (Self, AsynResult<()>) {
+        let (in_regs, _) = ModbusRegs::connect(in_port, TIMEOUT);
+        let (out_regs, out_status) = ModbusRegs::connect(out_port, TIMEOUT);
+        let ctrl = Self {
+            in_port: in_port.to_string(),
+            in_regs,
+            out_regs,
+        };
+        (ctrl, out_status)
     }
 
     fn read16(&self, reg: i32) -> AsynResult<i32> {
@@ -114,15 +121,12 @@ impl Ang1Controller {
         let _ = self.write16(reg, upper);
         self.write16(reg + 1, lower)
     }
-
-    fn force_read(&self) -> AsynResult<()> {
-        self.in_regs.force_read()
-    }
 }
 
 /// One ANG1 axis. Implements [`AsynMotor`].
 pub struct Ang1Axis {
     controller: Arc<Mutex<Ang1Controller>>,
+    force_read: ForceRead,
     /// Last published status. C's poll reuses a single stale `read_val` on a
     /// failed read and always publishes; this carries forward the last value
     /// field-by-field for any read that fails in a cycle (see [`Self::poll`]).
@@ -138,8 +142,24 @@ impl Ang1Axis {
     /// ignores its status, so a transient link error at IOC boot cannot abort
     /// `ANG1CreateController` (which C always returns `asynSuccess` from).
     pub fn new(controller: Arc<Mutex<Ang1Controller>>, _axis_no: i32) -> Self {
+        let in_port = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_port
+            .clone();
+        let force_read = ForceRead::connect(&in_port, 0, TIMEOUT);
+        if !force_read.connected() {
+            println!(
+                "{in_port}: Error, unable to connect pasynUserForceRead_ to Modbus input driver"
+            );
+        }
+        println!(
+            "ANG1Axis::ANG1Axis : pasynUserForceRead_->reason={}",
+            force_read.reason()
+        );
         let mut ax = Self {
             controller,
+            force_read,
             last: MotorStatus {
                 gain_support: true,
                 ..MotorStatus::default()
@@ -322,7 +342,7 @@ impl AsynMotor for Ang1Axis {
         let last = self.last.clone();
 
         let ctrl = self.lock();
-        let _ = ctrl.force_read();
+        let _ = self.force_read.write();
 
         let position = ctrl.read32(POS_RD_UPR).map_or(last.position, |v| v as f64);
 
@@ -370,6 +390,14 @@ impl AsynMotor for Ang1Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_of_missing_ports_keeps_its_axes() {
+        let (ctrl, out_status) = Ang1Controller::new("ang1MissingIn", "ang1MissingOut");
+        assert!(out_status.is_err());
+        let ax = Ang1Axis::new(Arc::new(Mutex::new(ctrl)), 0);
+        assert!(ax.lock().read16(STATUS_1).is_err());
+    }
 
     #[test]
     fn pack1000_exact_multiple() {

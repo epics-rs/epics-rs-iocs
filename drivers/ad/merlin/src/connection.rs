@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -87,13 +87,13 @@ impl From<AsynError> for ChannelError {
 
 /// A framed MPX channel on top of one asyn octet port.
 pub struct MpxConnection {
-    handle: PortHandle,
+    io: SyncIOHandle,
     max_frame: usize,
 }
 
 impl MpxConnection {
-    pub fn new(handle: PortHandle, max_frame: usize) -> Self {
-        Self { handle, max_frame }
+    pub fn new(io: SyncIOHandle, max_frame: usize) -> Self {
+        Self { io, max_frame }
     }
 
     fn user(&self, timeout: Duration) -> AsynUser {
@@ -102,9 +102,7 @@ impl MpxConnection {
 
     /// C prints these on the asynUser of the socket being read or written.
     pub(crate) fn trace(&self, msg: &str) {
-        self.handle
-            .trace()
-            .output(self.handle.port_name(), TraceMask::ERROR, msg);
+        self.io.print(0, TraceMask::ERROR, format_args!("{msg}"));
     }
 
     /// Read exactly `count` more bytes into `out`. `Err(None)` is C's read
@@ -121,13 +119,16 @@ impl MpxConnection {
             // a 0x0A byte inside a pixel payload cannot terminate it early —
             // MPX frames are length-delimited, never EOS-delimited.
             let result = self
-                .handle
-                .submit_blocking(
-                    RequestOp::OctetReadBinary {
-                        buf_size: want - out.len(),
-                    },
-                    self.user(timeout),
-                )
+                .io
+                .port()
+                .and_then(|handle| {
+                    handle.submit_blocking(
+                        RequestOp::OctetReadBinary {
+                            buf_size: want - out.len(),
+                        },
+                        self.user(timeout),
+                    )
+                })
                 .map_err(|e| Some(e.into()))?;
             let chunk = result.data.unwrap_or_default();
             if chunk.is_empty() {
@@ -236,12 +237,14 @@ impl MpxConnection {
     ) -> Result<Vec<u8>, ChannelError> {
         let msg = protocol::encode(kind, name, value)?;
         // C `mpxWrite` reports a failed write and still reads the reply.
-        if let Err(e) = self.handle.submit_blocking(
-            RequestOp::OctetWrite {
-                data: msg.as_bytes().to_vec(),
-            },
-            self.user(timeout),
-        ) {
+        if let Err(e) = self.io.port().and_then(|handle| {
+            handle.submit_blocking(
+                RequestOp::OctetWrite {
+                    data: msg.as_bytes().to_vec(),
+                },
+                self.user(timeout),
+            )
+        }) {
             self.trace(&format!(
                 "merlinDetector:mpxWrite, status={}, sent\n{msg}",
                 ChannelError::from(e).code()

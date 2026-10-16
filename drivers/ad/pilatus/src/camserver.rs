@@ -14,10 +14,11 @@ use std::time::Instant;
 
 use epics_rs::ad_core::driver::{ADStatus, ShutterMode};
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::asyn::error::{AsynError, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::request::{ParamSetValue, RequestOp, RequestResult};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -43,8 +44,9 @@ struct Batch {
 pub struct Ctx {
     /// This driver's own port (parameter library).
     handle: PortHandle,
-    /// The camserver octet port created by `drvAsynIPPortConfigure`.
-    cam_port: PortHandle,
+    /// C `pasynUserCamserver`: the user of the camserver octet port, which has
+    /// no port when the startup script named one that does not exist.
+    cam_port: Arc<SyncIOHandle>,
     pub ad: ADBaseParams,
     pub p: PilatusParams,
     pub stop: Arc<Event>,
@@ -70,7 +72,7 @@ fn classify(err: &AsynError) -> CamStatus {
 impl Ctx {
     pub fn new(
         handle: PortHandle,
-        cam_port: PortHandle,
+        cam_port: Arc<SyncIOHandle>,
         ad: ADBaseParams,
         p: PilatusParams,
         stop: Arc<Event>,
@@ -129,11 +131,21 @@ impl Ctx {
         let _ = self.handle.set_params_and_notify(0, updates).await;
     }
 
+    /// C `updateTimeStamps`' stamp: the port's, moved now
+    /// (asynNDArrayDriver.cpp:832-836).
+    pub async fn update_time_stamp(&self) -> epics_rs::ad_core::timestamp::EpicsTimestamp {
+        self.handle
+            .update_time_stamp()
+            .await
+            .unwrap_or_else(|_| std::time::SystemTime::now())
+            .into()
+    }
+
     /// An `asynPrint` on `pasynUserSelf`.
     pub fn trace(&self, mask: TraceMask, msg: &str) {
         self.handle
             .trace()
-            .output(self.handle.port_name(), mask, msg);
+            .output_device(self.handle.port_name(), Some(0), 0, mask, msg);
     }
 
     /// Flush pending writes so a following read observes them. The actor
@@ -168,21 +180,23 @@ impl Ctx {
 
     // --- camserver ---------------------------------------------------------
 
+    async fn cam_submit(&self, op: RequestOp, user: AsynUser) -> AsynResult<RequestResult> {
+        self.cam_port.port()?.submit_async(op, user).await
+    }
+
     /// C `writeCamserver`: flush stale input, write, then publish the command
     /// on `ADStringToServer` regardless of the write status.
     pub async fn cam_write(&mut self, cmd: &str, timeout: f64) -> CamStatus {
         self.to = cmd.to_string();
         let _ = self
-            .cam_port
-            .submit_async(RequestOp::Flush, AsynUser::default().with_addr(CAM_ADDR))
+            .cam_submit(RequestOp::Flush, AsynUser::default().with_addr(CAM_ADDR))
             .await;
 
         let user = AsynUser::default()
             .with_addr(CAM_ADDR)
             .with_timeout(secs(timeout));
         let status = match self
-            .cam_port
-            .submit_async(
+            .cam_submit(
                 RequestOp::OctetWrite {
                     data: cmd.as_bytes().to_vec(),
                 },
@@ -220,8 +234,7 @@ impl Ctx {
                 .with_addr(CAM_ADDR)
                 .with_timeout(secs(ASYN_POLL_TIME));
             status = match self
-                .cam_port
-                .submit_async(
+                .cam_submit(
                     RequestOp::OctetRead {
                         buf_size: MAX_MESSAGE_SIZE,
                     },
@@ -268,8 +281,7 @@ impl Ctx {
         // C prints these on pasynUserCamserver.
         let cam_trace = |msg: &str| {
             self.cam_port
-                .trace()
-                .output(self.cam_port.port_name(), TraceMask::ERROR, msg);
+                .print(0, TraceMask::ERROR, format_args!("{msg}"));
         };
         if status != CamStatus::Success {
             cam_trace(&format!(

@@ -349,9 +349,8 @@ impl NdStdArraysDriver {
         snapshot.attributes = current.attributes.clone();
         snapshot.codec = current.codec.clone();
         snapshot.unique_id = counter;
-        let now = EpicsTimestamp::now();
-        snapshot.time_stamp = now.sec as f64 + now.nsec as f64 / 1.0e9;
-        snapshot.timestamp = now;
+        snapshot.time_stamp = EpicsTimestamp::now().as_f64();
+        snapshot.timestamp = self.ad.port_base.update_time_stamp().into();
         // DEVIATION: C calls getAttributes(pArray->pAttributeList) here; the
         // NDAttributesFile machinery is not wired for this driver, so only the
         // ColorMode attribute added at allocation is attached.

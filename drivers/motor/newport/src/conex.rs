@@ -38,7 +38,9 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use crate::util::{leading_hex, parse_int_at, parse_value_at};
 
@@ -312,7 +314,8 @@ impl ConexAxis {
     ///
     /// Performs blocking serial I/O; call it where that is acceptable (the
     /// iocsh create command, at IOC init). `None` only when `VE` fails.
-    pub fn new(handle: SyncIOHandle, controller_id: i32) -> Option<Self> {
+    /// `trace` is C's `pasynUserSelf`.
+    pub fn new(handle: SyncIOHandle, controller_id: i32, trace: &MotorTrace) -> Option<Self> {
         // C writeReadController status is ignored past VE, and a failed read
         // leaves an empty reply that atof reads as 0.
         let reply =
@@ -322,14 +325,22 @@ impl ConexAxis {
         // Firmware version → model. C reads `&inString_[4]` for the VE reply
         // and creates neither the axis nor the poller when VE fails.
         let Ok(version_resp) = write_read_raw(&handle, &query(controller_id, "VE")) else {
-            eprintln!(
-                "AG_CONEXController::AG_CONEXController: cannot read version information from AG_CONEX controller"
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "AG_CONEXController::AG_CONEXController: cannot read version information from AG_CONEX controller\n"
+                ),
             );
             return None;
         };
         let version = version_resp.get(4..).unwrap_or("");
         let Some(model) = ConexModel::from_version(version) else {
-            eprintln!("AG_CONEXAxis::AG_CONEXAxis: unknown model, firmware string={version}");
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "AG_CONEXAxis::AG_CONEXAxis: unknown model, firmware string={version}\n"
+                ),
+            );
             return Some(Self {
                 handle,
                 controller_id,

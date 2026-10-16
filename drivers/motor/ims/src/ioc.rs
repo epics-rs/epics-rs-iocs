@@ -12,14 +12,14 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use epics_rs::asyn::asyn_record::get_port;
-use motor_common::connect::{EosRefusal, connect_with_eos};
+use epics_rs::asyn::sync_io::SyncIOHandle;
+use motor_common::connect::set_eos_ignored;
 use motor_common::iocsh::{
     arg_double_opt, arg_str_opt, arg_str_req, opt_double, opt_string, req_string,
 };
 use motor_common::{asyn_user, install, register_port};
 
-use crate::mdriveplus::{INPUT_EOS, ImsMDrivePlusAxis, OUTPUT_EOS};
+use crate::mdriveplus::{DRIVER_NAME, INPUT_EOS, ImsMDrivePlusAxis, OUTPUT_EOS};
 
 /// C `IMS_TIMEOUT` (ImsMDrivePlusMotorAxis.h:17).
 const IMS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,22 +45,23 @@ pub fn ims_create_controller_command() -> CommandDef {
             let moving_poll_ms = opt_double(args, 3, 0.0, "Moving poll period (ms)")?;
             let idle_poll_ms = opt_double(args, 4, 0.0, "Idle poll period (ms)")?;
 
-            let handle = connect_with_eos(
-                &io_port,
-                IMS_TIMEOUT,
-                INPUT_EOS,
-                OUTPUT_EOS,
-                EosRefusal::Ignored,
-            )?;
+            register_port(ctx, &motor_port, 1)?;
+            // C prints and carries on with the user of a missing port
+            // (ImsMDrivePlusMotorController.cpp:69-74).
+            let (handle, connected) = SyncIOHandle::connect_port(&io_port, 0, IMS_TIMEOUT);
+            if connected.is_err() {
+                println!(
+                    "\n\n{DRIVER_NAME}:ImsMDrivePlusMotorController(): ERROR connecting to \
+                     Controller's IO port={io_port}\n"
+                );
+            }
             println!(
-                "ImsMDrivePlusMotorDriver:ImsMDrivePlusMotorController(): motorPortName={motor_port}, \
+                "{DRIVER_NAME}:ImsMDrivePlusMotorController(): motorPortName={motor_port}, \
                  IOPortName={io_port}, devName={device_name} "
             );
-            let port =
-                get_port(&io_port).ok_or_else(|| format!("IP port '{io_port}' not found"))?;
-            let axis = ImsMDrivePlusAxis::new(handle, &port.handle, &motor_port, device_name);
+            set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
+            let axis = ImsMDrivePlusAxis::new(handle, &motor_port, device_name);
 
-            register_port(ctx, &motor_port, 1)?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             install(
                 ctx,

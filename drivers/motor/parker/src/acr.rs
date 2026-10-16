@@ -117,8 +117,9 @@ pub struct AcrAxis {
     controller: Arc<Mutex<AcrController>>,
     /// Axis name used in commands (`AXIS<n>`).
     name: String,
-    /// Pulses per engineering unit (read from the controller).
-    pulses_per_unit: f64,
+    /// Pulses per engineering unit (read from the controller); `None` when
+    /// the constructor's `PPU` query failed and C left `pulsesPerUnit_` unset.
+    pulses_per_unit: Option<f64>,
     encoder_pos_reg: i32,
     theory_pos_reg: i32,
     limits_reg: i32,
@@ -127,36 +128,41 @@ pub struct AcrAxis {
 
 impl AcrAxis {
     /// Construct axis `axis_no` and read its `PPU`, matching the C `ACRAxis`
-    /// constructor register layout. Blocking I/O; errors if `PPU` is unreadable
-    /// or non-positive.
-    pub fn new(controller: Arc<Mutex<AcrController>>, axis_no: usize) -> AsynResult<Self> {
+    /// constructor register layout. Blocking I/O. As C, whatever `PPU`
+    /// answers is kept and a failed query keeps the axis
+    /// (ACRMotorDriver.cpp:297-306).
+    pub fn new(controller: Arc<Mutex<AcrController>>, axis_no: usize) -> Self {
         let axis_no = axis_no as i32;
         let name = format!("AXIS{axis_no}");
-        let ppu = {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            atof(&ctrl.query(&format!("{name} PPU"))?)
-        };
-        if ppu <= 0.0 {
-            return Err(acr_err(format!("{name}: invalid PPU {ppu}")));
-        }
-        Ok(Self {
+        let reply = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .query(&format!("{name} PPU"));
+        let pulses_per_unit = reply.ok().map(|reply| atof(&reply));
+        Self {
             controller,
             name,
-            pulses_per_unit: ppu,
+            pulses_per_unit,
             encoder_pos_reg: 12290 + 256 * axis_no,
             theory_pos_reg: 12294 + 256 * axis_no,
             limits_reg: 4600 + axis_no,
             flags_reg: 4120 + axis_no,
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, AcrController> {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Convert an engineering value to controller units (÷ PPU).
-    fn scaled(&self, value: f64) -> f64 {
-        value / self.pulses_per_unit
+    /// Convert an engineering value to controller units (÷ PPU). C divides by
+    /// an uninitialised `pulsesPerUnit_` when its PPU query failed, and sends
+    /// `inf` for a PPU of 0; both C defects refuse the command instead.
+    fn scaled(&self, value: f64) -> AsynResult<f64> {
+        match self.pulses_per_unit {
+            None => Err(acr_err(format!("{}: PPU was never read", self.name))),
+            Some(0.0) => Err(acr_err(format!("{}: PPU is 0", self.name))),
+            Some(ppu) => Ok(value / ppu),
+        }
     }
 
     /// Write the common jog acceleration and velocity for a motion command.
@@ -169,9 +175,9 @@ impl AcrAxis {
         ctrl.write_only(&format!(
             "{} JOG ACC {}",
             self.name,
-            self.scaled(acceleration)
+            self.scaled(acceleration)?
         ))?;
-        ctrl.write_only(&format!("{} JOG VEL {}", self.name, self.scaled(velocity)))
+        ctrl.write_only(&format!("{} JOG VEL {}", self.name, self.scaled(velocity)?))
     }
 }
 
@@ -195,7 +201,7 @@ impl AsynMotor for AcrAxis {
         ctrl.write_only(&format!(
             "{CTL_Y}:{} JOG ABS {}",
             self.name,
-            self.scaled(position)
+            self.scaled(position)?
         ))
     }
 
@@ -212,7 +218,7 @@ impl AsynMotor for AcrAxis {
         ctrl.write_only(&format!(
             "{CTL_Y}:{} JOG INC {}",
             self.name,
-            self.scaled(distance)
+            self.scaled(distance)?
         ))
     }
 
@@ -261,7 +267,7 @@ impl AsynMotor for AcrAxis {
 
     fn set_position(&mut self, _user: &AsynUser, position: f64) -> AsynResult<()> {
         let ctrl = self.lock();
-        ctrl.write_only(&format!("{} RES {}", self.name, self.scaled(position)))?;
+        ctrl.write_only(&format!("{} RES {}", self.name, self.scaled(position)?))?;
         ctrl.write_only(&format!("{} JOG REN", self.name))
     }
 
@@ -303,8 +309,9 @@ impl AsynMotor for AcrAxis {
             velocity: 0.0,
             done: !moving,
             moving,
-            has_encoder: true,
-            gain_support: true,
+            // C sets these only when the constructor read PPU.
+            has_encoder: self.pulses_per_unit.is_some(),
+            gain_support: self.pulses_per_unit.is_some(),
             high_limit,
             low_limit,
             home: at_home,
@@ -318,12 +325,39 @@ impl AsynMotor for AcrAxis {
 mod tests {
     use super::*;
 
+    /// A failed PPU query keeps the axis with no encoder or gain support and
+    /// refuses motion rather than dividing by an unset PPU.
+    #[test]
+    fn an_axis_of_a_missing_port_is_kept_and_never_scales() {
+        let (handle, _) = SyncIOHandle::connect_port("ACR_NONE", 0, std::time::Duration::ZERO);
+        let controller = Arc::new(Mutex::new(AcrController::new(handle)));
+        let mut axis = AcrAxis::new(controller, 0);
+        assert_eq!(axis.pulses_per_unit, None);
+        let e = axis
+            .move_absolute(&AsynUser::new(0), 1.0, 0.0, 1.0, 1.0)
+            .unwrap_err();
+        assert_eq!(e.message(), "AXIS0: PPU was never read");
+        assert!(axis.poll(&AsynUser::new(0)).is_err());
+    }
+
     #[test]
     fn register_layout_matches_c() {
         // encoder=12290+256n, theory=12294+256n, limits=4600+n, flags=4120+n.
         let ax = |n: i32| (12290 + 256 * n, 12294 + 256 * n, 4600 + n, 4120 + n);
         assert_eq!(ax(0), (12290, 12294, 4600, 4120));
         assert_eq!(ax(2), (12802, 12806, 4602, 4122));
+    }
+
+    /// C keeps any PPU it reads; a 0 refuses scaling instead of sending `inf`,
+    /// and a negative PPU scales as C does.
+    #[test]
+    fn a_zero_ppu_never_scales() {
+        let (handle, _) = SyncIOHandle::connect_port("ACR_PPU0", 0, std::time::Duration::ZERO);
+        let mut axis = AcrAxis::new(Arc::new(Mutex::new(AcrController::new(handle))), 0);
+        axis.pulses_per_unit = Some(0.0);
+        assert_eq!(axis.scaled(1.0).unwrap_err().message(), "AXIS0: PPU is 0");
+        axis.pulses_per_unit = Some(-4.0);
+        assert_eq!(axis.scaled(2.0).unwrap(), -0.5);
     }
 
     #[test]

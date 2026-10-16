@@ -40,7 +40,7 @@ use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
 
-use crate::regs::ModbusRegs;
+use crate::regs::{ForceRead, ModbusRegs};
 
 /// C `AXIS_REG_OFFSET` — asyn-address stride per axis on both ports.
 pub const AXIS_REG_OFFSET: i32 = 10;
@@ -71,6 +71,8 @@ const ZERO5: [i32; 5] = [0; 5];
 /// axis-created gate (C `axesCreated_`, guards `poll` until every axis
 /// configured on the controller has been constructed).
 pub struct Anf2Controller {
+    /// C `inputDriver_`, which each axis connects its force-read user to.
+    in_port: String,
     in_regs: ModbusRegs,
     out_regs: ModbusRegs,
     num_axes: usize,
@@ -80,14 +82,20 @@ pub struct Anf2Controller {
 impl Anf2Controller {
     /// Connect the In/Out Modbus ports previously created by
     /// `drvModbusAsynConfigure` (C constructor's `pasynInt32SyncIO`/
-    /// `pasynInt32ArraySyncIO` connect loop).
-    pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> Result<Self, String> {
-        Ok(Self {
-            in_regs: ModbusRegs::connect(in_port, TIMEOUT)?,
-            out_regs: ModbusRegs::connect(out_port, TIMEOUT)?,
+    /// `pasynInt32ArraySyncIO` connect loop). C keeps the controller either
+    /// way; the status of the last output connect, the only one C checks, is
+    /// returned, and is success when the loop has no axis to run.
+    pub fn new(in_port: &str, out_port: &str, num_axes: usize) -> (Self, AsynResult<()>) {
+        let (in_regs, _) = ModbusRegs::connect(in_port, TIMEOUT);
+        let (out_regs, out_status) = ModbusRegs::connect(out_port, TIMEOUT);
+        let ctrl = Self {
+            in_port: in_port.to_string(),
+            in_regs,
+            out_regs,
             num_axes,
             axes_created: 0,
-        })
+        };
+        (ctrl, if num_axes == 0 { Ok(()) } else { out_status })
     }
 
     fn read16(&self, axis_no: i32, reg: i32) -> AsynResult<i32> {
@@ -108,16 +116,13 @@ impl Anf2Controller {
         self.out_regs
             .write_array(axis_no * AXIS_REG_OFFSET, data.to_vec())
     }
-
-    fn force_read(&self) -> AsynResult<()> {
-        self.in_regs.force_read()
-    }
 }
 
 /// One ANF2 axis. Implements [`AsynMotor`].
 pub struct Anf2Axis {
     controller: Arc<Mutex<Anf2Controller>>,
     axis_no: i32,
+    force_read: ForceRead,
     /// C `baseSpeed_` — used by [`Self::correct_accel`].
     base_speed: i32,
     /// C `jogging_` — `stop` skips the hold-move write while a jog is active.
@@ -137,17 +142,30 @@ pub struct Anf2Axis {
 
 impl Anf2Axis {
     /// C `ANF2Axis::ANF2Axis`: send the configuration array, decode the
-    /// has-encoder bits, and zero the position. Performs blocking I/O.
+    /// has-encoder bits, and zero the position. Performs blocking I/O. C
+    /// ignores every status here, so the axis is always built and counted.
     pub fn new(
         controller: Arc<Mutex<Anf2Controller>>,
         axis_no: i32,
         config: i32,
         base_speed: i32,
         homing_timeout: i32,
-    ) -> AsynResult<Self> {
+    ) -> Self {
+        let in_port = controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_port
+            .clone();
+        let force_read = ForceRead::connect(&in_port, axis_no * AXIS_REG_OFFSET, TIMEOUT);
+        if !force_read.connected() {
+            println!(
+                "{in_port}: Error, unable to connect pasynUserForceRead_ to Modbus input driver"
+            );
+        }
         let mut ax = Self {
             controller,
             axis_no,
+            force_read,
             base_speed,
             jogging: false,
             has_encoder: false,
@@ -164,7 +182,7 @@ impl Anf2Axis {
         conf_reg[CONFIGURATION] = config;
         conf_reg[BASE_SPEED] = base_speed;
         conf_reg[HOME_TIMEOUT] = homing_timeout << 16;
-        ax.lock().write_array(ax.axis_no, &conf_reg)?;
+        let _ = ax.lock().write_array(ax.axis_no, &conf_reg);
 
         sleep(Duration::from_millis(50));
 
@@ -172,11 +190,11 @@ impl Anf2Axis {
         // feedback configured (config bits 24/25).
         ax.has_encoder = (config & 0x0100_0000) != 0 || (config & 0x0200_0000) != 0;
 
-        ax.set_position(&AsynUser::new(0), 0.0)?;
+        let _ = ax.set_position(&AsynUser::new(0), 0.0);
 
         ax.lock().axes_created += 1;
 
-        Ok(ax)
+        ax
     }
 
     fn lock(&self) -> MutexGuard<'_, Anf2Controller> {
@@ -389,7 +407,7 @@ impl AsynMotor for Anf2Axis {
         // `read_val`), and always return Ok so the framework publishes.
         let last = self.last.clone();
 
-        let _ = ctrl.force_read();
+        let _ = self.force_read.write();
 
         let position = ctrl
             .read32(self.axis_no, POS_RD_UPR)
@@ -466,6 +484,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn axes_of_missing_ports_are_built_and_counted() {
+        let (ctrl, out_status) = Anf2Controller::new("anf2MissingIn", "anf2MissingOut", 1);
+        assert!(out_status.is_err());
+        let ctrl = Arc::new(Mutex::new(ctrl));
+        let axis = Anf2Axis::new(ctrl.clone(), 0, 0x0100_0000, 1, 0);
+        assert!(axis.has_encoder);
+        assert_eq!(ctrl.lock().unwrap().axes_created, 1);
+    }
+
+    #[test]
     fn send_accel_and_velocity_clamps_and_packs() {
         let mut reg = ZERO5;
         Anf2Axis::send_accel_and_velocity(&mut reg, 500_000.0, 2_000_000.0);
@@ -491,5 +519,15 @@ mod tests {
         let corrected = Anf2Axis::correct_accel(500.0, 0.0, 2500.0, 1000.0);
         // accelTime = 2500 / 1000 = 2.5; corrected = (2500 - 500) / 2.5 = 800.
         assert!((corrected - 800.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_axis_forces_its_read_at_its_register_block() {
+        let (reason, taken) = crate::regs::fake::publish("anf2ForceReadIn");
+        crate::regs::fake::publish("anf2ForceReadOut");
+        let ctrl = Anf2Controller::new("anf2ForceReadIn", "anf2ForceReadOut", 1).0;
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 2, 0, 1, 0);
+        ax.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(*taken.lock().unwrap(), [(reason, 2 * AXIS_REG_OFFSET)]);
     }
 }

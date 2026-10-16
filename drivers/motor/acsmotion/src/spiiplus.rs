@@ -199,10 +199,9 @@ pub struct SpiiPlusController {
 
 impl SpiiPlusController {
     /// Connect and identify a SPiiPlus controller (C `SPiiPlusController`
-    /// constructor): probe `?VR` (retry up to 3 times) and read the firmware
-    /// version. `num_axes` comes from the config command. Performs blocking
-    /// octet I/O.
-    pub fn new(handle: SyncIOHandle, port: &str, num_axes: usize) -> AsynResult<Self> {
+    /// constructor): read the firmware version (`?VR`). `num_axes` comes
+    /// from the config command. Performs blocking octet I/O.
+    pub fn new(handle: SyncIOHandle, port: &str, num_axes: usize) -> Self {
         let mut ctrl = Self {
             handle,
             port: port.to_string(),
@@ -211,21 +210,10 @@ impl SpiiPlusController {
             num_axes,
             homing: vec![Homing::default(); num_axes],
         };
-
-        let mut probed = false;
-        for _ in 0..3 {
-            if let Ok(v) = ctrl.exchange("writeReadStr", "?VR")
-                && !v.is_empty()
-            {
-                ctrl.ident = v;
-                probed = true;
-                break;
-            }
-        }
-        if !probed {
-            return Err(spiiplus_err("SPiiPlus: no valid response to ?VR probe"));
-        }
-        Ok(ctrl)
+        // C reads ?VR once and ignores the status: a controller that does not
+        // answer still gets its axes (SPiiPlusDriver.cpp:144-146).
+        ctrl.ident = ctrl.exchange("writeReadStr", "?VR").unwrap_or_default();
+        ctrl
     }
 
     /// The firmware version string (`?VR`).
@@ -627,6 +615,21 @@ impl ControllerParams for AcsMotionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_of_a_missing_port_keeps_its_axes() {
+        let (handle, status) = SyncIOHandle::connect_port(
+            "spiiplus-missing-port",
+            0,
+            std::time::Duration::from_millis(10),
+        );
+        assert!(status.is_err());
+        let ctrl = Arc::new(Mutex::new(SpiiPlusController::new(handle, "ACS", 2)));
+        assert_eq!(ctrl.lock().unwrap().ident(), "");
+        let axis = SpiiPlusAxis::new(ctrl, 1, false);
+        assert_eq!(axis.axis, 1);
+        assert!(!axis.reduced);
+    }
 
     #[test]
     fn home_code_resolves_method_and_direction() {

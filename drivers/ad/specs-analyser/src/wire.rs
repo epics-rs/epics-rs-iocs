@@ -18,8 +18,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use epics_rs::asyn::error::AsynError;
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::codec::{
@@ -120,7 +120,8 @@ pub struct OrdinateRange {
 /// EPICS param store's own consistency is already serialised by the port
 /// actor, independent of this lock.
 pub struct WireLink<'a> {
-    pub driver_port: &'a PortHandle,
+    /// C `portUser_`, unconnected when st.cmd named a missing port.
+    pub driver_port: &'a SyncIOHandle,
     pub addr: i32,
     pub wire_state: &'a Mutex<u32>,
     pub connected: &'a AtomicBool,
@@ -152,6 +153,8 @@ impl WireLink<'_> {
 
         let result = self
             .driver_port
+            .port()
+            .map_err(WireError::Io)?
             .submit_blocking(
                 RequestOp::OctetWriteRead {
                     data: request.into_bytes(),
@@ -170,6 +173,8 @@ impl WireLink<'_> {
             BeginOutcome::NeedsMore => loop {
                 let more = self
                     .driver_port
+                    .port()
+                    .map_err(WireError::Io)?
                     .submit_blocking(
                         RequestOp::OctetRead {
                             buf_size: MAX_MESSAGE_SIZE,

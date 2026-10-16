@@ -147,16 +147,26 @@ impl Mmc200Axis {
         controller: Arc<Mutex<Mmc200Controller>>,
         index: usize,
         ignore_limits: bool,
-    ) -> AsynResult<Self> {
+    ) -> Self {
         let axis_index = index as i32 + 1;
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
 
-        let version = ctrl.query(&format!("{axis_index}VER?"))?;
+        // C carries on past a failed query with `errorFlag` set and reports
+        // it as `motorStatusProblem_` (MMC200Driver.cpp:143-146, :263-266).
+        let mut error = false;
+        let mut query = |cmd: String| {
+            ctrl.query(&cmd).unwrap_or_else(|_| {
+                error = true;
+                String::new()
+            })
+        };
+
+        let version = query(format!("{axis_index}VER?"));
         let model = parse_model(&version);
 
         if model == MODEL_ETH {
             drop(ctrl);
-            return Ok(Self {
+            return Self {
                 controller,
                 axis_index,
                 model,
@@ -167,22 +177,25 @@ impl Mmc200Axis {
                     done: true,
                     ..MotorStatus::default()
                 },
-            });
+            };
         }
 
-        let vmx = ctrl.query(&format!("{axis_index}VMX?"))?;
+        let vmx = query(format!("{axis_index}VMX?"));
         let max_velocity = atof(vmx.get(1..).unwrap_or(""));
         drop(ctrl);
 
-        Ok(Self {
+        Self {
             controller,
             axis_index,
             model,
             active: true,
             max_velocity,
             ignore_limits,
-            last_status: MotorStatus::default(),
-        })
+            last_status: MotorStatus {
+                problem: error,
+                ..MotorStatus::default()
+            },
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Mmc200Controller> {
@@ -375,6 +388,16 @@ impl AsynMotor for Mmc200Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn an_axis_of_an_unanswering_controller_is_built_with_a_problem() {
+        let (handle, _) = SyncIOHandle::connect_port("MMC200_NONE", 0, Duration::ZERO);
+        let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
+        let axis = Mmc200Axis::new(controller, 0, false);
+        assert_eq!(axis.model, -1);
+        assert!(axis.last_status.problem);
+    }
 
     #[test]
     fn parse_model_recognizes_families() {

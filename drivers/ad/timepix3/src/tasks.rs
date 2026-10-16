@@ -68,7 +68,7 @@ impl Ctx {
     fn trace(&self, mask: TraceMask, line: &str) {
         self.handle
             .trace()
-            .output(self.handle.port_name(), mask, line);
+            .output_device(self.handle.port_name(), Some(0), 0, mask, line);
     }
 
     async fn set_int(&self, reason: usize, addr: i32, value: i32) {
@@ -1227,8 +1227,15 @@ async fn publish_image(
     ));
 
     array.unique_id = frame_number;
-    array.timestamp = EpicsTimestamp::now();
-    array.time_stamp = array.timestamp.as_f64();
+    // C reads the clock for timeStamp, then takes the port's moved stamp as
+    // epicsTS (serval_stream.cpp:1270-1273, updateTimeStamp).
+    array.time_stamp = EpicsTimestamp::now().as_f64();
+    array.timestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| SystemTime::now())
+        .into();
     array.attributes = attributes;
 
     ArrayPublisher::new(ctx.output.clone()).publish(array).await;

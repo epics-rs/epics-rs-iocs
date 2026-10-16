@@ -1,6 +1,6 @@
 //! Port of `simDetector::simTask` (simDetector.cpp:729-883).
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -122,8 +122,10 @@ impl SimTaskContext {
     async fn compute_image(&self, engine: &mut SimEngine) -> Result<DriverArray, &'static str> {
         let (mut cfg, read_ok) = self.sim.read_config(&self.handle, &self.ad).await;
         if !read_ok {
-            self.handle.trace().output(
+            self.handle.trace().output_device(
                 self.handle.port_name(),
+                Some(0),
+                0,
                 TraceMask::ERROR,
                 "simDetector:computeImage: error getting parameters",
             );
@@ -228,8 +230,10 @@ async fn sim_task(mut ctx: SimTaskContext) {
                 // task hot, recomputing with no delay. Instead report the failure
                 // via ADStatusError and end the acquisition, so the task returns
                 // to waiting for the next start event rather than busy-looping.
-                ctx.handle.trace().output(
+                ctx.handle.trace().output_device(
                     ctx.handle.port_name(),
+                    Some(0),
+                    0,
                     TraceMask::ERROR,
                     &format!("simDetector:computeImage: {e}"),
                 );
@@ -294,7 +298,13 @@ async fn sim_task(mut ctx: SimTaskContext) {
         image.unique_id = image_counter;
         // `updateTimeStamps` only stamps the NDArray; C's simDetector never
         // writes the NDTimeStamp / NDEpicsTSSec parameters.
-        image.update_time_stamps_now();
+        image.update_time_stamps(
+            ctx.handle
+                .update_time_stamp()
+                .await
+                .unwrap_or_else(|_| SystemTime::now())
+                .into(),
+        );
 
         let image = image.share();
         if array_callbacks {

@@ -11,7 +11,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::connect_serial;
+use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
 };
@@ -48,13 +48,20 @@ pub fn mmc200_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let ignore_limits = opt_int(args, 5, 0, "Ignore limit flag")? != 0;
 
-            let handle = connect_serial(&serial_port, MMC200_TIMEOUT)?;
+            register_port(ctx, &motor_port, num_axes as i32)?;
+
+            let (handle, _) = connect_controller(
+                &serial_port,
+                MMC200_TIMEOUT,
+                &motor_port,
+                format_args!(
+                    "MMC200Controller::MMC200Controller: cannot connect to MMC-200 controller"
+                ),
+            );
             let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
 
-            register_port(ctx, &motor_port, num_axes as i32)?;
             for index in 0..num_axes as usize {
-                let ax = Mmc200Axis::new(controller.clone(), index, ignore_limits)
-                    .map_err(|e| format!("MMC200CreateController: axis {index}: {e}"))?;
+                let ax = Mmc200Axis::new(controller.clone(), index, ignore_limits);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 install(
                     ctx,

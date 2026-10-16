@@ -61,9 +61,10 @@
 //! via `SAI?` (`PIGCSController::findConnectedAxes`), and creates
 //! `PIasynAxis` objects for the *first* `numAxes` of them, in discovery order
 //! — there is no explicit per-axis create command anywhere in this module.
-//! [`PIGCS2Controller::new`] mirrors that probe sequence exactly, and
-//! `ioc::pigcs2_config_command` mirrors the axis-count check (error if fewer
-//! axes were found than requested) and the first-N-in-order axis creation.
+//! [`PIGCS2Controller::read_idn`] and [`PIGCS2Controller::init`] mirror that
+//! probe sequence, and `ioc::pigcs2_config_command` mirrors the axis-count
+//! check (printed, no axes, if fewer were found than requested) and the
+//! first-N-in-order axis creation.
 //! `priority`/`stackSize` (OS thread-scheduling knobs) are dropped, matching
 //! every other port in this workspace (there is no OS thread to schedule).
 //!
@@ -228,6 +229,38 @@ fn status_mask_at(reply: &str, axis_no: usize) -> Option<u32> {
     leading_hex(mask_str)
 }
 
+/// C `PIGCSController::CreateGCSController`: whether the upper-cased `*IDN?`
+/// names a controller C creates a driver for.
+pub fn is_known_controller(idn: &str) -> bool {
+    const MODELS: [&str; 24] = [
+        "E-873.3QTU",
+        "C-663",
+        "C-863",
+        "C-867",
+        "C-884",
+        "E-861",
+        "E-871",
+        "E-873",
+        "E-517",
+        "E-518",
+        "C-885",
+        "E-753",
+        "E-754",
+        "E-709",
+        "E-712",
+        "E-725",
+        "E-727",
+        "E-755",
+        "C-702",
+        "HEXAPOD",
+        "F-HEX",
+        "F-206",
+        "M-8",
+        "C-887",
+    ];
+    MODELS.iter().any(|m| idn.contains(m))
+}
+
 /// Shared controller endpoint: owns the octet handle, identification,
 /// `VEL`-command support flag, and the discovered axis name list.
 pub struct PIGCS2Controller {
@@ -240,34 +273,40 @@ pub struct PIGCS2Controller {
 }
 
 impl PIGCS2Controller {
-    /// Connect and initialize a GCS2 controller (C `PIasynController`
-    /// constructor's probe sequence): read `*IDN?`, probe `VEL?` support, and
-    /// auto-discover connected axis names via `SAI?`. Performs blocking octet
-    /// I/O.
-    pub fn new(handle: SyncIOHandle, serial_port: &str) -> AsynResult<Self> {
-        let mut ctrl = Self {
+    /// C `new PIInterface(pAsynCom)`: no I/O until [`Self::read_idn`] and
+    /// [`Self::init`].
+    pub fn new(handle: SyncIOHandle, serial_port: &str) -> Self {
+        Self {
             handle,
             serial_port: serial_port.to_owned(),
             ident: String::new(),
             knows_vel: false,
             axis_names: Vec::new(),
-        };
+        }
+    }
 
-        ctrl.ident = ctrl.query("*IDN?")?;
+    /// The constructor's `*IDN?` into an emptied buffer: empty when the
+    /// exchange fails, whose status C ignores.
+    pub fn read_idn(&mut self) -> &str {
+        self.ident = self.query("*IDN?").unwrap_or_default();
+        &self.ident
+    }
 
+    /// C `PIGCSController::init`: probe `VEL?` and discover the axes with
+    /// `SAI?`. The constructor ignores its status, so a failed `SAI?` leaves
+    /// no axes.
+    pub fn init(&mut self) {
         // C only checks the transport status of the VEL? probe, not its
         // content (any real controller reply — even an error message — means
         // the round trip completed).
-        ctrl.knows_vel = match ctrl.query("VEL?") {
+        self.knows_vel = match self.query("VEL?") {
             Ok(_) => true,
             Err(_) => {
-                let _ = ctrl.get_gcs_error();
+                let _ = self.get_gcs_error();
                 false
             }
         };
-
-        ctrl.axis_names = ctrl.find_connected_axes()?;
-        Ok(ctrl)
+        self.axis_names = self.find_connected_axes().unwrap_or_default();
     }
 
     /// The controller identification string (`*IDN?`).
@@ -338,7 +377,8 @@ impl PIGCS2Controller {
             })
     }
 
-    fn print(&self, args: std::fmt::Arguments<'_>) {
+    /// `asynPrint(pAsynCom, ASYN_TRACE_ERROR, ...)`.
+    pub fn print(&self, args: std::fmt::Arguments<'_>) {
         PortManager::global().trace_manager().print(
             Some(&self.serial_port),
             Some(0),
@@ -442,10 +482,12 @@ impl PIGCS2Controller {
     }
 
     /// `TMN? {axis}` / `TMX? {axis}` -> `(negLimit, posLimit)`.
-    fn get_travel_limits(&self, axis: &str) -> AsynResult<(f64, f64)> {
-        let neg = get_value_f64(&self.query(&format!("TMN? {axis}"))?)?;
-        let pos = get_value_f64(&self.query(&format!("TMX? {axis}"))?)?;
-        Ok((neg, pos))
+    /// Each limit is stored as soon as it is read, so a failed `TMX?` keeps
+    /// the `TMN?` value, as C's reference out-parameters do.
+    fn get_travel_limits(&self, axis: &str, neg: &mut f64, pos: &mut f64) -> AsynResult<()> {
+        *neg = get_value_f64(&self.query(&format!("TMN? {axis}"))?)?;
+        *pos = get_value_f64(&self.query(&format!("TMX? {axis}"))?)?;
+        Ok(())
     }
 
     /// `LIM? {axis}`, falling back to `HAR? {axis}` when `LIM?` is false; a
@@ -590,46 +632,83 @@ pub struct PIGCS2Axis {
 }
 
 impl PIGCS2Axis {
-    /// Construct axis `axis_no` named `axis_name` (C `PIasynAxis::Init` +
-    /// `PIGCSMotorController::initAxis`): probe limit-switch/reference
-    /// capability, read the stage id (logged), enable the servo, and seed the
-    /// cached position/limits/homed state. Performs blocking octet I/O.
+    /// Construct axis `axis_no` named `axis_name` on controller port
+    /// `port_name` (C `PIasynAxis` + `PIasynAxis::Init`). C ignores every
+    /// status here: a failed `initAxis` step skips the rest of it, each later
+    /// read keeps its default, and the axis is always created.
     pub fn new(
         controller: Arc<Mutex<PIGCS2Controller>>,
         axis_name: String,
         axis_no: usize,
-    ) -> AsynResult<Self> {
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-
-        let has_limit_switches = ctrl.has_limit_switches(&axis_name)?;
-        let has_reference = ctrl.has_reference_sensor(&axis_name)?;
-        let stage_id = ctrl.stage_id(&axis_name)?;
-        println!("PIGCS2Axis: axis {axis_name} stage configuration: {stage_id}");
-        ctrl.set_servo(&axis_name, true)?;
-        let last_position = ctrl.get_axis_position(&axis_name)?;
-        let (low_limit, high_limit) = ctrl.get_travel_limits(&axis_name)?;
-        let homed = ctrl.get_referenced_state(&axis_name)?;
-        drop(ctrl);
-
-        Ok(Self {
+        port_name: &str,
+    ) -> Self {
+        println!("PIasynAxis::PIasynAxis() {axis_no}: {axis_name}");
+        let mut axis = Self {
             controller,
             axis_name,
             axis_no,
-            has_limit_switches,
-            has_reference,
-            homed,
+            has_limit_switches: false,
+            has_reference: false,
+            homed: false,
             is_homing: false,
-            servo_on: true,
+            servo_on: false,
             problem: false,
             moving: false,
             neg_limit: false,
             pos_limit: false,
-            last_position,
-            last_direction: true,
-            low_limit,
-            high_limit,
+            last_position: 0.0,
+            last_direction: false,
+            low_limit: 0.0,
+            high_limit: 0.0,
             max_acceleration: None,
-        })
+        };
+        let _ = axis.init_axis(port_name);
+        let ctrl = axis.lock();
+        let position = ctrl.get_axis_position(&axis.axis_name);
+        let (mut low_limit, mut high_limit) = (axis.low_limit, axis.high_limit);
+        let _ = ctrl.get_travel_limits(&axis.axis_name, &mut low_limit, &mut high_limit);
+        let homed = ctrl.get_referenced_state(&axis.axis_name);
+        drop(ctrl);
+        if let Ok(position) = position {
+            axis.last_position = position;
+        }
+        (axis.low_limit, axis.high_limit) = (low_limit, high_limit);
+        if let Ok(homed) = homed {
+            axis.homed = homed;
+        }
+        axis
+    }
+
+    /// C `PIGCSMotorController::initAxis`: stops at the first failure.
+    fn init_axis(&mut self, port_name: &str) -> AsynResult<()> {
+        let addr = self.axis_no as i32;
+        let flow = |args: std::fmt::Arguments<'_>| {
+            PortManager::global().trace_manager().print(
+                Some(port_name),
+                Some(addr),
+                0,
+                TraceMask::FLOW,
+                args,
+            )
+        };
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        self.has_limit_switches = ctrl.has_limit_switches(&self.axis_name)?;
+        flow(format_args!(
+            "PIGCSController::hasLimitSwitches() axis has {}limit switches\n",
+            if self.has_limit_switches { "" } else { "no " }
+        ));
+        self.has_reference = ctrl.has_reference_sensor(&self.axis_name)?;
+        flow(format_args!(
+            "PIGCSController::hasReferenceSwitch() axis has {}reference sensor\n",
+            if self.has_reference { "" } else { "no " }
+        ));
+        let stage_id = ctrl.stage_id(&self.axis_name)?;
+        flow(format_args!(
+            "PIGCSController::initAxis() stage configuration: {stage_id}\n"
+        ));
+        ctrl.set_servo(&self.axis_name, true)?;
+        self.servo_on = true;
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, PIGCS2Controller> {
@@ -785,9 +864,8 @@ impl AsynMotor for PIGCS2Axis {
         let position = ctrl
             .get_axis_position(&self.axis_name)
             .unwrap_or(self.last_position);
-        let (low_limit, high_limit) = ctrl
-            .get_travel_limits(&self.axis_name)
-            .unwrap_or((self.low_limit, self.high_limit));
+        let (mut low_limit, mut high_limit) = (self.low_limit, self.high_limit);
+        let _ = ctrl.get_travel_limits(&self.axis_name, &mut low_limit, &mut high_limit);
         drop(ctrl);
 
         self.moving = raw_moving;
@@ -1042,5 +1120,88 @@ mod tests {
         assert!(!done(true, false));
         assert!(!done(false, true), "homing alone must keep done false");
         assert!(!done(true, true));
+    }
+
+    #[test]
+    fn known_controllers_are_c_create_gcs_controllers_list() {
+        assert!(is_known_controller(
+            "(C)2015 PHYSIK INSTRUMENTE, C-863.11, 0, 1.0"
+        ));
+        assert!(is_known_controller("PI E-873.3QTU"));
+        assert!(is_known_controller("PI M-824"));
+        assert!(!is_known_controller("PI E-665"));
+        assert!(!is_known_controller(""));
+    }
+
+    /// Takes every write and never replies.
+    struct Silent(epics_rs::asyn::port::PortDriverBase);
+
+    impl epics_rs::asyn::port::PortDriver for Silent {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.0
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
+            Err(pigcs2_err("timeout"))
+        }
+    }
+
+    #[test]
+    fn a_silent_controller_reads_an_empty_idn_and_finds_no_axes() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = Silent(PortDriverBase::new("gcs2Silent", 1, PortFlags::default()));
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2Silent").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let mut ctrl = PIGCS2Controller::new(handle, "gcs2Silent");
+        assert_eq!(ctrl.read_idn(), "");
+        ctrl.init();
+        assert!(ctrl.axis_names().is_empty());
+    }
+
+    #[test]
+    fn an_axis_is_created_when_the_controller_does_not_answer() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = Silent(PortDriverBase::new(
+            "gcs2SilentAxis",
+            1,
+            PortFlags::default(),
+        ));
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("gcs2SilentAxis").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_millis(100),
+        );
+        let ctrl = PIGCS2Controller::new(handle, "gcs2SilentAxis");
+        let axis = PIGCS2Axis::new(Arc::new(Mutex::new(ctrl)), "1".into(), 0, "gcs2SilentAxis");
+        assert!(!axis.servo_on);
+        assert!(!axis.homed);
+        assert!(!axis.has_limit_switches);
+        assert_eq!((axis.low_limit, axis.high_limit), (0.0, 0.0));
     }
 }

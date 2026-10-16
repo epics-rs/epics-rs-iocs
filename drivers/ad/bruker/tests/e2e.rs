@@ -84,6 +84,11 @@ fn fake_bis(command: TcpListener, status: TcpListener) {
     });
 }
 
+/// The asynUser C's `pasynOctetSyncIO->connect` hands the driver.
+fn user(handle: PortHandle) -> SyncIOHandle {
+    SyncIOHandle::from_handle(handle, 0, Duration::ZERO)
+}
+
 fn ip_port(name: &str, addr: &str, input_eos: &[u8], output_eos: &[u8]) -> PortHandle {
     let mut driver = DrvAsynIPPort::new(name, addr).expect("ip port");
     // What `drvAsynIPPortConfigure` does before it starts the port: the EOS
@@ -126,9 +131,13 @@ impl Fixture {
         let command_port = ip_port(&format!("{name}_COMMAND"), &command_addr, b"]", b"\n");
         let status_port = ip_port(&format!("{name}_STATUS"), &status_addr, b"\n", b"");
 
-        let detector =
-            create_bruker_detector(&claim_port(name).unwrap(), command_port, status_port, 0)
-                .expect("the detector port");
+        let detector = create_bruker_detector(
+            &claim_port(name).unwrap(),
+            user(command_port),
+            user(status_port),
+            0,
+        )
+        .expect("the detector port");
 
         // The plugin: it takes every array the driver publishes and parks it
         // where the test thread can pick it up.
@@ -380,8 +389,8 @@ fn a_binning_write_does_not_depend_on_bis() {
     };
     let detector = create_bruker_detector(
         &claim_port("BISDEAD").unwrap(),
-        closed("BISDEAD_COMMAND"),
-        closed("BISDEAD_STATUS"),
+        user(closed("BISDEAD_COMMAND")),
+        user(closed("BISDEAD_STATUS")),
         0,
     )
     .expect("the detector port");
@@ -414,8 +423,8 @@ fn a_base_class_write_runs_both_base_class_write_int32s() {
     let name = "BISTRACE";
     let detector = create_bruker_detector(
         &claim_port(name).unwrap(),
-        closed("BISTRACE_COMMAND"),
-        closed("BISTRACE_STATUS"),
+        user(closed("BISTRACE_COMMAND")),
+        user(closed("BISTRACE_STATUS")),
         0,
     )
     .expect("the detector port");
@@ -456,4 +465,22 @@ fn a_scan_without_an_acquire_time_still_reaches_bis() {
         sent = fixture.string(ad.string_to_server);
     }
     assert!(sent.contains("/scantime=0.000000"), "last command {sent:?}");
+}
+
+/// C ignores both `pasynOctetSyncIO->connect` statuses (BISDetector.cpp:759-760),
+/// so a startup script naming socket ports that do not exist still boots the
+/// detector; only its BIS traffic fails.
+#[test]
+fn a_detector_whose_socket_ports_are_missing_still_boots() {
+    let (command, status) = SyncIOHandle::connect_port("BISNONE_COMMAND", 0, Duration::ZERO);
+    assert!(status.is_err());
+    let (status_user, status) = SyncIOHandle::connect_port("BISNONE_STATUS", 0, Duration::ZERO);
+    assert!(status.is_err());
+    let detector = create_bruker_detector(&claim_port("BISNONE").unwrap(), command, status_user, 0)
+        .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let ad = detector.ad_params;
+
+    sync.write_int32(ad.bin_x, 2).expect("binning 2");
+    assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
 }

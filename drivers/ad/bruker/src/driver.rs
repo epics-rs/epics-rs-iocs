@@ -17,6 +17,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -60,6 +61,8 @@ pub struct BrukerDetector {
     server: BisServer,
     shared: Arc<SharedState>,
     commands: rt::CommandSender<TaskCommand>,
+    /// C `BISTask`'s `fullFileName` local, kept across frames.
+    full_file_name: String,
 }
 
 impl BrukerDetector {
@@ -98,6 +101,7 @@ impl BrukerDetector {
             server,
             shared,
             commands,
+            full_file_name: String::new(),
         };
         det.ad.port_base.call_param_callbacks(0)?;
         Ok(det)
@@ -131,7 +135,7 @@ impl BrukerDetector {
 
     /// Build the next frame's file name (C `asynNDArrayDriver::createFileName`,
     /// which refuses when any of its five reads fails, asynNDArrayDriver.cpp:205-210).
-    fn create_file_name(&mut self) -> AsynResult<()> {
+    fn create_file_name(&mut self) -> AsynResult<String> {
         let p = self.ad.params.base;
         let base = &mut self.ad.port_base;
         let path = String::from_utf8_lossy(base.get_string_param(p.file_path, 0)?).into_owned();
@@ -142,11 +146,11 @@ impl BrukerDetector {
         let auto_increment = base.get_int32_param(p.auto_increment, 0)?;
 
         let full = filename::expand(&template, &path, &name, number);
-        base.set_string_param(p.full_file_name, 0, full)?;
+        base.set_string_param(p.full_file_name, 0, full.clone())?;
         if auto_increment != 0 {
             base.set_int32_param(p.file_number, 0, number + 1)?;
         }
-        Ok(())
+        Ok(full)
     }
 
     /// Name this frame's file and tell BIS to collect it (C `BISTask`'s
@@ -158,8 +162,11 @@ impl BrukerDetector {
     /// built from are read where they are owned.
     fn start_scan(&mut self) {
         // C ignores every status here (BISDetector.cpp:496-530): a failed
-        // name leaves the last one in NDFullFileName.
-        let _ = self.create_file_name();
+        // name leaves BISTask's fullFileName at the last one.
+        if let Ok(full) = self.create_file_name() {
+            self.full_file_name = full;
+        }
+        let file_name = self.full_file_name.clone();
 
         let p = self.ad.params;
         let frame_type =
@@ -170,13 +177,6 @@ impl BrukerDetector {
             .get_float64_param(p.acquire_time, 0)
             .unwrap_or(0.0);
         let num_darks = self.get_i32(self.params.num_darks);
-        let file_name = String::from_utf8_lossy(
-            self.ad
-                .port_base
-                .get_string_param(p.base.full_file_name, 0)
-                .unwrap_or_default(),
-        )
-        .into_owned();
 
         let _ = self
             .ad
@@ -355,12 +355,14 @@ impl BrukerRuntime {
 
 /// Create the detector port and start its two threads (C `BISDetectorConfig`).
 ///
-/// `command_handle` and `status_handle` are the two `drvAsynIPPort`s that reach
-/// BIS: one to send commands on and one BIS broadcasts its status on.
+/// `command_handle` and `status_handle` are the users of the two
+/// `drvAsynIPPort`s that reach BIS: one to send commands on and one BIS
+/// broadcasts its status on. C ignores both connect statuses
+/// (BISDetector.cpp:759-760), so either may be a user with no port.
 pub fn create_bruker_detector(
     claim: &PortClaim,
-    command_handle: PortHandle,
-    status_handle: PortHandle,
+    command_handle: SyncIOHandle,
+    status_handle: SyncIOHandle,
     max_memory: usize,
 ) -> AsynResult<BrukerRuntime> {
     let port_name = claim.name();

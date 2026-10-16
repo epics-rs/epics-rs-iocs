@@ -26,6 +26,7 @@ use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::codec::{self, BeginOutcome, ResponseAssembler};
@@ -44,7 +45,7 @@ pub struct Worker {
     /// This driver's own port (parameter library).
     pub self_handle: PortHandle,
     /// `driverPort_`.
-    pub driver_port: PortHandle,
+    pub driver_port: Arc<SyncIOHandle>,
     pub addr: i32,
     pub wire_state: Arc<Mutex<u32>>,
     pub connected: Arc<AtomicBool>,
@@ -179,6 +180,8 @@ impl Worker {
 
         let result = self
             .driver_port
+            .port()
+            .map_err(WireError::Io)?
             .submit_async(
                 RequestOp::OctetWriteRead {
                     data: request.into_bytes(),
@@ -198,6 +201,8 @@ impl Worker {
             BeginOutcome::NeedsMore => loop {
                 let more = self
                     .driver_port
+                    .port()
+                    .map_err(WireError::Io)?
                     .submit_async(
                         RequestOp::OctetRead {
                             buf_size: MAX_MESSAGE_SIZE,

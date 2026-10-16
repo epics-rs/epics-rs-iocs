@@ -19,6 +19,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -703,13 +704,15 @@ impl MerlinRuntime {
 
 /// Create the detector port and start its two tasks.
 ///
-/// `cmd_handle` and `data_handle` are the two `drvAsynIPPort`s the startup
-/// script created — the command socket and the data socket.
+/// `cmd_handle` and `data_handle` are the users of the two `drvAsynIPPort`s
+/// the startup script created — the command socket and the data socket. C
+/// ignores both connect statuses (merlinDetector.cpp:1398-1401), so either
+/// may be a user with no port.
 #[allow(clippy::too_many_arguments)]
 pub fn create_merlin_detector(
     claim: &PortClaim,
-    cmd_handle: PortHandle,
-    data_handle: PortHandle,
+    cmd_handle: SyncIOHandle,
+    data_handle: SyncIOHandle,
     max_size_x: i32,
     max_size_y: i32,
     det_type: DetectorType,
@@ -769,6 +772,8 @@ mod tests {
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::registry::claim_port;
+    use std::time::Duration;
+
     use epics_rs::asyn::sync_io::SyncIOHandle;
 
     /// A detector whose command socket never connects: the writes under test
@@ -787,7 +792,10 @@ mod tests {
         std::mem::forget(runtime);
         MerlinDetector::new(
             name,
-            MpxConnection::new(handle, MPX_MAXLINE),
+            MpxConnection::new(
+                SyncIOHandle::from_handle(handle, 0, Duration::ZERO),
+                MPX_MAXLINE,
+            ),
             512,
             512,
             DetectorType::MerlinQuad,
@@ -795,6 +803,31 @@ mod tests {
             Arc::new(SharedState::new()),
         )
         .unwrap()
+    }
+
+    /// C ignores both `pasynOctetSyncIO->connect` statuses
+    /// (merlinDetector.cpp:1398-1401): with neither socket port configured
+    /// the detector port still exists.
+    #[test]
+    fn a_detector_whose_socket_ports_are_missing_still_boots() {
+        let (cmd, status) = SyncIOHandle::connect_port("MERLIN_NONE_CMD", 0, Duration::ZERO);
+        assert!(status.is_err());
+        let (data, status) = SyncIOHandle::connect_port("MERLIN_NONE_DATA", 0, Duration::ZERO);
+        assert!(status.is_err());
+        let rt = create_merlin_detector(
+            &claim_port("MERLIN_NONE").unwrap(),
+            cmd,
+            data,
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+        )
+        .expect("the detector port");
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let p = rt.ad_params;
+        sync.write_int32(p.num_images, 3).unwrap();
+        assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
     }
 
     #[test]
@@ -904,7 +937,10 @@ mod tests {
             create_port_runtime(&claim_port(name).unwrap(), det, RuntimeConfig::default()).unwrap();
         let handle = runtime.port_handle().clone();
         let ctx = AcquisitionContext {
-            data: MpxConnection::new(handle.clone(), MPX_MAXLINE),
+            data: MpxConnection::new(
+                SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
+                MPX_MAXLINE,
+            ),
             handle: handle.clone(),
             output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()))),
             pool,

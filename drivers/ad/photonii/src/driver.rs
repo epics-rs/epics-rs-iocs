@@ -16,6 +16,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -296,11 +297,12 @@ impl PhotonIIRuntime {
 
 /// Create the detector port and start its acquisition task.
 ///
-/// `command_handle` is the `drvAsynIPPort` that reaches p2util (C
-/// `PhotonIIConfig`'s `commandPort`).
+/// `command_handle` is the user of the `drvAsynIPPort` that reaches p2util (C
+/// `PhotonIIConfig`'s `commandPort`) — one with no port when that port does
+/// not exist, since C ignores the connect status (PhotonII.cpp:112).
 pub fn create_photonii_detector(
     claim: &PortClaim,
-    command_handle: PortHandle,
+    command_handle: SyncIOHandle,
     max_memory: usize,
 ) -> AsynResult<PhotonIIRuntime> {
     let port_name = claim.name();
@@ -344,6 +346,7 @@ mod tests {
     use epics_rs::ad_core::driver::ShutterMode;
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::registry::claim_port;
+    use std::time::Duration;
 
     fn detector(name: &str) -> PhotonIIDetector {
         let ip = format!("{name}_IP");
@@ -353,7 +356,11 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let p2 = P2Util::new(runtime.port_handle().clone());
+        let p2 = P2Util::new(SyncIOHandle::from_handle(
+            runtime.port_handle().clone(),
+            0,
+            Duration::ZERO,
+        ));
         std::mem::forget(runtime);
         let shared = Arc::new(SharedState {
             stop_requested: AtomicBool::new(false),
@@ -417,5 +424,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("{line}: {text:?}"))
         };
         assert!(at(&base) < at(&own));
+    }
+
+    /// C ignores the `pasynOctetSyncIO->connect` status (PhotonII.cpp:112):
+    /// with no p2util port configured the detector port still exists.
+    #[test]
+    fn a_detector_whose_command_port_is_missing_still_boots() {
+        let (cmd, status) = SyncIOHandle::connect_port("PII_NONE_CMD", 0, Duration::ZERO);
+        assert!(status.is_err());
+        let rt = create_photonii_detector(&claim_port("PII_NONE").unwrap(), cmd, 1 << 20)
+            .expect("the detector port");
+        let sync = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(5));
+        let p = rt.ad_params;
+        sync.write_int32(p.num_images, 3).unwrap();
+        assert_eq!(sync.read_int32(p.num_images).unwrap(), 3);
     }
 }

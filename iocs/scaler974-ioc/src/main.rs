@@ -14,7 +14,6 @@ use epics_rs::base::server::device_support::DeviceSupport;
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
-use scaler974::connect::connect_octet;
 use scaler974::driver::Scaler974Driver;
 
 /// C `sendCommand`'s local `double timeout = 1.0` (`drvScaler974.cpp`) —
@@ -126,17 +125,13 @@ async fn main() -> CaResult<()> {
                 _ => return Err("poll required".into()),
             };
 
-            // Two independent SyncIOHandles onto the same underlying octet
-            // port: one for the synchronous command path (reset/arm/
-            // write_preset), one moved into the background SHOW_COUNTS
-            // poll thread (see driver::Scaler974Driver::new's doc — a
-            // SyncIOHandle is not Clone).
-            let handle = connect_octet(&serial_port, serial_addr, COMMAND_TIMEOUT)
-                .map_err(|e| format!("initScaler974: {e}"))?;
-            let poll_handle = connect_octet(&serial_port, serial_addr, COMMAND_TIMEOUT)
-                .map_err(|e| format!("initScaler974: {e}"))?;
-
-            let driver = Scaler974Driver::new(handle, poll_handle, poll);
+            // C prints and keeps going when the octet port is missing; no
+            // driver is left for a scaler record to bind.
+            let Some(driver) =
+                Scaler974Driver::create(&serial_port, serial_addr, poll, COMMAND_TIMEOUT)
+            else {
+                return Ok(CommandOutcome::Continue);
+            };
             scaler974::registry::register(&port_name, Box::new(driver))
                 .map_err(|e| format!("initScaler974: {e}"))?;
 

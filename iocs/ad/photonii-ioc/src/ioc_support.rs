@@ -69,19 +69,16 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                let cmd = get_port(&command_port).ok_or_else(|| {
-                    format!(
-                        "command port '{command_port}' not found \
-                         (call drvAsynIPPortConfigure first)"
-                    )
-                })?;
-
                 let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
                     Ok(claim) => claim,
                     Err(e) => return Ok(ctx.cxx_error(e)),
                 };
 
-                let rt = create_photonii_detector(&claim, cmd.handle.clone(), max_memory)
+                // C ignores the connect status (PhotonII.cpp:112): a missing
+                // command port leaves a user whose every command fails.
+                let (cmd, _) = SyncIOHandle::connect_port(&command_port, 0, Duration::ZERO);
+
+                let rt = create_photonii_detector(&claim, cmd, max_memory)
                     .map_err(|e| format!("failed to create the PhotonII detector: {e}"))?;
 
                 claim

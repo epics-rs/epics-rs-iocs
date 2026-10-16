@@ -9,5 +9,7 @@ use epics_rs::asyn::services::PortServices;
 pub use epics_rs::asyn::trace::TraceMask;
 
 pub fn print(port: &str, mask: TraceMask, msg: &str) {
-    PortServices::global().trace().output(port, mask, msg);
+    PortServices::global()
+        .trace()
+        .output_device(port, Some(0), 0, mask, msg);
 }

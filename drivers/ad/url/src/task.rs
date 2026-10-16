@@ -131,8 +131,10 @@ async fn acquire_one_image(
         Ok(decoded) => decoded,
         Err(message) => {
             if let Some(message) = message {
-                ctx.handle.trace().output(
+                ctx.handle.trace().output_device(
                     ctx.handle.port_name(),
+                    Some(0),
+                    0,
                     TraceMask::ERROR,
                     &format!("URLDriver:readImage: {message}"),
                 );
@@ -167,7 +169,13 @@ async fn acquire_one_image(
         NDAttrValue::Int32(color_mode as i32),
     ));
 
-    let end_ts = EpicsTimestamp::now();
+    // C updateTimeStamp (URLDriver.cpp:244): the port's stamp, moved now.
+    let end_ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
     // C releases pArrays[0] just before the alloc (URLDriver.cpp:132-133).
     ctx.pool.owner().store_array(0, None);
     // C dereferences a refused alloc unchecked (URLDriver.cpp:133); here the frame
