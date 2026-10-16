@@ -47,18 +47,7 @@ use mca_rs::record::{McaCommand, McaRecord, McaStatus, commands};
 
 use crate::interface::{ASYN_MCA_DTYP, McaReason};
 
-fn asyn_to_ca(e: AsynError) -> CaError {
-    CaError::Protocol(e.to_string())
-}
-
-/// `mcaAsynPvt` (`devMcaAsyn.c:38-56`). C's `data`/`nread` buffer is not
-/// needed here -- [`McaRecord::land_spectrum_read`] owns landing the
-/// spectrum into the record directly. C's `elapsedLive`/`elapsedReal`/
-/// `dwellTime`/`totalCounts`/`acquiring` cache fields are likewise not
-/// needed -- they exist in C only to survive the queued/two-phase
-/// `mcaReadStatus` completion; here `read_status` builds an
-/// [`McaStatus`] and hands it straight to `McaRecord::apply_status` in one
-/// synchronous step.
+/// `mcaAsynPvt` (`devMcaAsyn.c:38-56`).
 pub struct DevMcaAsyn {
     handle: PortHandle,
     /// `pasynUser->addr`, fixed for this record's lifetime by its own INP
@@ -72,6 +61,11 @@ pub struct DevMcaAsyn {
     /// (`devMcaAsyn.c:184-204`) in [`McaReason::ALL`] order. Indexed by
     /// `McaReason as usize`.
     reasons: [usize; McaReason::COUNT],
+    /// C's `acquiring`/`elapsedLive`/`elapsedReal`/`totalCounts`/`dwellTime`:
+    /// C discards every driver status, so a failed read keeps the last value.
+    status: McaStatus,
+    /// C's `data`/`nread`, kept across reads for the same reason.
+    data: SharedArray<i32>,
 }
 
 impl DevMcaAsyn {
@@ -104,28 +98,29 @@ impl DevMcaAsyn {
     /// every `pasynInt32->read`/`pasynFloat64->read` call there is bare,
     /// its return value discarded. A never-yet-acquired status field (e.g.
     /// `Acquiring` before the first status sample) is therefore a normal
-    /// "0" read in C, not an error. The strict blocking helper collapses
-    /// that (value, ignorable status) pair into one `Result`, so this
-    /// tolerates [`AsynError::ParamUndefined`] specifically -- any other
-    /// error (bad index, wrong type, disconnected) still propagates.
-    fn read_i32(&self, reason: McaReason) -> AsynResult<i32> {
+    /// "0" read in C, not an error, so [`AsynError::ParamUndefined`] stores
+    /// `0`; any other error leaves `slot` as it was, as a C read that fails
+    /// before writing its output does.
+    fn read_i32(&self, reason: McaReason, slot: &mut i32) {
         match self
             .handle
             .read_int32_blocking(self.reasons[reason as usize], self.addr)
         {
-            Err(AsynError::ParamUndefined(_)) => Ok(0),
-            other => other,
+            Ok(v) => *slot = v,
+            Err(AsynError::ParamUndefined(_)) => *slot = 0,
+            Err(_) => {}
         }
     }
 
     /// See [`Self::read_i32`].
-    fn read_f64(&self, reason: McaReason) -> AsynResult<f64> {
+    fn read_f64(&self, reason: McaReason, slot: &mut f64) {
         match self
             .handle
             .read_float64_blocking(self.reasons[reason as usize], self.addr)
         {
-            Err(AsynError::ParamUndefined(_)) => Ok(0.0),
-            other => other,
+            Ok(v) => *slot = v,
+            Err(AsynError::ParamUndefined(_)) => *slot = 0.0,
+            Err(_) => {}
         }
     }
 
@@ -167,32 +162,31 @@ impl DevMcaAsyn {
     /// trigger a status sample (C writes `0` to the `mcaReadStatus` reason
     /// itself first), then read the five status scalars. Always run, once
     /// per device-support cycle -- C's `mcaReadStatus` is not conditionally
-    /// queued (see module doc).
-    fn read_status(&self) -> AsynResult<McaStatus> {
-        self.write_i32(McaReason::ReadStatus, 0)?;
-        let acquiring = self.read_i32(McaReason::Acquiring)? != 0;
-        let elapsed_live = self.read_f64(McaReason::ElapsedLiveTime)?;
-        let elapsed_real = self.read_f64(McaReason::ElapsedRealTime)?;
-        let total_counts = self.read_f64(McaReason::ElapsedCounts)?;
-        let dwell_time = self.read_f64(McaReason::DwellTime)?;
-        Ok(McaStatus {
-            acquiring,
-            elapsed_real,
-            elapsed_live,
-            total_counts,
-            dwell_time,
-            dead_time: 0.0,
-        })
+    /// queued (see module doc). Every status is discarded, as in C.
+    fn read_status(&mut self) {
+        let _ = self.write_i32(McaReason::ReadStatus, 0);
+        let mut status = self.status;
+        let mut acquiring = i32::from(status.acquiring);
+        self.read_i32(McaReason::Acquiring, &mut acquiring);
+        status.acquiring = acquiring != 0;
+        self.read_f64(McaReason::ElapsedLiveTime, &mut status.elapsed_live);
+        self.read_f64(McaReason::ElapsedRealTime, &mut status.elapsed_real);
+        self.read_f64(McaReason::ElapsedCounts, &mut status.total_counts);
+        self.read_f64(McaReason::DwellTime, &mut status.dwell_time);
+        self.status = status;
     }
 
-    /// C `asynCallback`'s `mcaData` branch (`devMcaAsyn.c:340-348`):
-    /// `pasynInt32Array->read(..., pPvt->data, pmca->nuse, &pPvt->nread)`.
-    fn read_spectrum(&self, max_elements: usize) -> AsynResult<SharedArray<i32>> {
+    /// C `asynCallback`'s `mcaData` branch (`devMcaAsyn.c:355-358`):
+    /// `pasynInt32Array->read(..., pPvt->data, pmca->nuse, &pPvt->nread)`,
+    /// status discarded.
+    fn read_spectrum(&mut self, max_elements: usize) {
         let user = AsynUser::new(self.reasons[McaReason::Data as usize]).with_addr(self.addr);
-        let result = self
+        if let Ok(result) = self
             .handle
-            .submit_blocking(RequestOp::Int32ArrayRead { max_elements }, user)?;
-        Ok(result.int32_array.unwrap_or_default())
+            .submit_blocking(RequestOp::Int32ArrayRead { max_elements }, user)
+        {
+            self.data = result.int32_array.unwrap_or_default();
+        }
     }
 }
 
@@ -265,20 +259,22 @@ impl DeviceSupport for DevMcaAsyn {
     /// if the status update says a client asked for it or acquisition just
     /// finished (`McaRecord::apply_status`'s return value -- C's
     /// `rdng`/`pact` two-phase gate collapsed to one bool).
+    ///
+    /// C's `asynCallback` ignores every driver status (`devMcaAsyn.c:355-391`),
+    /// so a failing driver neither alarms the record nor cuts the cycle short.
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let mca = Self::mca(record)?;
 
         for command in mca.take_device_requests() {
-            self.send_command(command).map_err(asyn_to_ca)?;
+            let _ = self.send_command(command);
         }
 
-        let status = self.read_status().map_err(asyn_to_ca)?;
-        let must_read_spectrum = mca.apply_status(status);
+        self.read_status();
+        let must_read_spectrum = mca.apply_status(self.status);
 
         if must_read_spectrum {
-            let max_elements = mca.nuse.max(0) as usize;
-            let data = self.read_spectrum(max_elements).map_err(asyn_to_ca)?;
-            mca.land_spectrum_read(EpicsValue::LongArray(data))?;
+            self.read_spectrum(mca.nuse.max(0) as usize);
+            mca.land_spectrum_read(EpicsValue::LongArray(self.data.clone()))?;
         }
 
         Ok(DeviceReadOutcome::ok())
@@ -321,6 +317,8 @@ pub fn connect(inp: &str) -> Option<DevMcaAsyn> {
         handle: entry.handle,
         addr: link.addr,
         reasons: [0; McaReason::COUNT],
+        status: McaStatus::default(),
+        data: SharedArray::default(),
     })
 }
 
@@ -358,10 +356,12 @@ mod tests {
 
     use super::*;
 
-    /// An asyn MCA driver that logs every int32 write's reason.
+    /// An asyn MCA driver that logs every int32 write's reason and rejects
+    /// every `NumChannels` write.
     struct LoggingDriver {
         base: PortDriverBase,
         writes: Arc<Mutex<Vec<usize>>>,
+        num_channels: usize,
     }
 
     impl PortDriver for LoggingDriver {
@@ -375,6 +375,12 @@ mod tests {
 
         fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
             self.writes.lock().unwrap().push(user.reason);
+            if user.reason == self.num_channels {
+                return Err(AsynError::Status {
+                    status: epics_rs::asyn::error::AsynStatus::Error,
+                    message: "rejected".into(),
+                });
+            }
             self.base.params.set_int32(user.reason, user.addr, value)
         }
     }
@@ -402,12 +408,15 @@ mod tests {
         let driver = LoggingDriver {
             base,
             writes: Arc::clone(&writes),
+            num_channels: reasons[McaReason::NumChannels as usize],
         };
         let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
         let mut dev = DevMcaAsyn {
             handle: runtime.port_handle().clone(),
             addr: 0,
             reasons: [0; McaReason::COUNT],
+            status: McaStatus::default(),
+            data: SharedArray::default(),
         };
         let mut rec = McaRecord {
             nmax: 8,
@@ -436,6 +445,23 @@ mod tests {
         assert_eq!(
             *f.writes.lock().unwrap(),
             [f.reasons[McaReason::StopAcquire as usize]]
+        );
+    }
+
+    /// C ignores the driver's write status (`devMcaAsyn.c:385-391`): the
+    /// rejected write neither fails the cycle nor skips the status read.
+    #[test]
+    fn a_rejected_driver_write_does_not_cut_the_cycle_short() {
+        let mut f = fixture("MCATESTREJECT");
+        f.rec.put_field("NUSE", EpicsValue::Long(4)).unwrap();
+        f.rec.special("NUSE", true).unwrap();
+        f.dev.read(&mut f.rec).unwrap();
+        assert_eq!(
+            *f.writes.lock().unwrap(),
+            [
+                f.reasons[McaReason::NumChannels as usize],
+                f.reasons[McaReason::ReadStatus as usize],
+            ]
         );
     }
 }
