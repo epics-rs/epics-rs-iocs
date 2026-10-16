@@ -14,7 +14,7 @@
 //! fields, exactly like `love::driver::LoveDriver`.
 //! [`mca::interface::McaReason::create_params`] is called only so the
 //! default `drv_user_create` (name lookup against `McaReason::ALL`) resolves
-//! drvInfo strings for [`crate::driver::RontecDriver::reason_of`]; the
+//! drvInfo strings for `RontecDriver::reason_of`; the
 //! resulting param slots are otherwise unused.
 //!
 //! There is no `Init`/`Config` iocsh split here (unlike `love`/`microepsilon`):
@@ -27,7 +27,7 @@
 //!   (`drvMcaRontec.c:272-379`) has a single `return(asynSuccess)` reached
 //!   from every switch arm, including the illegal-command default -- no
 //!   internal I/O failure (a failed `sendMessage`) is ever surfaced to the
-//!   asyn caller, only logged. [`RontecDriver::dispatch_write`] reproduces
+//!   asyn caller, only logged. `RontecDriver::dispatch_write` reproduces
 //!   this: every `send_message` result inside it is discarded.
 //! - **`mcaElapsedLiveTime` always mirrors `mcaElapsedRealTime`.** C's
 //!   `mcaReadStatus` handler (`drvMcaRontec.c:307-317`) sets `elive` from
@@ -58,14 +58,14 @@
 //!   so the latter's body runs as an unintended continuation of the former.
 //!   Currently harmless only because `mcaChannelAdvanceSource`'s own body is
 //!   itself `break;` -- a latent hazard for any future edit. Rust `match`
-//!   arms cannot fall through, so [`RontecDriver::dispatch_write`] closes
+//!   arms cannot fall through, so `RontecDriver::dispatch_write` closes
 //!   this structurally rather than by convention.
 //! - **Integer division by zero in `mcaNumChannels`** (`drvMcaRontec.c:322-330`):
 //!   `pPvt->binning = pPvt->maxChans / pPvt->nchans;` is unguarded --
 //!   `NumChannels(0)` (or negative) is a client-reachable write (the mca
 //!   record's `NUSE` field has no lower bound of its own) that divides by
 //!   zero, undefined behavior in C and a `SIGFPE` crash in practice on
-//!   Linux/x86. [`RontecDriver::set_num_channels`] only recomputes
+//!   Linux/x86. `RontecDriver::set_num_channels` only recomputes
 //!   `binning` when the (post-cache) channel count is positive.
 //! - **Uninitialized-read on I/O failure in `mcaReadStatus`**
 //!   (`drvMcaRontec.c:307-317`): `sendMessage`'s `asynStatus` return is
@@ -74,7 +74,7 @@
 //!   or disconnected line, `response` was never written and its bytes are
 //!   indeterminate, so `acquiring`/`elive`/`ereal` are corrupted with
 //!   garbage rather than left at their last known value.
-//!   [`RontecDriver::read_status`] applies each parsed field only when its
+//!   `RontecDriver::read_status` applies each parsed field only when its
 //!   `send_message` call actually succeeded.
 //! - **`int32ArrayRead` buffer overflow and silent short-read corruption**
 //!   (`drvMcaRontec.c:436-478`): (a) `nread = 4 + 4*maxChans` is written
@@ -84,8 +84,8 @@
 //!   RONTEC_MAXCHANS` -- an oversized `NUSE` overflows the fixed buffer.
 //!   (b) `if (nbytesIn != nread)` only logs; the function still parses
 //!   `mcaBuffer` as if the transfer fully succeeded, returning stale/garbage
-//!   spectrum data on a short read. [`RontecDriver::read_spectrum`] clamps
-//!   the request to [`RONTEC_MAXCHANS`] and returns an error instead of
+//!   spectrum data on a short read. `RontecDriver::read_spectrum` clamps
+//!   the request to `RONTEC_MAXCHANS` and returns an error instead of
 //!   fabricating data when the reply is short.
 
 use std::time::Duration;
@@ -186,7 +186,7 @@ impl RontecDriver {
     /// (`drvMcaRontec.c:165-257`). `serial_port_name` must already be
     /// registered (`drvAsynSerialPortConfigure`) -- this only looks it up,
     /// matching `pasynOctetSyncIO->connect`'s own precondition. Unlike C,
-    /// the input EOS is not saved here: [`Self::read_spectrum`] uses
+    /// the input EOS is not saved here: `Self::read_spectrum` uses
     /// [`RequestOp::OctetReadBinary`], which brackets the save/suppress/
     /// restore atomically inside the port actor (C `getInputEos` +
     /// `setInputEos("",0)` + `setInputEos(saved)` around `int32ArrayRead`,
@@ -245,7 +245,7 @@ impl RontecDriver {
 
     /// Which [`McaReason`] (if any) `self.reasons` resolved `idx` to.
     /// `self.reasons[r as usize]` is what
-    /// [`epics_rs::asyn::port::DeviceSupport`]'s drvUserCreate resolves a
+    /// `DeviceSupport`'s drvUserCreate resolves a
     /// bound record's `pasynUser->reason` to for command `r` -- the reverse
     /// lookup here is what C's `pasynUser->reason == mcaCommand` direct
     /// comparison collapses to once drvInfo strings are resolved through a
