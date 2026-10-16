@@ -37,12 +37,12 @@ use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
 
-use crate::asyn_print;
 use crate::drv_quad_em::{
     self as qe, CallbackContext, QeModel, QeTriggerMode, QeTriggerPolarity, QuadEmBase,
     QuadEmDevice, QuadEmParams, QuadEmShared, num_average_from,
 };
 use crate::fx4_proto::{self as proto, Fx4Action, Fx4Cache, TriggerConfig};
+use crate::trace::AsynPrint;
 
 /// C++ `onMessageEvent`'s `epicsThreadSleep(0.01)` before the next `get`: the
 /// FX4 is polled at most 100 times a second.
@@ -468,13 +468,13 @@ fn data_thread(ctx: DataContext) {
 
         if event == "update" {
             let cfg = ctx.link.trigger_config();
-            let (actions, errors) = {
+            let (actions, trace) = {
                 let mut cache = ctx.link.cache.lock();
                 let actions = cache.ingest(&data, &cfg);
-                (actions, cache.take_errors())
+                (actions, cache.take_trace())
             };
-            for line in errors {
-                asyn_print!(ctx.handle, ERROR, "{line}");
+            for (mask, line) in trace {
+                ctx.handle.asyn_print(mask, format_args!("{line}"));
             }
             for action in actions {
                 match action {
