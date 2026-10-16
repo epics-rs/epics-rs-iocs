@@ -4,8 +4,8 @@
 //! model-1 dev/drv pair). One serial line drives up to three encoder-mike axes,
 //! but the controller can address only **one motor at a time**: a motor must be
 //! selected with `M<n>` before it will move or report status. Commands are
-//! terminated by CR (`\r`, the driver owns output framing) and replies by LF
-//! (`\n`, the startup script sets the input EOS). Every command produces a
+//! terminated by the port output EOS CR and replies by input EOS LF, both set
+//! by `EMC18011Config` as C `motor_init` does. Every command produces a
 //! reply, so each is written and its reply consumed to keep the stream
 //! synchronized.
 //!
@@ -62,9 +62,6 @@ use motor_common::util::{atof, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
 const READ_BUF: usize = 120;
-
-/// Command terminator (C `EMC18011_OUT_EOS`); the driver owns output framing.
-const TERMINATOR: &[u8] = b"\r";
 
 /// Fixed number of axes (C `EMC18011_MAX_MOTORS`).
 pub const MAX_MOTORS: usize = 3;
@@ -205,18 +202,11 @@ impl Emc18011Controller {
         MAX_MOTORS
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and return its reply (trimmed). Every command produces a
     /// reply, so this is used for both queries and set commands (whose reply is
     /// discarded) to keep the stream synchronized.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_matches(['\r', '\n', '\0', ' ']).to_string())
     }

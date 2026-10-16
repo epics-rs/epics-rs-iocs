@@ -24,11 +24,6 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# EMC18011 framing: the driver appends the CR command terminator, so only the
-# input EOS is configured here (replies are LF terminated). Do not set an output
-# EOS — the port would append it a second time.
-asynOctetSetInputEos("$(SERIAL)", 0, "\n")
-
 # ---- EMC18011 controller ----
 # EMC18011Setup(maxControllers, [scanRate]) is accepted for startup-script
 # parity; the asyn-rs port allocates per EMC18011Config call.
