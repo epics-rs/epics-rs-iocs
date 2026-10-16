@@ -453,10 +453,27 @@ impl SessionWorker {
                         errlog_vprintf(format_args!("OPC UA session {}: {e}\n", self.handle.name));
                     }
                     // `opcua_ConnectTimeout` is both the connect timeout and the
-                    // interval between attempts (`iocshVariables.h:24`).
+                    // interval between attempts (`iocshVariables.h:24`); an
+                    // `opcuaConnect` meanwhile is C's immediate `connect(true)`.
                     let retry = defaults::CONNECT_TIMEOUT.get().max(0.1);
-                    tokio::time::sleep(Duration::from_secs_f64(retry)).await;
-                    connect_now = self.autoconnect();
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(retry);
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => {
+                                connect_now = self.autoconnect();
+                                break;
+                            }
+                            control = self.control.recv() => match control {
+                                Some(Control::Connect) => {
+                                    connect_now = true;
+                                    manual = true;
+                                    break;
+                                }
+                                Some(Control::Disconnect) => {}
+                                None => return,
+                            },
+                        }
+                    }
                     continue;
                 }
             }

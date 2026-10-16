@@ -54,6 +54,8 @@ struct Mock {
     values: Mutex<HashMap<NodeId, Variant>>,
     sink: Mutex<Option<mpsc::UnboundedSender<Notification>>>,
     connects: Mutex<Vec<SessionConfig>>,
+    /// Refuse this many connect attempts before accepting one.
+    refuse_connects: Mutex<usize>,
 }
 
 impl Mock {
@@ -78,6 +80,11 @@ impl UaConnector for MockConnector {
         _identity: &opcua::client::Identity,
     ) -> Result<Arc<dyn UaConnection>, String> {
         self.0.connects.lock().push(config.clone());
+        let mut refuse = self.0.refuse_connects.lock();
+        if *refuse > 0 {
+            *refuse -= 1;
+            return Err("connect service failed with status BadNotConnected".into());
+        }
         Ok(self.0.clone())
     }
 }
@@ -518,6 +525,32 @@ async fn a_session_that_does_not_autoconnect_waits_for_the_connect_command() {
     handle.control(Control::Connect);
     until(|| handle.is_connected()).await;
     assert_eq!(mock.connects.lock().len(), 1);
+}
+
+/// An `opcuaConnect` while an autoconnecting session waits out its retry
+/// interval is C's `connect(true)`: it tries at once.
+#[tokio::test]
+async fn opcua_connect_cuts_the_autoconnect_retry_short() {
+    let mock = Mock::arc();
+    *mock.refuse_connects.lock() = 1;
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0],
+    );
+    until(|| mock.connects.lock().len() == 1).await;
+
+    // The retry interval is opcua_ConnectTimeout, 5 s; `until` gives up first.
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    assert_eq!(mock.connects.lock().len(), 2);
+
+    // Connected, opcuaConnect only reports it; no further attempt.
+    handle.control(Control::Connect);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(handle.is_connected());
+    assert_eq!(mock.connects.lock().len(), 2);
 }
 
 /// `bini=write` does not use the value just read: the item queues a write request
