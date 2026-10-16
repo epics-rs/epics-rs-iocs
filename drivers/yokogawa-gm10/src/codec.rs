@@ -94,24 +94,30 @@ pub fn cmd_err_query(code: i32) -> String {
 }
 
 /// C `sprintf("%G", value)` — default precision (6 significant digits),
-/// trailing zeros stripped (`drvGM10.c:1168,1171,1174`).
+/// trailing zeros stripped (`drvGM10.c:1168,1171,1174`). The style is
+/// chosen from the exponent after rounding, as C99 7.19.6.1 specifies.
 pub fn format_g(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
+    if value.is_nan() {
+        return if value.is_sign_negative() {
+            "-NAN"
+        } else {
+            "NAN"
+        }
+        .to_string();
+    }
+    if value.is_infinite() {
+        return if value < 0.0 { "-INF" } else { "INF" }.to_string();
     }
     const PRECISION: i32 = 6;
-    let exponent = value.abs().log10().floor() as i32;
-    if !(-4..PRECISION).contains(&exponent) {
-        let digits = (PRECISION - 1).max(0) as usize;
-        let s = format!("{value:.digits$e}");
-        let (mantissa, exp) = s.split_once('e').expect("Rust {:e} always emits 'e'");
-        let mantissa = strip_trailing_zeros(mantissa);
-        let exp: i32 = exp
-            .parse()
-            .expect("Rust {:e} exponent is always an integer");
-        format!("{mantissa}E{exp:+03}")
+    let s = format!("{value:.*e}", (PRECISION - 1) as usize);
+    let (mantissa, exp) = s.split_once('e').expect("Rust {:e} always emits 'e'");
+    let exp: i32 = exp
+        .parse()
+        .expect("Rust {:e} exponent is always an integer");
+    if !(-4..PRECISION).contains(&exp) {
+        format!("{}E{exp:+03}", strip_trailing_zeros(mantissa))
     } else {
-        let decimals = (PRECISION - 1 - exponent).max(0) as usize;
+        let decimals = (PRECISION - 1 - exp) as usize;
         strip_trailing_zeros(&format!("{value:.decimals$}"))
     }
 }
@@ -761,6 +767,17 @@ mod tests {
         assert_eq!(format_g(0.0), "0");
         assert_eq!(format_g(123456.0), "123456");
         assert_eq!(format_g(1234567.0), "1.23457E+06");
+        assert_eq!(format_g(999999.5), "1E+06");
+        assert_eq!(format_g(0.000099999996), "0.0001");
+        assert_eq!(format_g(123456.5), "123456");
+        assert_eq!(format_g(1e100), "1E+100");
+        assert_eq!(format_g(-1.5e-7), "-1.5E-07");
+        assert_eq!(format_g(0.00001), "1E-05");
+        assert_eq!(format_g(-0.0), "-0");
+        assert_eq!(format_g(f64::INFINITY), "INF");
+        assert_eq!(format_g(f64::NEG_INFINITY), "-INF");
+        assert_eq!(format_g(f64::NAN), "NAN");
+        assert_eq!(format_g(-f64::NAN), "-NAN");
     }
 
     #[test]
