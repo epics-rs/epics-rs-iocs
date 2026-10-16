@@ -19,6 +19,7 @@ use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
 use crate::registry::{self, DashboardHandle, DashboardState};
 use crate::session::DEFAULT_TIMEOUT;
+use crate::spdlog;
 
 /// asyn parameter indices, one per `createParam` in the C++ constructor.
 #[derive(Clone, Copy)]
@@ -155,8 +156,11 @@ impl DashboardDriver {
         {
             let mut c = client.lock();
             match c.connect() {
-                Ok(()) => log::info!("ur-robot: connected to the dashboard server at {robot_ip}"),
-                Err(e) => log::error!("ur-robot: dashboard connect failed: {e}"),
+                Ok(()) if c.is_connected() => {
+                    spdlog::info(format_args!("Connected to UR Dashboard server"))
+                }
+                Ok(()) => {}
+                Err(e) => spdlog::error(format_args!("{e}")),
             }
             if c.is_connected() {
                 let version = c.polyscope_version().unwrap_or_default();
@@ -210,9 +214,13 @@ impl DashboardDriver {
             return true;
         }
         match c.connect() {
-            Ok(()) => true,
+            Ok(()) if c.is_connected() => {
+                spdlog::info(format_args!("Connected to UR Dashboard server"));
+                true
+            }
+            Ok(()) => false,
             Err(e) => {
-                log::error!("ur-robot: dashboard connect failed: {e}");
+                spdlog::error(format_args!("{e}"));
                 false
             }
         }
@@ -239,6 +247,7 @@ impl PortDriver for DashboardDriver {
             }
 
             if reason == p.connect {
+                spdlog::debug(format_args!("Connecting to dashboard server"));
                 let ok = self.try_connect();
                 let connected = i32::from(ok);
                 self.base.set_int32_param(p.is_connected, 0, connected)?;
@@ -254,34 +263,47 @@ impl PortDriver for DashboardDriver {
 
             let mut client = self.client.lock();
             if !client.is_connected() {
-                log::warn!("ur-robot: the dashboard is disconnected; no action taken");
+                spdlog::debug(format_args!("Dashboard is disconnected. No action taken"));
                 return Err(asyn_error("the dashboard is not connected"));
             }
 
+            let debug = |what: &str| spdlog::debug(format_args!("{what}"));
             let result = if reason == p.play {
+                debug("Playing loaded program");
                 client.play()
             } else if reason == p.stop {
+                debug("Stopping current program");
                 client.stop()
             } else if reason == p.pause {
+                debug("Pausing current program");
                 client.pause()
             } else if reason == p.disconnect {
+                debug("Disconnecting from dashboard server");
                 client.disconnect();
                 Ok(())
             } else if reason == p.shutdown {
+                debug("Shutting down robot and controller");
                 client.shutdown()
             } else if reason == p.close_popup {
+                debug("Closing popup");
                 client.close_popup()
             } else if reason == p.close_safety_popup {
+                debug("Closing safety popup");
                 client.close_safety_popup()
             } else if reason == p.power_on {
+                debug("Powering on robot");
                 client.power_on()
             } else if reason == p.power_off {
+                debug("Powering off robot");
                 client.power_off()
             } else if reason == p.brake_release {
+                debug("Releasing brakes");
                 client.brake_release()
             } else if reason == p.unlock_protective_stop {
+                debug("Unlocking protective stop");
                 client.unlock_protective_stop()
             } else if reason == p.restart_safety {
+                debug("Restarting safety configuration");
                 client.restart_safety()
             } else {
                 Ok(())
@@ -290,7 +312,7 @@ impl PortDriver for DashboardDriver {
             match result {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    log::error!("ur-robot: dashboard command failed: {e}");
+                    spdlog::error(format_args!("{e}"));
                     Err(asyn_error("dashboard command failed"))
                 }
             }
@@ -310,13 +332,15 @@ impl PortDriver for DashboardDriver {
 
             let mut client = self.client.lock();
             if !client.is_connected() {
-                log::warn!("ur-robot: the dashboard is disconnected; no action taken");
+                spdlog::debug(format_args!("Dashboard is disconnected. No action taken"));
                 return Err(asyn_error("the dashboard is not connected"));
             }
 
             let result = if reason == p.popup {
+                spdlog::debug(format_args!("Popup text: {text}"));
                 client.popup(&text)
             } else if reason == p.load_urp {
+                spdlog::debug(format_args!("Loading program {text}"));
                 client.load_urp(&text)
             } else {
                 Ok(())
@@ -325,7 +349,7 @@ impl PortDriver for DashboardDriver {
             match result {
                 Ok(()) => Ok(data.len()),
                 Err(e) => {
-                    log::error!("ur-robot: dashboard command failed: {e}");
+                    spdlog::error(format_args!("{e}"));
                     Err(asyn_error("dashboard command failed"))
                 }
             }
@@ -365,7 +389,9 @@ pub fn start_poller(
                                 state.robot_mode = mode;
                             }
                             Err(e) => {
-                                log::error!("ur-robot: dashboard poll failed: {e}");
+                                spdlog::error(format_args!(
+                                    "Caught exception in dashboard poller: {e}"
+                                ));
                                 c.disconnect();
                                 state.connected = false;
                                 updates.push(ParamSetValue::new(

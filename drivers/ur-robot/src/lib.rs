@@ -26,6 +26,7 @@ pub mod registry;
 pub mod rtde;
 pub mod script;
 pub mod session;
+pub mod spdlog;
 pub mod state;
 pub mod stream;
 
