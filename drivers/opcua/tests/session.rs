@@ -1248,3 +1248,45 @@ fn the_element_map_reports_what_the_structure_cannot_supply() {
         ]
     );
 }
+
+/// open62541's 1 s connectivity check on an idle session
+/// (`SessionOpen62541::connectionInactive`).
+#[tokio::test]
+async fn an_idle_session_whose_server_stops_answering_goes_inactive() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    mock.calls.lock().reads.clear();
+
+    // A check that is answered keeps the session up.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(handle.is_connected());
+    let state = NodeId::new(0, 2259u32);
+    assert!(
+        mock.calls
+            .lock()
+            .reads
+            .iter()
+            .any(|r| r.len() == 1 && r[0].node_id == state)
+    );
+
+    mock.behave(|b| b.read_error = Some(StatusCode::BadTimeout));
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert!(
+        lines
+            .lock()
+            .iter()
+            .any(|l| l == "OPC UA Session sess: server inactive\n")
+    );
+}

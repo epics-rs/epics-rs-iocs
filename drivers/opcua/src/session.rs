@@ -32,6 +32,14 @@ use crate::subscription::SubscriptionConfig;
 /// (`Session.h:359`, `no_of_properties_read`).
 const NO_OF_PROPERTIES_READ: usize = 2;
 
+/// The `connectivityCheckInterval` C sets once the session is activated
+/// (`SessionOpen62541.cpp:2427`).
+const CONNECTIVITY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `Server_ServerStatus_State` (ns=0;i=2259), what open62541's
+/// connectivity check reads.
+const SERVER_STATUS_STATE: u32 = 2259;
+
 /// `opcuaSession(NAME, URL, [options])` (`iocshIntegration.cpp:88-140`) plus the
 /// session options of `opcuaOptions` (`SessionOpen62541.cpp:159-260`).
 #[derive(Debug, Clone, PartialEq)]
@@ -576,6 +584,10 @@ impl SessionWorker {
         let Some(connection) = self.connection.clone() else {
             return ServeOutcome::Disconnected;
         };
+        // open62541's background connectivity check: one Read of the server
+        // state at a time, the next one an interval after the last answer.
+        let mut check = None;
+        let mut next_check = Instant::now() + CONNECTIVITY_CHECK_INTERVAL;
         loop {
             let flush_at = self.next_flush();
             tokio::select! {
@@ -601,6 +613,33 @@ impl SessionWorker {
                     }
                     None => return ServeOutcome::Shutdown,
                 },
+
+                _ = tokio::time::sleep_until(next_check.into()), if check.is_none() => {
+                    let connection = connection.clone();
+                    check = Some(Box::pin(async move {
+                        let node = ReadValueId {
+                            node_id: NodeId::new(0, SERVER_STATUS_STATE),
+                            attribute_id: AttributeId::Value as u32,
+                            ..Default::default()
+                        };
+                        connection.read(&[node]).await
+                    }));
+                }
+
+                result = async { check.as_mut().unwrap().await }, if check.is_some() => {
+                    check = None;
+                    next_check = Instant::now() + CONNECTIVITY_CHECK_INTERVAL;
+                    // Only a timed-out check is inactivity
+                    // (`SessionOpen62541::connectionInactive`).
+                    if result.err() == Some(StatusCode::BadTimeout) {
+                        errlog_vprintf(format_args!(
+                            "OPC UA Session {}: server inactive\n",
+                            self.handle.name
+                        ));
+                        self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
+                        return ServeOutcome::Disconnected;
+                    }
+                }
 
                 _ = tokio::time::sleep_until(flush_at.into()), if self.has_pending() => {
                     if !self.flush(&connection).await {
