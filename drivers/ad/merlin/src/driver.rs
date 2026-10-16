@@ -598,9 +598,10 @@ impl PortDriver for MerlinDetector {
             .port_base
             .get_float64_param(reason, user.addr)
             .unwrap_or(0.0);
-        self.ad
+        let stored = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         let name = if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
             Some(MPXVAR_THRESHOLD[i])
@@ -614,27 +615,28 @@ impl PortDriver for MerlinDetector {
                 .cmd
                 .set(name, &format!("{value:.6}"), default_timeout())
                 .map_err(AsynError::from);
-            self.get_threshold()?;
+            let _ = self.get_threshold();
             set
         } else if reason == self.ad.params.acquire_time || reason == self.ad.params.acquire_period {
-            self.set_acquire_params()
+            // C drops both helpers' statuses (merlinDetector.cpp:1274-1282).
+            let _ = self.set_acquire_params();
+            stored
         } else if reason == self.params.start_threshold_scan
             || reason == self.params.stop_threshold_scan
             || reason == self.params.step_threshold_scan
         {
-            self.update_threshold_scan_params()
+            let _ = self.update_threshold_scan_params();
+            stored
         } else if reason < self.params.first() {
             // ADDriver::writeFloat64 is asynPortDriver's (merlinDetector.cpp:1287).
             self.ad.port_base.write_float64_param(user, value)
         } else {
-            Ok(())
+            stored
         };
 
         match &status {
             Err(e) => {
-                self.ad
-                    .port_base
-                    .set_float64_param(reason, user.addr, old)?;
+                let _ = self.ad.port_base.set_float64_param(reason, user.addr, old);
                 user.print(
                     TraceMask::ERROR,
                     file!(),
@@ -652,7 +654,7 @@ impl PortDriver for MerlinDetector {
                 format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}"),
             ),
         }
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
         status
     }
 }
@@ -985,5 +987,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("{line}: {text:?}"))
         };
         assert!(at(&base) < at(&own));
+    }
+
+    /// C drops setAcquireParams' status (merlinDetector.cpp:1274-1276): a
+    /// dead server leaves the write the store's success and the new value.
+    #[test]
+    fn an_acquire_time_write_keeps_the_stores_status() {
+        let mut det = detector("MERLIN_ACQ_TIME");
+        let t = det.ad.params.acquire_time;
+        det.write_float64(&mut AsynUser::new(t).with_addr(0), 1.5)
+            .unwrap();
+        assert_eq!(det.ad.port_base.get_float64_param(t, 0).unwrap(), 1.5);
     }
 }
