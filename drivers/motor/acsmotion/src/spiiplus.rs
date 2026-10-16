@@ -22,14 +22,10 @@
 //!
 //! ## Units
 //!
-//! The C driver scales every record value by `resolution_` (the axis
-//! stepper/encoder factor) to bridge the motor record's raw-step frame to the
-//! controller's native units, and divides back in `poll` (`APOS/resolution_`).
-//! At the asyn-rs motor boundary (EGU frame) that scale cancels, so this port
-//! drops it and works in the controller's native user units: positions pass
-//! through unscaled, its `EGU` is the controller unit (typically mm), and its
-//! `MRES` must be the axis resolution (raw counts are integers). Consequently the encoder readback is `?FPOS` directly
-//! (already in user units), not `FPOS/EFAC` as in the raw-step C frame.
+//! As C, every record value (steps) is scaled by `resolution_` into the
+//! controller's user units and `poll` divides back (`APOS/resolution_`,
+//! `FPOS/EFAC`). `resolution_` is the axis `STEPF` for a stepper and its
+//! `EFAC` otherwise, read with `MFLAGS` at construction.
 //!
 //! ## Homing
 //!
@@ -82,7 +78,10 @@ const FAULT_HARD_LEFT_LIMIT: i32 = 1 << 1;
 
 /// Motor-flags (`MFLAGS`) bit masks (C `SPIIPLUS_MFLAGS_*`).
 const MFLAGS_DUMMY: i32 = 1 << 0;
+const MFLAGS_MICRO: i32 = 1 << 2;
 const MFLAGS_HOME: i32 = 1 << 3;
+const MFLAGS_STEPPER: i32 = 1 << 4;
+const MFLAGS_STEPENC: i32 = 1 << 6;
 
 /// mbbo homing-method selectors (C `MBBO_HOME_*`), `SPiiPlusHoming.db`'s
 /// `homingMethod` values.
@@ -316,26 +315,33 @@ pub struct SpiiPlusAxis {
     /// Last non-zero feedback-velocity direction (C updates direction only while
     /// the axis is moving).
     last_direction: bool,
+    /// C `resolution_`: controller units per record step.
+    resolution: f64,
+    /// The axis `EFAC`, the encoder's units per count.
+    encoder_factor: f64,
 }
 
 impl SpiiPlusAxis {
     /// Construct axis `index` (0-based). `is_virtual` comes from the config
-    /// `virtualAxisList`; the dummy flag is read from `?MFLAGS(index)` here (C
-    /// reads MFLAGS at controller init). A probe failure leaves the axis
-    /// non-dummy, matching a zero MFLAGS read.
+    /// `virtualAxisList`; `MFLAGS`, `STEPF` and `EFAC` are read here, as C
+    /// reads them at controller init. A failed read counts as zero.
     pub fn new(controller: Arc<Mutex<SpiiPlusController>>, index: usize, is_virtual: bool) -> Self {
-        let dummy = {
+        let (mflags, stepper_factor, encoder_factor) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.query_int("MFLAGS", index)
-                .map(|f| (f & MFLAGS_DUMMY) != 0)
-                .unwrap_or(false)
+            (
+                ctrl.query_int("MFLAGS", index).unwrap_or(0),
+                ctrl.query_double("STEPF", index).unwrap_or(0.0),
+                ctrl.query_double("EFAC", index).unwrap_or(0.0),
+            )
         };
         Self {
             controller,
             axis: index,
-            reduced: dummy || is_virtual,
+            reduced: (mflags & MFLAGS_DUMMY) != 0 || is_virtual,
             is_virtual,
             last_direction: true,
+            resolution: resolution(mflags, is_virtual, stepper_factor, encoder_factor),
+            encoder_factor,
         }
     }
 
@@ -346,15 +352,28 @@ impl SpiiPlusAxis {
     /// Send the ACC/DEC/VEL preamble shared by point-to-point and jog moves
     /// (C `move`/`moveVelocity`): `ACC(n)=`, `DEC(n)=`, `VEL(n)=`.
     fn set_move_params(
+        &self,
         ctrl: &SpiiPlusController,
-        axis: usize,
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        ctrl.command(&format!("ACC({axis})={}", fmt(acceleration)))?;
-        ctrl.command(&format!("DEC({axis})={}", fmt(acceleration)))?;
-        ctrl.command(&format!("VEL({axis})={}", fmt(velocity)))?;
+        let (axis, res) = (self.axis, self.resolution);
+        ctrl.command(&format!("ACC({axis})={}", fmt(acceleration * res)))?;
+        ctrl.command(&format!("DEC({axis})={}", fmt(acceleration * res)))?;
+        ctrl.command(&format!("VEL({axis})={}", fmt(velocity * res)))?;
         Ok(())
+    }
+}
+
+/// C's `resolution_` choice: the stepper factor for a non-virtual microstepper
+/// or a stepper without encoder feedback, the encoder factor otherwise.
+fn resolution(mflags: i32, is_virtual: bool, stepper_factor: f64, encoder_factor: f64) -> f64 {
+    let stepper = (mflags & MFLAGS_MICRO) != 0
+        || ((mflags & MFLAGS_STEPPER) != 0 && (mflags & MFLAGS_STEPENC) == 0);
+    if !is_virtual && stepper {
+        stepper_factor
+    } else {
+        encoder_factor
     }
 }
 
@@ -375,8 +394,8 @@ impl AsynMotor for SpiiPlusAxis {
     ) -> AsynResult<()> {
         let ctrl = self.lock();
         let a = self.axis;
-        Self::set_move_params(&ctrl, a, velocity, acceleration)?;
-        ctrl.command(&format!("PTP {a}, {}", fmt(position)))?;
+        self.set_move_params(&ctrl, velocity, acceleration)?;
+        ctrl.command(&format!("PTP {a}, {}", fmt(position * self.resolution)))?;
         Ok(())
     }
 
@@ -390,8 +409,8 @@ impl AsynMotor for SpiiPlusAxis {
     ) -> AsynResult<()> {
         let ctrl = self.lock();
         let a = self.axis;
-        Self::set_move_params(&ctrl, a, velocity, acceleration)?;
-        ctrl.command(&format!("PTP/r {a}, {}", fmt(distance)))?;
+        self.set_move_params(&ctrl, velocity, acceleration)?;
+        ctrl.command(&format!("PTP/r {a}, {}", fmt(distance * self.resolution)))?;
         Ok(())
     }
 
@@ -403,13 +422,13 @@ impl AsynMotor for SpiiPlusAxis {
         acceleration: f64,
     ) -> AsynResult<()> {
         let ctrl = self.lock();
-        let a = self.axis;
+        let (a, res) = (self.axis, self.resolution);
         // C moveVelocity sets ACC/DEC then JOG/v with the |velocity| magnitude
         // and a separate direction sign (it does not change the normal VEL).
-        ctrl.command(&format!("ACC({a})={}", fmt(acceleration)))?;
-        ctrl.command(&format!("DEC({a})={}", fmt(acceleration)))?;
+        ctrl.command(&format!("ACC({a})={}", fmt(acceleration * res)))?;
+        ctrl.command(&format!("DEC({a})={}", fmt(acceleration * res)))?;
         let dir = if velocity > 0.0 { '+' } else { '-' };
-        ctrl.command(&format!("JOG/v {a}, {}, {dir}", fmt(velocity.abs())))?;
+        ctrl.command(&format!("JOG/v {a}, {}, {dir}", fmt(velocity.abs() * res)))?;
         Ok(())
     }
 
@@ -441,7 +460,7 @@ impl AsynMotor for SpiiPlusAxis {
             );
             return Ok(());
         };
-        ctrl.command(&homing.command(a, code, velocity, forward))?;
+        ctrl.command(&homing.command(a, code, velocity * self.resolution, forward))?;
         Ok(())
     }
 
@@ -460,7 +479,11 @@ impl AsynMotor for SpiiPlusAxis {
         }
         let ctrl = self.lock();
         // C setPosition writes RPOS; the controller auto-updates APOS/FPOS.
-        ctrl.command(&format!("SET RPOS({})={}", self.axis, fmt(position)))?;
+        ctrl.command(&format!(
+            "SET RPOS({})={}",
+            self.axis,
+            fmt(position * self.resolution)
+        ))?;
         Ok(())
     }
 
@@ -489,7 +512,8 @@ impl AsynMotor for SpiiPlusAxis {
         let (moving, powered, high_limit, low_limit, homed, encoder) = if self.reduced {
             // Dummy/virtual: motion from AST, no faults, encoder = commanded pos.
             let ast = ctrl.query_int("AST", a)?;
-            ((ast & AST_MOTION) != 0, false, false, false, false, apos)
+            let encoder = apos / self.resolution;
+            ((ast & AST_MOTION) != 0, false, false, false, false, encoder)
         } else {
             let mst = ctrl.query_int("MST", a)?;
             let fault = ctrl.query_int("FAULT", a)?;
@@ -501,7 +525,7 @@ impl AsynMotor for SpiiPlusAxis {
                 (fault & FAULT_HARD_RIGHT_LIMIT) != 0,
                 (fault & FAULT_HARD_LEFT_LIMIT) != 0,
                 (mflags & MFLAGS_HOME) != 0,
-                fpos,
+                fpos / self.encoder_factor,
             )
         };
         drop(ctrl);
@@ -517,9 +541,9 @@ impl AsynMotor for SpiiPlusAxis {
         }
 
         Ok(MotorStatus {
-            position: apos,
+            position: apos / self.resolution,
             encoder_position: encoder,
-            velocity,
+            velocity: velocity / self.resolution,
             done: !moving,
             moving,
             high_limit,
@@ -681,5 +705,16 @@ mod tests {
         assert_eq!(fmt(12.5), "12.5");
         assert_eq!(fmt(-0.25), "-0.25");
         assert_eq!(fmt(0.0000001), "0.0000001");
+    }
+
+    #[test]
+    fn resolution_is_stepf_only_for_a_real_stepper() {
+        let (stepf, efac) = (0.5, 2.0);
+        assert_eq!(resolution(0, false, stepf, efac), efac);
+        assert_eq!(resolution(MFLAGS_MICRO, false, stepf, efac), stepf);
+        assert_eq!(resolution(MFLAGS_STEPPER, false, stepf, efac), stepf);
+        let stepenc = MFLAGS_STEPPER | MFLAGS_STEPENC;
+        assert_eq!(resolution(stepenc, false, stepf, efac), efac);
+        assert_eq!(resolution(MFLAGS_MICRO, true, stepf, efac), efac);
     }
 }
