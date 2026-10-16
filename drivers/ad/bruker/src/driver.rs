@@ -200,13 +200,12 @@ impl PortDriver for BrukerDetector {
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
-            .port_base
-            .set_int32_param(reason, user.addr, value)?;
+        // C's setIntegerParam(function, value): list 0, and its status stands
+        // unless a branch below replaces it.
+        let mut status = self.ad.port_base.set_int32_param(reason, 0, value);
 
         let p = self.ad.params;
         let q = self.params;
-        let mut status = Ok(());
 
         if reason == p.acquire {
             let idle = self.get_i32(p.status) == ADStatus::Idle as i32;

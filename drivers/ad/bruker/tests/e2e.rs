@@ -450,6 +450,40 @@ fn a_base_class_write_runs_both_base_class_write_int32s() {
     }
 }
 
+/// A detector whose BIS sockets refuse every connection.
+fn dead_detector(name: &str) -> BrukerRuntime {
+    let closed = |name: &str| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+        let (runtime, _) =
+            create_port_runtime(&claim_port(name).unwrap(), driver, RuntimeConfig::default())
+                .expect("ip port runtime");
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        handle
+    };
+    create_bruker_detector(
+        &claim_port(name).unwrap(),
+        user(closed(&format!("{name}_COMMAND"))),
+        user(closed(&format!("{name}_STATUS"))),
+        0,
+    )
+    .expect("the detector port")
+}
+
+/// BISDetector.cpp:639: setIntegerParam(function, value) is list 0 whatever
+/// the address.
+#[test]
+fn a_write_at_another_address_sets_list_zero() {
+    let detector = dead_detector("BISLIST0");
+    let h = detector.port_handle().clone();
+    let reason = detector.params.num_darks;
+    h.write_int32_blocking(reason, 1, 3).unwrap();
+    assert_eq!(h.read_int32_blocking(reason, 0).unwrap(), 3);
+}
+
 /// BISTask ignores its getDoubleParam status (BISDetector.cpp:498), so a scan
 /// with no ADAcquireTime ever written still goes out to BIS, as 0 s.
 #[test]
