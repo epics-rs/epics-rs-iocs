@@ -2,29 +2,25 @@
 //!
 //! C `AcsMotionConfig(acsPort, asynPort, numAxes, movingPollPeriod,
 //! idlePollPeriod, virtualAxisList)`: connect the serial/TCP octet port,
-//! identify the controller ([`SpiiPlusController::new`]), and create controller
+//! make its comm, identify the controller ([`SpiiPlusController::new`]), and create controller
 //! port `acsPort` whose axes records address as `@asyn(acsPort,axis)`. The poll
 //! periods are seconds and `virtualAxisList` is comma-separated 0-based axis
 //! indices, as in C.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_int,
     req_string,
 };
 use motor_common::{asyn_user, install, register_controller_port};
 
-use crate::spiiplus::{AcsMotionParams, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
-
-/// Command timeout (C `SPiiPlusComm` uses the asyn default; 2 s here).
-const ACSMOTION_TIMEOUT: Duration = Duration::from_secs(2);
+use crate::comm::{SpiiPlusComm, register_comm_port};
+use crate::spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusController};
 
 /// Parse the `virtualAxisList` string (comma-separated 0-based indices)
 /// into a set, ignoring blanks and out-of-range/unparseable entries (C warns and
@@ -73,16 +69,12 @@ pub fn acsmotion_config_command() -> CommandDef {
 
             let virtual_axes = parse_virtual_axes(&virtual_list, num_axes);
 
-            // C's SPiiPlusComm port is the controller port name plus "Comm"; it
-            // prints and returns, and the controller carries on with its user.
-            let (handle, _) = connect_controller(
-                &asyn_port,
-                ACSMOTION_TIMEOUT,
-                &format!("{port_name}Comm"),
-                format_args!("SPiiPlusComm::SPiiPlusComm: cannot connect to SPii+ controller"),
-            );
-            set_eos_ignored(&handle, INPUT_EOS, OUTPUT_EOS);
-            let controller = SpiiPlusController::new(handle, &port_name, num_axes);
+            // C's constructor makes the comm `<ACSPortName>Comm` first.
+            let comm_port = format!("{port_name}Comm");
+            let comm = SpiiPlusComm::connect(&comm_port, &asyn_port)?;
+            let owner = ctx.db().scan_control().interrupt_gate();
+            register_comm_port(owner, &comm_port, num_axes as i32)?;
+            let controller = SpiiPlusController::new(comm, &port_name, num_axes);
             let controller = Arc::new(Mutex::new(controller));
 
             register_controller_port(

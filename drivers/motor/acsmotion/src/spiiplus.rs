@@ -1,24 +1,18 @@
-//! ACS SPiiPlus motion controller driver (serial/TCP ASCII, ACSPL+).
+//! ACS SPiiPlus motion controller driver (ACSPL+ over [`SpiiPlusComm`]).
 //!
-//! Ported from `motorAcsMotion/acsMotionApp/src/SPiiPlusDriver.cpp` +
-//! `SPiiPlusCommDriver.cpp` (the model-3 `asynMotorController`/`asynMotorAxis`
-//! driver). Commands are ACSPL+ text terminated by CR (`\r`); the port EOS is
-//! `\r` both ways, set at connect (see [`INPUT_EOS`]). A reply
-//! whose first character is `?` is a controller error (`?<errno>`), matching the
-//! C `writeReadAck`/`writeReadDouble` check `inString[0] == '?'`. Axes are
-//! addressed by 0-based index on the wire.
+//! Ported from `motorAcsMotion/acsMotionApp/src/SPiiPlusDriver.cpp` (the
+//! model-3 `asynMotorController`/`asynMotorAxis` driver). Every exchange goes
+//! through the controller's comm, as C's `pComm_` does; axes are addressed by
+//! 0-based index on the wire.
 //!
 //! ## Poll transport (deviation, documented)
 //!
 //! The C controller `poll()` reads all axes at once with the binary
-//! SPiiPlusBinComm protocol (`getDoubleArray`/`getIntegerArray`). This port
-//! replaces that bulk transport with per-axis ASCII single-element queries
-//! (`?APOS(n)`, `?FPOS(n)`, `?MST(n)`, `?FAULT(n)`, `?MFLAGS(n)`, `?FVEL(n)`,
-//! `?AST(n)`) issued from each axis's [`poll`](AsynMotor::poll). The values are
-//! identical — the binary protocol is purely a bulk-transfer optimization with
-//! no extra semantics — so only the number of round-trips differs. The binary
-//! comm layer (SPiiPlusBinComm), profile/PVT moves, the profile thread, and the
-//! SPiiPlusAux driver are therefore not modeled.
+//! protocol (`getDoubleArray`/`getIntegerArray`). This port still issues
+//! per-axis ASCII single-element queries (`?APOS(n)`, `?FPOS(n)`, `?MST(n)`,
+//! `?FAULT(n)`, `?MFLAGS(n)`, `?FVEL(n)`, `?AST(n)`) from each axis's
+//! [`poll`](AsynMotor::poll); the values are the same, only the number of
+//! round-trips differs.
 //!
 //! ## Units
 //!
@@ -39,8 +33,8 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! SPiiPlusBinComm binary array protocol (replaced by ASCII queries), profile /
-//! PVT moves and the profile thread, the SPiiPlusAux driver, and the other aux
+//! The binary bulk poll (replaced by ASCII queries), profile / PVT moves and
+//! the profile thread, and the other aux
 //! asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
 //! and factors, reference position, PEG, disable-set-position guard, global
 //! variable read/write, ACSPL program start/stop).
@@ -52,15 +46,12 @@ use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
-use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
 
-use motor_common::util::{atof, atoi};
-
-/// Response buffer size (C `MAX_CONTROLLER_STRING_SIZE` is 256).
-const READ_BUF: usize = 256;
+use crate::bincomm::Span;
+use crate::comm::SpiiPlusComm;
 
 /// Port EOS set at connect: C sets it in ACS_Motion.iocsh:28-29 and
 /// SPiiPlusCommDriver.cpp:425-426 restores it after every binary poll.
@@ -183,37 +174,56 @@ impl Homing {
     }
 }
 
-/// Shared controller endpoint: owns the octet handle, the version string, the
-/// axis count, and each axis's homing parameters.
+/// Shared controller endpoint: owns the comm, the version string, the
+/// axis count, the setup flags, and each axis's homing parameters.
 pub struct SpiiPlusController {
-    handle: SyncIOHandle,
+    comm: SpiiPlusComm,
     /// C `pasynUserSelf`'s port, the `AcsMotionConfig` port name.
     port: String,
-    /// C `SPiiPlusComm`'s port, `<ACSPortName>Comm`, whose `pasynUserSelf`
-    /// prints every exchange error.
-    comm_port: String,
     ident: String,
     num_axes: usize,
+    /// C `motorFlags_` as read at construction.
+    motor_flags: Vec<i32>,
     homing: Vec<Homing>,
 }
 
 impl SpiiPlusController {
-    /// Connect and identify a SPiiPlus controller (C `SPiiPlusController`
-    /// constructor): read the firmware version (`?VR`). `num_axes` comes
-    /// from the config command. Performs blocking octet I/O.
-    pub fn new(handle: SyncIOHandle, port: &str, num_axes: usize) -> Self {
-        let mut ctrl = Self {
-            handle,
+    /// C `SPiiPlusController` constructor's queries: the firmware version
+    /// (`?VR`), whether `VPOS` exists, and the setup arrays read over the
+    /// binary protocol. C ignores every status here, so a controller that
+    /// does not answer still gets its axes, with zeroed setup. Performs
+    /// blocking I/O.
+    pub fn new(comm: SpiiPlusComm, port: &str, num_axes: usize) -> Self {
+        let ident = comm.write_read_str("?VR").unwrap_or_default();
+        // C keeps the answer for the VPOS poll and recording this port
+        // does not have yet; the query stays for the wire sequence.
+        let _ = comm.is_variable_defined("VPOS");
+        let span = Span::one(0, num_axes as i32 - 1);
+        let ints = |var| fill(comm.get_integer_array(var, span), num_axes);
+        let doubles = |var| fill(comm.get_double_array(var, span), num_axes);
+        let motor_flags = ints("MFLAGS");
+        // C keeps these for the resolution and for parameters this port
+        // does not have.
+        let _ = doubles("STEPF");
+        let _ = doubles("EFAC");
+        let _ = doubles("E2FAC");
+        let encoder_type = ints("E_TYPE");
+        let _ = ints("E2_TYPE");
+        for (index, kind) in encoder_type.iter().enumerate() {
+            // An absolute encoder's position is valid once its error is
+            // cleared.
+            if *kind > 4 {
+                let _ = comm.write_read_ack(&format!("FCLEAR {index}"));
+            }
+        }
+        Self {
+            comm,
             port: port.to_string(),
-            comm_port: format!("{port}Comm"),
-            ident: String::new(),
+            ident,
             num_axes,
+            motor_flags,
             homing: vec![Homing::default(); num_axes],
-        };
-        // C reads ?VR once and ignores the status: a controller that does not
-        // answer still gets its axes (SPiiPlusDriver.cpp:144-146).
-        ctrl.ident = ctrl.exchange("writeReadStr", "?VR").unwrap_or_default();
-        ctrl
+        }
     }
 
     /// The firmware version string (`?VR`).
@@ -232,72 +242,26 @@ impl SpiiPlusController {
     }
 
     /// Send a set/motion command (C `writeReadAck`).
-    fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.exchange("writeReadAck", cmd)
+    fn command(&self, cmd: &str) -> AsynResult<()> {
+        self.comm.write_read_ack(cmd)
     }
 
-    /// Send a command and return its reply (trimmed of CR/LF/NUL/`:` prompt and
-    /// spaces). A reply whose first character is `?` is a controller error
-    /// (`?<errno>`): C prints it as `func` and asks the controller for its
-    /// text. A successful set/motion command replies with only the prompt
-    /// (empty after trimming); a query replies with the value.
-    fn exchange(&self, func: &str, cmd: &str) -> AsynResult<String> {
-        // C SPiiPlusComm::writeReadController: pasynOctetSyncIO->writeRead.
-        let text = self.write_read(cmd)?;
-        if text.starts_with('?') {
-            self.print(format_args!("SPiiPlusComm:{func}: Command failed: {cmd}\n"));
-            self.error_message(&text);
-            return Err(spiiplus_err(format!(
-                "SPiiPlus command failed: {cmd} -> {text}"
-            )));
-        }
-        Ok(text)
-    }
-
-    fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        let text = String::from_utf8_lossy(&raw);
-        Ok(text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string())
-    }
-
-    /// C `writeReadErrorMessage`: `?<reply>` (`??<errno>`) fetches the
-    /// error's text; its status never changes the caller's.
-    fn error_message(&self, reply: &str) {
-        let errno = atoi(&reply[1..]);
-        match self.write_read(&format!("?{reply}")) {
-            Ok(text) if !text.starts_with('?') => self.print(format_args!(
-                "SPiiPlusComm:writeReadErrorMessage: ERROR #{errno}: {text}\n"
-            )),
-            _ => self.print(format_args!(
-                "SPiiPlusComm:writeReadErrorMessage: ERROR #{errno}\n"
-            )),
-        }
-    }
-
-    fn print(&self, args: std::fmt::Arguments<'_>) {
-        PortManager::global().trace_manager().print(
-            Some(&self.comm_port),
-            Some(0),
-            0,
-            TraceMask::ERROR,
-            args,
-        );
-    }
-
-    /// Read a single integer array element `?VAR(index)` (0 on empty reply).
+    /// Read a single integer array element `?VAR(index)`.
     fn query_int(&self, var: &str, index: usize) -> AsynResult<i32> {
-        Ok(atoi(
-            &self.exchange("writeReadInt", &format!("?{var}({index})"))?,
-        ))
+        self.comm.write_read_int(&format!("?{var}({index})"))
     }
 
-    /// Read a single double array element `?VAR(index)` (0.0 on empty reply).
+    /// Read a single double array element `?VAR(index)`.
     fn query_double(&self, var: &str, index: usize) -> AsynResult<f64> {
-        Ok(atof(&self.exchange(
-            "writeReadDouble",
-            &format!("?{var}({index})"),
-        )?))
+        self.comm.write_read_double(&format!("?{var}({index})"))
     }
+}
+
+/// A setup array of `n` axes; a failed or short read leaves zeros.
+fn fill<T: Default + Clone>(read: AsynResult<Vec<T>>, n: usize) -> Vec<T> {
+    let mut values = read.unwrap_or_default();
+    values.resize(n, T::default());
+    values
 }
 
 /// One SPiiPlus axis sharing a controller. Implements [`AsynMotor`].
@@ -320,15 +284,12 @@ pub struct SpiiPlusAxis {
 
 impl SpiiPlusAxis {
     /// Construct axis `index` (0-based). `is_virtual` comes from the config
-    /// `virtualAxisList`; the dummy flag is read from `?MFLAGS(index)` here (C
-    /// reads MFLAGS at controller init). A probe failure leaves the axis
-    /// non-dummy, matching a zero MFLAGS read.
+    /// `virtualAxisList`; the dummy flag is the `MFLAGS` bit the controller
+    /// read at construction.
     pub fn new(controller: Arc<Mutex<SpiiPlusController>>, index: usize, is_virtual: bool) -> Self {
         let dummy = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            ctrl.query_int("MFLAGS", index)
-                .map(|f| (f & MFLAGS_DUMMY) != 0)
-                .unwrap_or(false)
+            (ctrl.motor_flags[index] & MFLAGS_DUMMY) != 0
         };
         Self {
             controller,
@@ -637,18 +598,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_controller_of_a_missing_port_keeps_its_axes() {
-        let (handle, status) = SyncIOHandle::connect_port(
-            "spiiplus-missing-port",
-            0,
-            std::time::Duration::from_millis(10),
-        );
-        assert!(status.is_err());
-        let ctrl = Arc::new(Mutex::new(SpiiPlusController::new(handle, "ACS", 2)));
-        assert_eq!(ctrl.lock().unwrap().ident(), "");
-        let axis = SpiiPlusAxis::new(ctrl, 1, false);
-        assert_eq!(axis.axis, 1);
-        assert!(!axis.reduced);
+    fn a_failed_or_short_setup_read_leaves_zeros() {
+        assert_eq!(fill(Ok(vec![5, 6]), 3), vec![5, 6, 0]);
+        assert_eq!(fill::<f64>(Err(spiiplus_err("down")), 2), vec![0.0, 0.0]);
     }
 
     #[test]
