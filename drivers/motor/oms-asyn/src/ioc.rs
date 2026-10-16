@@ -97,6 +97,7 @@ fn oms_config_command(
             let handle = connect_with_default_eos(
                 &asyn_port,
                 Duration::from_millis(timeout_ms.max(0.0) as u64),
+                &format!("{controller_type}Config"),
             )?;
             let controller = OmsController::new(handle, controller_type);
             match controller.firmware_version() {
@@ -163,29 +164,64 @@ fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> Co
 
 /// Connect to the octet port, giving it the OMS EOS (input `"\n\r"`, output
 /// `"\n"`) only where st.cmd left that direction empty, as
-/// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`.
-fn connect_with_default_eos(port_name: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
+/// `omsMAXnet`/`omsMXA` do after `getInputEos`/`getOutputEos`. As there, a
+/// refused get skips that direction and a refused set is printed, never fatal
+/// (omsMAXnet.cpp:134-142, omsMXA.cpp:129-137).
+fn connect_with_default_eos(
+    port_name: &str,
+    timeout: Duration,
+    who: &str,
+) -> Result<SyncIOHandle, String> {
     let port = get_port(port_name).ok_or_else(|| format!("asyn port '{port_name}' not found"))?;
     let user = || AsynUser::new(0).with_addr(0);
     let handle = &port.handle;
-    let eos_err = |e| format!("EOS on '{port_name}': {e}");
     if handle
         .get_input_eos_blocking(user())
-        .map_err(eos_err)?
-        .is_empty()
+        .is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_input_eos_blocking(user(), b"\n\r")
     {
-        handle
-            .set_input_eos_blocking(user(), b"\n\r")
-            .map_err(eos_err)?;
+        println!("{who}: unable to set InputEOS {port_name}: {e}");
     }
     if handle
         .get_output_eos_blocking(user())
-        .map_err(eos_err)?
-        .is_empty()
+        .is_ok_and(|eos| eos.is_empty())
+        && let Err(e) = handle.set_output_eos_blocking(user(), b"\n")
     {
-        handle
-            .set_output_eos_blocking(user(), b"\n")
-            .map_err(eos_err)?;
+        println!("{who}: unable to set OutputEOS {port_name}: {e}");
     }
     Ok(SyncIOHandle::from_handle(handle.clone(), 0, timeout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::{open_owner, register_port};
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+    /// A port with no EOS support of its own: both sets are refused.
+    struct Bare(PortDriverBase);
+
+    impl PortDriver for Bare {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    #[test]
+    fn a_port_refusing_the_default_eos_still_connects() {
+        let name = "omsEosRefused";
+        let base = PortDriverBase::new(name, 1, PortFlags::default());
+        let (rt, _actor) = create_port_runtime(Bare(base), RuntimeConfig::default()).unwrap();
+        let port = rt.port_handle().clone();
+        assert!(
+            port.set_input_eos_blocking(AsynUser::new(0), b"\n\r")
+                .is_err()
+        );
+        register_port(name, port, &open_owner()).unwrap();
+        assert!(connect_with_default_eos(name, Duration::from_secs(1), "MAXnetConfig").is_ok());
+    }
 }
