@@ -24,6 +24,11 @@ pub fn init_serial_port(port_name: &str, addr: i32) -> Result<PortHandle, String
     let port = get_port(port_name).ok_or_else(|| {
         format!("initSerialPort::failure to connect with device {port_name} @ {addr}")
     })?;
+    if port.handle.is_multi_device() {
+        return Err(format!(
+            "initSerialPort::{port_name} cannot be configured as multi device"
+        ));
+    }
     Ok(port.handle)
 }
 
@@ -108,6 +113,28 @@ mod tests {
         assert_eq!(
             e,
             "initSerialPort::failure to connect with device loveNoSuchPort @ 3"
+        );
+    }
+
+    #[test]
+    fn multi_device_port_is_refused() {
+        let base = PortDriverBase::new(
+            "loveMultiSer",
+            2,
+            PortFlags {
+                multi_device: true,
+                ..PortFlags::default()
+            },
+        );
+        let (rt, _actor) = create_port_runtime(Bare(base), RuntimeConfig::default()).unwrap();
+        register_port("loveMultiSer", rt.port_handle().clone(), &open_owner()).unwrap();
+        std::mem::forget(rt);
+        let Err(e) = init_serial_port("loveMultiSer", 0) else {
+            panic!("multi-device port accepted");
+        };
+        assert_eq!(
+            e,
+            "initSerialPort::loveMultiSer cannot be configured as multi device"
         );
     }
 
