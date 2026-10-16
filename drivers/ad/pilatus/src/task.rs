@@ -15,7 +15,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
@@ -90,6 +92,7 @@ pub(crate) struct Worker {
     pub ctx: Ctx,
     pub shared: Arc<Mutex<Shared>>,
     pub output: ArrayPublisher,
+    pub pool: Arc<NDArrayPool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +440,11 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
     }
 
     // C `doCallbacksGenericPointer(pFlatField, NDArrayData, 0)`.
-    let array = build_array(0, nx, ny, data, None);
-    w.output.publish(Arc::new(array)).await;
+    // A refused flat field is not published; the pool printed the
+    // reached-limit line.
+    if let Ok(array) = build_array(&w.pool, 0, nx, ny, data, None) {
+        w.output.publish(Arc::new(array)).await;
+    }
 
     w.ctx.set_i32(valid, 1);
     w.ctx.callbacks().await;
@@ -663,12 +669,13 @@ async fn read_image_file(
 }
 
 fn build_array(
+    pool: &NDArrayPool,
     unique_id: i32,
     nx: usize,
     ny: usize,
     data: Vec<i32>,
     description: Option<String>,
-) -> NDArray {
+) -> ADResult<NDArray> {
     let ts = EpicsTimestamp::now();
     let buffer = NDDataBuffer::I32(data);
     let mut attributes = NDAttributeList::new();
@@ -680,12 +687,12 @@ fn build_array(
             NDAttrValue::String(d),
         ));
     }
-    let mut array = NDArray::with_data(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer);
+    let mut array = pool.wrap(vec![NDDimension::new(nx), NDDimension::new(ny)], buffer)?;
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
-    array
+    Ok(array)
 }
 
 async fn max_size(ctx: &mut Ctx) -> (usize, usize) {
@@ -899,8 +906,11 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
                     apply_flat_field(&mut data, &s.flat_field, s.average_flat_field);
                 }
 
-                let array = build_array(image_counter, nx, ny, data, description);
-                w.output.publish(Arc::new(array)).await;
+                // C dereferences a refused alloc (pilatusDetector.cpp:1190);
+                // the frame is dropped after the pool's reached-limit line.
+                if let Ok(array) = build_array(&w.pool, image_counter, nx, ny, data, description) {
+                    w.output.publish(Arc::new(array)).await;
+                }
             }
 
             if num_images == 1 {
@@ -984,7 +994,15 @@ mod tests {
 
     #[test]
     fn build_array_carries_tiff_description() {
-        let a = build_array(7, 2, 2, vec![1, 2, 3, 4], Some("desc".into()));
+        let a = build_array(
+            &NDArrayPool::new(0),
+            7,
+            2,
+            2,
+            vec![1, 2, 3, 4],
+            Some("desc".into()),
+        )
+        .unwrap();
         assert_eq!(a.unique_id, 7);
         assert_eq!(a.dims.len(), 2);
         assert_eq!(a.data_size, 16);

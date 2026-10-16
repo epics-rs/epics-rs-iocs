@@ -22,9 +22,7 @@ use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 use parking_lot::Mutex;
 
@@ -421,7 +419,6 @@ pub struct PilatusRuntime {
     pub pilatus_params: PilatusParams,
     pool: Arc<NDArrayPool>,
     array_output: Arc<Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Worker threads; kept alive for the IOC's lifetime.
     pub tasks: Vec<std::thread::JoinHandle<()>>,
 }
@@ -439,8 +436,7 @@ impl PilatusRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -490,7 +486,6 @@ pub fn create_pilatus_detector(
     let pilatus_params = driver.p;
     let pool = driver.ad.pool.clone();
 
-    let queued_counter = driver.ad.queued_counter.clone();
     let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the Pilatus port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
@@ -506,11 +501,13 @@ pub fn create_pilatus_detector(
         ),
         shared: shared.clone(),
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
     };
     let acq_worker = Worker {
         ctx: Ctx::new(handle, cam_handle, ad_params, pilatus_params, stop),
         shared,
         output: ArrayPublisher::new(array_output.clone()),
+        pool: pool.clone(),
     };
 
     let tasks = vec![
@@ -530,7 +527,6 @@ pub fn create_pilatus_detector(
         pilatus_params,
         pool,
         array_output,
-        queued_counter,
         tasks,
     })
 }
