@@ -183,11 +183,12 @@ impl AmptekUdpTransport {
 
         self.socket.set_read_timeout(Some(READ_TIMEOUT))?;
         let mut found = Vec::new();
+        // One buffer for the whole search, as C's `szBuffer`.
+        let mut buf = [0u8; RECV_CHUNK_SIZE];
         for _ in 0..MAX_ENTRIES {
-            let mut buf = [0u8; RECV_CHUNK_SIZE];
             match self.socket.recv_from(&mut buf) {
                 Ok((n, SocketAddr::V4(from)))
-                    if net_finder::have_netfinder_packet(&buf[..n], rand) =>
+                    if net_finder::have_netfinder_packet(&buf, rand, n) =>
                 {
                     found.push(*from.ip());
                 }
@@ -446,20 +447,20 @@ mod tests {
     }
 
     #[test]
-    fn discover_broadcast_ignores_unrecognized_traffic() {
+    fn discover_broadcast_accepts_unrecognized_traffic() {
         let responder = UdpSocket::bind((LOOPBACK, 0)).unwrap();
         let responder_port = responder.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let mut buf = [0u8; 1024];
             let (_, from) = responder.recv_from(&mut buf).unwrap();
-            responder.send_to(&[0x42u8; 40], from).unwrap(); // garbage, not a NetFinder reply
+            responder.send_to(&[0x42u8; 40], from).unwrap();
         });
 
         let transport = AmptekUdpTransport::bind().unwrap();
         let broadcast_addr = SocketAddrV4::new(LOOPBACK, responder_port);
         let found = transport.discover_broadcast(broadcast_addr).unwrap();
         handle.join().unwrap();
-        assert!(found.is_empty());
+        assert_eq!(found, vec![LOOPBACK]);
     }
 
     #[test]

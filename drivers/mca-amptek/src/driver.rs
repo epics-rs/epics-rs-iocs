@@ -91,9 +91,7 @@
 //!   keys off `(pid1, pid2)` jointly, so the collision is structurally
 //!   unrepresentable rather than patched around.
 //!
-//! See also `protocol.rs`'s `AsciiCmdUtilities.h:17` and `net_finder.rs`'s
-//! `DppSocket.cpp:428-450` notes for the two defects found while porting
-//! the wire/discovery layers this module depends on.
+//! See also `ascii_cmd.rs`'s `AsciiCmdUtilities.h:17` note.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::Path;

@@ -10,22 +10,6 @@
 //! address to confirm/complete a connection, never the MAC, subnet,
 //! event schedule, or description text `CNetFinder::AddEntry` also
 //! parses.
-//!
-//! # Fixed (not reproduced) upstream defect
-//! `CDppSocket::HaveNetFinderPacket` (`DppSocket.cpp:428-450`) validates
-//! a broadcast response's `(buffer[0], buffer[2..4])` against the
-//! expected "Silicon Labs NetFinder packet" shape and the correlation
-//! nonce, but its final `else` branch -- reached by any buffer that
-//! matches *neither* the valid shape *nor* the specific
-//! `buffer[0]==0x00`-with-matching-nonce "unknown packet type" shape --
-//! returns `true` (with a `"no packet test"` log line) instead of
-//! `false`. That default-accept means arbitrary UDP traffic landing on
-//! the discovery socket (any other broadcast chatter on the LAN, or a
-//! spoofed packet, since this is unauthenticated broadcast UDP) gets
-//! treated as a confirmed device response and its bytes fed to
-//! `CNetFinder::AddEntry`. [`have_netfinder_packet`] here defaults to
-//! rejecting (`false`) unless the buffer positively matches the valid
-//! shape, closing that gap.
 
 use std::net::Ipv4Addr;
 
@@ -63,16 +47,19 @@ pub fn build_broadcast_request(rand: u16) -> [u8; 6] {
     ]
 }
 
-/// `CDppSocket::HaveNetFinderPacket` (`DppSocket.cpp:428-450`), with the
-/// default-accept fallthrough fixed to default-reject -- see the module
-/// doc's "Fixed (not reproduced) upstream defect" note.
-pub fn have_netfinder_packet(buf: &[u8], rand: u16) -> bool {
-    if buf.len() < 4 {
-        return false;
-    }
+/// `CDppSocket::HaveNetFinderPacket` (`DppSocket.cpp:428-450`). `buf` is
+/// the whole receive buffer and `num_bytes` the size of the last datagram:
+/// C reads bytes 0..4 whatever was received, and accepts every packet that
+/// is neither a NetFinder reply nor an echo of its own request.
+pub fn have_netfinder_packet(buf: &[u8], rand: u16, num_bytes: usize) -> bool {
     let rand_hi = (rand >> 8) as u8;
     let rand_lo = (rand & 0xFF) as u8;
-    buf.len() >= 32 && buf[0] == 0x01 && buf[2] == rand_hi && buf[3] == rand_lo
+    let nonce = buf[2] == rand_hi && buf[3] == rand_lo;
+    if num_bytes >= 32 && buf[0] == 0x01 && nonce {
+        true
+    } else {
+        !(buf[0] == 0x00 && nonce)
+    }
 }
 
 /// `doAmptekNetFinderPacket`'s outbound unicast request
@@ -138,26 +125,19 @@ mod tests {
 
     #[test]
     fn have_netfinder_packet_accepts_matching_nonce() {
-        assert!(have_netfinder_packet(&valid_response(0x55AA), 0x55AA));
+        assert!(have_netfinder_packet(&valid_response(0x55AA), 0x55AA, 32));
     }
 
+    /// Only an echo of the request shape is refused; a short reply, a
+    /// stale nonce and unrelated traffic all pass (`DppSocket.cpp:432-447`).
     #[test]
-    fn have_netfinder_packet_rejects_mismatched_nonce() {
-        assert!(!have_netfinder_packet(&valid_response(0x55AA), 0x1234));
-    }
-
-    #[test]
-    fn have_netfinder_packet_rejects_short_buffer() {
-        let short = &valid_response(0x55AA)[..31];
-        assert!(!have_netfinder_packet(short, 0x55AA));
-    }
-
-    /// The fixed defect: unrecognized-shape traffic must be rejected,
-    /// not default-accepted.
-    #[test]
-    fn have_netfinder_packet_rejects_unrecognized_shape() {
-        let garbage = vec![0x42u8; 40];
-        assert!(!have_netfinder_packet(&garbage, 0x55AA));
+    fn have_netfinder_packet_accepts_everything_but_a_request_echo() {
+        assert!(have_netfinder_packet(&valid_response(0x55AA), 0x1234, 32));
+        assert!(have_netfinder_packet(&valid_response(0x55AA), 0x55AA, 31));
+        assert!(have_netfinder_packet(&[0x42u8; 40], 0x55AA, 40));
+        let echo = build_broadcast_request(0x55AA);
+        assert!(!have_netfinder_packet(&echo, 0x55AA, echo.len()));
+        assert!(have_netfinder_packet(&echo, 0x1234, echo.len()));
     }
 
     #[test]
