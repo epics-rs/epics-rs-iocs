@@ -4,6 +4,7 @@ use meascomp::counter::CounterScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use crate::params::*;
@@ -12,8 +13,8 @@ use crate::trace::SelfTrace;
 
 /// MCS (Multi-Channel Scaler) acquisition state.
 pub struct McsState {
+    /// C `MCSRunning_`.
     pub running: bool,
-    pub acquiring: bool,
     pub num_counters_enabled: usize,
     pub max_points: usize,
     pub current_point: usize,
@@ -45,7 +46,6 @@ impl McsState {
         }
         Self {
             running: false,
-            acquiring: false,
             num_counters_enabled: 0,
             max_points,
             current_point: 0,
@@ -272,7 +272,6 @@ pub fn start_mcs(
     }
 
     state.running = true;
-    state.acquiring = true;
     state.current_point = 0;
     state.start_time = current_time_secs();
 
@@ -290,66 +289,115 @@ pub fn points_transferred(current_index: i64, n_chans: usize, max_points: usize)
     (current_index as usize / n_chans + 1).min(max_points)
 }
 
-/// Read MCS data from the scan buffer. Called from poller when running.
-pub fn read_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) {
-    let polled = device.daq_in_scan_status();
-    print_get_status(trace, "readMCS", &polled);
-    let Ok((status, xfer)) = polled else {
-        return;
-    };
+/// What one [`read_mcs`] pass leaves for the driver to publish.
+#[derive(Clone, Copy, Debug)]
+pub struct McsPass {
+    /// C `MCSCurrentPoint_`.
+    pub current_point: usize,
+    /// C `mcaElapsedRealTime_`/`LiveTime_`, set on every counter address.
+    pub elapsed: f64,
+    /// The scan ended this pass: C sets `mcaAcquiring_` 0 on each counter.
+    pub stopped: bool,
+}
 
-    if xfer.current_total_count == 0 {
-        return;
-    }
-
-    let n_chans = state.num_counters_enabled;
-    if n_chans == 0 || xfer.current_index < 0 {
-        return;
-    }
-
-    let skip = usize::from(state.point0_skip);
-    let last_point = points_transferred(xfer.current_index, n_chans, state.max_points + skip);
-    let now = current_time_secs();
-
-    // Copy new data points; a skipped point 0 shifts the scan buffer by one.
-    let mut in_ptr = state.current_point + skip;
-    while in_ptr < last_point && state.current_point < state.max_points {
-        let buf_offset = in_ptr * n_chans;
-        for (scan_idx, &ctr_idx) in state.chan_map.iter().enumerate() {
-            state.mcs_buffers[ctr_idx][state.current_point] =
-                state.scan_buffer[buf_offset + scan_idx] as i32;
+impl McsPass {
+    /// The param sets C readMCS makes for this pass, for whichever side
+    /// (poller or port driver) applies them.
+    pub fn updates(
+        &self,
+        params: &CtrParams,
+        num_counters: usize,
+    ) -> Vec<(usize, i32, ParamValue)> {
+        let mut updates = vec![(
+            params.mcs_current_point,
+            0,
+            ParamValue::Int32(self.current_point as i32),
+        )];
+        for addr in 0..MAX_MCS_COUNTERS as i32 {
+            updates.push((
+                params.mca_elapsed_real,
+                addr,
+                ParamValue::Float64(self.elapsed),
+            ));
+            updates.push((
+                params.mca_elapsed_live,
+                addr,
+                ParamValue::Float64(self.elapsed),
+            ));
         }
-        state.abs_time_buffer[state.current_point] = now;
-        state.current_point += 1;
-        in_ptr += 1;
-    }
-
-    // Check if done
-    let elapsed = now - state.start_time;
-    let done = status == SS_IDLE
-        || state.current_point >= state.max_points
-        || (state.preset_real_time > 0.0 && elapsed >= state.preset_real_time);
-
-    if done {
-        stop_mcs(device, state, trace);
-        state.acquiring = false;
+        if self.stopped {
+            for addr in 0..num_counters as i32 {
+                updates.push((params.mca_acquiring, addr, ParamValue::Int32(0)));
+            }
+        }
+        updates
     }
 }
 
-/// Stop MCS acquisition.
-pub fn stop_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) {
-    if state.running {
-        if let Err(e) = device.daq_in_scan_stop() {
-            trace.print(
-                TraceMask::ERROR,
-                format_args!(
-                    "USBCTR::stopMCS ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}",
-                    e.code, e.message
-                ),
-            );
-        }
+/// Copy the points the scan has transferred and stop it once the hardware
+/// is idle or the preset real time has passed. C `USBCTR::readMCS`.
+pub fn read_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> McsPass {
+    let polled = device.daq_in_scan_status();
+    print_get_status(trace, "readMCS", &polled);
+    let (scan_status, current_index) = match &polled {
+        Ok((scan, xfer)) => (*scan, xfer.current_index),
+        Err(_) => (SS_IDLE, -1),
+    };
+    if scan_status == SS_IDLE {
         state.running = false;
     }
+
+    let n_chans = state.num_counters_enabled;
+    if current_index >= 0 && n_chans > 0 {
+        let skip = usize::from(state.point0_skip);
+        let last_point = points_transferred(current_index, n_chans, state.max_points + skip);
+        let now = current_time_secs();
+        // A skipped point 0 shifts the scan buffer by one.
+        let mut in_ptr = state.current_point + skip;
+        while in_ptr < last_point && state.current_point < state.max_points {
+            let buf_offset = in_ptr * n_chans;
+            for (scan_idx, &ctr_idx) in state.chan_map.iter().enumerate() {
+                state.mcs_buffers[ctr_idx][state.current_point] =
+                    state.scan_buffer[buf_offset + scan_idx] as i32;
+            }
+            state.abs_time_buffer[state.current_point] = now;
+            state.current_point += 1;
+            in_ptr += 1;
+        }
+    }
+
+    let elapsed = state.elapsed_secs();
+    if state.running && state.preset_real_time > 0.0 && elapsed >= state.preset_real_time {
+        state.running = false;
+    }
+    let stopped = !state.running;
+    if stopped {
+        stop_mcs(device, state, trace);
+    }
+    McsPass {
+        current_point: state.current_point,
+        elapsed,
+        stopped,
+    }
+}
+
+/// C `USBCTR::stopMCS`: a running scan is marked stopped and given a final
+/// [`read_mcs`] pass, which comes back here to stop the hardware.
+pub fn stop_mcs(device: &DaqDevice, state: &mut McsState, trace: &SelfTrace) -> Option<McsPass> {
+    if state.running {
+        state.running = false;
+        return Some(read_mcs(device, state, trace));
+    }
+    if let Err(e) = device.daq_in_scan_stop() {
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::stopMCS ERROR calling cbStopBackground(CTRFUNCTION), status={}, error={}",
+                e.code, e.message
+            ),
+        );
+    }
+    None
 }
 
 fn current_time_secs() -> f64 {

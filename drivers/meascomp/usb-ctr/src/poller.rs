@@ -7,7 +7,7 @@ use epics_rs::asyn::trace::TraceMask;
 
 use meascomp::device::DaqDevice;
 
-use crate::mcs::{self, McsState};
+use crate::mcs::{self, McsPass, McsState};
 use crate::params::*;
 use crate::scaler::{self, ScalerState};
 use crate::trace::SelfTrace;
@@ -43,13 +43,8 @@ struct PollSnapshot {
     counters: [Option<i64>; MAX_COUNTERS],
     // Scaler state
     scaler_done_snapshot: Option<[u64; MAX_COUNTERS]>,
-    // MCS state
-    mcs_running: bool,
-    mcs_current_point: usize,
-    mcs_just_stopped: bool,
-    /// Seconds since the MCS scan started; C readMCS keeps
-    /// mcaElapsedRealTime/LiveTime on every counter address.
-    mcs_elapsed: f64,
+    mcs: Option<McsPass>,
+    num_counters: usize,
 }
 
 fn poller_loop(
@@ -88,12 +83,8 @@ fn poller_loop(
                             snap.scaler_done_snapshot = Some(st.scaler.counts);
                         }
                     } else if st.mcs.running {
-                        let mcs_was_acquiring = st.mcs.acquiring;
-                        mcs::read_mcs(&dev, &mut st.mcs, &trace);
-                        snap.mcs_running = true;
-                        snap.mcs_current_point = st.mcs.current_point;
-                        snap.mcs_just_stopped = mcs_was_acquiring && !st.mcs.acquiring;
-                        snap.mcs_elapsed = st.mcs.elapsed_secs();
+                        snap.mcs = Some(mcs::read_mcs(&dev, &mut st.mcs, &trace));
+                        snap.num_counters = st.num_counters;
                     } else {
                         for counter in 0..st.num_counters {
                             if let Ok(value) = dev.counter_in(counter as i32) {
@@ -129,29 +120,13 @@ fn poller_loop(
             for (i, c) in counts.iter().enumerate() {
                 let _ = handle.write_int32_blocking(params.counter_value, i as i32, *c as i32);
             }
-        } else if snapshot.mcs_running {
-            let _ = handle.write_int32_blocking(
-                params.mcs_current_point,
-                0,
-                snapshot.mcs_current_point as i32,
-            );
-            // C readMCS sets the elapsed times on every counter address, so a
-            // per-counter mca record sees them too.
-            for addr in 0..MAX_MCS_COUNTERS as i32 {
-                let _ = handle.write_float64_blocking(
-                    params.mca_elapsed_real,
-                    addr,
-                    snapshot.mcs_elapsed,
-                );
-                let _ = handle.write_float64_blocking(
-                    params.mca_elapsed_live,
-                    addr,
-                    snapshot.mcs_elapsed,
-                );
-            }
-            if snapshot.mcs_just_stopped {
-                let _ = handle.write_int32_blocking(params.mca_acquiring, 0, 0);
-            }
+        } else if let Some(pass) = snapshot.mcs {
+            let updates = pass
+                .updates(&params, snapshot.num_counters)
+                .into_iter()
+                .map(|(reason, addr, value)| ParamSetValue::new(reason, addr, value))
+                .collect();
+            let _ = handle.set_params_and_notify_blocking(0, updates);
         } else {
             for (counter, value) in snapshot.counters.iter().enumerate() {
                 if let Some(v) = value {

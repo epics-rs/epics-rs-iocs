@@ -278,11 +278,19 @@ impl PortDriver for CtrDriver {
         } else if reason == self.params.mca_stop_acquire {
             let dev = self.device.lock().unwrap();
             let mut st = self.state.lock().unwrap();
-            mcs::stop_mcs(&dev, &mut st.mcs, &trace);
-            st.mcs.acquiring = false;
-            self.base
-                .params
-                .set_int32(self.params.mca_acquiring, 0, 0)?;
+            let num_counters = st.num_counters;
+            // C stops only a running scan.
+            let pass = if st.mcs.running {
+                mcs::stop_mcs(&dev, &mut st.mcs, &trace)
+            } else {
+                None
+            };
+            for (reason, addr, value) in pass
+                .iter()
+                .flat_map(|p| p.updates(&self.params, num_counters))
+            {
+                self.base.params.set_value(reason, addr, value)?;
+            }
         } else if reason == self.params.mca_erase {
             let mut st = self.state.lock().unwrap();
             mcs::erase_mcs(&mut st.mcs);
@@ -436,6 +444,10 @@ impl PortDriver for CtrDriver {
         let reason = user.reason;
         let addr = device_addr(user.addr);
         self.base.params.set_float64(reason, addr, value)?;
+        if reason == self.params.mca_preset_real {
+            // C readMCS reads the preset on every pass.
+            self.state.lock().unwrap().mcs.preset_real_time = value;
+        }
 
         // Restart pulse generator if period or duty cycle changes while running
         if reason == self.params.pulse_period
