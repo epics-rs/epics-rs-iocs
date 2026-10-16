@@ -1,9 +1,11 @@
-//! Aerotech asyn motor controller drivers (Ensemble and A3200).
+//! Aerotech asyn motor controller drivers (Ensemble and A3200), and the
+//! model-1 Soloist.
 //!
 //! See [`ensemble`] and [`a3200`] for the per-controller protocols and porting
 //! notes, and [`ioc`] for the iocsh configuration commands.
 
 pub mod a3200;
+pub mod drv_soloist;
 pub mod ensemble;
 mod exchange;
 pub mod ioc;
