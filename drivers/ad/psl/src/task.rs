@@ -260,7 +260,15 @@ async fn publish_frame(
         Err(_) => return,
     };
 
-    let ts = EpicsTimestamp::now();
+    // C reads the clock for timeStamp, then takes the port's moved stamp as
+    // epicsTS (PSL.cpp:606-609).
+    let now = EpicsTimestamp::now();
+    let ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
     let dims: Vec<NDDimension> = header.dims().into_iter().map(NDDimension::new).collect();
     let n_dims = dims.len();
     let mut attributes = epics_rs::ad_core::attributes::NDAttributeList::new();
@@ -279,7 +287,7 @@ async fn publish_frame(
     };
     array.unique_id = unique_id;
     array.timestamp = ts;
-    array.time_stamp = ts.as_f64();
+    array.time_stamp = now.as_f64();
     array.attributes = attributes;
 
     set_params(

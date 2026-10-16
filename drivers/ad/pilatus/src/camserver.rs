@@ -131,6 +131,16 @@ impl Ctx {
         let _ = self.handle.set_params_and_notify(0, updates).await;
     }
 
+    /// C `updateTimeStamps`' stamp: the port's, moved now
+    /// (asynNDArrayDriver.cpp:832-836).
+    pub async fn update_time_stamp(&self) -> epics_rs::ad_core::timestamp::EpicsTimestamp {
+        self.handle
+            .update_time_stamp()
+            .await
+            .unwrap_or_else(|_| std::time::SystemTime::now())
+            .into()
+    }
+
     /// An `asynPrint` on `pasynUserSelf`.
     pub fn trace(&self, mask: TraceMask, msg: &str) {
         self.handle

@@ -696,12 +696,12 @@ async fn read_image_file(
 fn build_array(
     pool: &DriverPool,
     unique_id: i32,
+    ts: EpicsTimestamp,
     nx: usize,
     ny: usize,
     data: Vec<i32>,
     description: Option<String>,
 ) -> ADResult<DriverArray> {
-    let ts = EpicsTimestamp::now();
     let buffer = NDDataBuffer::I32(data);
     let mut attributes = NDAttributeList::new();
     if let Some(d) = description {
@@ -941,7 +941,11 @@ async fn acq_loop(mut w: Worker, start: Arc<Event>) {
 
                 // C dereferences a refused alloc (pilatusDetector.cpp:1190);
                 // the frame is dropped after the pool's reached-limit line.
-                if let Ok(array) = build_array(&w.pool, image_counter, nx, ny, data, description) {
+                // C updateTimeStamps (pilatusDetector.cpp:1227).
+                let ts = w.ctx.update_time_stamp().await;
+                if let Ok(array) =
+                    build_array(&w.pool, image_counter, ts, nx, ny, data, description)
+                {
                     w.output.publish(array).await;
                 }
             }
@@ -1154,6 +1158,7 @@ mod tests {
         let a = build_array(
             &DriverPool::standalone(0),
             7,
+            EpicsTimestamp::default(),
             2,
             2,
             vec![1, 2, 3, 4],

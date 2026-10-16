@@ -207,9 +207,9 @@ impl Worker {
             )
         {
             array.unique_id = image_counter;
-            array.timestamp = EpicsTimestamp::now();
-            // C uses `acqStartTime` for the double timestamp, and
-            // `updateTimeStamp` (current time) for the epicsTS.
+            // C uses `acqStartTime` for the double timestamp, and the port's
+            // `updateTimeStamp` for the epicsTS (marCCD.cpp:323-325).
+            array.timestamp = l.step(|d| EpicsTimestamp::from(d.ad.port_base.update_time_stamp()));
             array.time_stamp = self.load_acq_start();
             // C `getAttributes`, evaluated where its PARAM values live.
             let owner = self.owner.clone();

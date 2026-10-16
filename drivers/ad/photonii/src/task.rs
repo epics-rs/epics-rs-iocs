@@ -381,7 +381,13 @@ async fn publish_frame(
     let data = raw::decode_raw(&bytes)
         .map_err(|e| read_raw_failed(Abort::Error(format!("cannot decode {file_name}: {e}"))))?;
 
-    let ts = EpicsTimestamp::now();
+    // C updateTimeStamp (PhotonII.cpp:435): the port's stamp, moved now.
+    let ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| SystemTime::now())
+        .into();
     let data_type = data.data_type();
     // C dereferences a refused alloc unchecked (PhotonII.cpp:416); here the frame
     // is dropped after the pool's limit line.

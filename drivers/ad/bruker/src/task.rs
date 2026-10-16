@@ -80,6 +80,8 @@ struct Exposure {
     shutter_mode: Option<ShutterMode>,
     sfrm_timeout: f64,
     file_name: String,
+    /// C's `startTime`: the frame's `timeStamp`.
+    start_time: EpicsTimestamp,
 }
 
 async fn acquisition_loop(mut ctx: AcquisitionContext) {
@@ -195,15 +197,6 @@ async fn expose(ctx: &AcquisitionContext) -> Result<Exposure, Abort> {
         .await
         .map_err(|e| Abort::Error(format!("BISDetector:BISTask: cannot start the scan: {e}")))?;
 
-    let exposure = Exposure {
-        frame_type: FrameType::from_i32(read_i32(ctx, ctx.ad_params.frame_type).await)
-            .unwrap_or(FrameType::Normal),
-        acquire_time: read_f64(ctx, ctx.ad_params.acquire_time).await,
-        shutter_mode: ShutterMode::from_i32(read_i32(ctx, ctx.ad_params.shutter_mode).await),
-        sfrm_timeout: read_f64(ctx, ctx.params.sfrm_timeout).await,
-        file_name: read_string(ctx, ctx.ad_params.base.full_file_name).await,
-    };
-
     set_params(
         ctx,
         vec![ParamSetValue::new(
@@ -213,6 +206,16 @@ async fn expose(ctx: &AcquisitionContext) -> Result<Exposure, Abort> {
         )],
     )
     .await;
+
+    let exposure = Exposure {
+        frame_type: FrameType::from_i32(read_i32(ctx, ctx.ad_params.frame_type).await)
+            .unwrap_or(FrameType::Normal),
+        acquire_time: read_f64(ctx, ctx.ad_params.acquire_time).await,
+        shutter_mode: ShutterMode::from_i32(read_i32(ctx, ctx.ad_params.shutter_mode).await),
+        sfrm_timeout: read_f64(ctx, ctx.params.sfrm_timeout).await,
+        file_name: read_string(ctx, ctx.ad_params.base.full_file_name).await,
+        start_time: EpicsTimestamp::now(),
+    };
 
     // BIS drives the shutter itself when it is wired to the detector; an EPICS
     // shutter is ours to open.
@@ -314,7 +317,6 @@ async fn publish_frame(
     // status socket — and then let readSFRM write NROWS*NCOLS pixels into it: a
     // frame file bigger than the reported geometry ran off the end of the
     // buffer. The array is the size of the frame that was actually read.
-    let ts = EpicsTimestamp::now();
     let data_size = image.data.len() * 4;
     // C dereferences a refused alloc unchecked (BISDetector.cpp:588); here the frame
     // is dropped after the pool's limit line.
@@ -325,8 +327,13 @@ async fn publish_frame(
         return Ok(());
     };
     array.unique_id = unique_id;
-    array.timestamp = ts;
-    array.time_stamp = ts.as_f64();
+    array.time_stamp = exposure.start_time.as_f64();
+    array.timestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| SystemTime::now())
+        .into();
 
     set_params(
         ctx,
@@ -347,21 +354,6 @@ async fn publish_frame(
                 ParamValue::Int32(data_size as i32),
             ),
             ParamSetValue::new(ctx.ad_params.base.n_dimensions, 0, ParamValue::Int32(2)),
-            ParamSetValue::new(
-                ctx.ad_params.base.timestamp_rbv,
-                0,
-                ParamValue::Float64(ts.as_f64()),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_sec,
-                0,
-                ParamValue::Int32(ts.sec as i32),
-            ),
-            ParamSetValue::new(
-                ctx.ad_params.base.epics_ts_nsec,
-                0,
-                ParamValue::Int32(ts.nsec as i32),
-            ),
         ],
     )
     .await;

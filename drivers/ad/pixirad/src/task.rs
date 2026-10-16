@@ -323,6 +323,15 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
     });
 
     array.unique_id = unique_id;
+    // C: timeStamp is the first colour's startTime, epicsTS the port's
+    // updateTimeStamp (pixirad.cpp:1063-1064).
+    let epics_ts: EpicsTimestamp = ctx
+        .handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into();
+    array.timestamp = epics_ts;
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
 
@@ -344,12 +353,12 @@ async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, uniqu
                 ParamSetValue::new(
                     ctx.ad_params.base.epics_ts_sec,
                     0,
-                    ParamValue::Int32(ts.sec as i32),
+                    ParamValue::Int32(epics_ts.sec as i32),
                 ),
                 ParamSetValue::new(
                     ctx.ad_params.base.epics_ts_nsec,
                     0,
-                    ParamValue::Int32(ts.nsec as i32),
+                    ParamValue::Int32(epics_ts.nsec as i32),
                 ),
             ],
         )

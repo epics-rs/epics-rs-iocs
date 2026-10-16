@@ -1058,7 +1058,7 @@ async fn monitor_task(s: Arc<Shared>) {
                             None,
                             NDAttributeList::new(),
                             unique_id,
-                            None,
+                            port_stamp(&s.handle).await,
                         ) else {
                             s.trace().err("parseTiffFile", "couldn't allocate NDArray");
                             s.trace().err("monitorTask", "couldn't parse file");
@@ -1313,6 +1313,16 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
 // Publishing
 // ---------------------------------------------------------------------------
 
+/// C `updateTimeStamps` (asynNDArrayDriver.cpp:832-836): the port's stamp,
+/// moved now, which the frame's callbacks carry too.
+async fn port_stamp(handle: &PortHandle) -> EpicsTimestamp {
+    handle
+        .update_time_stamp()
+        .await
+        .unwrap_or_else(|_| std::time::SystemTime::now())
+        .into()
+}
+
 fn build_array(
     pool: &DriverPool,
     dims: [usize; 2],
@@ -1320,24 +1330,17 @@ fn build_array(
     codec: Option<epics_rs::ad_core::codec::Codec>,
     attributes: NDAttributeList,
     unique_id: i32,
-    timestamp: Option<EpicsTimestamp>,
+    timestamp: EpicsTimestamp,
 ) -> ADResult<DriverArray> {
     let mut array = pool.wrap(
         vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
         data,
     )?;
     array.unique_id = unique_id;
-    match timestamp {
-        // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337).
-        Some(ts) => {
-            array.timestamp = ts;
-            array.time_stamp = f64::from(ts.sec) + f64::from(ts.nsec) / 1.0e9;
-        }
-        None => {
-            array.timestamp = EpicsTimestamp::now();
-            array.time_stamp = array.timestamp.as_f64();
-        }
-    }
+    // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337),
+    // as updateTimeStamps does.
+    array.timestamp = timestamp;
+    array.time_stamp = f64::from(timestamp.sec) + f64::from(timestamp.nsec) / 1.0e9;
     array.attributes = attributes;
     array.codec = codec;
     Ok(array)
@@ -1409,6 +1412,12 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResu
     // :1878), so the first array of an IOC's life is uniqueId 0.
     let unique_id = s.get_int(s.ad.base.array_counter).await;
     let counter = unique_id + 1;
+    // C calls updateTimeStamps only when stream2 left the ts unset
+    // (eigerDetector.cpp:1539-1541).
+    let timestamp = match timestamp {
+        Some(ts) => ts,
+        None => port_stamp(&s.handle).await,
+    };
     let array = build_array(&s.pool, dims, data, codec, attributes, unique_id, timestamp)?.share();
 
     if array_callbacks {

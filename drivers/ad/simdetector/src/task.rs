@@ -1,6 +1,6 @@
 //! Port of `simDetector::simTask` (simDetector.cpp:729-883).
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
@@ -298,7 +298,13 @@ async fn sim_task(mut ctx: SimTaskContext) {
         image.unique_id = image_counter;
         // `updateTimeStamps` only stamps the NDArray; C's simDetector never
         // writes the NDTimeStamp / NDEpicsTSSec parameters.
-        image.update_time_stamps_now();
+        image.update_time_stamps(
+            ctx.handle
+                .update_time_stamp()
+                .await
+                .unwrap_or_else(|_| SystemTime::now())
+                .into(),
+        );
 
         let image = image.share();
         if array_callbacks {

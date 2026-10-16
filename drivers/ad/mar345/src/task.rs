@@ -400,9 +400,9 @@ impl Worker {
         };
         array.unique_id = image_counter;
         // C sets the double timeStamp from acqStartTime and the epicsTS from the
-        // current time (updateTimeStamp).
+        // port's updateTimeStamp (mar345.cpp:212-213).
         array.time_stamp = self.load_acq_start();
-        array.timestamp = EpicsTimestamp::now();
+        array.timestamp = l.step(|d| EpicsTimestamp::from(d.ad.port_base.update_time_stamp()));
         // C `getAttributes`, evaluated where its PARAM values live.
         let owner = self.owner.clone();
         let fresh = l.step(move |d| {
