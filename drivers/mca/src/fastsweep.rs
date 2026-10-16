@@ -34,7 +34,7 @@
 //! [`PortHandle::set_params_and_notify_blocking`], which the actor applies
 //! as one atomic `set_value` + `call_param_callbacks` step (see
 //! `drivers/ur-robot/src/drivers/control.rs`'s poll thread for the same
-//! pattern). [`SweepState`] plays the role of C's directly-shared `pData_`/
+//! pattern). `SweepState` plays the role of C's directly-shared `pData_`/
 //! `numAcquired_`/... fields, guarded by one `Mutex` instead of asyn's own
 //! port lock.
 //!
@@ -75,7 +75,7 @@
 //!   undefined behaviour in C; Rust's saturating float-to-int cast would
 //!   instead silently freeze acquisition forever (`numAverage_` pinned at
 //!   `i32::MAX`, never reaching the accumulation threshold).
-//!   [`SweepState::compute_num_average`] guards `callback_interval <= 0.0`
+//!   `SweepState::compute_num_average` guards `callback_interval <= 0.0`
 //!   and falls back to `num_average = 1` directly, extending the file's own
 //!   existing "unsupported interval source" fallback to also cover this case.
 

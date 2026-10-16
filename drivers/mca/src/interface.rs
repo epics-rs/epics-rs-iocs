@@ -52,7 +52,7 @@ impl McaReason {
     pub const COUNT: usize = 21;
 
     /// Every reason, in `mcaCommand`'s declaration order -- the order
-    /// [`crate::dev_mca_asyn::DevMcaAsyn::init`] resolves drvInfo strings in,
+    /// `DevMcaAsyn`'s `DeviceSupport::init` resolves drvInfo strings in,
     /// matching `devMcaAsyn.c:184-204`'s call sequence.
     pub const ALL: [McaReason; Self::COUNT] = [
         Self::Data,

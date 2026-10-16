@@ -56,7 +56,7 @@ fn asyn_to_ca(e: AsynError) -> CaError {
 /// spectrum into the record directly. C's `elapsedLive`/`elapsedReal`/
 /// `dwellTime`/`totalCounts`/`acquiring` cache fields are likewise not
 /// needed -- they exist in C only to survive the queued/two-phase
-/// `mcaReadStatus` completion; here [`Self::read_status`] builds an
+/// `mcaReadStatus` completion; here `read_status` builds an
 /// [`McaStatus`] and hands it straight to `McaRecord::apply_status` in one
 /// synchronous step.
 pub struct DevMcaAsyn {
@@ -206,7 +206,7 @@ impl DeviceSupport for DevMcaAsyn {
     /// (`findDrvInfo`, `devMcaAsyn.c:184-204`). The link parse and port
     /// lookup that precede this in C (`parseLink`/`connectDevice`,
     /// `devMcaAsyn.c:141-168`) already happened in
-    /// [`connect`](DevMcaAsyn::connect), which built `self.handle`/
+    /// [`connect`], which built `self.handle`/
     /// `self.addr` before this device support was ever registered -- unlike
     /// C, a bad link or unknown port cannot reach `init` at all (see
     /// `connect`'s doc).
