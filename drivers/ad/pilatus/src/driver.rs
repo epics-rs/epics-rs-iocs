@@ -244,9 +244,10 @@ impl PortDriver for PilatusDriver {
             .port_base
             .get_float64_param(function, 0)
             .unwrap_or(0.0);
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(function, user.addr, value)?;
+            .set_float64_param(function, user.addr, value);
 
         if function == params.gain || function == p.energy || function == p.threshold {
             let auto_apply = self
@@ -275,17 +276,16 @@ impl PortDriver for PilatusDriver {
                     }
                 };
                 if let Some(v) = demanded {
-                    self.ad
-                        .port_base
-                        .set_float64_param(function, user.addr, v)?;
+                    status = self.ad.port_base.set_float64_param(function, user.addr, v);
                 }
                 self.send(Cmd::SetThreshold);
             } else {
                 // Put the old value back if we are deferring the threshold.
                 if function == p.threshold || function == p.energy {
-                    self.ad
+                    status = self
+                        .ad
                         .port_base
-                        .set_float64_param(function, user.addr, old_value)?;
+                        .set_float64_param(function, user.addr, old_value);
                 }
             }
         } else if function == params.acquire_time
@@ -337,18 +337,37 @@ impl PortDriver for PilatusDriver {
             self.send(Cmd::Raw(cmd_mx_f64("Omega", value)));
         } else if function == p.omega_incr {
             self.send(Cmd::Raw(cmd_mx_f64("Omega_increment", value)));
+        } else if function < p.delay_time {
+            // ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571).
+            status = self.ad.port_base.write_float64_param(user, value);
         }
-        // Parameters below FIRST_PILATUS_PARAM need no extra work beyond the
-        // `set_float64` above, which is all `ADDriver::writeFloat64` does.
 
-        user.print(
-            TraceMask::IO_DRIVER,
-            file!(),
-            line!(),
-            format_args!("pilatusDetector:writeFloat64: function={function}, value={value:.6}"),
-        );
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        match &status {
+            Err(e) => {
+                // C puts the old value back (pilatusDetector.cpp:1574-1580).
+                let _ = self
+                    .ad
+                    .port_base
+                    .set_float64_param(function, user.addr, old_value);
+                user.print(
+                    TraceMask::ERROR,
+                    file!(),
+                    line!(),
+                    format_args!(
+                        "pilatusDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
+                        e.status() as i32
+                    ),
+                );
+            }
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("pilatusDetector:writeFloat64: function={function}, value={value:.6}"),
+            ),
+        }
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        status
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
@@ -594,5 +613,50 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (pilatusDetector.cpp:1571),
+    /// whose IO_DRIVER line precedes pilatusDetector's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "PILATUS_BASE_F64";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let mut det = PilatusDriver::new(port, 8, 8, 0, links).unwrap();
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("pilatus-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        det.write_float64(&mut user, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("pilatusDetector:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
     }
 }
