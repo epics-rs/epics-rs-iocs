@@ -23,12 +23,6 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# ANC150 framing: the driver appends the CR+LF terminator to each command, so
-# only the input EOS is configured here (each reply blob ends at the "> "
-# console prompt). Do not also set an output EOS — the port would append it a
-# second time.
-asynOctetSetInputEos("$(SERIAL)", 0, "> ")
-
 # ---- ANC150 controller ----
 # ANC150AsynSetup(maxControllers) is accepted for startup-script parity; the
 # asyn-rs port allocates per ANC150AsynConfig call.

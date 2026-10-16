@@ -45,8 +45,10 @@ use motor_common::util::nint;
 /// Response buffer size (C `BUFFER_SIZE` 100, padded for the multi-line reply).
 const READ_BUF: usize = 256;
 
-/// Command terminator (C `ANC150_OUT_EOS`).
-const TERMINATOR: &[u8] = b"\r\n";
+/// Port EOS set at connect (C `ANC150_IN_EOS`/`ANC150_OUT_EOS`,
+/// drvANC150Asyn.cc:742-743).
+pub const INPUT_EOS: &[u8] = b"> ";
+pub const OUTPUT_EOS: &[u8] = b"\r\n";
 
 /// Fallback move interval when the step frequency is unknown
 /// (C `epicsThreadSleepQuantum()`, ~1 clock tick).
@@ -91,18 +93,11 @@ impl Anc150Controller {
         &self.ident
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Send a command and read its prompt-framed response blob (echo, reply,
     /// ack, ending at the `"> "` input EOS). C sendOnly/sendAndReceive use
     /// `pasynOctetSyncIO->writeRead`, which flushes a stray reply first.
     fn exchange(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
