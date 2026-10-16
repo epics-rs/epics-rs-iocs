@@ -304,13 +304,24 @@ async fn publish_image(
         }
     };
 
-    let mut array = ctx.pool.wrap(
+    let Ok(mut array) = ctx.pool.wrap(
         vec![
             NDDimension::new(header.x_size),
             NDDimension::new(header.y_size),
         ],
         data,
-    );
+    ) else {
+        // merlinDetector.cpp:436-442 (copyToNDArray8, and its 16/32 twins).
+        trace(
+            &ctx.handle,
+            &format!(
+                "merlinDetector:copyToNDArray{}: unable to allocate NDArray from pool",
+                header.pixel_depth
+            ),
+        );
+        set_status_message(ctx, "Error: run out of buffers in detector driver").await;
+        return;
+    };
     array.unique_id = array_counter;
     array.timestamp = start;
     array.time_stamp = start.as_f64();
@@ -354,6 +365,22 @@ async fn publish_profiles(
         Err(_) => return,
     };
 
+    let stride = header.x_size.max(header.y_size);
+    let NDDataBuffer::U32(_) = &profiles.image else {
+        unreachable!("decode_profiles always returns U32")
+    };
+    // C fills the profile waveforms only once the array is allocated
+    // (merlinDetector.cpp:384-391).
+    let Ok(mut array) = ctx.pool.wrap(
+        vec![NDDimension::new(stride), NDDimension::new(2)],
+        profiles.image,
+    ) else {
+        ctx.data
+            .trace("merlinDetector:copyProfileToNDArray32: unable to allocate NDArray from pool");
+        set_status_message(ctx, "Error: run out of buffers in detector driver").await;
+        return;
+    };
+
     let _ = ctx
         .handle
         .set_params_and_notify(
@@ -373,14 +400,6 @@ async fn publish_profiles(
         )
         .await;
 
-    let stride = header.x_size.max(header.y_size);
-    let NDDataBuffer::U32(_) = &profiles.image else {
-        unreachable!("decode_profiles always returns U32")
-    };
-    let mut array = ctx.pool.wrap(
-        vec![NDDimension::new(stride), NDDimension::new(2)],
-        profiles.image,
-    );
     array.unique_id = array_counter;
     array.timestamp = start;
     array.time_stamp = start.as_f64();
