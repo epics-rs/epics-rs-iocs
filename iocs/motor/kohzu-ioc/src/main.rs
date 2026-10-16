@@ -12,7 +12,6 @@ use std::sync::Arc;
 use epics_rs::base::error::CaResult;
 use epics_rs::ca::server::ioc_app::IocApplication;
 
-use motor_common::MotorHolder;
 use motor_kohzu::ioc::{sc800_config_command, sc800_setup_command};
 
 #[epics_rs::base::epics_main]
@@ -37,11 +36,13 @@ async fn main() -> CaResult<()> {
     let port_manager = Arc::new(epics_rs::asyn::manager::PortManager::new());
     app = epics_rs::asyn::iocsh::register_asyn_commands(app, port_manager);
 
-    // SC800 iocsh commands + motor device support.
-    let holder = MotorHolder::new();
+    // SC800 iocsh commands, and the motor DTYPs their axes serve.
     app = app.register_startup_command(sc800_setup_command());
-    app = app.register_startup_command(sc800_config_command(&holder));
-    app = app.register_dynamic_device_support(holder.device_support_factory());
+    app = app.register_startup_command(sc800_config_command());
+    app = app.register_dynamic_device_support(
+        &epics_rs::motor::devices::devices(),
+        epics_rs::motor::devices::device_support_factory(),
+    );
 
     epics_rs::bridge::qsrv::run_ca_pva_qsrv_ioc_app(app.startup_script(&script)).await
 }

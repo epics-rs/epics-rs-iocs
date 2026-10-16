@@ -24,19 +24,18 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- SC800 controller ----
-# SC800Setup(maxControllers, [scanRate]) is accepted for startup-script parity;
-# the asyn-rs port allocates per SC800Config call.
+# SC800Setup(num_cards, scan_rate in Hz)
 SC800Setup(1, 10)
 
-# SC800Config(card, asynPort, [movingPollMs], [idlePollMs]) - axis count derived
-# from the controller model (SC-800 -> 8, SC-400 -> 4, SC-200 -> 2).
-SC800Config(0, "$(SERIAL)", 100, 1000)
+# SC800Config(card, asyn port, GPIB address) - axis count derived from the
+# controller model (SC-800 -> 8, SC-400 -> 4, SC-200 -> 2).
+SC800Config(0, "$(SERIAL)", 0)
 
-# One motor record per axis (DTYP SC800_$(CARD)_0, _1, ...). The SC-800 works in
+# One motor record per axis (DTYP SC-800, OUT #C$(CARD) S0, S1, ...). The SC-800 works in
 # motor steps, so MRES = 1 and EGU = steps. This example loads two axes; add
 # more (up to the model's axis count) as needed.
-dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
+dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m1,C=$(CARD),S=0")
+dbLoadRecords("$(KOHZU_IOC)/db/sc800.template", "P=$(P),M=m2,C=$(CARD),S=1")
 
 iocInit()
 
