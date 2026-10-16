@@ -131,7 +131,10 @@ pub fn octet_write_read(handle: &SyncIOHandle, command: &str) -> AsynResult<Stri
 }
 
 pub struct PmacController {
-    handle: SyncIOHandle,
+    /// `None` when the low-level port refused the connect or an EOS set: C
+    /// keeps the controller with a NULL `lowLevelPortUser_` and every command
+    /// fails.
+    handle: Option<SyncIOHandle>,
     /// Axes created with `pmacCreateAxis`/`pmacCreateAxes` (1-based; address 0
     /// is reserved for controller parameters in C and is never an axis).
     axes: BTreeSet<i32>,
@@ -159,7 +162,7 @@ pub struct PmacController {
 
 impl PmacController {
     pub fn new(
-        handle: SyncIOHandle,
+        handle: Option<SyncIOHandle>,
         deferred_mode: DeferredMode,
         feed_rate_poll: bool,
         feed_rate_limit: i32,
@@ -186,7 +189,11 @@ impl PmacController {
 
     /// C `pmacController::lowLevelWriteRead`; see [`octet_write_read`].
     pub fn write_read(&self, command: &str) -> AsynResult<String> {
-        octet_write_read(&self.handle, command)
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| pmac_err("no low level asynOctetSyncIO port"))?;
+        octet_write_read(handle, command)
     }
 
     /// Send a command whose reply carries no value (moves, jogs, set-position).
