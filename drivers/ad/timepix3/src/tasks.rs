@@ -32,7 +32,7 @@ use crate::http::{ServalHttp, TIMEOUT_POLL};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Shared};
-use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, parse_tcp_path};
+use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, ImageLimits, parse_tcp_path};
 
 /// C's `connectionPollPeriodSec_` (ADTimePix.cpp:1471).
 const CONNECTION_POLL: Duration = Duration::from_secs(5);
@@ -1106,6 +1106,9 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
         }
 
         loop {
+            if kind.channel() == Channel::Image {
+                decoder.set_image_limits(image_limits(ctx).await);
+            }
             match decoder.next_frame() {
                 Ok(Some(frame)) => handle_frame(ctx, kind, frame).await,
                 Ok(None) => break,
@@ -1118,6 +1121,17 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
             }
         }
     }
+}
+
+/// C `detectorImageFrameLimits` from the detector params
+/// (serval_stream.cpp:520-527).
+async fn image_limits(ctx: &Ctx) -> ImageLimits {
+    let int = |reason| async move { ctx.handle.read_int32(reason, 0).await.unwrap_or(0) };
+    ImageLimits::detector(
+        int(ctx.ad.max_size_x).await,
+        int(ctx.ad.max_size_y).await,
+        int(ctx.p.pix_count).await,
+    )
 }
 
 /// The line C prints for a header it cannot use.
@@ -1143,18 +1157,22 @@ fn decode_failed(ctx: &Ctx, kind: StreamKind, e: &DecodeError) {
         (None, DecodeError::Json(m)) => {
             eprintln!("ERROR | ADTimePix::processPrvHstDataLine: JSON parse error in PrvHst: {m}");
         }
-        (Some([_, _, line]), DecodeError::Dimensions(w, h)) => ctx.trace(
+        // The worker's payload-size resolver refuses the header before the
+        // line processor sees it (serval_stream.cpp:532-535, :606-611).
+        (Some([_, worker, _]), DecodeError::Image(e)) => ctx.trace(
             TraceMask::ERROR,
             &adlog::err(
-                line,
-                &format!("Invalid image dimensions: width={w}, height={h}"),
+                worker,
+                &format!(
+                    "{} rejected TCP stream: invalid JSON frame header: {e}",
+                    kind.name()
+                ),
             ),
         ),
         (None, DecodeError::BinSize(n)) => {
             eprintln!("ERROR | ADTimePix::processPrvHstDataLine: Invalid bin size: {n}");
         }
-        // C's `int` product wraps instead; and each channel's decoder only
-        // produces its own header's errors.
+        // Each channel's decoder only produces its own header's errors.
         _ => {}
     }
 }
@@ -1845,6 +1863,7 @@ fn geometry(ctx: &Ctx, f: &crate::stream::ImageFrame) -> [ParamSetValue; 7] {
     use epics_rs::ad_core::ndarray::NDDataType;
 
     let (data_type, bytes) = match f.format {
+        PixelFormat::UInt8 => (NDDataType::UInt8, 1),
         PixelFormat::UInt16 => (NDDataType::UInt16, 2),
         PixelFormat::UInt32 => (NDDataType::UInt32, 4),
     };
@@ -1873,9 +1892,17 @@ fn image_array(
     pixels: Vec<u32>,
     refused: &str,
 ) -> Option<DriverArray> {
+    use crate::stream::PixelFormat;
+    // C allocates the NDArray in the header's storage type
+    // (serval_stream.cpp:157-159, :793-795).
+    let data = match f.format {
+        PixelFormat::UInt8 => NDDataBuffer::U8(pixels.into_iter().map(|p| p as u8).collect()),
+        PixelFormat::UInt16 => NDDataBuffer::U16(pixels.into_iter().map(|p| p as u16).collect()),
+        PixelFormat::UInt32 => NDDataBuffer::U32(pixels),
+    };
     let array = ctx.pool.wrap(
         vec![NDDimension::new(f.width), NDDimension::new(f.height)],
-        NDDataBuffer::U32(pixels),
+        data,
     );
     if array.is_err() {
         ctx.trace(TraceMask::ERROR, refused);
@@ -2187,6 +2214,77 @@ mod tests {
                 .expect("no array")
                 .unwrap();
             assert_eq!(array.unique_id, frame_number);
+        }
+        std::mem::forget(runtime);
+    }
+
+    /// C allocates both image streams' NDArrays in the header's storage type
+    /// (serval_stream.cpp:157-159, :793-795).
+    #[tokio::test]
+    async fn an_image_is_published_in_its_header_storage_type() {
+        use crate::stream::PixelFormat;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let driver =
+            crate::driver::TimePix3Driver::new("TPXDTYPE", http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXDTYPE").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let outputs = new_outputs();
+        let (tx, mut rx) = ndarray_channel("TPXDTYPE_SINK", 4);
+        outputs[PRV_IMG_ADDR].lock().add(tx);
+        let (tx, mut rx_img) = ndarray_channel("TPXDTYPE_IMG_SINK", 4);
+        outputs[IMG_ADDR].lock().add(tx);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            outputs,
+            pool: DriverPool::standalone(0),
+        });
+        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+
+        for kind in [StreamKind::PrvImg, StreamKind::Img] {
+            for format in [PixelFormat::UInt8, PixelFormat::UInt16, PixelFormat::UInt32] {
+                let frame = Frame::Image(crate::stream::ImageFrame {
+                    width: 2,
+                    height: 1,
+                    format,
+                    frame_number: 1,
+                    time_at_frame: 0.0,
+                    threshold_id: 0,
+                    integration_size: 0,
+                    pixels: vec![1, 200],
+                });
+                handle_frame(&ctx, kind, frame).await;
+                let rx = match kind {
+                    StreamKind::Img => &mut rx_img,
+                    _ => &mut rx,
+                };
+                let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("no array")
+                    .unwrap();
+                let ok = match (format, &array.data) {
+                    (PixelFormat::UInt8, NDDataBuffer::U8(v)) => *v == [1, 200],
+                    (PixelFormat::UInt16, NDDataBuffer::U16(v)) => *v == [1, 200],
+                    (PixelFormat::UInt32, NDDataBuffer::U32(v)) => *v == [1, 200],
+                    _ => false,
+                };
+                assert!(ok, "{kind:?} {format:?}: {:?}", array.data.data_type());
+            }
         }
         std::mem::forget(runtime);
     }

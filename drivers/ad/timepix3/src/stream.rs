@@ -24,28 +24,188 @@ use serde_json::Value;
 /// `histogram_io.h:20` — the TDC clock period, in seconds.
 pub const TDC_CLOCK_PERIOD_SEC: f64 = (1.5625 / 6.0) * 1e-9;
 
-/// Serval's `pixelFormat` (serval_stream.cpp:483).
+/// A `jsonimage` pixel's storage (serval_stream_validation.h:18-22).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
+    UInt8,
     UInt16,
     UInt32,
 }
 
 impl PixelFormat {
-    fn parse(s: &str) -> Self {
-        if s.eq_ignore_ascii_case("uint32") {
-            Self::UInt32
-        } else {
-            Self::UInt16
+    const fn from_bytes(bytes: usize) -> Self {
+        match bytes {
+            1 => Self::UInt8,
+            4 => Self::UInt32,
+            _ => Self::UInt16,
         }
     }
 
     pub const fn bytes(self) -> usize {
         match self {
+            Self::UInt8 => 1,
             Self::UInt16 => 2,
             Self::UInt32 => 4,
         }
     }
+}
+
+/// The largest `jsonimage` frame accepted (C `ImageFrameLimits`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageLimits {
+    pub max_dimension: usize,
+    pub max_pixels: usize,
+    pub max_payload_bytes: usize,
+}
+
+/// Eight 256x256 chips at four bytes a pixel (serval_stream_validation.cpp:22-26).
+const SUPPORTED_PIXELS: usize = 8 * 256 * 256;
+const SUPPORTED_DIMENSION: usize = 8 * 256;
+
+impl ImageLimits {
+    /// C `detectorImageFrameLimits` (serval_stream_validation.cpp:39-61): the
+    /// detector's ADMaxSizeX/Y and PixCount may tighten the supported limits,
+    /// never widen them; any of them unset leaves the supported limits.
+    pub fn detector(max_size_x: i32, max_size_y: i32, pix_count: i32) -> Self {
+        let mut limits = Self {
+            max_dimension: SUPPORTED_DIMENSION,
+            max_pixels: SUPPORTED_PIXELS,
+            max_payload_bytes: SUPPORTED_PIXELS * 4,
+        };
+        if max_size_x > 0 && max_size_y > 0 && pix_count > 0 {
+            limits.max_dimension = (max_size_x.max(max_size_y) as usize).min(SUPPORTED_DIMENSION);
+            limits.max_pixels = (pix_count as usize).min(SUPPORTED_PIXELS);
+            limits.max_payload_bytes = limits.max_pixels * 4;
+        }
+        limits
+    }
+}
+
+/// C `ImageHeaderError`; `Display` is `imageHeaderErrorMessage`
+/// (serval_stream_validation.cpp:196-217).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageHeaderError {
+    MissingField,
+    InvalidFieldType,
+    InvalidDimension,
+    UnsupportedPixelFormat,
+    InconsistentPixelMetadata,
+    PixelLimitExceeded,
+    PayloadLimitExceeded,
+}
+
+impl std::fmt::Display for ImageHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MissingField => "missing width or height",
+            Self::InvalidFieldType => "image layout metadata has the wrong JSON type",
+            Self::InvalidDimension => "image dimensions are non-positive or exceed detector limits",
+            Self::UnsupportedPixelFormat => "unsupported jsonimage pixel storage format",
+            Self::InconsistentPixelMetadata => "pixelFormat, bitDepth, and dataSize disagree",
+            Self::PixelLimitExceeded => "image pixel count exceeds detector limits",
+            Self::PayloadLimitExceeded => "image payload size exceeds detector limits",
+        })
+    }
+}
+
+/// A validated `jsonimage` header's geometry (C `ImageFrameLayout`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageLayout {
+    pub width: usize,
+    pub height: usize,
+    pub format: PixelFormat,
+    pub payload_bytes: usize,
+}
+
+/// C `validateJsonImageHeader` (serval_stream_validation.cpp:63-194).
+pub fn validate_image_header(
+    header: &Value,
+    limits: &ImageLimits,
+) -> Result<ImageLayout, ImageHeaderError> {
+    use ImageHeaderError::*;
+    // nlohmann's get<int64_t> casts an unsigned value past i64::MAX.
+    let integer = |key: &str| match header.get(key) {
+        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_u64().map(|u| u as i64)),
+        _ => None,
+    };
+    let (Some(_), Some(_)) = (header.get("width"), header.get("height")) else {
+        return Err(MissingField);
+    };
+    let (Some(width), Some(height)) = (integer("width"), integer("height")) else {
+        return Err(InvalidFieldType);
+    };
+    let pixel_format = match header.get("pixelFormat") {
+        None => None,
+        Some(Value::String(f)) => Some(f.as_str()),
+        Some(_) => return Err(InvalidFieldType),
+    };
+    let [data_size, bit_depth] = ["dataSize", "bitDepth"].map(|key| match header.get(key) {
+        None => Ok(None),
+        Some(_) => integer(key).map(Some).ok_or(InvalidFieldType),
+    });
+    let (data_size, bit_depth) = (data_size?, bit_depth?);
+
+    let dimension_ok =
+        |d: i64| d > 0 && d as u64 <= limits.max_dimension as u64 && d <= i64::from(i32::MAX);
+    if !dimension_ok(width) || !dimension_ok(height) {
+        return Err(InvalidDimension);
+    }
+    let (width, height) = (width as usize, height as usize);
+    let pixels = width
+        .checked_mul(height)
+        .filter(|&n| n <= limits.max_pixels)
+        .ok_or(PixelLimitExceeded)?;
+
+    let mut bytes = 0;
+    let mut merge = |candidate: usize| {
+        if bytes != 0 && bytes != candidate {
+            return Err(InconsistentPixelMetadata);
+        }
+        bytes = candidate;
+        Ok(())
+    };
+    if let Some(f) = pixel_format.filter(|f| !f.is_empty()) {
+        merge(match f {
+            "uint8" | "UINT8" => 1,
+            "uint16" | "UINT16" => 2,
+            "uint32" | "UINT32" => 4,
+            _ => return Err(UnsupportedPixelFormat),
+        })?;
+    }
+    if let Some(depth) = bit_depth {
+        if !matches!(depth, 8 | 16 | 32) {
+            return Err(UnsupportedPixelFormat);
+        }
+        merge(depth as usize / 8)?;
+    }
+    if let Some(size) = data_size {
+        if size <= 0
+            || size as u64 > limits.max_payload_bytes as u64
+            || !(size as u64).is_multiple_of(pixels as u64)
+        {
+            return Err(PayloadLimitExceeded);
+        }
+        let declared = size as usize / pixels;
+        if !matches!(declared, 1 | 2 | 4) {
+            return Err(UnsupportedPixelFormat);
+        }
+        merge(declared)?;
+    }
+    // Serval 4.1.6 always sends dataSize and bitDepth; uint16 is C's legacy
+    // fallback for a header with neither.
+    if bytes == 0 {
+        bytes = 2;
+    }
+    let payload_bytes = pixels
+        .checked_mul(bytes)
+        .filter(|&n| n <= limits.max_payload_bytes)
+        .ok_or(PayloadLimitExceeded)?;
+    Ok(ImageLayout {
+        width,
+        height,
+        format: PixelFormat::from_bytes(bytes),
+        payload_bytes,
+    })
 }
 
 /// A decoded `jsonimage` frame. Pixels are widened to `u32` regardless of the
@@ -104,10 +264,8 @@ pub enum DecodeError {
     NoNewline,
     /// The header line is not JSON.
     Json(String),
-    /// Image width or height out of range.
-    Dimensions(i64, i64),
-    /// Image payload size overflows `usize`.
-    Overflow,
+    /// C `validateJsonImageHeader` refused the image header.
+    Image(ImageHeaderError),
     /// Histogram bin count out of range.
     BinSize(i64),
 }
@@ -117,8 +275,7 @@ impl std::fmt::Display for DecodeError {
         match self {
             Self::NoNewline => write!(f, "no newline in the header"),
             Self::Json(e) => write!(f, "header is not JSON: {e}"),
-            Self::Dimensions(w, h) => write!(f, "dimensions {w}x{h}"),
-            Self::Overflow => write!(f, "payload size overflows"),
+            Self::Image(e) => write!(f, "{e}"),
             Self::BinSize(n) => write!(f, "binSize {n}"),
         }
     }
@@ -126,8 +283,7 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// C's dimension guards (serval_stream.cpp:490, histogram_io.cpp:245).
-const MAX_DIM: usize = 100_000;
+/// C's bin-count guard (histogram_io.cpp:245).
 const MAX_BINS: usize = 1_000_000;
 /// A header line longer than this is not a header; the connection is desynced.
 const MAX_HEADER: usize = 64 * 1024;
@@ -144,6 +300,7 @@ pub enum Channel {
 pub struct FrameDecoder {
     channel: Channel,
     buf: Vec<u8>,
+    limits: ImageLimits,
 }
 
 impl FrameDecoder {
@@ -151,7 +308,14 @@ impl FrameDecoder {
         Self {
             channel,
             buf: Vec::new(),
+            limits: ImageLimits::detector(0, 0, 0),
         }
+    }
+
+    /// The limits the next image header is validated against; C reads them
+    /// from the detector's params for every header (serval_stream.cpp:520-527).
+    pub fn set_image_limits(&mut self, limits: ImageLimits) {
+        self.limits = limits;
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -182,7 +346,7 @@ impl FrameDecoder {
             serde_json::from_slice(&line[brace..]).map_err(|e| DecodeError::Json(e.to_string()))?;
 
         let (payload_len, frame) = match self.channel {
-            Channel::Image => image_header(&header)?,
+            Channel::Image => image_header(&header, &self.limits)?,
             Channel::Histogram => histogram_header(&header)?,
         };
 
@@ -267,6 +431,7 @@ impl Pending {
 /// big-endian host it corrupts every pixel. `from_be_bytes` is correct on both.
 fn decode_be(payload: &[u8], format: PixelFormat) -> Vec<u32> {
     match format {
+        PixelFormat::UInt8 => payload.iter().map(|&b| u32::from(b)).collect(),
         PixelFormat::UInt16 => payload
             .as_chunks::<2>()
             .0
@@ -305,30 +470,13 @@ fn threshold_id(header: &Value) -> i32 {
         .map_or(0, |v| v as i32)
 }
 
-fn image_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
-    let width = header_i64(header, "width", -1);
-    let height = header_i64(header, "height", -1);
-    let format = PixelFormat::parse(
-        header
-            .get("pixelFormat")
-            .and_then(Value::as_str)
-            .unwrap_or("uint16"),
-    );
-    let (Ok(w), Ok(h)) = (usize::try_from(width), usize::try_from(height)) else {
-        return Err(DecodeError::Dimensions(width, height));
-    };
-    if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
-        return Err(DecodeError::Dimensions(width, height));
-    }
-    let (width, height) = (w, h);
-    // UPSTREAM DEFECT (serval_stream.cpp:487): C computes `pixel_count =
-    // width * height` in `int` *before* the range check, so a hostile or
-    // corrupt header overflows the multiplication and the check passes on the
-    // wrapped value. Checked here, in usize, before anything is allocated.
-    let payload = width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(format.bytes()))
-        .ok_or(DecodeError::Overflow)?;
+fn image_header(header: &Value, limits: &ImageLimits) -> Result<(usize, Pending), DecodeError> {
+    let ImageLayout {
+        width,
+        height,
+        format,
+        payload_bytes: payload,
+    } = validate_image_header(header, limits).map_err(DecodeError::Image)?;
     Ok((
         payload,
         Pending::Image {
@@ -535,6 +683,114 @@ mod tests {
                 "{fields}"
             );
         }
+    }
+
+    /// C `validateJsonImageHeader` (serval_stream_validation.cpp:63-194),
+    /// one case per refusal and per storage source.
+    #[test]
+    fn an_image_header_is_validated_as_c_does() {
+        use ImageHeaderError::*;
+        let supported = ImageLimits::detector(0, 0, 0);
+        let check = |fields: &str, limits: &ImageLimits| {
+            let header: Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
+            validate_image_header(&header, limits).map(|l| (l.format, l.payload_bytes))
+        };
+        let wh = r#""width":4,"height":2"#;
+        for (fields, want) in [
+            (wh.to_string(), Ok((PixelFormat::UInt16, 16))),
+            (
+                format!(r#"{wh},"pixelFormat":"uint8""#),
+                Ok((PixelFormat::UInt8, 8)),
+            ),
+            (
+                format!(r#"{wh},"pixelFormat":"UINT32""#),
+                Ok((PixelFormat::UInt32, 32)),
+            ),
+            (
+                format!(r#"{wh},"pixelFormat":"""#),
+                Ok((PixelFormat::UInt16, 16)),
+            ),
+            (format!(r#"{wh},"bitDepth":8"#), Ok((PixelFormat::UInt8, 8))),
+            (
+                format!(r#"{wh},"dataSize":32"#),
+                Ok((PixelFormat::UInt32, 32)),
+            ),
+            (
+                format!(r#"{wh},"bitDepth":16,"dataSize":16"#),
+                Ok((PixelFormat::UInt16, 16)),
+            ),
+            (r#""width":4"#.to_string(), Err(MissingField)),
+            (
+                r#""width":4.0,"height":2"#.to_string(),
+                Err(InvalidFieldType),
+            ),
+            (format!(r#"{wh},"pixelFormat":16"#), Err(InvalidFieldType)),
+            (format!(r#"{wh},"dataSize":"16""#), Err(InvalidFieldType)),
+            (format!(r#"{wh},"bitDepth":16.0"#), Err(InvalidFieldType)),
+            (r#""width":0,"height":2"#.to_string(), Err(InvalidDimension)),
+            (
+                r#""width":2049,"height":1"#.to_string(),
+                Err(InvalidDimension),
+            ),
+            (
+                r#""width":2048,"height":512"#.to_string(),
+                Err(PixelLimitExceeded),
+            ),
+            (
+                format!(r#"{wh},"pixelFormat":"Uint16""#),
+                Err(UnsupportedPixelFormat),
+            ),
+            (
+                format!(r#"{wh},"bitDepth":12"#),
+                Err(UnsupportedPixelFormat),
+            ),
+            (
+                format!(r#"{wh},"dataSize":24"#),
+                Err(UnsupportedPixelFormat),
+            ),
+            (format!(r#"{wh},"dataSize":12"#), Err(PayloadLimitExceeded)),
+            (format!(r#"{wh},"dataSize":0"#), Err(PayloadLimitExceeded)),
+            (
+                format!(r#"{wh},"pixelFormat":"uint16","bitDepth":32"#),
+                Err(InconsistentPixelMetadata),
+            ),
+            (
+                format!(r#"{wh},"bitDepth":8,"dataSize":16"#),
+                Err(InconsistentPixelMetadata),
+            ),
+        ] {
+            assert_eq!(check(&fields, &supported), want, "{fields}");
+        }
+        // A detector's params tighten the limits; unset ones leave them.
+        let quad = ImageLimits::detector(512, 512, 512 * 512);
+        assert_eq!(
+            check(r#""width":513,"height":1"#, &quad),
+            Err(InvalidDimension)
+        );
+        let small = ImageLimits::detector(4, 2, 4);
+        assert_eq!(check(wh, &small), Err(PixelLimitExceeded));
+        assert_eq!(ImageLimits::detector(4096, 0, 1), supported);
+    }
+
+    #[test]
+    fn uint8_pixels_decode_and_a_refused_header_is_an_error() {
+        let mut bytes = br#"{"width":2,"height":1,"bitDepth":8}"#.to_vec();
+        bytes.extend_from_slice(b"\n\x07\xff");
+        let mut d = FrameDecoder::new(Channel::Image);
+        d.push(&bytes);
+        let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
+            panic!()
+        };
+        assert_eq!((f.format, f.pixels), (PixelFormat::UInt8, vec![7, 255]));
+
+        let mut d = FrameDecoder::new(Channel::Image);
+        d.set_image_limits(ImageLimits::detector(1, 1, 1));
+        d.push(br#"{"width":2,"height":1}"#);
+        d.push(b"\n");
+        assert_eq!(
+            d.next_frame(),
+            Err(DecodeError::Image(ImageHeaderError::InvalidDimension))
+        );
     }
 
     #[test]
