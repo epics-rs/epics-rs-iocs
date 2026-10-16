@@ -116,7 +116,7 @@ impl CtrDriver {
             trace: SelfTrace::default(),
         }));
 
-        Ok(Self {
+        let mut driver = Self {
             base,
             params,
             device: Arc::new(Mutex::new(device)),
@@ -124,11 +124,36 @@ impl CtrDriver {
             max_time_points,
             pulse_running: [false; NUM_TIMERS],
             dio_configurable,
-        })
+        };
+        // C's constructor ends its MCS setup with eraseMCS (drvUSBCTR.cpp:425).
+        driver.erase_mcs()?;
+        Ok(driver)
     }
 }
 
 impl CtrDriver {
+    /// C `USBCTR::eraseMCS`: the buffers, the point and every address's
+    /// elapsed times and counts.
+    fn erase_mcs(&mut self) -> AsynResult<()> {
+        let num_points = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
+        mcs::erase_mcs(
+            &mut self.state.lock().unwrap().mcs,
+            num_points.max(0) as usize,
+        );
+        self.base
+            .set_int32_param(self.params.mcs_current_point, 0, 0)?;
+        for i in 0..MAX_MCS_COUNTERS as i32 {
+            self.base
+                .set_float64_param(self.params.mca_elapsed_live, i, 0.0)?;
+            self.base
+                .set_float64_param(self.params.mca_elapsed_real, i, 0.0)?;
+            self.base
+                .set_float64_param(self.params.mca_elapsed_counts, i, 0.0)?;
+            self.base.call_param_callbacks(i)?;
+        }
+        Ok(())
+    }
+
     /// C `pulseGenRunning_[addr]`.
     fn pulse_running(&self, addr: i32) -> bool {
         usize::try_from(addr)
@@ -344,20 +369,7 @@ impl PortDriver for CtrDriver {
                 line!(),
                 format_args!("USBCTR:writeInt32: [{port} addr={addr}]: erased"),
             );
-            let num_points = self.base.get_int32_param(self.params.mca_num_channels, 0)?;
-            mcs::erase_mcs(
-                &mut self.state.lock().unwrap().mcs,
-                num_points.max(0) as usize,
-            );
-            self.base
-                .set_int32_param(self.params.mcs_current_point, 0, 0)?;
-            for i in 0..MAX_MCS_COUNTERS as i32 {
-                self.base
-                    .set_float64_param(self.params.mca_elapsed_live, i, 0.0)?;
-                self.base
-                    .set_float64_param(self.params.mca_elapsed_real, i, 0.0)?;
-                self.base.call_param_callbacks(i)?;
-            }
+            self.erase_mcs()?;
         } else if reason == self.params.mca_num_channels && value > self.max_time_points as i32 {
             let max = self.max_time_points as i32;
             self.base
