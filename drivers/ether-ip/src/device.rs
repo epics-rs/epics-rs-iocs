@@ -216,10 +216,14 @@ pub fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String>
 
 /// Gather `bits` consecutive bits out of the BOOL array starting at
 /// `element`/`mask`, packing them into an RVAL.
+///
+/// A multi-bit read tests its first bit as `(value & 0x1) & mask`
+/// (devEtherIP.c:209-216), so RVAL bit 0 is 0 unless `mask` covers bit 0.
 fn get_bits(raw: &[u8], mut element: usize, mut mask: u32, bits: usize) -> Option<u32> {
     let mut value = cip::get_udint(raw, element)?;
     let mut rval = 0u32;
-    if value & mask != 0 {
+    let first = if bits == 1 { value } else { value & 0x1 };
+    if first & mask != 0 {
         rval |= 1;
     }
     for i in 1..bits {
@@ -1167,10 +1171,19 @@ mod tests {
 
     #[test]
     fn get_bits_across_a_udint_boundary() {
-        // Bits 30,31 of word 0 are 1,0; bits 0,1 of word 1 are 1,1.
-        // Reading 4 bits from bit 30 gives 0b1101 (LSB first: 1,0,1,1).
+        // Bits 30,31 of word 0 are 1,0; bits 0,1 of word 1 are 1,1. C's
+        // first-bit test reads bit 30 as 0, so 4 bits give 0b1100.
         let raw = bits_buf(&[1 << 30, 0b11]);
-        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1101));
+        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1100));
+    }
+
+    /// mbbi NOBT=2 on BOOLs[300] with bits 300 and 301 set: C reads 2, not 3.
+    #[test]
+    fn multi_bit_read_takes_cs_first_bit_from_bit_zero() {
+        let raw = bits_buf(&[0x3000]);
+        assert_eq!(get_bits(&raw, 0, 1 << 12, 2), Some(2));
+        assert_eq!(get_bits(&raw, 0, 1 << 12, 1), Some(1));
+        assert_eq!(get_bits(&bits_buf(&[0b11]), 0, 1, 2), Some(3));
     }
 
     #[test]
@@ -1184,7 +1197,8 @@ mod tests {
     fn put_bits_round_trips() {
         let mut raw = bits_buf(&[0xFFFF_FFFF]);
         assert!(put_bits(&mut raw, 0, 1 << 4, 4, 0b0101));
-        assert_eq!(get_bits(&raw, 0, 1 << 4, 4), Some(0b0101));
+        // C reads the first bit back from bit 0 (set here), not bit 4.
+        assert_eq!(get_bits(&raw, 0, 1 << 4, 4), Some(0b0100));
         // Neighbouring bits are untouched.
         assert_eq!(cip::get_udint(&raw, 0), Some(0xFFFF_FF5F));
     }
@@ -1195,7 +1209,7 @@ mod tests {
         assert!(put_bits(&mut raw, 0, 1 << 30, 4, 0b1101));
         assert_eq!(cip::get_udint(&raw, 0), Some(1 << 30));
         assert_eq!(cip::get_udint(&raw, 1), Some(0b11));
-        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1101));
+        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1100));
     }
 
     #[test]
