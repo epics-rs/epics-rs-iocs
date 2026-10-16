@@ -9,12 +9,13 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::motor::controller_port::{
-    ControllerCtx, PROFILE_BUILD_BUSY, PROFILE_BUILD_DONE, PROFILE_MOVE_MODE_ABSOLUTE,
-    PROFILE_MOVE_MODE_RELATIVE, PROFILE_STATUS_FAILURE, PROFILE_STATUS_SUCCESS,
-    PROFILE_STATUS_UNDEFINED, index,
+    ControllerCtx, PROFILE_BUILD_BUSY, PROFILE_BUILD_DONE, PROFILE_EXECUTE_MOVE_START,
+    PROFILE_MOVE_MODE_ABSOLUTE, PROFILE_MOVE_MODE_RELATIVE, PROFILE_STATUS_FAILURE,
+    PROFILE_STATUS_SUCCESS, PROFILE_STATUS_UNDEFINED, index,
 };
 
 use crate::bincomm::Span;
+use crate::run::RunPlan;
 use crate::spiiplus::{AcsMotionParams, spiiplus_err};
 
 /// C `MAX_ACCEL_SEGMENTS`.
@@ -29,6 +30,11 @@ pub(crate) struct PulseParams {
     pub(crate) mode: usize,
     pub(crate) pos: usize,
     pub(crate) axis: usize,
+    pub(crate) peg_eng_enc_code: usize,
+    pub(crate) peg_out_assign_code: usize,
+    pub(crate) pouts_output_index: usize,
+    pub(crate) pouts_bit_code: usize,
+    pub(crate) pulse_width: usize,
 }
 
 /// One axis's part of C's profile: the `SPiiPlusAxis` arrays the base
@@ -66,7 +72,7 @@ pub(crate) struct SpiiProfile {
     /// C `fullProfileSize_`.
     full_size: usize,
     /// C `profileAxes_`.
-    profile_axes: Vec<usize>,
+    pub(crate) profile_axes: Vec<usize>,
     pulse_start_pos: f64,
     pulse_end_pos: f64,
     pulse_spacing: f64,
@@ -690,6 +696,93 @@ impl AcsMotionParams {
         Ok(message)
     }
 
+    /// C `runProfile` to its first `unlock()`: what the run reads, with
+    /// the execute state at the move to the start. `Ok` carries C's
+    /// `message` as the run starts; `Err` is the message of a run that
+    /// cannot start.
+    pub(crate) fn start_run(
+        &mut self,
+        ctx: &mut ControllerCtx<'_>,
+    ) -> Result<(RunPlan, String), String> {
+        let profile = &self.profile;
+        let axes = profile.profile_axes.clone();
+        if axes.is_empty() {
+            return Err("No axes selected".into());
+        }
+        // C dereferences the arrays initializeProfile never made.
+        if axes.iter().any(|&a| a >= profile.axes.len()) {
+            return Err("Error: profile not initialized".into());
+        }
+        print(
+            ctx,
+            TraceMask::IO_DRIVER,
+            "runProfile",
+            format_args!(" axisList = {}", axes_to_string(&axes)),
+        );
+        let string = |ctx: &ControllerCtx<'_>, index: usize| {
+            let bytes = ctx.base.get_string_param(index, 0).unwrap_or_default();
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        let pp = self.pulse_params();
+        let pulse_int = |ctx: &ControllerCtx<'_>, f: fn(&PulseParams) -> usize| {
+            pp.map_or(0, |pp| int(ctx, f(&pp), 0))
+        };
+        let full_size = profile.full_size;
+        let ctrl = self.lock();
+        let recorded = axes
+            .iter()
+            .take(MAX_DC_AXES)
+            .map(|&a| ctrl.recorded_position(a))
+            .collect();
+        drop(ctrl);
+        let plan = RunPlan {
+            start: axes.iter().map(|&a| profile.axes[a].start_pos).collect(),
+            flyback: axes.iter().map(|&a| profile.axes[a].flyback_pos).collect(),
+            full_positions: axes
+                .iter()
+                .map(|&a| profile.axes[a].full_positions[..full_size].to_vec())
+                .collect(),
+            full_times: profile.full_times[..full_size].to_vec(),
+            num_accel: profile.num_accel,
+            max_points: ctx.profile.max_points,
+            data_collection_interval: profile.data_collection_interval,
+            pulse_start_pos: profile.pulse_start_pos,
+            pulse_end_pos: profile.pulse_end_pos,
+            pulse_spacing: profile.pulse_spacing,
+            recorded,
+            start_pulses: int(ctx, index::PROFILE_START_PULSES, 0),
+            end_pulses: int(ctx, index::PROFILE_END_PULSES, 0),
+            num_points: int(ctx, index::PROFILE_NUM_POINTS, 0),
+            num_pulses: int(ctx, index::PROFILE_NUM_PULSES, 0),
+            pulse_mode: pulse_int(ctx, |pp| pp.mode),
+            pulse_axis: pulse_int(ctx, |pp| pp.axis),
+            peg_eng_enc_code: pp.map_or_else(String::new, |pp| string(ctx, pp.peg_eng_enc_code)),
+            peg_out_assign_code: pp
+                .map_or_else(String::new, |pp| string(ctx, pp.peg_out_assign_code)),
+            pouts_output_index: pulse_int(ctx, |pp| pp.pouts_output_index),
+            pouts_bit_code: pp.map_or_else(String::new, |pp| string(ctx, pp.pouts_bit_code)),
+            pulse_width: pp.map_or(0.0, |pp| float(ctx, pp.pulse_width, 0)),
+            move_mode: int(ctx, index::PROFILE_MOVE_MODE, 0),
+            axes,
+        };
+        let message = format!("Selected axes: {}", motors_to_string(&plan.axes));
+        set_message(ctx, index::PROFILE_EXECUTE_MESSAGE, &message);
+        set_int(
+            ctx,
+            index::PROFILE_EXECUTE_STATE,
+            PROFILE_EXECUTE_MOVE_START,
+        );
+        set_int(ctx, index::PROFILE_EXECUTE_STATUS, PROFILE_STATUS_UNDEFINED);
+        // A readback now reads the run this starts.
+        set_int(
+            ctx,
+            index::PROFILE_READBACK_STATUS,
+            PROFILE_STATUS_UNDEFINED,
+        );
+        let _ = ctx.base.call_param_callbacks(0);
+        Ok((plan, message))
+    }
+
     /// C `buildProfile`'s loop over the profile axes: the longest
     /// acceleration and deceleration times any axis needs, at 90% of its
     /// XACC or the user's PROFILE_ACCELERATION if longer, and each axis's
@@ -777,7 +870,7 @@ impl AcsMotionParams {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
@@ -800,6 +893,7 @@ mod tests {
     pub(crate) struct Rig {
         pub(crate) port: PortHandle,
         pub(crate) line: Arc<Mutex<crate::fake::Controller>>,
+        pub(crate) ctrl: Arc<Mutex<SpiiPlusController>>,
     }
 
     pub(crate) fn rig(name: &str, axes: usize, setup: &[(&str, &[f64])]) -> Rig {
@@ -811,9 +905,10 @@ mod tests {
         let port_name = format!("{name}Ctrl");
         let ctrl = SpiiPlusController::new(comm, &port_name, axes, &HashSet::new());
         let ctrl = Arc::new(Mutex::new(ctrl));
-        let params = AcsMotionParams::new(ctrl.clone());
+        let (params, thread) = AcsMotionParams::new(ctrl.clone());
         let port =
             register_controller_port(&open_owner(), &port_name, axes as i32, params).unwrap();
+        thread.spawn(port.clone()).unwrap();
         for addr in 0..axes {
             let motor: Arc<Mutex<dyn AsynMotor>> =
                 Arc::new(Mutex::new(SpiiPlusAxis::new(ctrl.clone(), addr)));
@@ -830,7 +925,7 @@ mod tests {
             port.write_int32_blocking(index::REC_DIRECTION, addr, 0)
                 .unwrap();
         }
-        let rig = Rig { port, line };
+        let rig = Rig { port, line, ctrl };
         rig.with(|params, ctx| params.initialize_profile_pulses(ctx, 8, 3))
             .unwrap();
         rig.line.lock().unwrap().sent.clear();
@@ -901,7 +996,7 @@ mod tests {
     }
 
     /// EFAC 0.5 and the controller's XVEL/XACC for each axis.
-    const SERVOS: &[(&str, &[f64])] = &[
+    pub(crate) const SERVOS: &[(&str, &[f64])] = &[
         ("EFAC", &[0.5, 0.5]),
         ("XVEL", &[100.0, 100.0]),
         ("XACC", &[1000.0, 1000.0]),
@@ -912,7 +1007,7 @@ mod tests {
         let line = crate::fake::line("spiiPInit");
         let comm = SpiiPlusComm::connect("spiiPInitComm", "spiiPInit").unwrap();
         let ctrl = SpiiPlusController::new(comm, "spiiPInitCtrl", 1, &HashSet::new());
-        let params = AcsMotionParams::new(Arc::new(Mutex::new(ctrl)));
+        let (params, _) = AcsMotionParams::new(Arc::new(Mutex::new(ctrl)));
         let port = register_controller_port(&open_owner(), "spiiPInitCtrl", 1, params).unwrap();
         line.lock().unwrap().sent.clear();
         port.with_driver_blocking::<ControllerPort<AcsMotionParams>, _>(|d| {

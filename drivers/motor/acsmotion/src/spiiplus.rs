@@ -31,13 +31,14 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! The binary bulk poll (replaced by ASCII queries), the profile execute
-//! and readback (the profile thread), and the other aux
+//! The binary bulk poll (replaced by ASCII queries), the profile
+//! readback, and the other aux
 //! asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
 //! and factors, reference position, PEG, disable-set-position guard, global
 //! variable read/write, ACSPL program start/stop).
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -47,11 +48,14 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerCtx, ControllerParams, ParamWrite};
+use epics_rs::motor::controller_port::{
+    ControllerCtx, ControllerParams, PROFILE_EXECUTE_DONE, ParamWrite, index,
+};
 
 use crate::bincomm::Span;
 use crate::comm::SpiiPlusComm;
-use crate::profile::{PulseParams, SpiiProfile};
+use crate::profile::{PulseParams, SpiiProfile, axes_to_string};
+use crate::run::{ProfileThread, RunControl, profile_thread};
 
 /// Port EOS set at connect: C sets it in ACS_Motion.iocsh:28-29 and
 /// SPiiPlusCommDriver.cpp:425-426 restores it after every binary poll.
@@ -136,7 +140,7 @@ pub(crate) fn spiiplus_err(message: impl Into<String>) -> AsynError {
 
 /// Format a floating-point command argument as a plain decimal (never
 /// scientific), matching the controller's ASCII numeric parsing.
-fn fmt(v: f64) -> String {
+pub(crate) fn fmt(v: f64) -> String {
     // Rust's f64 `Display` emits a shortest round-trip decimal with no exponent,
     // which the SPiiPlus command interpreter accepts directly.
     format!("{v}")
@@ -302,6 +306,35 @@ impl SpiiPlusController {
     /// Axis `axis`'s C `resolution_`.
     pub(crate) fn resolution(&self, axis: usize) -> f64 {
         self.setup[axis].resolution
+    }
+
+    /// The `AcsMotionConfig` port name.
+    pub(crate) fn port(&self) -> &str {
+        &self.port
+    }
+
+    /// Axis `axis`'s C `moving_`.
+    pub(crate) fn is_moving(&self, axis: usize) -> bool {
+        self.motion[axis].moving
+    }
+
+    /// Axis `axis`'s C `pegReady_`; `None` past the last axis.
+    pub(crate) fn peg_ready(&self, axis: usize) -> Option<bool> {
+        self.motion.get(axis).map(|m| m.peg_ready)
+    }
+
+    /// C `runProfile`'s `posData`: the position data collection records
+    /// for axis `axis`. FPOS and PE stay zero on a dummy axis, so it
+    /// records the desired position, as does a virtual axis without VPOS.
+    pub(crate) fn recorded_position(&self, axis: usize) -> &'static str {
+        let setup = self.setup[axis];
+        if setup.dummy || (setup.is_virtual && !self.vpos_supported) {
+            "APOS"
+        } else if setup.is_virtual {
+            "VPOS"
+        } else {
+            "FPOS"
+        }
     }
 
     /// Send a set/motion command (C `writeReadAck`).
@@ -597,16 +630,22 @@ pub struct AcsMotionParams {
     params: Option<HomingParams>,
     pub(crate) pulse: Option<PulseParams>,
     pub(crate) profile: SpiiProfile,
+    run: RunControl,
 }
 
 impl AcsMotionParams {
-    pub fn new(controller: Arc<Mutex<SpiiPlusController>>) -> Self {
-        Self {
+    /// The parameters, and the profile thread that runs their profile
+    /// once [`ProfileThread::spawn`] starts it on their port.
+    pub fn new(controller: Arc<Mutex<SpiiPlusController>>) -> (Self, ProfileThread) {
+        let (run, thread) = profile_thread(controller.clone());
+        let params = Self {
             controller,
             params: None,
             pulse: None,
             profile: SpiiProfile::default(),
-        }
+            run,
+        };
+        (params, thread)
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, SpiiPlusController> {
@@ -632,17 +671,18 @@ impl ControllerParams for AcsMotionParams {
         // C reads NUM_PULSES from the base's PROFILE_NUM_PULSES, never this.
         base.create_param("SPIIPLUS_NUM_PULSES", ParamType::Int32)?;
         let axis = base.create_param("SPIIPLUS_PULSE_AXIS", ParamType::Int32)?;
-        // The PEG output's: runProfile reads them.
-        for (name, kind) in [
-            ("SPIIPLUS_PEG_ENG_ENC_CODE", ParamType::Octet),
-            ("SPIIPLUS_PEG_OUT_ASSIGN_CODE", ParamType::Octet),
-            ("SPIIPLUS_POUTS_OUTPUT_INDEX", ParamType::Int32),
-            ("SPIIPLUS_POUTS_BIT_CODE", ParamType::Octet),
-            ("SPIIPLUS_PULSE_WIDTH", ParamType::Float64),
-        ] {
-            base.create_param(name, kind)?;
-        }
-        self.pulse = Some(PulseParams { mode, pos, axis });
+        self.pulse = Some(PulseParams {
+            mode,
+            pos,
+            axis,
+            peg_eng_enc_code: base.create_param("SPIIPLUS_PEG_ENG_ENC_CODE", ParamType::Octet)?,
+            peg_out_assign_code: base
+                .create_param("SPIIPLUS_PEG_OUT_ASSIGN_CODE", ParamType::Octet)?,
+            pouts_output_index: base
+                .create_param("SPIIPLUS_POUTS_OUTPUT_INDEX", ParamType::Int32)?,
+            pouts_bit_code: base.create_param("SPIIPLUS_POUTS_BIT_CODE", ParamType::Octet)?,
+            pulse_width: base.create_param("SPIIPLUS_PULSE_WIDTH", ParamType::Float64)?,
+        });
         Ok(())
     }
 
@@ -669,6 +709,29 @@ impl ControllerParams for AcsMotionParams {
 
     fn build_profile(&mut self, ctx: &mut ControllerCtx<'_>) -> AsynResult<()> {
         self.build(ctx)
+    }
+
+    /// C `executeProfile`: the profile thread runs it; the base's axis
+    /// execute is never called.
+    fn execute_profile(&mut self, _: &mut ControllerCtx<'_>) -> AsynResult<()> {
+        self.run.signal();
+        Ok(())
+    }
+
+    /// C `abortProfile`: halt a running profile's axes and have the
+    /// profile thread stop at its next check. C does not call the base.
+    fn abort_profile(&mut self, ctx: &mut ControllerCtx<'_>) -> AsynResult<()> {
+        let state = ctx
+            .base
+            .get_int32_param(index::PROFILE_EXECUTE_STATE, 0)
+            .unwrap_or_default();
+        if state == PROFILE_EXECUTE_DONE {
+            return Ok(());
+        }
+        let halt = format!("HALT {}", axes_to_string(&self.profile.profile_axes));
+        let status = self.lock().comm().write_read_ack(&halt);
+        self.run.halted.store(true, Ordering::SeqCst);
+        status
     }
 
     fn write_int32(

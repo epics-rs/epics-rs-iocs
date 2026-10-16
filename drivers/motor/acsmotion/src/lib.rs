@@ -9,6 +9,7 @@ pub mod ioc;
 pub mod ioc_aux;
 pub mod ioc_comm;
 mod profile;
+mod run;
 pub mod spiiplus;
 
 pub use spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusController};

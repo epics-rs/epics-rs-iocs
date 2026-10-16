@@ -77,12 +77,17 @@ pub fn acsmotion_config_command() -> CommandDef {
             let controller = SpiiPlusController::new(comm, &port_name, num_axes, &virtual_axes);
             let controller = Arc::new(Mutex::new(controller));
 
-            register_controller_port(
+            let (params, profile_thread) = AcsMotionParams::new(controller.clone());
+            let port = register_controller_port(
                 ctx.db().scan_control().interrupt_gate(),
                 &port_name,
                 num_axes as i32,
-                AcsMotionParams::new(controller.clone()),
+                params,
             )?;
+            // C ignores a failed epicsThreadCreate: the profile never runs.
+            if let Err(e) = profile_thread.spawn(port) {
+                println!("AcsMotionConfig: SPiiPlusProfile thread not started: {e}");
+            }
             for index in 0..num_axes {
                 let ax = SpiiPlusAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
