@@ -734,15 +734,6 @@ mod tests {
         };
         h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
         wait_for(ad.acquire, 0);
-        eprintln!(
-            "DBG queued={} busy={} wait={} status={} counter={} owner={:?}",
-            read(ad.base.num_queued_arrays),
-            read(ad.acquire_busy),
-            read(ad.base.wait_for_plugins),
-            read(ad.status),
-            read(ad.base.array_counter),
-            rt.pool().owner().queued().get()
-        );
         assert_eq!(read(ad.acquire_busy), 1, "busy cleared with a frame queued");
         drop(rx.blocking_recv().expect("frame"));
         wait_for(ad.acquire_busy, 0);
