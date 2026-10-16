@@ -47,20 +47,6 @@
 //!    parameter to replicate this onto in the first place, so the reader
 //!    thread is simply spawned at the default OS thread priority; this is a
 //!    platform-level divergence, not a silently dropped feature.
-//! 8. **Per-iteration reconnect bookkeeping collapses to "once per outcome"
-//!    here**: C re-runs the `badPacketCount`/`isCommunicating`/maybe-disconnect
-//!    block (`capaNCDT6200Sup.c:434-459`) on *every* inner-loop pass,
-//!    including a partial read that completed no packet. The only case where
-//!    that matters is a `disconnectDevice()` that keeps *failing* while
-//!    `badPacketCount >= 2` -- each such pass re-invokes
-//!    `processDataPacket(pdpvt, 0)`. `DrvAsynIPPort::disconnect` (asyn-rs
-//!    0.22.1) is unconditionally infallible (`ip_port.rs:997-1007`), so that
-//!    branch can never loop in this port; running the classify/communicate/
-//!    disconnect sequence once per *actual* read outcome (this module's
-//!    [`reader_thread`], matching [`packet::apply_read_outcome`]'s calling
-//!    convention) is therefore behaviorally equivalent here, not an
-//!    observable simplification.
-//!
 //! # Fixed upstream defects (doc/upstream-c-defects.md)
 //!
 //! - **#43 -- Inert `IPport` configure argument** (`capaNCDT6200Sup.c:698-707`):
@@ -527,40 +513,30 @@ fn reader_thread(
                         last_meas_value_counter = decoded.header.meas_value_counter;
                         last_chan_values = decoded.chan_values;
                         if packet::preamble_ok(&buf) {
-                            Some(ReadOutcome::GoodPacket)
+                            ReadOutcome::GoodPacket
                         } else {
-                            Some(ReadOutcome::BadPreamble)
+                            ReadOutcome::BadPreamble
                         }
                     } else {
-                        None
+                        ReadOutcome::Partial
                     }
                 }
-                Err(e) => Some(if is_asyn_timeout(&e) {
-                    ReadOutcome::Timeout
-                } else {
-                    ReadOutcome::ReadError
-                }),
+                Err(e) => {
+                    if is_asyn_timeout(&e) {
+                        ReadOutcome::Timeout
+                    } else {
+                        ReadOutcome::ReadError
+                    }
+                }
             };
 
-            // Quirk 9 (see module doc): only run the classify/communicate/
-            // disconnect sequence when this attempt actually produced an
-            // outcome -- a partial successful read (no outcome) just keeps
-            // accumulating.
-            let Some(outcome) = outcome else {
-                continue;
-            };
-
-            let should_process = packet::apply_read_outcome(&mut reader_state, outcome);
-
-            let push = should_process.and_then(|is_valid| {
-                packet::process_data_packet(
-                    &mut reader_state,
-                    last_meas_value_counter,
-                    last_chan_values,
-                    is_valid,
-                    true, // interruptAccept gap, see module doc
-                )
-            });
+            let push = packet::read_pass(
+                &mut reader_state,
+                outcome,
+                last_meas_value_counter,
+                last_chan_values,
+                true, // interruptAccept gap, see module doc
+            );
             // C's counters and `measValueCounter` are the reader's own
             // fields, so `int32Read` sees every pass, processed or not.
             {
