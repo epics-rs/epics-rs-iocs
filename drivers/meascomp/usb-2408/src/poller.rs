@@ -187,7 +187,10 @@ fn poller_loop(
                             &trace,
                         ) {
                             Ok(arrays) => snap.wave_dig_arrays = arrays,
-                            // Linux C does not `goto error` here.
+                            // Known deviation: Linux C does not `goto error`
+                            // here and goes on with the scanStatus/xferStatus
+                            // ulAInScanStatus left unset (UB); rs skips the
+                            // buffer copy and the stop for this pass.
                             Err(code) => {
                                 status = code;
                                 if prev_status == 0 {
