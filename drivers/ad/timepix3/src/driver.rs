@@ -2198,6 +2198,13 @@ impl PortDriver for TimePix3Driver {
         let reason = user.reason;
         let addr = user.addr;
         let p = self.p;
+        // C stores a base-class string without chaining to
+        // asynNDArrayDriver::writeOctet (ADTimePix.cpp:443-444), so
+        // NDAttributesFile never loads and NDFilePath is never checked; that
+        // C defect is not kept.
+        if reason < p.fw_time_stamp {
+            return self.ad.write_octet(user, data);
+        }
         // C stores the string up to its first NUL (ADTimePix.cpp:428-432).
         let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
         let value = String::from_utf8_lossy(&data[..end]).into_owned();
@@ -3410,6 +3417,28 @@ mod tests {
             det.text(det.ad.params.status_message, 0),
             "Preview stream did not become ready"
         );
+    }
+
+    /// A base-class string reaches asynNDArrayDriver::writeOctet, which C
+    /// skips (ADTimePix.cpp:443-444): NDFilePath is checked.
+    #[test]
+    fn a_base_class_octet_write_chains_to_the_base() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_OCTET_BASE",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let base = det.ad.params.base;
+        let dir = std::env::temp_dir();
+        let path = dir.to_str().unwrap().trim_end_matches('/').to_string();
+        det.write_octet(&mut AsynUser::new(base.file_path), path.as_bytes())
+            .unwrap();
+        assert_eq!(det.int(base.file_path_exists, 0), 1);
+        assert_eq!(det.text(base.file_path, 0), format!("{path}/"));
     }
 
     /// A start sends no configuration; the workers take the enabled
