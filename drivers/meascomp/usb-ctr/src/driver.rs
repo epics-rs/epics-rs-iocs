@@ -181,11 +181,9 @@ impl PortDriver for CtrDriver {
                 status = status_of(&pulse_gen::stop(&trace, &dev, addr));
             }
         } else if reason == self.params.counter_reset {
-            if value != 0 {
-                let dev = self.device.lock().unwrap();
-                if let Err(e) = dev.counter_clear(addr) {
-                    status = e.code;
-                }
+            let dev = self.device.lock().unwrap();
+            if let Err(e) = dev.counter_load(addr, uldaq_sys::CRT_LOAD, 0) {
+                status = e.code;
             }
         } else if reason == self.params.digital_output {
             let dev = self.device.lock().unwrap();

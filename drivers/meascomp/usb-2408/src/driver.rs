@@ -258,9 +258,13 @@ impl PortDriver for MultiFunctionDriver {
         let mut wave_arrays: Vec<ParamSetValue> = Vec::new();
         let mut time_wf: Option<ParamSetValue> = None;
 
-        if reason == self.params.counter_reset && value != 0 {
+        if reason == self.params.counter_reset {
             let dev = self.device.lock().unwrap();
-            status = trace.report(&dev.counter_clear(addr), FUNCTION, "Resetting counter");
+            status = trace.report(
+                &dev.counter_load(addr, uldaq_sys::CRT_LOAD, 0),
+                FUNCTION,
+                "Resetting counter",
+            );
         } else if reason == self.params.analog_out_value {
             // Only write immediately if sync mode is disabled
             let sync_enable = self
