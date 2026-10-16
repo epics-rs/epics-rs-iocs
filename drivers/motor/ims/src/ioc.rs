@@ -26,6 +26,7 @@ use crate::drv_im483::{
     DrvIm483Axis, IM483PL_NUM_CARDS, IM483SM_NUM_CARDS, Im483Controller, im483pl_probe,
     im483sm_probe,
 };
+use crate::drv_mdrive::{DrvMDriveAxis, MDRIVE_NUM_CARDS, MDriveController, mdrive_probe};
 use crate::mdriveplus::{INPUT_EOS, ImsMDrivePlusAxis, OUTPUT_EOS};
 
 /// C `IMS_TIMEOUT` (ImsMDrivePlusMotorAxis.h:17).
@@ -172,6 +173,52 @@ pub fn im483sm_config_command() -> CommandDef {
             let motor: Arc<Mutex<dyn AsynMotor>> =
                 Arc::new(Mutex::new(DrvIm483Axis::im483sm(controller)));
             IM483SM.install(ctx, card, 0, motor)?;
+            Ok(CommandOutcome::Continue)
+        },
+    )
+}
+
+/// `device(motor,VME_IO,devMDrive,"MDrive")` (devImsMotor.dbd).
+static DEV_MDRIVE: DevSup = model1_device("devMDrive", "MDrive");
+
+static MDRIVE: Model1 = Model1::new(&DEV_MDRIVE, MDRIVE_NUM_CARDS, SCAN_RATE);
+
+/// `MDriveSetup(num_cards, scan_rate)`.
+pub fn mdrive_setup_command() -> CommandDef {
+    MDRIVE.setup_command("MDriveSetup")
+}
+
+/// `MDriveConfig(card, name)`: probes the chain at once as for
+/// [`im483pl_config_command`].
+pub fn mdrive_config_command() -> CommandDef {
+    CommandDef::new(
+        "MDriveConfig",
+        config_args(),
+        "MDriveConfig(card, name)",
+        move |args: &[ArgValue], ctx: &CommandContext| {
+            let card = c_int(args, 0);
+            if !MDRIVE.has_card(card) {
+                return Ok(CommandOutcome::Continue);
+            }
+            let asyn_port = req_string(args, 1, "asyn port name")?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                COMM_TIMEOUT,
+                b"\r\n",
+                b"\n",
+                EosRefusal::Ignored,
+            )?;
+            let controller = MDriveController::new(handle);
+            let drives = mdrive_probe(&controller, card);
+            let controller = Arc::new(Mutex::new(controller));
+            for (signal, drive) in drives.into_iter().enumerate() {
+                let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(DrvMDriveAxis::new(
+                    controller.clone(),
+                    signal,
+                    drive,
+                )));
+                MDRIVE.install(ctx, card, signal as i32, motor)?;
+            }
             Ok(CommandOutcome::Continue)
         },
     )
