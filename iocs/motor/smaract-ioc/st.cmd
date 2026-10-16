@@ -22,11 +22,6 @@ epicsEnvSet("NAXES",  "3")
 # ---- asyn IP octet port ----
 drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 
-# MCS2 framing: the driver appends the LF command terminator, so only the input
-# EOS is configured here (replies are CRLF terminated). Do not set an output EOS
-# — the port would append it a second time.
-asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
-
 # ---- MCS2 controller ----
 # MCS2CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
 MCS2CreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)

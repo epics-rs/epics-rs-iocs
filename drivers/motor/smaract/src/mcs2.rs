@@ -47,8 +47,9 @@ use motor_common::util::atof;
 /// Response buffer size.
 const READ_BUF: usize = 128;
 
-/// Command terminator; the driver owns output framing.
-const TERMINATOR: &[u8] = b"\n";
+/// Port EOS set at connect (smarActMCS2MotorDriver.cpp:64-65).
+pub const INPUT_EOS: &[u8] = b"\r\n";
+pub const OUTPUT_EOS: &[u8] = b"\r\n";
 
 /// Controller pm→driver nm (and ndeg→µdeg) scale (C `PULSES_PER_STEP`).
 const PULSES_PER_STEP: f64 = 1000.0;
@@ -95,22 +96,15 @@ impl Mcs2Controller {
         &self.ident
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command with no reply expected.
     fn write_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a query and return its reply (trimmed).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '\0', ' '])
             .to_string())
