@@ -109,18 +109,14 @@ pub struct Dp5Status {
 /// DP4-format status block extracted as
 /// [`crate::protocol::ReceivedPacket::Status`]'s `data`.
 ///
-/// Panics if `raw.len() < 64` -- C indexes the fixed-size buffer directly
-/// without a length check (`DP5Status.cpp`'s `Process_Status`); a status
-/// packet is only ever produced by [`crate::protocol::parse_packet`] from
-/// wire bytes whose `LEN` field the sender fixes at 64, so a short buffer
-/// here means the transport handed over a malformed/truncated packet, not
-/// legitimate device data.
+/// C reads the fields out of the fixed `Packet_In.DATA` array whatever the
+/// packet's `LEN` (`DP5Status.cpp`'s `Process_Status`); a short block reads
+/// zeros past its end here.
 pub fn process_status(raw: &[u8]) -> Dp5Status {
-    assert!(
-        raw.len() >= 64,
-        "DP5 status block must be 64 bytes, got {}",
-        raw.len()
-    );
+    let mut block = [0u8; 64];
+    let n = raw.len().min(64);
+    block[..n].copy_from_slice(&raw[..n]);
+    let raw = &block;
 
     let dpp_type = DppType::from_device_id(raw[39]);
     let fast_count = long_word_to_double(0, raw);
@@ -192,6 +188,14 @@ mod tests {
 
     fn raw_fixture() -> [u8; 64] {
         [0u8; 64]
+    }
+
+    #[test]
+    fn short_block_reads_zeros_past_its_end() {
+        let s = process_status(&[255, 0, 0, 0, 7]);
+        assert_eq!(s.fast_count, 255.0);
+        assert_eq!(s.slow_count, 7.0);
+        assert_eq!(s.dpp_type, process_status(&raw_fixture()).dpp_type);
     }
 
     #[test]
@@ -329,11 +333,5 @@ mod tests {
     fn byte_version_formats_as_major_dot_minor() {
         assert_eq!(byte_version_to_string(0x67), "6.07");
         assert_eq!(byte_version_to_string(0x00), "0.00");
-    }
-
-    #[test]
-    #[should_panic(expected = "DP5 status block must be 64 bytes")]
-    fn process_status_rejects_short_buffer() {
-        process_status(&[0u8; 10]);
     }
 }
