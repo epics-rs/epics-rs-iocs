@@ -363,7 +363,6 @@ impl PortDriver for MythenDriver {
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
         let acquire = self.ad.params.acquire;
 
         // C refuses every write except ADAcquire while an acquisition runs
@@ -380,7 +379,9 @@ impl PortDriver for MythenDriver {
         }
 
         let mut status = StatusOr::default();
-        status.or(self.ad.port_base.set_int32_param(reason, addr, value));
+        // C's setIntegerParam(function, value) and callParamCallbacks() are
+        // list 0 whatever the address.
+        status.or(self.ad.port_base.set_int32_param(reason, 0, value));
 
         if reason == acquire {
             let read_mode = self.int_param(self.p.read_mode);
@@ -425,7 +426,7 @@ impl PortDriver for MythenDriver {
             status.or(self.refresh_settings());
         }
 
-        status.or(self.ad.port_base.call_param_callbacks(addr));
+        status.or(self.ad.port_base.call_param_callbacks(0));
         if status.bits != 0 {
             user.print(
                 TraceMask::ERROR,
@@ -449,7 +450,9 @@ impl PortDriver for MythenDriver {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        let addr = user.addr;
+        // C refuses an address outside the port before anything else
+        // (mythen.cpp:1182-1183); callParamCallbacks() stays list 0.
+        let addr = self.ad.port_base.get_address(user.addr, reason)?;
 
         if self.det.state.acquiring.load(Ordering::Acquire) {
             self.ad.port_base.trace_print(
@@ -480,7 +483,7 @@ impl PortDriver for MythenDriver {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     let _ = self.ad.port_base.set_float64_param(self.p.tau, 0, 0.0);
-                    let _ = self.ad.port_base.call_param_callbacks(addr);
+                    let _ = self.ad.port_base.call_param_callbacks(0);
                     Err(AsynError::Status {
                         status: AsynStatus::Error,
                         message: format!("mythen: tau must be -1 or > 0, got {value}"),
@@ -494,7 +497,7 @@ impl PortDriver for MythenDriver {
         }
 
         status.or(self.refresh_settings());
-        status.or(self.ad.port_base.call_param_callbacks(addr));
+        status.or(self.ad.port_base.call_param_callbacks(0));
         let g = format_g(value, 6);
         if status.bits != 0 {
             user.print(

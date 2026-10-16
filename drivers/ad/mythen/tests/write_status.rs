@@ -205,3 +205,32 @@ fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
     };
     assert!(at(&base) < at(&own));
 }
+
+/// mythen.cpp:1120, :1158: setIntegerParam(function, value) and
+/// callParamCallbacks() are list 0 whatever the address; ADDriver's
+/// getAddress then refuses addr 1 on this one-address multi-device port.
+#[test]
+fn a_write_at_another_address_sets_list_zero() {
+    let (mut driver, _received) = driver("MYTHEN_WS_LIST0");
+    let reason = driver.ad.params.base.array_counter;
+    let mut user = AsynUser::new(reason).with_addr(1);
+    let status = driver.write_int32(&mut user, 3);
+    assert_eq!(status.unwrap_err().c_status_code(), 3);
+    assert_eq!(driver.ad.port_base.get_int32_param(reason, 0).unwrap(), 3);
+}
+
+/// mythen.cpp:1182-1183: writeFloat64 returns getAddress's refusal before
+/// it sets anything.
+#[test]
+fn a_float_write_outside_the_port_is_refused_before_the_set() {
+    let (mut driver, _received) = driver("MYTHEN_WS_FADDR");
+    let reason = driver.p.delay_time;
+    let before = driver.ad.port_base.get_float64_param(reason, 0).ok();
+    let mut user = AsynUser::new(reason).with_addr(1);
+    let status = driver.write_float64(&mut user, 7.0);
+    assert_eq!(status.unwrap_err().c_status_code(), 3);
+    assert_eq!(
+        driver.ad.port_base.get_float64_param(reason, 0).ok(),
+        before
+    );
+}
