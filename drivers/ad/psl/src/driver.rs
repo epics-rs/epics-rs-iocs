@@ -16,6 +16,7 @@ use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
@@ -115,22 +116,20 @@ impl PslDetector {
     /// port comes up with no choices, and the next `CameraName` write retries.
     fn connect_to_server(&mut self) -> AsynResult<()> {
         let reply = self.command("GetVersion")?;
-        match protocol::parse_version(&reply) {
-            Ok(version) => log::info!("psl: PSLViewer {version}"),
-            Err(e) => {
-                log::error!("psl: {e}");
-                self.ad.port_base.set_string_param(
-                    self.ad.params.status_message,
-                    0,
-                    format!("PSL server: {e}"),
-                )?;
-                self.ad.port_base.set_int32_param(
-                    self.ad.params.status,
-                    0,
-                    ADStatus::Error as i32,
-                )?;
-                return Ok(());
-            }
+        if let Err(e) = protocol::parse_version(&reply) {
+            self.server.trace_error(&format!(
+                "PSL:getVersion, ERROR, unexpected version string = {reply}."
+            ));
+            self.trace_error("PSL:PSL: ERROR, incorrect server version");
+            self.ad.port_base.set_string_param(
+                self.ad.params.status_message,
+                0,
+                format!("PSL server: {e}"),
+            )?;
+            self.ad
+                .port_base
+                .set_int32_param(self.ad.params.status, 0, ADStatus::Error as i32)?;
+            return Ok(());
         }
 
         self.state.camera_names = self.get_choices("GetCamList")?;
@@ -142,36 +141,48 @@ impl PslDetector {
     /// Send one command and publish both sides of the exchange to the
     /// StringToServer / StringFromServer records (C `writeReadServer`).
     fn command(&mut self, command: &str) -> AsynResult<String> {
-        let reply = match self.server.command(command) {
-            Ok(reply) => reply,
-            Err(e) => {
-                log::error!("psl: '{command}' failed: {e}");
-                String::new()
-            }
+        Ok(self.command_status(command)?.0)
+    }
+
+    /// [`Self::command`] with the asynStatus C's `writeReadServer` returned.
+    fn command_status(&mut self, command: &str) -> AsynResult<(String, i32)> {
+        let (reply, status) = match self.server.command(command) {
+            Ok(reply) => (reply, 0),
+            Err(e) => (String::new(), e.status()),
         };
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, reply.clone())?;
-        Ok(reply)
+        Ok((reply, status))
+    }
+
+    /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`.
+    fn trace_error(&self, message: &str) {
+        self.ad.port_base.trace_print(TraceMask::ERROR, message);
     }
 
     fn get_choices(&mut self, command: &str) -> AsynResult<Choices> {
         let multi = self.state.multi_camera();
-        let reply = self.command(command)?;
-        Ok(protocol::parse_choices(&reply, multi))
+        let (reply, status) = self.command_status(command)?;
+        if status != 0 {
+            self.trace_error(&format!(
+                "PSL::getChoices error in write/read to server {status}"
+            ));
+        }
+        let choices = protocol::parse_choices(&reply, multi);
+        if choices.is_empty() {
+            self.trace_error("PSL::getChoices Options are NULL");
+        }
+        Ok(choices)
     }
 
     /// Open one of the cameras `GetCamList` offered (C `openCamera`).
     fn open_camera(&mut self, index: i32) -> AsynResult<()> {
         let name = match protocol::choice_from_index(&self.state.camera_names, index) {
             Ok(name) => name.to_string(),
-            Err(e) => {
-                // C walked its std::set past the end and dereferenced the end
-                // iterator, so an out-of-range CameraName was undefined
-                // behaviour.
-                log::error!("psl: cannot open camera {index}: {e}");
-                return Ok(());
-            }
+            // C walked its std::set past the end and dereferenced the end
+            // iterator, so an out-of-range CameraName was undefined behaviour.
+            Err(_) => return Ok(()),
         };
 
         self.command("Close")?;
@@ -193,8 +204,6 @@ impl PslDetector {
             let base = &mut self.ad.port_base;
             base.set_int32_param(self.ad.params.max_size_x, 0, size[0])?;
             base.set_int32_param(self.ad.params.max_size_y, 0, size[1])?;
-        } else {
-            log::error!("psl: GetMaximumSize answered '{reply}'");
         }
 
         self.state.valid_options = self.get_choices("GetOptions")?;
@@ -223,18 +232,21 @@ impl PslDetector {
         }
 
         // GetMode is always supported.
-        let reply = self.command("GetMode")?;
+        let (reply, status) = self.command_status("GetMode")?;
         match protocol::parse_mode(protocol::quoted_field(&reply, multi)) {
             Ok((data_type, color_mode)) => {
                 let base = &mut self.ad.port_base;
                 base.set_int32_param(self.ad.params.base.data_type, 0, data_type as u8 as i32)?;
                 base.set_int32_param(self.ad.params.base.color_mode, 0, color_mode as i32)?;
             }
-            Err(e) => log::error!("psl: GetMode: {e}"),
+            Err(_) if status == 0 => {
+                self.trace_error(&format!("PSL:getConfig: unknown mode={reply}"));
+            }
+            Err(_) => {}
         }
 
         if self.supports("TriggerMode") {
-            let reply = self.command("GetTriggerMode")?;
+            let (reply, status) = self.command_status("GetTriggerMode")?;
             let mode = protocol::quoted_field(&reply, multi).to_string();
             match protocol::index_of_choice(&self.state.trigger_modes, &mode) {
                 Some(index) => {
@@ -242,19 +254,20 @@ impl PslDetector {
                         .port_base
                         .set_int32_param(self.ad.params.trigger_mode, 0, index)?;
                 }
-                None => log::error!("psl: unknown trigger mode '{mode}'"),
+                None if status == 0 => {
+                    self.trace_error(&format!("PSL:getConfig: unknown trigger mode={mode}"));
+                }
+                None => {}
             }
         }
 
         if self.supports("Exposure") {
             let reply = self.command("GetExposure")?;
-            match protocol::parse_exposure(protocol::numeric_field(&reply, multi)) {
-                Some(seconds) => {
-                    self.ad
-                        .port_base
-                        .set_float64_param(self.ad.params.acquire_time, 0, seconds)?;
-                }
-                None => log::error!("psl: GetExposure answered '{reply}'"),
+            if let Some(seconds) = protocol::parse_exposure(protocol::numeric_field(&reply, multi))
+            {
+                self.ad
+                    .port_base
+                    .set_float64_param(self.ad.params.acquire_time, 0, seconds)?;
             }
         }
 
@@ -338,7 +351,7 @@ impl PslDetector {
         }
 
         if self.supports("RecordFormat") {
-            let reply = self.command("GetRecordFormat")?;
+            let (reply, status) = self.command_status("GetRecordFormat")?;
             let format = protocol::quoted_field(&reply, multi).to_string();
             match protocol::index_of_choice(&self.state.record_formats, &format) {
                 Some(index) => {
@@ -346,7 +359,12 @@ impl PslDetector {
                         .port_base
                         .set_int32_param(self.ad.params.base.file_format, 0, index)?;
                 }
-                None => log::error!("psl: unknown file format '{format}'"),
+                None if status == 0 => {
+                    self.trace_error(&format!(
+                        "PSL:getConfig: error, unknown file format string = {format}"
+                    ));
+                }
+                None => {}
             }
         }
 
@@ -402,9 +420,7 @@ impl PslDetector {
                 self.command("Start")?;
             }
         }
-        if self.commands.try_send(TaskCommand::Start).is_err() {
-            log::error!("psl: the acquisition task is not accepting commands");
-        }
+        let _ = self.commands.try_send(TaskCommand::Start);
         Ok(())
     }
 
@@ -463,22 +479,16 @@ impl PortDriver for PslDetector {
         } else if reason == p.reverse_y {
             self.command(&protocol::set_flipud(value))?;
         } else if reason == p.trigger_mode {
-            match protocol::choice_from_index(&self.state.trigger_modes, value) {
-                Ok(mode) => {
-                    let command = protocol::set_trigger_mode(mode);
-                    self.command(&command)?;
-                }
-                Err(e) => log::error!("psl: TriggerMode {value}: {e}"),
+            if let Ok(mode) = protocol::choice_from_index(&self.state.trigger_modes, value) {
+                let command = protocol::set_trigger_mode(mode);
+                self.command(&command)?;
             }
         } else if reason == p.base.auto_save {
             self.command(&protocol::set_auto_save(value))?;
         } else if reason == p.base.file_format {
-            match protocol::choice_from_index(&self.state.record_formats, value) {
-                Ok(format) => {
-                    let command = protocol::set_record_format(format);
-                    self.command(&command)?;
-                }
-                Err(e) => log::error!("psl: FileFormat {value}: {e}"),
+            if let Ok(format) = protocol::choice_from_index(&self.state.record_formats, value) {
+                let command = protocol::set_record_format(format);
+                self.command(&command)?;
             }
         } else if reason == self.params.camera_name {
             self.open_camera(value)?;

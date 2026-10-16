@@ -22,6 +22,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::{Mutex, MutexGuard};
 
@@ -57,6 +58,16 @@ impl From<AsynError> for ServerError {
     }
 }
 
+impl ServerError {
+    /// The asynStatus C's `writeReadServer` would have returned.
+    pub fn status(&self) -> i32 {
+        match self {
+            Self::Timeout => AsynStatus::Timeout as i32,
+            Self::Transport(e) => e.status() as i32,
+        }
+    }
+}
+
 pub type ServerResult<T> = Result<T, ServerError>;
 
 /// The PSLViewer server socket.
@@ -82,6 +93,14 @@ impl PslServer {
     pub fn command(&self, command: &str) -> ServerResult<String> {
         self.session().command(command)
     }
+
+    /// C `asynPrint(pasynUserServer_, ASYN_TRACE_ERROR, ...)`.
+    pub fn trace_error(&self, message: &str) {
+        let io = self.io.lock();
+        io.handle
+            .trace()
+            .output(io.handle.port_name(), TraceMask::ERROR, message);
+    }
 }
 
 /// Exclusive use of the socket.
@@ -95,10 +114,9 @@ impl Session<'_> {
     pub fn command(&mut self, command: &str) -> ServerResult<String> {
         let bytes = self
             .io
-            .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT)?;
-        let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
-        log::debug!("psl: '{command}' -> '{reply}'");
-        Ok(reply)
+            .write_read(command, MAX_MESSAGE_SIZE, SERVER_TIMEOUT)
+            .inspect_err(|e| self.io.write_read_failed(e, command))?;
+        Ok(String::from_utf8_lossy(&bytes).trim_end().to_string())
     }
 
     /// Ask for a frame and read the first block of the answer: the text header
@@ -113,6 +131,7 @@ impl Session<'_> {
             .reconnect()
             .and_then(|()| self.io.write("GetImage", GET_IMAGE_TIMEOUT))
             .and_then(|()| self.io.read_binary(MAX_MESSAGE_SIZE, GET_IMAGE_TIMEOUT))
+            .inspect_err(|e| self.io.write_read_failed(e, "GetImage"))
     }
 
     /// Read the next block of an image payload (C `pasynOctetSyncIO->read`
@@ -127,6 +146,19 @@ struct ServerIo {
 }
 
 impl ServerIo {
+    /// C `writeReadServer`'s line, on `pasynUserServer_`: the server port's
+    /// trace mask gates it.
+    fn write_read_failed(&self, e: &ServerError, command: &str) {
+        self.handle.trace().output(
+            self.handle.port_name(),
+            TraceMask::ERROR,
+            &format!(
+                "PSL:writeReadServer, status={}, sent\n{command}",
+                e.status()
+            ),
+        );
+    }
+
     fn user(&self, timeout: Duration) -> AsynUser {
         AsynUser::new(0).with_addr(0).with_timeout(timeout)
     }
