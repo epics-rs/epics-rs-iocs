@@ -2,13 +2,6 @@
 # poll triggers, freeze/recording/compute mode). Load once per $(HANDLE).
 # Macros: P, DAU, HANDLE.
 # Port of yokogawaDasApp/Db/GM10_system.db.
-#
-# Upstream-defect fix (devGM10_bo.c:130 vs GM10_system.db): the C bo device
-# support recognizes an "INFO_TRIG" command (alongside CHAN_TRIG/MISC_TRIG/
-# STAT_TRIG, all four dispatched by the same cmd-string switch in
-# devGM10_bo.c:120-139) but GM10_system.db never wires a record to it — a
-# live command with no PV surface. Added InfoPoll below, mirroring the other
-# three Poll records, instead of leaving the gap.
 
 record(stringin, "$(P)$(DAU):IPAddress")
 {
@@ -251,13 +244,6 @@ record(bo, "$(P)$(DAU):StatusPoll")
 {
     field(DTYP, "Yokogawa GM10")
     field(OUT, "@$(HANDLE) STAT_TRIG")
-    field(SCAN, "1 second")
-}
-
-record(bo, "$(P)$(DAU):InfoPoll")
-{
-    field(DTYP, "Yokogawa GM10")
-    field(OUT, "@$(HANDLE) INFO_TRIG")
     field(SCAN, "1 second")
 }
 
