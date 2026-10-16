@@ -1462,13 +1462,7 @@ impl PortDriver for TimePix3Driver {
         };
 
         // The write's outcome is the record's, and it must survive the
-        // callbacks.
-        //
-        // UPSTREAM DEFECT (ADTimePix.cpp:409-411, 448-450, 505-506): C returns
-        // `asynError` from several branches *before* `callParamCallbacks`, so
-        // the readbacks (and, for ADAcquire, the latched Acquire=1) are never
-        // refreshed after a failed write and the operator sees the detector as
-        // acquiring when it is not.
+        // callbacks (ADTimePix.cpp:866-873).
         let _ = self.ad.port_base.call_param_callbacks(addr);
         match &result {
             Err(e) => self.ad.port_base.trace_print(
