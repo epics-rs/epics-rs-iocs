@@ -658,7 +658,7 @@ impl PortDriver for EigerDriver {
             );
             return Err(e);
         }
-        let _ = self.ad.port_base.call_param_callbacks(user.addr);
+        let _ = self.ad.port_base.call_param_callbacks(0);
         user.print(
             TraceMask::IO_DRIVER,
             file!(),
@@ -688,7 +688,7 @@ impl PortDriver for EigerDriver {
                     line!(),
                     format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}"),
                 );
-                let _ = self.ad.port_base.call_param_callbacks(user.addr);
+                let _ = self.ad.port_base.call_param_callbacks(0);
             }
         }
         status
@@ -718,7 +718,7 @@ impl PortDriver for EigerDriver {
                     line!(),
                     format_args!("eigerDetector:writeOctet: function={function}, value={value}"),
                 );
-                let _ = self.ad.port_base.call_param_callbacks(user.addr);
+                let _ = self.ad.port_base.call_param_callbacks(0);
             }
         }
         status.map(|()| data.len())

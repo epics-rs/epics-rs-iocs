@@ -1760,4 +1760,60 @@ mod tests {
         assert_eq!(s.get_int(s.ad.base.array_counter).await, 2);
         std::mem::forget(runtime);
     }
+
+    /// eigerDetector's writeInt32/writeFloat64/writeOctet call
+    /// callParamCallbacks() (eigerDetector.cpp:596, :682, :772): a write to
+    /// another address still posts what is pending at address 0.
+    #[test]
+    fn a_write_to_another_address_posts_address_zero() {
+        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager, InterruptValue};
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::asyn::user::AsynUser;
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: "EIGER_ADDR0_POST".to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
+        det.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cb = std::sync::Arc::clone(&seen);
+        let _sub = det.ad.port_base.interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(0),
+                ..Default::default()
+            },
+            move |iv: &InterruptValue| seen_cb.lock().unwrap().push(iv.reason),
+        );
+        let pending = det.ad.params.shutter_close_delay;
+        // A store marks the parameter changed only when the value differs.
+        let pend = |det: &mut crate::driver::EigerDriver, value: f64| {
+            det.ad
+                .port_base
+                .set_float64_param(pending, 0, value)
+                .unwrap();
+            seen.lock().unwrap().clear();
+        };
+        pend(&mut det, 1.5);
+        let reason = det.ad.params.num_images;
+        let _ = det.write_int32(&mut AsynUser::new(reason).with_addr(1), 3);
+        assert!(seen.lock().unwrap().contains(&pending), "writeInt32");
+
+        pend(&mut det, 2.5);
+        let reason = det.ad.params.shutter_open_delay;
+        let _ = det.write_float64(&mut AsynUser::new(reason).with_addr(1), 2.0);
+        assert!(seen.lock().unwrap().contains(&pending), "writeFloat64");
+
+        pend(&mut det, 3.5);
+        let reason = det.ad.params.base.file_name;
+        let _ = det.write_octet(&mut AsynUser::new(reason).with_addr(1), b"f");
+        assert!(seen.lock().unwrap().contains(&pending), "writeOctet");
+    }
 }
