@@ -117,6 +117,13 @@ impl PilatusDriver {
         })
     }
 
+    fn f64_or_zero(&self, reason: usize) -> f64 {
+        self.ad
+            .port_base
+            .get_float64_param(reason, 0)
+            .unwrap_or(0.0)
+    }
+
     fn send(&self, cmd: Cmd) {
         let _ = self.cmd_tx.try_send(cmd);
     }
@@ -291,16 +298,18 @@ impl PortDriver for PilatusDriver {
         } else if function == p.wavelength {
             self.send(Cmd::Raw(cmd_mx_f64("Wavelength", value)));
         } else if function == p.energy_low || function == p.energy_high {
-            let low = self.ad.port_base.get_float64_param(p.energy_low, 0)?;
-            let high = self.ad.port_base.get_float64_param(p.energy_high, 0)?;
+            // C ignores both statuses and gets 0 (pilatusDetector.cpp:1511-1512).
+            let low = self.f64_or_zero(p.energy_low);
+            let high = self.f64_or_zero(p.energy_high);
             self.send(Cmd::Raw(cmd_mx_pair("Energy_range", low, high)));
         } else if function == p.det_dist {
             self.send(Cmd::Raw(cmd_mx_f64("Detector_distance", value / 1000.0)));
         } else if function == p.det_voffset {
             self.send(Cmd::Raw(cmd_mx_f64("Detector_Voffset", value / 1000.0)));
         } else if function == p.beam_x || function == p.beam_y {
-            let x = self.ad.port_base.get_float64_param(p.beam_x, 0)?;
-            let y = self.ad.port_base.get_float64_param(p.beam_y, 0)?;
+            // As above (pilatusDetector.cpp:1523-1524).
+            let x = self.f64_or_zero(p.beam_x);
+            let y = self.f64_or_zero(p.beam_y);
             self.send(Cmd::Raw(cmd_mx_pair("Beam_xy", x, y)));
         } else if function == p.flux {
             self.send(Cmd::Raw(cmd_mx_f64("Flux", value)));
@@ -524,4 +533,33 @@ pub fn create_pilatus_detector(
         queued_counter,
         tasks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pair_write_sends_zero_for_its_unset_partner() {
+        let (cmd_tx, mut cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let mut det = PilatusDriver::new("PILATUS_PAIR", 8, 8, 0, links).unwrap();
+        let p = det.p;
+
+        for (reason, name) in [(p.energy_low, "Energy_range"), (p.beam_x, "Beam_xy")] {
+            let mut user = AsynUser::new(reason);
+            det.write_float64(&mut user, 2.5).unwrap();
+            match cmd_rx.try_recv() {
+                Ok(Cmd::Raw(cmd)) => {
+                    assert_eq!(cmd, format!("mxsettings {name} 2.500000,0.000000"))
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
 }
