@@ -12,6 +12,7 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::server::records::printf::format_g;
 
 use crate::detector::{Detector, Settings};
 use crate::protocol::CHANNELS_PER_MODULE;
@@ -407,6 +408,24 @@ impl PortDriver for MythenDriver {
         }
 
         status.or(self.ad.port_base.call_param_callbacks(addr));
+        if status.bits != 0 {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mythen:writeInt32: error, status={} function={reason}, value={value}",
+                    status.bits
+                ),
+            );
+        } else {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mythen:writeInt32: function={reason}, value={value}"),
+            );
+        }
         status.into_result()
     }
 
@@ -454,12 +473,53 @@ impl PortDriver for MythenDriver {
 
         status.or(self.refresh_settings());
         status.or(self.ad.port_base.call_param_callbacks(addr));
+        let g = format_g(value, 6);
+        if status.bits != 0 {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mythen:writeFloat64: error, status={} function={reason}, value={g}",
+                    status.bits
+                ),
+            );
+        } else {
+            user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mythen:writeFloat64: function={reason}, value={g}"),
+            );
+        }
         status.into_result()
     }
 
-    /// `mythen::writeOctet` (mythen.cpp:1062-1085) handles no octet of its
+    /// `mythen::writeOctet` (mythen.cpp:1062-1097) handles no octet of its
     /// own and calls `ADDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        self.ad.write_octet(user, data)
+        let reason = user.reason;
+        let status = self.ad.write_octet(user, data);
+        // C prints the value as the `char *` it was handed: up to the NUL.
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let value = String::from_utf8_lossy(&data[..end]);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mythen:writeOctet: error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(_) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mythen:writeOctet: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 }
