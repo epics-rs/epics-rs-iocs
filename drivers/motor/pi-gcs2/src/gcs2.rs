@@ -39,7 +39,7 @@
 //! `SAI?` (axis discovery) is the one multi-line reply: PI GCS marks a
 //! non-final line with a trailing space before the EOS (`PIInterface::
 //! sendAndReceive`'s `while(inputBuff[strlen(inputBuff)-1]==' ')` continuation
-//! loop) — [`PIGCS2Controller::find_connected_axes`] replicates that instead
+//! loop) — `PIGCS2Controller::find_connected_axes` replicates that instead
 //! of assuming one line per reply.
 //!
 //! ## Units

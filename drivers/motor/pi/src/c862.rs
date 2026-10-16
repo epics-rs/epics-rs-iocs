@@ -370,7 +370,7 @@ impl PIC862Controller {
 pub struct PIC862Axis {
     controller: Arc<Mutex<PIC862Controller>>,
     /// Record soft limits (dial EGU = raw counts, `MRES = 1`), cached from
-    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`] — the C-862 has no
+    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`](AsynMotor::set_low_limit) — the C-862 has no
     /// jog command, so a jog moves to whichever of these the record's DHLM
     /// / DLLM the requested direction selects (C `JOG` case).
     high_limit: Option<f64>,

@@ -293,7 +293,7 @@ impl PIC663Controller {
 pub struct PIC663Axis {
     controller: Arc<Mutex<PIC663Controller>>,
     /// Record soft limits (dial EGU = raw counts, `MRES = 1`), cached from
-    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`] — the C-663 has no
+    /// [`AsynMotor::set_high_limit`]/[`set_low_limit`](AsynMotor::set_low_limit) — the C-663 has no
     /// jog command, so a jog moves to whichever of these the record's DHLM
     /// / DLLM the requested direction selects.
     high_limit: Option<f64>,
