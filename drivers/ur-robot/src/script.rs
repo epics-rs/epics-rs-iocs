@@ -176,11 +176,6 @@ pub fn inject(script: &str, injections: &[Injection]) -> String {
     for inj in injections {
         if let Some(pos) = out.find(&inj.search) {
             out.insert_str(pos + inj.search.len(), &inj.inject);
-        } else {
-            log::debug!(
-                "ur-robot: script injection anchor [{}] not found",
-                inj.search.trim_end()
-            );
         }
     }
     out
