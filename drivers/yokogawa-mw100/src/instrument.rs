@@ -98,8 +98,8 @@ struct Job {
 }
 
 /// Handle to a connected MW100 unit. Cheap to clone (`Arc`-backed); one
-/// instance per `mw100Init` handle, looked up by name from [`connect`]'s
-/// registry.
+/// instance per `mw100Init` handle, looked up by name from the
+/// [`Registry`].
 pub struct Instrument {
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,

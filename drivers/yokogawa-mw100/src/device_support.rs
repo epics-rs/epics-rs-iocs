@@ -2,7 +2,7 @@
 //! (`devMW100_{ai,ao,bi,bo,mbbi,mbbo,longin,stringin}.c`).
 //!
 //! Structurally this mirrors `yokogawa-gm10`'s `device_support.rs` (one
-//! shared DTYP string, [`resolve_operation`] as the single owner of every
+//! shared DTYP string, `resolve_operation` as the single owner of every
 //! `devMW100_*.c::init_record`'s command/address grammar, lazy resolution in
 //! `DeviceSupport::init` since only there is the concrete record type
 //! known) — but the grammar itself is NOT a copy of GM10's: every rule below
@@ -12,14 +12,14 @@
 //! - `ao`'s address switch (`devMW100_ao.c::init_record`) has no `A` (Math)
 //!   arm at all, falling through to `default: return 1` — unlike GM10's
 //!   `ao`, which accepts Math at `init_record` and only rejects it later, in
-//!   `write()`. [`parse_address_no_math`] rejects Math structurally at
+//!   `write()`. `parse_address_no_math` rejects Math structurally at
 //!   resolve time to match.
 //! - IOSCANPVT routing goes through ONE family-generic dispatcher,
 //!   `mw100_channel_io_handler(dq, family, channel)` (`drvMW100.c:1643-1660`),
 //!   shared by `ai`'s VAL (all 4 families) and `mbbi`'s VAL_STATUS/ALARM/
 //!   ALARMS/CH_STATUS's *read* path (Signal-or-Math only) — Signal routes
 //!   dynamically via [`Instrument::signal_interrupt_category`], Math is
-//!   always Input, Comm/Const are always Output. [`family_category`] is that
+//!   always Input, Comm/Const are always Output. `family_category` is that
 //!   one dispatcher, reused everywhere the C source reuses it.
 
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
