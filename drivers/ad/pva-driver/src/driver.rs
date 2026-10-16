@@ -100,11 +100,9 @@ impl PortDriver for PvaDriver {
                     user.addr,
                     0,
                 )?;
-                if self.cmd_tx.try_send(PvaCommand::Start).is_err() {
-                    log::error!("ad-pva-driver: monitor task is not running");
-                }
-            } else if self.cmd_tx.try_send(PvaCommand::Stop).is_err() {
-                log::error!("ad-pva-driver: monitor task is not running");
+                let _ = self.cmd_tx.try_send(PvaCommand::Start);
+            } else {
+                let _ = self.cmd_tx.try_send(PvaCommand::Stop);
             }
         }
 
@@ -137,7 +135,6 @@ impl PortDriver for PvaDriver {
                 .try_send(PvaCommand::Reconnect(new_value))
                 .is_err()
             {
-                log::error!("ad-pva-driver: monitor task is not running, PV name not changed");
                 self.ad
                     .port_base
                     .params
