@@ -9,9 +9,9 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
-use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -23,6 +23,18 @@ use crate::params::SimParams;
 use crate::shutter::{ShutterOp, shutter_op};
 use crate::task::{SimTaskContext, start_sim_task};
 use crate::types::Signal;
+
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "simDetector:writeInt32 error, ",
+    done: "simDetector:writeInt32: ",
+    list: OwnList::Zero,
+};
+
+const FLOAT64_TAIL: WriteTail = WriteTail {
+    error: "simDetector:writeFloat64 error, ",
+    done: "simDetector:writeFloat64: ",
+    list: OwnList::Zero,
+};
 
 /// `DRIVER_VERSION.DRIVER_REVISION.DRIVER_MODIFICATION` (simDetector.cpp:26-28).
 pub const DRIVER_VERSION: &str = "2.11.0";
@@ -162,85 +174,42 @@ impl PortDriver for SimDetector {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
-        // C `status = setIntegerParam(function, value)`: list 0, and for
-        // ADAcquire intercepted by asynNDArrayDriver::setIntegerParam to drive
-        // ADAcquireBusy.
-        let mut status = if reason == p.acquire {
-            self.ad.set_acquire(value)
-        } else {
-            self.ad.port_base.set_int32_param(reason, 0, value)
-        };
-
-        if reason == p.acquire {
-            if value != 0 && !acquiring {
-                let _ = self.start_tx.try_send(Signal);
+        // ADAcquire's set is asynNDArrayDriver::setIntegerParam's, which
+        // drives ADAcquireBusy.
+        INT32_TAIL.write_int32(self, user, value, |det, user, status| {
+            if reason == p.acquire {
+                if value != 0 && !acquiring {
+                    let _ = det.start_tx.try_send(Signal);
+                }
+                if value == 0 && acquiring {
+                    let _ = det.stop_tx.try_send(Signal);
+                }
+                status
+            } else if sim.int32_write_dirties_image(reason, &p) {
+                det.ad.port_base.set_int32_param(sim.reset_image, 0, 1)
+            } else if !sim.owns(reason) {
+                ADDriver::ad_write_int32(det, user, value)
+            } else {
+                status
             }
-            if value == 0 && acquiring {
-                let _ = self.stop_tx.try_send(Signal);
-            }
-        } else if sim.int32_write_dirties_image(reason, &p) {
-            status = self.ad.port_base.set_int32_param(sim.reset_image, 0, 1);
-        } else if !sim.owns(reason) {
-            status = ADDriver::ad_write_int32(self, user, value);
-        }
-
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "simDetector:writeInt32 error, status={} function={reason}, value={value}",
-                    e.c_status_code()
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("simDetector:writeInt32: function={reason}, value={value}"),
-            ),
-        }
-        status
+        })
     }
 
     /// `simDetector::writeFloat64` (simDetector.cpp:965-993).
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         // Both branches replace the store's status (simDetector.cpp:973-980).
-        let _ = self.ad.port_base.set_float64_param(reason, 0, value);
-        let status = if self
-            .sim
-            .float64_write_dirties_image(reason, self.ad.params.gain)
-        {
-            self.ad
-                .port_base
-                .set_int32_param(self.sim.reset_image, 0, 1)
-        } else {
-            // ADDriver::writeFloat64 is asynPortDriver's (simDetector.cpp:979).
-            self.ad.port_base.write_float64_param(user, value)
-        };
-
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "simDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
-                    e.c_status_code()
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("simDetector:writeFloat64: function={reason}, value={value:.6}"),
-            ),
-        }
-        status
+        FLOAT64_TAIL.write_float64(self, user, value, |det, user, _| {
+            if det
+                .sim
+                .float64_write_dirties_image(reason, det.ad.params.gain)
+            {
+                det.ad.port_base.set_int32_param(det.sim.reset_image, 0, 1)
+            } else {
+                // ADDriver::writeFloat64 is asynPortDriver's (simDetector.cpp:979).
+                det.ad.port_base.write_float64_param(user, value)
+            }
+        })
     }
 }
 
@@ -356,6 +325,7 @@ pub fn create_sim_detector(
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::asyn::trace::TraceMask;
 
     struct Fixture {
         det: SimDetector,
