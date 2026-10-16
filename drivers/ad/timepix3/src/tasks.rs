@@ -1213,7 +1213,12 @@ mod tests {
         // No database here, so the port gets an already-open interruptAccept.
         driver.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
         let (p, ad) = (driver.p, driver.ad.params);
-        let (runtime, _) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXT").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
         let handle = runtime.port_handle().clone();
         let ctx = Ctx {
             handle: handle.clone(),

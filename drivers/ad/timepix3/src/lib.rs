@@ -16,6 +16,7 @@ use epics_rs::ad_core::plugin::channel::NDArrayOutput;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 
@@ -57,10 +58,11 @@ impl TimePix3Runtime {
 ///
 /// `server_url` is the Serval endpoint, e.g. `http://localhost:8081`.
 pub fn create_timepix3_detector(
-    port_name: &str,
+    claim: &PortClaim,
     server_url: &str,
     max_memory: usize,
 ) -> AsynResult<TimePix3Runtime> {
+    let port_name = claim.name();
     let http = Arc::new(ServalHttp::new(server_url));
     let shared = Arc::new(Shared::new());
 
@@ -71,7 +73,7 @@ pub fn create_timepix3_detector(
     let ad_params = driver.ad.params;
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
 
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let ctx = Arc::new(tasks::Ctx {
