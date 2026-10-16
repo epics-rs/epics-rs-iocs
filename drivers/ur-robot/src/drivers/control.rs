@@ -432,13 +432,25 @@ impl ControlDriver {
     }
 
     /// Launch a custom URScript (from a file or inline) on the controller.
-    fn run_custom_script(&mut self, body: &str, source: &str) -> AsynResult<()> {
+    ///
+    /// `body` is read only after the motion check, and a `None` (an
+    /// unopenable file) is skipped silently; both skips succeed, as C's
+    /// `goto skip` with `comm_ok` still true (rtde_control_driver.cpp:531-545).
+    fn run_custom_script(
+        &mut self,
+        source: &str,
+        body: impl FnOnce() -> Option<String>,
+    ) -> AsynResult<()> {
         let p = self.params;
         let mut inner = self.inner.lock();
         if inner.pending_motion.is_some() && inner.motion_status != MotionStatus::WaitingAction {
             spdlog::warn(format_args!("Motion task in progress. Cannot run script."));
-            return Err(refused());
+            return Ok(());
         }
+        let Some(body) = body() else {
+            return Ok(());
+        };
+        let body = body.as_str();
         let start_count = self.receive.get().output_int_register_12;
         let timeout = inner.custom_script_timeout;
 
@@ -627,18 +639,8 @@ impl PortDriver for ControlDriver {
 
             if reason == p.run_custom_script_file {
                 let path = self.inner.lock().custom_script_path.clone();
-                let body = std::fs::read_to_string(&path).map_err(|_| {
-                    spdlog::error(format_args!("Failed to read URScript file: {path}"));
-                    refused()
-                });
-                let body = match body {
-                    Ok(body) => body,
-                    Err(e) => {
-                        self.base.set_int32_param(p.custom_script_error, 0, 1)?;
-                        return Err(e);
-                    }
-                };
-                return self.run_custom_script(&body, &path);
+                return self
+                    .run_custom_script(&path.clone(), || std::fs::read_to_string(&path).ok());
             }
 
             let mut inner = self.inner.lock();
@@ -820,7 +822,7 @@ impl PortDriver for ControlDriver {
             }
 
             if reason == p.custom_inline_script {
-                self.run_custom_script(&text, "(inline)")?;
+                self.run_custom_script("(inline)", || Some(text.clone()))?;
                 return Ok(data.len());
             }
 
