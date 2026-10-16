@@ -17,6 +17,8 @@ use crate::connection::{Connection, EipError};
 use crate::encap::{self, ETHERIP_PORT};
 use chrono::TimeZone;
 use epics_rs::base::runtime::log::errlog_vprintf;
+use epics_rs::base::runtime::task::CallbackPriority;
+use epics_rs::base::server::database::DeviceDone;
 use epics_rs::base::server::ioc_app::InitHookState;
 use epics_rs::base::server::records::printf::format_g;
 
@@ -86,14 +88,21 @@ impl TagData {
     }
 }
 
+/// A bound record's end of a tag's callbacks.
+pub struct Listener {
+    tx: Sender<()>,
+    /// Set while the record's write is PACT; the next transfer completes it.
+    pub write_done: Mutex<Option<(DeviceDone, CallbackPriority)>>,
+}
+
 pub struct TagInfo {
     pub string_tag: String,
     pub tag: ParsedTag,
     /// How many elements to request; grows as records register interest.
     pub elements: Mutex<usize>,
     pub data: Mutex<TagData>,
-    /// I/O Intr pulses, one per bound record (C `TagInfo.callbacks`).
-    listeners: Mutex<Vec<Sender<()>>>,
+    /// One per bound record (C `TagInfo.callbacks`).
+    listeners: Mutex<Vec<Arc<Listener>>>,
     /// The stats of the list this tag lives in -- the statistics device
     /// support reads them through the tag (C `TagInfo.scanlist`).
     /// Swapped when `add_tag` moves the tag to a faster list.
@@ -107,19 +116,33 @@ impl TagInfo {
         self.list_stats.lock().clone()
     }
 
-    /// Notify every bound record that this tag's value (or validity) changed.
+    /// C's callback loop after every transfer: a record whose write is
+    /// pending ends that write's cycle (`if (rec->pact) process`), every
+    /// other record gets an I/O Intr pulse.
     ///
     /// Never blocks: a full channel already has a pending pulse, and the record
     /// reads the *current* value when it processes, so coalescing is correct.
-    fn notify(&self) {
+    pub(crate) fn notify(&self) {
         let listeners = self.listeners.lock();
-        for tx in listeners.iter() {
-            let _ = tx.try_send(());
+        for l in listeners.iter() {
+            match l.write_done.lock().take() {
+                Some((done, prio)) => {
+                    let _ = done.complete(prio, Ok(()));
+                }
+                None => {
+                    let _ = l.tx.try_send(());
+                }
+            }
         }
     }
 
-    pub fn add_listener(&self, tx: Sender<()>) {
-        self.listeners.lock().push(tx);
+    pub fn add_listener(&self, tx: Sender<()>) -> Arc<Listener> {
+        let l = Arc::new(Listener {
+            tx,
+            write_done: Mutex::new(None),
+        });
+        self.listeners.lock().push(l.clone());
+        l
     }
 
     /// Device support side of the write handshake: stage the value in the tag

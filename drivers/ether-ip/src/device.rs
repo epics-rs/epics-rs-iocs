@@ -15,8 +15,9 @@ use std::sync::Arc;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
+use epics_rs::base::server::database::DeviceDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+    DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::{alarm_status, rec_gbl_record_error};
@@ -24,7 +25,7 @@ use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, Scan
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
-use crate::driver::{self, Plc, TagInfo};
+use crate::driver::{self, Listener, Plc, TagInfo};
 
 pub const DTYP: &str = "EtherIP";
 pub const DTYP_RESET: &str = "EtherIPReset";
@@ -375,6 +376,7 @@ pub struct EtherIpDevice {
     link: Option<Link>,
     plc: Option<Arc<Plc>>,
     tag: Option<Arc<TagInfo>>,
+    listener: Option<Arc<Listener>>,
     io_intr_rx: Option<mpsc::Receiver<()>>,
     alarm: Option<(u16, u16)>,
 }
@@ -390,6 +392,7 @@ impl EtherIpDevice {
             link: None,
             plc: None,
             tag: None,
+            listener: None,
             io_intr_rx: None,
             alarm: None,
         }
@@ -555,7 +558,7 @@ impl DeviceSupport for EtherIpDevice {
         // One I/O Intr pulse per new tag value. Depth 1: a pending pulse
         // already says "re-read", and the record reads the current value.
         let (tx, rx) = mpsc::channel(1);
-        tag.add_listener(tx);
+        self.listener = Some(tag.add_listener(tx));
         self.io_intr_rx = Some(rx);
 
         self.link = Some(link);
@@ -698,9 +701,35 @@ impl DeviceSupport for EtherIpDevice {
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
+        self.stage_write(record, None).map(|_| ())
+    }
+
+    /// C's `*_write` first pass: a staged write leaves the record PACT until
+    /// the driver's next transfer ends it, without a readback.
+    fn write_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &DeviceDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        Ok(if self.stage_write(record, Some(done))? {
+            WriteStart::Pending
+        } else {
+            WriteStart::Completed
+        })
+    }
+}
+
+impl EtherIpDevice {
+    /// Stage the record's value in the tag buffer and flag the write; true
+    /// when a write was flagged and `done` now waits on the next transfer.
+    fn stage_write(
+        &mut self,
+        record: &mut dyn Record,
+        done: Option<&DeviceDoneSource<'_>>,
+    ) -> CaResult<bool> {
         let Some((tag, link)) = self.bound() else {
             self.write_alarm();
-            return Ok(());
+            return Ok(false);
         };
         let (element, mask) = (link.element, link.mask);
         let rtype = record.record_type();
@@ -710,7 +739,7 @@ impl DeviceSupport for EtherIpDevice {
         if !data.has_value() || elements <= element {
             drop(data);
             self.write_alarm();
-            return Ok(());
+            return Ok(false);
         }
 
         // Stage the record's value in the tag buffer, but only when it differs
@@ -770,20 +799,21 @@ impl DeviceSupport for EtherIpDevice {
             _ => {
                 drop(data);
                 self.write_alarm();
-                return Ok(());
+                return Ok(false);
             }
         };
 
         if changed {
             tag.request_write(&mut data, &self.name);
+            if let (Some(done), Some(listener)) = (done, &self.listener) {
+                *listener.write_done.lock() = Some((done.device_done(), done.priority()));
+            }
         }
         drop(data);
         self.no_alarm();
-        Ok(())
+        Ok(changed && done.is_some())
     }
-}
 
-impl EtherIpDevice {
     /// The output half of the driver callback: a new PLC value arrived, so the
     /// record follows it (C `check_ao_callback` & friends). With `FORCE` the
     /// record wins instead -- its value is staged for the next scan.
@@ -1073,6 +1103,59 @@ mod tests {
     use super::*;
 
     /// `drvEtherIP_init` then `drvEtherIP_define_PLC`, as a st.cmd does.
+    /// devEtherIP.c mbbo_write / check_mbbo_callback: a staged write leaves
+    /// the record PACT, and the next transfer ends it without the readback
+    /// that would put the PLC's value back into VAL.
+    #[test]
+    fn a_staged_write_waits_for_the_next_transfer_instead_of_reading_back() {
+        use epics_rs::base::server::database::{DeviceDone, PvDatabase};
+        use epics_rs::base::server::records::mbbo::MbboRecord;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let db = PvDatabase::new();
+        rt.block_on(db.add_record("STAGED", Box::new(MbboRecord::default())))
+            .unwrap();
+        let done = DeviceDone::new(&db, &db.get_record("STAGED").unwrap().read());
+        let source = DeviceDoneSource::new(&done);
+
+        define_plc("staged", "127.0.0.1", 0);
+        let mut record = MbboRecord::default();
+        record.put_field("NOBT", EpicsValue::Short(2)).unwrap();
+        let mut dev = EtherIpDevice::new("@staged BOOLs[300]", true);
+        dev.init(&mut record).unwrap();
+        let mut rx = dev.io_intr_receiver().unwrap();
+        let tag = dev.tag.clone().unwrap();
+        {
+            let mut d = tag.data.lock();
+            d.buf = bits_buf(&[0; 10]);
+            d.valid_data_size = d.buf.len();
+        }
+
+        record.put_field("RVAL", EpicsValue::Long(3)).unwrap();
+        assert!(matches!(
+            dev.write_begin(&mut record, &source).unwrap(),
+            WriteStart::Pending
+        ));
+        assert!(tag.data.lock().do_write);
+        tag.notify();
+        assert!(
+            rx.try_recv().is_err(),
+            "the write's transfer is not a readback"
+        );
+        tag.notify();
+        assert!(rx.try_recv().is_ok(), "later transfers read back again");
+
+        // get_bits takes a multi-bit read's first bit from bit 0, so the 3
+        // just written reads back as 2 and every pass writes it again, as
+        // C's mbbo_write does.
+        assert!(matches!(
+            dev.write_begin(&mut record, &source).unwrap(),
+            WriteStart::Pending
+        ));
+    }
+
     fn define_plc(name: &str, ip_addr: &str, slot: u8) {
         if !driver::initialized() {
             driver::init();
