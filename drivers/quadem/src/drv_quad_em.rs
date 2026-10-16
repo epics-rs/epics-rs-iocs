@@ -829,13 +829,11 @@ pub trait QuadEmDevice {
         let shared = self.qe_shared().clone();
         let mut status = StatusOr::default();
 
-        status.add(if reason == acquire {
-            self.qe_base().set_ad_acquire(channel, value)
-        } else {
+        status.add(
             self.qe_base()
                 .port_base
-                .set_int32_param(reason, channel, value)
-        });
+                .set_int32_param(reason, channel, value),
+        );
         shared.shadow_int32(&p, reason, value);
 
         if reason == acquire {
@@ -846,7 +844,7 @@ pub trait QuadEmDevice {
         } else if reason == p.acquire_mode {
             if QeAcquireMode::from_i32(value) != QeAcquireMode::Continuous {
                 status.add(self.set_acquire(0));
-                let _ = self.qe_base().set_ad_acquire(0, 0);
+                let _ = self.qe_base().port_base.set_int32_param(acquire, 0, 0);
             }
             status.add(self.set_acquire_mode(value));
             status.add(self.read_status());
@@ -1001,7 +999,7 @@ pub struct QuadEmBase {
     /// One output per asyn address: 0-10 single-value streams, 11 the full
     /// 2-D array.
     pub outputs: Vec<Arc<parking_lot::Mutex<NDArrayOutput>>>,
-    pub queued: Vec<Arc<QueuedArrayCounter>>,
+    pub queued: Arc<QueuedArrayCounter>,
 }
 
 impl QuadEmBase {
@@ -1016,7 +1014,7 @@ impl QuadEmBase {
             },
         );
 
-        let nd_params = NDArrayDriverParams::create(&mut port_base)?;
+        let (nd_params, queued) = NDArrayDriverParams::create(&mut port_base)?;
         let params = QuadEmParams::create(&mut port_base)?;
 
         port_base.set_int32_param(nd_params.array_callbacks, 0, 1)?;
@@ -1049,9 +1047,6 @@ impl QuadEmBase {
         let outputs = (0..=QE_MAX_DATA)
             .map(|_| Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())))
             .collect();
-        let queued = (0..=QE_MAX_DATA)
-            .map(|_| Arc::new(QueuedArrayCounter::new()))
-            .collect();
 
         Ok(Self {
             port_base,
@@ -1061,27 +1056,6 @@ impl QuadEmBase {
             outputs,
             queued,
         })
-    }
-
-    /// The `ADAcquire` branch of `asynNDArrayDriver::setIntegerParam`
-    /// (asynNDArrayDriver.cpp:639-653), which every `drvQuadEM` write of
-    /// `ADAcquire` goes through: `ADAcquireBusy` follows it, except that a stop
-    /// with `WaitForPlugins` set leaves it busy while arrays are still queued.
-    pub fn set_ad_acquire(&mut self, list: i32, value: i32) -> AsynResult<()> {
-        let p = self.nd_params;
-        let busy = if value != 0 {
-            Some(1)
-        } else if int_param(&self.port_base, p.wait_for_plugins, list) == 0
-            || self.queued.iter().all(|q| q.get() == 0)
-        {
-            Some(0)
-        } else {
-            None
-        };
-        if let Some(busy) = busy {
-            self.port_base.set_int32_param(p.acquire_busy, list, busy)?;
-        }
-        self.port_base.set_int32_param(p.acquire, list, value)
     }
 
     /// Pool branch of `asynNDArrayDriver::writeInt32`, which `drvQuadEM`
@@ -1145,7 +1119,7 @@ impl QuadEmBase {
             );
             return;
         };
-        sender.set_queued_counter(self.queued[addr].clone());
+        sender.set_queued_counter(self.queued.clone());
         out.lock().add(sender);
     }
 }
@@ -1594,7 +1568,7 @@ mod tests {
         let acquire = m.base.nd_params.acquire;
         m.qe_write_int32(acquire, 0, 1).unwrap();
         assert_eq!(acquire_busy(&m), 1);
-        m.base.queued[3].increment();
+        m.base.queued.increment();
         m.qe_write_int32(acquire, 0, 0).unwrap();
         assert_eq!(acquire_busy(&m), 0);
     }
@@ -1605,12 +1579,12 @@ mod tests {
         let (acquire, wait) = (m.base.nd_params.acquire, m.base.nd_params.wait_for_plugins);
         m.base.port_base.set_int32_param(wait, 0, 1).unwrap();
         m.qe_write_int32(acquire, 0, 1).unwrap();
-        m.base.queued[3].increment();
+        m.base.queued.increment();
         m.qe_write_int32(acquire, 0, 0).unwrap();
         assert_eq!(acquire_busy(&m), 1);
 
         m.qe_write_int32(acquire, 0, 1).unwrap();
-        m.base.queued[3].decrement();
+        m.base.queued.decrement();
         m.qe_write_int32(acquire, 0, 0).unwrap();
         assert_eq!(acquire_busy(&m), 0);
     }
