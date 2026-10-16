@@ -400,13 +400,12 @@ impl AsynMotor for Emc18011Axis {
 
         let mut position = self.prev_position;
         if !z.moving {
-            // Stopped or at a limit: read a valid position and release the slot.
-            let reply = ctrl.command("A")?;
-            let value = atof(&reply);
-            if !reply.is_empty() {
-                position = value;
+            // Stopped or at a limit: a position reply releases the slot; with
+            // none C keeps the motor selected and the old position.
+            if let Some(reply) = ctrl.command("A").ok().filter(|r| !r.is_empty()) {
+                position = atof(&reply);
+                ctrl.active = None;
             }
-            ctrl.active = None;
         }
         drop(ctrl);
 
