@@ -112,8 +112,7 @@ pub fn acr_create_controller_command() -> CommandDef {
             let controller = Arc::new(Mutex::new(AcrController::new(handle)));
 
             for index in 0..num_axes as usize {
-                let ax = AcrAxis::new(controller.clone(), index)
-                    .map_err(|e| format!("ACRCreateController: axis {index}: {e}"))?;
+                let ax = AcrAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 install(
                     ctx,
