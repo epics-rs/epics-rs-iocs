@@ -5,6 +5,8 @@
 //! consumer's own `ptr += 4`), or on a full raw binary frame (`FD1`/`FO1`,
 //! which indexes from the frame start).
 
+use epics_rs::base::calc::engine::strtod::strtod;
+
 // ---------------------------------------------------------------------
 // Command builders
 // ---------------------------------------------------------------------
@@ -1257,32 +1259,19 @@ pub fn parse_fo0(payload: &[u8]) -> Option<Vec<OutputStatusLine>> {
             _ => {}
         }
         p += 2;
-        let digits_end = scan_digits(payload, p);
-        let index = parse_1based_index(payload, p, digits_end)?;
-        out.push(OutputStatusLine { index, status });
-        let nl = find_byte(payload, digits_end, b'\n')?;
+        if let Some(index) = zero_based(c_atoi(payload.get(p..).unwrap_or_default())) {
+            out.push(OutputStatusLine { index, status });
+        }
+        let nl = find_byte(payload, p, b'\n')?;
         p = nl + 1;
     }
     Some(out)
 }
 
-fn scan_digits(payload: &[u8], from: usize) -> usize {
-    let mut i = from;
-    while i < payload.len() && payload[i].is_ascii_digit() {
-        i += 1;
-    }
-    i
-}
-
-fn parse_1based_index(payload: &[u8], from: usize, to: usize) -> Option<usize> {
-    if to <= from {
-        return None;
-    }
-    let n: i64 = std::str::from_utf8(&payload[from..to]).ok()?.parse().ok()?;
-    if n < 1 {
-        return None;
-    }
-    Some((n - 1) as usize)
+/// C `*(p + width) = '\0'; atoi(p)`: atoi over at most `width` bytes.
+fn atoi_field(payload: &[u8], from: usize, width: usize) -> i32 {
+    let end = (from + width).min(payload.len());
+    c_atoi(payload.get(from..end).unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------
@@ -1316,8 +1305,7 @@ pub fn parse_ao(payload: &[u8]) -> Option<Vec<ChannelModeLine>> {
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += 2;
-        let digits_end = scan_digits(payload, p).min(p + 3);
-        let index = parse_1based_index(payload, p, digits_end)?;
+        let index = zero_based(atoi_field(payload, p, 3));
         p += 4;
         let mode = if payload.get(p) != Some(&b'A') {
             CH_MODE_DAC_SKIP
@@ -1329,7 +1317,9 @@ pub fn parse_ao(payload: &[u8]) -> Option<Vec<ChannelModeLine>> {
                 _ => CH_MODE_DAC_UNKNOWN,
             }
         };
-        out.push(ChannelModeLine { index, mode });
+        if let Some(index) = index {
+            out.push(ChannelModeLine { index, mode });
+        }
         let nl = find_byte(payload, p, b'\n')?;
         p = nl + 1;
     }
@@ -1348,9 +1338,12 @@ pub fn parse_xd(
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += 2;
-        let digits_end = scan_digits(payload, p).min(p + 3);
-        let index = parse_1based_index(payload, p, digits_end)?;
+        let index = zero_based(atoi_field(payload, p, 3));
         p += 4;
+        let Some(index) = index else {
+            p = find_byte(payload, p, b'\n')? + 1;
+            continue;
+        };
         let mode = if ch_status_of(index) == CH_STATUS_SKIP {
             CH_MODE_RELAY_SKIP
         } else {
@@ -1391,15 +1384,16 @@ pub fn parse_so(payload: &[u8]) -> Option<Vec<ExprLine>> {
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += 3;
-        let digits_end = (p + 3).min(payload.len());
-        let index = parse_1based_index(payload, p, digits_end)?;
+        let index = zero_based(atoi_field(payload, p, 3));
         p += 5;
         if payload.get(p) == Some(&b'F') {
-            out.push(ExprLine {
-                index,
-                on_flag: false,
-                expr: String::new(),
-            });
+            if let Some(index) = index {
+                out.push(ExprLine {
+                    index,
+                    on_flag: false,
+                    expr: String::new(),
+                });
+            }
             let nl = find_byte(payload, p, b'\n')?;
             p = nl + 1;
             continue;
@@ -1408,11 +1402,13 @@ pub fn parse_so(payload: &[u8]) -> Option<Vec<ExprLine>> {
         let comma = find_byte(payload, p, b',')?;
         let expr = String::from_utf8_lossy(&payload[p..comma]).into_owned();
         p = comma + 1;
-        out.push(ExprLine {
-            index,
-            on_flag: true,
-            expr,
-        });
+        if let Some(index) = index {
+            out.push(ExprLine {
+                index,
+                on_flag: true,
+                expr,
+            });
+        }
         let nl = find_byte(payload, p, b'\n')?;
         p = nl + 1;
     }
@@ -1519,43 +1515,23 @@ pub fn parse_const_lines(payload: &[u8]) -> Vec<ValueLine> {
     parse_addr_value_lines(payload, 3, 2)
 }
 
+/// C reads each line as `atoi` of the address field, then `atof` of what
+/// follows the delimiter (`drvMW100.c:1202-1210`), so no line ends the scan.
 fn parse_addr_value_lines(payload: &[u8], skip: usize, addr_width: usize) -> Vec<ValueLine> {
     let mut out = Vec::new();
     let mut p = 4usize;
     while p < payload.len() && payload[p] != b'E' {
         p += skip;
-        if p + addr_width > payload.len() {
-            break;
-        }
-        let Ok(addr1) = std::str::from_utf8(&payload[p..p + addr_width])
-            .unwrap_or("")
-            .parse::<i64>()
-        else {
-            break;
-        };
-        if addr1 < 1 {
-            break;
-        }
+        let index = zero_based(atoi_field(payload, p, addr_width));
         p += addr_width + 1;
-        let value_start = p;
-        let mut i = value_start;
-        while i < payload.len() && payload[i] != b'\n' {
-            i += 1;
+        let value = strtod(payload.get(p..).unwrap_or_default()).value;
+        if let Some(index) = index {
+            out.push(ValueLine { index, value });
         }
-        if i >= payload.len() {
-            break;
-        }
-        let value_str = std::str::from_utf8(&payload[value_start..i])
-            .unwrap_or("")
-            .trim_end_matches('\r');
-        let Ok(value) = value_str.parse::<f64>() else {
+        let Some(nl) = find_byte(payload, p, b'\n') else {
             break;
         };
-        out.push(ValueLine {
-            index: (addr1 - 1) as usize,
-            value,
-        });
-        p = i + 1;
+        p = nl + 1;
     }
     out
 }
@@ -1575,10 +1551,9 @@ pub fn parse_is0(payload: &[u8]) -> Option<[u8; 8]> {
         if p + 3 > payload.len() {
             return None;
         }
-        let d0 = payload[p].checked_sub(b'0')?;
-        let d1 = payload[p + 1].checked_sub(b'0')?;
-        let d2 = payload[p + 2].checked_sub(b'0')?;
-        *slot = 100 * d0 + 10 * d1 + d2;
+        // `unsigned char status[8]` takes the int sum mod 256, digits or not.
+        let d = |i: usize| i32::from(payload[p + i]) - i32::from(b'0');
+        *slot = (100 * d(0) + 10 * d(1) + d(2)) as u8;
         p += 4;
     }
     Some(status)
@@ -1886,5 +1861,57 @@ mod tests {
         let status = parse_is0(&payload).unwrap();
         assert_eq!(status[4], 5);
         assert_eq!(status[0], 0);
+    }
+
+    #[test]
+    fn info_parsers_take_atoi_and_drop_only_out_of_bounds_lines() {
+        let lines = parse_fo0(b"xxxxN 12x\nS 0\nN  3\nE").unwrap();
+        let got: Vec<_> = lines.iter().map(|l| (l.index, l.status)).collect();
+        assert_eq!(got, [(11, CH_STATUS_NORMAL), (2, CH_STATUS_NORMAL)]);
+
+        let lines = parse_ao(b"xxxx00000-XXX\nxx 2 0AXXT\nE").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].index, lines[0].mode), (1, CH_MODE_DAC_TRANS));
+
+        let lines = parse_xd(b"xxxx00000XM\nxx002XA\nE", |_| CH_STATUS_NORMAL).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].index, lines[0].mode), (1, CH_MODE_RELAY_ALARM));
+
+        let lines = parse_so(b"xxxxxxx000xxF\nxxx  5xxF\nE").unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].index, 4);
+    }
+
+    #[test]
+    fn value_lines_read_atof_and_never_stop_early() {
+        let lines = parse_comm_lines(b"xxxxxxx001,abc\nxxx  2,1.5e1x\nxxx000,9\nxxx003,-2\nE");
+        assert_eq!(
+            lines,
+            vec![
+                ValueLine {
+                    index: 0,
+                    value: 0.0
+                },
+                ValueLine {
+                    index: 1,
+                    value: 15.0
+                },
+                ValueLine {
+                    index: 2,
+                    value: -2.0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn is0_non_digits_wrap_as_unsigned_char() {
+        let mut payload = b"xxxx".to_vec();
+        payload.extend_from_slice(&b"000x".repeat(4));
+        payload.extend_from_slice(b"0 1x");
+        payload.extend_from_slice(&b"000x".repeat(3));
+        let status = parse_is0(&payload).unwrap();
+        // 10 * (' ' - '0') + 1 = -159, stored mod 256.
+        assert_eq!(status[4], (-159i32) as u8);
     }
 }
