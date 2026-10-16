@@ -4,6 +4,7 @@ use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -160,14 +161,15 @@ impl URLRuntime {
 /// acquisition task always runs on its own `rt::run_thread_named` OS thread
 /// at default priority/stack size) — accepted but unused, same framework
 /// limitation as the rest of this workspace's AD ports (e.g. d435i).
-pub fn create_url_detector(port_name: &str, max_memory: usize) -> AsynResult<URLRuntime> {
+pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<URLRuntime> {
+    let port_name = claim.name();
     let (acq_tx, acq_rx) = rt::command_channel::<AcqCommand>(16);
 
     let det = URLDriver::new(port_name, max_memory, acq_tx)?;
     let ad_params = det.ad.params;
     let url_params = det.url_params;
     let pool = det.ad.pool.clone();
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 
