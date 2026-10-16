@@ -551,26 +551,28 @@ fn reader_thread(
             };
 
             let should_process = packet::apply_read_outcome(&mut reader_state, outcome);
-            shared.lock().unwrap().is_communicating = reader_state.is_communicating;
 
-            if let Some(is_valid) = should_process {
-                let push = packet::process_data_packet(
+            let push = should_process.and_then(|is_valid| {
+                packet::process_data_packet(
                     &mut reader_state,
                     last_meas_value_counter,
                     last_chan_values,
                     is_valid,
                     true, // interruptAccept gap, see module doc
-                );
-                {
-                    let mut s = shared.lock().unwrap();
-                    s.stats = reader_state.stats;
-                    s.measured_count = last_meas_value_counter;
-                }
-                if let Some(update) = push {
-                    shared.lock().unwrap().pending_push = Some(update);
-                    if let Some(h) = self_handle.lock().unwrap().as_ref() {
-                        let _ = h.write_int32_blocking(PUSH_DISP_REASON, 0, 0);
-                    }
+                )
+            });
+            // C's counters and `measValueCounter` are the reader's own
+            // fields, so `int32Read` sees every pass, processed or not.
+            {
+                let mut s = shared.lock().unwrap();
+                s.is_communicating = reader_state.is_communicating;
+                s.stats = reader_state.stats;
+                s.measured_count = last_meas_value_counter;
+            }
+            if let Some(update) = push {
+                shared.lock().unwrap().pending_push = Some(update);
+                if let Some(h) = self_handle.lock().unwrap().as_ref() {
+                    let _ = h.write_int32_blocking(PUSH_DISP_REASON, 0, 0);
                 }
             }
 
