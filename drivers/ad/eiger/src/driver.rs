@@ -345,12 +345,14 @@ impl EigerDriver {
     /// A failed REST exchange: its text goes to the port's error trace, as
     /// eigerParam's `ERR_ARGS` lines do, and the record gets the status
     /// alone, since eigerDetector never writes `pasynUser->errorMessage`.
+    /// The status is `EigerParam::put`'s `EXIT_FAILURE` cast to asynStatus,
+    /// asynTimeout (eigerParam.cpp:729-756).
     fn rest_failure(&self, e: RestError) -> AsynError {
         self.ad
             .port_base
             .trace_print(TraceMask::ERROR, format_args!("{e}"));
         AsynError::Status {
-            status: AsynStatus::Error,
+            status: AsynStatus::Timeout,
             message: String::new(),
         }
     }
@@ -376,11 +378,17 @@ impl EigerDriver {
             return Ok(());
         }
 
-        if self.api == ApiVersion::V1_6_0 {
-            self.ops
-                .rest
-                .status_update()
-                .map_err(|e| self.rest_failure(e))?;
+        // eigerStatus returns asynError for any failure
+        // (eigerDetector.cpp:2017-2018, :2062).
+        let error = || AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        };
+        if self.api == ApiVersion::V1_6_0
+            && let Err(e) = self.ops.rest.status_update()
+        {
+            let _ = self.rest_failure(e);
+            return Err(error());
         }
 
         let mut indices = vec![
@@ -409,17 +417,12 @@ impl EigerDriver {
             self.p.fw_free,
         ]);
 
-        let mut first_err = None;
+        let mut failed = false;
         for index in indices {
-            if let Err(e) = self.fetch(index) {
-                first_err.get_or_insert(e);
-            }
+            failed |= self.fetch(index).is_err();
         }
         self.ad.port_base.call_param_callbacks(0)?;
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        if failed { Err(error()) } else { Ok(()) }
     }
 
     /// `writeInt32` up to its closing lines.

@@ -80,3 +80,16 @@ fn a_failed_rest_exchange_hands_the_record_no_message() {
     let e = driver.write_int32(&mut user, 1).unwrap_err();
     assert_eq!(e.message(), "");
 }
+
+/// eigerDetector.cpp:549: a failed put is `(asynStatus) EXIT_FAILURE`,
+/// asynTimeout; eigerStatus's failure is asynError (:2018).
+#[test]
+fn a_failed_put_is_exit_failure_and_a_failed_status_read_is_error() {
+    let mut driver = offline_driver("EIGER_WS_EXIT");
+    let mut user = AsynUser::new(driver.p.trigger_mode);
+    let e = driver.write_int32(&mut user, 0).unwrap_err();
+    assert_eq!(e.c_status_code(), 1);
+    let mut user = AsynUser::new(driver.ad.params.read_status);
+    let e = driver.write_int32(&mut user, 1).unwrap_err();
+    assert_eq!(e.c_status_code(), 3);
+}
