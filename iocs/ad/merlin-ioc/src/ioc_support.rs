@@ -105,6 +105,11 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+
                 let cmd = get_port(&cmd_port).ok_or_else(|| {
                     format!(
                         "command port '{cmd_port}' not found (call drvAsynIPPortConfigure first)"
@@ -113,11 +118,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 let data = get_port(&data_port).ok_or_else(|| {
                     format!("data port '{data_port}' not found (call drvAsynIPPortConfigure first)")
                 })?;
-
-                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
-                    Ok(claim) => claim,
-                    Err(e) => return Ok(ctx.cxx_error(e)),
-                };
 
                 let rt = create_merlin_detector(
                     &claim,
