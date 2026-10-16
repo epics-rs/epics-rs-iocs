@@ -11,7 +11,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::{connect_controller, connect_ip, set_eos_ignored};
+use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -101,10 +101,15 @@ pub fn acr_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_ip(&acr_port, ACR_TIMEOUT)?;
-            let controller = Arc::new(Mutex::new(AcrController::new(handle)));
-
             register_port(ctx, &port_name, num_axes as i32)?;
+
+            let (handle, _) = connect_controller(
+                &acr_port,
+                ACR_TIMEOUT,
+                &port_name,
+                format_args!("ACRMotorDriver:ACRController: cannot connect to ACR controller"),
+            );
+            let controller = Arc::new(Mutex::new(AcrController::new(handle)));
 
             for index in 0..num_axes as usize {
                 let ax = AcrAxis::new(controller.clone(), index)
