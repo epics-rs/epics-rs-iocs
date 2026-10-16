@@ -20,7 +20,7 @@ use crate::error::{RefusalReason, UrError, UrResult, verify_within};
 use crate::rtde::{CommandType, ControllerVersion, Payload, RobotCommand, default_frequency};
 use crate::script::{self, Injection, SCRIPT_PORT, ScriptClient};
 use crate::session::{DEFAULT_TIMEOUT, Session, SessionWriter};
-use crate::stream::{Snapshot, StateStream};
+use crate::stream::{Iface, Snapshot, StateStream};
 
 /// `UR_CONTROLLER_RDY_FOR_CMD` (rtde_control_interface.h:19).
 const CONTROLLER_RDY_FOR_CMD: i32 = 1;
@@ -178,7 +178,7 @@ impl ControlInterface {
         session.send_start()?;
 
         let writer = session.writer()?;
-        let stream = StateStream::spawn(session);
+        let stream = StateStream::spawn(session, Iface::Control);
         stream.wait_first_state(FIRST_STATE_TIMEOUT)?;
         self.stream = Some(stream);
         self.writer = Some(writer);

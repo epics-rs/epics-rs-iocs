@@ -12,6 +12,10 @@ pub enum UrError {
     #[error("i/o error: {0}")]
     Io(String),
 
+    /// The RTDE peer closed the socket (asio's `error::eof`).
+    #[error("End of file")]
+    PeerClosed,
+
     #[error("protocol error: {0}")]
     Protocol(String),
 

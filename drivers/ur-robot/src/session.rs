@@ -275,9 +275,7 @@ impl Session {
                 .as_mut()
                 .ok_or_else(|| UrError::NotConnected("RTDE".into()))?;
             match sock.read(&mut chunk) {
-                Ok(0) => {
-                    return Err(UrError::Io("RTDE connection closed by peer".into()));
-                }
+                Ok(0) => return Err(UrError::PeerClosed),
                 Ok(n) => n,
                 Err(e)
                     if matches!(

@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::error::UrResult;
 use crate::rtde::{ControllerVersion, default_frequency};
 use crate::session::{DEFAULT_TIMEOUT, Session};
-use crate::stream::{Snapshot, StateStream};
+use crate::stream::{Iface, Snapshot, StateStream};
 
 /// Wait for the first robot state, as the C++ constructor does.
 const FIRST_STATE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -164,7 +164,7 @@ impl ReceiveInterface {
         session.send_output_setup(&variables, default_frequency(version))?;
         session.send_start()?;
 
-        let stream = StateStream::spawn(session);
+        let stream = StateStream::spawn(session, Iface::Receive);
         stream.wait_first_state(FIRST_STATE_TIMEOUT)?;
         self.stream = Some(stream);
         Ok(())
