@@ -7,12 +7,15 @@
 
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
@@ -61,7 +64,14 @@ impl PilatusDriver {
         max_memory: usize,
         links: DriverLinks,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
         let p = PilatusParams::create(&mut ad.port_base)?;
 
         let params = ad.params;
@@ -108,9 +118,7 @@ impl PilatusDriver {
     }
 
     fn send(&self, cmd: Cmd) {
-        if let Err(e) = self.cmd_tx.try_send(cmd) {
-            log::error!("pilatus: command queue full or closed, dropped {:?}", e.0);
-        }
+        let _ = self.cmd_tx.try_send(cmd);
     }
 }
 
@@ -161,13 +169,13 @@ impl PortDriver for PilatusDriver {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
+        let mut status = Ok(());
         if function == params.acquire {
             self.ad.set_acquire(value)?;
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(function, user.addr, value)?;
+                .set_int32_param(function, user.addr, value)?;
         }
 
         if function == params.acquire {
@@ -196,11 +204,28 @@ impl PortDriver for PilatusDriver {
                 self.send(Cmd::ReadStatus);
             }
         } else if function < p.first() {
-            self.ad.write_int32_pool(function, value)?;
+            status = self.ad.write_int32_pool(function, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "pilatusDetector:writeInt32: error, status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("pilatusDetector:writeInt32: function={function}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -216,8 +241,7 @@ impl PortDriver for PilatusDriver {
             .unwrap_or(0.0);
         self.ad
             .port_base
-            .params
-            .set_float64(function, user.addr, value)?;
+            .set_float64_param(function, user.addr, value)?;
 
         if function == params.gain || function == p.energy || function == p.threshold {
             let auto_apply = self
@@ -248,8 +272,7 @@ impl PortDriver for PilatusDriver {
                 if let Some(v) = demanded {
                     self.ad
                         .port_base
-                        .params
-                        .set_float64(function, user.addr, v)?;
+                        .set_float64_param(function, user.addr, v)?;
                 }
                 self.send(Cmd::SetThreshold);
             } else {
@@ -257,8 +280,7 @@ impl PortDriver for PilatusDriver {
                 if function == p.threshold || function == p.energy {
                     self.ad
                         .port_base
-                        .params
-                        .set_float64(function, user.addr, old_value)?;
+                        .set_float64_param(function, user.addr, old_value)?;
                 }
             }
         } else if function == params.acquire_time
@@ -312,6 +334,12 @@ impl PortDriver for PilatusDriver {
         // Parameters below FIRST_PILATUS_PARAM need no extra work beyond the
         // `set_float64` above, which is all `ADDriver::writeFloat64` does.
 
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("pilatusDetector:writeFloat64: function={function}, value={value:.6}"),
+        );
         self.ad.port_base.call_param_callbacks(0)?;
         Ok(())
     }
@@ -327,24 +355,39 @@ impl PortDriver for PilatusDriver {
 
         self.ad
             .port_base
-            .params
-            .set_string(function, user.addr, value.clone())?;
+            .set_string_param(function, user.addr, value.clone())?;
 
+        let mut status = Ok(());
         if function == p.bad_pixel_file {
-            self.send(Cmd::ReadBadPixelFile(value));
+            self.send(Cmd::ReadBadPixelFile(value.clone()));
         } else if function == p.flat_field_file {
-            self.send(Cmd::ReadFlatFieldFile(value));
+            self.send(Cmd::ReadFlatFieldFile(value.clone()));
         } else if function == params.base.file_path {
-            self.send(Cmd::ImgPath(value));
+            self.send(Cmd::ImgPath(value.clone()));
         } else if function == p.oscill_axis {
             self.send(Cmd::Raw(cmd_oscill_axis(&value)));
         } else if function == p.cbf_template_file {
             self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
+        } else {
+            status = self.ad.write_octet(user, data).map(|_| ());
         }
-        // Parameters below FIRST_PILATUS_PARAM need no extra work beyond the
-        // `set_string` above.
 
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        if let Err(e) = status {
+            return Err(AsynError::Status {
+                status: e.status(),
+                message: format!(
+                    "pilatusDetector:writeOctet: status={}, function={function}, value={value}",
+                    e.status() as i32
+                ),
+            });
+        }
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("pilatusDetector:writeOctet: function={function}, value={value}"),
+        );
         Ok(data.len())
     }
 }
@@ -398,12 +441,13 @@ impl PilatusRuntime {
 /// `camserver_port` must already exist (`drvAsynIPPortConfigure`), because C
 /// connects to it with `pasynOctetSyncIO->connect` in the constructor.
 pub fn create_pilatus_detector(
-    port_name: &str,
+    claim: &PortClaim,
     camserver_port: &str,
     max_size_x: i32,
     max_size_y: i32,
     max_memory: usize,
 ) -> Result<PilatusRuntime, String> {
+    let port_name = claim.name();
     let cam_entry = get_port(camserver_port).ok_or_else(|| {
         format!("camserver port '{camserver_port}' not found (call drvAsynIPPortConfigure first)")
     })?;
@@ -437,7 +481,7 @@ pub fn create_pilatus_detector(
     let pilatus_params = driver.p;
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the Pilatus port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));

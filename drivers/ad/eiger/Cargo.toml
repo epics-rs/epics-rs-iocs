@@ -11,7 +11,6 @@ epics-rs = { workspace = true, features = ["asyn", "ad"] }
 # driver passes compressed frames through undecoded.
 ad-plugins-rs = { workspace = true }
 parking_lot = "0.12"
-log = "0.4"
 serde_json = "1.0"
 # Plain-HTTP only: the SIMPLON REST API is served over http on port 80, so no
 # TLS stack is pulled in.
@@ -22,6 +21,8 @@ zeromq = { version = "0.6", default-features = false, features = [
     "tokio-runtime",
     "tcp-transport",
 ] }
+# The stream2 parser keeps image payloads as slices of the received frame.
+bytes = "1"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 # Pure-Rust read-only HDF5 decoder: the FileWriter path parses detector-written

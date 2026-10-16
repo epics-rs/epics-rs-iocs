@@ -10,12 +10,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
@@ -61,7 +64,7 @@ impl Mar345Driver {
     fn new(port_name: &str, max_memory: usize, links: DriverLinks) -> AsynResult<Self> {
         // C's ADDriver base takes no sensor size; ADMaxSizeX/Y are set to 3450
         // explicitly below, and ADSizeX/Y are left at the base default of 0.
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let p = Mar345Params::create(&mut ad.port_base)?;
 
         let params = ad.params;
@@ -104,6 +107,11 @@ impl PortDriver for Mar345Driver {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let function = user.reason;
         let params = self.ad.params;
@@ -112,10 +120,10 @@ impl PortDriver for Mar345Driver {
         // C: `setIntegerParam(function, value)` for every function.
         self.ad
             .port_base
-            .params
-            .set_int32(function, user.addr, value)?;
+            .set_int32_param(function, user.addr, value)?;
 
         let idle = self.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
+        let mut status = Ok(());
         if function == params.acquire {
             if value != 0 && idle {
                 // Wake the mar345 task to acquire.
@@ -141,17 +149,33 @@ impl PortDriver for Mar345Driver {
                 // Abort operation.
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(params.status, 0, Status::Aborting as i32)?;
+                    .set_int32_param(params.status, 0, Status::Aborting as i32)?;
                 self.abort.signal();
             }
         } else if function < p.first() {
             // Base-class parameter: pool controls plus plain stores.
-            self.ad.write_int32_pool(function, value)?;
+            status = self.ad.write_int32_pool(function, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "mar345:writeInt32: error, status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("mar345:writeInt32: function={function}, value={value}"),
+            ),
+        }
+        status
     }
 }
 
@@ -204,10 +228,11 @@ impl Mar345Runtime {
 /// `server_port` must already exist (`drvAsynIPPortConfigure`), because C
 /// connects to it with `pasynOctetSyncIO->connect` in the constructor.
 pub fn create_mar345_detector(
-    port_name: &str,
+    claim: &PortClaim,
     server_port: &str,
     max_memory: usize,
 ) -> Result<Mar345Runtime, String> {
+    let port_name = claim.name();
     let server_entry = get_port(server_port).ok_or_else(|| {
         format!("marServer port '{server_port}' not found (call drvAsynIPPortConfigure first)")
     })?;
@@ -235,7 +260,7 @@ pub fn create_mar345_detector(
     let mar345_params = driver.p;
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the mar345 port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));

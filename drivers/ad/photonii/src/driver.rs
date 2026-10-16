@@ -9,11 +9,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
@@ -25,7 +28,7 @@ use epics_rs::ad_core::plugin::channel::{
 };
 use epics_rs::ad_core::runtime as rt;
 
-use crate::connection::P2Util;
+use crate::connection::{ChannelError, P2Util};
 use crate::params::PhotonIIParams;
 use crate::protocol;
 use crate::raw;
@@ -61,8 +64,14 @@ impl PhotonIIDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad =
-            ADDriverBase::new(port_name, PII_SIZE_X as i32, PII_SIZE_Y as i32, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            PII_SIZE_X as i32,
+            PII_SIZE_Y as i32,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
         let params = PhotonIIParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -99,7 +108,17 @@ impl PhotonIIDetector {
         let reply = match self.p2.write_read(command, COMMAND_TIMEOUT) {
             Ok(reply) => reply,
             Err(e) => {
-                log::error!("photonii: '{command}' failed: {e}");
+                let status = match &e {
+                    ChannelError::Timeout => AsynStatus::Timeout,
+                    ChannelError::Transport(e) => e.status(),
+                };
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    &format!(
+                        "PhotonII::writePhotonII, status={}, sent\n{command}",
+                        status as i32
+                    ),
+                );
                 String::new()
             }
         };
@@ -115,9 +134,7 @@ impl PhotonIIDetector {
 
     fn set_acquire(&mut self, value: i32, was_acquiring: bool) -> AsynResult<()> {
         if value != 0 && !was_acquiring {
-            if self.commands.try_send(TaskCommand::Start).is_err() {
-                log::error!("photonii: the acquisition task is not accepting commands");
-            }
+            let _ = self.commands.try_send(TaskCommand::Start);
         } else if value == 0 && was_acquiring {
             self.shared.stop_requested.store(true, Ordering::Release);
             self.command(&protocol::abort())?;
@@ -141,50 +158,69 @@ impl PortDriver for PhotonIIDetector {
         let was_acquiring = self.get_i32(self.ad.params.acquire) != 0;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
+        let mut status = Ok(());
         if reason == self.ad.params.acquire {
             self.set_acquire(value, was_acquiring)?;
         } else if reason == self.params.shutter {
-            self.ad.set_shutter(value != 0)?;
+            status = self.ad.set_shutter(value != 0);
         } else if reason == self.params.dr_sum_enable {
             self.command(&protocol::set_dr_summation(value))?;
         } else if reason == self.ad.params.trigger_mode {
-            match TriggerSource::from_i32(value) {
-                Some(source) => self.command(&protocol::set_trigger_source(source))?,
-                None => log::error!("photonii: unknown TriggerMode {value}"),
+            if let Some(source) = TriggerSource::from_i32(value) {
+                self.command(&protocol::set_trigger_source(source))?;
             }
         } else if reason == self.params.trigger_type {
-            match TriggerType::from_i32(value) {
-                Some(t) => self.command(&protocol::set_trigger_type(t))?,
-                None => log::error!("photonii: unknown TriggerType {value}"),
+            if let Some(t) = TriggerType::from_i32(value) {
+                self.command(&protocol::set_trigger_type(t))?;
             }
         } else if reason == self.params.trigger_edge {
-            match TriggerEdge::from_i32(value) {
-                Some(e) => self.command(&protocol::set_trigger_edge(e))?,
-                None => log::error!("photonii: unknown TriggerEdge {value}"),
+            if let Some(e) = TriggerEdge::from_i32(value) {
+                self.command(&protocol::set_trigger_edge(e))?;
             }
         } else if reason == self.params.num_subframes {
             self.command(&protocol::set_num_subframes(value))?;
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "PhotonII::writeInt32: error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("PhotonII::writeInt32: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         if reason == self.ad.params.acquire_time {
             self.command(&protocol::set_exposure_time(value))?;
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("PhotonII::writeFloat64: function={reason}, value={value:.6}"),
+        );
         Ok(())
     }
 
@@ -198,13 +234,8 @@ impl PortDriver for PhotonIIDetector {
             self.ad.port_base.call_param_callbacks(0)?;
             return Ok(value.len());
         }
-        self.ad.port_base.params.set_string(
-            reason,
-            user.addr,
-            String::from_utf8_lossy(value).into_owned(),
-        )?;
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(value.len())
+        // C has no writeOctet and inherits `ADDriver::writeOctet`.
+        self.ad.write_octet(user, value)
     }
 }
 
@@ -254,10 +285,11 @@ impl PhotonIIRuntime {
 /// `command_handle` is the `drvAsynIPPort` that reaches p2util (C
 /// `PhotonIIConfig`'s `commandPort`).
 pub fn create_photonii_detector(
-    port_name: &str,
+    claim: &PortClaim,
     command_handle: PortHandle,
     max_memory: usize,
 ) -> AsynResult<PhotonIIRuntime> {
+    let port_name = claim.name();
     let shared = Arc::new(SharedState {
         stop_requested: AtomicBool::new(false),
     });
@@ -269,7 +301,7 @@ pub fn create_photonii_detector(
     let params = det.params;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 

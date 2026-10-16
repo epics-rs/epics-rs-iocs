@@ -6,7 +6,7 @@ use std::sync::Arc;
 use epics_rs::ad_core::ioc::GenericDriverContext;
 use epics_rs::base::server::iocsh::registry::*;
 
-use eiger::{EigerRuntime, create_eiger_detector};
+use eiger::{ConfigError, EigerRuntime, create_eiger_detector};
 
 /// NDArray fan-out names.
 ///
@@ -74,19 +74,23 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "eigerDetectorConfig: port={port_name}, host={hostname}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let runtime = create_eiger_detector(&port_name, &hostname, max_memory)
-                    .map_err(|e| format!("failed to create the Eiger detector: {e}"))?;
+                let runtime =
+                    create_eiger_detector(&claim, &hostname, max_memory).map_err(|e| match e {
+                        ConfigError::Rest(what) => format!("C++ error: {what}"),
+                        e => format!("failed to create the Eiger detector: {e}"),
+                    })?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 // Address 0: the driver context (pool + main fan-out).
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

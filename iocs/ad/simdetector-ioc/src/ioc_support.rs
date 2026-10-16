@@ -83,27 +83,21 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "simDetectorConfig: port={port_name}, size={size_x}x{size_y}, \
-                     dataType={data_type_code}, maxBuffers={max_buffers}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let sim_rt = create_sim_detector(
-                    &port_name,
-                    size_x,
-                    size_y,
-                    data_type,
-                    max_buffers,
-                    max_memory,
-                )
-                .map_err(|e| format!("failed to create simDetector: {e}"))?;
+                let sim_rt =
+                    create_sim_detector(&claim, size_x, size_y, data_type, max_buffers, max_memory)
+                        .map_err(|e| format!("failed to create simDetector: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    sim_rt.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        sim_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     sim_rt.pool().clone(),

@@ -3,8 +3,10 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::param::{AsynType, ParamOps, ParamRegistry, ParamUpdate};
@@ -13,41 +15,10 @@ use crate::params::{
 };
 use crate::rest::{ApiVersion, RestApi, RestError, Sys};
 use crate::tasks::Signals;
+use crate::trace::Trace;
 
 /// The file permissions the driver is willing to set (C `value & 0666`).
 const FILE_PERMS_MASK: i32 = 0o666;
-
-/// The outcome of the constructor's requests to the detector.
-///
-/// The single gate that keeps a constructor-time request from failing port
-/// creation: it logs the failure, records which request it was, and reports
-/// whether the caller may go on. C gets the same property for free — its
-/// constructor issues these requests and inspects none of their return codes
-/// (eigerDetector.cpp:1655-1673) — and a detector that answers once and then
-/// drops must still leave a port behind for `iocInit`.
-#[derive(Default)]
-struct BootRequests {
-    failed: Vec<String>,
-}
-
-impl BootRequests {
-    /// Run one constructor-time request; reports whether it succeeded.
-    fn run(&mut self, what: &str, result: AsynResult<()>) -> bool {
-        match result {
-            Ok(()) => true,
-            Err(e) => {
-                log::error!("eiger: [{what}] failed at startup: {e}");
-                self.failed.push(what.to_string());
-                false
-            }
-        }
-    }
-
-    /// The requests that failed, or `None` when every one of them worked.
-    fn failure_summary(&self) -> Option<String> {
-        (!self.failed.is_empty()).then(|| self.failed.join(", "))
-    }
-}
 
 pub struct EigerDriver {
     pub ad: ADDriverBase,
@@ -57,6 +28,12 @@ pub struct EigerDriver {
     pub ops: Arc<ParamOps>,
     signals: Signals,
 }
+
+/// asyn address of the Monitor interface's NDArray callbacks (C
+/// `MONITOR_ASYN_ADDRESS`).
+pub const MONITOR_ASYN_ADDRESS: usize = 10;
+/// C `MAX_ASYN_ADDRESS`, the port's maxAddr.
+pub const MAX_ASYN_ADDRESS: usize = MONITOR_ASYN_ADDRESS + 1;
 
 /// Everything [`EigerDriver::new`] needs that is not read from the detector.
 pub struct EigerConfig {
@@ -78,11 +55,21 @@ impl EigerDriver {
             max_size_y,
             max_memory,
         } = cfg;
-        let mut ad = ADDriverBase::new(&port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            &port_name,
+            MAX_ASYN_ADDRESS,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            PortFlags {
+                multi_device: true,
+                ..ASYN_CANBLOCK
+            },
+        )?;
 
         let mut reg = ParamRegistry::new();
         let p = params::create(&mut ad.port_base, &mut reg, api, model)?;
-        let ops = Arc::new(ParamOps::new(rest, reg));
+        let ops = Arc::new(ParamOps::new(rest, reg, Trace::new(&port_name)));
 
         let mut driver = Self {
             ad,
@@ -103,17 +90,9 @@ impl EigerDriver {
     /// the IOC booted keeps its parameters at whatever `initParams` left them
     /// (eigerDetector.cpp:229-235) until the IOC restarts.
     pub fn reconnect(&mut self) -> AsynResult<()> {
-        let api = self.ops.rest.probe().map_err(rest_err)?;
-        if api != self.api {
-            // The parameter set was built for the API this port was created
-            // with, so it cannot follow the detector to another one.
-            log::warn!(
-                "eiger: the detector speaks SIMPLON {api:?} but this port was created for {:?}; \
-                 restart the IOC to pick up the right parameter set",
-                self.api
-            );
-        }
-        log::warn!("eiger: the detector answered again; re-reading it");
+        // A detector that comes back speaking another API keeps the parameter
+        // set this port was created with; only an IOC restart rebuilds it.
+        self.ops.rest.probe().map_err(rest_err)?;
         self.init_params()
     }
 
@@ -122,37 +101,72 @@ impl EigerDriver {
     fn init_params(&mut self) -> AsynResult<()> {
         self.set_driver_version()?;
 
-        let mut q = BootRequests::default();
+        // Cleared here because this runs again on every reconnect: a detector
+        // that came back must not leave the operator reading "FAILED TO
+        // CONNECT" off a working port. The initialization below may set it again.
+        self.status_message("")?;
 
         // C tests the detector with a single fetch of `state` before it touches
         // anything else, and abandons the rest of the constructor when that
-        // fails (eigerDetector.cpp:229-235). Skipping the body then is not only
-        // what C does, it is what stops an unreachable detector from costing
-        // the 20 s request timeout a few hundred times over.
-        if q.run("the detector state", self.fetch(self.p.state)) {
-            self.fetch_and_default(&mut q)?;
+        // fails (eigerDetector.cpp:229-235).
+        if self.fetch(self.p.state).is_err() {
+            self.ops.trace.err(
+                "eigerDetector",
+                "Cannot fetch state. Eiger could be disconnected.",
+            );
+            return self.boot_disconnected();
         }
+        if !self.initialize_if_needed()? {
+            return self.ad.port_base.call_param_callbacks(0);
+        }
+        // Only parameter-library failures reach here, as only they reach C's
+        // `initParams` status (eigerDetector.cpp:425-429).
+        if self.fetch_and_default().is_err() {
+            self.ops
+                .trace
+                .err("eigerDetector", "unable to set detector parameters");
+            return Ok(());
+        }
+        self.ad.port_base.call_param_callbacks(0)
+    }
 
-        match q.failure_summary() {
-            Some(failed) => self.boot_disconnected(&failed),
-            None => {
-                // Cleared here because this runs again on every reconnect: a
-                // detector that came back must not leave the operator reading
-                // "FAILED TO CONNECT" off a working port.
-                self.status_message("")?;
-                self.ad.port_base.call_param_callbacks(0)
-            }
+    /// A detector reporting `state` "na" has not been initialized since power
+    /// on: initialize it and arm/disarm once (eigerDetector.cpp:239-263).
+    /// Returns false when the initialize failed, where C abandons the rest of
+    /// the constructor.
+    fn initialize_if_needed(&mut self) -> AsynResult<bool> {
+        let state = self.ad.port_base.get_string_param(self.p.state, 0)?;
+        if state != b"na" {
+            return Ok(true);
         }
+        let trace = self.ops.trace.clone();
+        trace.err(
+            "eigerDetector",
+            "Eiger seems to be uninitialized\nInitializing... (may take a while)",
+        );
+        if self.ops.rest.initialize().is_err() {
+            trace.err("eigerDetector", "Eiger FAILED TO INITIALIZE");
+            self.status_message("Eiger FAILED TO INITIALIZE")?;
+            return Ok(false);
+        }
+        // C stores the arm's sequence id here, but `initParams` zeroes it
+        // before anything can read it (eigerDetector.cpp:1660).
+        if self.ops.rest.arm().is_err() {
+            trace.err(
+                "eigerDetector",
+                "Failed to arm the detector for the first time",
+            );
+            self.status_message("Eiger failed to arm for the first time")?;
+        } else {
+            let _ = self.ops.rest.disarm();
+        }
+        Ok(true)
     }
 
     /// Report the detector as unusable while keeping the port, so the IOC still
     /// reaches `iocInit` (C sets `ADStatusMessage` and returns,
     /// eigerDetector.cpp:231-234).
-    fn boot_disconnected(&mut self, failed: &str) -> AsynResult<()> {
-        log::error!(
-            "eiger: the detector did not answer at startup ({failed}); the port is created with \
-             the detector disconnected"
-        );
+    fn boot_disconnected(&mut self) -> AsynResult<()> {
         self.status_message("Eiger FAILED TO CONNECT")?;
         self.ad.port_base.set_int32_param(
             self.ad.params.status,
@@ -164,17 +178,12 @@ impl EigerDriver {
 
     /// The body of C `eigerDetector::initParams` (eigerDetector.cpp:1621).
     ///
-    /// Every request to the detector goes through `q`. C issues the same
-    /// requests and looks at none of their return codes — only its local
-    /// `setIntegerParam` results reach `initParams`' own status — so a detector
-    /// that answers the state fetch and then drops still leaves a usable port
-    /// behind. The `?`s here are all parameter-library operations, which never
-    /// touch the detector.
-    fn fetch_and_default(&mut self, q: &mut BootRequests) -> AsynResult<()> {
-        let (updates, failures) = self.ops.fetch_all();
-        if failures > 0 {
-            log::warn!("eiger: {failures} parameter(s) failed to fetch at startup");
-        }
+    /// C issues these requests and looks at none of their return codes — a
+    /// failed one prints its own lines and changes no status — so the `?`s
+    /// here are all parameter-library operations, which never touch the
+    /// detector.
+    fn fetch_and_default(&mut self) -> AsynResult<()> {
+        let (updates, _failures) = self.ops.fetch_all();
         self.apply(updates)?;
 
         // Read the sensor size with the ROI disabled — that is the maximum.
@@ -190,7 +199,8 @@ impl EigerDriver {
         let roi_mode = self.ad.port_base.get_int32_param(self.p.roi_mode, 0)?;
         let restore = match self.ops.enum_index_of(self.p.roi_mode, "disabled") {
             Some(disabled) if disabled != roi_mode => {
-                q.run("roi_mode", self.put_int(self.p.roi_mode, disabled))
+                let _ = self.put_int(self.p.roi_mode, disabled);
+                true
             }
             _ => false,
         };
@@ -203,7 +213,7 @@ impl EigerDriver {
             .port_base
             .get_int32_param(self.p.nd_array_size_y, 0)?;
         if restore {
-            q.run("roi_mode", self.put_int(self.p.roi_mode, roi_mode));
+            let _ = self.put_int(self.p.roi_mode, roi_mode);
         }
 
         let base = &mut self.ad.port_base;
@@ -241,30 +251,21 @@ impl EigerDriver {
         // false)` writes `enum_values[1]` — "enabled" — and the monitor is
         // *switched on* by the very line meant to switch it off. See
         // `param::encode_bool`, which inverts nothing.
-        q.run(
-            "monitor/config/mode",
-            self.put_bool(self.p.monitor_enable, false),
-        );
+        let _ = self.put_bool(self.p.monitor_enable, false);
 
         // Values this driver requires to be constant.
-        q.run("auto_summation", self.put_bool(self.p.auto_summation, true));
-        q.run(
-            "image_nr_start",
-            self.put_int(self.p.fw_img_num_start, params::DEFAULT_NR_START),
-        );
-        q.run(
-            "monitor/config/buffer_size",
-            self.put_int(self.p.monitor_buf_size, 1),
-        );
+        let _ = self.put_bool(self.p.auto_summation, true);
+        let _ = self.put_int(self.p.fw_img_num_start, params::DEFAULT_NR_START);
+        let _ = self.put_int(self.p.monitor_buf_size, 1);
         Ok(())
     }
 
     fn apply(&mut self, updates: Vec<ParamUpdate>) -> AsynResult<()> {
         for u in updates {
             match u {
-                ParamUpdate::Int32(i, v) => self.ad.port_base.params.set_int32(i, 0, v)?,
-                ParamUpdate::Float64(i, v) => self.ad.port_base.params.set_float64(i, 0, v)?,
-                ParamUpdate::Octet(i, v) => self.ad.port_base.params.set_string(i, 0, v)?,
+                ParamUpdate::Int32(i, v) => self.ad.port_base.set_int32_param(i, 0, v)?,
+                ParamUpdate::Float64(i, v) => self.ad.port_base.set_float64_param(i, 0, v)?,
+                ParamUpdate::Octet(i, v) => self.ad.port_base.set_string_param(i, 0, v)?,
             }
         }
         Ok(())
@@ -382,6 +383,156 @@ impl EigerDriver {
             None => Ok(()),
         }
     }
+
+    /// `writeInt32` up to its closing lines.
+    fn write_int32_status(&mut self, user: &AsynUser, value: i32) -> AsynResult<()> {
+        let reason = user.reason;
+        let addr = user.addr;
+        let acquire = self.ad.params.acquire;
+        let ad_status = self
+            .ad
+            .port_base
+            .get_int32_param(self.ad.params.status, 0)?;
+
+        if reason == acquire {
+            if value != 0 && ad_status != ADStatus::Acquire as i32 {
+                // Starting an acquisition is the one moment worth spending a
+                // real request on a detector that is not answering: the
+                // operator asked for data, and every parameter the acquisition
+                // needs was left at its default by the constructor that could
+                // not read them.
+                if !self.ops.rest.is_connected() {
+                    self.reconnect()?;
+                }
+                self.ad.port_base.set_int32_param(
+                    self.ad.params.status,
+                    0,
+                    ADStatus::Acquire as i32,
+                )?;
+                self.signals.start();
+            } else if value == 0 && ad_status == ADStatus::Acquire as i32 {
+                self.ad.port_base.set_int32_param(
+                    self.ad.params.status,
+                    0,
+                    ADStatus::Aborted as i32,
+                )?;
+                // C ignores mApi.abort()'s status: the stop is signalled anyway.
+                let _ = self.ops.rest.abort();
+                self.signals.stop();
+            }
+            self.ad.port_base.set_int32_param(acquire, 0, value)?;
+        } else if Some(reason) == self.p.fw_clear {
+            self.put_int(reason, 1)?;
+            let _ = self.fetch(self.p.fw_free);
+        } else if reason == self.ad.params.read_status {
+            self.eiger_status()?;
+        } else if reason == self.p.restart && value == 1 {
+            self.ad.port_base.set_int32_param(reason, 0, 1)?;
+            self.signals.restart();
+        } else if reason == self.p.initialize && value == 1 {
+            self.ad.port_base.set_int32_param(reason, 0, 1)?;
+            self.signals.initialize();
+        } else if reason == self.p.trigger {
+            self.signals.trigger();
+        } else if reason == self.p.file_perms {
+            self.put_int(reason, value & FILE_PERMS_MASK)?;
+        } else if Some(reason) == self.p.hv_reset {
+            let reset_time = self.ad.port_base.params.get_float64(
+                self.p
+                    .hv_reset_time
+                    .expect("hv_reset implies hv_reset_time"),
+                0,
+            )?;
+            let _ = self.ops.rest.hv_reset(reset_time as i32);
+        } else if reason == self.p.trigger_mode {
+            // INTE and EXTE deliver exactly one image per trigger.
+            if value == TRIGGER_MODE_INTE || value == TRIGGER_MODE_EXTE {
+                let _ = self.put_int(self.p.num_images, 1);
+            }
+            self.put_int(reason, value)?;
+        } else if self.ops.reg.lock().contains(reason) {
+            self.put_int(reason, value)?;
+            if reason == self.p.data_source || reason == self.p.stream_version {
+                let data_source = self.ad.port_base.get_int32_param(self.p.data_source, 0)?;
+                // Selecting the stream re-arms the detector's stream interface:
+                // it has to be off and on again for the socket to deliver.
+                if data_source == SOURCE_STREAM {
+                    let version = self
+                        .ad
+                        .port_base
+                        .get_int32_param(self.p.stream_version, 0)?;
+                    self.signals.stream_apis(Some(version));
+                    let _ = self.put_bool(self.p.stream_enable, false);
+                    let _ = self.put_bool(self.p.stream_enable, true);
+                } else {
+                    self.signals.stream_apis(None);
+                }
+            }
+        } else {
+            self.ad.port_base.set_int32_param(reason, addr, value)?;
+        }
+
+        Ok(())
+    }
+
+    /// `writeFloat64` up to its closing lines.
+    fn write_float64_status(&mut self, user: &AsynUser, value: f64) -> AsynResult<()> {
+        let reason = user.reason;
+        let addr = user.addr;
+
+        if reason == self.p.photon_energy {
+            let _ = self.status_message("Setting Photon Energy...");
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            let _ = self.put_f64(reason, value);
+            let _ = self.status_message("Photon Energy set");
+        } else if reason == self.p.threshold {
+            let _ = self.status_message("Setting Threshold Energy...");
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            let _ = self.put_f64(reason, value);
+            let _ = self.status_message("Threshold Energy set");
+        } else if reason == self.p.wavelength {
+            let _ = self.status_message("Setting Wavelength...");
+            let _ = self.ad.port_base.call_param_callbacks(0);
+            let _ = self.put_f64(reason, value);
+            let _ = self.status_message("Wavelength set");
+        } else if reason == self.p.wavelength_epsilon {
+            let _ = self.ad.port_base.set_float64_param(reason, 0, value);
+            self.ops.reg.lock().set_epsilon(self.p.wavelength, value);
+        } else if reason == self.p.energy_epsilon {
+            let _ = self.ad.port_base.set_float64_param(reason, 0, value);
+            let mut reg = self.ops.reg.lock();
+            reg.set_epsilon(self.p.photon_energy, value);
+            for t in params::thresholds(&self.p) {
+                reg.set_epsilon(t.energy, value);
+            }
+        } else if self.ops.reg.lock().contains(reason) {
+            self.put_f64(reason, value)?;
+        } else {
+            self.ad.port_base.set_float64_param(reason, addr, value)?;
+        }
+
+        Ok(())
+    }
+
+    /// `writeOctet` up to its closing lines.
+    fn write_octet_status(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<()> {
+        let reason = user.reason;
+        let value = String::from_utf8_lossy(data);
+
+        // The C driver resolves FILE_OWNER / FILE_OWNER_GROUP to a uid/gid with
+        // getpwnam/getgrnam and then setfsuid()s to it around every write.
+        //
+        // Not ported: see `tasks::save_task`. The two parameters are kept as
+        // plain strings so the PV surface is unchanged.
+        if self.ops.reg.lock().contains(reason)
+            && reason != self.p.file_owner
+            && reason != self.p.file_owner_group
+        {
+            self.put_str(reason, &value)
+        } else {
+            self.ad.write_octet(user, data).map(drop)
+        }
+    }
 }
 
 fn rest_err(e: RestError) -> AsynError {
@@ -453,155 +604,87 @@ impl PortDriver for EigerDriver {
             .lock()
             .add(index, drv_info, asyn_type, sys, &remote_name);
 
-        if let Err(e) = self.fetch(index) {
-            log::warn!("eiger: [{drv_info}] initial fetch failed: {e}");
-        }
+        // C `p->fetch()`: its failure lines are the parameter layer's.
+        let _ = self.fetch(index);
         Ok(DrvUserInfo::from_reason(index))
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        let reason = user.reason;
-        let addr = user.addr;
-        let acquire = self.ad.params.acquire;
-        let ad_status = self
-            .ad
-            .port_base
-            .get_int32_param(self.ad.params.status, 0)?;
-
-        if reason == acquire {
-            if value != 0 && ad_status != ADStatus::Acquire as i32 {
-                // Starting an acquisition is the one moment worth spending a
-                // real request on a detector that is not answering: the
-                // operator asked for data, and every parameter the acquisition
-                // needs was left at its default by the constructor that could
-                // not read them.
-                if !self.ops.rest.is_connected() {
-                    self.reconnect()?;
-                }
-                self.ad.port_base.set_int32_param(
-                    self.ad.params.status,
-                    0,
-                    ADStatus::Acquire as i32,
-                )?;
-                self.signals.start();
-            } else if value == 0 && ad_status == ADStatus::Acquire as i32 {
-                self.ad.port_base.set_int32_param(
-                    self.ad.params.status,
-                    0,
-                    ADStatus::Aborted as i32,
-                )?;
-                self.ops.rest.abort().map_err(rest_err)?;
-                self.signals.stop();
-            }
-            self.ad.port_base.set_int32_param(acquire, 0, value)?;
-        } else if Some(reason) == self.p.fw_clear {
-            self.put_int(reason, 1)?;
-            self.fetch(self.p.fw_free)?;
-        } else if reason == self.ad.params.read_status {
-            self.eiger_status()?;
-        } else if reason == self.p.restart && value == 1 {
-            self.ad.port_base.set_int32_param(reason, 0, 1)?;
-            self.signals.restart();
-        } else if reason == self.p.initialize && value == 1 {
-            self.ad.port_base.set_int32_param(reason, 0, 1)?;
-            self.signals.initialize();
-        } else if reason == self.p.trigger {
-            self.signals.trigger();
-        } else if reason == self.p.file_perms {
-            self.put_int(reason, value & FILE_PERMS_MASK)?;
-        } else if Some(reason) == self.p.hv_reset {
-            let reset_time = self.ad.port_base.params.get_float64(
-                self.p
-                    .hv_reset_time
-                    .expect("hv_reset implies hv_reset_time"),
-                0,
-            )?;
-            self.ops
-                .rest
-                .hv_reset(reset_time as i32)
-                .map_err(rest_err)?;
-        } else if reason == self.p.trigger_mode {
-            // INTE and EXTE deliver exactly one image per trigger.
-            if value == TRIGGER_MODE_INTE || value == TRIGGER_MODE_EXTE {
-                self.put_int(self.p.num_images, 1)?;
-            }
-            self.put_int(reason, value)?;
-        } else if self.ops.reg.lock().contains(reason) {
-            self.put_int(reason, value)?;
-            if reason == self.p.data_source || reason == self.p.stream_version {
-                let data_source = self.ad.port_base.get_int32_param(self.p.data_source, 0)?;
-                // Selecting the stream re-arms the detector's stream interface:
-                // it has to be off and on again for the socket to deliver.
-                if data_source == SOURCE_STREAM {
-                    self.put_bool(self.p.stream_enable, false)?;
-                    self.put_bool(self.p.stream_enable, true)?;
-                }
-            }
-        } else {
-            self.ad.port_base.params.set_int32(reason, addr, value)?;
+        let function = user.reason;
+        if let Err(e) = self.write_int32_status(user, value) {
+            // C's ERR_ARGS, on pasynUserSelf (eigerDetector.cpp:590-594).
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                &format!(
+                    "eigerDetector::writeInt32: error status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            );
+            return Err(e);
         }
-
-        self.ad.port_base.call_param_callbacks(addr)
+        let _ = self.ad.port_base.call_param_callbacks(user.addr);
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("eigerDetector:writeInt32: function={function}, value={value}"),
+        );
+        Ok(())
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        let addr = user.addr;
-
-        if reason == self.p.photon_energy {
-            self.status_message("Setting Photon Energy...")?;
-            self.ad.port_base.call_param_callbacks(0)?;
-            self.put_f64(reason, value)?;
-            self.status_message("Photon Energy set")?;
-        } else if reason == self.p.threshold {
-            self.status_message("Setting Threshold Energy...")?;
-            self.ad.port_base.call_param_callbacks(0)?;
-            self.put_f64(reason, value)?;
-            self.status_message("Threshold Energy set")?;
-        } else if reason == self.p.wavelength {
-            self.status_message("Setting Wavelength...")?;
-            self.ad.port_base.call_param_callbacks(0)?;
-            self.put_f64(reason, value)?;
-            self.status_message("Wavelength set")?;
-        } else if reason == self.p.wavelength_epsilon {
-            self.ad.port_base.params.set_float64(reason, 0, value)?;
-            self.ops.reg.lock().set_epsilon(self.p.wavelength, value);
-        } else if reason == self.p.energy_epsilon {
-            self.ad.port_base.params.set_float64(reason, 0, value)?;
-            let mut reg = self.ops.reg.lock();
-            reg.set_epsilon(self.p.photon_energy, value);
-            for t in params::thresholds(&self.p) {
-                reg.set_epsilon(t.energy, value);
+        let function = user.reason;
+        let status = self.write_float64_status(user, value);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "eigerDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => {
+                user.print(
+                    TraceMask::IO_DRIVER,
+                    file!(),
+                    line!(),
+                    format_args!("eigerDetector:writeFloat64: function={function}, value={value:.6}"),
+                );
+                let _ = self.ad.port_base.call_param_callbacks(user.addr);
             }
-        } else if self.ops.reg.lock().contains(reason) {
-            self.put_f64(reason, value)?;
-        } else {
-            self.ad.port_base.params.set_float64(reason, addr, value)?;
         }
-
-        self.ad.port_base.call_param_callbacks(addr)
+        status
     }
 
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let reason = user.reason;
-        let addr = user.addr;
-        let value = String::from_utf8_lossy(data).into_owned();
-
-        // The C driver resolves FILE_OWNER / FILE_OWNER_GROUP to a uid/gid with
-        // getpwnam/getgrnam and then setfsuid()s to it around every write.
-        //
-        // Not ported: see `tasks::save_task`. The two parameters are kept as
-        // plain strings so the PV surface is unchanged.
-        if self.ops.reg.lock().contains(reason)
-            && reason != self.p.file_owner
-            && reason != self.p.file_owner_group
-        {
-            self.put_str(reason, &value)?;
-        } else {
-            self.ad.port_base.params.set_string(reason, addr, value)?;
+        let function = user.reason;
+        let status = self.write_octet_status(user, data);
+        // C prints the value as the `char *` it was handed: up to the NUL.
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let value = String::from_utf8_lossy(&data[..end]);
+        match &status {
+            // C's error line has no newline (eigerDetector.cpp:763-766).
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "eigerDetector:writeOctet: status={}, function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => {
+                user.print(
+                    TraceMask::IO_DRIVER,
+                    file!(),
+                    line!(),
+                    format_args!("eigerDetector:writeOctet: function={function}, value={value}"),
+                );
+                let _ = self.ad.port_base.call_param_callbacks(user.addr);
+            }
         }
-
-        self.ad.port_base.call_param_callbacks(addr)?;
-        Ok(data.len())
+        status.map(|()| data.len())
     }
 }

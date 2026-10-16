@@ -62,7 +62,6 @@ impl P2Util {
     /// Send one command line and return p2util's reply (C `writePhotonII`,
     /// which is `asynOctetSyncIO::writeRead`: flush, write, read one line).
     pub fn write_read(&self, command: &str, timeout: Duration) -> Result<String, ChannelError> {
-        log::debug!("photonii -> {command}");
         let result = self.handle.submit_blocking(
             RequestOp::OctetWriteRead {
                 data: command.as_bytes().to_vec(),
@@ -72,7 +71,6 @@ impl P2Util {
             self.user(timeout),
         )?;
         let reply = decode(result.data.unwrap_or_default());
-        log::debug!("photonii <- {reply}");
         Ok(reply)
     }
 

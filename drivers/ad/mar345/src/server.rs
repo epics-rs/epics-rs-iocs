@@ -18,6 +18,7 @@ use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::protocol::{CMD_SHUTTER_CLOSE, CMD_SHUTTER_OPEN, response_done};
@@ -91,9 +92,14 @@ impl Server {
     /// C `callParamCallbacks()` — apply the pending writes and post monitors.
     pub async fn callbacks(&mut self) {
         let updates = std::mem::take(&mut self.batch);
-        if let Err(e) = self.handle.set_params_and_notify(0, updates).await {
-            log::error!("mar345: callParamCallbacks failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify(0, updates).await;
+    }
+
+    /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`.
+    pub fn trace_error(&self, message: &str) {
+        self.handle
+            .trace()
+            .output(self.handle.port_name(), TraceMask::ERROR, message);
     }
 
     /// Flush pending writes so a following read observes them.
@@ -123,10 +129,7 @@ impl Server {
                 let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
                 String::from_utf8_lossy(&bytes[..end]).into_owned()
             }
-            Err(e) => {
-                log::error!("mar345: getStringParam({reason}) failed: {e}");
-                String::new()
-            }
+            Err(_) => String::new(),
         }
     }
 
@@ -155,7 +158,15 @@ impl Server {
         {
             Ok(_) => CamStatus::Success,
             Err(e) => {
-                log::error!("mar345: writeServer failed, sent {output:?}: {e}");
+                // On pasynUserServer, so the server port's trace mask gates it.
+                self.server_port.trace().output(
+                    self.server_port.port_name(),
+                    TraceMask::ERROR,
+                    &format!(
+                        "mar345:writeServer, status={}, sent\n{output}",
+                        e.status() as i32
+                    ),
+                );
                 classify(&e)
             }
         };
@@ -212,7 +223,9 @@ impl Server {
                 return CamStatus::Success;
             }
             if start.elapsed().as_secs_f64() > timeout {
-                log::error!("mar345: error waiting for response from marServer");
+                self.trace_error(
+                    "mar345:waitForCompletion: error waiting for response from marServer",
+                );
                 return CamStatus::Error;
             }
         }

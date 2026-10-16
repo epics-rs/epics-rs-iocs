@@ -3,7 +3,7 @@
 //! The upfront `state` fetch only covers a detector that is already gone. C's
 //! constructor issues its `put`s afterwards and inspects none of their return
 //! codes (eigerDetector.cpp:1655-1673), so a detector that drops *between* the
-//! state fetch and the writes still has to leave a usable port behind.
+//! state fetch and the writes leaves a usable port and no status change.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -74,7 +74,7 @@ fn half_dead_detector(puts: Arc<AtomicUsize>) -> u16 {
 fn the_driver_is_created_when_the_detector_stops_answering_after_the_state_fetch() {
     let puts = Arc::new(AtomicUsize::new(0));
     let rest = RestApi::new("127.0.0.1", half_dead_detector(puts.clone()));
-    let (signals, _ctl_rx, _init_rx, _restart_rx) = tasks::signals();
+    let (signals, _receivers) = tasks::signals();
     let cfg = EigerConfig {
         port_name: "EIGER_FLAKY".to_string(),
         api: ApiVersion::V1_6_0,
@@ -94,12 +94,16 @@ fn the_driver_is_created_when_the_detector_stops_answering_after_the_state_fetch
         "expected the constructor's writes on the wire, saw {}",
         puts.load(Ordering::Acquire)
     );
-    assert_eq!(
-        driver
-            .ad
-            .port_base
-            .get_int32_param(driver.ad.params.status, 0)
-            .unwrap(),
+    // C looks at none of those writes' return codes: each prints its own
+    // lines and no status changes (eigerDetector.cpp:1655-1673).
+    let base = &driver.ad.port_base;
+    assert_ne!(
+        base.get_int32_param(driver.ad.params.status, 0).unwrap(),
         ADStatus::Disconnected as i32
+    );
+    assert_eq!(
+        base.get_string_param(driver.ad.params.status_message, 0)
+            .unwrap(),
+        b""
     );
 }

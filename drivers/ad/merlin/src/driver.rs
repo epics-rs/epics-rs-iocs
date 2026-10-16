@@ -12,11 +12,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
@@ -78,7 +81,14 @@ impl MerlinDetector {
         max_memory: usize,
         shared: Arc<SharedState>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
         let params = MerlinParams::create(&mut ad.port_base)?;
         let init_param = ad
             .port_base
@@ -140,12 +150,9 @@ impl MerlinDetector {
         self.get_threshold()?;
 
         // C read SOFTWAREVERSION into a local and threw it away.
-        match self.cmd.get(MPXVAR_GETSOFTWAREVERSION, default_timeout()) {
-            Ok(version) => {
-                let base = &mut self.ad.port_base;
-                base.set_string_param(self.ad.params.base.sdk_version, 0, version)?;
-            }
-            Err(e) => log::error!("merlin: could not read the Labview software version: {e}"),
+        if let Ok(version) = self.cmd.get(MPXVAR_GETSOFTWAREVERSION, default_timeout()) {
+            let base = &mut self.ad.port_base;
+            base.set_string_param(self.ad.params.base.sdk_version, 0, version)?;
         }
 
         let base = &mut self.ad.port_base;
@@ -171,11 +178,11 @@ impl MerlinDetector {
             DetectorType::MerlinXbpm | DetectorType::UomXbpm
         ) {
             let exposures = self.get_i32(self.ad.params.num_exposures);
-            self.set_or_log(MPXVAR_IMAGESTOSUM, &exposures.to_string());
+            self.try_set(MPXVAR_IMAGESTOSUM, &exposures.to_string());
             let bkg = self.get_i32(self.params.enable_background_corr);
-            self.set_or_log(MPXVAR_ENABLEBACKROUNDCORR, &bkg.to_string());
+            self.try_set(MPXVAR_ENABLEBACKROUNDCORR, &bkg.to_string());
             let sum = self.get_i32(self.params.enable_image_sum);
-            self.set_or_log(MPXVAR_ENABLEIMAGEAVERAGE, &sum.to_string());
+            self.try_set(MPXVAR_ENABLEIMAGEAVERAGE, &sum.to_string());
         }
 
         // Clamp the values the device will reject, writing the clamp back so
@@ -219,14 +226,14 @@ impl MerlinDetector {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
-        self.set_or_log(MPXVAR_NUMFRAMESPERTRIGGER, &num_exposures.to_string());
-        self.set_or_log(MPXVAR_COUNTERDEPTH, &counter_depth.to_string());
+        self.try_set(MPXVAR_NUMFRAMESPERTRIGGER, &num_exposures.to_string());
+        self.try_set(MPXVAR_COUNTERDEPTH, &counter_depth.to_string());
         // The device takes milliseconds.
-        self.set_or_log(
+        self.try_set(
             MPXVAR_ACQUISITIONTIME,
             &format!("{:.6}", acquire_time * 1000.0),
         );
-        self.set_or_log(
+        self.try_set(
             MPXVAR_ACQUISITIONPERIOD,
             &format!("{:.6}", acquire_period * 1000.0),
         );
@@ -242,9 +249,9 @@ impl MerlinDetector {
             // C sets no stop trigger for software triggering.
             TriggerMode::SoftwareTrigger => (TM_TRIG_SOFTWARE, None),
         };
-        self.set_or_log(MPXVAR_TRIGGERSTART, start);
+        self.try_set(MPXVAR_TRIGGERSTART, start);
         if let Some(stop) = stop {
-            self.set_or_log(MPXVAR_TRIGGERSTOP, stop);
+            self.try_set(MPXVAR_TRIGGERSTOP, stop);
         }
 
         // The server may lengthen the period to fit the readout time; take its
@@ -296,7 +303,7 @@ impl MerlinDetector {
         base.set_int32_param(self.ad.params.bin_y, 0, binning[1])?;
 
         let value = format!("{} {} {} {}", offset[0], offset[1], size[0], size[1]);
-        self.set_or_log(MPXVAR_ROI, &value);
+        self.try_set(MPXVAR_ROI, &value);
         Ok(())
     }
 
@@ -335,10 +342,10 @@ impl MerlinDetector {
         let step = self.get_f64(self.params.step_threshold_scan);
         let scan = self.get_i32(self.params.threshold_scan);
 
-        self.set_or_log(MPXVAR_THSTART, &format!("{start:.6}"));
-        self.set_or_log(MPXVAR_THSTOP, &format!("{stop:.6}"));
-        self.set_or_log(MPXVAR_THSTEP, &format!("{step:.6}"));
-        self.set_or_log(MPXVAR_THSSCAN, &scan.to_string());
+        self.try_set(MPXVAR_THSTART, &format!("{start:.6}"));
+        self.try_set(MPXVAR_THSTOP, &format!("{stop:.6}"));
+        self.try_set(MPXVAR_THSTEP, &format!("{step:.6}"));
+        self.try_set(MPXVAR_THSSCAN, &scan.to_string());
 
         for (name, reason) in [
             (MPXVAR_THSTART, self.params.start_threshold_scan),
@@ -369,7 +376,7 @@ impl MerlinDetector {
                     .port_base
                     .set_int32_param(self.params.enable_counter1, 0, v)?;
             }
-            self.set_or_log(MPXVAR_ENABLECOUNTER1, &v.to_string());
+            self.try_set(MPXVAR_ENABLECOUNTER1, &v.to_string());
         }
         if reason == self.params.continuous_rw {
             let mut v = self.get_i32(self.params.continuous_rw);
@@ -379,7 +386,7 @@ impl MerlinDetector {
                     .port_base
                     .set_int32_param(self.params.continuous_rw, 0, v)?;
             }
-            self.set_or_log(MPXVAR_CONTINUOUSRW, &v.to_string());
+            self.try_set(MPXVAR_CONTINUOUSRW, &v.to_string());
         }
 
         if let Some(v) = self.cmd.get_i32(MPXVAR_ENABLECOUNTER1, timeout) {
@@ -398,7 +405,6 @@ impl MerlinDetector {
     /// Apply one of the six canned Quad modes (C `SetQuadMode`).
     fn set_quad_mode(&mut self, mode: i32) -> AsynResult<()> {
         let Some(s) = quad_mode_settings(mode) else {
-            log::error!("merlin: unknown Quad mode {mode}");
             return Ok(());
         };
         self.shared
@@ -408,11 +414,11 @@ impl MerlinDetector {
             .port_base
             .set_int32_param(self.params.counter_depth, 0, s.counter_depth)?;
 
-        self.set_or_log(MPXVAR_COUNTERDEPTH, &s.counter_depth.to_string());
-        self.set_or_log(MPXVAR_ENABLECOUNTER1, &s.enable_counter1.to_string());
-        self.set_or_log(MPXVAR_CONTINUOUSRW, &s.continuous_rw.to_string());
-        self.set_or_log(MPXVAR_COLOURMODE, &s.colour_mode.to_string());
-        self.set_or_log(MPXVAR_CHARGESUMMING, &s.charge_summing.to_string());
+        self.try_set(MPXVAR_COUNTERDEPTH, &s.counter_depth.to_string());
+        self.try_set(MPXVAR_ENABLECOUNTER1, &s.enable_counter1.to_string());
+        self.try_set(MPXVAR_CONTINUOUSRW, &s.continuous_rw.to_string());
+        self.try_set(MPXVAR_COLOURMODE, &s.colour_mode.to_string());
+        self.try_set(MPXVAR_CHARGESUMMING, &s.charge_summing.to_string());
         Ok(())
     }
 
@@ -468,45 +474,36 @@ impl MerlinDetector {
                 .images_remaining
                 .store(remaining, Ordering::Release);
 
+            // C keeps the status of these two commands only.
             match image_mode {
                 MerlinImageMode::ThresholdScan => {
-                    if let Err(e) = self.cmd.command(MPXCMD_THSCAN, timeout) {
-                        log::error!("merlin: THSCAN failed: {e}");
-                    }
+                    self.cmd.command(MPXCMD_THSCAN, timeout)?;
                 }
                 MerlinImageMode::BackgroundCalibrate => {
-                    self.set_or_log(MPXVAR_BACKGROUNDCOUNT, &images_to_acquire.to_string());
-                    if let Err(e) = self.cmd.command(MPXCMD_BACKGROUNDACQUIRE, timeout) {
-                        log::error!("merlin: BCKGRND failed: {e}");
-                    }
+                    self.try_set(MPXVAR_BACKGROUNDCOUNT, &images_to_acquire.to_string());
+                    self.cmd.command(MPXCMD_BACKGROUNDACQUIRE, timeout)?;
                 }
                 _ => {
-                    self.set_or_log(MPXVAR_NUMFRAMESTOACQUIRE, &images_to_acquire.to_string());
+                    self.try_set(MPXVAR_NUMFRAMESTOACQUIRE, &images_to_acquire.to_string());
                     let cmd = if profile_mask & MPXPROFILES_IMAGE != 0 {
                         MPXCMD_STARTACQUISITION
                     } else {
                         MPXCMD_PROFILES
                     };
-                    if let Err(e) = self.cmd.command(cmd, timeout) {
-                        log::error!("merlin: {cmd} failed: {e}");
-                    }
+                    let _ = self.cmd.command(cmd, timeout);
                 }
             }
         } else if value == 0 && status == ADStatus::Acquire as i32 {
             self.ad
                 .port_base
                 .set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32)?;
-            if let Err(e) = self.cmd.command(MPXCMD_STOPACQUISITION, timeout) {
-                log::error!("merlin: STOPACQUISITION failed: {e}");
-            }
+            let _ = self.cmd.command(MPXCMD_STOPACQUISITION, timeout);
         }
         Ok(())
     }
 
-    fn set_or_log(&self, name: &str, value: &str) {
-        if let Err(e) = self.cmd.set(name, value, default_timeout()) {
-            log::error!("merlin: SET {name} {value} failed: {e}");
-        }
+    fn try_set(&self, name: &str, value: &str) {
+        let _ = self.cmd.set(name, value, default_timeout());
     }
 }
 
@@ -519,33 +516,33 @@ impl PortDriver for MerlinDetector {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
-        if reason == self.init_param {
-            self.initialise()?;
+        let status = if reason == self.init_param {
+            self.initialise()
         } else if reason == self.params.reset {
-            if let Err(e) = self.cmd.command(MPXCMD_RESET, default_timeout()) {
-                log::error!("merlin: RESET failed: {e}");
-            }
+            let _ = self.cmd.command(MPXCMD_RESET, default_timeout());
             // The Labview server cannot be reconnected to after a reset, so C
             // exits the IOC and relies on a supervisor to restart it. Keeping
             // the IOC up would leave every channel dead with no way back.
-            log::error!("merlin: RESET issued — exiting so the IOC can be restarted");
             self.ad.port_base.call_param_callbacks(0)?;
             std::process::exit(0);
         } else if reason == self.params.quad_merlin_mode {
-            self.set_quad_mode(value)?;
+            self.set_quad_mode(value)
         } else if reason == self.params.software_trigger {
-            if let Err(e) = self.cmd.command(MPXCMD_SOFTWARETRIGGER, default_timeout()) {
-                log::error!("merlin: SWTRIGGER failed: {e}");
-            }
+            let _ = self.cmd.command(MPXCMD_SOFTWARETRIGGER, default_timeout());
+            Ok(())
         } else if reason == self.ad.params.acquire {
-            self.set_acquire(value)?;
+            self.set_acquire(value)
         } else if reason == self.ad.params.trigger_mode
             || reason == self.ad.params.num_images
             || reason == self.ad.params.num_exposures
@@ -553,49 +550,108 @@ impl PortDriver for MerlinDetector {
             || reason == self.params.enable_background_corr
             || reason == self.params.enable_image_sum
         {
-            self.set_acquire_params()?;
+            self.set_acquire_params()
         } else if reason == self.ad.params.size_x
             || reason == self.ad.params.size_y
             || reason == self.ad.params.min_x
             || reason == self.ad.params.min_y
         {
-            self.set_roi()?;
+            self.set_roi()
         } else if reason == self.params.enable_counter1 || reason == self.params.continuous_rw {
-            self.set_mode_commands(reason)?;
+            self.set_mode_commands(reason)
         } else if reason == self.params.threshold_apply {
-            self.get_threshold()?;
+            self.get_threshold()
         } else if reason == self.params.profile_control {
-            self.set_or_log(MPXCMD_PROFILES, &value.to_string());
-        }
+            self.try_set(MPXCMD_PROFILES, &value.to_string());
+            Ok(())
+        } else if reason < self.params.first() {
+            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
+            if reason == self.ad.params.shutter_control {
+                self.ad.set_shutter(value != 0)
+            } else {
+                self.ad.write_int32_pool(reason, value).map(|_| ())
+            }
+        } else {
+            Ok(())
+        };
 
         self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "merlinDetector:writeInt32: error, status={}, reason={reason} value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("merlinDetector:writeInt32: reason={reason}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
+        let old = self.ad.port_base.get_float64_param(reason, user.addr)?;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
-        if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
-            self.set_or_log(MPXVAR_THRESHOLD[i], &format!("{value:.6}"));
-            self.get_threshold()?;
+        let name = if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
+            Some(MPXVAR_THRESHOLD[i])
         } else if reason == self.params.operating_energy {
-            self.set_or_log(MPXVAR_OPERATINGENERGY, &format!("{value:.6}"));
+            Some(MPXVAR_OPERATINGENERGY)
+        } else {
+            None
+        };
+        let status = if let Some(name) = name {
+            let set = self
+                .cmd
+                .set(name, &format!("{value:.6}"), default_timeout())
+                .map_err(AsynError::from);
             self.get_threshold()?;
+            set
         } else if reason == self.ad.params.acquire_time || reason == self.ad.params.acquire_period {
-            self.set_acquire_params()?;
+            self.set_acquire_params()
         } else if reason == self.params.start_threshold_scan
             || reason == self.params.stop_threshold_scan
             || reason == self.params.step_threshold_scan
         {
-            self.update_threshold_scan_params()?;
-        }
+            self.update_threshold_scan_params()
+        } else {
+            Ok(())
+        };
 
+        match &status {
+            Err(e) => {
+                self.ad
+                    .port_base
+                    .set_float64_param(reason, user.addr, old)?;
+                user.print(
+                    TraceMask::ERROR,
+                    file!(),
+                    line!(),
+                    format_args!(
+                        "merlinDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                        e.status() as i32
+                    ),
+                );
+            }
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("merlinDetector:writeFloat64: function={reason}, value={value:.6}"),
+            ),
+        }
         self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        status
     }
 }
 
@@ -649,7 +705,7 @@ impl MerlinRuntime {
 /// script created — the command socket and the data socket.
 #[allow(clippy::too_many_arguments)]
 pub fn create_merlin_detector(
-    port_name: &str,
+    claim: &PortClaim,
     cmd_handle: PortHandle,
     data_handle: PortHandle,
     max_size_x: i32,
@@ -657,15 +713,14 @@ pub fn create_merlin_detector(
     det_type: DetectorType,
     max_memory: usize,
 ) -> AsynResult<MerlinRuntime> {
+    let port_name = claim.name();
     let shared = Arc::new(SharedState::new());
     let cmd = MpxConnection::new(cmd_handle, MPX_MAXLINE);
     let data = MpxConnection::new(data_handle, det_type.max_frame_bytes());
 
     // C sends this from the constructor, before the parameters exist, so a
     // restarted IOC never inherits a running acquisition.
-    if let Err(e) = cmd.command(MPXCMD_STOPACQUISITION, default_timeout()) {
-        log::error!("merlin: initial STOPACQUISITION failed: {e}");
-    }
+    let _ = cmd.command(MPXCMD_STOPACQUISITION, default_timeout());
 
     let det = MerlinDetector::new(
         port_name,
@@ -681,7 +736,7 @@ pub fn create_merlin_detector(
     let init_param = det.init_param;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 
@@ -707,4 +762,73 @@ pub fn create_merlin_detector(
         data_task,
         status_task,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+
+    /// A detector whose command socket never connects: the writes under test
+    /// must not need the device.
+    fn detector(name: &str) -> MerlinDetector {
+        let ip = format!("{name}_CMD");
+        let driver = DrvAsynIPPort::new(&ip, "127.0.0.1:1").unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(&ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        MerlinDetector::new(
+            name,
+            MpxConnection::new(handle, MPX_MAXLINE),
+            512,
+            512,
+            DetectorType::MerlinQuad,
+            1 << 20,
+            Arc::new(SharedState::new()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let mut det = detector("MERLIN_BASE_WRITE");
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        let mut user = AsynUser::new(p.shutter_control);
+        det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    #[test]
+    fn a_refused_threshold_write_fails_and_keeps_the_old_value() {
+        let mut det = detector("MERLIN_THRESHOLD_WRITE");
+        let threshold = det.params.thresholds[0];
+        det.ad
+            .port_base
+            .set_float64_param(threshold, 0, 7.5)
+            .unwrap();
+        let mut user = AsynUser::new(threshold);
+        assert!(
+            det.write_float64(&mut user, 9.0).is_err(),
+            "a SET the device never answered reported success"
+        );
+        assert_eq!(
+            det.ad.port_base.get_float64_param(threshold, 0).unwrap(),
+            7.5
+        );
+    }
 }

@@ -9,10 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
+use epics_rs::asyn::error::AsynStatus;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
@@ -106,10 +108,7 @@ async fn task_loop(mut ctx: AcquisitionContext) {
 fn read_setup(ctx: &AcquisitionContext, sync: &SyncIOHandle) -> AcquireSetup {
     let ad = &ctx.ad_params;
     let frame_type_raw = sync.read_int32(ad.frame_type).unwrap_or(0);
-    let frame_type = FrameType::from_i32(frame_type_raw).unwrap_or_else(|| {
-        log::error!("photonii: unknown FrameType {frame_type_raw}, acquiring a normal frame");
-        FrameType::Normal
-    });
+    let frame_type = FrameType::from_i32(frame_type_raw).unwrap_or(FrameType::Normal);
 
     let image_mode = ImageMode::from_i32(sync.read_int32(ad.image_mode).unwrap_or(0));
     let mut num_images = sync.read_int32(ad.num_images).unwrap_or(1);
@@ -163,12 +162,11 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
 
     // Commands go through the actor so that StringToServer / StringFromServer
     // and the socket stay in one owner's hands.
-    if let Err(e) = sync.write_octet(
+    // writePhotonII prints its own failures.
+    let _ = sync.write_octet(
         ctx.params.util,
         protocol::set_run_number(setup.file_number).as_bytes(),
-    ) {
-        log::error!("photonii: could not set the run number: {e}");
-    }
+    );
     let grab = protocol::grab(
         setup.frame_type,
         &setup.file_path,
@@ -176,7 +174,6 @@ async fn acquire(ctx: &AcquisitionContext, sync: &SyncIOHandle) {
         setup.count,
     );
     if let Err(e) = sync.write_octet(ctx.params.util, grab.as_bytes()) {
-        log::error!("photonii: could not start the acquisition: {e}");
         finish(ctx, sync, Some(Abort::Error(format!("grab failed: {e}")))).await;
         return;
     }
@@ -286,12 +283,24 @@ async fn wait_for_frame(
             // Any other chatter from p2util is progress output; keep waiting.
             Ok(_) => {}
             Err(ChannelError::Timeout) => {}
-            Err(e) => {
+            Err(ChannelError::Transport(e)) => {
+                let status = e.status() as i32;
+                trace_error(ctx, &format!("PhotonII::readPhotonII, status={status}"));
+                trace_error(
+                    ctx,
+                    &format!(
+                        "PhotonII::PhotonIITask: error reading file written message status={status}"
+                    ),
+                );
                 return Err(Abort::Error(format!("error reading from p2util: {e}")));
             }
         }
 
         if poll_start.elapsed() > deadline {
+            trace_error(
+                ctx,
+                "PhotonII::PhotonIITask: timeout waiting for file written message",
+            );
             return Err(Abort::Timeout(
                 "timeout waiting for the file-written message".into(),
             ));
@@ -330,27 +339,47 @@ async fn publish_frame(
     let expected = raw::frame_bytes();
     let deadline = Duration::from_secs_f64(setup.acquire_time.max(0.0)) + FILE_READ_TIMEOUT;
     let poll_start = Instant::now();
+    // C's task prints this after every readRaw failure, a stop included.
+    let read_raw_failed = |abort: Abort| {
+        trace_error(
+            ctx,
+            &format!(
+                "PhotonII::PhotonIITask, error calling readRaw(), status={}",
+                AsynStatus::Error as i32
+            ),
+        );
+        abort
+    };
+    let mut file_exists = false;
 
     loop {
         if ctx.shared.stop_requested.load(Ordering::Acquire) {
-            return Err(Abort::Stopped);
+            return Err(read_raw_failed(Abort::Stopped));
         }
         match raw::check_raw_file(path, start, expected) {
             FileState::Ready => break,
-            FileState::Missing | FileState::Stale | FileState::Incomplete { .. } => {}
+            FileState::Missing => {}
+            FileState::Stale | FileState::Incomplete { .. } => file_exists = true,
         }
         if poll_start.elapsed() > deadline {
-            return Err(Abort::Timeout(format!(
+            trace_error(
+                ctx,
+                &format!("PhotonII::readRaw timeout waiting for file to be created {file_name}"),
+            );
+            if file_exists {
+                trace_error(ctx, "  file exists but is either old or the wrong size");
+            }
+            return Err(read_raw_failed(Abort::Timeout(format!(
                 "timeout waiting for the frame file {file_name}"
-            )));
+            ))));
         }
         rt::sleep(FILE_READ_DELAY).await;
     }
 
     let bytes = raw::read_raw_file(path)
-        .map_err(|e| Abort::Error(format!("cannot read {file_name}: {e}")))?;
+        .map_err(|e| read_raw_failed(Abort::Error(format!("cannot read {file_name}: {e}"))))?;
     let data = raw::decode_raw(&bytes)
-        .map_err(|e| Abort::Error(format!("cannot decode {file_name}: {e}")))?;
+        .map_err(|e| read_raw_failed(Abort::Error(format!("cannot decode {file_name}: {e}"))))?;
 
     let ts = EpicsTimestamp::now();
     let data_type = data.data_type();
@@ -424,10 +453,7 @@ async fn finish(ctx: &AcquisitionContext, sync: &SyncIOHandle, abort: Option<Abo
     let message = match &abort {
         None => None,
         Some(Abort::Stopped) => Some("Acquisition aborted".to_string()),
-        Some(Abort::Timeout(m)) | Some(Abort::Error(m)) => {
-            log::error!("photonii: {m}");
-            Some(m.clone())
-        }
+        Some(Abort::Timeout(m)) | Some(Abort::Error(m)) => Some(m.clone()),
     };
 
     let mut updates = vec![
@@ -452,6 +478,13 @@ async fn finish(ctx: &AcquisitionContext, sync: &SyncIOHandle, abort: Option<Abo
     set_params(ctx, updates).await;
 }
 
+/// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`.
+fn trace_error(ctx: &AcquisitionContext, message: &str) {
+    ctx.handle
+        .trace()
+        .output(ctx.handle.port_name(), TraceMask::ERROR, message);
+}
+
 async fn set_params(ctx: &AcquisitionContext, values: Vec<ParamSetValue>) {
     let _ = ctx.handle.set_params_and_notify(0, values).await;
 }
@@ -461,9 +494,6 @@ fn read_string(sync: &SyncIOHandle, reason: usize) -> String {
         Ok(bytes) => String::from_utf8_lossy(&bytes)
             .trim_end_matches('\0')
             .to_string(),
-        Err(e) => {
-            log::error!("photonii: cannot read a string parameter: {e}");
-            String::new()
-        }
+        Err(_) => String::new(),
     }
 }

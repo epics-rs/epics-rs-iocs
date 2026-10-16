@@ -9,12 +9,15 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
@@ -55,7 +58,7 @@ impl MarccdDriver {
     fn new(port_name: &str, max_memory: usize, links: DriverLinks) -> AsynResult<Self> {
         // marCCDConfig passes no sensor size; C's ADDriver base leaves
         // ADMaxSizeX/Y at 0 and `getConfig` fills them from the server.
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let p = MarccdParams::create(&mut ad.port_base)?;
 
         let params = ad.params;
@@ -82,9 +85,7 @@ impl MarccdDriver {
     }
 
     fn send(&self, cmd: Cmd) {
-        if let Err(e) = self.cmd_tx.try_send(cmd) {
-            log::error!("marccd: command queue full or closed, dropped {:?}", e.0);
-        }
+        let _ = self.cmd_tx.try_send(cmd);
     }
 }
 
@@ -115,10 +116,10 @@ impl PortDriver for MarccdDriver {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(function, user.addr, value)?;
+                .set_int32_param(function, user.addr, value)?;
         }
 
+        let mut status = Ok(());
         if function == params.acquire {
             if value != 0 {
                 // C calls getState here to gate the start; that server round-trip
@@ -145,11 +146,28 @@ impl PortDriver for MarccdDriver {
             self.send(Cmd::WriteFile);
         } else if function < p.first() {
             // Base-class parameter: pool controls plus plain stores.
-            self.ad.write_int32_pool(function, value)?;
+            status = self.ad.write_int32_pool(function, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "marCCD:writeInt32: error, status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("marCCD:writeInt32: function={function}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -158,8 +176,7 @@ impl PortDriver for MarccdDriver {
 
         self.ad
             .port_base
-            .params
-            .set_float64(function, user.addr, value)?;
+            .set_float64_param(function, user.addr, value)?;
 
         if function == p.stability {
             self.send(Cmd::SetStability(value));
@@ -167,28 +184,19 @@ impl PortDriver for MarccdDriver {
         // Parameters below FIRST_MARCCD_PARAM need no extra work beyond the
         // `set_float64` above, which is all `ADDriver::writeFloat64` does.
 
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("marCCD:writeFloat64: function={function}, value={value:.6}"),
+        );
         Ok(())
     }
 
+    /// C inherits `ADDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let function = user.reason;
-
-        // C receives a NUL-terminated `char *`; waveform records pad with NULs.
-        let payload = data.split(|&b| b == 0).next().unwrap_or(&[]);
-        let value = String::from_utf8_lossy(payload).into_owned();
-
-        self.ad
-            .port_base
-            .params
-            .set_string(function, user.addr, value)?;
-        // marCCD does not override writeOctet; every octet parameter is simply
-        // stored. (Deviation: the base `asynNDArrayDriver::writeOctet` side
-        // effects — NDFilePathExists via checkPath, NDAttributesFile reload —
-        // are not reproduced; see the crate docs.)
-
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(data.len())
+        self.ad.write_octet(user, data)
     }
 }
 
@@ -244,10 +252,11 @@ impl MarccdRuntime {
 /// asynchronously on the command task (a `PortDriver` cannot block on the
 /// server port from inside its own actor), enqueued as [`Cmd::Init`].
 pub fn create_marccd_detector(
-    port_name: &str,
+    claim: &PortClaim,
     server_port: &str,
     max_memory: usize,
 ) -> Result<MarccdRuntime, String> {
+    let port_name = claim.name();
     let server_entry = get_port(server_port).ok_or_else(|| {
         format!("marServer port '{server_port}' not found (call drvAsynIPPortConfigure first)")
     })?;
@@ -271,7 +280,7 @@ pub fn create_marccd_detector(
     let marccd_params = driver.p;
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the marCCD port runtime: {e}"))?;
     let handle = runtime_handle.port_handle().clone();
     let array_output = Arc::new(Mutex::new(NDArrayOutput::new()));

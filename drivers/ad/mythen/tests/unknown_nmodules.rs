@@ -14,6 +14,7 @@ use std::sync::mpsc;
 
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 
@@ -51,8 +52,12 @@ fn fake_detector() -> (PortHandle, mpsc::Receiver<String>) {
     });
 
     let driver = DrvAsynIPPort::new("MYTHEN_UNKNOWN_IP", &addr).expect("ip port");
-    let (runtime, _) =
-        create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
+    let (runtime, _) = create_port_runtime(
+        &claim_port("MYTHEN_UNKNOWN_IP").unwrap(),
+        driver,
+        RuntimeConfig::default(),
+    )
+    .expect("ip port runtime");
     let handle = runtime.port_handle().clone();
     // The port actor must outlive the test.
     std::mem::forget(runtime);
@@ -62,7 +67,7 @@ fn fake_detector() -> (PortHandle, mpsc::Receiver<String>) {
 #[test]
 fn a_readout_is_refused_while_the_module_count_is_unknown() {
     let (handle, received) = fake_detector();
-    let det = Arc::new(Detector::new(Transport::new(handle)));
+    let det = Arc::new(Detector::new(Transport::new(handle), "MYTHEN_NMODULES"));
 
     // Never asked: unknown, and unknown is not zero.
     assert_eq!(det.nmodules(), None);

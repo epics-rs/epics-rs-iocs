@@ -75,6 +75,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 _ => 0,
             };
 
+            // asynPortDriver registers the port before BISDetector's body looks
+            // up either socket (asynPortDriver.cpp:4030-4040, BISDetector.cpp:759).
+            let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let command = get_port(&bis_port).ok_or_else(|| {
                 format!("BIS port '{bis_port}' not found (call drvAsynIPPortConfigure first)")
             })?;
@@ -82,24 +89,20 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 format!("status port '{status_port}' not found (call drvAsynIPPortConfigure first)")
             })?;
 
-            println!(
-                "BISDetectorConfig: port={port_name}, command={bis_port}, status={status_port}"
-            );
-
             let rt = create_bruker_detector(
-                &port_name,
+                &claim,
                 command.handle.clone(),
                 status.handle.clone(),
                 max_memory,
             )
             .map_err(|e| format!("failed to create the BIS detector: {e}"))?;
 
-            epics_rs::asyn::asyn_record::register_port(
-                &port_name,
-                rt.port_handle().clone(),
-                ctx.db().scan_control().interrupt_gate(),
-            )
-            .map_err(|e| e.to_string())?;
+            claim
+                .publish(
+                    rt.port_handle().clone(),
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
 
             mgr.set_driver(Arc::new(GenericDriverContext::new(
                 rt.pool().clone(),

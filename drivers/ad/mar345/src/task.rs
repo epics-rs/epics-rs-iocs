@@ -155,10 +155,7 @@ impl Worker {
         let auto_increment = self.server.get_i32(base.auto_increment).await;
 
         let full = format_file_template(&template, &file_path, &file_name, file_number)
-            .unwrap_or_else(|| {
-                log::error!("mar345: cannot expand NDFileTemplate {template:?}");
-                String::new()
-            });
+            .unwrap_or_default();
         if auto_increment != 0 {
             self.server.set_i32(base.file_number, file_number + 1);
         }
@@ -292,8 +289,12 @@ impl Worker {
         let data = match std::fs::read(&full) {
             Ok(d) => d,
             Err(e) => {
-                // C logs the errno and returns without publishing.
-                log::error!("mar345: unable to open input file {full}, error={e}");
+                // C's "%s%s:" has no colon between driver and function.
+                let error = e.to_string();
+                let error = error.split(" (os error").next().unwrap_or(&error);
+                self.server.trace_error(&format!(
+                    "mar345getImageData: unable to open input file {full}, error={error}"
+                ));
                 return;
             }
         };

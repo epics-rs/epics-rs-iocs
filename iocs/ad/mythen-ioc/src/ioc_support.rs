@@ -53,19 +53,20 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "mythenConfig: port={port_name}, ipPort={ip_port_name}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let runtime = create_mythen_detector(&port_name, &ip_port_name, max_memory)
+                let runtime = create_mythen_detector(&claim, &ip_port_name, max_memory)
                     .map_err(|e| format!("failed to create the Mythen detector: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     runtime.pool.clone(),

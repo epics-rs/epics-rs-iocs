@@ -13,4 +13,3 @@ publish = false
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "ad"] }
 parking_lot = "0.12"
-log = "0.4"

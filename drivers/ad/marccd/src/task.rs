@@ -23,6 +23,7 @@ use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::trace::TraceMask;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::file_name::{format_file_template, full_file_template};
@@ -98,6 +99,10 @@ fn epoch_secs(t: SystemTime) -> i64 {
 }
 
 impl Worker {
+    async fn trace_error(&self, message: &str) {
+        self.server.lock().await.trace(TraceMask::ERROR, message);
+    }
+
     fn store_acq_start(&self, v: f64) {
         self.acq_start.store(v.to_bits(), Ordering::Relaxed);
     }
@@ -326,10 +331,7 @@ impl Worker {
         let auto_increment = srv.get_i32(base.auto_increment).await;
 
         let full = format_file_template(&template, &file_path, &file_name, file_number)
-            .unwrap_or_else(|| {
-                log::error!("marccd: cannot expand NDFileTemplate {template:?}");
-                String::new()
-            });
+            .unwrap_or_default();
         if auto_increment != 0 {
             srv.set_i32(base.file_number, file_number + 1);
         }
@@ -419,7 +421,11 @@ impl Worker {
                     let modified = match f.metadata().and_then(|m| m.modified()) {
                         Ok(m) => epoch_secs(m),
                         Err(e) => {
-                            log::error!("marccd: error calling fstat on {file}: {e}");
+                            self.trace_error(&format!(
+                                "marCCD::readTiff error calling fstat, errno={} {file}",
+                                e.raw_os_error().unwrap_or(0)
+                            ))
+                            .await;
                             return Err(CamStatus::Error);
                         }
                     };
@@ -438,13 +444,16 @@ impl Worker {
             delta_time = t_start.elapsed().as_secs_f64();
         }
         if !opened {
+            self.trace_error(&format!(
+                "marCCD::readTiff timeout waiting for file to be created {file}"
+            ))
+            .await;
             if file_exists {
-                log::error!(
-                    "marccd: timeout waiting for {file}; file exists but is more than \
-                     10 seconds old, possible clock synchronization problem"
-                );
-            } else {
-                log::error!("marccd: timeout waiting for file to be created {file}");
+                self.trace_error(
+                    "  file exists but is more than 10 seconds old, possible clock \
+                     synchronization problem",
+                )
+                .await;
             }
             return Err(CamStatus::Error);
         }
@@ -458,12 +467,26 @@ impl Worker {
                     decoded = Some(img.data);
                     break;
                 }
-                Ok(img) => log::error!(
-                    "marccd: image size incorrect = {}x{}, should be {nx}x{ny}",
-                    img.width,
-                    img.height
-                ),
-                Err(e) => log::debug!("marccd: error reading TIFF file {file}: {e}"),
+                Ok(img) if img.width as usize != nx => {
+                    self.trace_error(&format!(
+                        "marCCD::readTiff, image width incorrect ={}, should be {nx}",
+                        img.width
+                    ))
+                    .await;
+                }
+                Ok(img) => {
+                    self.trace_error(&format!(
+                        "marCCD::readTiff, image length incorrect ={}, should be {ny}",
+                        img.height
+                    ))
+                    .await;
+                }
+                Err(_) => {
+                    self.server.lock().await.trace(
+                        TraceMask::FLOW,
+                        &format!("marCCD::readTiff, error reading TIFF file {file}"),
+                    );
+                }
             }
             if self.stop.wait_timeout(secs(FILE_READ_DELAY)) {
                 return Err(CamStatus::Error);
@@ -475,7 +498,6 @@ impl Worker {
             // Fixed (upstream-c-defects.md #13): the retry loop timed out
             // without a valid frame. Do not fabricate a buffer or return it as
             // success.
-            log::error!("marccd: timeout reading TIFF file {file}; image not published");
             return Err(CamStatus::Error);
         };
         Ok(data)
@@ -896,7 +918,10 @@ async fn collect_series(w: &Worker) {
     let use_shutter = shutter_mode != 0;
 
     if frame_type != FrameType::Normal as i32 {
-        log::error!("marccd: collectSeries error, frame type must be Normal");
+        w.server.lock().await.trace(
+            TraceMask::ERROR,
+            "marCCD:collectSeries: error, frame type must be Normal",
+        );
         finish_series(w, tiff_timeout, false, auto_increment, file_number).await;
         return;
     }
@@ -906,7 +931,10 @@ async fn collect_series(w: &Worker) {
         match format_file_template(&series_file_template, &file_path, &file_name, file_number) {
             Some(s) => s,
             None => {
-                log::error!("marccd: collectSeries error creating base file name");
+                w.server.lock().await.trace(
+                    TraceMask::ERROR,
+                    "marCCD:collectSeries: error creating base file name",
+                );
                 // C returns here without restoring state, which spins the task;
                 // this port cleans up and stops instead.
                 finish_series(w, tiff_timeout, use_shutter, auto_increment, file_number).await;

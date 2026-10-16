@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase};
@@ -42,7 +45,7 @@ impl PvaDriver {
         max_memory: usize,
         cmd_tx: rt::CommandSender<PvaCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let pva_params = PvaParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -81,34 +84,44 @@ impl PortDriver for PvaDriver {
 
     /// Mirrors C++ `pvaDriver::writeInt32`: only `ADAcquire` is special-cased
     /// (`value != 0` resets `ADNumImagesCounter` and starts the monitor task;
-    /// otherwise stops it); every other Int32 param falls through to the same
-    /// "set param, call callbacks" behavior as the base `ADDriver::writeInt32`
-    /// (this crate's `PortDriver::write_int32` default already does that).
+    /// otherwise stops it); every other Int32 param goes to
+    /// `ADDriver::writeInt32`.
     /// Unlike `URLDriver`, there is no `ADStatus`/`ADAcquireBusy` gate here —
     /// `pvaDriver.cpp` never references either param.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
         if reason == self.ad.params.acquire {
             if value != 0 {
-                self.ad.port_base.params.set_int32(
+                self.ad.port_base.set_int32_param(
                     self.ad.params.num_images_counter,
                     user.addr,
                     0,
                 )?;
-                if self.cmd_tx.try_send(PvaCommand::Start).is_err() {
-                    log::error!("ad-pva-driver: monitor task is not running");
-                }
-            } else if self.cmd_tx.try_send(PvaCommand::Stop).is_err() {
-                log::error!("ad-pva-driver: monitor task is not running");
+                let _ = self.cmd_tx.try_send(PvaCommand::Start);
+            } else {
+                let _ = self.cmd_tx.try_send(PvaCommand::Stop);
             }
+        } else if reason < self.pva_params.overrun_counter {
+            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`. C
+            // overwrites its status with `callParamCallbacks()`'s.
+            let _ = if reason == self.ad.params.shutter_control {
+                self.ad.set_shutter(value != 0)
+            } else {
+                self.ad.write_int32_pool(reason, value).map(|_| ())
+            };
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("pvaDriver:writeInt32: function={reason}, value={value}"),
+        );
         Ok(())
     }
 
@@ -130,29 +143,41 @@ impl PortDriver for PvaDriver {
                 .to_vec();
             self.ad
                 .port_base
-                .params
-                .set_string(reason, user.addr, new_value.clone())?;
+                .set_string_param(reason, user.addr, new_value.clone())?;
             if self
                 .cmd_tx
                 .try_send(PvaCommand::Reconnect(new_value))
                 .is_err()
             {
-                log::error!("ad-pva-driver: monitor task is not running, PV name not changed");
                 self.ad
                     .port_base
-                    .params
-                    .set_string(reason, user.addr, old_value)?;
+                    .set_string_param(reason, user.addr, old_value)?;
             }
         } else {
-            self.ad
-                .port_base
-                .params
-                .set_string(reason, user.addr, new_value)?;
+            let n = self.ad.write_octet(user, data)?;
+            trace_octet(user, data);
+            return Ok(n);
         }
 
+        trace_octet(user, data);
         self.ad.port_base.call_param_callbacks(0)?;
         Ok(data.len())
     }
+}
+
+/// The `ASYN_TRACEIO_DRIVER` line `pvaDriver::writeOctet` ends with; a
+/// failure only fills `errorMessage`, so it prints nothing.
+fn trace_octet(user: &AsynUser, value: &[u8]) {
+    user.print(
+        TraceMask::IO_DRIVER,
+        file!(),
+        line!(),
+        format_args!(
+            "pvaDriver:writeOctet: function={}, value={}",
+            user.reason,
+            String::from_utf8_lossy(value)
+        ),
+    );
 }
 
 impl ADDriver for PvaDriver {
@@ -204,17 +229,18 @@ impl PvaRuntime {
 /// priority/stack size) — same framework limitation as the rest of this
 /// workspace's AD ports (e.g. ad-url).
 pub fn create_pva_detector(
-    port_name: &str,
+    claim: &PortClaim,
     pv_name: &str,
     max_memory: usize,
 ) -> AsynResult<PvaRuntime> {
+    let port_name = claim.name();
     let (cmd_tx, cmd_rx) = rt::command_channel::<PvaCommand>(16);
 
     let det = PvaDriver::new(port_name, pv_name, max_memory, cmd_tx)?;
     let ad_params = det.ad.params;
     let pva_params = det.pva_params;
     let pool = det.ad.pool.clone();
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 
@@ -236,4 +262,31 @@ pub fn create_pva_detector(
         queued_counter,
         task_handle: Some(task_handle),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel(1);
+        let mut det = PvaDriver::new("PVA_BASE_WRITE", "", 1 << 20, cmd_tx).unwrap();
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        let mut user = AsynUser::new(p.shutter_control);
+        det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
 }

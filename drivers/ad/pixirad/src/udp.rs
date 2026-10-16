@@ -110,10 +110,6 @@ impl FrameAssembler {
         if slot >= self.expected_packets {
             // More packets than the frame can hold: the detector is sending a
             // frame we cannot describe, so start over on the next one.
-            log::error!(
-                "pixirad: packet {slot} does not fit a frame of {} packets",
-                self.expected_packets
-            );
             self.reset();
             return None;
         }
@@ -143,19 +139,14 @@ impl FrameAssembler {
 }
 
 /// Bind a UDP socket that listens on every interface, with the receive buffer
-/// the detector's data rate needs (C's `SO_RCVBUF` call).
-pub fn bind_data_socket(port: u16) -> io::Result<UdpSocket> {
+/// the detector's data rate needs (C's `SO_RCVBUF` call), and return the
+/// buffer size the kernel reports back.
+pub fn bind_data_socket(port: u16) -> io::Result<(UdpSocket, usize)> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_recv_buffer_size(MAX_UDP_DATA_BUFFER)?;
     socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
     let actual = socket.recv_buffer_size()?;
-    if actual < MAX_UDP_DATA_BUFFER {
-        log::warn!(
-            "pixirad: the kernel gave the data socket a {actual}-byte receive buffer, \
-             {MAX_UDP_DATA_BUFFER} were asked for"
-        );
-    }
-    Ok(socket.into())
+    Ok((socket.into(), actual))
 }
 
 /// Bind the status broadcast socket.

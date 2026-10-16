@@ -15,6 +15,7 @@ use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::asyn_record;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 
@@ -51,15 +52,16 @@ impl MythenRuntime {
 ///
 /// `ip_port_name` is the asyn octet port `drvAsynIPPortConfigure` created.
 pub fn create_mythen_detector(
-    port_name: &str,
+    claim: &PortClaim,
     ip_port_name: &str,
     max_memory: usize,
 ) -> AsynResult<MythenRuntime> {
+    let port_name = claim.name();
     let ip_port = asyn_record::get_port(ip_port_name).ok_or_else(|| AsynError::Status {
         status: AsynStatus::Error,
         message: format!("mythen: no asyn port named {ip_port_name}"),
     })?;
-    let det = Arc::new(Detector::new(Transport::new(ip_port.handle)));
+    let det = Arc::new(Detector::new(Transport::new(ip_port.handle), port_name));
 
     let (start_tx, start_rx) = rt::command_channel::<()>(1);
     let driver = MythenDriver::new(port_name, det.clone(), max_memory, start_tx)?;
@@ -68,7 +70,7 @@ pub fn create_mythen_detector(
     let ad_params = driver.ad.params;
     let pool = driver.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
 
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let shared = Arc::new(task::Shared {

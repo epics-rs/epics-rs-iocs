@@ -10,13 +10,14 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
@@ -191,7 +192,7 @@ async fn expose(ctx: &AcquisitionContext) -> Result<Exposure, Abort> {
     ctx.handle
         .write_int32(ctx.params.start_scan, 0, 1)
         .await
-        .map_err(|e| Abort::Error(format!("cannot start the scan: {e}")))?;
+        .map_err(|e| Abort::Error(format!("BISDetector:BISTask: cannot start the scan: {e}")))?;
 
     let exposure = Exposure {
         frame_type: FrameType::from_i32(read_i32(ctx, ctx.ad_params.frame_type).await)
@@ -266,12 +267,9 @@ async fn expose(ctx: &AcquisitionContext) -> Result<Exposure, Abort> {
     // its runtime, and it has nothing else to do until BIS answers.
     match ctx.readout.recv_timeout(READOUT_TIMEOUT) {
         Ok(()) => Ok(exposure),
-        Err(RecvTimeoutError::Timeout) => Err(Abort::Error(
-            "timeout waiting for the readout to complete".into(),
+        Err(_) => Err(Abort::Error(
+            "BISDetector:BISTask: error waiting for readout to complete".into(),
         )),
-        Err(RecvTimeoutError::Disconnected) => {
-            Err(Abort::Error("the status task is not running".into()))
-        }
     }
 }
 
@@ -302,10 +300,14 @@ async fn publish_frame(
     let written_after = SystemTime::now() - CLOCK_SKEW_ALLOWANCE;
     wait_for_file(ctx, path, written_after, deadline).await?;
 
-    let bytes = std::fs::read(path)
-        .map_err(|e| Abort::Error(format!("cannot read {}: {e}", path.display())))?;
-    let image = sfrm::decode(&bytes)
-        .map_err(|e| Abort::Error(format!("cannot read {}: {e}", path.display())))?;
+    let bytes = std::fs::read(path).map_err(|e| {
+        Abort::Error(format!(
+            "BISDetector:readSFRM: error reading file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let image =
+        sfrm::decode(&bytes).map_err(|e| Abort::Error(format!("BISDetector:readSFRM: {e}")))?;
 
     // C sized the array from ADSizeX/ADSizeY — the geometry BIS reported on the
     // status socket — and then let readSFRM write NROWS*NCOLS pixels into it: a
@@ -385,15 +387,16 @@ async fn wait_for_file(
             return Err(Abort::Stopped);
         }
         if start.elapsed() > deadline {
-            return Err(Abort::Error(if stale {
-                format!(
-                    "{} is more than {} seconds old: the clocks may not agree",
-                    path.display(),
-                    CLOCK_SKEW_ALLOWANCE.as_secs()
-                )
-            } else {
-                format!("timeout waiting for {} to be written", path.display())
-            }));
+            let mut message = format!(
+                "BISDetector::readSFRM timeout waiting for file to be created {}",
+                path.display()
+            );
+            if stale {
+                message.push_str(
+                    "\n  file exists but is more than 10 seconds old, possible clock synchronization problem",
+                );
+            }
+            return Err(Abort::Error(message));
         }
         rt::sleep(FILE_READ_DELAY).await;
     }
@@ -421,7 +424,9 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
             ParamValue::Octet("Acquisition aborted".as_bytes().into()),
         )),
         Some(Abort::Error(message)) => {
-            log::error!("bruker: {message}");
+            ctx.handle
+                .trace()
+                .output(ctx.handle.port_name(), TraceMask::ERROR, message);
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,

@@ -151,7 +151,7 @@ pub fn register_quadem_port(
     )));
     for (addr, output) in outputs.iter().enumerate().take(QE_ADDR_ALL + 1).skip(1) {
         mgr.wiring()
-            .register_output(&format!("{port_name}:{addr}"), output.clone());
+            .register_output_at(port_name, addr as i32, output.clone());
     }
     Ok(())
 }

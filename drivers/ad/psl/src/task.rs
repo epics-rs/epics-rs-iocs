@@ -13,6 +13,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
@@ -213,9 +214,20 @@ fn read_frame(ctx: &AcquisitionContext) -> Result<(ImageHeader, Vec<u8>), Abort>
 
     while payload.len() < header.data_len {
         let want = (header.data_len - payload.len()).min(MAX_MESSAGE_SIZE);
-        let block = session
-            .read_image_block(want)
-            .map_err(|e| Abort::Error(format!("error reading the image: {e}")))?;
+        let block = session.read_image_block(want).map_err(|e| {
+            ctx.handle.trace().output(
+                ctx.handle.port_name(),
+                TraceMask::ERROR,
+                &format!(
+                    "PSL:getImage: error reading image, status={}, dataLen={}, nCopied={}, \
+                     maxRead={want}, nRead=0",
+                    e.status(),
+                    header.data_len,
+                    payload.len()
+                ),
+            );
+            Abort::Error(format!("error reading the image: {e}"))
+        })?;
         // C added `nRead_` to its copy counter without checking it: a read that
         // returned nothing left the loop spinning forever on a half-written
         // image.
@@ -243,10 +255,7 @@ async fn publish_frame(
 ) {
     let data = match image::decode_payload(header, &payload) {
         Ok(data) => data,
-        Err(e) => {
-            log::error!("psl: cannot decode the frame: {e}");
-            return;
-        }
+        Err(_) => return,
     };
 
     let ts = EpicsTimestamp::now();
@@ -344,7 +353,6 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
             ParamValue::Octet("Acquisition aborted".as_bytes().into()),
         )),
         Some(Abort::Error(message)) => {
-            log::error!("psl: {message}");
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,

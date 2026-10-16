@@ -8,7 +8,7 @@
 //!
 //! The C template is instantiated for all ten `NDDataType_t`s and relies on the
 //! platform's `double -> integer` conversion, which truncates toward zero and
-//! then wraps modulo 2^N. Rust's `as` saturates instead. [`SimPixel::from_f64_c`]
+//! then wraps modulo 2^N. Rust's `as` saturates instead. `SimPixel::from_f64_c`
 //! restores the C behaviour by going through `i128` (truncate) before the
 //! narrowing bit-truncation.
 //!

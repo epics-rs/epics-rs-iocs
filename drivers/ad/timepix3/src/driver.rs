@@ -4,26 +4,42 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::ADDriverBase;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
-use epics_rs::ad_core::params::ad_driver::ADDriverParams;
-use epics_rs::ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use serde_json::json;
 
+use crate::adlog;
 use crate::http::{HttpError, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
 use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Shared};
 
+/// The line C prints when a Serval request fails: `logHttpFailure` or
+/// `logHttpWarning` with its context, method and path, or nothing.
+enum HttpPrint<'a> {
+    None,
+    Failure(&'a str, &'a str, &'a str),
+    Warning(&'a str, &'a str, &'a str),
+}
+
 /// C's `maxAddr` (ADTimePix.cpp:1069): 0 = PrvImg, 1 = Img, 2 = Img running
 /// sum, 3 = Img sum-of-N, 4 = PrvHst sum-of-N, 5 = PrvHst running sum,
 /// 6 = PrvHst frame, 7 = PrvHst ToF axis. The chip DACs bind addresses 0-7 and
 /// the voltage rails 0-5 on the same port.
 pub const MAX_ADDR: usize = 8;
+
+/// ADTIMEPIX_VERSION.REVISION.MODIFICATION (ADTimePix.h:20-22).
+const DRIVER_VERSION: &str = "1.6.4";
+
+/// C `calculateImgMemoryUsageMB()` before the first frame (ADTimePix.cpp:1545):
+/// the 512x512 UINT16 current frame, the 512x512 default for the two Int64 and
+/// one Int32 waveforms, plus the fixed 0.1 MB overhead.
+const INITIAL_IMG_MEMORY_MB: f64 =
+    (512.0 * 512.0 * (2.0 + 8.0 + 8.0 + 4.0)) / (1024.0 * 1024.0) + 0.1;
 
 /// The per-chip DAC names Serval takes on `/detector/chips/<n>/dacs/`
 /// (ADTimePix.cpp:1123-1147). These are on-wire names, not display names.
@@ -71,7 +87,20 @@ impl TimePix3Driver {
         max_memory: usize,
         cmd_tx: rt::CommandSender<Command>,
     ) -> AsynResult<Self> {
-        let mut ad = new_multi_addr_base(port_name, max_memory)?;
+        // ADDriver(portName, 8, ..., ASYN_MULTIDEVICE | ASYN_CANBLOCK, ...),
+        // ADTimePix.cpp:1072-1076.
+        let mut ad = ADDriverBase::new(
+            port_name,
+            MAX_ADDR,
+            0,
+            0,
+            max_memory,
+            PortFlags {
+                can_block: true,
+                multi_device: true,
+                ..Default::default()
+            },
+        )?;
         let p = TimePixParams::create(&mut ad.port_base)?;
 
         let mut driver = Self {
@@ -81,22 +110,32 @@ impl TimePix3Driver {
             shared,
             cmd_tx,
         };
-        driver.init_params(port_name)?;
+        driver.init_params()?;
         Ok(driver)
     }
 
-    /// C's constructor tail (ADTimePix.cpp:1440-1520).
-    fn init_params(&mut self, port_name: &str) -> AsynResult<()> {
+    /// C's constructor seeds (ADTimePix.cpp:1414-1553, ADTimePix3 R1-6-4).
+    /// Manufacturer and Model come from the dashboard, and the PrvHst sum
+    /// parameters from the first histogram frame or write, as in C.
+    fn init_params(&mut self) -> AsynResult<()> {
         let server = self.http.base_url().to_string();
+        let p = self.p;
+        let ad = &self.ad.params;
         let base = &mut self.ad.port_base;
-        base.set_string_param(self.ad.params.base.manufacturer, 0, "ASI")?;
-        base.set_string_param(self.ad.params.base.model, 0, "TimePix3")?;
-        base.set_string_param(self.p.server_name, 0, server)?;
-        base.set_string_param(self.ad.params.base.port_name_self, 0, port_name)?;
-        base.set_int32_param(self.p.img_frames_to_sum, 0, 10)?;
-        base.set_int32_param(self.p.img_sum_update_interval_frames, 0, 1)?;
-        base.set_int32_param(self.p.prv_hst_frames_to_sum, 0, 10)?;
-        base.set_int32_param(self.p.prv_hst_sum_update_interval, 0, 1)?;
+        base.set_string_param(ad.base.driver_version, 0, DRIVER_VERSION)?;
+        base.set_string_param(p.server_name, 0, server)?;
+        base.set_int32_param(p.img_accumulation_enable, 0, 1)?;
+        base.set_int32_param(p.prv_hst_accumulation_enable, 0, 1)?;
+        base.set_int32_param(p.img_frames_to_sum, 0, 10)?;
+        base.set_int32_param(p.img_sum_update_interval_frames, 0, 1)?;
+        base.set_int64_param(p.img_total_counts, 0, 0)?;
+        base.set_float64_param(p.img_processing_time, 0, 0.0)?;
+        base.set_float64_param(p.img_memory_usage, 0, INITIAL_IMG_MEMORY_MB)?;
+        base.set_int32_param(p.write_processed_img, 0, 0)?;
+        base.set_int32_param(p.processed_img_output_type, 0, 0)?;
+        base.set_int32_param(p.write_processed_hst, 0, 0)?;
+        base.set_int32_param(p.processed_hst_output_type, 0, 0)?;
+        base.set_int32_param(ad.num_images, 0, 0)?;
         Ok(())
     }
 
@@ -122,17 +161,29 @@ impl TimePix3Driver {
     }
 
     /// Publish the HTTP status of the last request, as C's `TPX3_HTTP_CODE`
-    /// does, and turn the failure into an asyn error.
-    fn http_failed(&mut self, what: &str, e: &HttpError) -> AsynError {
+    /// does, print the line C prints for it, and turn the failure into an
+    /// asyn error.
+    fn http_failed(&mut self, what: &str, e: &HttpError, print: HttpPrint) -> AsynError {
         let _ = self
             .ad
             .port_base
             .set_int32_param(self.p.http_code, 0, e.code());
-        let message = format!("timepix3: {what}: {e}");
-        log::error!("{message}");
+        let url = |path: &str| format!("{}{path}", self.http.base_url());
+        let line = match print {
+            HttpPrint::None => None,
+            HttpPrint::Failure(context, method, path) => {
+                adlog::http_failure(context, method, &url(path), e).map(|l| (TraceMask::ERROR, l))
+            }
+            HttpPrint::Warning(context, method, path) => {
+                adlog::http_warning(context, method, &url(path), e).map(|l| (TraceMask::WARNING, l))
+            }
+        };
+        if let Some((mask, line)) = line {
+            self.ad.port_base.trace_print(mask, &line);
+        }
         AsynError::Status {
             status: AsynStatus::Error,
-            message,
+            message: format!("timepix3: {what}: {e}"),
         }
     }
 
@@ -148,7 +199,7 @@ impl TimePix3Driver {
         let current = self
             .http
             .get_json(serval::DETECTOR_CONFIG, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("GET /detector/config", &e))?;
+            .map_err(|e| self.http_failed("GET /detector/config", &e, HttpPrint::None))?;
 
         let cfg = serval::DetectorConfig {
             trigger_mode: self.int(self.ad.params.trigger_mode, 0),
@@ -175,7 +226,7 @@ impl TimePix3Driver {
         })?;
         self.http
             .put_json(serval::DETECTOR_CONFIG, &body, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("PUT /detector/config", &e))?;
+            .map_err(|e| self.http_failed("PUT /detector/config", &e, HttpPrint::None))?;
         self.http_ok();
         Ok(())
     }
@@ -185,7 +236,7 @@ impl TimePix3Driver {
         let current = self
             .http
             .get_json(serval::MEASUREMENT_CONFIG, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("GET /measurement/config", &e))?;
+            .map_err(|e| self.http_failed("GET /measurement/config", &e, HttpPrint::None))?;
         let cfg = serval::MeasurementConfig {
             scan_width: self.int(self.p.stem_scan_width, 0),
             scan_height: self.int(self.p.stem_scan_height, 0),
@@ -199,7 +250,17 @@ impl TimePix3Driver {
         let body = serval::measurement_config_body(&current, &cfg);
         self.http
             .put_json(serval::MEASUREMENT_CONFIG, &body, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("PUT /measurement/config", &e))?;
+            .map_err(|e| {
+                self.http_failed(
+                    "PUT /measurement/config",
+                    &e,
+                    HttpPrint::Failure(
+                        "sendMeasurementConfig PUT /measurement/config",
+                        "PUT",
+                        serval::MEASUREMENT_CONFIG,
+                    ),
+                )
+            })?;
         self.http_ok();
         Ok(())
     }
@@ -334,7 +395,17 @@ impl TimePix3Driver {
         })?;
         self.http
             .put_json(serval::SERVER_DESTINATION, &body, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("PUT /server/destination", &e))?;
+            .map_err(|e| {
+                self.http_failed(
+                    "PUT /server/destination",
+                    &e,
+                    HttpPrint::Failure(
+                        "sendConfiguration PUT /server/destination",
+                        "PUT",
+                        serval::SERVER_DESTINATION,
+                    ),
+                )
+            })?;
         self.http_ok();
 
         // The stream workers follow the Base PVs.
@@ -353,7 +424,7 @@ impl TimePix3Driver {
         let dest = self
             .http
             .get_json(serval::SERVER_DESTINATION, TIMEOUT_POLL)
-            .map_err(|e| self.http_failed("GET /server/destination", &e))?;
+            .map_err(|e| self.http_failed("GET /server/destination", &e, HttpPrint::None))?;
         self.http_ok();
 
         let raw = dest.get("Raw").and_then(|v| v.as_array());
@@ -396,14 +467,24 @@ impl TimePix3Driver {
             });
         }
         let path = serval::chip_dacs(chip);
-        let mut dacs = self
-            .http
-            .get_json(&path, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed(&format!("GET {path}"), &e))?;
+        let mut dacs = self.http.get_json(&path, TIMEOUT_CONFIG).map_err(|e| {
+            let context = format!("writeDac GET chip {chip}");
+            self.http_failed(
+                &format!("GET {path}"),
+                &e,
+                HttpPrint::Failure(&context, "GET", &path),
+            )
+        })?;
         dacs[name] = json!(value);
         self.http
             .put_json(&path, &dacs, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed(&format!("PUT {path}"), &e))?;
+            .map_err(|e| {
+                self.http_failed(
+                    &format!("PUT {path}"),
+                    &e,
+                    HttpPrint::Failure("writeDac PUT", "PUT", &path),
+                )
+            })?;
         self.http_ok();
         Ok(())
     }
@@ -414,9 +495,13 @@ impl TimePix3Driver {
             status: AsynStatus::Error,
             message: format!("timepix3: orientation {orientation} is not one of the eight"),
         })?;
-        self.http
-            .get(&path, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("GET /detector/layout/rotate", &e))?;
+        self.http.get(&path, TIMEOUT_CONFIG).map_err(|e| {
+            self.http_failed(
+                "GET /detector/layout/rotate",
+                &e,
+                HttpPrint::Failure("rotateLayout", "GET", &path),
+            )
+        })?;
         self.http_ok();
         self.shared.set_orientation(orientation);
         Ok(())
@@ -427,9 +512,18 @@ impl TimePix3Driver {
     fn config_load(&mut self, format: &str, path: usize, name: usize) -> AsynResult<()> {
         let file = format!("{}{}", self.text(path, 0), self.text(name, 0));
         let url = serval::config_load(format, &file);
-        self.http
-            .get(&url, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed(&format!("GET /config/load ({format})"), &e))?;
+        self.http.get(&url, TIMEOUT_CONFIG).map_err(|e| {
+            let context = if format == "dacs" {
+                "uploadDACS GET /config/load dacs"
+            } else {
+                "uploadBPC GET /config/load pixelconfig"
+            };
+            self.http_failed(
+                &format!("GET /config/load ({format})"),
+                &e,
+                HttpPrint::Failure(context, "GET", &url),
+            )
+        })?;
         self.http_ok();
         Ok(())
     }
@@ -495,13 +589,7 @@ impl TimePix3Driver {
             mask::mask_from_bpc(&geom, &bpc, &mut mask);
         } else if self.int(self.p.mask_write, 0) == 1 {
             let mut bpc = self.read_bpc()?;
-            let dropped = mask::apply_mask_to_bpc(&geom, &mask, &mut bpc);
-            if dropped > 0 {
-                log::warn!(
-                    "timepix3: {dropped} masked pixels fall outside the BPC file ({} bytes)",
-                    bpc.len()
-                );
-            }
+            mask::apply_mask_to_bpc(&geom, &mask, &mut bpc);
             self.write_mask_file(&bpc)?;
         }
 
@@ -547,9 +635,21 @@ impl TimePix3Driver {
         })?;
 
         let url = serval::config_load("pixelconfig", &format!("{dir}{name}"));
-        self.http
-            .get(&url, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("GET /config/load (pixelconfig)", &e))?;
+        self.http.get(&url, TIMEOUT_CONFIG).map_err(|e| {
+            let err = self.http_failed(
+                "GET /config/load (pixelconfig)",
+                &e,
+                HttpPrint::Failure("uploadBPC GET /config/load pixelconfig", "GET", &url),
+            );
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                &adlog::err(
+                    adlog::WRITE_BPC_FILE,
+                    "WriteBPC: uploadBPC to SERVAL failed",
+                ),
+            );
+            err
+        })?;
         self.http_ok();
         Ok(())
     }
@@ -562,10 +662,17 @@ impl TimePix3Driver {
 
         for chip in 0..geom.num_chips {
             let path = serval::chip_pixel_config(i32::try_from(chip).unwrap_or(0));
-            let reply = self
-                .http
-                .get(&path, TIMEOUT_POLL)
-                .map_err(|e| self.http_failed(&format!("GET {path}"), &e))?;
+            let reply = self.http.get(&path, TIMEOUT_POLL).map_err(|e| {
+                let err = self.http_failed(&format!("GET {path}"), &e, HttpPrint::None);
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    &adlog::err(
+                        adlog::REFRESH_PIXEL_CONFIG,
+                        &format!("chip {chip} PixelConfig GET failed: HTTP {}", e.code()),
+                    ),
+                );
+                err
+            })?;
             // Serval answers with a JSON string, or with the bare base64.
             let encoded = match serde_json::from_str::<serde_json::Value>(&reply) {
                 Ok(v) => serval::json_to_string(&v),
@@ -625,7 +732,7 @@ impl TimePix3Driver {
             self.ad
                 .port_base
                 .set_int32_param(self.p.pixel_config_match_bp_c, addr, match_code)?;
-            self.ad.port_base.params.set_int64(
+            self.ad.port_base.set_int64_param(
                 self.p.pixel_config_mismatch_bytes,
                 addr,
                 mismatch,
@@ -686,11 +793,21 @@ impl TimePix3Driver {
         let measurement = self
             .http
             .get_json(serval::MEASUREMENT, TIMEOUT_POLL)
-            .map_err(|e| self.http_failed("GET /measurement", &e))?;
+            .map_err(|e| self.http_failed("GET /measurement", &e, HttpPrint::None))?;
         if serval::measurement_is_running(&measurement) {
             self.http
                 .get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
-                .map_err(|e| self.http_failed("GET /measurement/stop", &e))?;
+                .map_err(|e| {
+                    self.http_failed(
+                        "GET /measurement/stop",
+                        &e,
+                        HttpPrint::Warning(
+                            "acquireStart stop prior measurement",
+                            "GET",
+                            serval::MEASUREMENT_STOP,
+                        ),
+                    )
+                })?;
         }
 
         self.init_acquisition()?;
@@ -699,7 +816,17 @@ impl TimePix3Driver {
 
         self.http
             .get(serval::MEASUREMENT_START, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("GET /measurement/start", &e))?;
+            .map_err(|e| {
+                self.http_failed(
+                    "GET /measurement/start",
+                    &e,
+                    HttpPrint::Failure(
+                        "acquireStart GET /measurement/start",
+                        "GET",
+                        serval::MEASUREMENT_START,
+                    ),
+                )
+            })?;
         self.http_ok();
 
         self.cmd_tx
@@ -714,49 +841,21 @@ impl TimePix3Driver {
     fn acquire_stop(&mut self) -> AsynResult<()> {
         self.http
             .get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
-            .map_err(|e| self.http_failed("GET /measurement/stop", &e))?;
+            .map_err(|e| {
+                self.http_failed(
+                    "GET /measurement/stop",
+                    &e,
+                    HttpPrint::Failure(
+                        "acquireStop GET /measurement/stop",
+                        "GET",
+                        serval::MEASUREMENT_STOP,
+                    ),
+                )
+            })?;
         self.http_ok();
         let _ = self.cmd_tx.try_send(Command::AcquisitionStopped);
         Ok(())
     }
-}
-
-/// `ADDriverBase::new` builds its port with `max_addr = 1` and
-/// `multi_device = false`; ADTimePix3 is an `ASYN_MULTIDEVICE` port with
-/// `maxAddr = 8` (ADTimePix.cpp:1069), so the base is assembled here from the
-/// same public pieces.
-fn new_multi_addr_base(port_name: &str, max_memory: usize) -> AsynResult<ADDriverBase> {
-    let mut port_base = PortDriverBase::new(
-        port_name,
-        MAX_ADDR,
-        PortFlags {
-            can_block: true,
-            multi_device: true,
-            ..Default::default()
-        },
-    );
-    let params = ADDriverParams::create(&mut port_base)?;
-    port_base.set_string_param(params.base.port_name_self, 0, port_name)?;
-    port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
-    port_base.set_float64_param(
-        params.base.pool_max_memory,
-        0,
-        max_memory as f64 / 1_048_576.0,
-    )?;
-    port_base.set_int32_param(params.image_mode, 0, 0)?;
-    port_base.set_int32_param(params.num_images, 0, 1)?;
-    port_base.set_float64_param(params.acquire_time, 0, 1.0)?;
-    port_base.set_float64_param(params.acquire_period, 0, 1.0)?;
-
-    Ok(ADDriverBase {
-        port_base,
-        params,
-        pool: NDArrayPool::new(max_memory),
-        array_output: NDArrayOutput::new(),
-        queued_counter: Arc::new(QueuedArrayCounter::new()),
-        last_array: None,
-        attributes: Default::default(),
-    })
 }
 
 impl PortDriver for TimePix3Driver {
@@ -773,7 +872,7 @@ impl PortDriver for TimePix3Driver {
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
 
-        self.ad.port_base.params.set_int32(reason, addr, value)?;
+        self.ad.port_base.set_int32_param(reason, addr, value)?;
 
         let p = self.p;
         let result = if reason == self.ad.params.acquire {
@@ -923,7 +1022,26 @@ impl PortDriver for TimePix3Driver {
         // the readbacks (and, for ADAcquire, the latched Acquire=1) are never
         // refreshed after a failed write and the operator sees the detector as
         // acquiring when it is not.
-        self.ad.port_base.call_param_callbacks(addr)?;
+        let _ = self.ad.port_base.call_param_callbacks(addr);
+        match &result {
+            Err(e) => self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                &adlog::err(
+                    adlog::WRITE_INT32,
+                    &format!(
+                        "ERROR status={} function={reason}, value={value}",
+                        e.status() as i32
+                    ),
+                ),
+            ),
+            Ok(()) => self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                &adlog::log(
+                    adlog::WRITE_INT32,
+                    &format!("function={reason} value={value}"),
+                ),
+            ),
+        }
         result
     }
 
@@ -936,7 +1054,7 @@ impl PortDriver for TimePix3Driver {
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
 
-        self.ad.port_base.params.set_float64(reason, addr, value)?;
+        self.ad.port_base.set_float64_param(reason, addr, value)?;
 
         let p = self.p;
         let result = if reason == self.ad.params.acquire_time
@@ -954,7 +1072,26 @@ impl PortDriver for TimePix3Driver {
             Ok(())
         };
 
-        self.ad.port_base.call_param_callbacks(addr)?;
+        let _ = self.ad.port_base.call_param_callbacks(addr);
+        match &result {
+            Err(e) => self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                &adlog::err(
+                    adlog::WRITE_FLOAT64,
+                    &format!(
+                        "ERROR status = {}, function ={reason}, value = {value:.6}",
+                        e.status() as i32
+                    ),
+                ),
+            ),
+            Ok(()) => self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                &adlog::log(
+                    adlog::WRITE_FLOAT64,
+                    &format!("function={reason} value={value:.6}"),
+                ),
+            ),
+        }
         result
     }
 
@@ -962,7 +1099,7 @@ impl PortDriver for TimePix3Driver {
         let reason = user.reason;
         let addr = user.addr;
         let value = String::from_utf8_lossy(data).into_owned();
-        self.ad.port_base.params.set_string(reason, addr, value)?;
+        self.ad.port_base.set_string_param(reason, addr, value)?;
 
         let p = self.p;
         // A path PV's "does it exist" readback (C `checkBPCPath`,
@@ -989,6 +1126,17 @@ impl PortDriver for TimePix3Driver {
         // parameter library and discards it — the record never shows the
         // failure. The status is left to the return value here.
         self.ad.port_base.call_param_callbacks(addr)?;
+        let name = self.ad.port_base.params.param_name(reason).unwrap_or("");
+        // C prints the value as the `char *` it was handed: up to the NUL.
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let value = String::from_utf8_lossy(&data[..end]);
+        self.ad.port_base.trace_print(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                adlog::WRITE_OCTET,
+                &format!("function={reason}, paramName={name}, value={value}"),
+            ),
+        );
         Ok(data.len())
     }
 

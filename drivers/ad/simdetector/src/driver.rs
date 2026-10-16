@@ -2,11 +2,14 @@
 
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
@@ -46,7 +49,8 @@ impl SimDetector {
         start_tx: rt::CommandSender<Signal>,
         stop_tx: rt::CommandSender<Signal>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad =
+            ADDriverBase::new(port_name, 1, max_size_x, max_size_y, max_memory, ASYN_NONE)?;
         let sim = SimParams::create(&mut ad.port_base)?;
 
         let p = ad.params;
@@ -130,6 +134,11 @@ impl PortDriver for SimDetector {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     /// `simDetector::writeInt32` (simDetector.cpp:891-957).
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
@@ -174,10 +183,10 @@ impl PortDriver for SimDetector {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(reason, user.addr, value)?;
+                .set_int32_param(reason, user.addr, value)?;
         }
 
+        let mut status = Ok(());
         if reason == p.acquire {
             if value != 0 && !acquiring {
                 let _ = self.start_tx.try_send(Signal);
@@ -186,42 +195,77 @@ impl PortDriver for SimDetector {
                 let _ = self.stop_tx.try_send(Signal);
             }
         } else if sim.int32_write_dirties_image(reason, &p) {
-            self.ad.port_base.set_int32_param(sim.reset_image, 0, 1)?;
+            status = self.ad.port_base.set_int32_param(sim.reset_image, 0, 1);
         } else if !sim.owns(reason) {
             // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
-            if reason == p.shutter_control {
-                self.set_shutter(value != 0)?;
+            status = if reason == p.shutter_control {
+                self.set_shutter(value != 0)
             } else {
-                self.ad.write_int32_pool(reason, value)?;
-            }
+                self.ad.write_int32_pool(reason, value).map(drop)
+            };
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "simDetector:writeInt32 error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("simDetector:writeInt32: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 
     /// `simDetector::writeFloat64` (simDetector.cpp:965-993).
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         if self
             .sim
             .float64_write_dirties_image(reason, self.ad.params.gain)
         {
-            self.ad
+            status = self
+                .ad
                 .port_base
-                .set_int32_param(self.sim.reset_image, 0, 1)?;
+                .set_int32_param(self.sim.reset_image, 0, 1);
         }
         // Otherwise C calls `ADDriver::writeFloat64`, which neither ADDriver nor
         // asynNDArrayDriver override: asynPortDriver::writeFloat64 only sets the
         // parameter (done above) and fires callbacks (done below).
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "simDetector:writeFloat64 error, status={} function={reason}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("simDetector:writeFloat64: function={reason}, value={value:.6}"),
+            ),
+        }
+        status
     }
 }
 
@@ -272,13 +316,14 @@ impl SimDetectorRuntime {
 /// allocate. `ad-core-rs` 0.22.1's `NDArrayPool` is bounded by `maxMemory`
 /// only, so `max_buffers` is accepted for iocsh signature parity and ignored.
 pub fn create_sim_detector(
-    port_name: &str,
+    claim: &PortClaim,
     max_size_x: i32,
     max_size_y: i32,
     data_type: NDDataType,
     _max_buffers: i32,
     max_memory: usize,
 ) -> AsynResult<SimDetectorRuntime> {
+    let port_name = claim.name();
     let (start_tx, start_rx) = rt::command_channel::<Signal>(1);
     let (stop_tx, stop_rx) = rt::command_channel::<Signal>(1);
 
@@ -294,7 +339,7 @@ pub fn create_sim_detector(
     // ownership of it and the IOC still needs to attach plugin senders.
     let queued_counter = det.ad.queued_counter.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
     let task_handle = start_sim_task(SimTaskContext {
@@ -364,6 +409,29 @@ mod tests {
                 .set_int32_param(self.det.sim.reset_image, 0, 0)
                 .unwrap();
         }
+    }
+
+    /// simDetector inherits `asynNDArrayDriver::writeOctet`, so an
+    /// `NDAttributesFile` write loads the set and a `FilePath` write runs
+    /// `checkPath`.
+    #[test]
+    fn octet_writes_reach_the_asyn_nd_array_driver_branches() {
+        let mut f = Fixture::new();
+        let p = f.det.ad.params.base;
+        let xml = br#"<Attributes><Attribute name="G" type="PARAM" source="GAIN" datatype="DOUBLE"/></Attributes>"#;
+        f.det
+            .write_octet(&mut AsynUser::new(p.attributes_file), xml)
+            .unwrap();
+        assert_eq!(f.get_i32(p.attributes_status), 0);
+
+        let dir = std::env::temp_dir();
+        f.det
+            .write_octet(
+                &mut AsynUser::new(p.file_path),
+                dir.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(f.get_i32(p.file_path_exists), 1);
     }
 
     #[test]

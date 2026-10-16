@@ -4,6 +4,7 @@ use std::time::Duration;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
@@ -13,8 +14,8 @@ use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
-use crate::decode::decode_image;
-use crate::fetch::fetch_bytes;
+use crate::decode::{DecodeError, decode_image};
+use crate::fetch::{FetchError, fetch_bytes};
 use crate::params::URLParams;
 use crate::types::AcqCommand;
 
@@ -113,17 +114,34 @@ async fn acquire_one_image(
         .unwrap_or_default();
     let url_string = String::from_utf8_lossy(&url_bytes).into_owned();
 
+    // readImage's own lines (URLDriver.cpp:105,126,152); an empty URL returns
+    // asynError without one.
     let decoded = fetch_bytes(&url_string)
-        .map_err(|e| log::error!("ad-url: fetch {url_string}: {e}"))
-        .ok()
+        .map_err(|e| match e {
+            FetchError::EmptyUrl => None,
+            e => Some(format!("error reading URL={e}")),
+        })
         .and_then(|bytes| {
-            decode_image(&bytes)
-                .map_err(|e| log::error!("ad-url: decode {url_string}: {e}"))
-                .ok()
+            decode_image(&bytes).map_err(|e| {
+                Some(match e {
+                    DecodeError::Unsupported(t) => format!("unknown ImageType={t}"),
+                    e => format!("error reading URL={e}"),
+                })
+            })
         });
 
-    let Some(decoded) = decoded else {
-        return Err(());
+    let decoded = match decoded {
+        Ok(decoded) => decoded,
+        Err(message) => {
+            if let Some(message) = message {
+                ctx.handle.trace().output(
+                    ctx.handle.port_name(),
+                    TraceMask::ERROR,
+                    &format!("URLDriver:readImage: {message}"),
+                );
+            }
+            return Err(());
+        }
     };
 
     // C++ readImage(): ADSizeX/NDArraySizeX use dims[ndims-2] (X), ADSizeY/
@@ -232,13 +250,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             )
             .await;
 
-        let mut image_counter = ctx
-            .handle
-            .read_int32(ctx.ad.base.array_counter, 0)
-            .await
-            .unwrap_or(0);
-        let mut num_images_counter = 0i32;
-
         loop {
             let start_time = EpicsTimestamp::now();
             let acquire_period = ctx
@@ -262,18 +273,23 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             set_shutter_via_handle(&ctx.handle, &ctx.ad, true).await;
             let _ = ctx.handle.call_param_callbacks(0).await;
 
-            image_counter += 1;
-            num_images_counter += 1;
+            // C re-reads both counters every frame (URLDriver.cpp:231-233), so a
+            // write to either during acquisition is where the next frame counts
+            // from. acquire_one_image stores them only on success, as C does.
+            let image_counter = ctx
+                .handle
+                .read_int32(ctx.ad.base.array_counter, 0)
+                .await
+                .unwrap_or(0)
+                + 1;
+            let num_images_counter = ctx
+                .handle
+                .read_int32(ctx.ad.num_images_counter, 0)
+                .await
+                .unwrap_or(0)
+                + 1;
             let image_result =
                 acquire_one_image(&ctx, start_time, image_counter, num_images_counter).await;
-
-            if image_result.is_err() {
-                // Failed fetch/decode: this iteration's counters didn't advance
-                // (matches C++, which only increments NDArrayCounter/
-                // ADNumImagesCounter inside the `imageStatus == asynSuccess` branch).
-                image_counter -= 1;
-                num_images_counter -= 1;
-            }
 
             set_shutter_via_handle(&ctx.handle, &ctx.ad, false).await;
             let _ = ctx.handle.call_param_callbacks(0).await;

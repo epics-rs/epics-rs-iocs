@@ -5,7 +5,7 @@
 use std::io::Read;
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
@@ -14,18 +14,21 @@ use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::interrupt::InterruptValue;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::{ParamSetValue, RequestOp};
-use epics_rs::asyn::user::AsynUser;
+use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 use serde_json::Value;
 
 use crate::accum::Update;
+use crate::adlog;
 use crate::http::{ServalHttp, TIMEOUT_POLL};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Shared};
-use crate::stream::{Channel, Frame, FrameDecoder, parse_tcp_path};
+use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, parse_tcp_path};
 
 /// C's `connectionPollPeriodSec_` (ADTimePix.cpp:1471).
 const CONNECTION_POLL: Duration = Duration::from_secs(5);
@@ -57,9 +60,13 @@ pub struct Ctx {
 
 impl Ctx {
     async fn set(&self, addr: i32, updates: Vec<ParamSetValue>) {
-        if let Err(e) = self.handle.set_params_and_notify(addr, updates).await {
-            log::error!("timepix3: parameter update failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify(addr, updates).await;
+    }
+
+    fn trace(&self, mask: TraceMask, line: &str) {
+        self.handle
+            .trace()
+            .output(self.handle.port_name(), mask, line);
     }
 
     async fn set_int(&self, reason: usize, addr: i32, value: i32) {
@@ -70,30 +77,28 @@ impl Ctx {
         .await;
     }
 
-    /// `PortHandle` has no `Int64` parameter setter, so the request goes in
-    /// directly; the driver's default `write_int64` stores it and fires the
-    /// callbacks, which is exactly C's `setInteger64Param` +
-    /// `callParamCallbacks`.
+    /// C `setInteger64Param` + `callParamCallbacks`.
     async fn set_int64(&self, reason: usize, addr: i32, value: i64) {
-        let user = AsynUser::new(reason).with_addr(addr);
-        if let Err(e) = self
-            .handle
-            .submit_async(RequestOp::Int64Write { value }, user)
-            .await
-        {
-            log::error!("timepix3: int64 parameter update failed: {e}");
-        }
+        self.set(
+            addr,
+            vec![ParamSetValue::new(reason, addr, ParamValue::Int64(value))],
+        )
+        .await;
     }
 
-    async fn set_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
-        let user = AsynUser::new(reason).with_addr(addr);
-        if let Err(e) = self
-            .handle
-            .submit_async(RequestOp::Int64ArrayWrite { data }, user)
-            .await
-        {
-            log::error!("timepix3: int64 array update failed: {e}");
-        }
+    /// C `doCallbacksInt64Array` from the stream threads (serval_stream.cpp:975,
+    /// histogram_io.cpp:541/605): the array goes to the asynInt64Array
+    /// subscribers only, is not stored, and is not gated on interruptAccept
+    /// (asynPortDriver.cpp:1829-1866).
+    fn post_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
+        self.handle.interrupts().notify(InterruptValue {
+            reason,
+            addr,
+            value: ParamValue::Int64Array(data.into()),
+            timestamp: SystemTime::now(),
+            iface: Some(InterfaceType::Int64Array),
+            ..Default::default()
+        });
     }
 }
 
@@ -147,9 +152,7 @@ async fn connection_poll(
         match command {
             Command::AcquisitionStarted => {
                 ctx.shared.set_acquiring(true);
-                if acq_tx.try_send(()).is_err() {
-                    log::error!("timepix3: the acquisition poll is not running");
-                }
+                let _ = acq_tx.try_send(());
                 continue;
             }
             Command::AcquisitionStopped => {
@@ -232,6 +235,7 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
         ));
     }
     if let Ok(dashboard) = &reply {
+        serval_version(ctx, dashboard, &mut updates);
         disk_space(ctx, dashboard, &mut updates);
     }
     ctx.set(0, updates).await;
@@ -240,6 +244,31 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
 
 /// The first disk in `Server.DiskSpace`, which is empty until raw file writing
 /// is configured (C getDashboard, serval_http.cpp:388).
+/// C `updateServalVersionFromDashboard` (serval_http.cpp:133).
+fn serval_version(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
+    let Some(server) = dashboard.get("Server").filter(|s| s.is_object()) else {
+        return;
+    };
+    let mut octet = |reason: usize, v: &str| {
+        updates.push(ParamSetValue::new(
+            reason,
+            0,
+            ParamValue::Octet(v.as_bytes().to_vec().into()),
+        ));
+    };
+    if let Some(ver) = server.get("SoftwareVersion").map(serval::json_to_string)
+        && !ver.is_empty()
+    {
+        octet(ctx.ad.base.sdk_version, &ver);
+        octet(ctx.ad.base.manufacturer, "ASI");
+    }
+    if let Some(ts) = server.get("SoftwareTimestamp").map(serval::json_to_string)
+        && !ts.is_empty()
+    {
+        octet(ctx.p.fw_time_stamp, &ts);
+    }
+}
+
 fn disk_space(ctx: &Arc<Ctx>, dashboard: &Value, updates: &mut Vec<ParamSetValue>) {
     let p = ctx.p;
     let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") else {
@@ -265,21 +294,23 @@ fn as_bool_or_int(v: &Value) -> Option<i32> {
 async fn refresh_detector(ctx: &Arc<Ctx>) {
     let p = ctx.p;
 
-    if let Ok(dashboard) = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL)
-        && let Some(disk) = dashboard.pointer("/Server/DiskSpace/0")
-    {
-        if let Some(v) = disk.get("FreeSpace").and_then(Value::as_i64) {
-            ctx.set_int64(p.free_space, 0, v).await;
-        }
-        if let Some(v) = disk.get("LowerLimit").and_then(Value::as_i64) {
-            ctx.set_int64(p.lower_limit, 0, v).await;
+    if let Ok(dashboard) = ctx.http.get_json(serval::DASHBOARD, TIMEOUT_POLL) {
+        let mut updates = Vec::new();
+        serval_version(ctx, &dashboard, &mut updates);
+        ctx.set(0, updates).await;
+        if let Some(disk) = dashboard.pointer("/Server/DiskSpace/0") {
+            if let Some(v) = disk.get("FreeSpace").and_then(Value::as_i64) {
+                ctx.set_int64(p.free_space, 0, v).await;
+            }
+            if let Some(v) = disk.get("LowerLimit").and_then(Value::as_i64) {
+                ctx.set_int64(p.lower_limit, 0, v).await;
+            }
         }
     }
 
     let detector = match ctx.http.get_json(serval::DETECTOR, TIMEOUT_POLL) {
         Ok(d) => d,
-        Err(e) => {
-            log::warn!("timepix3: GET /detector: {e}");
+        Err(_) => {
             ctx.set_int(p.det_connected, 0, 0).await;
             return;
         }
@@ -631,57 +662,57 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
         )
         .await;
 
+        // C's first GET and its in-loop polls print different lines.
+        let mut first = true;
         while ctx.shared.acquiring() {
-            match ctx.http.get_json(serval::MEASUREMENT, TIMEOUT_POLL) {
-                Ok(m) => {
-                    let mut updates = Vec::new();
-                    if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
-                        updates.push(ParamSetValue::new(
-                            p.status,
-                            0,
-                            ParamValue::Octet(v.as_bytes().into()),
-                        ));
-                    }
-                    for (ptr, reason) in [
-                        ("/Info/ElapsedTime", p.elapsed_time),
-                        ("/Info/TimeLeft", p.time_left),
-                        ("/Info/PixelEventRate", p.pel_rate),
-                        ("/Info/TdcEventRate", p.tdc1_rate),
-                    ] {
-                        if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
-                            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
-                        }
-                    }
-                    for (ptr, reason) in [
-                        ("/Info/FrameCount", p.frame_count),
-                        ("/Info/DroppedFrames", p.dropped_frames),
-                    ] {
-                        if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
-                            updates.push(ParamSetValue::new(
-                                reason,
-                                0,
-                                ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
-                            ));
-                        }
-                    }
-                    if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
-                        updates.push(ParamSetValue::new(
-                            p.start_time,
-                            0,
-                            ParamValue::Octet(v.as_bytes().into()),
-                        ));
-                    }
-                    ctx.set(0, updates).await;
-
-                    if !serval::measurement_is_running(&m) {
-                        break;
+            // A failed poll is retried after the sleep. UPSTREAM DEFECT
+            // (acquire.cpp:514-518): C `continue`s on an HTTP error without
+            // sleeping, so a Serval that goes away mid-acquisition leaves this
+            // thread spinning at 100% CPU.
+            let polled = poll_measurement(&ctx, first);
+            first = false;
+            if let Some(m) = polled {
+                let mut updates = Vec::new();
+                if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
+                    updates.push(ParamSetValue::new(
+                        p.status,
+                        0,
+                        ParamValue::Octet(v.as_bytes().into()),
+                    ));
+                }
+                for (ptr, reason) in [
+                    ("/Info/ElapsedTime", p.elapsed_time),
+                    ("/Info/TimeLeft", p.time_left),
+                    ("/Info/PixelEventRate", p.pel_rate),
+                    ("/Info/TdcEventRate", p.tdc1_rate),
+                ] {
+                    if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
+                        updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
                     }
                 }
-                Err(e) => {
-                    // UPSTREAM DEFECT (acquire.cpp:514-518): C `continue`s on an
-                    // HTTP error without sleeping, so a Serval that goes away
-                    // mid-acquisition leaves this thread spinning at 100% CPU.
-                    log::warn!("timepix3: GET /measurement: {e}");
+                for (ptr, reason) in [
+                    ("/Info/FrameCount", p.frame_count),
+                    ("/Info/DroppedFrames", p.dropped_frames),
+                ] {
+                    if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
+                        updates.push(ParamSetValue::new(
+                            reason,
+                            0,
+                            ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
+                        ));
+                    }
+                }
+                if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
+                    updates.push(ParamSetValue::new(
+                        p.start_time,
+                        0,
+                        ParamValue::Octet(v.as_bytes().into()),
+                    ));
+                }
+                ctx.set(0, updates).await;
+
+                if !serval::measurement_is_running(&m) {
+                    break;
                 }
             }
             tokio::time::sleep(ACQUISITION_POLL).await;
@@ -696,6 +727,38 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
             ],
         )
         .await;
+    }
+}
+
+/// One `GET /measurement`, printing C `timePixCallback`'s line for a failure.
+fn poll_measurement(ctx: &Ctx, first: bool) -> Option<Value> {
+    match ctx.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
+        Ok(body) => serde_json::from_str(&body)
+            .inspect_err(|e| {
+                let what = if first { "measurement" } else { "poll" };
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &adlog::err(
+                        adlog::TIME_PIX_CALLBACK,
+                        &format!("timePixCallback: {what} JSON parse failed: {e}"),
+                    ),
+                );
+            })
+            .ok(),
+        Err(e) => {
+            let url = format!("{}{}", ctx.http.base_url(), serval::MEASUREMENT);
+            let line = if first {
+                adlog::http_failure("timePixCallback GET /measurement", "GET", &url, &e)
+                    .map(|l| (TraceMask::ERROR, l))
+            } else {
+                adlog::http_warning("timePixCallback poll GET /measurement", "GET", &url, &e)
+                    .map(|l| (TraceMask::WARNING, l))
+            };
+            if let Some((mask, line)) = line {
+                ctx.trace(mask, &line);
+            }
+            None
+        }
     }
 }
 
@@ -716,6 +779,33 @@ impl StreamKind {
         match self {
             Self::PrvHst => Channel::Histogram,
             _ => Channel::Image,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::PrvImg => "PrvImg",
+            Self::Img => "Img",
+            Self::PrvHst => "PrvHst",
+        }
+    }
+
+    /// The C functions whose `__PRETTY_FUNCTION__` the image channels' asyn
+    /// lines carry: connect, worker thread, header parse. C's PrvHst code
+    /// prints with `printf`/`fprintf` instead, so it has none.
+    fn c_functions(self) -> Option<[&'static str; 3]> {
+        match self {
+            Self::PrvImg => Some([
+                "void ADTimePix::prvImgConnect()",
+                "void ADTimePix::prvImgWorkerThread()",
+                "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)",
+            ]),
+            Self::Img => Some([
+                "void ADTimePix::imgConnect()",
+                "void ADTimePix::imgWorkerThread()",
+                "bool ADTimePix::processImgDataLine(char*, char*, size_t)",
+            ]),
+            Self::PrvHst => None,
         }
     }
 
@@ -752,20 +842,38 @@ async fn stream_worker(ctx: Arc<Ctx>, kind: StreamKind) {
             continue;
         };
 
+        let name = kind.name();
+        if kind.c_functions().is_none() {
+            println!("PrvHst worker thread: Attempting to connect to {host}:{port}");
+        }
         let stream = match TcpStream::connect((host.as_str(), port)) {
             Ok(s) => s,
-            Err(e) => {
-                log::warn!("timepix3: {kind:?}: connecting to {host}:{port}: {e}");
+            Err(_) => {
+                let msg = format!("{name} TCP failed to connect to {host}:{port}");
+                match kind.c_functions() {
+                    Some([connect, ..]) => ctx.trace(TraceMask::ERROR, &adlog::err(connect, &msg)),
+                    None => {
+                        eprintln!("ERROR | ADTimePix::prvHstConnect: {msg}");
+                        println!(
+                            "PrvHst worker thread: Connection failed, will retry in {:.1} seconds",
+                            RECONNECT_WAIT.as_secs_f64()
+                        );
+                    }
+                }
                 tokio::time::sleep(RECONNECT_WAIT).await;
                 continue;
             }
         };
-        if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
-            log::warn!("timepix3: {kind:?}: cannot set the read timeout: {e}");
+        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+        let msg = format!("{name} TCP connected to {host}:{port}");
+        match kind.c_functions() {
+            Some([connect, ..]) => ctx.trace(TraceMask::IO_DRIVER, &adlog::log(connect, &msg)),
+            None => {
+                println!("{msg}");
+                println!("PrvHst worker thread: Connection successful, starting data reception");
+            }
         }
-        log::info!("timepix3: {kind:?} stream connected to {host}:{port}");
         read_stream(&ctx, kind, stream).await;
-        log::info!("timepix3: {kind:?} stream closed");
     }
 }
 
@@ -775,12 +883,21 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
 
     while ctx.shared.acquiring() {
         match stream.read(&mut buf) {
-            Ok(0) => return, // The peer closed the stream.
+            Ok(0) => {
+                println!("{} TCP connection closed by peer", kind.name());
+                return;
+            }
             Ok(n) => decoder.push(&buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                log::warn!("timepix3: {kind:?}: read: {e}");
+                let msg = format!("{} TCP socket error: {}", kind.name(), strerror(&e));
+                match kind.c_functions() {
+                    Some([_, worker, _]) => {
+                        ctx.trace(TraceMask::IO_DRIVER, &adlog::log(worker, &msg))
+                    }
+                    None => println!("{msg}"),
+                }
                 return;
             }
         }
@@ -792,11 +909,59 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
                 Err(e) => {
                     // The payload length is unknown, so the stream cannot be
                     // resynchronised: drop the connection and start over.
-                    log::error!("timepix3: {kind:?}: {e}");
+                    decode_failed(ctx, kind, &e);
                     return;
                 }
             }
         }
+    }
+}
+
+/// The line C prints for a header it cannot use.
+fn decode_failed(ctx: &Ctx, kind: StreamKind, e: &DecodeError) {
+    match (kind.c_functions(), e) {
+        (Some([_, worker, _]), DecodeError::NoNewline) => ctx.trace(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                worker,
+                &format!(
+                    "{} TCP buffer full without finding newline, resetting",
+                    kind.name()
+                ),
+            ),
+        ),
+        (None, DecodeError::NoNewline) => {
+            println!("PrvHst TCP buffer full without finding newline, resetting");
+        }
+        (Some([_, _, line]), DecodeError::Json(m)) => ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(line, &format!("JSON parse error: {m}")),
+        ),
+        (None, DecodeError::Json(m)) => {
+            eprintln!("ERROR | ADTimePix::processPrvHstDataLine: JSON parse error in PrvHst: {m}");
+        }
+        (Some([_, _, line]), DecodeError::Dimensions(w, h)) => ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(
+                line,
+                &format!("Invalid image dimensions: width={w}, height={h}"),
+            ),
+        ),
+        (None, DecodeError::BinSize(n)) => {
+            eprintln!("ERROR | ADTimePix::processPrvHstDataLine: Invalid bin size: {n}");
+        }
+        // C's `int` product wraps instead; and each channel's decoder only
+        // produces its own header's errors.
+        _ => {}
+    }
+}
+
+/// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(end) => text[..end].to_string(),
+        None => text,
     }
 }
 
@@ -820,7 +985,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ],
             )
             .await;
-            publish_image(ctx, f.width, f.height, f.pixels).await;
+            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
         }
         (StreamKind::Img, Frame::Image(f)) => {
             let p = ctx.p;
@@ -866,7 +1031,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ADDR,
             )
             .await;
-            publish_image(ctx, f.width, f.height, f.pixels).await;
+            publish_image(ctx, f.frame_number, f.width, f.height, f.pixels).await;
         }
         (StreamKind::PrvHst, Frame::Histogram(h)) => {
             let p = ctx.p;
@@ -944,9 +1109,8 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             )
             .await;
         }
-        // The decoder is created for the channel, so this cannot happen; a
-        // mismatch means the channel's Format PV disagrees with the port.
-        (kind, _) => log::error!("timepix3: {kind:?}: the stream carries the wrong frame type"),
+        // The decoder is created for the channel, so this cannot happen.
+        _ => {}
     }
 }
 
@@ -958,7 +1122,7 @@ async fn publish_accumulation(
     sum_n_param: usize,
     sum_n_addr: i32,
 ) {
-    ctx.set_int64_array(
+    ctx.post_int64_array(
         sum_param,
         sum_addr,
         update
@@ -966,23 +1130,28 @@ async fn publish_accumulation(
             .iter()
             .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
             .collect(),
-    )
-    .await;
+    );
     if let Some(sum_n) = &update.sum_n {
-        ctx.set_int64_array(
+        ctx.post_int64_array(
             sum_n_param,
             sum_n_addr,
             sum_n
                 .iter()
                 .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
                 .collect(),
-        )
-        .await;
+        );
     }
 }
 
-/// Push a preview frame down the plugin chain as an NDArray.
-async fn publish_image(ctx: &Arc<Ctx>, width: usize, height: usize, pixels: Vec<u32>) {
+/// Push a preview frame down the plugin chain as an NDArray. C stamps it with
+/// Serval's `frameNumber`, not NDArrayCounter (serval_stream.cpp:604, :1467).
+async fn publish_image(
+    ctx: &Arc<Ctx>,
+    frame_number: i32,
+    width: usize,
+    height: usize,
+    pixels: Vec<u32>,
+) {
     if ctx
         .handle
         .read_int32(ctx.ad.base.array_callbacks, 0)
@@ -1012,7 +1181,7 @@ async fn publish_image(ctx: &Arc<Ctx>, width: usize, height: usize, pixels: Vec<
         vec![NDDimension::new(width), NDDimension::new(height)],
         NDDataBuffer::U32(pixels),
     );
-    array.unique_id = counter;
+    array.unique_id = frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
     array.attributes = attributes;
@@ -1064,11 +1233,112 @@ mod tests {
         assert_eq!(r[3], (0.0, 0.0));
     }
 
+    #[tokio::test]
+    async fn preview_sums_reach_io_intr_subscribers() {
+        use epics_rs::asyn::interrupt::InterruptFilter;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        // The port's interruptAccept is never opened: C's doCallbacksArray
+        // does not consult it.
+        let driver =
+            crate::driver::TimePix3Driver::new("TPXT", http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXT").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        let ctx = Ctx {
+            handle: handle.clone(),
+            http,
+            shared,
+            p,
+            ad,
+            output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+        };
+
+        let (_sub, mut rx) = handle.interrupts().register_interrupt_user(
+            InterruptFilter {
+                reason: Some(p.prv_hst_histogram_data),
+                ..Default::default()
+            },
+            1024,
+        );
+        ctx.post_int64_array(p.prv_hst_histogram_data, 0, vec![3, 1, 4]);
+        let v = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no callback")
+            .unwrap();
+        let ParamValue::Int64Array(a) = v.value else {
+            panic!("expected an Int64Array, got {:?}", v.value);
+        };
+        assert_eq!(&a[..], [3, 1, 4]);
+        assert_eq!(v.iface, Some(InterfaceType::Int64Array));
+    }
+
     #[test]
     fn adjust_reports_the_shape() {
         assert_eq!(adjust_code(&json!({})), -1);
         assert_eq!(adjust_code(&json!({"Adjust": null})), -1);
         assert_eq!(adjust_code(&json!({"Adjust": [1, 2]})), -2);
         assert_eq!(adjust_code(&json!({"Adjust": 7})), -3);
+    }
+
+    #[tokio::test]
+    async fn an_image_carries_the_serval_frame_number() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let driver =
+            crate::driver::TimePix3Driver::new("TPXUID", http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXUID").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let mut output = NDArrayOutput::new();
+        let (tx, mut rx) = ndarray_channel("TPXUID_SINK", 4);
+        output.add(tx);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            output: Arc::new(parking_lot::Mutex::new(output)),
+        });
+        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+
+        for (kind, frame_number) in [(StreamKind::PrvImg, 41), (StreamKind::Img, 97)] {
+            let frame = Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number,
+                time_at_frame: 0.0,
+                pixels: vec![1, 2],
+            });
+            handle_frame(&ctx, kind, frame).await;
+            let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no array")
+                .unwrap();
+            assert_eq!(array.unique_id, frame_number);
+        }
+        std::mem::forget(runtime);
     }
 }

@@ -6,16 +6,18 @@
 //! — reach the parameter library through the actor and never call into the
 //! driver directly (see the invariant in [`crate::connection`]).
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode, ShutterMode};
@@ -70,7 +72,8 @@ impl BrukerDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, MAX_SIZE, MAX_SIZE, max_memory)?;
+        let mut ad =
+            ADDriverBase::new(port_name, 1, MAX_SIZE, MAX_SIZE, max_memory, ASYN_CANBLOCK)?;
         let params = BrukerParams::create(&mut ad.port_base)?;
         let p = ad.params;
 
@@ -102,14 +105,24 @@ impl BrukerDetector {
         Ok(det)
     }
 
-    /// Send one command; publish both sides of it (C `writeBIS`).
-    fn command(&mut self, command: &str, timeout: std::time::Duration) -> AsynResult<()> {
+    /// Send one command; publish both sides of it (C `writeBIS`). No caller
+    /// of C's `writeBIS` looks at its status: a failure is the trace line.
+    fn command(&mut self, command: &str, timeout: std::time::Duration) {
         let exchange = self.server.command(command, timeout);
+        if let Err(e) = exchange.result {
+            self.trace_error(&format!(
+                "BISDetector:writeBIS, status={}, sent\n{command}",
+                e.status() as i32
+            ));
+        }
         let p = self.ad.params;
         let base = &mut self.ad.port_base;
-        base.set_string_param(p.string_to_server, 0, command)?;
-        base.set_string_param(p.string_from_server, 0, exchange.reply)?;
-        exchange.result
+        let _ = base.set_string_param(p.string_to_server, 0, command);
+        let _ = base.set_string_param(p.string_from_server, 0, exchange.reply);
+    }
+
+    fn trace_error(&self, message: &str) {
+        self.ad.port_base.trace_print(TraceMask::ERROR, message);
     }
 
     fn get_i32(&self, reason: usize) -> i32 {
@@ -163,20 +176,7 @@ impl BrukerDetector {
         self.ad.port_base.call_param_callbacks(0)?;
 
         let command = protocol::acquire(frame_type, &file_name, acquire_time, num_darks);
-        self.command(&command, BIS_COMMAND_TIMEOUT)
-    }
-
-    /// Report whether the directory BIS is told to write into exists here too
-    /// (`asynNDArrayDriver::checkPath`, which the C base class ran on every
-    /// `FilePath` write).
-    fn check_path(&mut self) -> AsynResult<()> {
-        let p = self.ad.params.base;
-        let path = String::from_utf8_lossy(self.ad.port_base.get_string_param(p.file_path, 0)?)
-            .into_owned();
-        let exists = !path.is_empty() && Path::new(&path).is_dir();
-        self.ad
-            .port_base
-            .set_int32_param(p.file_path_exists, 0, exists as i32)?;
+        self.command(&command, BIS_COMMAND_TIMEOUT);
         Ok(())
     }
 
@@ -196,7 +196,7 @@ impl BrukerDetector {
             .ad
             .port_base
             .get_float64_param(p.shutter_close_delay, 0)?;
-        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT)?;
+        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT);
 
         // Opening: wait out the difference between the opening and the closing
         // time so the exposure is the length that was asked for, and never less
@@ -228,8 +228,7 @@ impl PortDriver for BrukerDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
         let p = self.ad.params;
         let q = self.params;
@@ -243,9 +242,7 @@ impl PortDriver for BrukerDetector {
                 self.ad
                     .port_base
                     .set_int32_param(p.status, 0, ADStatus::Acquire as i32)?;
-                if self.commands.try_send(TaskCommand::Start).is_err() {
-                    log::error!("bruker: the acquisition task is not running");
-                }
+                let _ = self.commands.try_send(TaskCommand::Start);
             } else if value == 0 && !idle {
                 self.shared.stop_requested.store(true, Ordering::Release);
             }
@@ -257,9 +254,11 @@ impl PortDriver for BrukerDetector {
                 self.command(
                     &protocol::change_frame_size(max_size_x / value),
                     BIS_DEFAULT_TIMEOUT,
-                )?;
+                );
             } else {
-                log::error!("bruker: binning {value} is not 1, 2, 4 or 8");
+                self.trace_error(&format!(
+                    "BISDetector:writeInt32: invalid binning={value}, must be 1,2,4 or 8"
+                ));
                 status = Err(AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("binning {value} is not 1, 2, 4 or 8"),
@@ -275,29 +274,33 @@ impl PortDriver for BrukerDetector {
             // shutter is not BIS's to drive.
             self.ad.set_shutter(value != 0)?;
         } else {
-            self.ad.write_int32_pool(reason, value)?;
+            status = self.ad.write_int32_pool(reason, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "BISDetector:writeInt32: error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("BISDetector:writeInt32: function={reason}, value={value}"),
+            ),
+        }
         status
     }
 
+    /// C inherits `ADDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, value: &[u8]) -> AsynResult<usize> {
-        let reason = user.reason;
-        let text = String::from_utf8_lossy(value)
-            .trim_end_matches('\0')
-            .to_string();
-        self.ad
-            .port_base
-            .params
-            .set_string(reason, user.addr, text)?;
-
-        if reason == self.ad.params.base.file_path {
-            self.check_path()?;
-        }
-
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(value.len())
+        self.ad.write_octet(user, value)
     }
 }
 
@@ -347,11 +350,12 @@ impl BrukerRuntime {
 /// `command_handle` and `status_handle` are the two `drvAsynIPPort`s that reach
 /// BIS: one to send commands on and one BIS broadcasts its status on.
 pub fn create_bruker_detector(
-    port_name: &str,
+    claim: &PortClaim,
     command_handle: PortHandle,
     status_handle: PortHandle,
     max_memory: usize,
 ) -> AsynResult<BrukerRuntime> {
+    let port_name = claim.name();
     let shared = Arc::new(SharedState {
         stop_requested: AtomicBool::new(false),
     });
@@ -371,7 +375,7 @@ pub fn create_bruker_detector(
     let params = det.params;
     let pool = det.ad.pool.clone();
 
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 

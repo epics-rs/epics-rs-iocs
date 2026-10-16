@@ -76,10 +76,6 @@ async fn acquire(s: &Arc<Shared>) {
     // would sit in the socket and be picked up as the answer to the next
     // command, for the life of the process. Refuse instead.
     let (Some(nmodules), Some(expect)) = (det.nmodules(), det.readout_len()) else {
-        log::error!(
-            "mythen: cannot read out: the module count is unknown — `-get nmodules` has not \
-             answered since the IOC started"
-        );
         det.state.acquiring.store(false, Ordering::Release);
         s.set_int(s.ad.status, ADStatus::Disconnected as i32).await;
         s.set_int(s.ad.acquire, 0).await;
@@ -87,11 +83,6 @@ async fn acquire(s: &Arc<Shared>) {
     };
     let acquire_time = s.get_f64(s.ad.acquire_time).await;
     let timeout = M1K_TIMEOUT + Duration::from_secs_f64(acquire_time.max(0.0));
-    let command = if read_mode == READ_MODE_RAW {
-        "-readoutraw"
-    } else {
-        "-readout"
-    };
     // Raw readout packs several channels into one 32-bit word; a corrected
     // readout is one word per channel.
     let decode_nbits = if read_mode == READ_MODE_RAW {
@@ -113,15 +104,15 @@ async fn acquire(s: &Arc<Shared>) {
                     status = read_status(s).await;
                 }
             }
-            Ok(reply) => {
-                log::debug!(
-                    "mythen: [{command}] returned {} of {expect} bytes",
-                    reply.len()
-                );
+            Ok(_) => {
                 status = read_status(s).await;
             }
             Err(e) => {
-                log::error!("mythen: [{command}] failed: {e}");
+                det.trace_error(&format!(
+                    "mythen:acquisitionTask: error using readout command status={}, nRead=0, \
+                     eomReason=0",
+                    e.status() as i32
+                ));
                 break;
             }
         }
@@ -134,10 +125,15 @@ async fn acquire(s: &Arc<Shared>) {
     }
 
     det.state.acquiring.store(false, Ordering::Release);
+    let image_mode = s.get_int(s.ad.image_mode).await;
     if status == ADStatus::Error {
-        // C aborts the detector on the way out (mythen.cpp:941-946).
-        if let Err(e) = det.stop() {
-            log::error!("mythen: cannot stop the detector: {e}");
+        // C aborts the detector on the way out (mythen.cpp:939-946).
+        det.trace_error("mythen:acquisitionTask: error timed out waiting for data");
+        let _ = det.stop();
+    } else {
+        println!("Acquisition finish");
+        if image_mode == ImageMode::Single as i32 || image_mode == ImageMode::Multiple as i32 {
+            println!("ADAcquire Callback");
         }
     }
     s.set_int(s.ad.acquire, 0).await;
@@ -147,20 +143,14 @@ async fn acquire(s: &Arc<Shared>) {
     // offers is Single or Multiple only (mythen.template re-opens the mbbo
     // without "Continuous"), so the acquisition ends here in every mode the
     // detector can be put into.
-    let image_mode = s.get_int(s.ad.image_mode).await;
-    if image_mode == ImageMode::Continuous as i32 {
-        log::warn!("mythen: the image mode Continuous is not supported; acquisition stopped");
-    }
     s.set_int(s.ad.status, ADStatus::Idle as i32).await;
 }
 
 async fn read_status(s: &Arc<Shared>) -> ADStatus {
     let status = match s.det.get_status() {
         Ok(status) => status,
-        Err(e) => {
-            log::error!("mythen: cannot read the detector status: {e}");
-            ADStatus::Error
-        }
+        // writeReadMeter has printed C's line.
+        Err(_) => ADStatus::Error,
     };
     s.set_int(s.ad.status, status as i32).await;
     status

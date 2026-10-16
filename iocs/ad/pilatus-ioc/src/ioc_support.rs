@@ -84,25 +84,20 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 100_000_000,
                 };
 
-                println!(
-                    "pilatusDetectorConfig: port={port_name}, camserver={camserver_port}, \
-                     size={size_x}x{size_y}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let det = create_pilatus_detector(
-                    &port_name,
-                    &camserver_port,
-                    size_x,
-                    size_y,
-                    max_memory,
-                )?;
+                let det =
+                    create_pilatus_detector(&claim, &camserver_port, size_x, size_y, max_memory)?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    det.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        det.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     det.pool().clone(),

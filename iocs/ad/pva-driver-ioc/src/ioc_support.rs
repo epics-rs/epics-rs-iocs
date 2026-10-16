@@ -69,20 +69,18 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "pvaDriverConfig: port={port_name}, pvName={pv_name}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                let det_runtime = create_pva_detector(&port_name, &pv_name, max_memory)
+                let det_runtime = create_pva_detector(&claim, &pv_name, max_memory)
                     .map_err(|e| format!("failed to create pvAccess detector: {e}"))?;
 
                 let port_handle = det_runtime.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(port_handle, ctx.db().scan_control().interrupt_gate())
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     det_runtime.pool().clone(),

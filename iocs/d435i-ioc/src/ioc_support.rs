@@ -51,14 +51,23 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
 
                 println!("d435iConfig: port={port_name}, serial={serial}, size={size_x}x{size_y}, maxMemory={max_memory}");
 
-                let (color_rt, depth_rt) = create_d435i_detector(&port_name, &serial, size_x, size_y, max_memory)
+                let color_claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let depth_claim = match epics_rs::asyn::manager::claim_port_driver(&depth_port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+
+                let (color_rt, depth_rt) = create_d435i_detector(&color_claim, &depth_claim, &serial, size_x, size_y, max_memory)
                     .map_err(|e| format!("failed to create D435i detector: {e}"))?;
 
                 let c_port_handle = color_rt.port_handle().clone();
                 let d_port_handle = depth_rt.port_handle().clone();
 
-                epics_rs::asyn::asyn_record::register_port(&port_name, c_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
-                epics_rs::asyn::asyn_record::register_port(&depth_port_name, d_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
+                color_claim.publish(c_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
+                depth_claim.publish(d_port_handle, ctx.db().scan_control().interrupt_gate()).map_err(|e| e.to_string())?;
 
                 // Register color port as the primary driver context (pool + fan-out).
                 mgr.set_driver(Arc::new(GenericDriverContext::new(

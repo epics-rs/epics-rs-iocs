@@ -4,7 +4,6 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use epics_rs::ad_core::ioc::GenericDriverContext;
 use epics_rs::ad_core::ndarray::NDDataType;
-use epics_rs::ad_core::plugin::wiring::upstream_key;
 
 use ad_csimdetector::{CSimDetectorRuntime, MAX_SIGNALS, create_c_sim_detector};
 
@@ -89,13 +88,13 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "ADCSimDetectorConfig: port={port_name}, numTimePoints={num_time_points}, \
-                     dataType={data_type_code}, maxBuffers={max_buffers}, maxMemory={max_memory}"
-                );
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
                 let sim_rt = create_c_sim_detector(
-                    &port_name,
+                    &claim,
                     num_time_points,
                     data_type,
                     max_buffers,
@@ -103,12 +102,12 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 )
                 .map_err(|e| format!("failed to create ADCSimDetector: {e}"))?;
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    sim_rt.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        sim_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 // Address 0 is the 2-D array and doubles as the driver context.
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
@@ -118,11 +117,10 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     mgr.wiring(),
                 )));
                 // Addresses 1..=MAX_SIGNALS carry the per-signal 1-D arrays.
-                // `register_output` keys on `upstream_key(name, 0)`, i.e. the
-                // bare name, so the already-suffixed key is passed through.
                 for addr in 1..=MAX_SIGNALS {
-                    mgr.wiring().register_output(
-                        &upstream_key(&port_name, addr as i32),
+                    mgr.wiring().register_output_at(
+                        &port_name,
+                        addr as i32,
                         sim_rt.array_output(addr).clone(),
                     );
                 }

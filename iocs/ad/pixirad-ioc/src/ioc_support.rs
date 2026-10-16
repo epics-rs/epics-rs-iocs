@@ -111,6 +111,11 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 return Err("maxDataPortBuffers must be at least 1".into());
             }
 
+            let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                Ok(claim) => claim,
+                Err(e) => return Ok(ctx.cxx_error(e)),
+            };
+
             let command = get_port(&command_port).ok_or_else(|| {
                 format!(
                     "command port '{command_port}' not found \
@@ -118,14 +123,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 )
             })?;
 
-            println!(
-                "pixiradConfig: port={port_name}, command={command_port}, \
-                 data=UDP {data_port}, status=UDP {status_port}, \
-                 size={max_size_x}x{max_size_y}"
-            );
-
             let rt = create_pixirad_detector(
-                &port_name,
+                &claim,
                 command.handle.clone(),
                 data_port,
                 status_port,
@@ -136,12 +135,12 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
             )
             .map_err(|e| format!("failed to create the Pixirad detector: {e}"))?;
 
-            epics_rs::asyn::asyn_record::register_port(
-                &port_name,
-                rt.port_handle().clone(),
-                ctx.db().scan_control().interrupt_gate(),
-            )
-            .map_err(|e| e.to_string())?;
+            claim
+                .publish(
+                    rt.port_handle().clone(),
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| e.to_string())?;
 
             mgr.set_driver(Arc::new(GenericDriverContext::new(
                 rt.pool().clone(),

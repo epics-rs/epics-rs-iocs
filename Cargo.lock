@@ -42,7 +42,6 @@ name = "ad-csimdetector"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]
@@ -62,7 +61,6 @@ name = "ad-mar345"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -71,7 +69,6 @@ name = "ad-marccd"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tempfile",
  "tiff",
@@ -83,7 +80,6 @@ name = "ad-pilatus"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tempfile",
  "tiff",
@@ -122,7 +118,6 @@ name = "ad-pva-driver"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]
@@ -132,7 +127,6 @@ name = "ad-simdetector"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -151,7 +145,6 @@ name = "ad-specs-analyser"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -160,7 +153,6 @@ name = "ad-std-arrays-driver"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "tokio",
 ]
@@ -182,7 +174,6 @@ dependencies = [
  "anyhow",
  "epics-rs",
  "image",
- "log",
  "parking_lot",
  "ureq 2.12.1",
 ]
@@ -660,7 +651,6 @@ name = "bruker"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -1018,7 +1008,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "epics-rs",
- "log",
  "parking_lot",
  "realsense-rust",
 ]
@@ -1228,9 +1217,9 @@ name = "eiger"
 version = "0.1.0"
 dependencies = [
  "ad-plugins-rs",
+ "bytes",
  "epics-rs",
  "hdf5-reader",
- "log",
  "lz4_flex",
  "parking_lot",
  "serde_json",
@@ -2507,7 +2496,6 @@ name = "merlin"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -2878,7 +2866,6 @@ name = "mythen"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -3212,7 +3199,6 @@ name = "photonii"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -3283,7 +3269,6 @@ name = "pixirad"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "socket2 0.6.3",
 ]
@@ -3441,7 +3426,6 @@ name = "psl"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
 ]
 
@@ -4447,7 +4431,6 @@ name = "timepix3"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "parking_lot",
  "serde_json",
  "tokio",

@@ -19,6 +19,7 @@ use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 
@@ -65,8 +66,12 @@ fn switchable_detector(answering: Arc<AtomicBool>) -> (PortHandle, mpsc::Receive
     });
 
     let driver = DrvAsynIPPort::new("MYTHEN_RECONNECT_IP", &addr).expect("ip port");
-    let (runtime, _) =
-        create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
+    let (runtime, _) = create_port_runtime(
+        &claim_port("MYTHEN_RECONNECT_IP").unwrap(),
+        driver,
+        RuntimeConfig::default(),
+    )
+    .expect("ip port runtime");
     let handle = runtime.port_handle().clone();
     // The port actor must outlive the test.
     std::mem::forget(runtime);
@@ -97,7 +102,7 @@ fn reply_to(command: &str) -> Vec<u8> {
 fn no_command_is_sent_while_the_detector_is_disconnected_and_an_acquisition_brings_it_back() {
     let answering = Arc::new(AtomicBool::new(false));
     let (handle, received) = switchable_detector(answering.clone());
-    let det = Arc::new(Detector::new(Transport::new(handle)));
+    let det = Arc::new(Detector::new(Transport::new(handle), "MYTHEN_RECONNECT"));
     let (start_tx, _start_rx) = rt::command_channel::<()>(1);
 
     // --- Boot against a silent detector ------------------------------------

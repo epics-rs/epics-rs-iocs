@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -15,6 +17,7 @@ use epics_rs::ad_core::runtime as rt;
 
 use crate::params::D435iParams;
 use crate::task::{AcquisitionContext, start_acquisition_task};
+use crate::trace::{self, TraceMask};
 use crate::types::{AcqCommand, CameraCapabilities, DirtyFlags, StreamMode, default_mode_index};
 
 // ============================================================================
@@ -40,7 +43,14 @@ impl D435iColorDriver {
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
         caps: CameraCapabilities,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
         let rs_params = D435iParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -150,6 +160,11 @@ impl PortDriver for D435iColorDriver {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         let acquire_idx = self.ad.params.acquire;
@@ -168,7 +183,9 @@ impl PortDriver for D435iColorDriver {
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Start).is_err() {
-                    log::error!("D435i: acquisition task is not running");
+                    self.ad
+                        .port_base
+                        .trace_print(TraceMask::ERROR, "D435i: acquisition task is not running");
                     self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
                         0,
@@ -184,7 +201,9 @@ impl PortDriver for D435iColorDriver {
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Stop).is_err() {
-                    log::error!("D435i: acquisition task is not running");
+                    self.ad
+                        .port_base
+                        .trace_print(TraceMask::ERROR, "D435i: acquisition task is not running");
                 }
             } else {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
@@ -194,46 +213,42 @@ impl PortDriver for D435iColorDriver {
             if let Some(mode) = self.stream_modes.get(value as usize).copied() {
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(reason, user.addr, value)?;
+                    .set_int32_param(reason, user.addr, value)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.rs_params.rs_res_x, 0, mode.width)?;
+                    .set_int32_param(self.rs_params.rs_res_x, 0, mode.width)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.rs_params.rs_res_y, 0, mode.height)?;
+                    .set_int32_param(self.rs_params.rs_res_y, 0, mode.height)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.rs_params.rs_frame_rate, 0, mode.fps)?;
+                    .set_int32_param(self.rs_params.rs_frame_rate, 0, mode.fps)?;
                 // Update AD params to match
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.ad.params.size_x, 0, mode.width)?;
+                    .set_int32_param(self.ad.params.size_x, 0, mode.width)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.ad.params.size_y, 0, mode.height)?;
-                self.ad.port_base.params.set_float64(
+                    .set_int32_param(self.ad.params.size_y, 0, mode.height)?;
+                self.ad.port_base.set_float64_param(
                     self.ad.params.acquire_time,
                     0,
                     1.0 / mode.fps as f64,
                 )?;
                 self.dirty.lock().reconfigure_pipeline = true;
             } else {
-                log::warn!(
-                    "D435i: invalid stream mode index {value}, this camera offers {}",
-                    self.stream_modes.len()
+                self.ad.port_base.trace_print(
+                    TraceMask::WARNING,
+                    &format!(
+                        "D435i: invalid stream mode index {value}, this camera offers {}",
+                        self.stream_modes.len()
+                    ),
                 );
             }
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(reason, user.addr, value)?;
+                .set_int32_param(reason, user.addr, value)?;
 
             // Dirty flag routing
             if reason == self.rs_params.rs_auto_exposure
@@ -263,8 +278,7 @@ impl PortDriver for D435iColorDriver {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         let mut dirty = self.dirty.lock();
         if reason == self.rs_params.rs_exposure
@@ -306,7 +320,14 @@ impl D435iDepthDriver {
         max_size_y: i32,
         max_memory: usize,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
 
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Intel")?;
@@ -346,6 +367,11 @@ impl PortDriver for D435iDepthDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.ad.port_base
+    }
+
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
     }
 }
 
@@ -433,13 +459,15 @@ impl D435iDepthRuntime {
 
 /// Create both Color and Depth drivers, start the shared acquisition task.
 pub fn create_d435i_detector(
-    port_name: &str,
+    color_claim: &PortClaim,
+    depth_claim: &PortClaim,
     serial: &str,
     max_size_x: i32,
     max_size_y: i32,
     max_memory: usize,
 ) -> AsynResult<(D435iColorRuntime, D435iDepthRuntime)> {
-    let depth_port_name = format!("{port_name}_DEPTH");
+    let port_name = color_claim.name();
+    let depth_port_name = depth_claim.name();
 
     // Shared state
     let (acq_tx, acq_rx) = rt::command_channel::<AcqCommand>(16);
@@ -448,12 +476,16 @@ pub fn create_d435i_detector(
 
     // Ask the camera which modes it has before the records are built: the
     // RSStreamMode enum is served from this list.
-    let caps = CameraCapabilities::discover(serial);
-    log::info!(
-        "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}",
-        caps.modes.len(),
-        caps.has_imu,
-        caps.has_emitter
+    let caps = CameraCapabilities::discover(port_name, serial);
+    trace::print(
+        port_name,
+        TraceMask::FLOW,
+        &format!(
+            "D435i: camera offers {} colour+depth stream modes, imu={}, emitter={}",
+            caps.modes.len(),
+            caps.has_imu,
+            caps.has_emitter
+        ),
     );
 
     // --- Color port ---
@@ -469,17 +501,19 @@ pub fn create_d435i_detector(
     let color_ad_params = color_det.ad.params;
     let color_rs_params = color_det.rs_params;
     let color_pool = color_det.ad.pool.clone();
-    let (color_runtime_handle, _) = create_port_runtime(color_det, RuntimeConfig::default())?;
+    let (color_runtime_handle, _) =
+        create_port_runtime(color_claim, color_det, RuntimeConfig::default())?;
     let color_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let color_queued = Arc::new(QueuedArrayCounter::new());
     let pc_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let pc_queued = Arc::new(QueuedArrayCounter::new());
 
     // --- Depth port ---
-    let depth_det = D435iDepthDriver::new(&depth_port_name, max_size_x, max_size_y, max_memory)?;
+    let depth_det = D435iDepthDriver::new(depth_port_name, max_size_x, max_size_y, max_memory)?;
     let depth_ad_params = depth_det.ad.params;
     let depth_pool = depth_det.ad.pool.clone();
-    let (depth_runtime_handle, _) = create_port_runtime(depth_det, RuntimeConfig::default())?;
+    let (depth_runtime_handle, _) =
+        create_port_runtime(depth_claim, depth_det, RuntimeConfig::default())?;
     let depth_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let depth_queued = Arc::new(QueuedArrayCounter::new());
 

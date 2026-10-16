@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
@@ -41,7 +44,7 @@ impl URLDriver {
         max_memory: usize,
         acq_tx: rt::CommandSender<AcqCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_NONE)?;
         let url_params = URLParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -77,38 +80,62 @@ impl PortDriver for URLDriver {
         &mut self.ad.port_base
     }
 
-    /// Mirrors C++ `URLDriver::writeInt32`: only `ADAcquire` is special-cased
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
+    /// C++ `URLDriver::writeInt32`: only `ADAcquire` is special-cased
     /// (start/stop-signals the acquisition task, gated on `ADStatus` being
-    /// idle or not); every other Int32 param falls through to the same
-    /// "set param, call callbacks" behavior as the base `ADDriver::writeInt32`
-    /// (this crate's `PortDriver::write_int32` default already does that).
+    /// idle or not); every other Int32 param goes to `ADDriver::writeInt32`.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
-        if reason == self.ad.params.acquire {
+        let status = if reason == self.ad.params.acquire {
             let status = self
                 .ad
                 .port_base
                 .get_int32_param(self.ad.params.status, 0)
                 .unwrap_or(ADStatus::Idle as i32);
             if value != 0 && status == ADStatus::Idle as i32 {
-                if self.acq_tx.try_send(AcqCommand::Start).is_err() {
-                    log::error!("ad-url: acquisition task is not running");
-                }
-            } else if value == 0
-                && status != ADStatus::Idle as i32
-                && self.acq_tx.try_send(AcqCommand::Stop).is_err()
-            {
-                log::error!("ad-url: acquisition task is not running");
+                let _ = self.acq_tx.try_send(AcqCommand::Start);
+            } else if value == 0 && status != ADStatus::Idle as i32 {
+                let _ = self.acq_tx.try_send(AcqCommand::Stop);
             }
-        }
+            Ok(())
+        } else if reason < self.url_params.url_name {
+            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
+            if reason == self.ad.params.shutter_control {
+                self.ad.set_shutter(value != 0)
+            } else {
+                self.ad.write_int32_pool(reason, value).map(|_| ())
+            }
+        } else {
+            Ok(())
+        };
 
         self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "URLDriver:writeInt32 error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("URLDriver:writeInt32: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 }
 
@@ -160,14 +187,15 @@ impl URLRuntime {
 /// acquisition task always runs on its own `rt::run_thread_named` OS thread
 /// at default priority/stack size) — accepted but unused, same framework
 /// limitation as the rest of this workspace's AD ports (e.g. d435i).
-pub fn create_url_detector(port_name: &str, max_memory: usize) -> AsynResult<URLRuntime> {
+pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<URLRuntime> {
+    let port_name = claim.name();
     let (acq_tx, acq_rx) = rt::command_channel::<AcqCommand>(16);
 
     let det = URLDriver::new(port_name, max_memory, acq_tx)?;
     let ad_params = det.ad.params;
     let url_params = det.url_params;
     let pool = det.ad.pool.clone();
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 
@@ -189,4 +217,84 @@ pub fn create_url_detector(port_name: &str, max_memory: usize) -> AsynResult<URL
         queued_counter,
         task_handle: Some(task_handle),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let mut det = URLDriver::new("URL_BASE_WRITE", 1 << 20, acq_tx).unwrap();
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        let mut user = AsynUser::new(p.shutter_control);
+        det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
+
+    #[test]
+    fn a_counter_written_during_acquisition_is_where_the_next_frame_counts_from() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+
+        let dir = std::env::temp_dir().join(format!("url-counter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("frame.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&png)
+            .unwrap();
+
+        let rt = create_url_detector(&claim_port("URL_COUNTER").unwrap(), 1 << 20).unwrap();
+        let (tx, mut rx) = ndarray_channel("URL_COUNTER_SINK", 8);
+        rt.connect_downstream(tx);
+        let (h, ad) = (rt.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    rt.url_params.url_name,
+                    0,
+                    ParamValue::Octet(format!("file://{}", png.display()).into_bytes().into()),
+                ),
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Continuous as i32),
+                ),
+                ParamSetValue::new(ad.acquire_period, 0, ParamValue::Float64(0.2)),
+            ],
+        )
+        .unwrap();
+
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let first = rx.blocking_recv().expect("first frame").unique_id;
+        h.write_int32_blocking(ad.base.array_counter, 0, 100)
+            .unwrap();
+        let mut next = rx.blocking_recv().expect("next frame").unique_id;
+        // A frame already past its counter read when the write landed.
+        if next == first + 1 {
+            next = rx.blocking_recv().expect("next frame").unique_id;
+        }
+        h.write_int32_blocking(ad.acquire, 0, 0).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(next, 101);
+        std::mem::forget(rt);
+    }
 }

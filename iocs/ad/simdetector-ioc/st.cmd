@@ -18,6 +18,7 @@ epicsEnvSet("XSIZE",  "1024")
 epicsEnvSet("YSIZE",  "1024")
 epicsEnvSet("NCHANS", "2048")
 epicsEnvSet("CBUFFS", "500")
+epicsEnvSet("MAX_THREADS", "8")
 
 # NELEMENTS for the NDStdArrays output waveform: XSIZE * YSIZE * 3, so an RGB
 # frame at the full detector size fits.
