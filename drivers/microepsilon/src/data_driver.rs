@@ -109,6 +109,7 @@ use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
 use epics_rs::base::server::recgbl::alarm_status;
@@ -452,6 +453,7 @@ impl PortDriver for DataDriver {
 /// gap), so the ten increments collapse to one sleep of the same total
 /// duration.
 fn long_wait() {
+    println!("capaNCDT6200LongWait called.");
     thread::sleep(Duration::from_secs(30));
 }
 
@@ -473,22 +475,38 @@ fn reader_thread(
     let mut last_meas_value_counter: u32 = 0;
     let mut last_chan_values = [0.0f64; MAX_CHANNELS];
     let mut port_open = false;
+    let rbk = rbk_port_handle.port_name().to_string();
+    // C `asynPrint(pasynUser, ASYN_TRACE_ERROR, ...)` on the RBK port.
+    let print_error = |args: std::fmt::Arguments<'_>| {
+        rbk_port_handle
+            .trace()
+            .print(Some(&rbk), None, 0, TraceMask::ERROR, args)
+    };
+    // `pasynUserCommon->errorMessage`: C prints it on success lines too, so
+    // it keeps the last failure's text.
+    let mut common_error = String::new();
 
     loop {
         if !reader_state.is_communicating {
-            let connected = rbk_port_handle
-                .submit_blocking(RequestOp::Connect, AsynUser::default())
-                .is_ok();
-            if connected {
-                port_open = true;
-            } else {
-                long_wait();
+            match rbk_port_handle.submit_blocking(RequestOp::Connect, AsynUser::default()) {
+                Ok(_) => {
+                    port_open = true;
+                    print_error(format_args!(
+                        "{rbk} Successfully connected to MicroEpsilon port: {common_error}."
+                    ));
+                }
+                Err(e) => {
+                    common_error = e.message();
+                    print_error(format_args!("{rbk} can't connect port: {common_error}"));
+                    long_wait();
+                }
             }
         }
 
         // C resets `eopReached` only on an open port; otherwise it keeps the
         // last pass's 1 and the read loop is skipped until a connect works.
         if !port_open {
+            println!("Micro-Epsilon unit port is not open.");
             continue;
         }
         let mut tread = 0usize;
@@ -532,6 +550,7 @@ fn reader_thread(
                     }
                 }
                 Err(e) => {
+                    print_error(format_args!("{rbk}: port read failed: {}", e.message()));
                     if is_asyn_timeout(&e) {
                         ReadOutcome::Timeout
                     } else {
@@ -542,6 +561,11 @@ fn reader_thread(
                 }
             };
 
+            if outcome == ReadOutcome::BadPreamble {
+                print_error(format_args!(
+                    "{rbk}: Could not find correct Preamble string: {common_error}"
+                ));
+            }
             let push = packet::read_pass(
                 &mut reader_state,
                 outcome,
@@ -549,6 +573,9 @@ fn reader_thread(
                 last_chan_values,
                 interrupt_accept.is_open(),
             );
+            if reader_state.bad_packet_count >= 2 {
+                println!("Process SCAN=I/O Intr records to set STAT/SEVR.");
+            }
             // C's counters and `measValueCounter` are the reader's own
             // fields, so `int32Read` sees every pass, processed or not.
             {
@@ -565,13 +592,17 @@ fn reader_thread(
             }
 
             if !reader_state.is_communicating {
-                let disconnected = rbk_port_handle
-                    .submit_blocking(RequestOp::Disconnect, AsynUser::default())
-                    .is_ok();
-                if disconnected {
-                    eop_reached = true;
-                    port_open = false;
-                    long_wait();
+                match rbk_port_handle.submit_blocking(RequestOp::Disconnect, AsynUser::default()) {
+                    Ok(_) => {
+                        eop_reached = true;
+                        port_open = false;
+                        println!("Successfully disconnected MicroEpsilon port: {rbk}.");
+                        long_wait();
+                    }
+                    Err(e) => {
+                        common_error = e.message();
+                        print_error(format_args!("{rbk} can't disconnect: {common_error}"));
+                    }
                 }
             }
         }
