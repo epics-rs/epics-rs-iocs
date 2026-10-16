@@ -159,21 +159,45 @@ impl OmsController {
     /// Send a command and read one reply, skipping any notification lines and
     /// stripping the leading ACK/CR/LF (C `sendReceive`).
     pub fn send_receive(&self, cmd: &str) -> AsynResult<String> {
-        let mut raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let (reply, status) = self.send_receive_buffer(cmd);
+        status.map(|()| reply)
+    }
+
+    /// [`Self::send_receive`] as C fills `inputBuff`: a failed read still
+    /// leaves the bytes it got there, and C callers that ignore the status
+    /// read them.
+    pub fn send_receive_buffer(&self, cmd: &str) -> (String, AsynResult<()>) {
+        let trim = |raw: &[u8]| {
+            String::from_utf8_lossy(raw)
+                .trim_start_matches(['\x06', '\r', '\n'])
+                .trim_end_matches(['\r', '\n', '\0', ' '])
+                .to_string()
+        };
+        let failed = |e: AsynError| {
+            let reply = e.partial_read().map_or_else(String::new, |p| trim(&p.data));
+            (reply, Err(e))
+        };
+        let mut raw = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
+            Ok(raw) => raw,
+            Err(e) => return failed(e),
+        };
         // A move notification may sit ahead of the real reply; skip it. Bound
         // the retries so a chatty controller cannot spin forever.
         for _ in 0..12 {
-            let s = String::from_utf8_lossy(&raw);
-            let trimmed = s
-                .trim_start_matches(['\x06', '\r', '\n'])
-                .trim_end_matches(['\r', '\n', '\0', ' ']);
-            if is_notification(trimmed) {
-                raw = self.handle.read_octet(0, READ_BUF)?;
+            let trimmed = trim(&raw);
+            if is_notification(&trimmed) {
+                raw = match self.handle.read_octet(0, READ_BUF) {
+                    Ok(raw) => raw,
+                    Err(e) => return failed(e),
+                };
                 continue;
             }
-            return Ok(trimmed.to_string());
+            return (trimmed, Ok(()));
         }
-        Err(oms_err("oms: only notification lines received"))
+        (
+            String::new(),
+            Err(oms_err("oms: only notification lines received")),
+        )
     }
 
     /// C `omsBaseController::getFirmwareVersion`: up to three `WY` tries a
@@ -181,25 +205,22 @@ impl OmsController {
     /// field. An unparsable reply fails with an empty message, as C's caller
     /// prints the user's untouched `errorMessage`.
     pub fn firmware_version(&self) -> AsynResult<(i32, i32)> {
-        let mut reply = Err(oms_err(""));
+        let (mut reply, mut status) = (String::new(), Err(oms_err("")));
         for _ in 0..3 {
             std::thread::sleep(Duration::from_secs(1));
-            reply = self.send_receive("WY");
-            errlog_vprintf(format_args!(
-                "OMS Firmware Version: {}\n",
-                reply.as_deref().unwrap_or_default()
-            ));
-            if reply.is_ok() {
+            (reply, status) = self.send_receive_buffer("WY");
+            errlog_vprintf(format_args!("OMS Firmware Version: {reply}\n"));
+            if status.is_ok() {
                 break;
             }
         }
-        let version = parse_firmware_version(reply.as_deref().unwrap_or_default());
+        let version = parse_firmware_version(&reply);
         if version.is_none() {
             errlog_vprintf(format_args!(
                 "omsBaseController::getFirmwareVersion: unable to retrieve Firmware version\n"
             ));
         }
-        reply.and_then(|_| version.ok_or_else(|| oms_err("")))
+        status.and_then(|()| version.ok_or_else(|| oms_err("")))
     }
 
     /// Interrupt-clear and stop-all, then send an optional init string (C
@@ -218,9 +239,9 @@ impl OmsController {
 
     /// The axis count: the fields of the `AA RP;` reply, empty ones skipped
     /// as `epicsStrtok_r` does. C ignores the exchange's status and counts
-    /// the buffer it emptied, so a failed one counts none.
+    /// whatever a failed read left in the buffer.
     pub fn axis_count(&self) -> usize {
-        let reply = self.send_receive("AA RP;").unwrap_or_default();
+        let (reply, _) = self.send_receive_buffer("AA RP;");
         reply.split(',').filter(|f| !f.is_empty()).count()
     }
 }
@@ -710,6 +731,55 @@ mod tests {
         assert_eq!(parse_firmware_version("MXA ver:S2.0"), Some((2, 0)));
         assert_eq!(parse_firmware_version("MAXnet ver:1"), None);
         assert_eq!(parse_firmware_version("garbage"), None);
+    }
+
+    /// A line that times out after `partial` bytes of every reply.
+    struct TimesOutMidReply {
+        base: epics_rs::asyn::port::PortDriverBase,
+        partial: &'static [u8],
+    }
+
+    impl epics_rs::asyn::port::PortDriver for TimesOutMidReply {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, _buf: &mut [u8]) -> AsynResult<usize> {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "timeout".into(),
+            }
+            .with_partial_read(epics_rs::asyn::interpose::PartialOctetRead {
+                data: self.partial.to_vec(),
+                eom_reason: epics_rs::asyn::interpose::EomReason::empty(),
+            }))
+        }
+    }
+
+    #[test]
+    fn the_axis_count_reads_a_timed_out_reply_as_c_does() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let port = TimesOutMidReply {
+            base: PortDriverBase::new("omsPartialAxisCount", 1, PortFlags::default()),
+            partial: b"0,0",
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("omsPartialAxisCount").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+        let controller = OmsController::new(io, "omsPartialAxisCount", "MAXnet");
+        assert_eq!(controller.axis_count(), 2);
     }
 
     #[test]
