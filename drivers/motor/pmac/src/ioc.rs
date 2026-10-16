@@ -96,33 +96,51 @@ fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
     ))
 }
 
-/// C `pmacController`'s constructor (pmacController.cpp:194-200): a refused
-/// connect or EOS set is printed and the controller is still created, with no
-/// low-level user.
+/// C `pmacController`'s constructor (pmacController.cpp:194-200) and its
+/// `lowLevelPortConnect`: a missing port keeps the unconnected user, a refused
+/// EOS set disconnects it (`None`); either is printed and the controller is
+/// still created.
 fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<SyncIOHandle> {
     let trace = MotorTrace::new(self_port, 0);
-    connect_octet(port, addr)
-        .inspect_err(|e| {
-            let line = |args: std::fmt::Arguments<'_>| trace.print_self(TraceMask::ERROR, args);
-            match e {
-                ConnectError::NoPort => line(format_args!(
+    let (handle, connected) = SyncIOHandle::connect_port(port, addr, PMAC_TIMEOUT);
+    let kept = match connected.and_then(|()| handle.port()) {
+        Err(_) => {
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
                     "pmacController::motorAxisAsynConnect: unable to connect to port {port}\n"
-                )),
-                ConnectError::InputEos(e) => line(format_args!(
-                    "pmacController: unable to set input EOS on {port}: {}\n",
-                    e.message_display()
-                )),
-                ConnectError::OutputEos(e) => line(format_args!(
-                    "pmacController: unable to set output EOS on {port}: {}\n",
-                    e.message_display()
-                )),
-            }
-            println!(
-                "pmacController::pmacController: Failed to connect to low level \
-                 asynOctetSyncIO port {port}"
+                ),
             );
-        })
-        .ok()
+            Some(handle)
+        }
+        Ok(entry) => {
+            let user = || AsynUser::new(0).with_addr(addr);
+            let refused = entry
+                .set_input_eos_blocking(user(), b"\x06")
+                .map_err(|e| ("input", e))
+                .and_then(|()| {
+                    entry
+                        .set_output_eos_blocking(user(), b"\r")
+                        .map_err(|e| ("output", e))
+                });
+            let Err((which, e)) = refused else {
+                return Some(handle);
+            };
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "pmacController: unable to set {which} EOS on {port}: {}\n",
+                    e.message_display()
+                ),
+            );
+            None
+        }
+    };
+    println!(
+        "pmacController::pmacController: Failed to connect to low level \
+         asynOctetSyncIO port {port}"
+    );
+    kept
 }
 
 /// Every PMAC iocsh command but `drvAsynMotorConfigure`, which the IOC builds
@@ -685,6 +703,8 @@ mod tests {
 
     #[test]
     fn a_missing_low_level_port_leaves_a_controller_whose_commands_fail() {
+        // C keeps the unconnected user; only a refused EOS set clears it.
+        assert!(low_level_port_connect("pmacTest", "pmacNoSuchPort", 0).is_some());
         assert!(controller_on("pmacNoSuchPort").write_read("I100").is_err());
     }
 
