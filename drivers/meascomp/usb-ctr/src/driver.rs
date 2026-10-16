@@ -36,6 +36,8 @@ pub struct CtrDriver {
     pub device: Arc<Mutex<DaqDevice>>,
     pub state: Arc<Mutex<PollerState>>,
     pub max_time_points: usize,
+    /// C `pulseGenRunning_`.
+    pulse_running: [bool; NUM_TIMERS],
     /// Whether AUXPORT accepts a direction change at all (`DPIOT_IO` /
     /// `DPIOT_BITIO`). The USB-CTR08 reports `DPIOT_BITIO`.
     dio_configurable: bool,
@@ -113,7 +115,76 @@ impl CtrDriver {
             device: Arc::new(Mutex::new(device)),
             state,
             max_time_points,
+            pulse_running: [false; NUM_TIMERS],
             dio_configurable,
+        })
+    }
+}
+
+impl CtrDriver {
+    /// C `pulseGenRunning_[addr]`.
+    fn pulse_running(&self, addr: i32) -> bool {
+        usize::try_from(addr)
+            .ok()
+            .and_then(|i| self.pulse_running.get(i))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn set_pulse_running(&mut self, addr: i32, running: bool) {
+        if let Some(r) = usize::try_from(addr)
+            .ok()
+            .and_then(|i| self.pulse_running.get_mut(i))
+        {
+            *r = running;
+        }
+    }
+
+    /// C `USBCTR::startPulseGenerator`: start from the timer's params and
+    /// write back what the hardware gave.
+    fn start_pulse_generator(&mut self, trace: &SelfTrace, addr: i32) -> UlError {
+        let request = match self.pulse_request(addr) {
+            Ok(r) => r,
+            Err(_) => return -1,
+        };
+        let started = pulse_gen::start(trace, &self.device.lock().unwrap(), addr, &request);
+        match started {
+            Ok((period, duty_cycle, delay)) => {
+                self.set_pulse_running(addr, true);
+                let _ = self
+                    .base
+                    .set_float64_param(self.params.pulse_period, addr, period);
+                let _ = self
+                    .base
+                    .set_float64_param(self.params.pulse_duty_cycle, addr, duty_cycle);
+                let _ = self
+                    .base
+                    .set_float64_param(self.params.pulse_delay, addr, delay);
+                0
+            }
+            Err(e) => e.code,
+        }
+    }
+
+    /// C `USBCTR::stopPulseGenerator`.
+    fn stop_pulse_generator(&mut self, trace: &SelfTrace, addr: i32) -> UlError {
+        self.set_pulse_running(addr, false);
+        status_of(&pulse_gen::stop(trace, &self.device.lock().unwrap(), addr))
+    }
+
+    fn pulse_request(&self, addr: i32) -> AsynResult<PulseRequest> {
+        Ok(PulseRequest {
+            period: self
+                .base
+                .get_float64_param(self.params.pulse_period, addr)?,
+            duty_cycle: self
+                .base
+                .get_float64_param(self.params.pulse_duty_cycle, addr)?,
+            delay: self.base.get_float64_param(self.params.pulse_delay, addr)?,
+            count: self.base.get_int32_param(self.params.pulse_count, addr)? as u64,
+            idle_state: self
+                .base
+                .get_int32_param(self.params.pulse_idle_state, addr)?,
         })
     }
 }
@@ -135,58 +206,18 @@ impl PortDriver for CtrDriver {
 
         self.base.params.set_int32(reason, addr, value)?;
 
-        if reason == self.params.pulse_run
-            || reason == self.params.pulse_count
-            || reason == self.params.pulse_idle_state
-        {
-            let dev = self.device.lock().unwrap();
-            let running = self.base.get_int32_param(self.params.pulse_run, addr)? != 0;
-            if running {
-                // Stop first if restarting due to parameter change
-                if reason != self.params.pulse_run {
-                    status = status_of(&pulse_gen::stop(&trace, &dev, addr));
-                }
-                let period = self
-                    .base
-                    .get_float64_param(self.params.pulse_period, addr)?;
-                let duty = self
-                    .base
-                    .get_float64_param(self.params.pulse_duty_cycle, addr)?;
-                let delay = self.base.get_float64_param(self.params.pulse_delay, addr)?;
-                let count = self.base.get_int32_param(self.params.pulse_count, addr)? as u64;
-                let idle = self
-                    .base
-                    .get_int32_param(self.params.pulse_idle_state, addr)?;
-                let request = PulseRequest {
-                    period,
-                    duty_cycle: duty,
-                    delay,
-                    count,
-                    idle_state: idle,
-                };
-                match pulse_gen::start(&trace, &dev, addr, &request) {
-                    Ok((actual_period, actual_duty, actual_delay)) => {
-                        // Write back actual values from hardware
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_period,
-                            addr,
-                            actual_period,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_duty_cycle,
-                            addr,
-                            actual_duty,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_delay,
-                            addr,
-                            actual_delay,
-                        );
-                    }
-                    Err(e) => status |= e.code,
-                }
-            } else if reason == self.params.pulse_run {
-                status = status_of(&pulse_gen::stop(&trace, &dev, addr));
+        if reason == self.params.pulse_run {
+            // C starts on any non-zero write, running or not: with a pulse
+            // count it cannot tell when the last run ended.
+            if value != 0 {
+                status = self.start_pulse_generator(&trace, addr);
+            } else if self.pulse_running(addr) {
+                status = self.stop_pulse_generator(&trace, addr);
+            }
+        } else if reason == self.params.pulse_count || reason == self.params.pulse_idle_state {
+            if self.pulse_running(addr) {
+                status = self.stop_pulse_generator(&trace, addr);
+                status |= self.start_pulse_generator(&trace, addr);
             }
         } else if reason == self.params.counter_reset {
             let dev = self.device.lock().unwrap();
@@ -500,58 +531,13 @@ impl PortDriver for CtrDriver {
             self.base.call_param_callbacks(0)?;
         }
 
-        // Restart pulse generator if period or duty cycle changes while running
-        if reason == self.params.pulse_period
+        if (reason == self.params.pulse_period
             || reason == self.params.pulse_duty_cycle
-            || reason == self.params.pulse_delay
+            || reason == self.params.pulse_delay)
+            && self.pulse_running(addr)
         {
-            let running = self
-                .base
-                .get_int32_param(self.params.pulse_run, addr)
-                .unwrap_or(0)
-                != 0;
-            if running {
-                let dev = self.device.lock().unwrap();
-                status = status_of(&pulse_gen::stop(&trace, &dev, addr));
-                let period = self
-                    .base
-                    .get_float64_param(self.params.pulse_period, addr)?;
-                let duty = self
-                    .base
-                    .get_float64_param(self.params.pulse_duty_cycle, addr)?;
-                let delay = self.base.get_float64_param(self.params.pulse_delay, addr)?;
-                let count = self.base.get_int32_param(self.params.pulse_count, addr)? as u64;
-                let idle = self
-                    .base
-                    .get_int32_param(self.params.pulse_idle_state, addr)?;
-                let request = PulseRequest {
-                    period,
-                    duty_cycle: duty,
-                    delay,
-                    count,
-                    idle_state: idle,
-                };
-                match pulse_gen::start(&trace, &dev, addr, &request) {
-                    Ok((actual_period, actual_duty, actual_delay)) => {
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_period,
-                            addr,
-                            actual_period,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_duty_cycle,
-                            addr,
-                            actual_duty,
-                        );
-                        let _ = self.base.set_float64_param(
-                            self.params.pulse_delay,
-                            addr,
-                            actual_delay,
-                        );
-                    }
-                    Err(e) => status |= e.code,
-                }
-            }
+            status = self.stop_pulse_generator(&trace, addr);
+            status |= self.start_pulse_generator(&trace, addr);
         }
 
         self.base.call_param_callbacks(addr)?;
