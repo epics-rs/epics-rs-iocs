@@ -36,6 +36,7 @@ pub mod state;
 pub mod stream;
 pub mod tasks;
 pub mod window;
+pub mod worker;
 
 use crate::driver::TimePix3Driver;
 use crate::http::ServalHttp;

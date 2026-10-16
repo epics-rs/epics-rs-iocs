@@ -34,13 +34,14 @@ use crate::serval;
 use crate::state::{Command, Shared};
 use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, ImageLimits, parse_tcp_path};
 use crate::window::{Configuration, RollingSumStatus};
+use crate::worker::{Generation, WorkerState};
 
 /// C's `connectionPollPeriodSec_` (ADTimePix.cpp:1471).
 const CONNECTION_POLL: Duration = Duration::from_secs(5);
 /// C's `timePixCallback` poll period (acquire.cpp:430).
 const ACQUISITION_POLL: Duration = Duration::from_millis(10);
-/// How long a stream worker waits before retrying a connection.
-const RECONNECT_WAIT: Duration = Duration::from_millis(200);
+/// C's `reconnectDelay` (serval_stream.cpp:497, histogram_io.cpp:962).
+const RECONNECT_WAIT: Duration = Duration::from_millis(1000);
 /// A read timeout the C worker does not set at all (UPSTREAM DEFECT,
 /// network_client.cpp:157): C blocks in `recv` forever and relies on another
 /// thread closing the socket underneath it, which is a use-after-close race.
@@ -1015,6 +1016,14 @@ impl StreamKind {
         }
     }
 
+    fn worker(self, s: &Shared) -> &WorkerState {
+        match self {
+            Self::PrvImg => &s.prv_img_worker,
+            Self::Img => &s.img_worker,
+            Self::PrvHst => &s.prv_hst_worker,
+        }
+    }
+
     fn path(self, s: &Shared) -> Option<String> {
         let paths = s.stream_paths();
         match self {
@@ -1025,48 +1034,60 @@ impl StreamKind {
     }
 }
 
-/// One worker: connect while an acquisition runs, decode frames, publish them.
+/// One worker. C `runJsonImageTcpWorker` / `prvHstWorkerThread`
+/// (serval_stream.cpp:483-645, histogram_io.cpp:957-1124) run once per
+/// acquisition start: they retry the connect every second until it succeeds,
+/// and a stream that ends or fails ends the run for the rest of that
+/// acquisition.
 ///
 /// C creates these threads inside `acquireStart` and never joins the one that
 /// stops itself (UPSTREAM DEFECT, acquire.cpp:625-628: `epicsThreadMustJoin` is
 /// skipped when the callback thread *is* the caller, leaking a joinable thread
 /// on every DA_IDLE stop). Here each worker is created once and parks between
-/// acquisitions.
+/// runs.
 async fn stream_worker(ctx: Arc<Ctx>, kind: StreamKind) {
+    let worker = kind.worker(&ctx.shared);
+    let mut served = None;
     loop {
-        if !ctx.shared.acquisition.monitoring() {
-            tokio::time::sleep(RECONNECT_WAIT).await;
-            continue;
+        let run = worker.wait_for_start(served);
+        served = Some(run);
+        stream_run(&ctx, kind, run).await;
+        match kind.c_functions() {
+            Some([_, thread, _]) => ctx.trace(
+                TraceMask::IO_DRIVER,
+                &adlog::log(thread, &format!("{} worker thread exiting", kind.name())),
+            ),
+            None => println!("PrvHst worker thread exiting"),
         }
-        let Some(path) = kind.path(&ctx.shared) else {
-            tokio::time::sleep(RECONNECT_WAIT).await;
-            continue;
-        };
-        let Some((host, port)) = parse_tcp_path(&path) else {
-            // A file:// channel has no stream to read.
-            tokio::time::sleep(RECONNECT_WAIT).await;
-            continue;
-        };
+    }
+}
 
-        let name = kind.name();
+async fn stream_run(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation) {
+    let worker = kind.worker(&ctx.shared);
+    let name = kind.name();
+    while worker.running(run) {
+        let Some((host, port)) = kind.path(&ctx.shared).and_then(|p| parse_tcp_path(&p)) else {
+            worker.wait_for_stop_for(run, RECONNECT_WAIT);
+            continue;
+        };
         if kind.c_functions().is_none() {
             println!("PrvHst worker thread: Attempting to connect to {host}:{port}");
         }
         let stream = match TcpStream::connect((host.as_str(), port)) {
-            Ok(s) => s,
+            Ok(stream) if worker.mark_connected(run, &stream) => stream,
+            Ok(_) => break,
             Err(_) => {
-                let msg = format!("{name} TCP failed to connect to {host}:{port}");
-                match kind.c_functions() {
-                    Some([connect, ..]) => ctx.trace(TraceMask::ERROR, &adlog::err(connect, &msg)),
-                    None => {
-                        eprintln!("ERROR | ADTimePix::prvHstConnect: {msg}");
-                        println!(
-                            "PrvHst worker thread: Connection failed, will retry in {:.1} seconds",
-                            RECONNECT_WAIT.as_secs_f64()
-                        );
+                if worker.running(run) {
+                    let msg = format!("{name} TCP failed to connect to {host}:{port}");
+                    match kind.c_functions() {
+                        Some([connect, ..]) => {
+                            ctx.trace(TraceMask::ERROR, &adlog::err(connect, &msg))
+                        }
+                        None => eprintln!("ERROR | ADTimePix::prvHstConnect: {msg}"),
                     }
                 }
-                tokio::time::sleep(RECONNECT_WAIT).await;
+                disconnected(ctx, kind);
+                worker.wait_for_stop_for(run, RECONNECT_WAIT);
                 continue;
             }
         };
@@ -1074,24 +1095,41 @@ async fn stream_worker(ctx: Arc<Ctx>, kind: StreamKind) {
         let msg = format!("{name} TCP connected to {host}:{port}");
         match kind.c_functions() {
             Some([connect, ..]) => ctx.trace(TraceMask::IO_DRIVER, &adlog::log(connect, &msg)),
-            None => {
-                println!("{msg}");
-                println!("PrvHst worker thread: Connection successful, starting data reception");
-            }
+            None => println!("{msg}"),
         }
-        read_stream(&ctx, kind, stream).await;
+        read_stream(ctx, kind, run, stream).await;
+        worker.fail(run);
+        worker.mark_disconnected(run);
+        disconnected(ctx, kind);
     }
 }
 
-async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
+/// C `prvImgDisconnect` / `imgDisconnect` / `prvHstDisconnect` closing a
+/// client (serval_stream.cpp:1648-1706, histogram_io.cpp:944-953).
+fn disconnected(ctx: &Ctx, kind: StreamKind) {
+    match kind {
+        StreamKind::PrvImg => ctx.trace(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                "void ADTimePix::prvImgDisconnect()",
+                "PrvImg TCP disconnected",
+            ),
+        ),
+        StreamKind::Img => {}
+        StreamKind::PrvHst => println!("PrvHst TCP disconnected"),
+    }
+}
+
+async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, run: Generation, mut stream: TcpStream) {
     let mut decoder = FrameDecoder::new(kind.channel());
     let mut buf = vec![0u8; 256 * 1024];
 
-    while ctx.shared.acquisition.monitoring() {
+    let worker = kind.worker(&ctx.shared);
+    while worker.running(run) {
         // C leaves the histogram socket unread while accumulation is off
         // (histogram_io.cpp:1018-1023).
         if kind == StreamKind::PrvHst && !prv_hst_accumulating(ctx).await {
-            tokio::time::sleep(PRV_HST_PAUSED_WAIT).await;
+            worker.wait_for_stop_for(run, PRV_HST_PAUSED_WAIT);
             continue;
         }
         match stream.read(&mut buf) {
@@ -1114,7 +1152,7 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
             }
         }
 
-        loop {
+        while worker.running(run) {
             if kind.channel() == Channel::Image {
                 decoder.set_image_limits(image_limits(ctx).await);
             }
@@ -3052,6 +3090,35 @@ mod tests {
         assert_eq!(o.rate, 0.0);
     }
 
+    /// A stream that ends ends the worker's run for the acquisition: C fails
+    /// the state instead of reconnecting (serval_stream.cpp:563-585).
+    #[test]
+    fn a_stream_that_ends_is_not_reconnected() {
+        let ctx = Arc::new(idle_ctx("TPX_ONE_SHOT"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let path = format!("tcp://{}", listener.local_addr().unwrap());
+        ctx.shared.set_stream_paths(Some(path), None, None);
+        assert!(ctx.shared.acquisition.begin_start());
+        assert!(ctx.shared.prv_img_worker.start());
+        let c = ctx.clone();
+        let _worker = rt::run_thread_named("TpxOneShot", move || async move {
+            stream_worker(c, StreamKind::PrvImg).await;
+        });
+
+        drop(listener.accept().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + RECONNECT_WAIT + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            assert!(listener.accept().is_err(), "the worker reconnected");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !ctx.shared
+                .prv_img_worker
+                .wait_for_connected_for(Duration::ZERO)
+        );
+    }
+
     /// C neither reads the histogram socket nor handles a frame while
     /// PrvHstAccumulationEnable is 0 (histogram_io.cpp:165-170, :1018-1023):
     /// a frame sent meanwhile waits in the socket and is taken on re-enable.
@@ -3062,14 +3129,15 @@ mod tests {
         let ctx = Arc::new(idle_ctx("TPX_HST_GATE"));
         let enable = ctx.p.prv_hst_accumulation_enable;
         ctx.set_int(enable, 0, 0).await;
-        assert!(ctx.shared.acquisition.begin_start());
+        assert!(ctx.shared.prv_hst_worker.start());
+        let run = ctx.shared.prv_hst_worker.wait_for_start(None);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let _ = client.set_read_timeout(Some(Duration::from_millis(50)));
         let (mut peer, _) = listener.accept().unwrap();
         let reader = tokio::spawn({
             let ctx = ctx.clone();
-            async move { read_stream(&ctx, StreamKind::PrvHst, client).await }
+            async move { read_stream(&ctx, StreamKind::PrvHst, run, client).await }
         });
 
         let mut bytes = br#"{"binSize":2,"binWidth":1,"binOffset":0,"frameNumber":1}"#.to_vec();

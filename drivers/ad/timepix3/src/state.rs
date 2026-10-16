@@ -15,6 +15,7 @@ use crate::accum::Accumulator;
 use crate::coordinator::Coordinator;
 use crate::family::DetectorFamily;
 use crate::rate::Rates;
+use crate::worker::WorkerState;
 
 /// What the port driver asks the background threads to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,10 @@ pub struct Shared {
     /// buffer; the driver owns it here).
     pub mask: Mutex<Vec<i32>>,
     pub streams: Mutex<StreamPaths>,
+    /// C `prvImgWorkerState_`, `imgWorkerState_`, `prvHstWorkerState_`.
+    pub prv_img_worker: WorkerState,
+    pub img_worker: WorkerState,
+    pub prv_hst_worker: WorkerState,
     orientation: AtomicI32,
     /// C `acquisitionCoordinator_`: the one owner of the acquisition phase.
     pub acquisition: Coordinator,
@@ -78,6 +83,9 @@ impl Shared {
             rates: Mutex::new(Rates::default()),
             mask: Mutex::new(Vec::new()),
             streams: Mutex::new(StreamPaths::default()),
+            prv_img_worker: WorkerState::default(),
+            img_worker: WorkerState::default(),
+            prv_hst_worker: WorkerState::default(),
             orientation: AtomicI32::new(0),
             acquisition: Coordinator::default(),
             family: AtomicI32::new(DetectorFamily::Unknown as i32),
@@ -100,6 +108,17 @@ impl Shared {
 
     pub fn stream_paths(&self) -> StreamPaths {
         self.streams.lock().clone()
+    }
+
+    pub fn stream_workers(&self) -> [&WorkerState; 3] {
+        [&self.prv_img_worker, &self.img_worker, &self.prv_hst_worker]
+    }
+
+    /// The stop half of C `stopAndJoinStreamWorkers` (acquire.cpp:159-199).
+    pub fn stop_stream_workers(&self) {
+        for worker in self.stream_workers() {
+            worker.request_stop();
+        }
     }
 
     pub fn set_orientation(&self, orientation: i32) {

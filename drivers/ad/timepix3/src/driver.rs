@@ -1389,6 +1389,8 @@ impl TimePix3Driver {
     /// reason.
     fn start_measurement(&mut self) -> Result<(), &'static str> {
         const FAILED: &str = "Failed to start acquisition";
+        // acquire.cpp:333-336: start from one known worker generation.
+        self.shared.stop_stream_workers();
         if self.mpx3_trigger_conflict(self.int(self.ad.params.trigger_mode, 0)) {
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
@@ -1471,6 +1473,7 @@ impl TimePix3Driver {
         // acquire.cpp:416.
         self.shared.rates.lock().prv_img.restart();
         self.sync_stream_endpoints()?;
+        self.start_stream_workers()?;
 
         if self.cmd_tx.try_send(Command::AcquisitionStarted).is_err() {
             return Err("Failed to create measurement monitor thread");
@@ -1524,6 +1527,46 @@ impl TimePix3Driver {
         Ok(())
     }
 
+    /// acquire.cpp:428-503: every enabled TCP channel's worker must connect
+    /// within C `startRequiredStreamWorker`'s readiness deadline
+    /// (acquisition_runtime.cpp:66-82) before the start commits.
+    fn start_stream_workers(&mut self) -> Result<(), &'static str> {
+        const READY: std::time::Duration = std::time::Duration::from_millis(5000);
+        let paths = self.shared.stream_paths();
+        let s = &self.shared;
+        for (path, worker, resource, failure) in [
+            (
+                paths.prv_img,
+                &s.prv_img_worker,
+                Resource::PreviewWorker,
+                "Preview stream did not become ready",
+            ),
+            (
+                paths.img,
+                &s.img_worker,
+                Resource::ImageWorker,
+                "Image stream did not become ready",
+            ),
+            (
+                paths.prv_hst,
+                &s.prv_hst_worker,
+                Resource::HistogramWorker,
+                "Histogram stream did not become ready",
+            ),
+        ] {
+            if !path.is_some_and(|p| p.starts_with("tcp://")) {
+                continue;
+            }
+            if !worker.start()
+                || !s.acquisition.note_resource(resource)
+                || !worker.wait_for_connected_for(READY)
+            {
+                return Err(failure);
+            }
+        }
+        Ok(())
+    }
+
     /// C `acquireStop` (acquire.cpp:696-698).
     fn acquire_stop(&mut self) -> AsynResult<()> {
         self.stop_acquisition(false, "")
@@ -1561,7 +1604,7 @@ impl TimePix3Driver {
             },
         );
 
-        // The monitor and the stream workers leave on the phase change.
+        // The monitor leaves on the phase change.
         let p = self.p;
         let had_remote = claim.snapshot.has(Resource::RemoteMeasurement);
         let mut stop_succeeded = !had_remote;
@@ -1581,6 +1624,10 @@ impl TimePix3Driver {
                     );
                 }
             }
+        }
+        // acquisition_runtime.cpp:211.
+        self.shared.stop_stream_workers();
+        if had_remote {
             match self.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
                 Ok(body) => match serval::parse_status_response(&body) {
                     Ok(m) => {
@@ -3297,11 +3344,80 @@ mod tests {
         );
     }
 
+    /// Stand in for the three stream workers: every run a start admits
+    /// connects, or fails at once when `connect` is false.
+    fn serve_workers(shared: &Arc<Shared>, connect: bool) {
+        for which in 0..3 {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let socket = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let worker = shared.stream_workers()[which];
+                let mut served = None;
+                loop {
+                    let run = worker.wait_for_start(served);
+                    served = Some(run);
+                    if connect {
+                        worker.mark_connected(run, &socket);
+                    } else {
+                        worker.fail(run);
+                    }
+                }
+            });
+        }
+    }
+
+    /// A start commits only once every enabled TCP channel's worker has
+    /// connected (acquire.cpp:428-503, acquisition_runtime.cpp:66-82); a
+    /// worker that does not fails the start, and a stop ends the runs.
+    #[test]
+    fn a_start_waits_for_its_stream_workers() {
+        let start = |name: &str, connect: bool| {
+            let shared = Arc::new(Shared::new());
+            serve_workers(&shared, connect);
+            let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+            let mut det = TimePix3Driver::new(
+                name,
+                Arc::new(ServalHttp::new(&fake_serval("/server/destination"))),
+                shared.clone(),
+                0,
+                cmd_tx,
+            )
+            .unwrap();
+            let p = det.p;
+            det.ad
+                .port_base
+                .set_int32_param(p.write_prv_img, 0, 1)
+                .unwrap();
+            det.set_text(p.prv_img_base, "tcp://localhost:8089")
+                .unwrap();
+            let started = det
+                .write_int32(&mut AsynUser::new(det.ad.params.acquire), 1)
+                .is_ok();
+            (det, shared, started)
+        };
+
+        let (mut det, shared, started) = start("TPX_READY_OK", true);
+        assert!(started);
+        assert!(shared.prv_img_worker.connected());
+        det.write_int32(&mut AsynUser::new(det.ad.params.acquire), 0)
+            .unwrap();
+        assert!(!shared.prv_img_worker.connected());
+
+        let (det, _, started) = start("TPX_READY_FAIL", false);
+        assert!(!started);
+        assert_eq!(
+            det.text(det.ad.params.status_message, 0),
+            "Preview stream did not become ready"
+        );
+    }
+
     /// A start sends no configuration; the workers take the enabled
     /// channels' Base PVs (acquire.cpp:313-535, :201-223).
     #[test]
     fn a_start_sends_no_configuration_and_syncs_the_streams() {
         let shared = Arc::new(Shared::new());
+        serve_workers(&shared, true);
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
         let mut det = TimePix3Driver::new(
             "TPX_START_SYNC",
@@ -3336,6 +3452,7 @@ mod tests {
     fn a_start_gates_the_img_and_prv_hst_workers() {
         let start = |name: &str, img_acc: i32, format: i32, hst_acc: i32, hst: &str| {
             let shared = Arc::new(Shared::new());
+            serve_workers(&shared, true);
             let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
             let mut det = TimePix3Driver::new(
                 name,
