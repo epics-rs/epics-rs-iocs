@@ -457,13 +457,14 @@ impl AmptekDriver {
 
     /// `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "...\n")`.
     fn trace_error(&self, msg: &str) {
-        self.base.trace_print(TraceMask::ERROR, &format!("{msg}\n"));
+        self.base
+            .trace_print(TraceMask::ERROR, format_args!("{msg}"));
     }
 
     /// `asynPrint(pasynUserSelf, ASYN_TRACEIO_DRIVER, "...\n")`.
     fn trace_io(&self, msg: &str) {
         self.base
-            .trace_print(TraceMask::IO_DRIVER, &format!("{msg}\n"));
+            .trace_print(TraceMask::IO_DRIVER, format_args!("{msg}"));
     }
 
     /// The disconnect transition itself, shared by [`PortDriver::disconnect`]
