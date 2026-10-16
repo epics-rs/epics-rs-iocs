@@ -1089,7 +1089,7 @@ impl PortDriver for TimePix3Driver {
                     .set_int32_param(self.ad.params.trigger_mode, 0, 4)?;
                 self.set_text(self.ad.params.status_message, MPX3_TRIGGER_MSG)?;
             }
-            // Single image mode carries exactly one image (C ADTimePix.cpp:519).
+            // Single image mode carries exactly one image (C ADTimePix.cpp:716-724).
             if reason == self.ad.params.num_images
                 && self.int(self.ad.params.image_mode, 0) == 0
                 && value != 1
@@ -1097,6 +1097,9 @@ impl PortDriver for TimePix3Driver {
                 self.ad
                     .port_base
                     .set_int32_param(self.ad.params.num_images, 0, 1)?;
+                self.log_write_int32(&format!(
+                    "Ignoring NumImages={value} in single mode, forcing NumImages=1"
+                ));
             }
             self.init_acquisition()
         } else if reason == self.ad.params.image_mode {
@@ -1375,6 +1378,51 @@ impl PortDriver for TimePix3Driver {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// A NumImages write in single mode is clamped to 1 and says so on
+    /// ASYN_TRACEIO_DRIVER (ADTimePix.cpp:716-724).
+    #[test]
+    fn a_single_mode_num_images_write_logs_the_clamp() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_NUM_IMAGES_LOG";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let ad = det.ad.params;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_int32_blocking(ad.image_mode, 0, 0).ok();
+        h.write_int32_blocking(ad.num_images, 0, 5).ok();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(h.read_int32_blocking(ad.num_images, 0).unwrap(), 1);
+        assert!(
+            text.contains("Ignoring NumImages=5 in single mode, forcing NumImages=1"),
+            "{text:?}"
+        );
+        std::mem::forget(runtime);
+    }
 
     /// An image frame read before the first frame, and a pixel-config diff
     /// shorter than the waveform, both come back as nElements zero-filled
