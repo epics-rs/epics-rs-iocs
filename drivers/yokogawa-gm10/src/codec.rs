@@ -79,9 +79,9 @@ pub fn cmd_ocmdrelay(channel: u32, on: bool) -> String {
 pub fn cmd_orec_set(on: bool) -> String {
     format!("ORec,{}\r\n", if on { '1' } else { '0' })
 }
-/// `set_mode(CMD_SET_COMPUTE, ...)` (`drvGM10.c:1222`): `value` is 0-3.
+/// `set_mode(CMD_SET_COMPUTE, ...)` (`drvGM10.c:1222`): `mode` is 0-3.
 pub fn cmd_omath_set(mode: u8) -> String {
-    format!("OMath,{}\r\n", (b'0' + (mode & 0x3)) as char)
+    format!("OMath,{}\r\n", (b'0' + mode) as char)
 }
 pub fn cmd_oerrorclear() -> String {
     "OErrorClear,0\r\n".to_string()

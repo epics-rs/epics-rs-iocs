@@ -84,8 +84,8 @@ pub enum Command {
     SetConst(u32, f64),
     SetVarConst(u32, f64),
     SetBinaryOutput(u32, bool),
-    SetOpMode(bool),
-    SetCompute(u8),
+    SetOpMode(u16),
+    SetCompute(u16),
     ClearError,
     AcknowledgeAlarms,
 }
@@ -467,8 +467,10 @@ impl Actor {
             Command::SetConst(ch, value) => self.set_output_value(&cmd_skconst_set(ch, value)),
             Command::SetVarConst(ch, value) => self.set_output_value(&cmd_swconst_set(ch, value)),
             Command::SetBinaryOutput(ch, on) => self.set_binary_value(ch, on),
-            Command::SetOpMode(on) => self.set_output_value(&cmd_orec_set(on)),
-            Command::SetCompute(mode) => self.set_output_value(&cmd_omath_set(mode)),
+            // `set_mode` sends nothing outside 0..1 / 0..3 (`drvGM10.c:1209-1224`).
+            Command::SetOpMode(v @ 0..=1) => self.set_output_value(&cmd_orec_set(v == 1)),
+            Command::SetCompute(v @ 0..=3) => self.set_output_value(&cmd_omath_set(v as u8)),
+            Command::SetOpMode(_) | Command::SetCompute(_) => Ok(()),
             Command::ClearError => self.clear_error(),
             Command::AcknowledgeAlarms => self.acknowledge_alarms(),
         }
@@ -1104,5 +1106,25 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), -1);
         let received = device.join().unwrap();
         assert_eq!(received.last().unwrap(), "OErrorClear,0\r\n");
+    }
+
+    #[test]
+    fn set_mode_out_of_range_sends_nothing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(b"E0\r\n".to_vec());
+        responses.push(b"E0\r\n".to_vec());
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::SetOpMode(2));
+        instrument.submit(Command::SetCompute(4));
+        instrument.submit(Command::SetCompute(3));
+        instrument.submit(Command::SetOpMode(1));
+        let received = device.join().unwrap();
+        assert_eq!(
+            received[received.len() - 2..],
+            ["OMath,3\r\n", "ORec,1\r\n"]
+        );
     }
 }

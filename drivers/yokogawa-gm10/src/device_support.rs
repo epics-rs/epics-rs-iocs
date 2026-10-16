@@ -726,17 +726,17 @@ impl GmDevice {
             Operation::InfoTrig => Command::ReadAllInfos,
             Operation::StatTrig => Command::ReadStatus,
             Operation::RecordingModeSet => {
-                let on = match record.get_field("VAL") {
-                    Some(EpicsValue::Enum(v)) => v != 0,
+                let v = match record.get_field("VAL") {
+                    Some(EpicsValue::Enum(v)) => v,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                Command::SetOpMode(on)
+                Command::SetOpMode(v)
             }
             Operation::ErrorClearSet => Command::ClearError,
             Operation::AlarmAckSet => Command::AcknowledgeAlarms,
             Operation::ComputeCmdSet => {
                 let v = match record.get_field("VAL") {
-                    Some(EpicsValue::Enum(v)) => v as u8,
+                    Some(EpicsValue::Enum(v)) => v,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
                 Command::SetCompute(v)
