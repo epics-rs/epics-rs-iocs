@@ -133,6 +133,9 @@ pub struct CorvusAxis {
     /// 0-based axis index (command prefix uses `axis_no + 1`).
     axis_no: usize,
     num_axes: usize,
+    /// What the last poll left: C keeps every parameter a poll did not
+    /// write (asynMotorAxis params persist across polls).
+    last_status: MotorStatus,
 }
 
 impl CorvusAxis {
@@ -152,6 +155,10 @@ impl CorvusAxis {
             controller,
             axis_no,
             num_axes,
+            last_status: MotorStatus {
+                has_encoder: true,
+                ..MotorStatus::default()
+            },
         })
     }
 
@@ -274,18 +281,40 @@ impl AsynMotor for CorvusAxis {
         Ok(())
     }
 
+    /// C `SMCcorvusAxis::poll`: a failed exchange skips the rest and sets
+    /// only Problem; C's poller ignores the returned error, so no COMM_ERR.
+    /// Problem is set from the comm status alone, overwriting the drive-off
+    /// problem (SMCcorvusDriver.cpp:473-477).
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
+        let mut status = self.last_status.clone();
+        status.problem = self.poll_into(&mut status).is_err();
+        self.last_status = status.clone();
+        Ok(status)
+    }
+}
+
+impl CorvusAxis {
+    /// Write each field as C sets its parameter, in C's order.
+    fn poll_into(&self, status: &mut MotorStatus) -> AsynResult<()> {
         let ctrl = self.lock();
 
-        let position = ctrl.read_positions()?[self.axis_no];
+        // C sscanf's into locals: a short reply leaves the position unset.
+        let reply = ctrl.query("pos")?;
+        if let Some(position) = reply
+            .split_whitespace()
+            .filter_map(|tok| tok.parse::<f64>().ok())
+            .nth(self.axis_no)
+        {
+            status.position = position;
+            status.encoder_position = position;
+        }
 
-        let status = atoi(&ctrl.query("st")?);
-        let moving = (status & STATUS_MOVING) != 0;
+        let moving = (atoi(&ctrl.query("st")?) & STATUS_MOVING) != 0;
+        status.done = !moving;
+        status.moving = moving;
 
-        let mut high_limit = false;
-        let mut low_limit = false;
-        let mut powered = true;
-        let mut problem = false;
+        // Limits and drive current are not read while moving (it would block
+        // the controller's interpreter); they keep the last poll's values.
         if !moving {
             // Switch config: bit 1 (0x2) masks (disables) the switch.
             let sw = ctrl.query(&format!("{} getsw", self.axis_no + 1))?;
@@ -305,30 +334,14 @@ impl AsynMotor for CorvusAxis {
                 .filter_map(|tok| tok.parse::<i32>().ok())
                 .collect();
             if let [low, high, ..] = state.as_slice() {
-                low_limit = ignore_low == 0 && *low != 0;
-                high_limit = ignore_high == 0 && *high != 0;
+                status.low_limit = ignore_low == 0 && *low != 0;
+                status.high_limit = ignore_high == 0 && *high != 0;
             }
 
-            // Drive current enabled?
             let drive_on = atoi(&ctrl.query(&format!("{} getmp", self.axis_no + 1))?);
-            powered = drive_on != 0;
-            problem = drive_on == 0;
+            status.powered = drive_on != 0;
         }
-        drop(ctrl);
-
-        Ok(MotorStatus {
-            position,
-            encoder_position: position,
-            velocity: 0.0,
-            done: !moving,
-            moving,
-            has_encoder: true,
-            high_limit,
-            low_limit,
-            powered,
-            problem,
-            ..MotorStatus::default()
-        })
+        Ok(())
     }
 }
 
