@@ -25,20 +25,19 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- MDT695 controller ----
-# MDT695Setup(maxControllers, [scanRate]) is accepted for startup-script parity;
-# the asyn-rs port allocates per MDT695Config call.
+# MDT695Setup(num_cards, scan_rate in Hz)
 MDT695Setup(1, 10)
 
-# MDT695Config(card, asynPort, [movingPollMs], [idlePollMs]) - the axis count
+# MDT695Config(card, asyn port) - the axis count
 # (1 for MDT694, else 3) is read from the controller.
-MDT695Config(0, "$(SERIAL)", 100, 1000)
+MDT695Config(0, "$(SERIAL)")
 
-# One motor record per channel (DTYP MDT695_$(CARD)_0, _1, _2). The controller
+# One motor record per channel (DTYP "MDT695", OUT #C$(CARD) S0, S1, ...). The controller
 # works in volts (EGU = V) at a 0.1 V step (MRES). Load only as many channels as the
 # controller has (3 for MDT693/695, 1 for MDT694).
-dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=x,N=0,CARD=$(CARD)")
-dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=y,N=1,CARD=$(CARD)")
-dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=z,N=2,CARD=$(CARD)")
+dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=x,C=$(CARD),S=0")
+dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=y,C=$(CARD),S=1")
+dbLoadRecords("$(THORLABS_IOC)/db/mdt695.template", "P=$(P),M=z,C=$(CARD),S=2")
 
 iocInit()
 
