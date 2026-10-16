@@ -74,10 +74,8 @@
 //!   whose content is never inspected anywhere in the driver, only its
 //!   `asynStatus` (which is itself discarded by the `eventThread` caller).
 //!   The four-arg overload (STOP/START/CLEAR_ALL/SET_COUNT_PRESET) does a
-//!   single `writeRead` only. [`Scaler974Driver::poll_loop`] reproduces the
-//!   two-read shape (draining the second reply so a persistent connection's
-//!   line framing stays in sync) without inspecting its content;
-//!   [`Scaler974Driver::send`] does one write + one read.
+//!   single `writeRead` only. Both go through [`send_command`], which
+//!   reads the second reply without inspecting it.
 //! - **The `timeOut` macro (`drvScaler974.cpp:24`, `0.1`) is dead code** —
 //!   never referenced anywhere in the file. The only timeout actually used
 //!   is the local `double timeout = 1.0` inside `sendCommand`, applied to
@@ -96,13 +94,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use epics_rs::asyn::error::AsynError;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::scaler::MAX_SCALER_CHANNELS;
 use epics_rs::scaler::device_support::scaler_asyn::{DoneInterrupt, DoneParam, ScalerDriver};
 
-use crate::wire::{encode_set_count_preset, parse_show_counts};
+use crate::wire::{encode_set_count_preset, scan_show_counts};
 
 /// asyn reason used for octet transactions against the underlying serial
 /// port (mirrors `delaygen::wire::OCTET_REASON`/`love`'s `OCTET_REASON`).
@@ -182,39 +180,37 @@ impl Scaler974Driver {
     /// the single-read overload used by STOP/START/CLEAR_ALL/
     /// SET_COUNT_PRESET.
     fn send(&self, command: &str) -> CaResult<()> {
-        self.handle
-            .write_octet(OCTET_REASON, command.as_bytes())
-            .map_err(asyn_to_ca)?;
-        self.handle
-            .read_octet(OCTET_REASON, COMMAND_REPLY_BUF)
-            .map_err(asyn_to_ca)?;
-        Ok(())
+        let mut status = Vec::new();
+        send_command(&self.handle, command, &mut status, COMMAND_REPLY_BUF, None)
+            .map_err(asyn_to_ca)
     }
 
-    /// C `eventThread` (`drvScaler974.cpp:217-254`).
+    /// C `eventThread` (`drvScaler974.cpp:217-254`). `response` and
+    /// `counts` are the thread's locals there, declared outside the loop:
+    /// a failed `SHOW_COUNTS` leaves both as the last poll left them, so
+    /// the record keeps its counts while the port is down.
     fn poll_loop(
         handle: SyncIOHandle,
         state: Arc<Mutex<PollState>>,
         start_rx: mpsc::Receiver<()>,
         poll_interval: Duration,
     ) {
+        let mut response = Vec::new();
+        let mut counts = [0i32; MAX_CHANNELS];
         while start_rx.recv().is_ok() {
             loop {
-                // C's six-arg sendCommand("SHOW_COUNTS", ...): a writeRead
-                // into the data buffer, then a second, separate read into a
-                // status buffer whose content is never inspected. Both
-                // asynStatus results are discarded here too, matching
-                // `eventThread` never checking `status`.
-                let _ = handle.write_octet(OCTET_REASON, b"SHOW_COUNTS");
-                let data = handle
-                    .read_octet(OCTET_REASON, SHOW_COUNTS_DATA_BUF)
-                    .unwrap_or_default();
-                let _ = handle.read_octet(OCTET_REASON, SHOW_COUNTS_STATUS_BUF);
-
-                let parsed = parse_show_counts(&data);
+                // `eventThread` never checks the status.
+                let _ = send_command(
+                    &handle,
+                    "SHOW_COUNTS",
+                    &mut response,
+                    SHOW_COUNTS_DATA_BUF,
+                    Some(SHOW_COUNTS_STATUS_BUF),
+                );
+                scan_show_counts(&response, &mut counts);
                 let done = {
                     let mut st = state.lock().unwrap();
-                    let done = apply_poll_result(&mut st, parsed);
+                    let done = apply_poll_result(&mut st, counts);
                     st.done.call_callbacks();
                     done
                 };
@@ -226,6 +222,24 @@ impl Scaler974Driver {
             }
         }
     }
+}
+
+/// C `Scaler974::sendCommand` (`drvScaler974.cpp:103-127`): a `writeRead`
+/// into `reply`, which a failure leaves untouched; with `status_read`, a
+/// second `read` (the `SHOW_COUNTS` status line, never inspected) only
+/// after the `writeRead` succeeded.
+fn send_command(
+    handle: &SyncIOHandle,
+    command: &str,
+    reply: &mut Vec<u8>,
+    reply_buf: usize,
+    status_read: Option<usize>,
+) -> AsynResult<()> {
+    *reply = handle.write_read(OCTET_REASON, command.as_bytes(), reply_buf)?;
+    if let Some(status_buf) = status_read {
+        handle.read_octet(OCTET_REASON, status_buf)?;
+    }
+    Ok(())
 }
 
 /// C `eventThread`'s per-iteration state update (`drvScaler974.cpp:239-249`):
