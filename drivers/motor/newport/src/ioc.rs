@@ -22,8 +22,8 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::{claim_port, get_port};
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::iocsh::registry::*;
@@ -114,12 +114,7 @@ static NEXT_SOCKET: AtomicUsize = AtomicUsize::new(0);
 /// C `ConnectToServer` (asynOctetSocket.cpp:60): asyn IP port
 /// `ip:port:N` from `drvAsynIPPortConfigure(name, "ip:port TCP", 0, 0, 1)`.
 /// `None` is C's -1, printed as C prints it.
-fn connect_to_server(
-    ctx: &CommandContext,
-    ip: &str,
-    ip_port: i32,
-    timeout: Duration,
-) -> Option<SyncIOHandle> {
+fn connect_to_server(ctx: &CommandContext, ip: &str, ip_port: i32) -> Option<PortHandle> {
     let socket = NEXT_SOCKET.load(Ordering::Relaxed);
     if socket >= MAX_SOCKETS {
         println!("ConnectToServer: too many open sockets, max={MAX_SOCKETS}");
@@ -158,11 +153,7 @@ fn connect_to_server(
         return None;
     };
     NEXT_SOCKET.store(socket + 1, Ordering::Relaxed);
-    Some(SyncIOHandle::from_handle(
-        handle.port_handle().clone(),
-        0,
-        timeout,
-    ))
+    Some(handle.port_handle().clone())
 }
 
 /// `SMC100CreateController(portName, SMC100PortName, numAxes,
@@ -472,14 +463,20 @@ pub fn xps_create_controller_command() -> CommandDef {
             let settling = Duration::from_millis(c_int(args, 7).max(0) as u64);
 
             register_port(ctx, &port_name, c_int(args, 3))?;
-            let poll = connect_to_server(ctx, &ip, ip_port, XPS_POLL_TIMEOUT);
+            let poll = connect_to_server(ctx, &ip, ip_port);
             if poll.is_none() {
                 println!(
                     "XPSController:XPSController: error calling TCP_ConnectToServer for pollSocket"
                 );
             }
-            let profile_sock = connect_to_server(ctx, &ip, ip_port, XPS_PVT_EXEC_TIMEOUT)
-                .map(|handle| Arc::new(XpsSocket::new(handle, &port_name, SocketMode::Query)));
+            let profile_sock = connect_to_server(ctx, &ip, ip_port).map(|handle| {
+                Arc::new(XpsSocket::new(
+                    handle,
+                    &port_name,
+                    SocketMode::Query,
+                    XPS_PVT_EXEC_TIMEOUT,
+                ))
+            });
             if profile_sock.is_none() {
                 println!(
                     "XPSController:XPSController: error calling TCP_ConnectToServer for moveSocket"
@@ -488,7 +485,7 @@ pub fn xps_create_controller_command() -> CommandDef {
             let controller = match poll {
                 Some(handle) => Some(Arc::new(Mutex::new(
                     XpsController::new(
-                        XpsSocket::new(handle, &port_name, SocketMode::Query),
+                        XpsSocket::new(handle, &port_name, SocketMode::Query, XPS_POLL_TIMEOUT),
                         enable_set_position,
                         settling,
                     )
@@ -547,14 +544,14 @@ pub fn xps_create_axis_command() -> CommandDef {
             else {
                 return Ok(CommandOutcome::Continue);
             };
-            let Some(handle) = connect_to_server(ctx, &ip, ip_port, XPS_MOVE_TIMEOUT) else {
+            let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
                 println!("XPSAxis:XPSAxis: error calling TCP_ConnectToServer for move socket");
                 return Ok(CommandOutcome::Continue);
             };
             let Some(controller) = controller else {
                 return Ok(CommandOutcome::Continue);
             };
-            let move_sock = XpsSocket::new(handle, &port_name, SocketMode::Fire);
+            let move_sock = XpsSocket::new(handle, &port_name, SocketMode::Fire, XPS_MOVE_TIMEOUT);
             let ax = XpsAxis::new(
                 controller,
                 move_sock,
@@ -612,6 +609,12 @@ pub fn xps_disable_auto_enable_command() -> CommandDef {
 /// the MSTA problem bit.
 pub fn xps_no_disable_error_command() -> CommandDef {
     xps_controller_flag_command("XPSNoDisableError", XpsController::set_no_disable_error)
+}
+
+/// `XPSEnableMovingMode(portName)`: an axis's move is done when its move
+/// socket answers, so one axis can move while another in its group moves.
+pub fn xps_enable_moving_mode_command() -> CommandDef {
+    xps_controller_flag_command("XPSEnableMovingMode", XpsController::set_moving_mode)
 }
 
 /// A one-argument command that sets a flag on a registered XPS controller.
@@ -1247,23 +1250,24 @@ pub fn hxp_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
             register_port(ctx, &port_name, NUM_HXP_AXES as i32)?;
-            let Some(handle) = connect_to_server(ctx, &ip, ip_port, HXP_POLL_TIMEOUT) else {
+            let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
                 println!(
                     "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"
                 );
                 return Ok(CommandOutcome::Continue);
             };
-            let poll_sock = XpsSocket::new(handle, &port_name, SocketMode::Query);
+            let poll_sock = XpsSocket::new(handle, &port_name, SocketMode::Query, HXP_POLL_TIMEOUT);
             // One group poll serves all six axis polls per period: cache for
             // half the fastest poll interval.
             let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
             let controller = Arc::new(Mutex::new(HxpController::new(poll_sock, cache_ttl)));
 
             for axis_no in 0..NUM_HXP_AXES {
-                let Some(handle) = connect_to_server(ctx, &ip, ip_port, HXP_MOVE_TIMEOUT) else {
+                let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
                     continue;
                 };
-                let move_sock = XpsSocket::new(handle, &port_name, SocketMode::Fire);
+                let move_sock =
+                    XpsSocket::new(handle, &port_name, SocketMode::Fire, HXP_MOVE_TIMEOUT);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(HxpAxis::new(
                     controller.clone(),
                     move_sock,
@@ -1278,7 +1282,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 )?;
             }
 
-            let Some(handle) = connect_to_server(ctx, &ip, ip_port, HXP_MOVE_TIMEOUT) else {
+            let Some(handle) = connect_to_server(ctx, &ip, ip_port) else {
                 return Ok(CommandOutcome::Continue);
             };
             HXP_CONTROLLERS
@@ -1287,7 +1291,12 @@ pub fn hxp_create_controller_command() -> CommandDef {
                 .push(HxpRegistration {
                     port_name: port_name.clone(),
                     controller,
-                    move_sock: XpsSocket::new(handle, &port_name, SocketMode::Fire),
+                    move_sock: XpsSocket::new(
+                        handle,
+                        &port_name,
+                        SocketMode::Fire,
+                        HXP_MOVE_TIMEOUT,
+                    ),
                 });
             Ok(CommandOutcome::Continue)
         },

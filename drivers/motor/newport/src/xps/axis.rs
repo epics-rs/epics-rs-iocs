@@ -75,6 +75,9 @@ pub struct XpsAxis {
     /// Last group status code seen by [`poll`](AsynMotor::poll); `move` reads it
     /// to decide whether to auto-enable a disabled axis.
     axis_status: i32,
+    /// C `moving_`: set by a move this axis sent; in moving mode only the
+    /// move socket's answer or a stopped group clears it.
+    moving: bool,
     /// The status the last poll left, C's parameter-library values.
     last_status: MotorStatus,
     /// C's `pasynUser_`: the motor port and axis number every error line
@@ -125,6 +128,7 @@ impl XpsAxis {
             min_jerk,
             max_jerk,
             axis_status: 0,
+            moving: false,
             last_status: MotorStatus {
                 gain_support: true,
                 has_encoder: true,
@@ -463,7 +467,9 @@ impl AsynMotor for XpsAxis {
             "GroupMoveAbsolute",
             self.move_sock
                 .group_move_absolute(&self.positioner_name, device_units),
-        )
+        )?;
+        self.moving = true;
+        Ok(())
     }
 
     fn move_relative(
@@ -485,7 +491,9 @@ impl AsynMotor for XpsAxis {
             "GroupMoveRelative",
             self.move_sock
                 .group_move_relative(&self.positioner_name, device_units),
-        )
+        )?;
+        self.moving = true;
+        Ok(())
     }
 
     fn move_velocity(
@@ -519,6 +527,7 @@ impl AsynMotor for XpsAxis {
                 acceleration * self.step_size,
             )
             .inspect_err(|e| jog_error("GroupJogParametersSet", e))?;
+        self.moving = true;
         Ok(())
     }
 
@@ -565,6 +574,7 @@ impl AsynMotor for XpsAxis {
             home_error(&self.lock_controller(), "GroupHomeSearch", &e);
             return Err(e.into());
         }
+        self.moving = true;
         Ok(())
     }
 
@@ -951,7 +961,18 @@ impl XpsAxis {
             .and_then(|code| sock.group_status_string_get(code).map(|_| code))
             .inspect_err(|e| poll_error("GroupStatusGet", e))?;
         let flags = StatusFlags::from_status(axis_status);
-        status.done = !flags.group_moving;
+        // C reads the group state for every axis in the group; moving mode
+        // instead waits for this axis's move socket to answer the move.
+        let moving_mode = ctrl.moving_mode();
+        if !flags.group_moving {
+            self.moving = false;
+        } else if !moving_mode {
+            self.moving = true;
+        }
+        if moving_mode && self.moving && self.move_sock.read_pending() > 0 {
+            self.moving = false;
+        }
+        status.done = !self.moving;
 
         // A TCL script may change the soft limits; C re-reads them each poll
         // and ignores a failure.
@@ -1045,6 +1066,115 @@ mod tests {
             })
             .collect();
         (axes, line.fail.clone(), line.log.clone())
+    }
+
+    /// A group in state 44 (moving) whose move replies wait until `answer`.
+    struct LateMoveXps {
+        base: epics_rs::asyn::port::PortDriverBase,
+        reply: Option<String>,
+        answer: Arc<Mutex<bool>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for LateMoveXps {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data);
+            self.reply = match cmd.split('(').next().unwrap_or("").trim() {
+                "GroupMoveAbsolute" => None,
+                "GroupStatusGet" => Some("0,44,EndOfAPI".into()),
+                _ => Some("0,0,EndOfAPI".into()),
+            };
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = self
+                .reply
+                .take()
+                .or_else(|| {
+                    std::mem::take(&mut *self.answer.lock().unwrap()).then(|| "0,EndOfAPI".into())
+                })
+                .ok_or_else(|| AsynError::Status {
+                    status: AsynStatus::Timeout,
+                    message: "no reply".into(),
+                })?;
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok(reply.len())
+        }
+    }
+
+    /// Two axes of one moving group; the first has sent a move.
+    fn late_move_axes(port: &str, moving_mode: bool) -> (XpsAxis, XpsAxis, Arc<Mutex<bool>>) {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let answer = Arc::new(Mutex::new(false));
+        let line = LateMoveXps {
+            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            reply: None,
+            answer: answer.clone(),
+        };
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
+                .unwrap();
+        let socket = |mode| {
+            XpsSocket::new(
+                rt.port_handle().clone(),
+                port,
+                mode,
+                Duration::from_millis(100),
+            )
+        };
+        let controller = Arc::new(Mutex::new(
+            XpsController::new(socket(SocketMode::Query), false, Duration::ZERO).unwrap(),
+        ));
+        if moving_mode {
+            controller.lock().unwrap().set_moving_mode();
+        }
+        let axis = |n, p| {
+            XpsAxis::new(
+                controller.clone(),
+                socket(SocketMode::Fire),
+                port,
+                n,
+                p,
+                1.0,
+            )
+        };
+        let (mut mover, other) = (axis(0, "G1.P1"), axis(1, "G1.P2"));
+        let user = AsynUser::new(0);
+        mover.move_absolute(&user, 1.0, 0.0, 1.0, 1.0).unwrap();
+        (mover, other, answer)
+    }
+
+    /// C `XPSAxis::poll` with `enableMovingMode_`: the mover is done when its
+    /// move socket answers, and a group mate that sent nothing is not moving.
+    #[test]
+    fn moving_mode_waits_for_the_move_socket_not_the_group() {
+        let (mut mover, mut other, answer) = late_move_axes("xps_moving_mode", true);
+        let user = AsynUser::new(0);
+        assert!(!mover.poll(&user).unwrap().done);
+        assert!(other.poll(&user).unwrap().done);
+        *answer.lock().unwrap() = true;
+        assert!(mover.poll(&user).unwrap().done);
+        assert!(mover.poll(&user).unwrap().done);
+    }
+
+    /// Without moving mode every axis of a moving group is moving, and the
+    /// move socket is not read.
+    #[test]
+    fn without_moving_mode_the_group_state_decides() {
+        let (mut mover, mut other, answer) = late_move_axes("xps_group_mode", false);
+        let user = AsynUser::new(0);
+        *answer.lock().unwrap() = true;
+        assert!(!mover.poll(&user).unwrap().done);
+        assert!(!other.poll(&user).unwrap().done);
+        assert!(*answer.lock().unwrap());
     }
 
     /// C `XPSAxis::poll` (`done:`, XPSAxis.cpp:755-758): a failed call raises

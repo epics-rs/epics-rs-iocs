@@ -8,7 +8,6 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
-use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use super::rpc::{SocketMode, XpsSocket};
@@ -86,9 +85,12 @@ impl FakeLine {
     }
 
     pub fn socket(&self, mode: SocketMode) -> XpsSocket {
-        let io =
-            SyncIOHandle::from_handle(self.rt.port_handle().clone(), 0, Duration::from_secs(1));
-        XpsSocket::new(io, &self.port, mode)
+        XpsSocket::new(
+            self.rt.port_handle().clone(),
+            &self.port,
+            mode,
+            Duration::from_secs(1),
+        )
     }
 
     /// The commands sent since the last call.

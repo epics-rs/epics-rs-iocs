@@ -28,9 +28,11 @@
 //! register a plain `drvAsynIPPort` per socket.
 
 use std::fmt;
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::manager::PortManager;
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 
@@ -190,6 +192,8 @@ pub enum SocketMode {
 /// [`Fire`]: SocketMode::Fire
 pub struct XpsSocket {
     handle: SyncIOHandle,
+    /// The same port at timeout 0, for [`read_pending`](Self::read_pending).
+    pending: SyncIOHandle,
     /// The asyn port `handle` is connected to: C prints its `SendAndReceive`
     /// errors on that port's user.
     port: String,
@@ -197,11 +201,12 @@ pub struct XpsSocket {
 }
 
 impl XpsSocket {
-    /// Wrap an already-connected octet handle on asyn port `port` with the
-    /// given send mode.
-    pub fn new(handle: SyncIOHandle, port: &str, mode: SocketMode) -> Self {
+    /// Wrap the connected octet port `handle`, named `port`, with the given
+    /// send mode and per-call timeout.
+    pub fn new(handle: PortHandle, port: &str, mode: SocketMode, timeout: Duration) -> Self {
         Self {
-            handle,
+            pending: SyncIOHandle::from_handle(handle.clone(), 0, Duration::ZERO),
+            handle: SyncIOHandle::from_handle(handle, 0, timeout),
             port: port.to_string(),
             mode,
         }
@@ -235,6 +240,22 @@ impl XpsSocket {
                 Ok(XpsReply("0".to_string()))
             }
         }
+    }
+
+    /// C `ReadXPSSocket(socket, ..., 0)`: whatever reply is already waiting,
+    /// read until the terminator or the first read that does not succeed.
+    /// Returns the byte count.
+    pub fn read_pending(&self) -> usize {
+        let mut buf = Vec::new();
+        while !buf.ends_with(XPS_TERMINATOR.as_bytes()) && buf.len() < MAX_REPLY {
+            match self.pending.read_octet(OCTET_REASON, READ_BUF) {
+                // A zero-byte success is the peer closing; C's next read
+                // fails on the closed socket.
+                Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        buf.len()
     }
 
     /// This socket's send mode.
@@ -502,12 +523,12 @@ mod tests {
             RuntimeConfig::default(),
         )
         .unwrap();
-        let io = SyncIOHandle::from_handle(
+        let sock = XpsSocket::new(
             rt.port_handle().clone(),
-            0,
-            std::time::Duration::from_millis(100),
+            port,
+            SocketMode::Fire,
+            Duration::from_millis(100),
         );
-        let sock = XpsSocket::new(io, port, SocketMode::Fire);
         sock.group_move_absolute("G1.P1", 1.0).unwrap();
     }
 
