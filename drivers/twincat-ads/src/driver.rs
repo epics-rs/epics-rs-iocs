@@ -909,15 +909,13 @@ impl AdsShared {
                     Ok(data) => {
                         self.publish(reason, data, plc_time);
                     }
-                    Err(_) => {
-                        self.print(
-                            TraceMask::ERROR,
-                            format_args!(
-                                "{DRIVER_NAME}:bulkReadThread: bulk read for {drv_info} ({slot}) failed"
-                            ),
-                        );
-                        self.alarm(reason, alarm_status::READ_ALARM, INVALID_ALARM);
-                    }
+                    // C only reports it: the record keeps its last sample.
+                    Err(_) => self.print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "{DRIVER_NAME}:bulkReadThread: bulk read for {drv_info} ({slot}) failed"
+                        ),
+                    ),
                 }
             }
         }
