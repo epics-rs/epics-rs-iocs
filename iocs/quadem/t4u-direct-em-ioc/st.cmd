@@ -8,7 +8,6 @@
 # Port of quadEM iocBoot/iocT4UDirect_EM/st.cmd + T4UDirect_EM.cmd. dbLoadDatabase and
 # registerRecordDeviceDriver have no epics-rs counterpart; $(QUADEM) is set
 # to iocs/quadem by ioc_support.
-# TEMPLATE is T4UDirect_EM: the port splits QE_WSMODE/QE_RPP out of T4U_EM.template.
 #============================================================
 
 errlogInit(5000)
@@ -19,7 +18,7 @@ epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db:$(QUADEM)/db")
 epicsEnvSet("PREFIX",    "QE1_")
 epicsEnvSet("RECORD",    "T4U_EM_")
 epicsEnvSet("PORT",      "T4U_EM")
-epicsEnvSet("TEMPLATE",  "T4UDirect_EM")
+epicsEnvSet("TEMPLATE",  "T4U_EM")
 epicsEnvSet("QSIZE",     "20")
 epicsEnvSet("RING_SIZE", "10000")
 epicsEnvSet("TSPOINTS",  "5000")
