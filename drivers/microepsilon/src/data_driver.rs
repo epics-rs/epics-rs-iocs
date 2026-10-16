@@ -635,11 +635,10 @@ pub fn configure(
     ip_port: &str,
     owner: &Arc<InterruptGate>,
 ) -> AsynResult<()> {
+    // C prints and returns; the startup script goes on.
     if port_name.is_empty() || ip_address.is_empty() {
-        return Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: "Required argument not present".into(),
-        });
+        println!("Required argument not present");
+        return Ok(());
     }
     let tcp_port = resolve_tcp_port(ip_port)?;
 
@@ -669,6 +668,7 @@ pub fn configure(
     // outlive this function.
     keep_port_runtime_alive(rbk_runtime);
     keep_port_runtime_alive(runtime_handle);
+    println!("capaNCDT6200:  Data port created -> host = {host}");
     Ok(())
 }
 
