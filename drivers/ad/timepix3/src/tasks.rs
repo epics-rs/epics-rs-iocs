@@ -53,6 +53,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// not these parameters.
 const ADDR: i32 = 0;
 
+/// C `NDARRAY_ADDR_PRVIMG_THRESHOLD0` / `NDARRAY_ADDR_IMG_THRESHOLD0`
+/// (ADTimePix.h:907, :919): the PrvImg and Img images' NDArray addresses.
+const PRV_IMG_ADDR: usize = 0;
+const IMG_ADDR: usize = 1;
+
 pub struct Ctx {
     pub handle: PortHandle,
     pub http: Arc<ServalHttp>,
@@ -1159,6 +1164,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             .await;
             publish_image(
                 ctx,
+                PRV_IMG_ADDR,
                 f.frame_number,
                 f.width,
                 f.height,
@@ -1231,6 +1237,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             }
             publish_image(
                 ctx,
+                IMG_ADDR,
                 f.frame_number,
                 f.width,
                 f.height,
@@ -1695,6 +1702,7 @@ async fn push_processed_img(ctx: &Ctx) {
 /// Serval's `frameNumber`, not NDArrayCounter (serval_stream.cpp:604, :1467).
 async fn publish_image(
     ctx: &Arc<Ctx>,
+    addr: usize,
     frame_number: i32,
     width: usize,
     height: usize,
@@ -1734,7 +1742,7 @@ async fn publish_image(
     // (serval_stream.cpp:292, :943); C ignores the status.
     let _ = ctx.pool.owner().get_attributes(&mut array).await;
 
-    ArrayPublisher::new(ctx.outputs[0].clone())
+    ArrayPublisher::new(ctx.outputs[addr].clone())
         .publish(array)
         .await;
 }
@@ -1978,7 +1986,9 @@ mod tests {
         .unwrap();
         let outputs = new_outputs();
         let (tx, mut rx) = ndarray_channel("TPXUID_SINK", 4);
-        outputs[0].lock().add(tx);
+        outputs[PRV_IMG_ADDR].lock().add(tx);
+        let (tx, mut rx_img) = ndarray_channel("TPXUID_IMG_SINK", 4);
+        outputs[IMG_ADDR].lock().add(tx);
         let ctx = Arc::new(Ctx {
             handle: runtime.port_handle().clone(),
             http,
@@ -2000,6 +2010,10 @@ mod tests {
                 pixels: vec![1, 2],
             });
             handle_frame(&ctx, kind, frame).await;
+            let rx = match kind {
+                StreamKind::Img => &mut rx_img,
+                _ => &mut rx,
+            };
             let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("no array")
@@ -2043,7 +2057,9 @@ mod tests {
         .unwrap();
         let outputs = new_outputs();
         let (tx, mut rx) = ndarray_channel("TPXATTR_SINK", 4);
-        outputs[0].lock().add(tx);
+        outputs[PRV_IMG_ADDR].lock().add(tx);
+        let (tx, mut rx_img) = ndarray_channel("TPXATTR_IMG_SINK", 4);
+        outputs[IMG_ADDR].lock().add(tx);
         let ctx = Arc::new(Ctx {
             handle: runtime.port_handle().clone(),
             http,
@@ -2074,6 +2090,10 @@ mod tests {
                 pixels: vec![1, 2],
             });
             handle_frame(&ctx, kind, frame).await;
+            let rx = match kind {
+                StreamKind::Img => &mut rx_img,
+                _ => &mut rx,
+            };
             let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
                 .expect("no array")
