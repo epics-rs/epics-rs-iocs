@@ -429,6 +429,12 @@ impl CellBody for Trip {
         }
     }
 
+    /// C's duplicate has no `timeoutUser` (`devMcaAsyn.c:263`), so a read on
+    /// a disconnected device still runs its callback (asynManager.c:886).
+    fn timeout_user(&self) -> bool {
+        false
+    }
+
     /// C arms no queue timeout and keeps a request queued while its port is
     /// disabled, so nothing here re-enters the record.
     fn unrun(&self, _why: Unrun) {
@@ -796,22 +802,28 @@ mod tests {
         [usize; McaReason::COUNT],
     );
 
-    /// The driver on a registered port `name`.
+    /// The driver on a registered port `name`; with `down`, a multi-device
+    /// port whose device `down` is disconnected and does not autoconnect.
     fn driver_port(
         name: &str,
         can_block: bool,
         refuse: Option<McaReason>,
         gate: Option<Arc<Gate>>,
+        down: Option<i32>,
     ) -> DriverPort {
         let mut base = PortDriverBase::new(
             name,
-            1,
+            2,
             PortFlags {
-                multi_device: false,
+                multi_device: down.is_some(),
                 can_block,
                 destructible: false,
             },
         );
+        if let Some(addr) = down {
+            base.set_auto_connect_addr(addr, false);
+            base.set_addr_connected(addr, false);
+        }
         let reasons = McaReason::create_params(&mut base).unwrap();
         let writes = Arc::new(Mutex::new(Vec::new()));
         let array_reads = Arc::new(AtomicUsize::new(0));
@@ -836,7 +848,7 @@ mod tests {
     /// A record initialised on a port without `ASYN_CANBLOCK` whose driver
     /// refuses `refuse`'s drvInfo; the writes the init made stay logged.
     fn fixture_refusing(name: &str, refuse: Option<McaReason>) -> (Fixture, DeviceInitOutcome) {
-        let (runtime, writes, array_reads, reasons) = driver_port(name, false, refuse, None);
+        let (runtime, writes, array_reads, reasons) = driver_port(name, false, refuse, None, None);
         let (dev, rec, outcome) = init_dev(&format!("@asyn({name})"));
         let f = Fixture {
             _runtime: runtime,
@@ -967,7 +979,7 @@ mod tests {
             } else {
                 "MCATRIPSYNC"
             };
-            let (runtime, _, array_reads, _) = driver_port(port, can_block, None, None);
+            let (runtime, _, array_reads, _) = driver_port(port, can_block, None, None, None);
             let db = format!(
                 r#"
 record(mca, "MCATRIP") {{
@@ -1035,7 +1047,8 @@ record(calc, "MCATRIPN") {{ field(CALC, "A+1") field(INPA, "MCATRIPN") }}
         use epics_rs::base::runtime::task::{sleep, test_block_on};
         use epics_rs::base::server::ioc_builder::IocBuilder;
 
-        let (runtime, writes, array_reads, reasons) = driver_port("MCAHOLD", true, None, None);
+        let (runtime, writes, array_reads, reasons) =
+            driver_port("MCAHOLD", true, None, None, None);
         let db = r#"
 record(mca, "MCAHOLD") {
     field(DTYP, "asynMCA")
@@ -1103,7 +1116,8 @@ record(mca, "MCAHOLD") {
         use epics_rs::base::server::ioc_builder::IocBuilder;
 
         let gate = Arc::new(Gate::default());
-        let (runtime, _, array_reads, _) = driver_port("MCAOWN", true, None, Some(gate.clone()));
+        let (runtime, _, array_reads, _) =
+            driver_port("MCAOWN", true, None, Some(gate.clone()), None);
         let (mut dev, _, outcome) = init_dev("@asyn(MCAOWN)");
         assert!(matches!(outcome, DeviceInitOutcome::Ok(_)));
         let port = dev.port.as_mut().unwrap();
@@ -1149,6 +1163,47 @@ record(mca, "MCAHOLD") {
             run(3).await;
             assert_eq!(array_reads.load(Ordering::SeqCst), 5);
             assert_eq!(reentered(), 2.0);
+        });
+        drop(runtime);
+    }
+
+    /// C's read request has no `timeoutUser`, so on a disconnected device
+    /// the port thread runs its callback anyway (asynManager.c:886): the
+    /// driver is called and the record is re-entered.
+    #[test]
+    fn a_read_on_a_disconnected_device_still_runs_its_callback() {
+        use std::collections::HashMap;
+        use std::time::Duration;
+
+        use epics_rs::base::runtime::task::{sleep, test_block_on};
+        use epics_rs::base::server::ioc_builder::IocBuilder;
+
+        let (runtime, writes, array_reads, reasons) =
+            driver_port("MCADOWN", true, None, None, Some(1));
+        let (mut dev, _, outcome) = init_dev("@asyn(MCADOWN,1)");
+        assert!(matches!(outcome, DeviceInitOutcome::Ok(_)));
+        let port = dev.port.as_mut().unwrap();
+        test_block_on(async {
+            let db = r#"record(calc, "MCADOWNN") { field(CALC, "A+1") field(INPA, "MCADOWNN") }"#;
+            let (db, _) = IocBuilder::new()
+                .db_string(db, &HashMap::new())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let done = DeviceDone::new(&db, &db.get_record("MCADOWNN").unwrap().read());
+            port.queue(McaRead::Data, None).unwrap();
+            port.queue(McaRead::Status, Some((done.clone(), done.priority())))
+                .unwrap();
+            sleep(Duration::from_millis(200)).await;
+            assert_eq!(array_reads.load(Ordering::SeqCst), 1);
+            assert!(
+                writes
+                    .lock()
+                    .unwrap()
+                    .contains(&reasons[McaReason::ReadStatus as usize])
+            );
+            assert_eq!(db.get_pv("MCADOWNN").unwrap().to_f64(), Some(1.0));
         });
         drop(runtime);
     }
