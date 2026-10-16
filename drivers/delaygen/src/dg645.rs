@@ -2,10 +2,8 @@
 //!
 //! Ported from `drvAsynDG645.cpp`. Every parameter is exposed as a tag
 //! (asyn drvInfo string, e.g. `@asyn(DG0) TRIG_LEVEL`) resolved to a
-//! reason via the default [`PortDriver::drv_user_create`] (lookup by
-//! parameter name), matching the C driver's own tag-based `create()`
-//! (`asynDrvUser::create`, `epicsStrCaseCmp` against `commandTable[].tag`)
-//! — no override needed here.
+//! reason by C's own `create()`: a case-insensitive `epicsStrCaseCmp` scan
+//! of `commandTable[].tag`.
 //!
 //! # EOS ownership
 //! Like the other two delaygen drivers, DG645 never appends a terminator
@@ -42,9 +40,10 @@
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_vprintf;
 
 use crate::connect::OctetLink;
 use crate::wire::{self, atof, atoi};
@@ -488,11 +487,8 @@ impl Dg645Driver {
             },
         );
         for spec in COMMANDS {
-            // The stored ParamType is never read back through a typed
-            // getter for any tag but STATUS_CODE — every other tag exists
-            // purely so `find_param`/the default `drv_user_create` can
-            // resolve it to a reason index, mirroring C's `create()`
-            // tag-table scan.
+            // Param index == COMMANDS index, the reason `drv_user_create`
+            // hands out; only STATUS_CODE's value is ever read.
             base.create_param(spec.tag, ParamType::Int32)?;
         }
         let status_code_reason = base
@@ -612,10 +608,7 @@ impl Dg645Driver {
     /// C `statusChecking`.
     fn write_status_checking(&mut self, value: i32) -> AsynResult<()> {
         if !(0..=1).contains(&value) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: "STATUS_CHECKING must be 0 or 1".into(),
-            });
+            return Err(wire::record_error(AsynStatus::Error));
         }
         let new_enabled = value != 0;
         if new_enabled == self.check_errors {
@@ -646,7 +639,58 @@ impl PortDriver for Dg645Driver {
         &mut self.base
     }
 
+    /// C `create()` (drvAsynDG645.cpp:983-1001).
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        match COMMANDS
+            .iter()
+            .position(|c| c.tag.eq_ignore_ascii_case(&req.drv_info))
+        {
+            Some(reason) => Ok(DrvUserInfo::from_reason(reason)),
+            None => {
+                errlog_vprintf(format_args!(
+                    "drvAsynDG645::create port {} failed to find tag {}\n",
+                    self.base.port_name, req.drv_info
+                ));
+                Err(wire::record_error(AsynStatus::Error))
+            }
+        }
+    }
+
     fn read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
+        self.do_read_int32(user)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        self.do_write_int32(user, value)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+        self.do_read_float64(user)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+        self.do_write_float64(user, value)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+        self.do_read_octet(user, buf)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.do_write_octet(user, data)
+            .map_err(|e| wire::record_error(e.status()))
+    }
+}
+
+/// The C transfers; [`PortDriver`] hands their errors to the record as
+/// [`wire::record_error`].
+impl Dg645Driver {
+    fn do_read_int32(&mut self, user: &AsynUser) -> AsynResult<i32> {
         wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.conv {
@@ -668,7 +712,7 @@ impl PortDriver for Dg645Driver {
         }
     }
 
-    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+    fn do_write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
@@ -688,7 +732,7 @@ impl PortDriver for Dg645Driver {
         }
     }
 
-    fn read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
+    fn do_read_float64(&mut self, user: &AsynUser) -> AsynResult<f64> {
         wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.conv {
@@ -705,7 +749,7 @@ impl PortDriver for Dg645Driver {
         }
     }
 
-    fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
+    fn do_write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
@@ -720,7 +764,7 @@ impl PortDriver for Dg645Driver {
         }
     }
 
-    fn read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+    fn do_read_octet(&mut self, user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
         wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         let text = match spec.conv {
@@ -743,7 +787,7 @@ impl PortDriver for Dg645Driver {
         Ok(n)
     }
 
-    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+    fn do_write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         wire::require_init(self.init)?;
         let spec = self.spec(user.reason)?;
         match spec.write_kind {
@@ -908,5 +952,34 @@ mod init_tests {
 
         let reason = dg.base.find_param("STATUS_CODE").unwrap();
         assert!(dg.read_int32(&AsynUser::new(reason)).is_err());
+    }
+
+    /// C's `epicsStrCaseCmp` tag scan; a miss is asynError with no text.
+    #[test]
+    fn a_tag_resolves_without_case_and_a_miss_carries_no_text() {
+        let mut dg = Dg645Driver::new("DG645_TAGS", mute_link("DG645_TAGS_IO")).unwrap();
+        let req = |tag: &str| DrvUserRequest::new(tag, 0);
+        let info = dg.drv_user_create(&req("trig_level")).unwrap();
+        assert_eq!(Some(info.reason), dg.base.find_param("TRIG_LEVEL"));
+        let e = dg.drv_user_create(&req("NO_SUCH_TAG")).unwrap_err();
+        assert_eq!(e.message(), "");
+        assert_eq!(e.status(), AsynStatus::Error);
+    }
+
+    /// C never writes the record's errorMessage: a failed transfer carries
+    /// its status and no text.
+    #[test]
+    fn a_failed_transfer_reaches_the_record_without_text() {
+        let mut dg = Dg645Driver::new("DG645_MUTE2", mute_link("DG645_MUTE2_IO")).unwrap();
+        dg.init = true;
+        let reason = dg.base.find_param("TRIG_LEVEL").unwrap();
+        let e = dg
+            .write_float64(&mut AsynUser::new(reason), 1.0)
+            .unwrap_err();
+        assert_eq!(e.message(), "");
+        assert_eq!(e.status(), AsynStatus::Error);
+        let reason = dg.base.find_param("STATUS_CHECKING").unwrap();
+        let e = dg.write_int32(&mut AsynUser::new(reason), 2).unwrap_err();
+        assert_eq!(e.message(), "");
     }
 }
