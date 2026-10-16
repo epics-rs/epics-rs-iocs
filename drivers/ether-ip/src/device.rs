@@ -818,8 +818,10 @@ impl EtherIpDevice {
     /// record follows it (C `check_ao_callback` & friends). With `FORCE` the
     /// record wins instead -- its value is staged for the next scan.
     ///
-    /// C's callback processes the record whatever it found, so a failure here
-    /// is the one `ao_write` & co. raise: WRITE_ALARM (devEtherIP.c:1949,1993).
+    /// With no data C's callback processes the record, so that failure is the
+    /// one `ao_write` & co. raise: WRITE_ALARM (devEtherIP.c:1949,1993). A get
+    /// that fails on data C's callback does not process for, and raises
+    /// nothing (devEtherIP.c:360,386).
     fn readback(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         let Some((tag, link)) = self.bound() else {
             self.write_alarm();
@@ -843,7 +845,7 @@ impl EtherIpDevice {
                 Some(CipType::Real) | Some(CipType::Lreal) => {
                     let Some(plc) = cip::get_double(&data.buf, element) else {
                         drop(data);
-                        self.write_alarm();
+                        self.alarm = None;
                         return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                     };
                     let val = f64_field(record, "VAL");
@@ -859,7 +861,7 @@ impl EtherIpDevice {
                 _ => {
                     let Some(plc) = cip::get_dint(&data.buf, element) else {
                         drop(data);
-                        self.write_alarm();
+                        self.alarm = None;
                         return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                     };
                     let rval = i32_field(record, "RVAL");
@@ -876,7 +878,7 @@ impl EtherIpDevice {
             "int64out" => {
                 let Some(plc) = cip::get_lint(&data.buf, element) else {
                     drop(data);
-                    self.write_alarm();
+                    self.alarm = None;
                     return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let val = match record.get_field("VAL") {
@@ -896,7 +898,7 @@ impl EtherIpDevice {
                 let bits = if rtype == "bo" { 1 } else { nobt(record) };
                 let Some(plc) = get_bits(&data.buf, element, mask, bits) else {
                     drop(data);
-                    self.write_alarm();
+                    self.alarm = None;
                     return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let rval = i32_field(record, "RVAL") as u32;
@@ -913,7 +915,7 @@ impl EtherIpDevice {
                 let max = data.buf.len();
                 let Some(plc) = cip::get_string(&data.buf, element, max) else {
                     drop(data);
-                    self.write_alarm();
+                    self.alarm = None;
                     return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
                 };
                 let val = match record.get_field("VAL") {
@@ -931,7 +933,7 @@ impl EtherIpDevice {
             }
             _ => {
                 drop(data);
-                self.write_alarm();
+                self.alarm = None;
                 return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
             }
         }
@@ -1306,6 +1308,26 @@ mod tests {
         dev.read(&mut record).unwrap();
         let alarm = dev.last_alarm().unwrap();
         assert_eq!(alarm.stat, alarm_status::WRITE_ALARM);
+    }
+
+    /// A get that fails on data the tag does hold: C's check_ao_callback
+    /// does not process the record, so nothing is raised.
+    #[test]
+    fn an_output_whose_readback_get_fails_raises_nothing() {
+        use epics_rs::base::server::records::ao::AoRecord;
+        define_plc("shortdata", "127.0.0.1", 0);
+        let mut record = AoRecord::default();
+        let mut dev = EtherIpDevice::new("@shortdata DINT S 1", true);
+        dev.init(&mut record).unwrap();
+        let tag = dev.tag.clone().unwrap();
+        {
+            let mut d = tag.data.lock();
+            // The DINT typecode and no value behind it.
+            d.buf = CipType::Dint.code().to_le_bytes().to_vec();
+            d.valid_data_size = d.buf.len();
+        }
+        dev.read(&mut record).unwrap();
+        assert!(dev.last_alarm().is_none());
     }
 
     /// devEtherIP.c:1642: statistics are read under lock_data, so a tag
