@@ -109,13 +109,10 @@ fn exchange(handle: &PortHandle, command: &str, timeout: Duration) -> Exchange {
     };
 
     match handle.submit_blocking(op, user) {
-        Err(e) => {
-            log::error!("bruker: '{command}': {e}");
-            Exchange {
-                reply: String::new(),
-                result: Err(e),
-            }
-        }
+        Err(e) => Exchange {
+            reply: String::new(),
+            result: Err(e),
+        },
         Ok(result) => {
             let bytes = result.data.unwrap_or_default();
             let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();

@@ -15,6 +15,7 @@ use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode, ShutterMode};
@@ -101,14 +102,24 @@ impl BrukerDetector {
         Ok(det)
     }
 
-    /// Send one command; publish both sides of it (C `writeBIS`).
-    fn command(&mut self, command: &str, timeout: std::time::Duration) -> AsynResult<()> {
+    /// Send one command; publish both sides of it (C `writeBIS`). No caller
+    /// of C's `writeBIS` looks at its status: a failure is the trace line.
+    fn command(&mut self, command: &str, timeout: std::time::Duration) {
         let exchange = self.server.command(command, timeout);
+        if let Err(e) = exchange.result {
+            self.trace_error(&format!(
+                "BISDetector:writeBIS, status={}, sent\n{command}",
+                e.status() as i32
+            ));
+        }
         let p = self.ad.params;
         let base = &mut self.ad.port_base;
-        base.set_string_param(p.string_to_server, 0, command)?;
-        base.set_string_param(p.string_from_server, 0, exchange.reply)?;
-        exchange.result
+        let _ = base.set_string_param(p.string_to_server, 0, command);
+        let _ = base.set_string_param(p.string_from_server, 0, exchange.reply);
+    }
+
+    fn trace_error(&self, message: &str) {
+        self.ad.port_base.trace_print(TraceMask::ERROR, message);
     }
 
     fn get_i32(&self, reason: usize) -> i32 {
@@ -162,7 +173,8 @@ impl BrukerDetector {
         self.ad.port_base.call_param_callbacks(0)?;
 
         let command = protocol::acquire(frame_type, &file_name, acquire_time, num_darks);
-        self.command(&command, BIS_COMMAND_TIMEOUT)
+        self.command(&command, BIS_COMMAND_TIMEOUT);
+        Ok(())
     }
 
     /// BIS drives the shutter itself when the shutter is wired to the detector
@@ -181,7 +193,7 @@ impl BrukerDetector {
             .ad
             .port_base
             .get_float64_param(p.shutter_close_delay, 0)?;
-        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT)?;
+        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT);
 
         // Opening: wait out the difference between the opening and the closing
         // time so the exposure is the length that was asked for, and never less
@@ -229,7 +241,7 @@ impl PortDriver for BrukerDetector {
                     .port_base
                     .set_int32_param(p.status, 0, ADStatus::Acquire as i32)?;
                 if self.commands.try_send(TaskCommand::Start).is_err() {
-                    log::error!("bruker: the acquisition task is not running");
+                    self.trace_error("BISDetector:writeInt32: the acquisition task is not running");
                 }
             } else if value == 0 && !idle {
                 self.shared.stop_requested.store(true, Ordering::Release);
@@ -242,9 +254,11 @@ impl PortDriver for BrukerDetector {
                 self.command(
                     &protocol::change_frame_size(max_size_x / value),
                     BIS_DEFAULT_TIMEOUT,
-                )?;
+                );
             } else {
-                log::error!("bruker: binning {value} is not 1, 2, 4 or 8");
+                self.trace_error(&format!(
+                    "BISDetector:writeInt32: invalid binning={value}, must be 1,2,4 or 8"
+                ));
                 status = Err(AsynError::Status {
                     status: AsynStatus::Error,
                     message: format!("binning {value} is not 1, 2, 4 or 8"),
@@ -260,10 +274,16 @@ impl PortDriver for BrukerDetector {
             // shutter is not BIS's to drive.
             self.ad.set_shutter(value != 0)?;
         } else {
-            self.ad.write_int32_pool(reason, value)?;
+            status = self.ad.write_int32_pool(reason, value).map(|_| ());
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
+        if let Err(e) = &status {
+            self.trace_error(&format!(
+                "BISDetector:writeInt32: error, status={} function={reason}, value={value}",
+                e.status() as i32
+            ));
+        }
         status
     }
 

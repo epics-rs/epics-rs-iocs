@@ -354,3 +354,35 @@ fn a_stop_during_the_exposure_publishes_no_frame() {
         0
     );
 }
+
+/// No caller of C's `writeBIS` looks at its status (BISDetector.cpp:349, :362,
+/// :531, :659): with BIS gone a binning write still succeeds, and only a
+/// binning C refuses is an error.
+#[test]
+fn a_binning_write_does_not_depend_on_bis() {
+    let closed = |name: &str| {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        drop(listener);
+        // The EOS setters need a connection, which a dead BIS never gives.
+        let driver = DrvAsynIPPort::new(name, &addr).expect("ip port");
+        let (runtime, _) =
+            create_port_runtime(driver, RuntimeConfig::default()).expect("ip port runtime");
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        handle
+    };
+    let detector = create_bruker_detector(
+        "BISDEAD",
+        closed("BISDEAD_COMMAND"),
+        closed("BISDEAD_STATUS"),
+        0,
+    )
+    .expect("the detector port");
+    let sync = SyncIOHandle::from_handle(detector.port_handle().clone(), 0, Duration::from_secs(5));
+    let ad = detector.ad_params;
+
+    sync.write_int32(ad.bin_x, 2).expect("binning 2");
+    assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
+    assert!(sync.write_int32(ad.bin_x, 3).is_err());
+}

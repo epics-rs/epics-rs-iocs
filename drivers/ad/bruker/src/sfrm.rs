@@ -103,7 +103,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, SfrmError> {
     let header_blocks = numbers(bytes, 2, 1)?[0];
 
     if format != 100 || version < 11 {
-        return err(format!("unsupported format {format} or version {version}"));
+        return err(format!("unsupported format={format} or version={version}"));
     }
     if header_blocks <= 0 {
         return err(format!("a header of {header_blocks} blocks cannot be read"));
@@ -128,7 +128,10 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, SfrmError> {
     let frame = numbers(bytes, 79, 5)?;
 
     if word_order != 0 {
-        return err(format!("unsupported word order {word_order}"));
+        // C read longOrder from the same header line (BISDetector.cpp:213-216).
+        return err(format!(
+            "unsupported wordOrder={word_order} or longOrder={word_order}"
+        ));
     }
 
     // C's switch on bytesPerPixel had no default: any other width left the
@@ -455,7 +458,7 @@ mod tests {
     fn a_big_endian_word_order_is_an_error() {
         let file = HeaderBuilder::new(2, 1, 1).set(42, "WORDORD:1").build();
         let e = decode(&file).expect_err("word order 1");
-        assert!(e.to_string().contains("word order 1"), "{e}");
+        assert!(e.to_string().contains("wordOrder=1"), "{e}");
     }
 
     #[test]
