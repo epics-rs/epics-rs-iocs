@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
-use async_opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, Session};
+use async_opcua::client::{ClientBuilder, IdentityToken, Session, SubscriptionCallbacks};
 use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
     DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
@@ -21,6 +21,7 @@ use async_opcua::types::{
     WriteValue, custom::DataTypeTree,
 };
 use async_trait::async_trait;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
@@ -304,6 +305,7 @@ impl UaConnection for AsyncOpcuaConnection {
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
     ) -> Result<u32, StatusCode> {
+        let name = config.name.clone();
         self.session
             .create_subscription(
                 Duration::from_secs_f64(config.publishing_interval / 1000.0),
@@ -312,14 +314,24 @@ impl UaConnection for AsyncOpcuaConnection {
                 config.max_notifications_per_publish,
                 config.priority,
                 true,
-                DataChangeCallback::new(move |value, item| {
-                    // The channel is closed only when the driver is shutting the
-                    // session down, so a failed send is not worth logging.
-                    let _ = sink.send(Notification {
-                        client_handle: item.client_handle(),
-                        value,
-                    });
-                }),
+                SubscriptionCallbacks::new(
+                    // `SubscriptionOpen62541::subscriptionStatusChanged`.
+                    move |change| {
+                        errlog_vprintf(format_args!(
+                            "Subscription {name} status changed to {}\n",
+                            status_name(change.status)
+                        ))
+                    },
+                    move |value, item| {
+                        // The channel is closed only when the driver is shutting the
+                        // session down, so a failed send is not worth logging.
+                        let _ = sink.send(Notification {
+                            client_handle: item.client_handle(),
+                            value,
+                        });
+                    },
+                    |_, _| {},
+                ),
             )
             .await
     }
