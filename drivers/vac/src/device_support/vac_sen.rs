@@ -96,7 +96,7 @@ impl DeviceSupport for VacSen {
             timeout: IO_TIMEOUT,
         });
         self.cfg = Some(cfg);
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

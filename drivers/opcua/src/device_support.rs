@@ -857,7 +857,11 @@ impl DeviceSupport for OpcuaDevice {
                 from_server: false,
             };
         }
-        Ok(DeviceInitOutcome::Live)
+        // devOpcua.cpp:94-97: every output dset's init returns 2.
+        if self.is_output {
+            return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        }
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn set_record_info(&mut self, name: &str, _scan: ScanType) {

@@ -553,7 +553,7 @@ impl PortDriver for RontecDriver {
             None => {
                 self.base.trace_print(
                     TraceMask::ERROR,
-                    &format!(
+                    format_args!(
                         "drvMcaRontec::drvUserCreate, unknown command={}",
                         req.drv_info
                     ),

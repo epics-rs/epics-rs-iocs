@@ -256,7 +256,7 @@ impl DeviceSupport for DevMcaAsyn {
             // (`mcaRecord.c:464-487`).
             let _ = self.send_command(command);
         }
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     /// One process cycle, restructured from C's `send_msg` + `asynCallback`

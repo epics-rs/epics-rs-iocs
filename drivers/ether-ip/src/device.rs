@@ -439,7 +439,12 @@ impl DeviceSupport for EtherIpDevice {
         self.link = Some(link);
         self.plc = Some(plc);
         self.tag = Some(tag);
-        Ok(DeviceInitOutcome::Live)
+        // devEtherIP.c ao/bo/mbbo/mbboDirect_init_record: "return 2; /* don't
+        // convert, we have no value, yet */".
+        if matches!(record.record_type(), "ao" | "bo" | "mbbo" | "mbboDirect") {
+            return Ok(DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched));
+        }
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn io_intr_receiver(&mut self) -> Option<mpsc::Receiver<()>> {

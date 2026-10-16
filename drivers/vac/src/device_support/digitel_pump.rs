@@ -105,7 +105,7 @@ impl DeviceSupport for DigitelPump {
         });
         self.err_count = initial_err_count(dev);
         self.cfg = Some(cfg);
-        Ok(DeviceInitOutcome::Live)
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn read(&mut self, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {

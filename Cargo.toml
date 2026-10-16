@@ -264,18 +264,18 @@ mca-rs = "0.32.0"
 
 # Local check of epics-rs release/v0.32.0 before it is on crates.io.
 [patch.crates-io]
-ad-core-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/ad-core-rs" }
-ad-plugins-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/ad-plugins-rs" }
-asyn-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/asyn-rs" }
-epics-base-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-base-rs" }
-epics-bridge-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-bridge-rs" }
-epics-ca-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-ca-rs" }
-epics-libcom-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-libcom-rs" }
-epics-macros-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-macros-rs" }
-epics-modbus-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/modbus-rs" }
-epics-pva-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-pva-rs" }
-epics-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-rs" }
-epics-rtems-boot = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/epics-rtems-boot" }
-mca-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/mca-rs" }
-motor-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/motor-rs" }
-scaler-rs = { path = "/home/stevek/work/pvcheck-dbputa-rs/crates/scaler-rs" }
+ad-core-rs = { path = "/home/stevek/work/_rv5_rel/crates/ad-core-rs" }
+ad-plugins-rs = { path = "/home/stevek/work/_rv5_rel/crates/ad-plugins-rs" }
+asyn-rs = { path = "/home/stevek/work/_rv5_rel/crates/asyn-rs" }
+epics-base-rs = { path = "/home/stevek/work/_rv5_rel/crates/epics-base-rs" }
+epics-bridge-rs = { path = "/home/stevek/work/_rv5_rel/crates/epics-bridge-rs" }
+epics-ca-rs = { path = "/home/stevek/work/_rv5_rel/crates/epics-ca-rs" }
+epics-libcom-rs = { path = "/home/stevek/work/_rv5_rel/crates/epics-libcom-rs" }
+epics-macros-rs = { path = "/home/stevek/work/_rv5_rel/crates/epics-macros-rs" }
+epics-modbus-rs = { path = "/home/stevek/work/_rv5_rel/crates/modbus-rs" }
+epics-pva-rs = { path = "/home/stevek/work/_rv5_rel/crates/epics-pva-rs" }
+epics-rs = { path = "/home/stevek/work/_rv5_rel/crates/epics-rs" }
+epics-rtems-boot = { path = "/home/stevek/work/_rv5_rel/crates/epics-rtems-boot" }
+mca-rs = { path = "/home/stevek/work/_rv5_rel/crates/mca-rs" }
+motor-rs = { path = "/home/stevek/work/_rv5_rel/crates/motor-rs" }
+scaler-rs = { path = "/home/stevek/work/_rv5_rel/crates/scaler-rs" }

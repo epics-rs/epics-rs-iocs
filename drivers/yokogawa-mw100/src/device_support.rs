@@ -592,7 +592,15 @@ impl DeviceSupport for MwDevice {
         )?;
         seed_initial_value(&instrument, op, record)?;
         self.resolved = Some(Resolved { instrument, op });
-        Ok(DeviceInitOutcome::Live)
+        // devMW100_ao.c:84-91 returns 2 and defines the VAL it seeded.
+        if record.record_type() == "ao" {
+            let udf = match op {
+                Operation::AnalogSet(_) => DeviceUdf::Defined,
+                _ => DeviceUdf::Untouched,
+            };
+            return Ok(DeviceInitOutcome::DoNotConvert(udf));
+        }
+        Ok(DeviceInitOutcome::ok())
     }
 
     fn set_record_info(&mut self, _name: &str, scan: ScanType) {
@@ -1301,5 +1309,28 @@ mod tests {
 
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "FD1,001,A300\r\n");
+    }
+
+    /// C ao init_record returns 2 with the seeded VAL defined; bo returns 0
+    /// so the record converts the RVAL the dset left.
+    #[test]
+    fn init_status_is_c_ao_two_and_bo_zero() {
+        use epics_rs::base::server::device_support::DeviceUdf;
+        let f = factory(registry_with("mw100dev", connect_default_fixture()));
+        let init = |record_type: &'static str, out: &'static str| {
+            let ctx = DeviceSupportContext {
+                record_type,
+                dtyp: DTYP,
+                inp: "",
+                out,
+            };
+            let mut device = f(&ctx).unwrap();
+            device.init(&mut FakeRecord::new(record_type)).unwrap()
+        };
+        assert_eq!(
+            init("ao", "mw100dev VAL:K1"),
+            DeviceInitOutcome::DoNotConvert(DeviceUdf::Defined)
+        );
+        assert_eq!(init("bo", "mw100dev INP_TRIG"), DeviceInitOutcome::ok());
     }
 }

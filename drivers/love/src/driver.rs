@@ -441,7 +441,8 @@ impl LoveDriver {
     }
 
     fn trace_error(&self, msg: &str) {
-        self.base.trace_print(TraceMask::ERROR, msg);
+        self.base
+            .trace_print(TraceMask::ERROR, format_args!("{msg}"));
     }
 
     fn trace_read_failure(&self, frame: &str, rcvd: &[u8]) {
