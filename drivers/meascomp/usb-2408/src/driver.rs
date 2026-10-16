@@ -236,11 +236,18 @@ impl PortDriver for MultiFunctionDriver {
 
         // The scan buffers are sized once from maxInputPoints/maxOutputPoints,
         // so a point count above that capacity must never reach the store --
-        // wave_dig indexes its fixed per-channel buffers by it. The records
-        // carry the same bound in DRVL/DRVH; this gate is what makes the
-        // invariant hold no matter what the database says.
+        // wave_dig indexes its fixed per-channel buffers by it.
         let value = if reason == self.params.wave_dig_num_points {
-            value.clamp(1, self.max_input_points as i32)
+            if value > self.max_input_points as i32 {
+                trace.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}::{FUNCTION} error WaveDigNumPoints={value} must be less than MaxInputPoints={}",
+                        self.max_input_points
+                    ),
+                );
+            }
+            value.min(self.max_input_points as i32)
         } else if reason == self.params.wave_gen_num_points {
             value.clamp(1, self.max_output_points as i32)
         } else {
@@ -364,10 +371,11 @@ impl PortDriver for MultiFunctionDriver {
                     .base
                     .get_int32_param(self.params.wave_dig_num_chans, 0)?
                     as usize;
+                // C hands a non-positive count to ulAInScan, which refuses it.
                 let num_points = self
                     .base
                     .get_int32_param(self.params.wave_dig_num_points, 0)?
-                    as usize;
+                    .max(0) as usize;
                 let dwell = self.base.get_float64_param(self.params.wave_dig_dwell, 0)?;
                 let input_mode = self.base.get_int32_param(self.params.analog_in_mode, 0)?;
                 let range = self
