@@ -497,7 +497,6 @@ pub fn create_d435i_detector(
     let color_ad_params = color_det.ad.params;
     let color_rs_params = color_det.rs_params;
     let color_pool = color_det.ad.pool.clone();
-    let color_queued = color_det.ad.owner.queued().clone();
     let (color_runtime_handle, _) =
         create_port_runtime(color_claim, color_det, RuntimeConfig::default())?;
     let color_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
@@ -507,7 +506,6 @@ pub fn create_d435i_detector(
     let depth_det = D435iDepthDriver::new(depth_port_name, max_size_x, max_size_y, max_memory)?;
     let depth_ad_params = depth_det.ad.params;
     let depth_pool = depth_det.ad.pool.clone();
-    let depth_queued = depth_det.ad.owner.queued().clone();
     let (depth_runtime_handle, _) =
         create_port_runtime(depth_claim, depth_det, RuntimeConfig::default())?;
     let depth_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
@@ -518,11 +516,9 @@ pub fn create_d435i_detector(
         color_handle: color_runtime_handle.port_handle().clone(),
         color_output: color_output.clone(),
         color_pool: color_pool.clone(),
-        color_queued,
         depth_handle: depth_runtime_handle.port_handle().clone(),
         depth_output: depth_output.clone(),
         depth_pool: depth_pool.clone(),
-        depth_queued,
         pc_output: pc_output.clone(),
         dirty,
         color_ad: color_ad_params,

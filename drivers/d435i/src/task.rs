@@ -10,7 +10,7 @@ use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
 
 use realsense_rust::config::Config;
@@ -60,12 +60,10 @@ pub(crate) struct AcquisitionContext {
     pub color_handle: PortHandle,
     pub color_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     pub color_pool: Arc<NDArrayPool>,
-    pub color_queued: Arc<QueuedArrayCounter>,
     // Depth port
     pub depth_handle: PortHandle,
     pub depth_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
     pub depth_pool: Arc<NDArrayPool>,
-    pub depth_queued: Arc<QueuedArrayCounter>,
     // Pointcloud output
     /// Point clouds are the colour port's arrays.
     pub pc_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
@@ -86,17 +84,14 @@ impl AcquisitionContext {
         trace::print(self.color_handle.port_name(), mask, msg);
     }
 
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.color_queued.wait_until_zero(Duration::from_secs(5));
-            self.depth_queued.wait_until_zero(Duration::from_secs(5));
-        }
+    /// ADAcquireBusy follows the ADAcquire store, WaitForPlugins included, on
+    /// the colour port's own queued count (asynNDArrayDriver.cpp:636-663).
+    async fn end_acquisition(&self) {
         let _ = self
             .color_handle
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::new(self.color_ad.acquire_busy, 0, ParamValue::Int32(0)),
                     ParamSetValue::new(
                         self.color_ad.status,
                         0,
@@ -868,7 +863,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                         0,
                         ParamValue::Int32(ADStatus::Acquire as i32),
                     ),
-                    ParamSetValue::new(ctx.color_ad.acquire_busy, 0, ParamValue::Int32(1)),
                 ],
             )
             .await;
@@ -904,7 +898,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     TraceMask::ERROR,
                     &format!("D435i: failed to read config: {e}"),
                 );
-                ctx.end_acquisition(false).await;
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -913,7 +907,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         let mut pipeline = match try_connect_pipeline(&mut ctx, &config).await {
             Some(p) => p,
             None => {
-                ctx.end_acquisition(false).await;
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -942,7 +936,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     TraceMask::ERROR,
                     &format!("D435i: failed to create depth filters: {e}"),
                 );
-                ctx.end_acquisition(false).await;
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -955,7 +949,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     TraceMask::ERROR,
                     &format!("D435i: failed to create align block: {e}"),
                 );
-                ctx.end_acquisition(false).await;
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -967,7 +961,7 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
                     TraceMask::ERROR,
                     &format!("D435i: failed to create pointcloud block: {e}"),
                 );
-                ctx.end_acquisition(false).await;
+                ctx.end_acquisition().await;
                 continue;
             }
         };
@@ -1291,6 +1285,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
         }
 
         // Pipeline is dropped here (ActivePipeline::drop calls rs2_delete_pipeline)
-        ctx.end_acquisition(config.wait_for_plugins).await;
+        ctx.end_acquisition().await;
     }
 }
