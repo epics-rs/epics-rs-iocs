@@ -1762,36 +1762,43 @@ fn acquisition_error(message: impl Into<String>) -> AsynError {
     }
 }
 
-impl ADDriver for TimePix3Driver {
-    fn ad_base(&self) -> &ADDriverBase {
-        &self.ad
-    }
+/// How a failed write reaches the record. C writes `errorMessage` only at
+/// its BiasEnabled and MPX3 refusals and inside ADDriver's own writes
+/// (ADTimePix.cpp:502, :667); every other failure is its status alone.
+enum Refusal {
+    /// The status alone; the closing callbacks and ERR line follow.
+    Bare(AsynStatus),
+    /// ADDriver's failure, its message kept; the closing callbacks follow.
+    Base(AsynError),
+    /// C returns at once with its message.
+    Told(AsynError),
+}
 
-    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
-        &mut self.ad
+impl From<AsynError> for Refusal {
+    fn from(e: AsynError) -> Self {
+        Refusal::Bare(e.status())
     }
 }
 
-impl PortDriver for TimePix3Driver {
-    fn base(&self) -> &PortDriverBase {
-        &self.ad.port_base
+impl Refusal {
+    fn into_record(self) -> AsynError {
+        match self {
+            Refusal::Bare(status) => AsynError::Status {
+                status,
+                message: String::new(),
+            },
+            Refusal::Base(e) | Refusal::Told(e) => e,
+        }
     }
+}
 
-    fn base_mut(&mut self) -> &mut PortDriverBase {
-        &mut self.ad.port_base
-    }
-
-    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+impl TimePix3Driver {
+    /// writeInt32 from its parameter store through its dispatch, before the
+    /// closing callbacks (ADTimePix.cpp:505-863).
+    fn write_int32_effect(&mut self, user: &mut AsynUser, value: i32) -> Result<(), Refusal> {
         let reason = user.reason;
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
-
-        if reason == self.p.bias_enable && !(value == 0 || value == 1) {
-            return Err(AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("BiasEnabled must be 0 or 1 (received {value})"),
-            });
-        }
         // Acquire is published once the coordinator accepts the transition.
         if reason != self.ad.params.acquire {
             self.ad.port_base.set_int32_param(reason, addr, value)?;
@@ -1937,10 +1944,10 @@ impl PortDriver for TimePix3Driver {
                     TraceMask::ERROR,
                     format_args!("{}", adlog::err(adlog::WRITE_INT32, MPX3_PIXEL_DEPTH_MSG)),
                 );
-                return Err(AsynError::Status {
+                return Err(Refusal::Told(AsynError::Status {
                     status: AsynStatus::Error,
                     message: MPX3_PIXEL_DEPTH_MSG.into(),
-                });
+                }));
             }
             self.init_acquisition()
         } else if reason == p.both_counters {
@@ -2143,9 +2150,83 @@ impl PortDriver for TimePix3Driver {
         } else if reason < p.http_code {
             // ADTIMEPIX_FIRST_PARAM is ADTimePixHttpCode (ADTimePix.h:467,
             // ADTimePix.cpp:860-863).
-            ADDriver::ad_write_int32(self, user, value)
+            return ADDriver::ad_write_int32(self, user, value).map_err(Refusal::Base);
         } else {
             Ok(())
+        };
+        Ok(result?)
+    }
+
+    /// writeFloat64 from its parameter store through its dispatch, before
+    /// the closing callbacks (ADTimePix.cpp:1090-1105).
+    fn write_float64_effect(&mut self, user: &mut AsynUser, value: f64) -> Result<(), Refusal> {
+        let reason = user.reason;
+        // UPSTREAM DEFECT (ADTimePix.cpp:791): C's writeFloat64 calls
+        // `setDoubleParam(function, value)` — the two-argument form, which
+        // always writes address 0 — on a maxAddr=8 multi-device port, so every
+        // per-chip float write lands on chip 0. The address is honoured here.
+        let addr = user.addr;
+        let acquiring = self.int(self.ad.params.acquire, 0) != 0;
+
+        self.ad.port_base.set_float64_param(reason, addr, value)?;
+
+        let p = self.p;
+        if reason == self.ad.params.acquire_time
+            || reason == self.ad.params.acquire_period
+            || reason == p.trigger_delay
+            || reason == p.global_timestamp_interval
+        {
+            if acquiring {
+                let _ = self.acquire_stop();
+            }
+            Ok(self.init_acquisition()?)
+        } else if reason == p.stem_dwell_time || reason == p.tof_min || reason == p.tof_max {
+            Ok(self.send_measurement_config()?)
+        } else if reason < p.http_code {
+            // ADDriver::writeFloat64 is asynPortDriver's (ADTimePix.cpp:1100-1104).
+            self.ad
+                .port_base
+                .write_float64_param(user, value)
+                .map_err(Refusal::Base)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ADDriver for TimePix3Driver {
+    fn ad_base(&self) -> &ADDriverBase {
+        &self.ad
+    }
+
+    fn ad_base_mut(&mut self) -> &mut ADDriverBase {
+        &mut self.ad
+    }
+}
+
+impl PortDriver for TimePix3Driver {
+    fn base(&self) -> &PortDriverBase {
+        &self.ad.port_base
+    }
+
+    fn base_mut(&mut self) -> &mut PortDriverBase {
+        &mut self.ad.port_base
+    }
+
+    fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+        let reason = user.reason;
+        let addr = user.addr;
+
+        if reason == self.p.bias_enable && !(value == 0 || value == 1) {
+            return Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: format!("BiasEnabled must be 0 or 1 (received {value})"),
+            });
+        }
+        let result = match self.write_int32_effect(user, value) {
+            Ok(()) => Ok(()),
+            Err(Refusal::Told(e)) => return Err(e),
+            Err(refusal) => Err(refusal.into_record()),
         };
 
         // The write's outcome is the record's, and it must survive the
@@ -2180,34 +2261,10 @@ impl PortDriver for TimePix3Driver {
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        let reason = user.reason;
-        // UPSTREAM DEFECT (ADTimePix.cpp:791): C's writeFloat64 calls
-        // `setDoubleParam(function, value)` — the two-argument form, which
-        // always writes address 0 — on a maxAddr=8 multi-device port, so every
-        // per-chip float write lands on chip 0. The address is honoured here.
-        let addr = user.addr;
-        let acquiring = self.int(self.ad.params.acquire, 0) != 0;
-
-        self.ad.port_base.set_float64_param(reason, addr, value)?;
-
-        let p = self.p;
-        let result = if reason == self.ad.params.acquire_time
-            || reason == self.ad.params.acquire_period
-            || reason == p.trigger_delay
-            || reason == p.global_timestamp_interval
-        {
-            if acquiring {
-                let _ = self.acquire_stop();
-            }
-            self.init_acquisition()
-        } else if reason == p.stem_dwell_time || reason == p.tof_min || reason == p.tof_max {
-            self.send_measurement_config()
-        } else if reason < p.http_code {
-            // ADDriver::writeFloat64 is asynPortDriver's (ADTimePix.cpp:1100-1104).
-            self.ad.port_base.write_float64_param(user, value)
-        } else {
-            Ok(())
-        };
+        let (reason, addr) = (user.reason, user.addr);
+        let result = self
+            .write_float64_effect(user, value)
+            .map_err(Refusal::into_record);
 
         let _ = self.ad.port_base.call_param_callbacks(addr);
         match &result {
@@ -2451,7 +2508,9 @@ mod tests {
         let e = det
             .write_int32(&mut AsynUser::new(p.write_data), 1)
             .unwrap_err();
-        assert!(e.to_string().contains("Destination blocked"), "{e}");
+        // C posts the refusal to WriteMsg only; the record gets the status
+        // (ADTimePix.cpp:172-183).
+        assert_eq!(e.message(), "");
         assert_eq!(
             det.text(p.write_msg, 0),
             "Destination blocked by startup allowlist: file:/data"
@@ -2461,6 +2520,26 @@ mod tests {
             det.text(p.destination_policy, 0),
             "Blocked: destination allowlist contains an invalid entry"
         );
+    }
+
+    /// C's writeFloat64 returns asynError with no errorMessage when Serval
+    /// refuses the configuration (ADTimePix.cpp:1107-1110).
+    #[test]
+    fn a_failed_float_write_hands_the_record_no_message() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_F64_REFUSED",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let ad = det.ad.params;
+        let e = det
+            .write_float64(&mut AsynUser::new(ad.acquire_time), 0.5)
+            .unwrap_err();
+        assert_eq!(e.message(), "");
     }
 
     /// A channel Base PV reads back whether it names a reachable folder or
