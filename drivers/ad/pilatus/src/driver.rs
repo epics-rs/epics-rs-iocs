@@ -221,7 +221,7 @@ impl PortDriver for PilatusDriver {
                 line!(),
                 format_args!(
                     "pilatusDetector:writeInt32: error, status={} function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -347,7 +347,7 @@ impl PortDriver for PilatusDriver {
                     line!(),
                     format_args!(
                         "pilatusDetector:writeFloat64 error, status={} function={function}, value={value:.6}",
-                        e.status() as i32
+                        e.c_status_code()
                     ),
                 );
             }
@@ -397,7 +397,7 @@ impl PortDriver for PilatusDriver {
                 status: e.status(),
                 message: format!(
                     "pilatusDetector:writeOctet: status={}, function={function}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             });
         }
@@ -607,6 +607,57 @@ mod tests {
         assert_eq!(base.get_int32_param(p.pixel_cutoff, 0).unwrap(), 3);
         assert_eq!(base.get_float64_param(p.delay_time, 0).unwrap(), 2.5);
         assert_eq!(base.get_string_param(p.header_string, 0).unwrap(), b"h");
+    }
+
+    /// pilatusDetector.cpp:1441, :1578, :1633 carry the param library's
+    /// asynParamWrongType for a write of the other type.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "PILATUS_STATUS";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Cmd>(4);
+        let links = DriverLinks {
+            cmd_tx,
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let mut det = PilatusDriver::new(port, 8, 8, 0, links).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let user = |reason| {
+            let mut user = AsynUser::new(reason);
+            user.trace = Some(UserTrace {
+                manager: manager.clone(),
+                port: port.into(),
+            });
+            user
+        };
+        let (float, int) = (det.p.delay_time, det.p.pixel_cutoff);
+        assert!(det.write_int32(&mut user(float), 1).is_err());
+        assert!(det.write_float64(&mut user(int), 1.0).is_err());
+        let octet = det.write_octet(&mut user(int), b"x").unwrap_err();
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        for line in [
+            format!("pilatusDetector:writeInt32: error, status=8 function={float}, value=1"),
+            format!("pilatusDetector:writeFloat64 error, status=8 function={int}, value=1.000000"),
+        ] {
+            assert!(text.contains(&line), "{line}: {text}");
+        }
+        assert!(
+            octet.to_string().contains(&format!(
+                "pilatusDetector:writeOctet: status=8, function={int}, value=x"
+            )),
+            "{octet}"
+        );
     }
 
     #[test]
