@@ -57,23 +57,18 @@ pub fn ims_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 OUTPUT_EOS,
                 EosRefusal::Ignored,
             )?;
+            println!(
+                "ImsMDrivePlusMotorDriver:ImsMDrivePlusMotorController(): motorPortName={motor_port}, \
+                 IOPortName={io_port}, devName={device_name} "
+            );
             let port =
                 get_port(&io_port).ok_or_else(|| format!("IP port '{io_port}' not found"))?;
-            let axis = ImsMDrivePlusAxis::new(handle, &port.handle, device_name.clone())
+            let axis = ImsMDrivePlusAxis::new(handle, &port.handle, device_name)
                 .map_err(|e| format!("ImsMDrivePlusCreateController: axis setup failed: {e}"))?;
 
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             holder.install(ctx, motor_port.clone(), motor, moving_poll_ms, idle_poll_ms);
 
-            let dev = if device_name.is_empty() {
-                "(none)".to_string()
-            } else {
-                device_name
-            };
-            println!(
-                "ImsMDrivePlusCreateController: motorPort={motor_port} ioPort={io_port} \
-                 deviceName={dev} poll=[{moving_poll_ms}/{idle_poll_ms}]ms"
-            );
             Ok(CommandOutcome::Continue)
         },
     )

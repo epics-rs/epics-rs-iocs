@@ -57,6 +57,9 @@ pub const OUTPUT_EOS: &[u8] = b"\r\n";
 const IS_READ_BUF: usize = 1024;
 const IS_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Rule under the setup-config banner lines.
+const RULE: &str = "-------------------------------------------";
+
 /// `(input, function)` per line of a `PR IS` block: C turns every non-digit
 /// into a separator and scans `%d %d %d` (input, function, active level) from
 /// each LF-terminated line; text after the last LF is not scanned.
@@ -168,31 +171,59 @@ impl ImsMDrivePlusAxis {
             ));
         }
 
+        // Console lines are C readHomeAndLimitConfig's printfs.
+        println!("Controller version {version}");
+        println!("Setup config:");
         let vlow = version.to_lowercase();
-        if vlow.contains("lmd") {
-            // Lexium MDrive: output EOS depends on party mode.
-            let eos: &[u8] = if self.device_name.is_empty() {
-                b"\r"
-            } else {
-                b"\n"
-            };
-            port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos)?;
-        }
-
         if vlow.contains("lmm") || vlow.contains("lmd") {
-            if let Ok(block) = self.read_input_setup(port) {
-                for (input_no, function) in parse_input_setup(&block) {
-                    self.set_switch(function, input_no);
-                }
+            if vlow.contains("lmm") {
+                println!("Lexium Motor Module detected");
+                println!("{RULE}");
+            } else {
+                // Lexium MDrive: output EOS depends on party mode.
+                println!("Lexium MDrive detected");
+                println!("{RULE}");
+                let eos: &[u8] = if self.device_name.is_empty() {
+                    println!("Have no device name, line ending CR.");
+                    b"\r"
+                } else {
+                    println!("Have device name going party modus, line ending LF.");
+                    b"\n"
+                };
+                port.set_output_eos_blocking(AsynUser::new(0).with_addr(0), eos)?;
+            }
+            let block = self.read_input_setup(port).unwrap_or_default();
+            let text = block.split(|&b| b == 0).next().unwrap_or_default();
+            println!("{}", String::from_utf8_lossy(text));
+            for (input_no, function) in parse_input_setup(&block) {
+                self.set_switch(function, input_no);
             }
         } else {
             // MForce: read the S1-S4 I/O setup and map any home/limit inputs.
+            println!("MForce 1 driver detected");
+            println!("{RULE}");
+            println!("Checking setup for home, pos and neg limit switches:");
             for input_no in 1..=4 {
-                if let Ok(resp) = self.write_read(&format!("PR S{input_no}")) {
-                    self.set_switch(atoi(&resp), input_no);
-                }
+                let resp = self
+                    .write_read(&format!("PR S{input_no}"))
+                    .unwrap_or_default();
+                println!("{resp}");
+                self.set_switch(atoi(&resp), input_no);
             }
         }
+        println!(
+            "    HOME limit switch input line: {}",
+            self.home_switch.unwrap_or(-1)
+        );
+        println!(
+            "POSITIVE limit switch input line: {}",
+            self.pos_limit_switch.unwrap_or(-1)
+        );
+        println!(
+            "NEGATIVE limit switch input line: {}",
+            self.neg_limit_switch.unwrap_or(-1)
+        );
+        println!("{RULE}");
 
         // Encoder present? (`EE` echo-encoder flag.)
         if let Ok(resp) = self.write_read("PR EE") {
@@ -244,12 +275,16 @@ impl ImsMDrivePlusAxis {
     /// Map an I/O setup type code to the switch input it configures (C
     /// `set_switch_vars`: 1 = home, 2 = positive limit, 3 = negative limit).
     fn set_switch(&mut self, type_code: i32, input_no: i32) {
-        match type_code {
-            1 => self.home_switch = Some(input_no),
-            2 => self.pos_limit_switch = Some(input_no),
-            3 => self.neg_limit_switch = Some(input_no),
-            _ => {}
-        }
+        let (slot, name) = match type_code {
+            1 => (&mut self.home_switch, "HOME"),
+            2 => (&mut self.pos_limit_switch, "POSITIVE"),
+            3 => (&mut self.neg_limit_switch, "NEGATIVE"),
+            _ => return,
+        };
+        *slot = Some(input_no);
+        println!(
+            "Setup type {type_code} found: {name} limit switch input line is set to {input_no}"
+        );
     }
 
     /// Set base velocity (`VI`, only if > 0), max velocity (`VM`), acceleration
