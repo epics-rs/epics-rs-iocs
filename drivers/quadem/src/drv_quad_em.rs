@@ -573,7 +573,8 @@ pub struct QuadEmShared {
 }
 
 /// C's `int status; status |= ...`: the OR of every step's `asynStatus`, so
-/// a timeout and an overflow return asynError's 3.
+/// a timeout and an overflow return asynError's 3 and a param-library
+/// refusal its own code.
 #[derive(Default)]
 struct StatusOr(i32);
 
@@ -590,22 +591,12 @@ impl StatusOr {
         self.add(r);
     }
 
-    /// C's `return (asynStatus)status` with the errorMessage it formats; a
-    /// code past asynDisabled, which [`AsynStatus`] does not carry, is
-    /// returned as asynError.
+    /// C's `return (asynStatus)status` with the errorMessage it formats.
     fn into_result(self, message: impl FnOnce(i32) -> String) -> AsynResult<()> {
-        let status = match self.0 {
-            0 => return Ok(()),
-            1 => AsynStatus::Timeout,
-            2 => AsynStatus::Overflow,
-            4 => AsynStatus::Disconnected,
-            5 => AsynStatus::Disabled,
-            _ => AsynStatus::Error,
-        };
-        Err(AsynError::Status {
-            status,
-            message: message(self.0),
-        })
+        if self.0 == 0 {
+            return Ok(());
+        }
+        AsynError::from_c_status_code(self.0, message(self.0)).map_or(Ok(()), Err)
     }
 }
 
@@ -1533,11 +1524,10 @@ mod tests {
         }
     }
 
-    fn failed_with(r: AsynResult<()>) -> (AsynStatus, String) {
-        match r {
-            Err(AsynError::Status { status, message }) => (status, message),
-            other => panic!("expected a status error, got {other:?}"),
-        }
+    /// The status C's write returns, in its numbering, and its errorMessage.
+    fn failed_with(r: AsynResult<()>) -> (i32, String) {
+        let e = r.unwrap_err();
+        (e.c_status_code(), e.message())
     }
 
     #[test]
@@ -1547,7 +1537,7 @@ mod tests {
         assert_eq!(
             failed_with(m.qe_write_int32(&AsynUser::new(range).with_addr(0), 3)),
             (
-                AsynStatus::Disconnected,
+                4,
                 format!("drvQuadEM:writeInt32: status=4, function={range}, name=QE_RANGE, value=3")
             )
         );
@@ -1562,7 +1552,7 @@ mod tests {
         assert_eq!(
             failed_with(m.qe_write_float64(&AsynUser::new(bias_voltage).with_addr(0), 50.0)),
             (
-                AsynStatus::Timeout,
+                1,
                 format!(
                     "drvQuadEM:writeFloat64: status=1, function={bias_voltage}, \
                      name=QE_BIAS_VOLTAGE, value=50.000000"
@@ -1585,7 +1575,7 @@ mod tests {
         assert_eq!(
             failed_with(m.qe_write_int32(&AsynUser::new(acquire_mode).with_addr(0), single)),
             (
-                AsynStatus::Error,
+                3,
                 format!(
                     "drvQuadEM:writeInt32: status=3, function={acquire_mode}, \
                      name=QE_ACQUIRE_MODE, value={single}"
@@ -1682,9 +1672,9 @@ mod tests {
     }
 
     /// Overflow(2) | Disconnected(4) is 6, which no asynStatus names: the
-    /// message carries C's 6, the returned status is asynError.
+    /// message and the returned status both carry C's 6.
     #[test]
-    fn an_or_no_status_names_is_an_error() {
+    fn an_or_past_asyn_disabled_keeps_its_code() {
         let mut m = FakeMeter::new(&[
             ("set_range", AsynStatus::Overflow),
             ("read_status", AsynStatus::Disconnected),
@@ -1692,7 +1682,7 @@ mod tests {
         let range = m.base.params.range;
         let (status, message) =
             failed_with(m.qe_write_int32(&AsynUser::new(range).with_addr(0), 1));
-        assert_eq!(status, AsynStatus::Error);
+        assert_eq!(status, 6);
         assert!(message.contains("status=6,"), "{message}");
     }
 
@@ -1706,7 +1696,7 @@ mod tests {
         assert_eq!(
             failed_with(m.qe_write_int32(&AsynUser::new(geometry).with_addr(list), 1)),
             (
-                AsynStatus::Error,
+                11,
                 format!(
                     "drvQuadEM:writeInt32: status=11, function={geometry}, \
                      name=QE_GEOMETRY, value=1"
