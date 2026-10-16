@@ -75,6 +75,8 @@ pub struct XpsAxis {
     /// Last group status code seen by [`poll`](AsynMotor::poll); `move` reads it
     /// to decide whether to auto-enable a disabled axis.
     axis_status: i32,
+    /// The status the last poll left, C's parameter-library values.
+    last_status: MotorStatus,
     /// C's `pasynUser_`: the motor port and axis number every error line
     /// prints on and names as `[port,axis]`.
     trace: MotorTrace,
@@ -118,6 +120,13 @@ impl XpsAxis {
             min_jerk,
             max_jerk,
             axis_status: 0,
+            last_status: MotorStatus {
+                gain_support: true,
+                has_encoder: true,
+                // The XPS move ignores base velocity (min_velocity); VBAS unused.
+                vbas_supported: false,
+                ..Default::default()
+            },
             trace,
         })
     }
@@ -832,71 +841,74 @@ impl AsynMotor for XpsAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        // Clone the Arc into a local so the lock guard does not borrow `self`
-        // (we mutate `self.axis_status` after the reads).
+        // C's parameter library: every field this poll does not reach keeps
+        // its last value, and a failed call ends the poll with only
+        // `motorStatusCommsError_` raised (XPSAxis.cpp:755-758).
+        let mut status = self.last_status.clone();
+        let failed = self.poll_into(&mut status).is_err();
+        status.comms_error = failed;
+        self.last_status = status.clone();
+        Ok(status)
+    }
+}
+
+impl XpsAxis {
+    /// C `XPSAxis::poll` up to its `done:` label: writes each field as its
+    /// call succeeds, and stops at the first failed call.
+    fn poll_into(&mut self, status: &mut MotorStatus) -> XpsResult<()> {
         let controller = self.controller.clone();
         let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         let sock = ctrl.poll_socket();
-
         let poll_error = |command: &str, e: &XpsError| {
-            self.error(
+            trace_error(
+                &self.trace,
                 "poll",
                 format_args!(
                     "[{},{}]: error calling {command} status={}",
-                    self.port(),
-                    self.axis_no(),
+                    self.trace.port(),
+                    self.trace.addr(),
                     e.code()
                 ),
             )
         };
+
         let axis_status = sock
             .group_status_get(&self.group_name)
+            .inspect(|&code| self.axis_status = code)
             .inspect_err(|e| poll_error("GroupStatusGet", e))?;
+        let flags = StatusFlags::from_status(axis_status);
+        status.done = !flags.group_moving;
+
+        // In referencing (move-to-home) mode C reports the axis as not homed /
+        // not at home regardless of status (XPSAxis::poll 636/648).
+        let referencing = ctrl.is_group_referencing(&self.group_name);
+        status.encoder_home = flags.encoder_home && !referencing;
+        status.homed = flags.homed && !referencing;
+        status.powered = flags.powered;
+        status.problem = flags.problem;
+
         let encoder = sock
             .group_position_current_get(&self.positioner_name)
             .inspect_err(|e| poll_error("GroupPositionCurrentGet", e))?;
+        status.encoder_position = encoder / self.step_size;
         let setpoint = sock
             .group_position_setpoint_get(&self.positioner_name)
             .inspect_err(|e| poll_error("GroupPositionSetpointGet", e))?;
+        status.position = setpoint / self.step_size;
         let positioner_error = sock
             .positioner_error_get(&self.positioner_name)
             .inspect_err(|e| poll_error("PositionerErrorGet", e))?;
+        (status.high_limit, status.low_limit) = limits_from_error(positioner_error);
         // C's line names GroupPositionVelocityGet for this call (XPSAxis.cpp:746).
         let velocity = sock
             .group_velocity_current_get(&self.positioner_name)
             .inspect_err(|e| poll_error("GroupPositionVelocityGet", e))?;
-        // In referencing (move-to-home) mode C reports the axis as not homed /
-        // not at home regardless of status (XPSAxis::poll 636/648).
-        let referencing = ctrl.is_group_referencing(&self.group_name);
-        drop(ctrl);
-
-        self.axis_status = axis_status;
-
-        let flags = StatusFlags::from_status(axis_status);
-        let moving = velocity.abs() > XPS_VELOCITY_DEADBAND;
-        let (high_limit, low_limit) = limits_from_error(positioner_error);
-
-        Ok(MotorStatus {
-            position: setpoint / self.step_size,
-            encoder_position: encoder / self.step_size,
-            velocity: velocity / self.step_size,
-            // Motion-done is the group-status view; the separate `moving` flag
-            // is velocity-derived (C `motorStatusDone_` vs `motorStatusMoving_`).
-            done: !flags.group_moving,
-            moving,
-            high_limit,
-            low_limit,
-            encoder_home: flags.encoder_home && !referencing,
-            homed: flags.homed && !referencing,
-            powered: flags.powered,
-            problem: flags.problem,
-            direction: velocity > XPS_VELOCITY_DEADBAND,
-            gain_support: true,
-            has_encoder: true,
-            // The XPS move ignores base velocity (min_velocity); VBAS unused.
-            vbas_supported: false,
-            ..Default::default()
-        })
+        status.velocity = velocity / self.step_size;
+        status.direction = velocity > XPS_VELOCITY_DEADBAND;
+        // Motion-done is the group-status view; `moving` is velocity-derived
+        // (C `motorStatusDone_` vs `motorStatusMoving_`).
+        status.moving = velocity.abs() > XPS_VELOCITY_DEADBAND;
+        Ok(())
     }
 }
 
@@ -915,6 +927,102 @@ fn referencing_distance(distance: f64, hardware_status: i32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::sync_io::SyncIOHandle;
+
+    use crate::xps::rpc::SocketMode;
+
+    /// An XPS that answers every call, and `fail` with error -3.
+    struct FakeXps {
+        base: PortDriverBase,
+        reply: Option<String>,
+        fail: Arc<Mutex<&'static str>>,
+    }
+
+    impl PortDriver for FakeXps {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            let cmd = String::from_utf8_lossy(data);
+            let name = cmd.split('(').next().unwrap_or("").trim();
+            let values = match name {
+                _ if name == *self.fail.lock().unwrap() => "-3",
+                "GroupStatusGet" => "0,12",
+                "GroupPositionCurrentGet" => "0,1.5",
+                "GroupPositionSetpointGet" => "0,1.25",
+                "PositionerSGammaParametersGet" => "0,10,40,0.02,0.02",
+                _ => "0,0",
+            };
+            self.reply = Some(format!("{values},EndOfAPI"));
+            Ok(data.len())
+        }
+        fn io_read_octet(&mut self, _user: &AsynUser, buf: &mut [u8]) -> AsynResult<usize> {
+            let reply = self.reply.take().ok_or_else(|| AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "no reply".into(),
+            })?;
+            buf[..reply.len()].copy_from_slice(reply.as_bytes());
+            Ok(reply.len())
+        }
+    }
+
+    fn fake_axis(port: &str) -> (XpsAxis, Arc<Mutex<&'static str>>) {
+        let fail = Arc::new(Mutex::new(""));
+        let line = FakeXps {
+            base: PortDriverBase::new(port, 1, PortFlags::default()),
+            reply: None,
+            fail: fail.clone(),
+        };
+        let (rt, _jh) =
+            create_port_runtime(&claim_port(port).unwrap(), line, RuntimeConfig::default())
+                .unwrap();
+        let socket = |mode| {
+            let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
+            XpsSocket::new(io, port, mode)
+        };
+        let controller =
+            XpsController::new(socket(SocketMode::Query), false, Duration::ZERO).unwrap();
+        let axis = XpsAxis::new(
+            Arc::new(Mutex::new(controller)),
+            socket(SocketMode::Fire),
+            "MOTOR_T",
+            0,
+            "G1.P1",
+            1.0,
+        )
+        .unwrap();
+        (axis, fail)
+    }
+
+    /// C `XPSAxis::poll` (`done:`, XPSAxis.cpp:755-758): a failed call raises
+    /// only COMM_ERR, keeps what this poll already wrote and every older value.
+    #[test]
+    fn a_failed_poll_raises_only_comms_error() {
+        let (mut axis, fail) = fake_axis("xps_poll_fail");
+        let user = AsynUser::new(0);
+
+        *fail.lock().unwrap() = "PositionerErrorGet";
+        let s = axis.poll(&user).unwrap();
+        assert!(s.comms_error);
+        assert!(!s.problem, "status 12 is Ready");
+        assert!(s.homed);
+        assert_eq!((s.encoder_position, s.position), (1.5, 1.25));
+
+        *fail.lock().unwrap() = "";
+        assert!(!axis.poll(&user).unwrap().comms_error);
+
+        *fail.lock().unwrap() = "GroupStatusGet";
+        let s = axis.poll(&user).unwrap();
+        assert!(s.comms_error && s.homed && !s.problem);
+        assert_eq!(s.position, 1.25);
+    }
 
     #[test]
     fn group_name_is_prefix_before_dot() {
