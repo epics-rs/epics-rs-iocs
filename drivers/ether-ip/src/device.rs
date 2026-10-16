@@ -13,13 +13,14 @@
 use std::sync::Arc;
 
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status;
-use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
+use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType, menu_scan};
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
@@ -215,10 +216,14 @@ pub fn parse_link(text: &str, count: usize, bits: usize) -> Result<Link, String>
 
 /// Gather `bits` consecutive bits out of the BOOL array starting at
 /// `element`/`mask`, packing them into an RVAL.
+///
+/// A multi-bit read tests its first bit as `(value & 0x1) & mask`
+/// (devEtherIP.c:209-216), so RVAL bit 0 is 0 unless `mask` covers bit 0.
 fn get_bits(raw: &[u8], mut element: usize, mut mask: u32, bits: usize) -> Option<u32> {
     let mut value = cip::get_udint(raw, element)?;
     let mut rval = 0u32;
-    if value & mask != 0 {
+    let first = if bits == 1 { value } else { value & 0x1 };
+    if first & mask != 0 {
         rval |= 1;
     }
     for i in 1..bits {
@@ -278,6 +283,10 @@ fn put_bits(raw: &mut [u8], mut element: usize, mut mask: u32, bits: usize, rval
 pub struct EtherIpDevice {
     /// The record name, for C's `rec->name` in the lines it prints.
     name: String,
+    /// The record's SCAN, for C's `get_period`.
+    scan: ScanType,
+    /// `rec->udf` as the cycle began: FORCE yields to the PLC while it is set.
+    udf: u8,
     link_text: String,
     is_output: bool,
     link: Option<Link>,
@@ -291,6 +300,8 @@ impl EtherIpDevice {
     fn new(link_text: &str, is_output: bool) -> EtherIpDevice {
         EtherIpDevice {
             name: String::new(),
+            scan: ScanType::Passive,
+            udf: 1,
             link_text: link_text.to_string(),
             is_output,
             link: None,
@@ -367,23 +378,34 @@ fn record_shape(record: &dyn Record) -> (usize, usize) {
     }
 }
 
-/// C `get_period`: the SCAN menu, in seconds. Passive / Event / I/O Intr have
-/// no period of their own.
-fn scan_period(record: &dyn Record) -> Option<f64> {
-    let scan = match record.get_field("SCAN") {
-        Some(EpicsValue::Enum(n)) => n,
-        _ => return None,
+/// C `get_period`: a periodic SCAN's menu label, when it says "second", read
+/// as `strtod` reads it. Anything else is no period.
+fn get_period(name: &str, scan: ScanType) -> Option<f64> {
+    let ScanType::Menu(index) = scan else {
+        return None;
     };
-    match scan {
-        3 => Some(10.0),
-        4 => Some(5.0),
-        5 => Some(2.0),
-        6 => Some(1.0),
-        7 => Some(0.5),
-        8 => Some(0.2),
-        9 => Some(0.1),
-        _ => None,
-    }
+    let label = menu_scan().label_at(index)?;
+    let period = label
+        .contains("second")
+        .then(|| strtod_prefix(label))
+        .flatten()
+        .filter(|p| p.is_finite());
+    crate::eip_printf!(
+        8,
+        "EIP record '{name}' scans at {:.1} secs\n",
+        period.unwrap_or(-1.0)
+    );
+    period
+}
+
+/// The number `strtod` takes off the front of `text`, or None when it takes
+/// nothing.
+fn strtod_prefix(text: &str) -> Option<f64> {
+    let t = text.trim_start();
+    (1..=t.len())
+        .rev()
+        .filter(|&n| t.is_char_boundary(n))
+        .find_map(|n| t[..n].parse::<f64>().ok())
 }
 
 impl DeviceSupport for EtherIpDevice {
@@ -391,8 +413,13 @@ impl DeviceSupport for EtherIpDevice {
         DTYP
     }
 
-    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+    fn set_record_info(&mut self, name: &str, scan: ScanType) {
         self.name = name.to_string();
+        self.scan = scan;
+    }
+
+    fn set_process_context(&mut self, ctx: &ProcessContext) {
+        self.udf = ctx.udf;
     }
 
     // Every C init_record/analyze_link failure returns an `S_*` status after
@@ -415,16 +442,30 @@ impl DeviceSupport for EtherIpDevice {
             CaError::InvalidValue(format!("devEtherIP: unknown PLC '{}'", link.plc_name))
         })?;
 
+        // devEtherIP.c:1021-1035: a non-positive period at each step falls
+        // through to the next.
+        let positive = |p: &f64| *p > 0.0;
         let period = link
             .period
-            .or_else(|| scan_period(record))
+            .filter(positive)
+            .or_else(|| get_period(&self.name, self.scan).filter(positive))
             .or_else(
                 || match driver::DEFAULT_RATE_MS.load(std::sync::atomic::Ordering::Relaxed) {
                     0 => None,
                     ms => Some(ms as f64 / 1000.0),
                 },
             )
-            .unwrap_or(1.0);
+            .unwrap_or_else(|| {
+                errlog_vprintf(format_args!(
+                    "devEtherIP ({}): cannot decode SCAN field, no scan flag given\n",
+                    self.name
+                ));
+                errlog_vprintf(format_args!(
+                    "Device support will use the default of 1 secs, "
+                ));
+                errlog_vprintf(format_args!("please complete the record configuration\n"));
+                1.0
+            });
 
         let tag = plc
             .add_tag(period, &link.string_tag, link.elements)
@@ -681,8 +722,7 @@ impl EtherIpDevice {
             return Ok(DeviceReadOutcome::computed(DeviceUdf::Untouched));
         }
 
-        let udf = matches!(record.get_field("UDF"), Some(EpicsValue::Char(1)));
-        let force = forced && !udf;
+        let force = forced && self.udf == 0;
 
         match rtype {
             "ao" => match cip::typecode(&data.buf) {
@@ -981,6 +1021,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn get_period_reads_the_scan_menu_label() {
+        assert_eq!(get_period("r", ScanType::SEC1), Some(1.0));
+        assert_eq!(get_period("r", ScanType::Menu(9)), Some(0.1));
+        assert_eq!(get_period("r", ScanType::SEC10), Some(10.0));
+        assert_eq!(get_period("r", ScanType::Passive), None);
+        assert_eq!(get_period("r", ScanType::IoIntr), None);
+    }
+
+    /// devEtherIP.c:361-375: FORCE re-writes the record's value only once
+    /// the record is defined; an undefined record takes the PLC's.
+    #[test]
+    fn force_yields_to_the_plc_while_the_record_is_undefined() {
+        use epics_rs::base::server::record::CommonFields;
+        use epics_rs::base::server::records::ao::AoRecord;
+
+        driver::define_plc("forceudf", "127.0.0.1", 0);
+        for (udf, want_val, want_write) in [(1u8, 5.0, false), (0, 0.0, true)] {
+            let mut record = AoRecord::default();
+            let mut dev = EtherIpDevice::new("@forceudf REAL S 1 FORCE", true);
+            dev.init(&mut record).unwrap();
+            let tag = dev.tag.clone().unwrap();
+            {
+                let mut d = tag.data.lock();
+                d.buf = CipType::Real.code().to_le_bytes().to_vec();
+                d.buf.extend_from_slice(&5.0f32.to_le_bytes());
+                d.valid_data_size = d.buf.len();
+                d.do_write = false;
+            }
+            let mut common = CommonFields::default();
+            common.udf = udf;
+            dev.set_process_context(&common.process_context());
+            dev.read(&mut record).unwrap();
+            assert_eq!(f64_field(&record, "VAL"), want_val, "udf={udf}");
+            assert_eq!(tag.data.lock().do_write, want_write, "udf={udf}");
+        }
+    }
+
     // -- link parsing --------------------------------------------------------
 
     #[test]
@@ -1098,10 +1176,19 @@ mod tests {
 
     #[test]
     fn get_bits_across_a_udint_boundary() {
-        // Bits 30,31 of word 0 are 1,0; bits 0,1 of word 1 are 1,1.
-        // Reading 4 bits from bit 30 gives 0b1101 (LSB first: 1,0,1,1).
+        // Bits 30,31 of word 0 are 1,0; bits 0,1 of word 1 are 1,1. C's
+        // first-bit test reads bit 30 as 0, so 4 bits give 0b1100.
         let raw = bits_buf(&[1 << 30, 0b11]);
-        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1101));
+        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1100));
+    }
+
+    /// mbbi NOBT=2 on BOOLs[300] with bits 300 and 301 set: C reads 2, not 3.
+    #[test]
+    fn multi_bit_read_takes_cs_first_bit_from_bit_zero() {
+        let raw = bits_buf(&[0x3000]);
+        assert_eq!(get_bits(&raw, 0, 1 << 12, 2), Some(2));
+        assert_eq!(get_bits(&raw, 0, 1 << 12, 1), Some(1));
+        assert_eq!(get_bits(&bits_buf(&[0b11]), 0, 1, 2), Some(3));
     }
 
     #[test]
@@ -1115,7 +1202,8 @@ mod tests {
     fn put_bits_round_trips() {
         let mut raw = bits_buf(&[0xFFFF_FFFF]);
         assert!(put_bits(&mut raw, 0, 1 << 4, 4, 0b0101));
-        assert_eq!(get_bits(&raw, 0, 1 << 4, 4), Some(0b0101));
+        // C reads the first bit back from bit 0 (set here), not bit 4.
+        assert_eq!(get_bits(&raw, 0, 1 << 4, 4), Some(0b0100));
         // Neighbouring bits are untouched.
         assert_eq!(cip::get_udint(&raw, 0), Some(0xFFFF_FF5F));
     }
@@ -1126,7 +1214,7 @@ mod tests {
         assert!(put_bits(&mut raw, 0, 1 << 30, 4, 0b1101));
         assert_eq!(cip::get_udint(&raw, 0), Some(1 << 30));
         assert_eq!(cip::get_udint(&raw, 1), Some(0b11));
-        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1101));
+        assert_eq!(get_bits(&raw, 0, 1 << 30, 4), Some(0b1100));
     }
 
     #[test]
