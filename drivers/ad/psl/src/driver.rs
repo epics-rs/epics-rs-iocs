@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::EnumEntry;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -81,7 +82,7 @@ impl PslDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let params = PslParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
