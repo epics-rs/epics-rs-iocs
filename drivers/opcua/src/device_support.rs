@@ -175,6 +175,8 @@ struct EnumState {
 pub struct OpcuaDevice {
     registry: Arc<Registry>,
     link_text: String,
+    /// The record type the factory saw, declared to the registry at attach.
+    record_type: String,
     record_name: String,
     op: Op,
     is_output: bool,
@@ -196,10 +198,11 @@ pub struct OpcuaDevice {
 }
 
 impl OpcuaDevice {
-    pub fn new(registry: Arc<Registry>, link_text: String) -> Self {
+    pub fn new(registry: Arc<Registry>, link_text: String, record_type: &str) -> Self {
         Self {
             registry,
             link_text,
+            record_type: record_type.to_string(),
             record_name: String::new(),
             op: Op::Int32,
             is_output: false,
@@ -768,17 +771,9 @@ impl OpcuaDevice {
         put(record, "VAL", EpicsValue::Double(value))?;
         Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
-}
 
-impl DeviceSupport for OpcuaDevice {
-    fn dtyp(&self) -> &str {
-        DTYP
-    }
-
-    // Every C++ init failure is a `CATCH()` that returns an `S_*` status
-    // (`devOpcua.cpp:106-108`), never touching pact — the record scans on:
-    // the `Err` shape, kept by every `?` below.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+    /// C `init_record` for this record: parse and bind its link.
+    fn bind_link(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let record_type = record.record_type();
         let (op, is_output) = Op::of(record_type).ok_or_else(|| {
             CaError::LinkError(format!(
@@ -847,9 +842,27 @@ impl DeviceSupport for OpcuaDevice {
         }
         Ok(DeviceInitOutcome::Live)
     }
+}
+
+impl DeviceSupport for OpcuaDevice {
+    fn dtyp(&self) -> &str {
+        DTYP
+    }
+
+    // Every C++ init failure is a `CATCH()` that returns an `S_*` status
+    // (`devOpcua.cpp:106-108`), never touching pact — the record scans on:
+    // the `Err` shape, kept by every `?` below.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        let outcome = self.bind_link(record);
+        if outcome.is_err() && record.record_type() == "opcuaItem" {
+            self.registry.item_record_failed(&self.record_name);
+        }
+        outcome
+    }
 
     fn set_record_info(&mut self, name: &str, _scan: ScanType) {
         self.record_name = name.to_string();
+        self.registry.declare_record(name, &self.record_type);
     }
 
     fn apply_record_info(&mut self, info: &HashMap<String, String>) {
@@ -1186,9 +1199,10 @@ pub fn factory(
         // The link text is the db field verbatim, so an INST_IO link still
         // carries its leading '@'.
         let link_text = raw.strip_prefix('@').unwrap_or(raw).trim();
-        Some(
-            Box::new(OpcuaDevice::new(registry.clone(), link_text.to_string()))
-                as Box<dyn DeviceSupport>,
-        )
+        Some(Box::new(OpcuaDevice::new(
+            registry.clone(),
+            link_text.to_string(),
+            ctx.record_type,
+        )) as Box<dyn DeviceSupport>)
     }
 }

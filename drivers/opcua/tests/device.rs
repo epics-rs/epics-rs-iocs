@@ -66,7 +66,7 @@ fn registry() -> Arc<Registry> {
 /// state table it does not know it has.
 fn bind(registry: &Arc<Registry>, record: &mut dyn Record, link: &str) -> OpcuaDevice {
     record.init_record(0).expect("the record initialises");
-    let mut device = OpcuaDevice::new(registry.clone(), link.to_string());
+    let mut device = OpcuaDevice::new(registry.clone(), link.to_string(), record.record_type());
     device.set_record_info("REC", ScanType::IoIntr);
     device.init(record).expect("the link binds");
     device
@@ -895,7 +895,11 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
 fn a_record_type_with_no_opc_ua_device_support_is_refused() {
     let registry = registry();
     let mut record = epics_rs::base::server::records::calc::CalcRecord::new("");
-    let mut device = OpcuaDevice::new(registry.clone(), "S ns=2;s=Node monitor=n".to_string());
+    let mut device = OpcuaDevice::new(
+        registry.clone(),
+        "S ns=2;s=Node monitor=n".to_string(),
+        "calc",
+    );
     device.set_record_info("REC", ScanType::Passive);
 
     let err = device
