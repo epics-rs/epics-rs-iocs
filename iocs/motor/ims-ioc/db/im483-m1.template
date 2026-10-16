@@ -1,5 +1,6 @@
-# The model-1 IMS drivers (drvIM483PL.cc, ...): one motor record per axis,
-# signal S of card C as in C's basic_motor.db. DTYP names the driver.
+# The model-1 IMS drivers (drvIM483PL.cc, drvIM483SM.cc, drvMDrive.cc): one
+# motor record per axis, signal S of card C as in C's basic_motor.db. DTYP
+# names the driver.
 #
 # Positions and speeds go to the controller in raw steps, so MRES = 1 and
 # EGU = steps.
