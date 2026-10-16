@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
@@ -81,11 +81,11 @@ pub struct Exchange {
 /// The Pixirad command socket.
 #[derive(Clone)]
 pub struct PixiradServer {
-    handle: Arc<Mutex<PortHandle>>,
+    handle: Arc<Mutex<SyncIOHandle>>,
 }
 
 impl PixiradServer {
-    pub fn new(handle: PortHandle) -> Self {
+    pub fn new(handle: SyncIOHandle) -> Self {
         Self {
             handle: Arc::new(Mutex::new(handle)),
         }
@@ -101,13 +101,13 @@ impl PixiradServer {
             flush: true,
         };
         let handle = self.handle.lock();
-        let outcome = handle.submit_blocking(op, user);
+        let outcome = handle
+            .port()
+            .and_then(|port| port.submit_blocking(op, user));
         // C prints both lines on `pasynUserCommand_`: the command port's trace
         // mask gates them.
         let trace_error = |message: &str| {
-            handle
-                .trace()
-                .output(handle.port_name(), TraceMask::ERROR, message);
+            handle.print(0, TraceMask::ERROR, format_args!("{message}"));
         };
 
         match outcome {
@@ -153,11 +153,15 @@ impl PixiradServer {
         let user = || AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
         {
             let handle = self.handle.lock();
-            let _ = handle.submit_blocking(RequestOp::Disconnect, user());
+            let _ = handle
+                .port()
+                .and_then(|port| port.submit_blocking(RequestOp::Disconnect, user()));
         }
         std::thread::sleep(delay);
         let handle = self.handle.lock();
-        let _ = handle.submit_blocking(RequestOp::Connect, user());
+        let _ = handle
+            .port()
+            .and_then(|port| port.submit_blocking(RequestOp::Connect, user()));
     }
 }
 

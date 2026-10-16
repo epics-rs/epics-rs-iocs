@@ -16,6 +16,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
@@ -520,12 +521,14 @@ impl PixiradRuntime {
 
 /// Create the detector port and start its three threads (C `pixiradConfig`).
 ///
-/// `command_handle` is the `drvAsynIPPort` that reaches the box on TCP 2222;
+/// `command_handle` is the user of the `drvAsynIPPort` that reaches the box on
+/// TCP 2222 — one with no port when the startup script named none, since C
+/// ignores the connect status (pixirad.cpp:471-472);
 /// `data_port` and `status_port` are the UDP ports it broadcasts on.
 #[allow(clippy::too_many_arguments)]
 pub fn create_pixirad_detector(
     claim: &PortClaim,
-    command_handle: PortHandle,
+    command_handle: SyncIOHandle,
     data_port: u16,
     status_port: u16,
     max_data_port_buffers: usize,
@@ -621,6 +624,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::time::Duration;
 
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::registry::claim_port;
@@ -678,7 +682,7 @@ mod tests {
         let sensor = Sensor::from_size(476, 512).unwrap();
         PixiradDetector::new(
             name,
-            PixiradServer::new(handle),
+            PixiradServer::new(SyncIOHandle::from_handle(handle, 0, Duration::ZERO)),
             sensor,
             476,
             512,
@@ -686,6 +690,32 @@ mod tests {
             shared,
         )
         .expect("C builds the driver whatever the box answers")
+    }
+
+    /// C ignores the command port's connect status (pixirad.cpp:471-472): the
+    /// driver is built on a user with no port and each command fails.
+    #[test]
+    fn a_missing_command_port_fails_each_command() {
+        let (user, status) = SyncIOHandle::connect_port("PIXI_NONE_IP", 0, Duration::ZERO);
+        assert!(status.is_err());
+        let shared = Arc::new(SharedState {
+            udp_buffers_read: AtomicI32::new(0),
+            queued_frames: AtomicI32::new(0),
+            max_buffers: 1,
+            udp_speed: AtomicU64::new(0),
+        });
+        let mut det = PixiradDetector::new(
+            "PIXI_NONE",
+            PixiradServer::new(user),
+            Sensor::from_size(476, 512).unwrap(),
+            476,
+            512,
+            1 << 20,
+            shared,
+        )
+        .expect("C builds the driver whatever the box answers");
+        let q = det.params;
+        assert!(det.write_int32(&mut AsynUser::new(q.hv_state), 0).is_err());
     }
 
     #[test]
