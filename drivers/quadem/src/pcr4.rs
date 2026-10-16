@@ -575,7 +575,7 @@ fn read_thread(ctx: ReadContext) {
             ctx.shared.set_reading_active(true);
         }
 
-        let read = ctx.io.read_line(proto::ASCII_BUFFER_SIZE);
+        let read = ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE);
         let outcome = match read {
             Ok(o) if o.eom.contains(EomReason::EOS) => o,
             _ => {

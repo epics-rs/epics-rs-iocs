@@ -23,7 +23,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interpose::EomReason;
 use epics_rs::asyn::port::PortDriver;
 use epics_rs::asyn::port_handle::PortHandle;
-use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::request::{PortCalls, RequestOp};
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -86,9 +86,19 @@ impl OctetIo {
     }
 
     fn user(&self) -> AsynUser {
-        AsynUser::new(OCTET_REASON)
-            .with_addr(OCTET_ADDR)
-            .with_timeout(self.timeout)
+        octet_user(self.timeout)
+    }
+
+    /// `pasynManager->lockPort` … `unlockPort` around direct `pasynOctet`
+    /// calls, as the C++ read threads do: no connect gate, so a down link
+    /// answers with the port's own error, and the calls in `f` run back to back.
+    pub fn locked<R: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut LockedOctet<'_>) -> R + Send + 'static,
+    ) -> AsynResult<R> {
+        let timeout = self.timeout;
+        self.handle
+            .lock_port_blocking(move |calls| f(&mut LockedOctet { calls, timeout }))
     }
 
     /// `asynOctetSyncIO->writeRead`: flush stale input, write, read one
@@ -142,28 +152,79 @@ impl OctetIo {
         })
     }
 
+    /// One `pasynOctet->read` under [`Self::locked`], EOS-terminated.
+    pub fn locked_read_line(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
+        self.locked(move |port| port.read_line(buf_size))?
+    }
+
+    /// One `pasynOctet->read` under [`Self::locked`], EOS suppressed.
+    pub fn locked_read_binary(&self, buf_size: usize) -> AsynResult<ReadOutcome> {
+        self.locked(move |port| port.read_binary(buf_size))?
+    }
+
     /// `pasynOctetSyncIO->setInputEos`. Called once at driver construction;
-    /// nothing writes this cell afterwards.
+    /// nothing writes this cell afterwards. C's SyncIO EOS setters take
+    /// `lockPort`, not `queueLockPort`, so they succeed on a port whose device
+    /// is down — the constructor runs before the meter is reachable.
     pub fn set_input_eos(&self, eos: &[u8]) -> AsynResult<()> {
-        self.handle.set_input_eos_blocking(self.eos_user(), eos)
+        let eos = eos.to_vec();
+        self.locked(move |port| port.set_eos(RequestOp::SetInputEos { eos }))?
     }
 
     /// `pasynOctetSyncIO->setOutputEos`.
     pub fn set_output_eos(&self, eos: &[u8]) -> AsynResult<()> {
-        self.handle.set_output_eos_blocking(self.eos_user(), eos)
-    }
-
-    /// C's SyncIO EOS setters take `lockPort`, not `queueLockPort`, so they
-    /// succeed on a port whose device is down — the constructor runs before
-    /// the meter is reachable.
-    fn eos_user(&self) -> AsynUser {
-        self.user().queue_even_if_not_connected()
+        let eos = eos.to_vec();
+        self.locked(move |port| port.set_eos(RequestOp::SetOutputEos { eos }))?
     }
 
     /// `asynOctetSyncIO->flush`.
     pub fn flush(&self) -> AsynResult<()> {
         self.handle.submit_blocking(RequestOp::Flush, self.user())?;
         Ok(())
+    }
+}
+
+fn octet_user(timeout: Duration) -> AsynUser {
+    AsynUser::new(OCTET_REASON)
+        .with_addr(OCTET_ADDR)
+        .with_timeout(timeout)
+}
+
+/// The octet interface under [`OctetIo::locked`].
+pub struct LockedOctet<'a> {
+    calls: &'a mut dyn PortCalls,
+    timeout: Duration,
+}
+
+impl LockedOctet<'_> {
+    fn read(&mut self, op: RequestOp) -> AsynResult<ReadOutcome> {
+        let result = self.calls.call(op, octet_user(self.timeout))?;
+        Ok(ReadOutcome {
+            data: result.data.unwrap_or_default(),
+            eom: EomReason::from_bits_truncate(result.eom_reason),
+        })
+    }
+
+    /// `pasynOctet->read` with the port's input EOS active.
+    pub fn read_line(&mut self, buf_size: usize) -> AsynResult<ReadOutcome> {
+        self.read(RequestOp::OctetRead { buf_size })
+    }
+
+    /// `pasynOctet->read` with the input EOS suppressed; see
+    /// [`OctetIo::read_binary`].
+    pub fn read_binary(&mut self, buf_size: usize) -> AsynResult<ReadOutcome> {
+        self.read(RequestOp::OctetReadBinary { buf_size })
+    }
+
+    /// `pasynOctet->flush`.
+    pub fn flush(&mut self) -> AsynResult<()> {
+        self.calls
+            .call(RequestOp::Flush, octet_user(self.timeout))
+            .map(drop)
+    }
+
+    fn set_eos(&mut self, op: RequestOp) -> AsynResult<()> {
+        self.calls.call(op, octet_user(self.timeout)).map(drop)
     }
 }
 
@@ -228,5 +289,26 @@ mod tests {
         .unwrap();
         io.set_input_eos(b"\r\n").unwrap();
         io.set_output_eos(b"\r").unwrap();
+    }
+
+    /// A read-thread read on a down data link is the IP port's own error, as
+    /// C's `pasynOctet->read` under `lockPort` reports it — not the queue's
+    /// asynDisconnected.
+    #[test]
+    fn a_locked_read_on_a_down_link_is_the_ports_own_error() {
+        let (io, _runtime) = create_ip_port(
+            "QE_LOCKED_DOWN",
+            "127.0.0.1:1",
+            Duration::from_millis(200),
+            true,
+            true,
+        )
+        .unwrap();
+        let err = io.locked_read_line(64).unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error, "{err:?}");
+        assert!(
+            err.to_string().contains("127.0.0.1:1 disconnected:"),
+            "{err}"
+        );
     }
 }

@@ -531,11 +531,11 @@ fn read_thread(ctx: ReadContext) {
             ctx.shared.set_reading_active(false);
             ctx.shared.acquire_start.wait();
             ctx.shared.set_reading_active(true);
-            let _ = ctx.data.flush();
+            let _ = ctx.data.locked(|port| port.flush());
             ping_pong = ctx.state.lock().ping_pong;
         }
 
-        let read = ctx.data.read_line(proto::DATA_BUFFER_SIZE);
+        let read = ctx.data.locked_read_line(proto::DATA_BUFFER_SIZE);
         let outcome = match read {
             Ok(o) if o.eom.contains(EomReason::EOS) => o,
             _ => {

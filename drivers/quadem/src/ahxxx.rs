@@ -589,7 +589,7 @@ fn read_thread(ctx: ReadContext) {
                     && QeTriggerMode::from_i32(ctx.shared.acq.lock().trigger_mode)
                         == QeTriggerMode::ExtGate;
 
-                let read = ctx.io.read_binary(n_requested);
+                let read = ctx.io.locked_read_binary(n_requested);
                 let mut outcome = match read {
                     Ok(o) if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) => o,
                     Ok(_) => {
@@ -635,7 +635,7 @@ fn read_thread(ctx: ReadContext) {
                     ctx.shared.trigger_callbacks(&ctx.handle);
                     let preamble_len = proto::ACK_PREAMBLE.len();
                     outcome.data.drain(0..preamble_len);
-                    let extra = ctx.io.read_binary(preamble_len);
+                    let extra = ctx.io.locked_read_binary(preamble_len);
                     match &extra {
                         Ok(o) if o.data.len() == preamble_len && o.eom.contains(EomReason::CNT) => {
                         }
@@ -677,7 +677,7 @@ fn read_thread(ctx: ReadContext) {
             }
             QeReadFormat::Ascii => {
                 for _ in 0..values_per_read {
-                    let read = ctx.io.read_line(proto::ASCII_BUFFER_SIZE);
+                    let read = ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE);
                     let outcome = match read {
                         Ok(o) if o.eom.contains(EomReason::EOS) => o,
                         _ => {

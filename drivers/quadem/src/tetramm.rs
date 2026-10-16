@@ -569,7 +569,7 @@ fn read_thread(ctx: ReadContext) {
         match read_format {
             QeReadFormat::Binary => {
                 let n_requested = proto::binary_frame_len(num_channels);
-                let read = ctx.io.read_binary(n_requested);
+                let read = ctx.io.locked_read_binary(n_requested);
                 let outcome = match read {
                     Ok(o) if o.data.len() == n_requested && o.eom.contains(EomReason::CNT) => o,
                     _ => {
@@ -629,7 +629,7 @@ fn read_thread(ctx: ReadContext) {
                 }
             }
             QeReadFormat::Ascii => {
-                let read = ctx.io.read_line(proto::ASCII_BUFFER_SIZE);
+                let read = ctx.io.locked_read_line(proto::ASCII_BUFFER_SIZE);
                 let outcome = match read {
                     Ok(o) if o.eom.contains(EomReason::EOS) => o,
                     _ => {
@@ -694,19 +694,26 @@ fn report_read_failure(handle: &PortHandle, read: &AsynResult<ReadOutcome>, bina
 }
 
 /// C++ resync: read two frames' worth, find the data trailer, then consume the
-/// bytes that follow it so the next read lands on a frame boundary. A failed
-/// read is scanned for what it did transfer, as C++ scans its buffer
-/// regardless of the read status.
+/// bytes that follow it so the next read lands on a frame boundary — both reads
+/// under one `lockPort`. A failed read is scanned for what it did transfer, as
+/// C++ scans its buffer regardless of the read status.
 fn resync(ctx: &ReadContext, num_channels: usize) {
     let doubled = proto::binary_frame_len(num_channels) * 2;
-    let data = match ctx.io.read_binary(doubled) {
-        Ok(outcome) => outcome.data,
-        Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
-    };
-    match proto::find_resync_offset(&data) {
-        Some(offset) => {
+    let locked = ctx.io.locked(move |port| {
+        let data = match port.read_binary(doubled) {
+            Ok(outcome) => outcome.data,
+            Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
+        };
+        let found = proto::find_resync_offset(&data).map(|offset| {
             let remainder = proto::resync_remainder(num_channels, offset);
-            let _ = ctx.io.read_binary(remainder);
+            let _ = port.read_binary(remainder);
+            (offset, remainder)
+        });
+        (data, found)
+    });
+    let (data, found) = locked.unwrap_or_default();
+    match found {
+        Some((offset, remainder)) => {
             ctx.num_resync.fetch_add(1, Ordering::Relaxed);
             asyn_print!(
                 ctx.handle,
