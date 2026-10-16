@@ -484,6 +484,32 @@ fn a_write_at_another_address_sets_list_zero() {
     assert_eq!(h.read_int32_blocking(reason, 0).unwrap(), 3);
 }
 
+/// BISDetector.cpp:675-678 prints setIntegerParam's asynParamWrongType for
+/// an int written to BISSFRMTimeout.
+#[test]
+fn a_refused_write_prints_the_param_librarys_status() {
+    use epics_rs::asyn::trace::TraceFile;
+    let name = "BISSTATUS";
+    let detector = dead_detector(name);
+    let h = detector.port_handle().clone();
+    let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    let file = std::fs::File::create(&path).unwrap();
+    h.trace().set_trace_file(
+        Some(name),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    let reason = detector.params.sfrm_timeout;
+    assert!(h.write_int32_blocking(reason, 0, 1).is_err());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        text.contains(&format!(
+            "BISDetector:writeInt32: error, status=8 function={reason}, value=1"
+        )),
+        "{text}"
+    );
+}
+
 /// BISTask ignores its getDoubleParam status (BISDetector.cpp:498), so a scan
 /// with no ADAcquireTime ever written still goes out to BIS, as 0 s.
 #[test]

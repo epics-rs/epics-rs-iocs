@@ -114,7 +114,7 @@ impl BrukerDetector {
         if let Err(e) = exchange.result {
             self.trace_error(&format!(
                 "BISDetector:writeBIS, status={}, sent\n{command}",
-                e.status() as i32
+                e.c_status_code()
             ));
         }
         let p = self.ad.params;
@@ -258,7 +258,7 @@ impl PortDriver for BrukerDetector {
                 line!(),
                 format_args!(
                     "BISDetector:writeInt32: error, status={} function={reason}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
