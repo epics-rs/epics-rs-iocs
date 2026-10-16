@@ -18,8 +18,9 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAt
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -35,8 +36,7 @@ pub(crate) struct AcquisitionContext {
     pub data: MpxConnection,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: Arc<NDArrayPool>,
     pub ad_params: ADBaseParams,
     pub params: MerlinParams,
     pub init_param: usize,
@@ -304,7 +304,7 @@ async fn publish_image(
         }
     };
 
-    let mut array = NDArray::with_data(
+    let mut array = ctx.pool.wrap(
         vec![
             NDDimension::new(header.x_size),
             NDDimension::new(header.y_size),
@@ -377,7 +377,7 @@ async fn publish_profiles(
     let NDDataBuffer::U32(_) = &profiles.image else {
         unreachable!("decode_profiles always returns U32")
     };
-    let mut array = NDArray::with_data(
+    let mut array = ctx.pool.wrap(
         vec![NDDimension::new(stride), NDDimension::new(2)],
         profiles.image,
     );

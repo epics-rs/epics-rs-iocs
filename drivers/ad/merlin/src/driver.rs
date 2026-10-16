@@ -25,9 +25,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 
 use crate::connection::{MpxConnection, default_timeout};
 use crate::params::MerlinParams;
@@ -679,7 +677,6 @@ pub struct MerlinRuntime {
     pub params: MerlinParams,
     pool: Arc<NDArrayPool>,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     data_task: std::thread::JoinHandle<()>,
     #[allow(dead_code)]
@@ -699,8 +696,7 @@ impl MerlinRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -741,8 +737,6 @@ pub fn create_merlin_detector(
     let params = det.params;
     let init_param = det.init_param;
     let pool = det.ad.pool.clone();
-
-    let queued_counter = det.ad.queued_counter.clone();
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
@@ -750,7 +744,7 @@ pub fn create_merlin_detector(
         data,
         handle: runtime_handle.port_handle().clone(),
         output: ArrayPublisher::new(array_output.clone()),
-        queued: queued_counter.clone(),
+        pool: pool.clone(),
         ad_params,
         params,
         init_param,
@@ -764,7 +758,6 @@ pub fn create_merlin_detector(
         params,
         pool,
         array_output,
-        queued_counter,
         data_task,
         status_task,
     })
