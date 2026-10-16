@@ -99,19 +99,23 @@ fn connect_octet(port: &str, addr: i32) -> Result<SyncIOHandle, ConnectError> {
 /// C `pmacController`'s constructor (pmacController.cpp:194-200): a refused
 /// connect or EOS set is printed and the controller is still created, with no
 /// low-level user.
-fn low_level_port_connect(port: &str, addr: i32) -> Option<SyncIOHandle> {
+fn low_level_port_connect(self_port: &str, port: &str, addr: i32) -> Option<SyncIOHandle> {
+    let trace = MotorTrace::new(self_port, 0);
     connect_octet(port, addr)
         .inspect_err(|e| {
+            let line = |args: std::fmt::Arguments<'_>| trace.print_self(TraceMask::ERROR, args);
             match e {
-                ConnectError::NoPort => eprintln!(
-                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}"
-                ),
-                ConnectError::InputEos(e) => {
-                    eprintln!("pmacController: unable to set input EOS on {port}: {e}")
-                }
-                ConnectError::OutputEos(e) => {
-                    eprintln!("pmacController: unable to set output EOS on {port}: {e}")
-                }
+                ConnectError::NoPort => line(format_args!(
+                    "pmacController::motorAxisAsynConnect: unable to connect to port {port}\n"
+                )),
+                ConnectError::InputEos(e) => line(format_args!(
+                    "pmacController: unable to set input EOS on {port}: {}\n",
+                    e.message_display()
+                )),
+                ConnectError::OutputEos(e) => line(format_args!(
+                    "pmacController: unable to set output EOS on {port}: {}\n",
+                    e.message_display()
+                )),
             }
             println!(
                 "pmacController::pmacController: Failed to connect to low level \
@@ -165,7 +169,7 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
             let controller = Arc::new(Mutex::new(PmacController::new(
-                low_level_port_connect(&low_level_port, low_level_addr),
+                low_level_port_connect(&name, &low_level_port, low_level_addr),
                 POLL_CACHE_TTL,
             )));
             let params = PmacControllerParams::new(controller.clone());
@@ -550,9 +554,11 @@ fn pmac_set_coord_poll_period_command(name: &'static str, period: &'static str) 
 mod tests {
     use super::*;
     use epics_rs::asyn::error::AsynResult;
+    use epics_rs::asyn::manager::PortManager;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{PortRuntimeHandle, RuntimeConfig, create_port_runtime};
+    use epics_rs::asyn::trace::TraceFile;
 
     /// A port with no EOS support of its own: both sets are refused.
     struct Bare(PortDriverBase);
@@ -599,7 +605,7 @@ mod tests {
     }
 
     fn controller_on(port: &str) -> PmacController {
-        PmacController::new(low_level_port_connect(port, 0), POLL_CACHE_TTL)
+        PmacController::new(low_level_port_connect("pmacTest", port, 0), POLL_CACHE_TTL)
     }
 
     #[test]
@@ -680,5 +686,24 @@ mod tests {
     #[test]
     fn a_missing_low_level_port_leaves_a_controller_whose_commands_fail() {
         assert!(controller_on("pmacNoSuchPort").write_read("I100").is_err());
+    }
+
+    #[test]
+    fn a_refused_eos_set_prints_through_the_controller_trace() {
+        let _self_rt = publish_bare("pmacTraceSelf");
+        let _low_rt = publish_bare("pmacTraceLow");
+        let path = std::env::temp_dir().join(format!("pmacTraceSelf-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        PortManager::global().trace_manager().set_trace_file(
+            Some("pmacTraceSelf"),
+            TraceFile::File(Arc::new(Mutex::new(file))),
+        );
+        assert!(low_level_port_connect("pmacTraceSelf", "pmacTraceLow", 0).is_none());
+        let trace = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            trace.contains("pmacController: unable to set input EOS on pmacTraceLow: "),
+            "{trace:?}"
+        );
     }
 }
