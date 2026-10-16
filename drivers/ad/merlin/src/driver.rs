@@ -623,6 +623,9 @@ impl PortDriver for MerlinDetector {
             || reason == self.params.step_threshold_scan
         {
             self.update_threshold_scan_params()
+        } else if reason < self.params.first() {
+            // ADDriver::writeFloat64 is asynPortDriver's (merlinDetector.cpp:1287).
+            self.ad.port_base.write_float64_param(user, value)
         } else {
             Ok(())
         };
@@ -944,5 +947,43 @@ mod tests {
     fn a_refused_frame_still_advances_the_array_counter() {
         let (_, _, counter) = last_software_triggered_frame("MERLIN_COUNTER_REFUSED", 1000);
         assert_eq!(counter, 1);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (merlinDetector.cpp:1287), whose
+    /// IO_DRIVER line precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MERLIN_BASE_F64";
+        let mut det = detector(port);
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        let _ = det.write_float64(&mut user, 2.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("merlinDetector:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
     }
 }
