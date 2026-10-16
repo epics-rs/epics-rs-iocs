@@ -16,8 +16,8 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::error::UrResult;
 use crate::gripper::{MoveMode, MoveParameter, ObjectStatus, RobotiqGripper, Unit};
 use crate::registry::{self, DashboardHandle};
@@ -313,9 +313,7 @@ impl PortDriver for GripperDriver {
                 spdlog::error(format_args!(
                     "Robot must be powered and dashboard connected on to use gripper"
                 ));
-                return Err(asyn_error(
-                    "the robot must be powered on and the dashboard connected to use the gripper",
-                ));
+                return Err(refused());
             }
 
             if reason == p.connect {
@@ -326,7 +324,7 @@ impl PortDriver for GripperDriver {
             let mut gripper = self.gripper.lock();
             if !gripper.is_connected() {
                 spdlog::error(format_args!("Robotiq gripper not connected"));
-                return Err(asyn_error("the Robotiq gripper is not connected"));
+                return Err(refused());
             }
             if reason == p.connect {
                 return Ok(());
@@ -398,7 +396,7 @@ impl PortDriver for GripperDriver {
             }
             result.map_err(|e| {
                 spdlog::error(format_args!("{e}"));
-                asyn_error(format!("gripper command failed: {e}"))
+                crate::drivers::refused()
             })
         })();
         if result.is_err() {

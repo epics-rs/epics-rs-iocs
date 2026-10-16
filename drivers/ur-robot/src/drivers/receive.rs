@@ -15,8 +15,8 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::receive::ReceiveInterface;
 use crate::registry::{self, ReceiveHandle, ReceiveState};
 use crate::stream::Snapshot;
@@ -349,16 +349,14 @@ impl PortDriver for ReceiveDriver {
                 return if self.try_connect() {
                     Ok(())
                 } else {
-                    Err(asyn_error(
-                        "could not connect to the RTDE receive interface",
-                    ))
+                    Err(refused())
                 };
             }
 
             let mut slot = self.iface.lock();
             let Some(iface) = slot.as_mut() else {
                 spdlog::error(format_args!("RTDE Receive interface not initialized"));
-                return Err(asyn_error("the RTDE receive interface is not initialised"));
+                return Err(refused());
             };
 
             if reason == p.disconnect {
@@ -369,7 +367,7 @@ impl PortDriver for ReceiveDriver {
 
             if !iface.is_connected() {
                 spdlog::warn(format_args!("RTDE Receive interface not connected"));
-                return Err(asyn_error("the RTDE receive interface is not connected"));
+                return Err(refused());
             }
             Ok(())
         })();

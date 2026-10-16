@@ -15,8 +15,8 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::dashboard::DashboardClient;
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::registry::{self, DashboardHandle, DashboardState};
 use crate::session::DEFAULT_TIMEOUT;
 use crate::spdlog;
@@ -254,17 +254,13 @@ impl PortDriver for DashboardDriver {
                 let mut s = self.shared.get();
                 s.connected = ok;
                 self.shared.set(s);
-                return if ok {
-                    Ok(())
-                } else {
-                    Err(asyn_error("could not connect to the dashboard server"))
-                };
+                return if ok { Ok(()) } else { Err(refused()) };
             }
 
             let mut client = self.client.lock();
             if !client.is_connected() {
                 spdlog::debug(format_args!("Dashboard is disconnected. No action taken"));
-                return Err(asyn_error("the dashboard is not connected"));
+                return Err(refused());
             }
 
             let debug = |what: &str| spdlog::debug(format_args!("{what}"));
@@ -313,7 +309,7 @@ impl PortDriver for DashboardDriver {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     spdlog::error(format_args!("{e}"));
-                    Err(asyn_error("dashboard command failed"))
+                    Err(refused())
                 }
             }
         })();
@@ -333,7 +329,7 @@ impl PortDriver for DashboardDriver {
             let mut client = self.client.lock();
             if !client.is_connected() {
                 spdlog::debug(format_args!("Dashboard is disconnected. No action taken"));
-                return Err(asyn_error("the dashboard is not connected"));
+                return Err(refused());
             }
 
             let result = if reason == p.popup {
@@ -350,7 +346,7 @@ impl PortDriver for DashboardDriver {
                 Ok(()) => Ok(data.len()),
                 Err(e) => {
                     spdlog::error(format_args!("{e}"));
-                    Err(asyn_error("dashboard command failed"))
+                    Err(refused())
                 }
             }
         })();

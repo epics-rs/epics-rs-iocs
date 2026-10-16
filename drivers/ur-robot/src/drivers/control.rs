@@ -17,8 +17,8 @@ use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
 use crate::control::ControlInterface;
-use crate::drivers::asyn_error;
 use crate::drivers::ioc_ready::IocReady;
+use crate::drivers::{asyn_error, refused};
 use crate::error::{UrError, UrResult};
 use crate::registry::{self, DashboardHandle, ReceiveHandle};
 use crate::spdlog;
@@ -444,9 +444,7 @@ impl ControlDriver {
         let mut inner = self.inner.lock();
         if inner.pending_motion.is_some() && inner.motion_status != MotionStatus::WaitingAction {
             spdlog::warn(format_args!("Motion task in progress. Cannot run script."));
-            return Err(asyn_error(
-                "a motion task is in progress; the URScript was not run",
-            ));
+            return Err(refused());
         }
         let start_count = self.receive.get().output_int_register_12;
         let timeout = inner.custom_script_timeout;
@@ -454,16 +452,15 @@ impl ControlDriver {
         if !inner.connected() {
             print_unusable(&inner);
         }
-        let iface = inner
-            .iface_mut()
-            .map_err(|e| asyn_error(format!("cannot run the URScript: {e}")))?;
+        let iface = inner.iface_mut().map_err(|_| refused())?;
         match source {
             "(inline)" => spdlog::debug(format_args!("Running inline URScript: {body}")),
             path => spdlog::debug(format_args!("Running custom URScript: {path}")),
         }
-        iface
-            .send_custom_script(body)
-            .map_err(|e| asyn_error(format!("failed to run the URScript {source}: {e}")))?;
+        iface.send_custom_script(body).map_err(|e| {
+            spdlog::error(format_args!("{e}"));
+            refused()
+        })?;
 
         inner.custom_script = Some(CustomScript {
             started: Instant::now(),
@@ -506,7 +503,10 @@ impl PortDriver for ControlDriver {
             let index = usize::try_from(addr)
                 .ok()
                 .filter(|i| *i < limit)
-                .ok_or_else(|| asyn_error(format!("address {addr} is out of range")))?;
+                .ok_or_else(|| {
+                    spdlog::error(format_args!("address {addr} is out of range"));
+                    refused()
+                })?;
 
             // Every arm below stages IOC-local state, so none of them needs the
             // link up — PINI processes these records at boot, before any connect
@@ -551,7 +551,10 @@ impl PortDriver for ControlDriver {
                     inner
                         .iface_mut()
                         .and_then(|i| i.set_tcp(&offset))
-                        .map_err(|e| asyn_error(format!("setTcp failed: {e}")))?;
+                        .map_err(|e| {
+                            spdlog::error(format_args!("{e}"));
+                            refused()
+                        })?;
                 }
             } else if reason == p.joint_speed {
                 inner.joint_speed = deg_to_rad(value);
@@ -609,16 +612,15 @@ impl PortDriver for ControlDriver {
                 return if self.try_connect() {
                     Ok(())
                 } else {
-                    Err(asyn_error(
-                        "could not connect to the RTDE control interface",
-                    ))
+                    Err(refused())
                 };
             }
 
             if reason == p.run_custom_script_file {
                 let path = self.inner.lock().custom_script_path.clone();
-                let body = std::fs::read_to_string(&path).map_err(|e| {
-                    asyn_error(format!("could not read the URScript file {path}: {e}"))
+                let body = std::fs::read_to_string(&path).map_err(|_| {
+                    spdlog::error(format_args!("Failed to read URScript file: {path}"));
+                    refused()
                 });
                 let body = match body {
                     Ok(body) => body,
@@ -641,7 +643,7 @@ impl PortDriver for ControlDriver {
                     }
                     None => {
                         spdlog::error(format_args!("RTDE Control interface not initialized"));
-                        return Err(asyn_error("the RTDE control interface is not initialised"));
+                        return Err(refused());
                     }
                 }
             }
@@ -658,7 +660,7 @@ impl PortDriver for ControlDriver {
 
             if !inner.connected() {
                 print_unusable(&inner);
-                return Err(asyn_error("the RTDE control interface is not connected"));
+                return Err(refused());
             }
 
             let mut updates: Vec<ParamSetValue> = Vec::new();
@@ -791,7 +793,10 @@ impl PortDriver for ControlDriver {
                     self.base.set_int32_param(reason, addr, value)?;
                 }
             }
-            result.map_err(|e| asyn_error(format!("RTDE control command failed: {e}")))
+            result.map_err(|e| {
+                spdlog::error(format_args!("{e}"));
+                refused()
+            })
         })();
         if result.is_err() {
             spdlog::debug(format_args!(
