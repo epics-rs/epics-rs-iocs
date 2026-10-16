@@ -172,7 +172,7 @@ impl DashboardDriver {
                         version.major, version.minor, version.patch, version.build
                     ),
                 )?;
-                if let Ok(serial) = c.serial_number(version) {
+                if let Ok(serial) = c.serial_number() {
                     base.set_string_param(params.serial_number, 0, serial)?;
                 }
                 if let Ok(model) = c.robot_model() {
@@ -377,7 +377,7 @@ pub fn start_poller(
                 {
                     let mut c = client.lock();
                     if c.is_connected() {
-                        match poll_once(&mut c, params, state.polyscope.unwrap_or_default()) {
+                        match poll_once(&mut c, params) {
                             Ok((u, mode)) => {
                                 updates = u;
                                 state.connected = true;
@@ -430,7 +430,6 @@ pub fn start_poller(
 fn poll_once(
     client: &mut DashboardClient,
     params: DashboardParams,
-    polyscope: crate::dashboard::PolyScopeVersion,
 ) -> crate::UrResult<(Vec<ParamSetValue>, String)> {
     let running = client.running()?;
     let program_state = client.program_state()?;
@@ -438,7 +437,7 @@ fn poll_once(
     let loaded_program = client.loaded_program()?;
     let safety_status = client.safety_status()?;
     let program_saved = client.is_program_saved()?;
-    let remote = client.is_in_remote_control(polyscope)?;
+    let remote = client.is_in_remote_control()?;
 
     let updates = vec![
         ParamSetValue::new(params.is_connected, 0, ParamValue::Int32(1)),

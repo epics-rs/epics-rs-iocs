@@ -273,23 +273,26 @@ impl DashboardClient {
         })
     }
 
-    /// `is in remote control` — only supported from PolyScope 5.6.
-    ///
-    /// The caller passes the version it already knows, rather than upstream's
-    /// habit of re-querying `PolyscopeVersion` on every single call
-    /// (dashboard_client.cpp:323), which doubles the dashboard round-trips in
-    /// the poll loop.
-    pub fn is_in_remote_control(&mut self, version: PolyScopeVersion) -> UrResult<bool> {
-        if !version.supports_remote_control_query() {
+    /// `is in remote control` — only supported from PolyScope 5.6. Like
+    /// upstream it asks for the version on every call
+    /// (dashboard_client.cpp:323), so a dashboard that first connects after
+    /// boot still answers from the live version.
+    pub fn is_in_remote_control(&mut self) -> UrResult<bool> {
+        if !self.polyscope_version()?.supports_remote_control_query() {
+            eprintln!(
+                "Warning! isInRemoteControl() function is not supported on the dashboard \
+                 server for PolyScope versions less than 5.6.0"
+            );
             return Ok(false);
         }
         let reply = self.command("is in remote control")?;
         Ok(reply.contains("true"))
     }
 
-    /// `get serial number` — only supported from PolyScope 5.6.
-    pub fn serial_number(&mut self, version: PolyScopeVersion) -> UrResult<String> {
-        if !version.supports_remote_control_query() {
+    /// `get serial number` — only supported from PolyScope 5.6; asks for the
+    /// version first, as upstream (dashboard_client.cpp:392).
+    pub fn serial_number(&mut self) -> UrResult<String> {
+        if !self.polyscope_version()?.supports_remote_control_query() {
             return Err(UrError::Dashboard {
                 command: "get serial number".into(),
                 reply: "not supported before PolyScope 5.6".into(),
@@ -444,33 +447,40 @@ mod tests {
 
     #[test]
     fn remote_control_skips_the_wire_on_old_polyscope() {
-        // No reply is scripted: on CB3 the command must not be sent at all.
-        let (port, jh) = spawn_dashboard(vec![]);
+        // Only the version is scripted: on CB3 the query must not be sent.
+        let (port, jh) = spawn_dashboard(vec!["URSoftware 3.15.8.106339 (Jan 1 2023)"]);
         let mut c = client_on(port);
-        let cb3 = PolyScopeVersion {
-            major: 3,
-            minor: 15,
-            ..Default::default()
-        };
-        assert!(!c.is_in_remote_control(cb3).unwrap());
-        assert!(jh.join().unwrap().is_empty());
+        assert!(!c.is_in_remote_control().unwrap());
+        assert_eq!(jh.join().unwrap(), vec!["PolyscopeVersion"]);
+    }
+
+    /// A client that never saw the version (the dashboard was down at boot)
+    /// still answers from the live controller.
+    #[test]
+    fn remote_control_asks_the_live_version() {
+        let (port, jh) = spawn_dashboard(vec![
+            "URSoftware 5.11.3.108355 (Aug 09 2021)",
+            "Remote control: true",
+        ]);
+        let mut c = client_on(port);
+        assert!(c.is_in_remote_control().unwrap());
+        assert_eq!(
+            jh.join().unwrap(),
+            vec!["PolyscopeVersion", "is in remote control"]
+        );
     }
 
     #[test]
     fn serial_number_must_be_numeric() {
-        let v = PolyScopeVersion {
-            major: 5,
-            minor: 11,
-            ..Default::default()
-        };
-        let (port, jh) = spawn_dashboard(vec!["20195500926"]);
+        let v511 = "URSoftware 5.11.3.108355 (Aug 09 2021)";
+        let (port, jh) = spawn_dashboard(vec![v511, "20195500926"]);
         let mut c = client_on(port);
-        assert_eq!(c.serial_number(v).unwrap(), "20195500926");
+        assert_eq!(c.serial_number().unwrap(), "20195500926");
         jh.join().unwrap();
 
-        let (port, jh) = spawn_dashboard(vec!["not a number"]);
+        let (port, jh) = spawn_dashboard(vec![v511, "not a number"]);
         let mut c = client_on(port);
-        assert!(c.serial_number(v).is_err());
+        assert!(c.serial_number().is_err());
         jh.join().unwrap();
     }
 
