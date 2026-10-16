@@ -95,11 +95,12 @@ use std::thread;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult};
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::scaler::MAX_SCALER_CHANNELS;
 use epics_rs::scaler::device_support::scaler_asyn::{DoneInterrupt, DoneParam, ScalerDriver};
 
+use crate::connect::OctetLink;
 use crate::wire::{encode_set_count_preset, scan_show_counts};
 
 /// asyn reason used for octet transactions against the underlying serial
@@ -140,7 +141,7 @@ struct PollState {
 }
 
 pub struct Scaler974Driver {
-    handle: SyncIOHandle,
+    handle: OctetLink,
     state: Arc<Mutex<PollState>>,
     start_tx: mpsc::Sender<()>,
 }
@@ -153,7 +154,7 @@ impl Scaler974Driver {
     /// `crate::connect::connect_octet`'s doc for why `SyncIOHandle` isn't
     /// just cloned). `poll` is the constructor's poll interval in
     /// milliseconds.
-    pub fn new(handle: SyncIOHandle, poll_handle: SyncIOHandle, poll: i32) -> Self {
+    pub fn new(handle: OctetLink, poll_handle: OctetLink, poll: i32) -> Self {
         let state = Arc::new(Mutex::new(PollState {
             counts: [0; MAX_SCALER_CHANNELS],
             done: DoneParam::new(1),
@@ -190,7 +191,7 @@ impl Scaler974Driver {
     /// a failed `SHOW_COUNTS` leaves both as the last poll left them, so
     /// the record keeps its counts while the port is down.
     fn poll_loop(
-        handle: SyncIOHandle,
+        handle: OctetLink,
         state: Arc<Mutex<PollState>>,
         start_rx: mpsc::Receiver<()>,
         poll_interval: Duration,
@@ -227,19 +228,35 @@ impl Scaler974Driver {
 /// C `Scaler974::sendCommand` (`drvScaler974.cpp:103-127`): a `writeRead`
 /// into `reply`, which a failure leaves untouched; with `status_read`, a
 /// second `read` (the `SHOW_COUNTS` status line, never inspected) only
-/// after the `writeRead` succeeded.
+/// after the `writeRead` succeeded. Either failure prints C's one error
+/// line.
 fn send_command(
-    handle: &SyncIOHandle,
+    link: &OctetLink,
     command: &str,
     reply: &mut Vec<u8>,
     reply_buf: usize,
     status_read: Option<usize>,
 ) -> AsynResult<()> {
-    *reply = handle.write_read(OCTET_REASON, command.as_bytes(), reply_buf)?;
-    if let Some(status_buf) = status_read {
-        handle.read_octet(OCTET_REASON, status_buf)?;
+    let result = link
+        .sync
+        .write_read(OCTET_REASON, command.as_bytes(), reply_buf)
+        .and_then(|data| {
+            *reply = data;
+            match status_read {
+                Some(status_buf) => link.sync.read_octet(OCTET_REASON, status_buf).map(drop),
+                None => Ok(()),
+            }
+        });
+    if let Err(e) = &result {
+        link.print_self(
+            TraceMask::ERROR,
+            format_args!(
+                "Scaler974:sendCommand: writing command {command}, error={}",
+                e.message_display()
+            ),
+        );
     }
-    Ok(())
+    result
 }
 
 /// C `eventThread`'s per-iteration state update (`drvScaler974.cpp:239-249`):
