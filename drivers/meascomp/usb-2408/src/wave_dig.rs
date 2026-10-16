@@ -55,14 +55,15 @@ impl WaveDigState {
 }
 
 /// Digitizer settings for [`start_wave_dig`], read from the WaveDig records.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WaveDigScan {
     pub first_chan: usize,
     pub num_chans: usize,
     pub num_points: usize,
     pub dwell: f64,
     pub input_mode: i32,
-    pub range: i32,
+    /// C `gainArray`: each scanned channel's own ANALOG_IN_RANGE.
+    pub ranges: Vec<i32>,
     pub ext_trigger: bool,
     pub ext_clock: bool,
     pub continuous: bool,
@@ -85,7 +86,7 @@ pub fn start_wave_dig(
         num_points,
         dwell,
         input_mode,
-        range,
+        ref ranges,
         ext_trigger,
         ext_clock,
         continuous,
@@ -102,7 +103,7 @@ pub fn start_wave_dig(
 
     // Load input queue for multi-channel scanning (required by uldaq)
     let mut queue = Vec::with_capacity(num_chans);
-    for i in 0..num_chans {
+    for (i, &range) in ranges.iter().enumerate() {
         queue.push(AiQueueElement {
             channel: (first_chan + i) as i32,
             input_mode,
@@ -138,14 +139,15 @@ pub fn start_wave_dig(
         options |= SO_BURSTMODE;
     }
 
-    state.last_scan = Some(*scan);
+    state.last_scan = Some(scan.clone());
 
     let result = device.analog_in_scan(
         &AInScanConfig {
             low_chan: first_chan as i32,
             high_chan: (first_chan + num_chans - 1) as i32,
             input_mode,
-            range,
+            // The queue sets each channel's range.
+            range: BIP10VOLTS,
             samples_per_chan: num_points as i32,
             options,
             flags: AINSCAN_FF_DEFAULT,
@@ -249,7 +251,7 @@ pub fn stop_wave_dig(
         "Stopping AIn scan",
     );
     if state.auto_restart
-        && let Some(scan) = state.last_scan
+        && let Some(scan) = state.last_scan.clone()
     {
         let _ = start_wave_dig(device, state, &scan, trace);
     }

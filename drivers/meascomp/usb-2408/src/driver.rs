@@ -378,9 +378,12 @@ impl PortDriver for MultiFunctionDriver {
                     .max(0) as usize;
                 let dwell = self.base.get_float64_param(self.params.wave_dig_dwell, 0)?;
                 let input_mode = self.base.get_int32_param(self.params.analog_in_mode, 0)?;
-                let range = self
-                    .base
-                    .get_int32_param(self.params.analog_in_range, first_chan as i32)?;
+                let ranges = (first_chan..first_chan + num_chans)
+                    .map(|chan| {
+                        self.base
+                            .get_int32_param(self.params.analog_in_range, chan as i32)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 let ext_trig = self
                     .base
                     .get_int32_param(self.params.wave_dig_ext_trigger, 0)?
@@ -415,7 +418,7 @@ impl PortDriver for MultiFunctionDriver {
                         num_points,
                         dwell,
                         input_mode,
-                        range,
+                        ranges,
                         ext_trigger: ext_trig,
                         ext_clock: ext_clk,
                         continuous: cont,
