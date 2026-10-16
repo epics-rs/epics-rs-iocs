@@ -38,10 +38,17 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::CommandContext;
 use epics_rs::motor::builder::{AxisSetup, MotorBuilder};
 pub use epics_rs::motor::devices::{
-    PortDriver, device_support_factory, devices, model1_device, register_model1_device,
-    register_port,
+    device_support_factory, devices, model1_device, register_controller_port,
+    register_drv_motor_asyn_port, register_model1_device,
 };
 pub use epics_rs::motor::trace::TraceUser;
+
+/// Create C `asynMotorController` port `port` with axes `0..num_axes` for a
+/// driver with no parameters of its own, gated on the IOC's interruptAccept.
+pub fn register_port(ctx: &CommandContext, port: &str, num_axes: i32) -> Result<(), String> {
+    let owner = ctx.db().scan_control().interrupt_gate();
+    register_controller_port(owner, port, num_axes, ()).map(drop)
+}
 
 /// The trace user of an axis a C asyn driver serves: its port and address.
 pub fn asyn_user(port: &str, addr: i32) -> TraceUser {

@@ -19,7 +19,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double, opt_string, req_int,
     req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::spiiplus::{HOME_LIMIT_INDEX, INPUT_EOS, OUTPUT_EOS, SpiiPlusAxis, SpiiPlusController};
 
@@ -85,7 +85,7 @@ pub fn acsmotion_config_command() -> CommandDef {
                     .map_err(|e| format!("AcsMotionConfig: {e}"))?;
             let controller = Arc::new(Mutex::new(controller));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
             for index in 0..num_axes {
                 let is_virtual = virtual_axes.contains(&index);
                 let ax = SpiiPlusAxis::new(controller.clone(), index, is_virtual);

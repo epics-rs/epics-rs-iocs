@@ -26,7 +26,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
 use motor_common::model2::{Model2, Model2Axis};
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::axis::PmacAxis;
 use crate::controller::{DeferredMode, PMAC_TIMEOUT, PmacController};
@@ -154,14 +154,14 @@ fn pmac_create_controller_command(registry: &Registry) -> CommandDef {
         ],
         "pmacCreateController(portName, lowLevelPortName, lowLevelPortAddress, numAxes, \
          movingPollPeriod, idlePollPeriod)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller port name")?;
             let low_level_port = req_string(args, 1, "Low level port name")?;
             let low_level_addr = c_int(args, 2);
             let num_axes = c_int(args, 3);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 4, 5)?;
 
-            register_port(&name, PortDriver::Controller, num_axes + 1)?;
+            register_port(ctx, &name, num_axes + 1)?;
             let controller = PmacController::new(
                 low_level_port_connect(&low_level_port, low_level_addr),
                 DeferredMode::Fast,

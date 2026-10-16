@@ -19,7 +19,7 @@ use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::gcs2::{PIGCS2Axis, PIGCS2Controller};
 
@@ -70,7 +70,7 @@ pub fn pigcs2_config_command() -> CommandDef {
             }
             let controller = Arc::new(Mutex::new(controller));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
             for (index, axis_name) in found.into_iter().take(num_axes).enumerate() {
                 let axis = PIGCS2Axis::new(controller.clone(), axis_name.clone(), index)
                     .map_err(|e| format!("PIasynController: {e}"))?;

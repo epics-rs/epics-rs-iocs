@@ -17,7 +17,7 @@ use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_double_opt, arg_str_opt, arg_str_req, opt_double, opt_string, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::mdriveplus::{INPUT_EOS, ImsMDrivePlusAxis, OUTPUT_EOS};
 
@@ -60,7 +60,7 @@ pub fn ims_create_controller_command() -> CommandDef {
                 get_port(&io_port).ok_or_else(|| format!("IP port '{io_port}' not found"))?;
             let axis = ImsMDrivePlusAxis::new(handle, &port.handle, &motor_port, device_name);
 
-            register_port(&motor_port, PortDriver::Controller, 1)?;
+            register_port(ctx, &motor_port, 1)?;
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
             install(
                 ctx,

@@ -38,7 +38,7 @@ use motor_common::model1::{Model1, SCAN_RATE, c_int};
 use motor_common::model1_device;
 use motor_common::model2::{Model2, Model2Axis};
 use motor_common::util::atof;
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -191,7 +191,7 @@ pub fn smc100_create_controller_command() -> CommandDef {
                 return Err("SMC100CreateController: EGUs per step must be non-zero".into());
             }
 
-            register_port(&port_name, PortDriver::Controller, num_axes)?;
+            register_port(ctx, &port_name, num_axes)?;
             if get_port(&serial_port).is_none() {
                 eprintln!(
                     "SMC100Controller::SMC100Controller: cannot connect to SMC100 controller"
@@ -243,7 +243,7 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             let controller_id = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(&port_name, PortDriver::Controller, 1)?;
+            register_port(ctx, &port_name, 1)?;
             let Ok(handle) = connect_serial(&serial_port, CONEX_TIMEOUT) else {
                 eprintln!(
                     "AG_CONEXController::AG_CONEXController: cannot connect to CONEX controller"
@@ -280,7 +280,7 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             let controller_id = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(&port_name, PortDriver::Controller, agap::NUM_AXES as i32)?;
+            register_port(ctx, &port_name, agap::NUM_AXES as i32)?;
             let Ok(handle) = connect_serial(&serial_port, AGAP_TIMEOUT) else {
                 eprintln!(
                     "AGAP_CONEXController::AGAP_CONEXController: cannot connect to CONEX controller"
@@ -333,12 +333,12 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
         ],
         "AG_UCCreateController(portName, serialPortName, numAxes, movingPollPeriod, \
          idlePollPeriod)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
             let serial_port = req_string(args, 1, "Serial port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(&port_name, PortDriver::Controller, c_int(args, 2))?;
+            register_port(ctx, &port_name, c_int(args, 2))?;
             let controller = match connect_serial(&serial_port, AG_UC_TIMEOUT) {
                 Ok(handle) => Some(Arc::new(Mutex::new(AgUcController::new(handle)))),
                 Err(_) => {
@@ -471,7 +471,7 @@ pub fn xps_create_controller_command() -> CommandDef {
             let enable_set_position = c_int(args, 6) != 0;
             let settling = Duration::from_millis(c_int(args, 7).max(0) as u64);
 
-            register_port(&port_name, PortDriver::Controller, c_int(args, 3))?;
+            register_port(ctx, &port_name, c_int(args, 3))?;
             let poll = connect_to_server(ctx, &ip, ip_port, XPS_POLL_TIMEOUT);
             if poll.is_none() {
                 println!(
@@ -1246,7 +1246,7 @@ pub fn hxp_create_controller_command() -> CommandDef {
             let ip_port = c_int(args, 2);
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(&port_name, PortDriver::Controller, NUM_HXP_AXES as i32)?;
+            register_port(ctx, &port_name, NUM_HXP_AXES as i32)?;
             let Some(handle) = connect_to_server(ctx, &ip, ip_port, HXP_POLL_TIMEOUT) else {
                 println!(
                     "HXPDriver:HXPController::HXPController: error calling TCP_ConnectToServer for pollSocket"

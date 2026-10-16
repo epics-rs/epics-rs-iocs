@@ -19,7 +19,7 @@ use motor_common::connect::connect_serial;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::mcb4b::{Mcb4bAxis, Mcb4bController};
 
@@ -50,7 +50,7 @@ pub fn mcb4b_create_controller_command() -> CommandDef {
             let num_axes = num_axes as usize;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
             if get_port(&asyn_port).is_none() {
                 eprintln!("MCB4BController::MCB4BController: cannot connect to MCB-4B controller");
                 return Ok(CommandOutcome::Continue);

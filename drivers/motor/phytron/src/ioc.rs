@@ -21,7 +21,7 @@ use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::phytron::{CtrlType, PhytronAxis, PhytronController};
 
@@ -73,7 +73,7 @@ fn phytron_create_phymotion_command(registry: &Registry) -> CommandDef {
         ],
         "phytronCreateController(controllerName, asynPort, movingPollPeriod, idlePollPeriod, \
          timeout, noResetAtBoot)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller name")?;
             let asyn_port = req_string(args, 1, "Phytron communication port name")?;
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
@@ -81,6 +81,7 @@ fn phytron_create_phymotion_command(registry: &Registry) -> CommandDef {
             let no_reset = opt_int(args, 5, 0, "Do not restart controller with IOC")?;
 
             register_controller(
+                ctx,
                 &registry,
                 name,
                 asyn_port,
@@ -113,7 +114,7 @@ fn phytron_create_mcc_command(registry: &Registry) -> CommandDef {
         ],
         "phytronCreateMCC(controllerName, asynPort, address, movingPollPeriod, idlePollPeriod, \
          timeout, noResetAtBoot)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let name = req_string(args, 0, "Controller name")?;
             let asyn_port = req_string(args, 1, "Phytron communication port name")?;
             let address = req_int(args, 2, "Controller address (0..15)")?;
@@ -125,6 +126,7 @@ fn phytron_create_mcc_command(registry: &Registry) -> CommandDef {
             let no_reset = opt_int(args, 6, 0, "Do not restart controller with IOC")?;
 
             register_controller(
+                ctx,
                 &registry,
                 name,
                 asyn_port,
@@ -143,6 +145,7 @@ fn phytron_create_mcc_command(registry: &Registry) -> CommandDef {
 /// Shared body for the two create-controller commands.
 #[allow(clippy::too_many_arguments)]
 fn register_controller(
+    ctx: &CommandContext,
     registry: &Registry,
     name: String,
     asyn_port: String,
@@ -168,7 +171,7 @@ fn register_controller(
         controller.reset_at_boot();
     }
     let controller = Arc::new(Mutex::new(controller));
-    register_port(&name, PortDriver::Controller, PHYTRON_PORT_AXES)?;
+    register_port(ctx, &name, PHYTRON_PORT_AXES)?;
     registry_lock(registry).insert(
         name.clone(),
         ControllerReg {

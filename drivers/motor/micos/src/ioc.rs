@@ -17,7 +17,7 @@ use motor_common::connect::connect_ip;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::corvus::{CorvusAxis, CorvusController};
 use crate::hydra::{HydraAxis, HydraController};
@@ -58,7 +58,7 @@ pub fn corvus_create_controller_command() -> CommandDef {
             let handle = connect_ip(&corvus_port, CORVUS_TIMEOUT)?;
             let controller = Arc::new(Mutex::new(CorvusController::new(handle, num_axes as usize)));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
 
             for index in 0..num_axes as usize {
                 let ax = CorvusAxis::new(controller.clone(), index)
@@ -103,7 +103,7 @@ pub fn hydra_create_controller_command() -> CommandDef {
             let handle = connect_ip(&hydra_port, HYDRA_TIMEOUT)?;
             let controller = Arc::new(Mutex::new(HydraController::new(handle)));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
 
             for index in 0..num_axes as usize {
                 let ax = HydraAxis::new(controller.clone(), index)
@@ -148,7 +148,7 @@ pub fn taurus_create_controller_command() -> CommandDef {
             let handle = connect_ip(&taurus_port, TAURUS_TIMEOUT)?;
             let controller = Arc::new(Mutex::new(TaurusController::new(handle)));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
 
             for index in 0..num_axes as usize {
                 let ax = TaurusAxis::new(controller.clone(), index)

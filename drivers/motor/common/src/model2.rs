@@ -10,7 +10,7 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use crate::iocsh::{arg_int_req, arg_str_req};
 use crate::model1::c_int;
-use crate::{PortDriver, TraceUser, install, register_port};
+use crate::{TraceUser, install, register_drv_motor_asyn_port};
 
 /// One axis a `Config` built, with the poll periods of its driver's poller.
 #[derive(Clone)]
@@ -95,7 +95,7 @@ pub fn drv_asyn_motor_configure_command(drivers: Vec<&'static Model2>) -> Comman
                 println!("drvAsynMotorConfigure ERROR: Can't find driver: {driver_name}");
                 return Ok(CommandOutcome::Continue);
             };
-            register_port(&port_name, PortDriver::DrvMotorAsyn, num_axes)?;
+            register_drv_motor_asyn_port(&port_name, num_axes)?;
             for addr in 0..num_axes {
                 let Some(axis) = driver.open(card, addr) else {
                     println!("drvAsynMotorConfigure: Failed to open axis {addr}");

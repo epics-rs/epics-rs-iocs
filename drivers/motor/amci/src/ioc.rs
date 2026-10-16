@@ -17,7 +17,7 @@ use motor_common::iocsh::{
     DEFAULT_IDLE_POLL_MS, DEFAULT_MOVING_POLL_MS, arg_int_opt, arg_int_req, arg_str_req,
     poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::anf2::{Anf2Axis, Anf2Controller, MAX_AXES};
 use crate::ang1::{Ang1Axis, Ang1Controller};
@@ -41,7 +41,7 @@ pub fn anf2_create_controller_command() -> CommandDef {
             arg_int_req("Number of axes"),
         ],
         "ANF2CreateController(portName, ANF2InPortName, ANF2OutPortName, numAxes)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
             let in_port = req_string(args, 1, "In port name")?;
             let out_port = req_string(args, 2, "Out port name")?;
@@ -56,7 +56,7 @@ pub fn anf2_create_controller_command() -> CommandDef {
             let controller = Anf2Controller::new(&in_port, &out_port, num_axes)
                 .map_err(|e| format!("ANF2CreateController: {e}"))?;
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
             anf2_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -198,7 +198,7 @@ pub fn ang1_create_controller_command() -> CommandDef {
                 .map_err(|e| format!("ANG1CreateController: {e}"))?;
             let controller = Arc::new(Mutex::new(controller));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
             for axis in 0..num_axes {
                 // Infallible, matching C: axis construction ignores the
                 // initial setPosition status and never aborts this command.

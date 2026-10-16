@@ -15,7 +15,7 @@ use motor_common::connect::connect_serial;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, opt_int, poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::mmc200::{Mmc200Axis, Mmc200Controller};
 
@@ -51,7 +51,7 @@ pub fn mmc200_create_controller_command() -> CommandDef {
             let handle = connect_serial(&serial_port, MMC200_TIMEOUT)?;
             let controller = Arc::new(Mutex::new(Mmc200Controller::new(handle)));
 
-            register_port(&motor_port, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &motor_port, num_axes as i32)?;
             for index in 0..num_axes as usize {
                 let ax = Mmc200Axis::new(controller.clone(), index, ignore_limits)
                     .map_err(|e| format!("MMC200CreateController: axis {index}: {e}"))?;

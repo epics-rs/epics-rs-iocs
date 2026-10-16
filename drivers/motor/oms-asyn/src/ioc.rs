@@ -12,7 +12,7 @@ use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::iocsh::{arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::oms::{OmsAxis, OmsController};
 
@@ -56,7 +56,7 @@ fn oms_config_command(cmd_name: &'static str, controller_type: &'static str) -> 
             let init_string = req_string(args, 5, "initstring").unwrap_or_default();
             let who = format!("{controller_type}Config");
 
-            register_port(&port_name, PortDriver::Controller, num_axes)?;
+            register_port(ctx, &port_name, num_axes)?;
             let Some(handle) = connect_with_default_eos(&serial_port, TIMEOUT, &who) else {
                 println!(
                     "{who}: can't connect to port {serial_port}: port {serial_port} not found"

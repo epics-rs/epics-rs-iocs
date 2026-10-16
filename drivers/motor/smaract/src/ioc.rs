@@ -18,7 +18,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use motor_common::connect::{EosRefusal, connect_serial, connect_with_eos};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::mcs::{self, McsAxis, McsController};
 use crate::mcs2::{self, Mcs2Axis, Mcs2Controller};
@@ -65,7 +65,7 @@ pub fn mcs2_create_controller_command() -> CommandDef {
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
             let unused_mask = c_int(args, 5);
 
-            register_port(&port_name, PortDriver::Controller, num_axes)?;
+            register_port(ctx, &port_name, num_axes)?;
             let Ok(handle) = connect_with_eos(
                 &mcs2_port,
                 MCS2_TIMEOUT,
@@ -138,13 +138,14 @@ fn create_axis_args() -> Vec<ArgDesc> {
 /// Register `port_name` and its controller, or print C's connect refusal:
 /// the asynPrint and the `THROW_` that, with exceptions off, only prints.
 fn register<C>(
+    ctx: &CommandContext,
     registry: &Registry<C>,
     args: &[ArgValue],
     controller: Option<C>,
     refusal: (&str, &str),
 ) -> Result<(), String> {
     let port_name = req_string(args, 0, "Port name [string]")?;
-    register_port(&port_name, PortDriver::Controller, c_int(args, 2))?;
+    register_port(ctx, &port_name, c_int(args, 2))?;
     if controller.is_none() {
         eprintln!("{}", refusal.0);
         println!("{}", refusal.1);
@@ -205,12 +206,13 @@ pub fn scu_create_controller_command() -> CommandDef {
         create_controller_args(),
         "smarActSCUCreateController(motorPortName, ioPortName, numAxes, movingPollPeriod, \
          idlePollPeriod)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let io_port = req_string(args, 1, "I/O port name [string]")?;
             let controller = connect_serial(&io_port, SCU_TIMEOUT)
                 .ok()
                 .map(ScuController::new);
             register(
+                ctx,
                 &SCU_CONTROLLERS,
                 args,
                 controller,
@@ -259,7 +261,7 @@ pub fn mcs_create_controller_command() -> CommandDef {
         args,
         "smarActMCSCreateController(motorPortName, ioPortName, numAxes, movingPollPeriod, \
          idlePollPeriod, disableSpeed)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name [string]")?;
             let io_port = req_string(args, 1, "I/O port name [string]")?;
             let disable_speed = c_int(args, 5) != 0;
@@ -279,6 +281,7 @@ pub fn mcs_create_controller_command() -> CommandDef {
             .ok()
             .map(|handle| McsController::new(handle, disable_speed));
             register(
+                ctx,
                 &MCS_CONTROLLERS,
                 args,
                 controller,

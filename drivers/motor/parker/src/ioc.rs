@@ -15,7 +15,7 @@ use motor_common::connect::{EosRefusal, connect_ip, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::acr::{AcrAxis, AcrController};
 use crate::oem::{OemAxis, OemController};
@@ -53,7 +53,7 @@ pub fn oem_create_controller_command() -> CommandDef {
                 connect_with_eos(&oem_port, OEM_TIMEOUT, b"\r", b"\r", EosRefusal::Ignored)?;
             let controller = Arc::new(Mutex::new(OemController::new(handle)));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
 
             for index in 0..num_axes as usize {
                 let ax = OemAxis::new(controller.clone(), index)
@@ -98,7 +98,7 @@ pub fn acr_create_controller_command() -> CommandDef {
             let handle = connect_ip(&acr_port, ACR_TIMEOUT)?;
             let controller = Arc::new(Mutex::new(AcrController::new(handle)));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
 
             for index in 0..num_axes as usize {
                 let ax = AcrAxis::new(controller.clone(), index)

@@ -15,7 +15,7 @@ use motor_common::connect::connect_ip;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::c300::{C300Axis, C300Controller};
 
@@ -50,7 +50,7 @@ pub fn c300_create_controller_command() -> CommandDef {
                 .map_err(|e| format!("C300CreateController: {e}"))?;
             let controller = Arc::new(Mutex::new(controller));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
 
             for index in 0..num_axes as usize {
                 let ax = C300Axis::new(controller.clone(), index);

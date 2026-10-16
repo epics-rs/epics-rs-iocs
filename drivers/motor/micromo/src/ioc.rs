@@ -20,7 +20,7 @@ use motor_common::connect::connect_serial;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{PortDriver, asyn_user, install, register_port};
+use motor_common::{asyn_user, install, register_port};
 
 use crate::mvp2001::{Mvp2001Axis, Mvp2001Controller};
 
@@ -55,7 +55,7 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
         ],
         "MVP2001CreateController(portName, MVP2001PortName, numAxes, movingPollPeriod, \
          idlePollPeriod)",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
+        move |args: &[ArgValue], ctx: &CommandContext| {
             let port_name = req_string(args, 0, "Port name")?;
             let asyn_port = req_string(args, 1, "MVP 2001 port name")?;
             let num_axes = req_int(args, 2, "Number of axes")?;
@@ -70,7 +70,7 @@ pub fn mvp2001_create_controller_command() -> CommandDef {
                 num_axes as usize,
             )));
 
-            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+            register_port(ctx, &port_name, num_axes as i32)?;
             registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
                 port_name,
                 Registered {
