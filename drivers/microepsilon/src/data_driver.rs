@@ -371,7 +371,7 @@ impl PortDriver for DataDriver {
     }
 
     /// C `report` (`capaNCDT6200Sup.c:525`), the whole of it at every level.
-    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, _level: i32) {
         let communicating = self.shared.lock().unwrap().is_communicating;
         let _ = writeln!(
             out,
@@ -869,7 +869,7 @@ mod tests {
 
     #[test]
     fn the_report_says_whether_the_rbk_link_communicates() {
-        let (driver, _keep_alive) = make_test_driver();
+        let (mut driver, _keep_alive) = make_test_driver();
         let mut out = String::new();
         driver.report(&mut out, 1);
         assert_eq!(out, " capaNCDT6200 RBK NOT communicating\n");

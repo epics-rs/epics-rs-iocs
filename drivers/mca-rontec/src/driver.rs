@@ -590,7 +590,7 @@ impl PortDriver for RontecDriver {
     }
 
     /// C `RontecReport` (`drvMcaRontec.c:548-559`).
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
             "Rontec {}: connected on serial port {}",

@@ -494,7 +494,7 @@ impl PortDriver for FastSweepDriver {
     /// C `report` (`drvFastSweep.cpp:360-370`). The `asynPortDriver::report`
     /// it chains to is reproduced only as far as `PortDriverBase` exposes it:
     /// the port line and the parameter list.
-    fn report(&self, out: &mut dyn std::fmt::Write, level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
             "fastSweep {}: connected, input={}",
@@ -820,7 +820,7 @@ mod tests {
     /// C `report`'s two lines (`drvFastSweep.cpp:362-367`).
     #[test]
     fn report_prints_the_c_lines() {
-        let (driver, _subscriptions) =
+        let (mut driver, _subscriptions) =
             FastSweepDriver::connect("FSTESTREPORT", "FSTESTNOSUCHPORT", 2, 8, "", "").unwrap();
         let mut out = String::new();
         driver.report(&mut out, 1);

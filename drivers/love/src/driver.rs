@@ -606,7 +606,7 @@ impl PortDriver for LoveDriver {
     }
 
     /// C `reportIt` (drvLove.c:978-990).
-    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
+    fn report(&mut self, out: &mut dyn std::fmt::Write, _level: i32) {
         let _ = writeln!(
             out,
             "    {} is connected to {}",
@@ -945,7 +945,7 @@ mod tests {
         love_on(ReplySerial { base, eom }, name)
     }
 
-    fn report_of(love: &LoveDriver) -> String {
+    fn report_of(love: &mut LoveDriver) -> String {
         let mut out = String::new();
         love.report(&mut out, 0);
         out
@@ -961,14 +961,14 @@ mod tests {
         let unlisted = "    LOVETESTDIS is connected to SER\n";
 
         love.do_read(2, 0).unwrap();
-        assert_eq!(report_of(&love), listed);
+        assert_eq!(report_of(&mut love), listed);
         love.disconnect_addr(&addr2).unwrap();
-        assert_eq!(report_of(&love), unlisted);
+        assert_eq!(report_of(&mut love), unlisted);
         assert!(!love.base().is_device_connected(2));
         assert!(love.disconnect_addr(&addr2).is_err());
 
         love.connect_addr(&addr2).unwrap();
-        assert_eq!(report_of(&love), listed);
+        assert_eq!(report_of(&mut love), listed);
         assert!(love.base().is_device_connected(2));
         assert!(love.connect_addr(&addr2).is_err());
         assert!(love.connect_addr(&AsynUser::new(0).with_addr(0)).is_err());
