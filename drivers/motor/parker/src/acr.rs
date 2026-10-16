@@ -297,7 +297,6 @@ impl AsynMotor for AcrAxis {
             velocity: 0.0,
             done: !moving,
             moving,
-            direction: true,
             has_encoder: true,
             gain_support: true,
             high_limit,
