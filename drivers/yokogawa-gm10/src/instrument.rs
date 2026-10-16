@@ -490,6 +490,7 @@ impl Actor {
             self.cache.lock().error_flag = false;
         }
         if let RawResponse::Error(bytes) = &raw {
+            self.cache.lock().error_flag = true;
             let text = String::from_utf8_lossy(bytes);
             let Some((code, parameter)) = parse_error_header(&text) else {
                 return Err(io::Error::new(
@@ -499,9 +500,10 @@ impl Actor {
             };
             {
                 let mut cache = self.cache.lock();
-                cache.error_flag = true;
                 cache.error.code = code;
-                cache.error.parameter = parameter;
+                if let Some(parameter) = parameter {
+                    cache.error.parameter = parameter;
+                }
             }
             self.write_command(&cmd_err_query(code))?;
             let follow = wire::read_response(&mut self.stream)?;
@@ -1392,6 +1394,19 @@ mod tests {
         assert!(misc.try_recv().is_err());
         instrument.submit(Command::ReadAllMisc);
         assert!(misc.try_recv().is_ok());
+        device.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_error_header_still_sets_error_flag() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(b"E1,junk\r\n".to_vec());
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ClearError);
+        assert!(instrument.get_error_flag());
         device.join().unwrap();
     }
 }

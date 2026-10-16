@@ -133,26 +133,29 @@ fn strip_trailing_zeros(s: &str) -> String {
 // Error decode (`response_reader`, `drvGM10.c:360-413`)
 // ---------------------------------------------------------------------
 
-/// `sscanf(inbuffer, "E1,%d:1:%d\r\n", &code, &parameter) >= 1` — `code` is
-/// mandatory, `parameter` defaults to 0 if the `:1:` suffix is absent or
-/// malformed (matching C's tolerant `>= 1` accept).
-pub fn parse_error_header(payload: &str) -> Option<(i32, i32)> {
-    let rest = payload.strip_prefix("E1,")?;
-    let code_end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    if code_end == 0 {
+/// `sscanf(inbuffer, "E1,%d:1:%d\r\n", &code, &parameter) >= 1`: `code`
+/// is mandatory; `parameter` is `None` when C's sscanf would leave it
+/// unassigned.
+pub fn parse_error_header(payload: &str) -> Option<(i32, Option<i32>)> {
+    let (code, rest) = scanf_int(payload.strip_prefix("E1,")?)?;
+    let param = rest.strip_prefix(":1:").and_then(scanf_int).map(|(p, _)| p);
+    Some((code, param))
+}
+
+/// One scanf `%d`: optional whitespace and sign, then at least one digit.
+fn scanf_int(s: &str) -> Option<(i32, &str)> {
+    let t = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let digits_from = usize::from(t.starts_with(['+', '-']));
+    let end = digits_from
+        + t[digits_from..]
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(t.len() - digits_from);
+    if end == digits_from {
         return None;
     }
-    let code: i32 = rest[..code_end].parse().ok()?;
-    let param = rest[code_end..]
-        .strip_prefix(":1:")
-        .and_then(|p| {
-            let end = p.find(|c: char| !c.is_ascii_digit()).unwrap_or(p.len());
-            p[..end].parse().ok()
-        })
-        .unwrap_or(0);
-    Some((code, param))
+    // Out-of-range `%d` is undefined in C; wrap.
+    let v = t[..end].parse::<i128>().ok()? as i32;
+    Some((v, &t[end..]))
 }
 
 /// `chopstring40` (`drvGM10.c:330-356`): split off a chunk of at most 39
@@ -782,8 +785,10 @@ mod tests {
 
     #[test]
     fn error_header_with_and_without_parameter() {
-        assert_eq!(parse_error_header("E1,205:1:12\r\n"), Some((205, 12)));
-        assert_eq!(parse_error_header("E1,205\r\n"), Some((205, 0)));
+        assert_eq!(parse_error_header("E1,205:1:12\r\n"), Some((205, Some(12))));
+        assert_eq!(parse_error_header("E1,205\r\n"), Some((205, None)));
+        assert_eq!(parse_error_header("E1, -7:1:x"), Some((-7, None)));
+        assert_eq!(parse_error_header("E1,x"), None);
         assert_eq!(parse_error_header("E0\r\n"), None);
     }
 
