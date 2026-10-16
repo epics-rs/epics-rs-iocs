@@ -179,7 +179,7 @@ async fn main() -> CaResult<()> {
                 ));
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
-                let driver = LoveDriver::new(&lov_port, handle, models.clone())
+                let driver = LoveDriver::new(&lov_port, &ser_port, handle, models.clone())
                     .map_err(|e| format!("drvLoveInit: failed to initialize {lov_port}: {e}"))?;
                 love::registry::register(&lov_port, models);
 

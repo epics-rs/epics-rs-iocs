@@ -60,10 +60,8 @@
 //!   `wrapping_neg` reproduces as defined behavior instead of a Rust debug
 //!   panic. Not reachable by any real PID setpoint.
 //! - **This driver does not replicate the C driver's `connectIt`/
-//!   `disconnectIt` per-address double-connect bookkeeping** or its
-//!   `reportIt` dbior text -- neither is wire-observable protocol, matching
-//!   the precedent set by the `delaygen` drivers (no `report()` override
-//!   there either).
+//!   `disconnectIt` per-address double-connect bookkeeping**; asyn-rs
+//!   devices start connected, so `connectIt` is never reached.
 //! - **`drv_user_create` bounds-checks `addr` against `1..=K_INSTRMAX`**
 //!   before use. C's `create()` (`drvLove.c:1106-1138`) computes
 //!   `&pport->instr[addr-1]` with *no* range check at all -- an
@@ -346,8 +344,13 @@ fn eval_error_to_asyn(e: EvalError) -> AsynError {
 /// registration bookkeeping the Rust runtime already owns).
 pub struct LoveDriver {
     base: PortDriverBase,
+    /// C `Serport::name`, for `reportIt`.
+    ser_name: String,
     handle: SyncIOHandle,
     models: ModelTable,
+    /// C `Instr::isConn`: set when the port thread first connects the
+    /// address, which is just before its first request runs.
+    is_conn: [bool; K_INSTRMAX],
 }
 
 impl LoveDriver {
@@ -357,7 +360,12 @@ impl LoveDriver {
     /// `registry` module doc) -- the caller constructs it, passes a clone
     /// here, and registers another clone under `port_name` for a later
     /// `drvLoveConfig` call to find.
-    pub fn new(port_name: &str, handle: SyncIOHandle, models: ModelTable) -> AsynResult<Self> {
+    pub fn new(
+        port_name: &str,
+        ser_name: &str,
+        handle: SyncIOHandle,
+        models: ModelTable,
+    ) -> AsynResult<Self> {
         let base = PortDriverBase::new(
             port_name,
             K_INSTRMAX + 1,
@@ -370,8 +378,10 @@ impl LoveDriver {
 
         Ok(Self {
             base,
+            ser_name: ser_name.to_owned(),
             handle,
             models,
+            is_conn: [false; K_INSTRMAX],
         })
     }
 
@@ -448,6 +458,7 @@ impl LoveDriver {
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }
+        self.is_conn[(addr - 1) as usize] = true;
         let spec = &COMMANDS[reason];
         let model = self.model_for(addr);
         let read_cmd = spec.read[model as usize];
@@ -465,6 +476,7 @@ impl LoveDriver {
         if !(1..=K_INSTRMAX as i32).contains(&addr) {
             return Err(AsynError::AddressOutOfRange(addr));
         }
+        self.is_conn[(addr - 1) as usize] = true;
         let spec = &COMMANDS[reason];
         let write_cmd = match spec.write_conv {
             WriteConv::Null => {
@@ -495,6 +507,20 @@ impl PortDriver for LoveDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.base
+    }
+
+    /// C `reportIt` (drvLove.c:978-990).
+    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
+        let _ = writeln!(
+            out,
+            "    {} is connected to {}",
+            self.base.port_name, self.ser_name
+        );
+        for (i, &conn) in self.is_conn.iter().enumerate() {
+            if conn {
+                let _ = writeln!(out, "        Addr {} is connected", i + 1);
+            }
+        }
     }
 
     /// C `create()` (asynDrvUser, `drvLove.c:1106-1138`).
@@ -690,7 +716,7 @@ mod tests {
         let handle =
             SyncIOHandle::from_handle(runtime.port_handle().clone(), 0, Duration::from_millis(100));
         let models = std::sync::Arc::new(std::sync::Mutex::new([Model::default(); K_INSTRMAX]));
-        LoveDriver::new(name, handle, models).expect("love driver")
+        LoveDriver::new(name, "SER", handle, models).expect("love driver")
     }
 
     /// Every timed-out attempt prints C's sendCommand and executeCommand
@@ -735,6 +761,31 @@ mod tests {
         ] {
             assert!(out.contains(line), "missing {line:?} in {out:?}");
         }
+    }
+
+    /// C `reportIt` (drvLove.c:978-990): the port pair, then every address
+    /// a request has reached.
+    #[test]
+    fn report_prints_reportit_lines() {
+        let serial = TimeoutSerial {
+            base: PortDriverBase::new(
+                "LOVETESTRPT",
+                1,
+                PortFlags {
+                    multi_device: false,
+                    can_block: true,
+                    destructible: true,
+                },
+            ),
+        };
+        let mut love = love_on(serial, "LOVETESTRPTL");
+        love.is_conn[3] = true;
+        let mut out = String::new();
+        love.report(&mut out, 0);
+        assert_eq!(
+            out,
+            "    LOVETESTRPTL is connected to SER\n        Addr 4 is connected\n"
+        );
     }
 
     /// C `executeCommand` (drvLove.c:767-768) ends three timed-out attempts
