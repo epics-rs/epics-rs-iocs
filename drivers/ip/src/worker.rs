@@ -13,6 +13,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::{TraceManager, TraceMask};
 
@@ -51,29 +52,35 @@ impl Transport {
 
     /// Write `data` and read one EOS-delimited reply.
     pub fn write_read(&self, data: &[u8]) -> Result<String, String> {
-        self.write(data)?;
+        self.write(data).map_err(|e| format!("write failed: {e}"))?;
         self.read()
     }
 
-    pub fn write(&self, data: &[u8]) -> Result<(), String> {
-        self.io
-            .write_octet(OCTET_REASON, data)
-            .map(|_| ())
-            .map_err(|e| format!("write failed: {e}"))
+    pub fn write(&self, data: &[u8]) -> AsynResult<()> {
+        self.io.write_octet(OCTET_REASON, data).map(|_| ())
     }
 
     /// Read one EOS-delimited reply and decode it as text. The `ip` devices all
     /// speak ASCII; a non-UTF-8 byte is a framing error, not data.
     pub fn read(&self) -> Result<String, String> {
-        let raw = self.read_bytes()?;
+        let raw = self.read_bytes().map_err(|e| format!("read failed: {e}"))?;
         String::from_utf8(raw).map_err(|e| format!("reply is not ASCII: {e}"))
     }
 
     /// Read one EOS-delimited reply, undecoded.
-    pub fn read_bytes(&self) -> Result<Vec<u8>, String> {
-        self.io
-            .read_octet(OCTET_REASON, READ_BUF)
-            .map_err(|e| format!("read failed: {e}"))
+    pub fn read_bytes(&self) -> AsynResult<Vec<u8>> {
+        self.io.read_octet(OCTET_REASON, READ_BUF)
+    }
+
+    /// C's device-support callback: write `data`, then read whatever comes
+    /// back, as one transaction. `None` when the write never ran — C's
+    /// `queueRequest` callback never ran either, so nothing is printed. Once
+    /// the write ran, a failed read is C's `nread == 0`: empty bytes.
+    pub fn exchange(&self, data: &[u8]) -> Option<Vec<u8>> {
+        match self.write(data) {
+            Err(e) if e.never_ran() => None,
+            _ => Some(self.read_bytes().unwrap_or_default()),
+        }
     }
 }
 
@@ -138,11 +145,31 @@ pub(crate) mod test_support {
 
     use super::*;
 
-    /// A transport on an octet port that never connects, its trace sent to a
-    /// file, so every transaction fails as a dead device's does.
+    /// A transport on an octet port that never connects, so the queue gate
+    /// refuses every request before it runs. The trace goes to a file.
     pub fn refused_transport(port: &str) -> (Transport, PathBuf, PortRuntimeHandle) {
-        let mut driver = DrvAsynIPPort::new(port, "127.0.0.1:1").unwrap();
-        driver.base_mut().init_auto_connect(false);
+        transport_on(port, "127.0.0.1:1", false)
+    }
+
+    /// A transport on a device that accepts the connection and never answers,
+    /// so every read times out after the write went out.
+    pub fn silent_transport(port: &str) -> (Transport, PathBuf, PortRuntimeHandle) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        });
+        transport_on(port, &addr, true)
+    }
+
+    fn transport_on(
+        port: &str,
+        host: &str,
+        auto_connect: bool,
+    ) -> (Transport, PathBuf, PortRuntimeHandle) {
+        let mut driver = DrvAsynIPPort::new(port, host).unwrap();
+        driver.base_mut().init_auto_connect(auto_connect);
         let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
         let handle = runtime.port_handle().clone();
         let path = std::env::temp_dir().join(format!("{port}-trace-{}", std::process::id()));
@@ -150,7 +177,7 @@ pub(crate) mod test_support {
         handle
             .trace()
             .set_trace_file(Some(port), TraceFile::File(Arc::new(Mutex::new(file))));
-        let io = SyncIOHandle::from_handle(handle.clone(), OCTET_ADDR, Duration::from_millis(200));
+        let io = SyncIOHandle::from_handle(handle.clone(), OCTET_ADDR, Duration::from_millis(50));
         (
             Transport::new(io, handle.trace().clone(), port),
             path,

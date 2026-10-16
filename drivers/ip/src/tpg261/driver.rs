@@ -187,7 +187,7 @@ impl TpgWorker {
     /// (`devTPG261.c::devTPG261Callback`), with the error lines it prints.
     /// `who` stands where C prints the record name.
     fn transact(&self, command: &str, who: &str) -> Result<String, ()> {
-        let acknowledgement = self.exchange(format!("{command}\r").as_bytes());
+        let acknowledgement = self.exchange(format!("{command}\r").as_bytes()).ok_or(())?;
         match protocol::check_ack(&acknowledgement) {
             Ok(()) => {}
             Err(TpgError::Nak) => {
@@ -202,7 +202,8 @@ impl TpgWorker {
                 return Err(());
             }
         }
-        let data = self.exchange(&[ENQ]);
+        // The <ENQ> goes out in the same C callback, so it always "runs".
+        let data = self.exchange(&[ENQ]).unwrap_or_default();
         let data = data.trim().to_string();
         if data.is_empty() {
             self.print_too_small("Val", who);
@@ -211,9 +212,10 @@ impl TpgWorker {
         Ok(data)
     }
 
-    /// C reads after a failed write too, and a failed read is `nread == 0`.
-    fn exchange(&self, data: &[u8]) -> String {
-        self.transport.write_read(data).unwrap_or_default()
+    fn exchange(&self, data: &[u8]) -> Option<String> {
+        self.transport
+            .exchange(data)
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned())
     }
 
     fn print_too_small(&self, stage: &str, who: &str) {
@@ -344,14 +346,10 @@ impl DeviceWorker for TpgWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::test_support::{refused_transport, traced};
+    use crate::worker::test_support::{refused_transport, silent_transport, traced};
 
-    /// A dead controller prints devTPG261Callback's Cmd line once per
-    /// transaction, and nothing else.
-    #[test]
-    fn a_failed_command_prints_cmd_message_too_small() {
-        let (transport, path, runtime) = refused_transport("TPG_TRACE");
-        let params = TpgParams {
+    fn params() -> TpgParams {
+        TpgParams {
             pressure: 0,
             gauge_status: 1,
             setpoint_value: [2, 3],
@@ -362,8 +360,15 @@ mod tests {
             set_setpoint: [9, 10],
             set_sensor: 11,
             set_units: 12,
-        };
-        let mut worker = TpgWorker::new(transport, runtime.port_handle().clone(), params);
+        }
+    }
+
+    /// A controller that never answers prints devTPG261Callback's Cmd line
+    /// once per transaction, and nothing else.
+    #[test]
+    fn a_silent_controller_prints_cmd_message_too_small() {
+        let (transport, path, runtime) = silent_transport("TPG_SILENT");
+        let mut worker = TpgWorker::new(transport, runtime.port_handle().clone(), params());
         worker.poll();
         worker.handle(TpgCommand {
             text: "UNI,1".into(),
@@ -395,5 +400,13 @@ mod tests {
                 "TPG_SET_UNITS[0]",
             ]
         );
+    }
+
+    /// A request the port refused never reached C's callback: no line.
+    #[test]
+    fn a_refused_request_prints_nothing() {
+        let (transport, path, runtime) = refused_transport("TPG_REFUSED");
+        TpgWorker::new(transport, runtime.port_handle().clone(), params()).poll();
+        assert_eq!(traced(&path), Vec::<String>::new());
     }
 }

@@ -108,11 +108,7 @@ impl TelevacWorker {
     /// for a read that returned nothing. `who` stands where C prints the
     /// record name.
     fn transact(&self, command: &str, who: fmt::Arguments<'_>) -> Option<String> {
-        let raw = self
-            .transport
-            .write(command.as_bytes())
-            .and_then(|()| self.transport.read_bytes())
-            .unwrap_or_default();
+        let raw = self.transport.exchange(command.as_bytes())?;
         if raw.is_empty() {
             self.transport.print(
                 TraceMask::ERROR,
@@ -238,15 +234,12 @@ pub fn create_televac(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::test_support::{refused_transport, traced};
+    use crate::worker::test_support::{refused_transport, silent_transport, traced};
 
-    /// A dead gauge prints devTelevacCallback's one error line per read.
-    #[test]
-    fn a_failed_read_prints_message_too_small() {
-        let (transport, path, runtime) = refused_transport("TVAC_TRACE");
-        let mut worker = TelevacWorker {
+    fn worker(transport: Transport, handle: PortHandle) -> TelevacWorker {
+        TelevacWorker {
             transport,
-            handle: runtime.port_handle().clone(),
+            handle,
             params: TelevacParams {
                 pressure: 0,
                 relay_on: 1,
@@ -255,8 +248,15 @@ mod tests {
             },
             stations: 1,
             relays: 0,
-        };
-        worker.poll();
+        }
+    }
+
+    /// A gauge that never answers prints devTelevacCallback's one error line
+    /// per read.
+    #[test]
+    fn a_silent_gauge_prints_message_too_small() {
+        let (transport, path, runtime) = silent_transport("TVAC_SILENT");
+        worker(transport, runtime.port_handle().clone()).poll();
         let lines = traced(&path);
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
@@ -269,5 +269,13 @@ mod tests {
                 .ends_with("devTelevac::devTelevacCallback TVAC_RELAY_STATE message too small=0"),
             "{lines:?}"
         );
+    }
+
+    /// A request the port refused never reached C's callback: no line.
+    #[test]
+    fn a_refused_request_prints_nothing() {
+        let (transport, path, runtime) = refused_transport("TVAC_REFUSED");
+        worker(transport, runtime.port_handle().clone()).poll();
+        assert_eq!(traced(&path), Vec::<String>::new());
     }
 }
