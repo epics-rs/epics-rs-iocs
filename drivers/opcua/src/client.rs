@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
 use async_opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, Session};
+use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
-    DataValue, MessageSecurityMode, MonitoredItemCreateRequest, NodeId, ReadValueId, StatusCode,
-    TimestampsToReturn, Variant, WriteValue, custom::DataTypeTree,
+    DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest, NodeId,
+    ReadValueId, StatusCode, TimestampsToReturn, Variant, WriteValue, custom::DataTypeTree,
 };
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -78,6 +79,10 @@ pub trait UaConnection: Send + Sync {
         items: Vec<MonitoredItemCreateRequest>,
     ) -> Result<Vec<StatusCode>, StatusCode>;
     async fn disconnect(&self);
+    /// The endpoint the session runs on, as the server described it.
+    fn endpoint(&self) -> Option<EndpointDescription> {
+        None
+    }
 }
 
 /// Opens sessions. The driver holds one; a test holds a double.
@@ -318,6 +323,25 @@ impl UaConnection for AsyncOpcuaConnection {
 
     async fn disconnect(&self) {
         let _ = self.session.disconnect().await;
+    }
+
+    fn endpoint(&self) -> Option<EndpointDescription> {
+        Some(self.session.endpoint_info().endpoint.clone())
+    }
+}
+
+/// C `Session::securityPolicyString`.
+pub fn security_policy_string(uri: &str) -> String {
+    if uri.is_empty() {
+        return "None".to_string();
+    }
+    let Some((_, name)) = uri.rsplit_once('#') else {
+        return "Invalid".to_string();
+    };
+    if SecurityPolicy::from_uri(uri) == SecurityPolicy::Unknown {
+        format!("{name} (unsupported)")
+    } else {
+        name.to_string()
     }
 }
 

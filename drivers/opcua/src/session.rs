@@ -12,14 +12,16 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use async_opcua::types::{
-    AttributeId, DataValue, EndpointDescription, MonitoredItemCreateRequest, NodeId, ReadValueId,
-    StatusCode, Variant, WriteValue,
+    AttributeId, DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
+    NodeId, ReadValueId, StatusCode, Variant, WriteValue,
 };
 use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::client::{Identity, SecurityMode, ServerInfo, UaConnection, UaConnector};
+use crate::client::{
+    Identity, SecurityMode, ServerInfo, UaConnection, UaConnector, security_policy_string,
+};
 use crate::defaults;
 use crate::item::Item;
 use crate::queue::{ConnectionStatus, ProcessReason};
@@ -383,6 +385,28 @@ impl SessionWorker {
         self.handle.config.lock().autoconnect
     }
 
+    /// The `ACTIVATED` arm's first lines (`SessionOpen62541.cpp:2432-2445`).
+    fn report_connected(&self, config: &SessionConfig, endpoint: &EndpointDescription) {
+        let (user, token) = match &config.identity {
+            Identity::Anonymous => ("Anonymous", ""),
+            Identity::UserName { user, .. } => (user.as_str(), " (username token)"),
+            Identity::Certificate { .. } => ("Certificate user", " (certificate token)"),
+        };
+        errlog_vprintf(format_args!(
+            "OPC UA session {}: connected as '{user}'{token} with security level {} (mode={:?}; policy={})\n",
+            self.handle.name,
+            endpoint.security_level,
+            endpoint.security_mode,
+            security_policy_string(endpoint.security_policy_uri.as_ref()),
+        ));
+        if endpoint.security_mode == MessageSecurityMode::None {
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: WARNING - this session uses *** NO SECURITY ***\n",
+                self.handle.name
+            ));
+        }
+    }
+
     fn debug(&self) -> u32 {
         self.handle.config.lock().debug
     }
@@ -390,6 +414,9 @@ impl SessionWorker {
     async fn connect(&mut self) -> Result<(), String> {
         let config = self.handle.config.lock().clone();
         let connection = self.connector.connect(&config).await?;
+        if let Some(endpoint) = connection.endpoint() {
+            self.report_connected(&config, &endpoint);
+        }
         // C reads each capability on its own and keeps its default when the
         // read fails, with no print (`SessionOpen62541.cpp:2447-2484`).
         self.server = connection.server_info().await.unwrap_or_default();
