@@ -948,9 +948,12 @@ impl PortDriver for TimePix3Driver {
             } else {
                 Ok(())
             }
-        } else if let Some((name, _)) = DAC_NAMES.iter().find(|(_, f)| f(&p) == reason) {
-            // Every per-chip DAC is written to the chip the asyn address names.
-            self.write_dac(addr, name, value)
+        } else if reason == p.vthreshold_fine {
+            // Only the two thresholds are written; the other DACs are
+            // readbacks (ADTimePix.cpp:540-546).
+            self.write_dac(addr, "Vthreshold_fine", value)
+        } else if reason == p.vthreshold_coarse {
+            self.write_dac(addr, "Vthreshold_coarse", value)
         } else if reason == p.write_raw
             || reason == p.write_raw1
             || reason == p.write_img
@@ -1384,6 +1387,29 @@ impl PortDriver for TimePix3Driver {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// A DAC other than the two thresholds is stored without a Serval
+    /// round trip (ADTimePix.cpp:540-546).
+    #[test]
+    fn only_the_threshold_dacs_reach_serval() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_DAC_DISPATCH",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.write_int32(&mut AsynUser::new(p.preamp_on), 77)
+            .unwrap();
+        assert_eq!(det.int(p.preamp_on, 0), 77);
+        assert!(
+            det.write_int32(&mut AsynUser::new(p.vthreshold_fine), 5)
+                .is_err()
+        );
+    }
 
     /// BiasEnable takes 0 or 1 only; anything else is refused before the
     /// parameter is stored (ADTimePix.cpp:500-505).
