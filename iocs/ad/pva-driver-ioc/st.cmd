@@ -50,15 +50,13 @@ dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,
 # Load all other plugins using commonPlugins.cmd
 < $(ADCORE)/ioc/commonPlugins.cmd
 
-# Upstream also calls asynSetTraceMask/asynSetTraceInfoMask here. Omitted:
-# AdIoc (ad-plugins-rs) never calls asyn-rs's register_asyn_commands_on_shell,
-# so no asyn* iocsh command (asynSetTraceMask, asynReport, ...) is
-# registered on an AdIoc's shell at all -- a pre-existing framework gap
-# affecting every AdIoc-based IOC in this workspace, not specific to this
-# port. An unknown-command line here is a fatal script error (aborts before
-# iocInit()), so it cannot be ported even as a faithful no-op.
+set_requestfile_path("$(PVADRIVERIOC)/db")
 
-# iocInit is called automatically by IocApplication after this script completes.
+iocInit()
+
+# save things every thirty seconds
+create_monitor_set("auto_settings.req", 30, "P=$(PREFIX)")
+
 #
 # Example interactive commands:
 #   dbl                                   # List all PVs
