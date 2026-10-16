@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
@@ -61,7 +62,8 @@ impl PilatusDriver {
         max_memory: usize,
         links: DriverLinks,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory)?;
+        let mut ad =
+            ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory, ASYN_CANBLOCK)?;
         let p = PilatusParams::create(&mut ad.port_base)?;
 
         let params = ad.params;
