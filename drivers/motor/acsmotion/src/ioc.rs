@@ -20,7 +20,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_with_eos;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_int, opt_string, poll_intervals,
     req_int, req_string,
@@ -85,7 +85,13 @@ pub fn acsmotion_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
 
             let virtual_axes = parse_virtual_axes(&virtual_list, num_axes);
 
-            let handle = connect_with_eos(&asyn_port, ACSMOTION_TIMEOUT, INPUT_EOS, OUTPUT_EOS)?;
+            let handle = connect_with_eos(
+                &asyn_port,
+                ACSMOTION_TIMEOUT,
+                INPUT_EOS,
+                OUTPUT_EOS,
+                EosRefusal::Ignored,
+            )?;
             let controller = SpiiPlusController::new(handle, num_axes, homing_method)
                 .map_err(|e| format!("AcsMotionConfig: {e}"))?;
             let ident = controller.ident().to_string();

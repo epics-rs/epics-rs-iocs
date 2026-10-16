@@ -33,7 +33,7 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
-use motor_common::connect::connect_with_eos;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
@@ -1490,6 +1490,7 @@ impl NewportHolder {
                     ESP300_TIMEOUT,
                     esp300::INPUT_EOS,
                     esp300::OUTPUT_EOS,
+                    EosRefusal::BothFatal,
                 )?;
                 let controller = Esp300Controller::new(handle)
                     .map_err(|e| format!("ESP300CreateController: {e}"))?;

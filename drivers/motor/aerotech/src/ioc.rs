@@ -15,7 +15,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::MotorHolder;
-use motor_common::connect::connect_with_eos;
+use motor_common::connect::{EosRefusal, connect_with_eos};
 use motor_common::iocsh::{
     arg_double_opt, arg_int_opt, arg_int_req, arg_str_req, opt_double, opt_int, poll_intervals,
     req_int, req_string,
@@ -61,6 +61,7 @@ pub fn ensemble_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 Duration::from_millis(timeout_ms.max(0.0) as u64),
                 ensemble::INPUT_EOS,
                 ensemble::OUTPUT_EOS,
+                EosRefusal::Ignored,
             )?;
             let controller = Arc::new(Mutex::new(EnsembleController::new(handle)));
             {
@@ -150,6 +151,7 @@ pub fn a3200_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 Duration::from_millis(timeout_ms.max(0.0) as u64),
                 a3200::INPUT_EOS,
                 a3200::OUTPUT_EOS,
+                EosRefusal::Ignored,
             )?;
             let controller = Arc::new(Mutex::new(A3200Controller::new(
                 handle,
