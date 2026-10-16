@@ -13,6 +13,7 @@ use epics_rs::asyn::user::AsynUser;
 use serde_json::json;
 
 use crate::adlog;
+use crate::family::DetectorFamily;
 use crate::http::{HttpError, ServalHttp, TIMEOUT_CONFIG, TIMEOUT_POLL, decode_base64};
 use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
 use crate::params::TimePixParams;
@@ -77,6 +78,13 @@ pub fn dac_params(p: &TimePixParams) -> Vec<(&'static str, usize)> {
 fn one_shot(value: i32) -> bool {
     value == 1
 }
+
+/// C `kMpx3BothCountersTriggerMsg` (ADTimePix.cpp:2129-2130).
+const MPX3_TRIGGER_MSG: &str =
+    "MPX3: BothCounters requires non-Continuous TriggerMode (use AutoTrgSt_TmrSp=4)";
+/// C `kMpx3BothCountersPixelDepthMsg` (ADTimePix.cpp:2132-2133).
+const MPX3_PIXEL_DEPTH_MSG: &str =
+    "MPX3: PixelDepth 24 incompatible with BothCounters (use 12-bit)";
 
 pub struct TimePix3Driver {
     pub ad: ADDriverBase,
@@ -198,6 +206,32 @@ impl TimePix3Driver {
 
     fn http_ok(&mut self) {
         let _ = self.ad.port_base.set_int32_param(self.p.http_code, 0, 200);
+    }
+
+    /// C `mpx3BothCountersTriggerConflict` (ADTimePix.cpp:2135-2143).
+    fn mpx3_trigger_conflict(&self, trigger_mode: i32) -> bool {
+        self.shared.family() == DetectorFamily::Mpx3
+            && self.int(self.p.both_counters, 0) != 0
+            && trigger_mode == 5
+    }
+
+    /// C `mpx3BothCountersPixelDepthConflict` (ADTimePix.cpp:2145-2153).
+    fn mpx3_pixel_depth_conflict(&self, pixel_depth: i32) -> bool {
+        self.shared.family() == DetectorFamily::Mpx3
+            && self.int(self.p.both_counters, 0) != 0
+            && pixel_depth == 24
+    }
+
+    /// C `LOG`/`LOG_ARGS` in `writeInt32`.
+    fn log_write_int32(&self, msg: &str) {
+        self.ad.port_base.trace_print(
+            TraceMask::IO_DRIVER,
+            format_args!("{}", adlog::log(adlog::WRITE_INT32, msg)),
+        );
+    }
+
+    fn set_text(&mut self, index: usize, text: &str) -> AsynResult<()> {
+        self.ad.port_base.set_string_param(index, 0, text)
     }
 
     // -- Serval requests -----------------------------------------------------
@@ -992,8 +1026,51 @@ impl PortDriver for TimePix3Driver {
             if reason == p.gain_mode && !(0..=3).contains(&value) {
                 self.ad.port_base.set_int32_param(p.gain_mode, 0, 0)?;
             }
+            let mut value = value;
             if reason == p.pixel_depth && ![1, 6, 12, 24].contains(&value) {
+                value = 12;
+                self.ad.port_base.set_int32_param(p.pixel_depth, 0, value)?;
+            }
+            if reason == p.pixel_depth && self.mpx3_pixel_depth_conflict(value) {
+                // C returns before its closing callbacks and line; its
+                // callParamCallbacks(ADTimePixPixelDepth) calls pass a
+                // parameter index as the address and post nothing (UPSTREAM
+                // DEFECT, ADTimePix.cpp:664-666), so the readbacks are posted
+                // here as on every other path.
+                self.log_write_int32(MPX3_PIXEL_DEPTH_MSG);
                 self.ad.port_base.set_int32_param(p.pixel_depth, 0, 12)?;
+                self.set_text(self.ad.params.status_message, MPX3_PIXEL_DEPTH_MSG)?;
+                self.set_text(p.write_msg, MPX3_PIXEL_DEPTH_MSG)?;
+                self.ad.port_base.set_int32_param(p.http_code, 0, 400)?;
+                let _ = self.ad.port_base.call_param_callbacks(addr);
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!("{}", adlog::err(adlog::WRITE_INT32, MPX3_PIXEL_DEPTH_MSG)),
+                );
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: MPX3_PIXEL_DEPTH_MSG.into(),
+                });
+            }
+            self.init_acquisition()
+        } else if reason == p.both_counters {
+            if value != 0 {
+                if self.mpx3_trigger_conflict(self.int(self.ad.params.trigger_mode, 0)) {
+                    self.log_write_int32(
+                        "MPX3 BothCounters: auto-switching TriggerMode 5 (CONTINUOUS) -> 4 (AUTOTRIGSTART_TIMERSTOP)",
+                    );
+                    self.ad
+                        .port_base
+                        .set_int32_param(self.ad.params.trigger_mode, 0, 4)?;
+                }
+                for ths in [p.prv_img_ths, p.prv_img1_ths, p.img_ths, p.img1_ths] {
+                    self.set_text(ths, "0,1")?;
+                }
+                if self.mpx3_pixel_depth_conflict(self.int(p.pixel_depth, 0)) {
+                    self.log_write_int32(MPX3_PIXEL_DEPTH_MSG);
+                    self.ad.port_base.set_int32_param(p.pixel_depth, 0, 12)?;
+                    self.set_text(self.ad.params.status_message, MPX3_PIXEL_DEPTH_MSG)?;
+                }
             }
             self.init_acquisition()
         } else if reason == self.ad.params.num_images || reason == self.ad.params.trigger_mode {
@@ -1003,6 +1080,14 @@ impl PortDriver for TimePix3Driver {
                 self.ad
                     .port_base
                     .set_int32_param(self.ad.params.trigger_mode, 0, 0)?;
+            }
+            let trigger_mode = self.int(self.ad.params.trigger_mode, 0);
+            if reason == self.ad.params.trigger_mode && self.mpx3_trigger_conflict(trigger_mode) {
+                self.log_write_int32(MPX3_TRIGGER_MSG);
+                self.ad
+                    .port_base
+                    .set_int32_param(self.ad.params.trigger_mode, 0, 4)?;
+                self.set_text(self.ad.params.status_message, MPX3_TRIGGER_MSG)?;
             }
             // Single image mode carries exactly one image (C ADTimePix.cpp:519).
             if reason == self.ad.params.num_images
@@ -1321,6 +1406,51 @@ mod tests {
             .read_int32_array(&AsynUser::new(p.pixel_config_diff), &mut buf)
             .unwrap();
         assert_eq!((n, buf), (4, [5, 6, 0, 0]));
+    }
+
+    /// A Medipix3 counting both counters refuses 24-bit depth and CONTINUOUS
+    /// triggering (ADTimePix.cpp:658-671, :675-702, :709-714).
+    #[test]
+    fn medipix3_both_counters_refuses_24_bit_and_continuous() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let shared = Arc::new(Shared::new());
+        shared.note_family(DetectorFamily::Mpx3);
+        let mut det = TimePix3Driver::new(
+            "TPX_MPX3_BOTH",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            shared,
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let (trigger_mode, status_message) =
+            (det.ad.params.trigger_mode, det.ad.params.status_message);
+        det.ad
+            .port_base
+            .set_int32_param(trigger_mode, 0, 5)
+            .unwrap();
+        det.ad
+            .port_base
+            .set_int32_param(p.pixel_depth, 0, 24)
+            .unwrap();
+        let _ = det.write_int32(&mut AsynUser::new(p.both_counters), 1);
+        assert_eq!(det.int(trigger_mode, 0), 4);
+        assert_eq!(det.int(p.pixel_depth, 0), 12);
+        assert_eq!(det.text(p.img1_ths, 0), "0,1");
+        assert_eq!(det.text(status_message, 0), MPX3_PIXEL_DEPTH_MSG);
+
+        let e = det
+            .write_int32(&mut AsynUser::new(p.pixel_depth), 24)
+            .unwrap_err();
+        assert!(e.to_string().contains(MPX3_PIXEL_DEPTH_MSG));
+        assert_eq!(det.int(p.pixel_depth, 0), 12);
+        assert_eq!(det.int(p.http_code, 0), 400);
+        assert_eq!(det.text(p.write_msg, 0), MPX3_PIXEL_DEPTH_MSG);
+
+        let _ = det.write_int32(&mut AsynUser::new(trigger_mode), 5);
+        assert_eq!(det.int(trigger_mode, 0), 4);
+        assert_eq!(det.text(status_message, 0), MPX3_TRIGGER_MSG);
     }
 
     /// The trigger-mode menu is C's nine labels, FOLLOWING included, and the
