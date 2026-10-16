@@ -11,6 +11,7 @@ use std::sync::Arc;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
@@ -554,10 +555,11 @@ impl NdStdArraysRuntime {
 /// allocate. `ad-core-rs` 0.22.1's `NDArrayPool` is bounded by `maxMemory`
 /// only, so `max_buffers` is accepted for iocsh signature parity and ignored.
 pub fn create_nd_std_arrays(
-    port_name: &str,
+    claim: &PortClaim,
     _max_buffers: i32,
     max_memory: usize,
 ) -> AsynResult<NdStdArraysRuntime> {
+    let port_name = claim.name();
     let pool = NDArrayPool::new(max_memory);
     let queued_counter = Arc::new(QueuedArrayCounter::new());
     let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
@@ -572,7 +574,7 @@ pub fn create_nd_std_arrays(
     let params = driver.params;
     let ndsa = driver.ndsa;
 
-    let (runtime_handle, _) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
 
     let output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let publisher = ArrayPublisher::new(output.clone());

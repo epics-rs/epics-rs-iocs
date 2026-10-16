@@ -17,7 +17,12 @@ fn f64s(data: &NDDataBuffer) -> Vec<f64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_waveform_write_is_published_as_an_ndarray() {
-    let rt = create_nd_std_arrays("NDSA_E2E", 0, 0).unwrap();
+    let rt = create_nd_std_arrays(
+        &epics_rs::asyn::registry::claim_port("NDSA_E2E").unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
     let handle = rt.port_handle().clone();
     let params = rt.params;
     let ndsa = rt.ndsa;
@@ -70,7 +75,12 @@ async fn a_waveform_write_is_published_as_an_ndarray() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn append_mode_publishes_a_growing_array_on_each_write() {
-    let rt = create_nd_std_arrays("NDSA_E2E_APPEND", 0, 0).unwrap();
+    let rt = create_nd_std_arrays(
+        &epics_rs::asyn::registry::claim_port("NDSA_E2E_APPEND").unwrap(),
+        0,
+        0,
+    )
+    .unwrap();
     let handle = rt.port_handle().clone();
     let params = rt.params;
     let ndsa = rt.ndsa;
