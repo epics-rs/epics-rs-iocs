@@ -467,7 +467,14 @@ impl PortDriver for NdStdArraysDriver {
             let _ = self.write_int32_pool(reason);
         }
 
+        // A failure here reaches C's errorMessage only, never the console.
         self.port_base.call_param_callbacks(addr)?;
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("NDDriverStdArrays:writeInt32: function={reason}, value={value}"),
+        );
         Ok(())
     }
 
