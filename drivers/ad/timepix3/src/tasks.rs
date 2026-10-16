@@ -1181,35 +1181,34 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             );
             ctx.set(
                 ADDR,
-                [
-                    ParamSetValue::new(
-                        p.prv_img_frame_number,
-                        ADDR,
-                        ParamValue::Int32(f.frame_number),
-                    ),
-                    ParamSetValue::new(
-                        p.prv_img_time_at_frame,
-                        ADDR,
-                        ParamValue::Float64(f.time_at_frame),
-                    ),
-                    ParamSetValue::new(
-                        p.prv_img_threshold_id,
-                        ADDR,
-                        ParamValue::Int32(f.threshold_id),
-                    ),
-                    ParamSetValue::new(
-                        p.prv_img_integration_size,
-                        ADDR,
-                        ParamValue::Int32(f.integration_size),
-                    ),
-                ]
-                .into_iter()
-                .chain(
-                    rate.map(|r| {
+                geometry(ctx, &f)
+                    .into_iter()
+                    .chain([
+                        ParamSetValue::new(
+                            p.prv_img_frame_number,
+                            ADDR,
+                            ParamValue::Int32(f.frame_number),
+                        ),
+                        ParamSetValue::new(
+                            p.prv_img_time_at_frame,
+                            ADDR,
+                            ParamValue::Float64(f.time_at_frame),
+                        ),
+                        ParamSetValue::new(
+                            p.prv_img_threshold_id,
+                            ADDR,
+                            ParamValue::Int32(f.threshold_id),
+                        ),
+                        ParamSetValue::new(
+                            p.prv_img_integration_size,
+                            ADDR,
+                            ParamValue::Int32(f.integration_size),
+                        ),
+                    ])
+                    .chain(rate.map(|r| {
                         ParamSetValue::new(p.prv_img_acq_rate, ADDR, ParamValue::Float64(r))
-                    }),
-                )
-                .collect(),
+                    }))
+                    .collect(),
             )
             .await;
             publish_image(
@@ -1225,6 +1224,26 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
         }
         (StreamKind::Img, Frame::Image(f)) => {
             let p = ctx.p;
+            // processImgDataLine counts every Img frame, NDArrayCallbacks or
+            // not, before getAttributes (serval_stream.cpp:880-883).
+            let counter = ctx
+                .handle
+                .read_int32(ctx.ad.base.array_counter, 0)
+                .await
+                .unwrap_or(0)
+                + 1;
+            ctx.set(
+                ADDR,
+                geometry(ctx, &f)
+                    .into_iter()
+                    .chain([ParamSetValue::new(
+                        ctx.ad.base.array_counter,
+                        ADDR,
+                        ParamValue::Int32(counter),
+                    )])
+                    .collect(),
+            )
+            .await;
             let update = ctx
                 .shared
                 .img
@@ -1799,6 +1818,33 @@ async fn push_processed_img(ctx: &Ctx) {
 
 /// Push a preview frame down the plugin chain as an NDArray. C stamps it with
 /// Serval's `frameNumber`, not NDArrayCounter (serval_stream.cpp:604, :1467).
+/// The geometry both image streams post before getAttributes
+/// (serval_stream.cpp:224-233, :862-875).
+fn geometry(ctx: &Ctx, f: &crate::stream::ImageFrame) -> [ParamSetValue; 7] {
+    use crate::stream::PixelFormat;
+    use epics_rs::ad_core::color::NDColorMode;
+    use epics_rs::ad_core::ndarray::NDDataType;
+
+    let (data_type, bytes) = match f.format {
+        PixelFormat::UInt16 => (NDDataType::UInt16, 2),
+        PixelFormat::UInt32 => (NDDataType::UInt32, 4),
+    };
+    let width = i32::try_from(f.width).unwrap_or(i32::MAX);
+    let height = i32::try_from(f.height).unwrap_or(i32::MAX);
+    let size = i32::try_from(f.width * f.height * bytes).unwrap_or(i32::MAX);
+    let ad = &ctx.ad;
+    let int = |reason, v| ParamSetValue::new(reason, ADDR, ParamValue::Int32(v));
+    [
+        int(ad.size_x, width),
+        int(ad.base.array_size_x, width),
+        int(ad.size_y, height),
+        int(ad.base.array_size_y, height),
+        int(ad.base.data_type, data_type as u8 as i32),
+        int(ad.base.color_mode, NDColorMode::Mono as i32),
+        int(ad.base.array_size, size),
+    ]
+}
+
 async fn publish_image(ctx: &Arc<Ctx>, addr: usize, f: crate::stream::ImageFrame, refused: &str) {
     if ctx
         .handle
@@ -1818,14 +1864,6 @@ async fn publish_image(ctx: &Arc<Ctx>, addr: usize, f: crate::stream::ImageFrame
         ctx.trace(TraceMask::ERROR, refused);
         return;
     };
-    let counter = ctx
-        .handle
-        .read_int32(ctx.ad.base.array_counter, 0)
-        .await
-        .unwrap_or(0)
-        + 1;
-    ctx.set_int(ctx.ad.base.array_counter, 0, counter).await;
-
     array.unique_id = f.frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
@@ -2244,6 +2282,117 @@ mod tests {
         assert_eq!(int(p.prv_img_threshold_id).await.unwrap(), 1);
         assert_eq!(int(p.prv_img_integration_size).await.unwrap(), 7);
         assert_eq!(int(p.img_threshold_id).await.unwrap(), 1);
+        std::mem::forget(runtime);
+    }
+
+    /// C posts the frame geometry, and on Img the bumped NDArrayCounter, before
+    /// getAttributes; PrvImg leaves the counter alone and Img counts with
+    /// NDArrayCallbacks off (serval_stream.cpp:224-233, :862-883).
+    #[tokio::test]
+    async fn the_frame_geometry_and_counter_precede_get_attributes() {
+        use epics_rs::ad_core::attributes::NDAttrValue;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::user::AsynUser;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut driver =
+            crate::driver::TimePix3Driver::new("TPXGEOM", http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad, pool) = (driver.p, driver.ad.params, driver.ad.pool.clone());
+        driver
+            .ad
+            .write_octet(
+                &AsynUser::new(ad.base.attributes_file),
+                br#"<Attributes>
+                <Attribute name="SizeX" type="PARAM" source="ARRAY_SIZE_X" datatype="INT"/>
+                <Attribute name="DataType" type="PARAM" source="DATA_TYPE" datatype="INT"/>
+                <Attribute name="Bytes" type="PARAM" source="ARRAY_SIZE" datatype="INT"/>
+                <Attribute name="Counter" type="PARAM" source="ARRAY_COUNTER" datatype="INT"/>
+                </Attributes>"#,
+            )
+            .unwrap();
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port("TPXGEOM").unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let outputs = new_outputs();
+        let (tx, mut rx) = ndarray_channel("TPXGEOM_SINK", 4);
+        outputs[PRV_IMG_ADDR].lock().add(tx);
+        let (tx, mut rx_img) = ndarray_channel("TPXGEOM_IMG_SINK", 4);
+        outputs[IMG_ADDR].lock().add(tx);
+        let ctx = Arc::new(Ctx {
+            handle: runtime.port_handle().clone(),
+            http,
+            shared,
+            p,
+            ad,
+            outputs,
+            pool,
+        });
+        let frame = |format| {
+            Frame::Image(crate::stream::ImageFrame {
+                width: 3,
+                height: 1,
+                format,
+                frame_number: 1,
+                time_at_frame: 0.0,
+                threshold_id: 0,
+                integration_size: 0,
+                pixels: vec![1, 2, 3],
+            })
+        };
+        let attr = |a: &epics_rs::ad_core::ndarray::NDArray, name| {
+            a.attributes.get(name).map(|a| a.value.clone())
+        };
+        let int = |reason| ctx.handle.read_int32(reason, 0);
+
+        // Counted with NDArrayCallbacks off.
+        ctx.set_int(ad.base.array_callbacks, 0, 0).await;
+        handle_frame(
+            &ctx,
+            StreamKind::Img,
+            frame(crate::stream::PixelFormat::UInt16),
+        )
+        .await;
+        assert_eq!(int(ad.base.array_counter).await.unwrap(), 1);
+
+        ctx.set_int(ad.base.array_callbacks, 0, 1).await;
+        handle_frame(
+            &ctx,
+            StreamKind::PrvImg,
+            frame(crate::stream::PixelFormat::UInt32),
+        )
+        .await;
+        let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no array")
+            .unwrap();
+        assert_eq!(attr(&array, "SizeX"), Some(NDAttrValue::Int32(3)));
+        assert_eq!(attr(&array, "DataType"), Some(NDAttrValue::Int32(5)));
+        assert_eq!(attr(&array, "Bytes"), Some(NDAttrValue::Int32(12)));
+        assert_eq!(attr(&array, "Counter"), Some(NDAttrValue::Int32(1)));
+
+        handle_frame(
+            &ctx,
+            StreamKind::Img,
+            frame(crate::stream::PixelFormat::UInt16),
+        )
+        .await;
+        let array = tokio::time::timeout(Duration::from_secs(5), rx_img.recv())
+            .await
+            .expect("no array")
+            .unwrap();
+        assert_eq!(attr(&array, "DataType"), Some(NDAttrValue::Int32(3)));
+        assert_eq!(attr(&array, "Bytes"), Some(NDAttrValue::Int32(6)));
+        assert_eq!(attr(&array, "Counter"), Some(NDAttrValue::Int32(2)));
+        assert_eq!(int(ad.size_x).await.unwrap(), 3);
+        assert_eq!(int(ad.base.color_mode).await.unwrap(), 0);
         std::mem::forget(runtime);
     }
 
