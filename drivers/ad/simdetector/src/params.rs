@@ -201,9 +201,10 @@ impl SimParams {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ADDriverBase;
+    use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 
     fn fixture() -> (ADDriverBase, SimParams) {
-        let mut ad = ADDriverBase::new("SIMTEST", 64, 64, 0).unwrap();
+        let mut ad = ADDriverBase::new("SIMTEST", 64, 64, 0, ASYN_NONE).unwrap();
         let sim = SimParams::create(&mut ad.port_base).unwrap();
         (ad, sim)
     }
