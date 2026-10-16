@@ -460,12 +460,21 @@ mod tests {
 
     #[test]
     fn amplitude_and_period_defaults_apply_to_address_zero_only() {
-        // C's two-argument `setDoubleParam` writes parameter list 0. Signals
-        // 1..7 therefore start at 0 amplitude and 0 period.
+        // C's two-argument `setDoubleParam` writes parameter list 0
+        // (ADCSimDetector.cpp:100-102). Signals 1..7 stay undefined until
+        // their records post a value.
         let f = Fixture::new();
+        let base = &f.det.port_base;
         for addr in 1..MAX_SIGNALS as i32 {
-            assert_eq!(f.get_f64(f.det.sim.amplitude, addr), 0.0, "addr {addr}");
-            assert_eq!(f.get_f64(f.det.sim.period, addr), 0.0, "addr {addr}");
+            for reason in [f.det.sim.amplitude, f.det.sim.period] {
+                assert!(
+                    matches!(
+                        base.get_float64_param(reason, addr),
+                        Err(AsynError::ParamUndefined(r)) if r == reason
+                    ),
+                    "addr {addr}"
+                );
+            }
         }
     }
 
