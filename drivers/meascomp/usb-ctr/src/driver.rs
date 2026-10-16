@@ -237,20 +237,18 @@ impl PortDriver for CtrDriver {
                     .base
                     .get_int32_param(self.params.mca_ch_advance_source, 0)?;
                 let prescale = self.base.get_int32_param(self.params.mca_prescale, 0)?;
-                let trigger = self.base.get_int32_param(self.params.trigger_mode, 0)? != 0;
                 let enable = self
                     .base
                     .get_uint32_param(self.params.mcs_counter_enable, 0)?;
                 st.mcs.preset_real_time = self
                     .base
                     .get_float64_param(self.params.mca_preset_real, 0)?;
-                let point0_no_clear = self
+                let point0_action = self
                     .base
-                    .get_int32_param(self.params.mcs_point0_action, 0)?
-                    != 0;
+                    .get_int32_param(self.params.mcs_point0_action, 0)?;
                 // C `writeInt32` ignores `startMCS`'s status; it prints its own.
                 let num_counters = st.num_counters;
-                let _ = mcs::start_mcs(
+                let actual_dwell = mcs::start_mcs(
                     &dev,
                     &mut st.mcs,
                     &McsScan {
@@ -260,11 +258,16 @@ impl PortDriver for CtrDriver {
                         counter_enable: enable,
                         ch_advance_source: ch_adv,
                         prescale,
-                        ext_trigger: trigger,
-                        point0_no_clear,
+                        point0_action,
                     },
                     &trace,
                 );
+                self.base
+                    .params
+                    .set_float64(self.params.mca_dwell_time, 0, actual_dwell)?;
+                self.base
+                    .params
+                    .set_int32(self.params.mcs_current_point, 0, 0)?;
                 self.base
                     .params
                     .set_int32(self.params.mca_acquiring, 0, 1)?;
