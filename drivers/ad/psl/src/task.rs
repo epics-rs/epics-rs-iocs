@@ -17,9 +17,10 @@ use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray::{NDArray, NDDimension};
+use epics_rs::ad_core::ndarray::NDDimension;
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -33,8 +34,7 @@ pub(crate) struct AcquisitionContext {
     pub server: PslServer,
     pub handle: PortHandle,
     pub output: ArrayPublisher,
-    #[allow(dead_code)] // held so plugins can be back-pressured on the queue
-    pub queued: Arc<QueuedArrayCounter>,
+    pub pool: Arc<NDArrayPool>,
     pub ad_params: ADBaseParams,
     pub shared: Arc<SharedState>,
     pub commands: rt::CommandReceiver<TaskCommand>,
@@ -270,7 +270,7 @@ async fn publish_frame(
         source_impl: None,
     });
 
-    let mut array = NDArray::with_data(dims, data);
+    let mut array = ctx.pool.wrap(dims, data);
     array.unique_id = unique_id;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
