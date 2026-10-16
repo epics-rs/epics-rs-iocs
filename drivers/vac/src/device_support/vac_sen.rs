@@ -336,7 +336,8 @@ impl DeviceSupport for VacSen {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        let Some(live) = self.live.as_mut() else {
+        // The pass a completion re-entered is `pact == 1`: `read` decodes.
+        let Some(live) = self.live.as_mut().filter(|_| !done.pact()) else {
             return Ok(ReadStart::Synchronous);
         };
         let job = &live.job;
@@ -538,5 +539,60 @@ mod tests {
             ),
             "{log}"
         );
+    }
+
+    /// The pass a completion re-enters is C `readWrite_vs` with `pact == 1`:
+    /// it decodes what landed and queues nothing.
+    #[test]
+    fn the_continuation_pass_does_not_queue_again() {
+        let port = "VSREENTRY";
+        let claim = claim_port_driver(port).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let driver = DrvAsynIPPort::new(port, &addr).unwrap();
+        let _runtime = PortManager::new()
+            .register_port(claim, driver, &open_owner())
+            .unwrap();
+
+        let mut dev = VacSen::new(AsynLink {
+            port_name: port.into(),
+            addr: 0,
+            timeout: None,
+            drv_info: String::new(),
+        });
+        dev.set_record_info("V:G2", ScanType::Passive);
+        let mut rec = VsRecord::default();
+        assert!(matches!(dev.init(&mut rec), Ok(o) if o == DeviceInitOutcome::ok()));
+        let db = PvDatabase::new();
+        let done = DeviceDone::new(&db, &RecordInstance::new("V:G2", VsRecord::default()));
+
+        let start = dev
+            .read_begin(&mut rec, &DeviceDoneSource::new(&done))
+            .unwrap();
+        assert!(matches!(start, ReadStart::Pending));
+        // The listener never answers: the exchange ends on its timeout, and
+        // the cell is free to queue again, as it is when C re-enters.
+        let deadline = std::time::Instant::now() + 4 * IO_TIMEOUT;
+        while dev
+            .live
+            .as_ref()
+            .unwrap()
+            .job
+            .exchange
+            .lock()
+            .unwrap()
+            .err_count
+            == 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exchange never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let again = dev
+            .read_begin(&mut rec, &DeviceDoneSource::continuing(&done))
+            .unwrap();
+        assert!(matches!(again, ReadStart::Synchronous));
     }
 }
