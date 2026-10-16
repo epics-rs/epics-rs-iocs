@@ -15,7 +15,7 @@ use crate::params::*;
 use crate::poller::{self, PollerState};
 use crate::pulse_gen::{self, PulseRequest};
 use crate::scaler::ScalerState;
-use crate::trace::SelfTrace;
+use crate::trace::{self, SelfTrace};
 
 /// C `USBCTR::writeInt32`/`writeFloat64` resolve the counter number through
 /// `asynPortDriver::getAddress` (drvUSBCTR.cpp:1096, 1288), which maps the
@@ -262,7 +262,7 @@ impl PortDriver for CtrDriver {
                 format_args!("USBCTR:writeInt32, port {port}, function={reason}, ERROR writing {value} to address {addr}, status={status}"),
             );
         }
-        Ok(())
+        trace::asyn_status(status)
     }
 
     /// MCS spectrum readout. C `USBCTR::readInt32Array` / the `mcaReadData`
@@ -402,7 +402,7 @@ impl PortDriver for CtrDriver {
                 format_args!("USBCTR:writeFloat64, port {port}, ERROR writing {value:.6} to address {addr}, status={status}"),
             );
         }
-        Ok(())
+        trace::asyn_status(status)
     }
 
     fn write_uint32_digital(
@@ -471,7 +471,7 @@ impl PortDriver for CtrDriver {
                 format_args!("USBCTR:writeUInt32Digital, port {port}, ERROR writing outValue=0x{out_value:x}, value=0x{value:x}, mask=0x{mask:x}, direction=0x{direction:x}, status={status}"),
             );
         }
-        Ok(())
+        trace::asyn_status(status)
     }
 }
 

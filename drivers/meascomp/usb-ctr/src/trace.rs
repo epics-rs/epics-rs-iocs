@@ -4,8 +4,22 @@
 
 use std::sync::{Arc, OnceLock};
 
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::trace::TraceMask;
+
+/// C's `return (status==0) ? asynSuccess : asynError;`, which leaves the
+/// user's error message unset.
+pub fn asyn_status(status: i32) -> AsynResult<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(AsynError::Status {
+            status: AsynStatus::Error,
+            message: String::new(),
+        })
+    }
+}
 
 /// The port's own trace, bound once its runtime exists. Silent before that,
 /// as `PortDriverBase::trace_print` is for a port not yet bound.

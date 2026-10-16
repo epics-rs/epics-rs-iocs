@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -190,7 +190,7 @@ impl MultiFunctionDriver {
                 ),
             );
         }
-        Ok(())
+        trace::asyn_status(status)
     }
 
     /// Whether `chan` is configured as a thermocouple input. ulAISetConfig
@@ -278,12 +278,8 @@ impl PortDriver for MultiFunctionDriver {
                         FUNCTION,
                         "cannot write analog outputs while waveform generator is running.",
                     );
-                    // C returns before its callbacks and its summary line, and
-                    // sets no error message.
-                    return Err(AsynError::Status {
-                        status: AsynStatus::Error,
-                        message: String::new(),
-                    });
+                    // C returns before its callbacks and its summary line.
+                    return trace::asyn_status(-1);
                 }
                 let dev = self.device.lock().unwrap();
                 let range = self
@@ -703,16 +699,36 @@ impl PortDriver for MultiFunctionDriver {
 
     /// Load a user-defined generator waveform (volts) for one channel.
     fn write_float32_array(&mut self, user: &AsynUser, data: &[f32]) -> AsynResult<()> {
+        const FUNCTION: &str = "writeFloat32Array";
         if user.reason != self.params.wave_gen_user_wf {
-            return Ok(());
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}: ERROR: unknown function={}",
+                    user.reason
+                ),
+            );
+            return trace::asyn_status(-1);
         }
-        let ch = device_addr(user.addr) as usize;
-        if ch >= MAX_ANALOG_OUT {
-            return Ok(());
-        }
+        let addr = device_addr(user.addr);
         let mut st = self.state.lock().unwrap();
-        let n = data.len().min(st.wave_gen.max_points);
-        st.wave_gen.user_waveforms[ch] = data[..n].iter().map(|v| *v as f64).collect();
+        let max_points = st.wave_gen.max_points;
+        if addr as usize >= MAX_ANALOG_OUT || data.len() > max_points {
+            user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}: ERROR: addr={addr} max={}, nElements={} max={max_points}",
+                    MAX_ANALOG_OUT - 1,
+                    data.len()
+                ),
+            );
+            return trace::asyn_status(-1);
+        }
+        st.wave_gen.user_waveforms[addr as usize] = data.iter().map(|v| *v as f64).collect();
         Ok(())
     }
 
@@ -777,7 +793,7 @@ impl PortDriver for MultiFunctionDriver {
                 ),
             );
         }
-        Ok(())
+        trace::asyn_status(status)
     }
 }
 
