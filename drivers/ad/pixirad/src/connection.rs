@@ -17,6 +17,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use parking_lot::Mutex;
 
@@ -82,20 +83,45 @@ impl PixiradServer {
             buf_size: MAX_MESSAGE_SIZE,
             flush: true,
         };
-        let outcome = self.handle.lock().submit_blocking(op, user);
+        let handle = self.handle.lock();
+        let outcome = handle.submit_blocking(op, user);
+        // C prints both lines on `pasynUserCommand_`: the command port's trace
+        // mask gates them.
+        let trace_error = |message: &str| {
+            handle
+                .trace()
+                .output(handle.port_name(), TraceMask::ERROR, message);
+        };
 
         match outcome {
-            Err(e) => Exchange {
-                reply: String::new(),
-                result: Err(e.into()),
-            },
+            Err(e) => {
+                let status = e.status();
+                // A timeout is the read side giving up after the write went out.
+                let wrote = if status == AsynStatus::Timeout {
+                    command.len()
+                } else {
+                    0
+                };
+                trace_error(&format!(
+                    "pixirad:writeReadServer, timeout={:.6}, status={} wrote {wrote} bytes, \
+                     received 0 bytes\n",
+                    SERVER_TIMEOUT.as_secs_f64(),
+                    status as i32
+                ));
+                Exchange {
+                    reply: String::new(),
+                    result: Err(e.into()),
+                }
+            }
             Ok(result) => {
                 let bytes = result.data.unwrap_or_default();
                 let reply = String::from_utf8_lossy(&bytes).trim_end().to_string();
-                log::debug!("pixirad: '{command}' -> '{reply}'");
                 let result = if crate::protocol::reply_is_ok(command, &reply) {
                     Ok(())
                 } else {
+                    trace_error(&format!(
+                        "pixirad:writeReadServer unexpected response from server = {reply}"
+                    ));
                     Err(ServerError::Rejected(reply.clone()))
                 };
                 Exchange { reply, result }
@@ -110,15 +136,11 @@ impl PixiradServer {
         let user = || AsynUser::new(0).with_addr(0).with_timeout(SERVER_TIMEOUT);
         {
             let handle = self.handle.lock();
-            if let Err(e) = handle.submit_blocking(RequestOp::Disconnect, user()) {
-                log::error!("pixirad: cannot disconnect the command port: {e}");
-            }
+            let _ = handle.submit_blocking(RequestOp::Disconnect, user());
         }
         std::thread::sleep(delay);
         let handle = self.handle.lock();
-        if let Err(e) = handle.submit_blocking(RequestOp::Connect, user()) {
-            log::error!("pixirad: cannot reconnect the command port: {e}");
-        }
+        let _ = handle.submit_blocking(RequestOp::Connect, user());
     }
 }
 

@@ -141,26 +141,20 @@ impl PixiradDetector {
     /// Ask the box who it is (C's constructor).
     fn identify(&mut self) -> AsynResult<()> {
         let reply = self.command(&protocol::get_firmware_version())?;
-        match protocol::parse_firmware_version(&reply) {
-            Some((serial, version)) => {
-                let base = &mut self.ad.port_base;
-                base.set_string_param(self.ad.params.base.serial_number, 0, serial)?;
-                base.set_string_param(self.ad.params.base.firmware_version, 0, version)?;
-            }
-            None => log::error!("pixirad: GET_FIRMWARE_VERSION answered '{reply}'"),
+        if let Some((serial, version)) = protocol::parse_firmware_version(&reply) {
+            let base = &mut self.ad.port_base;
+            base.set_string_param(self.ad.params.base.serial_number, 0, serial)?;
+            base.set_string_param(self.ad.params.base.firmware_version, 0, version)?;
         }
 
         let reply = self.command(&protocol::get_additional_info())?;
-        match protocol::parse_additional_info(&reply) {
-            // C added the length of the marker to a null `strstr` result and
-            // published whatever was at that address.
-            Some(info) => {
-                let info = info.trim().to_string();
-                self.ad
-                    .port_base
-                    .set_string_param(self.params.system_info, 0, info)?;
-            }
-            None => log::error!("pixirad: GET_ADDITIONAL_INFO answered '{reply}'"),
+        // C added the length of the marker to a null `strstr` result and
+        // published whatever was at that address.
+        if let Some(info) = protocol::parse_additional_info(&reply) {
+            let info = info.trim().to_string();
+            self.ad
+                .port_base
+                .set_string_param(self.params.system_info, 0, info)?;
         }
         Ok(())
     }
@@ -171,10 +165,7 @@ impl PixiradDetector {
         let exchange = self.server.command(command);
         let message = match &exchange.result {
             Ok(()) => "Server returned OK",
-            Err(e) => {
-                log::error!("pixirad: '{command}': {e}");
-                "Error from server"
-            }
+            Err(_) => "Error from server",
         };
         let base = &mut self.ad.port_base;
         base.set_string_param(self.ad.params.status_message, 0, message)?;
@@ -431,8 +422,6 @@ impl PortDriver for PixiradDetector {
                     values[0], values[1], values[2], values[3], values[4], values[5],
                 );
                 self.command(&command)?;
-            } else {
-                log::error!("pixirad: cannot read the autocal settings from '{text}'");
             }
         }
 
@@ -512,10 +501,11 @@ pub fn create_pixirad_detector(
         udp_speed: AtomicU64::new(0),
     });
 
-    let data_socket = crate::udp::bind_data_socket(data_port).map_err(|e| AsynError::Status {
-        status: AsynStatus::Error,
-        message: format!("pixirad: cannot listen on UDP data port {data_port}: {e}"),
-    })?;
+    let (data_socket, data_rcvbuf) =
+        crate::udp::bind_data_socket(data_port).map_err(|e| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("pixirad: cannot listen on UDP data port {data_port}: {e}"),
+        })?;
     let status_socket =
         crate::udp::bind_status_socket(status_port).map_err(|e| AsynError::Status {
             status: AsynStatus::Error,
@@ -543,7 +533,14 @@ pub fn create_pixirad_detector(
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<Frame>(max_buffers);
 
     let threads = vec![
-        task::start_udp_listener(data_socket, sensor, frame_tx, shared.clone()),
+        task::start_udp_listener(
+            data_socket,
+            data_rcvbuf,
+            runtime_handle.port_handle().clone(),
+            sensor,
+            frame_tx,
+            shared.clone(),
+        ),
         task::start_data_task(DataContext {
             handle: runtime_handle.port_handle().clone(),
             output: ArrayPublisher::new(array_output.clone()),

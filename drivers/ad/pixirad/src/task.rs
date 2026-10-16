@@ -11,6 +11,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
@@ -24,7 +25,7 @@ use crate::decode::Decoder;
 use crate::driver::SharedState;
 use crate::params::PixiradParams;
 use crate::protocol;
-use crate::types::{FrameType, MAX_UDP_PACKET_LEN, Sensor};
+use crate::types::{FrameType, MAX_UDP_DATA_BUFFER, MAX_UDP_PACKET_LEN, Sensor};
 use crate::udp::{Frame, FrameAssembler};
 
 /// The box sends the colours in the order thresh2, thresh1, thresh4, thresh3
@@ -36,6 +37,8 @@ const COLOR_OFFSET_MAP: [usize; 4] = [1, 0, 3, 2];
 /// Read packets and hand complete frames on (C `udpDataListenerTask`).
 pub(crate) fn start_udp_listener(
     socket: UdpSocket,
+    rcvbuf: usize,
+    handle: PortHandle,
     sensor: Sensor,
     frames: SyncSender<Frame>,
     shared: Arc<SharedState>,
@@ -43,6 +46,17 @@ pub(crate) fn start_udp_listener(
     std::thread::Builder::new()
         .name("PixiradUDPDataTask".into())
         .spawn(move || {
+            let trace_error = |message: &str| {
+                handle
+                    .trace()
+                    .output(handle.port_name(), TraceMask::ERROR, message);
+            };
+            if rcvbuf != MAX_UDP_DATA_BUFFER {
+                trace_error(&format!(
+                    "pixirad:udpDataListenerTask: Unable to set requested buffer size for \
+                     SO_RCVBUF, actual={rcvbuf}"
+                ));
+            }
             let mut assembler = FrameAssembler::new(sensor);
             let mut packet = vec![0u8; MAX_UDP_PACKET_LEN];
             let mut started_at: Option<Instant> = None;
@@ -51,7 +65,10 @@ pub(crate) fn start_udp_listener(
                 let n = match socket.recv(&mut packet) {
                     Ok(n) => n,
                     Err(e) => {
-                        log::error!("pixirad: error reading the UDP data port: {e}");
+                        trace_error(&format!(
+                            "pixirad:udpDataListenerTask: Error calling recvfrom = {}",
+                            strerror(&e)
+                        ));
                         continue;
                     }
                 };
@@ -123,7 +140,11 @@ async fn data_loop(ctx: DataContext) {
         ctx.shared.queued_frames.fetch_sub(1, Ordering::AcqRel);
 
         if frame.align_errors {
-            log::error!("pixirad: frame has alignment errors");
+            ctx.handle.trace().output(
+                ctx.handle.port_name(),
+                TraceMask::ERROR,
+                "pixirad:dataTask: frame has alignment errors",
+            );
         }
 
         let auto_calibrate = sync.read_int32(ctx.params.auto_calibrate).unwrap_or(0) != 0;
@@ -148,10 +169,7 @@ async fn data_loop(ctx: DataContext) {
 
         let decoded = match decoder.decode(frame.is_autocal, &frame.payload) {
             Ok(pixels) => pixels,
-            Err(e) => {
-                log::error!("pixirad: cannot decode the frame: {e}");
-                continue;
-            }
+            Err(_) => continue,
         };
 
         let image = image.get_or_insert_with(|| Image {
@@ -335,6 +353,23 @@ pub(crate) struct StatusContext {
     pub params: PixiradParams,
 }
 
+impl StatusContext {
+    fn trace_error(&self, message: &str) {
+        self.handle
+            .trace()
+            .output(self.handle.port_name(), TraceMask::ERROR, message);
+    }
+}
+
+/// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
+}
+
 pub(crate) fn start_status_task(ctx: StatusContext) -> std::thread::JoinHandle<()> {
     rt::run_thread_named("PixiradStatusTask", move || status_loop(ctx))
 }
@@ -356,7 +391,10 @@ async fn status_loop(ctx: StatusContext) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(e) => {
-                log::error!("pixirad: error reading the status broadcast: {e}");
+                ctx.trace_error(&format!(
+                    "pixirad:statusTask: error reading status broadcast message: {}",
+                    strerror(&e)
+                ));
                 continue;
             }
         };
@@ -379,7 +417,14 @@ async fn status_loop(ctx: StatusContext) {
         let mut humidity = None;
         for (key, reason) in readings {
             let Some(value) = protocol::status_value(&message, key) else {
-                log::error!("pixirad: no {key} in the status broadcast '{message}'");
+                ctx.trace_error(&format!(
+                    "pixirad:statusTask: {} {key} in status broadcast message={message}",
+                    if message.contains(key) {
+                        "error parsing"
+                    } else {
+                        "cannot find string"
+                    }
+                ));
                 continue;
             };
             match key {
@@ -430,14 +475,10 @@ async fn status_loop(ctx: StatusContext) {
         // Switch the cooling off at the box. Every parameter it needs is read
         // before the command socket is taken — see the invariant in
         // `crate::connection`.
-        log::error!("pixirad: {cooling_status:?}, switching the cooling off");
         let temperature = sync.read_float64(ctx.ad_params.temperature).unwrap_or(0.0);
         let hv_value = sync.read_float64(ctx.params.hv_value).unwrap_or(0.0);
         let hv_state = sync.read_int32(ctx.params.hv_state).unwrap_or(0);
         let command = protocol::init(temperature, 0, hv_value, hv_state);
-        let exchange = ctx.server.command(&command);
-        if let Err(e) = exchange.result {
-            log::error!("pixirad: '{command}': {e}");
-        }
+        let _ = ctx.server.command(&command);
     }
 }
