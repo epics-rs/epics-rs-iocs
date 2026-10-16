@@ -1,5 +1,6 @@
 //! ACS SPiiPlus motion controller driver (motorAcsMotion).
 
+pub mod bincomm;
 pub mod ioc;
 pub mod spiiplus;
 
