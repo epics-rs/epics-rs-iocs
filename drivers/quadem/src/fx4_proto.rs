@@ -216,7 +216,12 @@ impl Fx4Cache {
         // sorts ahead of an ADC event with the same timestamp.
         let mut events: Vec<TimedEvent> = Vec::new();
 
-        for (path, values) in object {
+        // nlohmann::json keeps an object in a std::map, so C walks the paths
+        // sorted; serde_json may keep wire order. The first timestamp seen
+        // becomes startTime_, so the walk order is observable.
+        let mut paths: Vec<_> = object.iter().collect();
+        paths.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (path, values) in paths {
             let is_gate = path == GATE_PATH;
             let chan = ADC_PATHS.iter().position(|p| p == path);
             if !is_gate && chan.is_none() {
@@ -594,6 +599,26 @@ mod tests {
                 io("drvFX4::onMessageEvent minimum size=1, size=1 1 1 1"),
                 io("trigger event: gateLevel=1, triggerActive=0, numTriggerValues=0"),
             ]
+        );
+    }
+
+    /// A gate path sent ahead of the ADC paths is still walked after them, as
+    /// C's sorted nlohmann object is: channel 1's timestamp is startTime_.
+    #[test]
+    fn the_update_paths_are_walked_in_sorted_order() {
+        let mut map = Map::new();
+        map.insert(GATE_PATH.to_string(), json!([[true, 1_000_000_000_i64]]));
+        for (i, path) in ADC_PATHS.iter().enumerate() {
+            map.insert(path.to_string(), json!([[i as f64, 2_000_000_000_i64]]));
+        }
+        let mut cache = Fx4Cache::new();
+        cache.ingest(&Value::Object(map), &free_run());
+        assert_eq!(
+            cache.take_trace()[0],
+            (
+                TraceMask::IO_DRIVER,
+                "Gate event, value=1.000000, time=-1.000000, ADC1 last time=0.000000".to_string()
+            )
         );
     }
 
