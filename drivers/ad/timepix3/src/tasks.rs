@@ -1201,11 +1201,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             publish_image(
                 ctx,
                 PRV_IMG_ADDR,
-                f.frame_number,
-                f.threshold_id,
-                f.width,
-                f.height,
-                f.pixels,
+                f,
                 &adlog::err(
                     adlog::PROCESS_PRV_IMG_DATA_LINE,
                     "Failed to allocate NDArray or NDArray has no data pointer",
@@ -1276,11 +1272,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             publish_image(
                 ctx,
                 IMG_ADDR,
-                f.frame_number,
-                f.threshold_id,
-                f.width,
-                f.height,
-                f.pixels,
+                f,
                 &adlog::err(
                     adlog::PROCESS_IMG_DATA_LINE,
                     "Failed to allocate NDArray or NDArray has no data pointer",
@@ -1739,16 +1731,7 @@ async fn push_processed_img(ctx: &Ctx) {
 
 /// Push a preview frame down the plugin chain as an NDArray. C stamps it with
 /// Serval's `frameNumber`, not NDArrayCounter (serval_stream.cpp:604, :1467).
-async fn publish_image(
-    ctx: &Arc<Ctx>,
-    addr: usize,
-    frame_number: i32,
-    threshold_id: i32,
-    width: usize,
-    height: usize,
-    pixels: Vec<u32>,
-    refused: &str,
-) {
+async fn publish_image(ctx: &Arc<Ctx>, addr: usize, f: crate::stream::ImageFrame, refused: &str) {
     if ctx
         .handle
         .read_int32(ctx.ad.base.array_callbacks, 0)
@@ -1761,8 +1744,8 @@ async fn publish_image(
     // C prints and drops a refused alloc before it counts
     // (serval_stream.cpp:177-183, :808-814).
     let Ok(mut array) = ctx.pool.wrap(
-        vec![NDDimension::new(width), NDDimension::new(height)],
-        NDDataBuffer::U32(pixels),
+        vec![NDDimension::new(f.width), NDDimension::new(f.height)],
+        NDDataBuffer::U32(f.pixels),
     ) else {
         ctx.trace(TraceMask::ERROR, refused);
         return;
@@ -1775,7 +1758,7 @@ async fn publish_image(
         + 1;
     ctx.set_int(ctx.ad.base.array_counter, 0, counter).await;
 
-    array.unique_id = frame_number;
+    array.unique_id = f.frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
     // C hands the frame the getAttributes set plus ThresholdID, and no
@@ -1786,7 +1769,7 @@ async fn publish_image(
         "ThresholdID",
         "Serval jsonimage thresholdID",
         NDAttrSource::Driver,
-        NDAttrValue::Int32(threshold_id),
+        NDAttrValue::Int32(f.threshold_id),
     ));
 
     ArrayPublisher::new(ctx.outputs[addr].clone())
