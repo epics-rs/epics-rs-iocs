@@ -383,6 +383,18 @@ impl OctetInterpose for PmacIpInterpose {
     }
 }
 
+/// The interpose layers of a PMAC ethernet port, in install order. Each
+/// install becomes the outermost layer (as C `interposeInterface`), so the
+/// framing goes on first and the EOS layer last: the EOS layer then appends
+/// the CR inside the framed payload and sees the ACK the framing layer
+/// produces, as C's `asynInterposeEosConfig` above the framing does.
+fn port_layers() -> [Box<dyn OctetInterpose>; 2] {
+    [
+        Box::new(PmacIpInterpose::new()),
+        Box::new(EosInterpose::default()),
+    ]
+}
+
 /// `pmacAsynIPConfigure(portName, hostInfo)` — C
 /// `pmacAsynIPPort.c::pmacAsynIPConfigure`: create the TCP port, install the
 /// PMAC framing layer, and put an EOS layer above it.
@@ -406,13 +418,9 @@ pub fn pmac_asyn_ip_configure_command() -> CommandDef {
 
             let mut driver = DrvAsynIPPort::new(&port, &host)
                 .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
-            // Layer 0 is dispatched first (outermost). The EOS layer must see
-            // the ACK-terminated stream the framing layer produces, so it goes
-            // on first and the framing layer sits between it and the socket —
-            // the same order as C (interposeInterface, then
-            // asynInterposeEosConfig above it).
-            driver.install_interpose(Box::new(EosInterpose::default()));
-            driver.install_interpose(Box::new(PmacIpInterpose::new()));
+            for layer in port_layers() {
+                driver.install_interpose(layer);
+            }
 
             let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default())
                 .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
@@ -476,6 +484,30 @@ mod tests {
         fn flush(&mut self, _user: &mut AsynUser) -> AsynResult<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn port_layers_put_the_eos_layer_above_the_framing() {
+        use epics_rs::asyn::interpose::{EosSet, OctetInterposeStack, PORT_CHAIN};
+
+        let mut stack = OctetInterposeStack::new(false);
+        for layer in port_layers() {
+            stack.install(PORT_CHAIN, layer);
+        }
+        assert!(matches!(stack.set_input_eos(0, b"\x06"), EosSet::Stored));
+        assert!(matches!(stack.set_output_eos(0, b"\r"), EosSet::Stored));
+
+        let mut base = MockBase::new(&[b"5\r\x06"]);
+        let mut user = AsynUser::default();
+        stack.dispatch_write(&mut user, b"#1 P", &mut base).unwrap();
+        // The CR is inside the framed payload and counted in wLength.
+        assert_eq!(&base.written[0][6..8], &[0x00, 0x05]);
+        assert_eq!(&base.written[0][HEADER_LEN..], b"#1 P\r");
+
+        let mut buf = [0u8; 32];
+        let r = stack.dispatch_read(&user, &mut buf, &mut base).unwrap();
+        assert_eq!(&buf[..r.nbytes_transferred], b"5\r");
+        assert!(r.eom_reason.contains(EomReason::EOS));
     }
 
     #[test]
