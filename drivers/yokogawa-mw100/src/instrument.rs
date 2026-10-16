@@ -670,18 +670,17 @@ impl Actor {
             }
             {
                 let module = &mut cache.modules[line.index];
-                module.set_message = line.set_message.clone();
-                module.status_message = line.status_message.clone();
+                module.set_message = line.set_message;
+                module.status_message = line.status_message;
                 module.error_message = line.error_message.clone();
             }
             if !module_line_ok(line) {
                 continue;
             }
-            let module_string = line.set_message.clone();
-            let (model, code, speed, number) = classify_module_string(&module_string);
+            let (model, code, speed, number) = classify_module_string(&line.set_message);
             let module = &mut cache.modules[line.index];
             module.use_flag = true;
-            module.module_string = module_string;
+            module.module_string = String::from_utf8_lossy(&line.set_message).into_owned();
             module.model = model;
             module.code = code;
             module.speed = speed;

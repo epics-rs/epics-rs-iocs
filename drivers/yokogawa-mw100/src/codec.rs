@@ -942,14 +942,15 @@ pub static ERRORS: &[ErrorEntry] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleLine {
     pub index: usize,
-    pub set_message: String,
-    pub status_message: String,
+    /// The fixed 13 wire bytes C copies (`drvMW100.c:587-601`).
+    pub set_message: [u8; 13],
+    pub status_message: [u8; 13],
     pub error_message: String,
 }
 
 /// The all-dashes sentinel for "no module configured" (`drvMW100.c:616`) —
 /// 13 dashes, unlike GM10's 16-dash sentinel.
-pub const NO_MODULE: &str = "-------------";
+pub const NO_MODULE: &[u8; 13] = b"-------------";
 
 /// Parses the `CF0` ASCII body. Each line: 1-digit module index (0-5), 3
 /// unexamined bytes, a fixed 13-byte `set_message` (no space-trimming), 3
@@ -968,13 +969,13 @@ pub fn parse_cf0(payload: &[u8]) -> Option<Vec<ModuleLine>> {
         if p + 13 > payload.len() {
             return None;
         }
-        let set_message = String::from_utf8_lossy(&payload[p..p + 13]).into_owned();
+        let set_message: [u8; 13] = payload[p..p + 13].try_into().expect("13-byte slice");
         p += 13 + 3;
 
         if p + 13 > payload.len() {
             return None;
         }
-        let status_message = String::from_utf8_lossy(&payload[p..p + 13]).into_owned();
+        let status_message: [u8; 13] = payload[p..p + 13].try_into().expect("13-byte slice");
         p += 13 + 1;
 
         let start = p;
@@ -1003,7 +1004,7 @@ pub fn parse_cf0(payload: &[u8]) -> Option<Vec<ModuleLine>> {
 pub fn module_line_ok(line: &ModuleLine) -> bool {
     line.set_message == line.status_message
         && line.error_message.is_empty()
-        && line.set_message != NO_MODULE
+        && line.set_message != *NO_MODULE
 }
 
 /// Decode a module type string (e.g. `"MX110-UNV-M10"`) into
@@ -1012,42 +1013,20 @@ pub fn module_line_ok(line: &ModuleLine) -> bool {
 /// sub-field falls back to a default (`atoi` on garbage returns 0, an
 /// unrecognized speed char yields -1), matching the C source's own
 /// tolerant parse.
-pub fn classify_module_string(module_string: &str) -> (i32, String, i32, i32) {
-    let bytes = module_string.as_bytes();
-    // `ptr = module_string + 2` then `atoi(ptr)` (`drvMW100.c:623-624`):
-    // the model number starts at byte offset 2 (e.g. "MX110..." -> "110...").
-    let model_start = 2.min(bytes.len());
-    let model_str = &module_string[model_start..];
-    let digits_end = model_str
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(model_str.len());
-    let model: i32 = model_str[..digits_end].parse().unwrap_or(0);
-
-    // `ptr += 4` from the model start (`drvMW100.c:625`), then a 3-byte
-    // code field (`drvMW100.c:627-630`).
-    let code_start = (model_start + 4).min(bytes.len());
-    let code_end = (code_start + 3).min(bytes.len());
-    let code = module_string[code_start..code_end].to_string();
-
-    // `ptr++` past the code (`drvMW100.c:631`, the extra increment after the
-    // copy loop skips the `-` separator), then the speed char
-    // (`drvMW100.c:633-646`).
-    let speed_pos = code_start + 3 + 1;
-    let speed = match bytes.get(speed_pos) {
+pub fn classify_module_string(module_string: &[u8]) -> (i32, String, i32, i32) {
+    // Byte offsets, as C walks `ptr` (`drvMW100.c:623-649`); the dash after
+    // the model number halts `atoi`.
+    let tail = |at: usize| module_string.get(at..).unwrap_or(&[]);
+    let model = c_atoi(tail(2));
+    let code_bytes = tail(6);
+    let code = String::from_utf8_lossy(&code_bytes[..code_bytes.len().min(3)]).into_owned();
+    let speed = match module_string.get(10) {
         Some(b'L') => 0,
         Some(b'M') => 1,
         Some(b'H') => 2,
         _ => -1,
     };
-
-    // `ptr++` past the speed char, then `atoi(ptr)` (`drvMW100.c:647-649`).
-    let number_start = (speed_pos + 1).min(bytes.len());
-    let number_str = &module_string[number_start.min(module_string.len())..];
-    let digits_end = number_str
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(number_str.len());
-    let number: i32 = number_str[..digits_end].parse().unwrap_or(0);
-
+    let number = c_atoi(tail(11));
     (model, code, speed, number)
 }
 
@@ -1696,20 +1675,32 @@ mod tests {
     #[test]
     fn classify_module_string_matches_doc_examples() {
         assert_eq!(
-            classify_module_string("MX110-UNV-M10"),
+            classify_module_string(b"MX110-UNV-M10"),
             (110, "UNV".to_string(), 1, 10)
         );
         assert_eq!(
-            classify_module_string("MX115-D05-H10"),
+            classify_module_string(b"MX115-D05-H10"),
             (115, "D05".to_string(), 2, 10)
         );
         assert_eq!(
-            classify_module_string("MX120-VAO-M08"),
+            classify_module_string(b"MX120-VAO-M08"),
             (120, "VAO".to_string(), 1, 8)
         );
         assert_eq!(
-            classify_module_string("MX125-MKC-M10"),
+            classify_module_string(b"MX125-MKC-M10"),
             (125, "MKC".to_string(), 1, 10)
+        );
+    }
+
+    #[test]
+    fn classify_module_string_reads_non_utf8_bytes_at_c_offsets() {
+        assert_eq!(
+            classify_module_string(b"MX110\xff-2-4-M-1"),
+            (110, "-2-".to_string(), -1, 0)
+        );
+        assert_eq!(
+            classify_module_string(b"MX110-\xffNV-M10"),
+            (110, "\u{fffd}NV".to_string(), 1, 10)
         );
     }
 
@@ -1738,7 +1729,7 @@ mod tests {
         let modules = parse_cf0(&payload).unwrap();
         assert_eq!(modules.len(), 1);
         assert_eq!(modules[0].index, 0);
-        assert_eq!(modules[0].set_message, "MX110-UNV-M10");
+        assert_eq!(&modules[0].set_message, b"MX110-UNV-M10");
         assert!(module_line_ok(&modules[0]));
     }
 

@@ -32,8 +32,8 @@ pub enum ChannelType {
 /// content.
 #[derive(Debug, Clone, Default)]
 pub struct Module {
-    pub set_message: String,
-    pub status_message: String,
+    pub set_message: [u8; 13],
+    pub status_message: [u8; 13],
     pub error_message: String,
     pub use_flag: bool,
     pub module_string: String,
