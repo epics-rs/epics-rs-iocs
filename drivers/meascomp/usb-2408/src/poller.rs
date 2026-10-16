@@ -21,6 +21,9 @@ pub struct PollerState {
     pub wave_dig: WaveDigState,
     pub wave_gen: WaveGenState,
     pub trace: SelfTrace,
+    /// C `aiInputMode_`: the uldaq mode ANALOG_IN_MODE writes map to
+    /// (drvMultiFunction.cpp:1279, 1989), not the record's menu value.
+    pub ai_input_mode: i32,
 }
 
 /// Start the polling thread for USB-2408-2AO.
@@ -81,30 +84,27 @@ fn poller_loop(
         start = Instant::now();
 
         // ---- Phase 1: read config params (no device lock) ----
-        let input_mode = handle
-            .read_int32_blocking(params.analog_in_mode, 0)
-            .unwrap_or(uldaq_sys::AI_DIFFERENTIAL);
+        // C pollerThread's getIntegerParam reads (drvMultiFunction.cpp:
+        // 2762-2763, 2790-2793) into uninitialised locals, status ignored.
+        let input_mode = state
+            .lock()
+            .map_or(uldaq_sys::AI_SINGLE_ENDED, |st| st.ai_input_mode);
         let mut in_types = [0i32; MAX_ANALOG_IN];
-        let mut in_ranges = [uldaq_sys::BIP10VOLTS; MAX_ANALOG_IN];
-        let mut tc_scales = [uldaq_sys::TS_CELSIUS; MAX_ANALOG_IN];
+        let mut in_ranges = [0i32; MAX_ANALOG_IN];
+        let mut tc_scales = [0i32; MAX_ANALOG_IN];
         for ch in 0..MAX_ANALOG_IN {
-            in_types[ch] = handle
-                .read_int32_blocking(params.analog_in_type, ch as i32)
-                .unwrap_or(0);
-            in_ranges[ch] = handle
-                .read_int32_blocking(params.analog_in_range, ch as i32)
-                .unwrap_or(uldaq_sys::BIP10VOLTS);
-            tc_scales[ch] = handle
-                .read_int32_blocking(params.temperature_scale, ch as i32)
-                .unwrap_or(uldaq_sys::TS_CELSIUS);
+            in_types[ch] = get_int(&handle, params.analog_in_type, ch as i32);
+            in_ranges[ch] = get_int(&handle, params.analog_in_range, ch as i32);
+            tc_scales[ch] = get_int(&handle, params.temperature_scale, ch as i32);
         }
 
         // What a digitizer scan that ends this cycle restarts with.
         let restart = if state.lock().is_ok_and(|st| st.wave_dig.running) {
             WaveDigScan::read_restart(
                 &params,
-                |r, a| handle.read_int32_blocking(r, a).unwrap_or(0),
-                |r, a| handle.read_float64_blocking(r, a).unwrap_or(0.0),
+                input_mode,
+                |r, a| get_int(&handle, r, a),
+                |r, a| get_float(&handle, r, a),
             )
         } else {
             None
@@ -112,9 +112,7 @@ fn poller_loop(
 
         // What a generator that ends this cycle puts back.
         let wave_gen_restore = if state.lock().is_ok_and(|st| st.wave_gen.running) {
-            wave_gen::restore_outputs(&params, |r, a| {
-                handle.read_int32_blocking(r, a).unwrap_or(0)
-            })
+            wave_gen::restore_outputs(&params, |r, a| get_int(&handle, r, a))
         } else {
             Vec::new()
         };
@@ -338,11 +336,21 @@ fn poller_loop(
             }
         });
 
-        let poll_ms = handle
-            .read_float64_blocking(params.poll_sleep_ms, 0)
-            .unwrap_or(50.0);
+        // C :2847-2848; the ctor sets POLL_SLEEP_MS.
+        let poll_ms = get_float(&handle, params.poll_sleep_ms, 0);
         std::thread::sleep(Duration::from_secs_f64(poll_ms.max(0.0) / 1000.0));
     }
+}
+
+/// The driver's `int` rule over the port handle: C's getIntegerParam with
+/// its status ignored, an unset value read as 0.
+fn get_int(handle: &PortHandle, reason: usize, addr: i32) -> i32 {
+    handle.read_int32_blocking(reason, addr).unwrap_or(0)
+}
+
+/// C `getDoubleParam`; see [`get_int`].
+fn get_float(handle: &PortHandle, reason: usize, addr: i32) -> f64 {
+    handle.read_float64_blocking(reason, addr).unwrap_or(0.0)
 }
 
 /// One `setXxxParam` of the poll pass.

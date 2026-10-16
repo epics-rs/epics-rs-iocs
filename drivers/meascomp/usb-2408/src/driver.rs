@@ -108,6 +108,7 @@ impl MultiFunctionDriver {
             wave_dig: WaveDigState::new(max_input_points),
             wave_gen: WaveGenState::new(max_output_points),
             trace: SelfTrace::default(),
+            ai_input_mode: uldaq_sys::AI_SINGLE_ENDED,
         }));
 
         Ok(Self {
@@ -555,6 +556,13 @@ impl PortDriver for MultiFunctionDriver {
                     &mut values,
                 ));
             }
+        } else if reason == self.params.analog_in_mode {
+            // C's DIFFERENTIAL is the record's menu value 0 (:225, :1989).
+            self.state.lock().unwrap().ai_input_mode = if value == 0 {
+                uldaq_sys::AI_DIFFERENTIAL
+            } else {
+                uldaq_sys::AI_SINGLE_ENDED
+            };
         } else if reason == self.params.analog_in_type {
             let dev = self.device.lock().unwrap();
             let chan_type = if value != 0 {
@@ -596,13 +604,18 @@ impl PortDriver for MultiFunctionDriver {
             // stop only when running. The busy record echoes the driver's own
             // value back, so an unguarded start would hit ERR_ALREADY_ACTIVE.
             if value != 0 && !st.wave_dig.running {
-                let scan =
-                    WaveDigScan::read(&self.params, |r, a| self.int(r, a), |r, a| self.float(r, a));
+                let scan = WaveDigScan::read(
+                    &self.params,
+                    st.ai_input_mode,
+                    |r, a| self.int(r, a),
+                    |r, a| self.float(r, a),
+                );
                 (status, wave_arrays) =
                     wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace);
             } else if value == 0 && st.wave_dig.running {
                 let restart = WaveDigScan::read_restart(
                     &self.params,
+                    st.ai_input_mode,
                     |r, a| self.int(r, a),
                     |r, a| self.float(r, a),
                 );

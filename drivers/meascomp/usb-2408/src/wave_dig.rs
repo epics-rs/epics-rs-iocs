@@ -68,6 +68,7 @@ impl WaveDigScan {
     /// store the caller is: the port actor directly, the poller by request.
     pub fn read(
         params: &MultiFunctionParams,
+        input_mode: i32,
         int: impl Fn(usize, i32) -> i32,
         float: impl Fn(usize, i32) -> f64,
     ) -> Self {
@@ -82,7 +83,7 @@ impl WaveDigScan {
             // C hands a non-positive count to ulAInScan, which refuses it.
             num_points: int(params.wave_dig_num_points, 0).max(0) as usize,
             dwell: float(params.wave_dig_dwell, 0),
-            input_mode: int(params.analog_in_mode, 0),
+            input_mode,
             ranges,
             ext_trigger: int(params.wave_dig_ext_trigger, 0) != 0,
             ext_clock: int(params.wave_dig_ext_clock, 0) != 0,
@@ -96,10 +97,12 @@ impl WaveDigScan {
     /// scan ends, if WAVEDIG_AUTO_RESTART is set.
     pub fn read_restart(
         params: &MultiFunctionParams,
+        input_mode: i32,
         int: impl Fn(usize, i32) -> i32,
         float: impl Fn(usize, i32) -> f64,
     ) -> Option<Self> {
-        (int(params.wave_dig_auto_restart, 0) != 0).then(|| Self::read(params, int, float))
+        (int(params.wave_dig_auto_restart, 0) != 0)
+            .then(|| Self::read(params, input_mode, int, float))
     }
 }
 
