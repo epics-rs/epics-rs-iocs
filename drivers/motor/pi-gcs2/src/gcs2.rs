@@ -936,7 +936,6 @@ impl AsynMotor for PIGCS2Axis {
             powered: servo_control,
             problem: self.problem,
             homed: self.homed,
-            has_encoder: true,
             gain_support: true,
             ..MotorStatus::default()
         })
