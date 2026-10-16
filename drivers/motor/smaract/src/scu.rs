@@ -308,48 +308,56 @@ impl ScuAxis {
     /// (for inherited infinite hold), positioner type and position, matching the
     /// C `SmarActSCUAxis` constructor. Performs blocking I/O.
     /// `port` and `axis` name the motor port's asyn user the axis prints on.
+    ///
+    /// Like C's `goto bail`, a failed probe keeps the axis with the values
+    /// probed so far; the failure is returned alongside it.
     pub fn new(
         controller: Arc<Mutex<ScuController>>,
         channel: i32,
         port: &str,
         axis: i32,
-    ) -> AsynResult<Self> {
-        let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-        let mut io = AxisIo {
-            port: port.to_owned(),
-            addr: axis,
-            from_controller: String::new(),
+    ) -> (Self, AsynResult<()>) {
+        let mut ax = Self {
+            controller,
+            channel,
+            is_rot: false,
+            hold_time: 0,
+            position_offset: 0.0,
+            closed_loop: false,
+            has_encoder: false,
+            io: AxisIo {
+                port: port.to_owned(),
+                addr: axis,
+                from_controller: String::new(),
+            },
         };
+        let probed = ax.probe();
+        (ax, probed)
+    }
+
+    fn probe(&mut self) -> AsynResult<()> {
+        let channel = self.channel;
+        let ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
+        let io = &mut self.io;
 
         // Probe max closed-loop frequency (also the first comms check).
-        ctrl.query_int(&mut io, "GCLF", channel)?;
+        ctrl.query_int(io, "GCLF", channel)?;
 
         // Inherit infinite hold if the controller is still holding from a prior
         // life; otherwise start from the (initially disabled) closed-loop state.
-        let move_status = ctrl.query_char(&mut io, "M", channel)?;
-        let hold_time = if move_status == 'H' { HOLD_FOREVER } else { 0 };
+        let move_status = ctrl.query_char(io, "M", channel)?;
+        self.hold_time = if move_status == 'H' { HOLD_FOREVER } else { 0 };
 
-        let positioner_type = ctrl.query_int(&mut io, "GST", channel)?;
-        let is_rot = is_rotary_type(positioner_type);
+        let positioner_type = ctrl.query_int(io, "GST", channel)?;
+        self.is_rot = is_rotary_type(positioner_type);
 
         // A successful position read means the sensor knows the position.
-        let has_encoder = if is_rot {
-            ctrl.query_angle(&mut io, channel).is_ok()
+        self.has_encoder = if self.is_rot {
+            ctrl.query_angle(io, channel).is_ok()
         } else {
-            ctrl.query_double(&mut io, "GP", channel).is_ok()
+            ctrl.query_double(io, "GP", channel).is_ok()
         };
-
-        drop(ctrl);
-        Ok(Self {
-            controller,
-            channel,
-            is_rot,
-            hold_time,
-            position_offset: 0.0,
-            closed_loop: false,
-            has_encoder,
-            io,
-        })
+        Ok(())
     }
 
     /// Shared move: cache the hold time, convert to controller units minus the
@@ -506,6 +514,22 @@ impl AsynMotor for ScuAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// smarActSCUMotorDriver.cpp:185-193: a failed probe bails and the axis
+    /// stays, its poll then failing on the same user.
+    #[test]
+    fn an_axis_of_an_unconnected_controller_is_kept() {
+        let (handle, status) =
+            SyncIOHandle::connect_port("scu-missing-port", 0, std::time::Duration::from_millis(10));
+        assert!(status.is_err());
+        let controller = Arc::new(Mutex::new(ScuController::new(handle)));
+        let (mut axis, probed) = ScuAxis::new(controller, 3, "scu-motor", 1);
+        assert!(probed.is_err());
+        assert_eq!(axis.channel, 3);
+        assert!(!axis.is_rot && !axis.has_encoder);
+        assert_eq!(axis.hold_time, 0);
+        assert!(axis.poll(&AsynUser::new(0)).is_err());
+    }
 
     #[test]
     fn parses_integer_and_double_replies() {

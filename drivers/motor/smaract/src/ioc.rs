@@ -16,7 +16,7 @@ use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::{connect_controller, connect_serial, set_eos_ignored};
+use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
 use motor_common::model1::c_int;
 use motor_common::{asyn_user, install, register_port};
@@ -131,21 +131,17 @@ fn create_axis_args() -> Vec<ArgDesc> {
     ]
 }
 
-/// Register `port_name` and its controller, or print C's connect refusal:
-/// the asynPrint and the `THROW_` that, with exceptions off, only prints.
+/// Register `port_name`, then connect its controller on it, as C's
+/// asynMotorController base constructor runs before the driver's own.
 fn register<C>(
     ctx: &CommandContext,
     registry: &Registry<C>,
     args: &[ArgValue],
-    controller: Option<C>,
-    refusal: (&str, &str),
+    connect: impl FnOnce(&str) -> Option<C>,
 ) -> Result<(), String> {
     let port_name = req_string(args, 0, "Port name [string]")?;
     register_port(ctx, &port_name, c_int(args, 2))?;
-    if controller.is_none() {
-        eprintln!("{}", refusal.0);
-        println!("{}", refusal.1);
-    }
+    let controller = connect(&port_name);
     registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -204,19 +200,23 @@ pub fn scu_create_controller_command() -> CommandDef {
          idlePollPeriod)",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let io_port = req_string(args, 1, "I/O port name [string]")?;
-            let controller = connect_serial(&io_port, SCU_TIMEOUT)
-                .ok()
-                .map(ScuController::new);
-            register(
-                ctx,
-                &SCU_CONTROLLERS,
-                args,
-                controller,
-                (
-                    "SmarActSCUController:SmarActSCUController: cannot connect to SCU controller",
-                    "SmarActSCUController: unable to connect serial channel",
-                ),
-            )?;
+            register(ctx, &SCU_CONTROLLERS, args, |port_name| {
+                let (handle, connected) = connect_controller(
+                    &io_port,
+                    SCU_TIMEOUT,
+                    port_name,
+                    format_args!(
+                        "SmarActSCUController:SmarActSCUController: cannot connect to SCU controller"
+                    ),
+                );
+                // C's THROW_ without ASYN_CANDO_EXCEPTIONS: an epicsPrintf, and on.
+                if connected.is_err() {
+                    errlog_vprintf(format_args!(
+                        "SmarActSCUController: unable to connect serial channel\n"
+                    ));
+                }
+                Some(ScuController::new(handle))
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
@@ -237,8 +237,13 @@ pub fn scu_create_axis_command() -> CommandDef {
                 args,
                 ctx,
                 |controller, axis, channel| {
-                    let ax = ScuAxis::new(controller, channel, &port, axis)
-                        .map_err(|e| e.to_string())?;
+                    let (ax, probed) = ScuAxis::new(controller, channel, &port, axis);
+                    if let Err(e) = probed {
+                        errlog_vprintf(format_args!(
+                            "SmarActSCUAxis::SmarActSCUAxis -- channel {axis} ASYN error {}\n",
+                            e.status() as i32
+                        ));
+                    }
                     Ok(Arc::new(Mutex::new(ax)))
                 },
             )?;
@@ -267,18 +272,17 @@ pub fn mcs_create_controller_command() -> CommandDef {
                      been disabled for this controller\n"
                 ));
             }
-            let controller = mcs::connect_link(&port_name, &io_port, MCS_TIMEOUT)
-                .map(|handle| McsController::new(handle, disable_speed));
-            register(
-                ctx,
-                &MCS_CONTROLLERS,
-                args,
-                controller,
-                (
-                    "SmarActMCSController:SmarActMCSController: cannot connect to MCS controller",
-                    "SmarActMCSController: unable to connect serial channel",
-                ),
-            )?;
+            register(ctx, &MCS_CONTROLLERS, args, |_| {
+                let controller = mcs::connect_link(&port_name, &io_port, MCS_TIMEOUT)
+                    .map(|handle| McsController::new(handle, disable_speed));
+                if controller.is_none() {
+                    eprintln!(
+                        "SmarActMCSController:SmarActMCSController: cannot connect to MCS controller"
+                    );
+                    println!("SmarActMCSController: unable to connect serial channel");
+                }
+                controller
+            })?;
             Ok(CommandOutcome::Continue)
         },
     )
