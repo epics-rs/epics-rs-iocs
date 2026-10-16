@@ -12,10 +12,10 @@
 //! [`RontecDriver`] does not touch [`epics_rs::asyn::port::PortDriverBase`]'s
 //! own param cache either -- every value is served from this struct's own
 //! fields, exactly like `love::driver::LoveDriver`.
-//! [`mca::interface::McaReason::create_params`] is called only so the
-//! default `drv_user_create` (name lookup against `McaReason::ALL`) resolves
-//! drvInfo strings for `RontecDriver::reason_of`; the
-//! resulting param slots are otherwise unused.
+//! [`mca::interface::McaReason::create_params`] is called only to give each
+//! command a reason index, which `drv_user_create` hands out for a
+//! case-insensitive drvInfo match and `RontecDriver::reason_of` maps back;
+//! the param slots themselves are otherwise unused.
 //!
 //! There is no `Init`/`Config` iocsh split here (unlike `love`/`microepsilon`):
 //! `RontecConfig(portName,serialPort,serialPortAddress)` does everything C's
@@ -90,7 +90,7 @@ use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::trace::TraceMask;
@@ -526,6 +526,27 @@ impl PortDriver for RontecDriver {
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         self.dispatch_write(user, 0, value);
         Ok(())
+    }
+
+    /// C `drvUserCreate` (`drvMcaRontec.c:503-524`): case-insensitive
+    /// (`epicsStrCaseCmp`).
+    fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
+        match McaReason::ALL
+            .into_iter()
+            .find(|r| r.drv_info().eq_ignore_ascii_case(&req.drv_info))
+        {
+            Some(r) => Ok(DrvUserInfo::from_reason(self.reasons[r as usize])),
+            None => {
+                self.base.trace_print(
+                    TraceMask::ERROR,
+                    &format!(
+                        "drvMcaRontec::drvUserCreate, unknown command={}",
+                        req.drv_info
+                    ),
+                );
+                Err(AsynError::ParamNotFound(req.drv_info.clone()))
+            }
+        }
     }
 
     /// C `RontecReport` (`drvMcaRontec.c:548-559`).
@@ -1001,6 +1022,27 @@ mod tests {
         assert_eq!(
             err.message(),
             "RontecConfig: can't connect to serial port NOSUCHSERIAL, status=3"
+        );
+    }
+
+    #[test]
+    fn drv_user_create_ignores_case_and_prints_an_unknown_command() {
+        let rig = Rig::new("drvuser", rontec_reply);
+        let handle = rig.rontec.port_handle();
+        let info = handle
+            .drv_user_create_blocking(&DrvUserRequest::new("mca_erase", 0))
+            .expect("case-insensitive match");
+        assert_eq!(info.reason, McaReason::Erase as usize);
+        assert!(
+            handle
+                .drv_user_create_blocking(&DrvUserRequest::new("NOT_A_COMMAND", 0))
+                .is_err()
+        );
+        assert!(
+            rig.trace()
+                .contains("drvMcaRontec::drvUserCreate, unknown command=NOT_A_COMMAND\n"),
+            "{}",
+            rig.trace()
         );
     }
 
