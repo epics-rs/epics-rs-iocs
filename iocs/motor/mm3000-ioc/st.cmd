@@ -25,10 +25,10 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MM3000 replies end in CR (the C example st.cmd sets EOS "\r" for RS-232).
-# The driver appends the CR command terminator itself, so no output EOS is
-# needed.
+# Port EOS as the C example sets it (MM3000.cmd:17-20);
+# the driver sends bare commands.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MM3000 controller (axis configuration read automatically) ----
 # MM3000CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs])

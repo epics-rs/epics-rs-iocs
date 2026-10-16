@@ -3,10 +3,9 @@
 //! Ported from `motorNewport/newportApp/src/drvMM3000.cc` + `devMM3000.cc`
 //! (a model-1 dev/drv pair). Commands are `{axis}CC{value}` with a 1-based
 //! *unpadded* axis prefix and integer values; record transactions join
-//! commands with `;` into one write (a move is `[VB;]VA;AC;PA`). The C
-//! example st.cmd sets input and output EOS `"\r"`; this driver owns framing
-//! like its siblings (appends `\r` itself) and expects the serial port's
-//! input EOS to frame replies (`asynOctetSetInputEos("\r")` in st.cmd).
+//! commands with `;` into one write (a move is `[VB;]VA;AC;PA`). Commands go out
+//! bare and the port EOS `"\r"` both ways comes from the startup script, as in
+//! C's MM3000.cmd:17-20 (the C driver sets no EOS).
 //! Replies are not trimmed: the `MS` status reply is a raw binary byte.
 //!
 //! ## Units
@@ -41,9 +40,6 @@ use crate::util::{atof, is_unsolicited_limit_error, nint};
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
-
-/// Command line terminator (C example st.cmd output EOS `"\r"`).
-const TERMINATOR: &[u8] = b"\r";
 
 /// C `MOTOR_STATUS` bit layout of the binary `MS` reply byte (LSB first:
 /// in-motion, NOT-power (0 = ON), direction (1 = plus), plus travel limit,
@@ -197,22 +193,15 @@ impl Mm3000Controller {
         &self.axis_types
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
-    /// Write a command (C `send_mess`); the terminator is appended here.
+    /// Write a command (C `send_mess`); the port output EOS terminates it.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a command and read the reply (C `send_mess` + `recv_mess`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         self.read_reply()
     }
 
