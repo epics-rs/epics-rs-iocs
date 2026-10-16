@@ -5,9 +5,8 @@
 //! as many tag reads/writes as fit under the transfer-buffer limit into one CIP
 //! MultiRequest, sends it, and fans the results back out to the tags.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -152,8 +151,8 @@ pub struct PlcStats {
 
 pub struct Plc {
     pub name: String,
-    pub ip_addr: String,
-    pub slot: u8,
+    /// `ip_addr` and `slot`; `drvEtherIP_define_PLC` may redefine them.
+    pub addr: Mutex<(String, u8)>,
     pub scanlists: Mutex<Vec<Arc<ScanList>>>,
     pub stats: Mutex<PlcStats>,
     pub connected: AtomicBool,
@@ -169,8 +168,7 @@ impl Plc {
     fn new(name: &str, ip_addr: &str, slot: u8) -> Plc {
         Plc {
             name: name.to_string(),
-            ip_addr: ip_addr.to_string(),
-            slot,
+            addr: Mutex::new((ip_addr.to_string(), slot)),
             scanlists: Mutex::new(Vec::new()),
             stats: Mutex::new(PlcStats::default()),
             connected: AtomicBool::new(false),
@@ -265,27 +263,29 @@ impl Plc {
 // Registry
 // ---------------------------------------------------------------------------
 
-static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<Plc>>>> = OnceLock::new();
+/// C's PLC list: definition order, which every diagnostic walks in.
+static REGISTRY: Mutex<Vec<Arc<Plc>>> = Mutex::new(Vec::new());
 
-fn registry() -> &'static Mutex<HashMap<String, Arc<Plc>>> {
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// `drvEtherIP_define_PLC`.
+/// `drvEtherIP_define_PLC`: a second definition replaces the address.
 pub fn define_plc(name: &str, ip_addr: &str, slot: u8) -> Arc<Plc> {
-    let mut reg = registry().lock();
-    reg.entry(name.to_string())
-        .or_insert_with(|| Arc::new(Plc::new(name, ip_addr, slot)))
-        .clone()
+    let mut reg = REGISTRY.lock();
+    if let Some(plc) = reg.iter().find(|p| p.name == name) {
+        crate::eip_printf!(1, "Redefining IP address of PLC {name}?\n");
+        *plc.addr.lock() = (ip_addr.to_string(), slot);
+        return plc.clone();
+    }
+    let plc = Arc::new(Plc::new(name, ip_addr, slot));
+    reg.push(plc.clone());
+    plc
 }
 
 /// `drvEtherIP_find_PLC`.
 pub fn find_plc(name: &str) -> Option<Arc<Plc>> {
-    registry().lock().get(name).cloned()
+    REGISTRY.lock().iter().find(|p| p.name == name).cloned()
 }
 
 pub fn all_plcs() -> Vec<Arc<Plc>> {
-    registry().lock().values().cloned().collect()
+    REGISTRY.lock().clone()
 }
 
 /// `drvEtherIP_reset_statistics`.
@@ -391,13 +391,13 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
     if conn.is_none() {
         let limit = BUFFER_LIMIT.load(Ordering::Relaxed) as usize;
         crate::eip_printf_time!(4, "EIP connecting {}\n", plc.name);
-        match Connection::startup(&plc.ip_addr, ETHERIP_PORT, plc.slot, timeout(), limit) {
+        let (ip_addr, slot) = plc.addr.lock().clone();
+        match Connection::startup(&ip_addr, ETHERIP_PORT, slot, timeout(), limit) {
             Ok(mut c) => {
                 *plc.identity.lock() = Some(c.identity.clone());
                 if !complete_tag_infos(plc, &mut c) {
                     errlog_vprintf(format_args!(
-                        "EIP error during scan list completion for {}:{ETHERIP_PORT}\n",
-                        plc.ip_addr
+                        "EIP error during scan list completion for {ip_addr}:{ETHERIP_PORT}\n"
                     ));
                     crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
                     c.shutdown();
@@ -410,8 +410,7 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
             }
             Err(_) => {
                 errlog_vprintf(format_args!(
-                    "EIP connection failed for {}:{ETHERIP_PORT}\n",
-                    plc.ip_addr
+                    "EIP connection failed for {ip_addr}:{ETHERIP_PORT}\n"
                 ));
                 crate::eip_printf_time!(2, "drvEtherIP: PLC '{}' is disconnected\n", plc.name);
                 plc.connected.store(false, Ordering::Relaxed);
@@ -851,11 +850,10 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
 pub fn report(level: i32) {
     for plc in all_plcs() {
         let ident = plc.identity.lock().clone();
+        let (ip_addr, slot) = plc.addr.lock().clone();
         println!(
-            "PLC '{}': IP {}, slot {}, {}",
+            "PLC '{}': IP {ip_addr}, slot {slot}, {}",
             plc.name,
-            plc.ip_addr,
-            plc.slot,
             if plc.connected.load(Ordering::Relaxed) {
                 "connected"
             } else {
@@ -898,5 +896,26 @@ pub fn report(level: i32) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// drvEtherIP.c:1234: a redefinition keeps the PLC and its place in
+    /// the list but takes the new address.
+    #[test]
+    fn redefining_a_plc_keeps_its_place_and_takes_the_new_address() {
+        define_plc("regorder_b", "10.0.0.1", 0);
+        define_plc("regorder_a", "10.0.0.2", 0);
+        let again = define_plc("regorder_b", "10.0.0.3", 4);
+        assert_eq!(*again.addr.lock(), ("10.0.0.3".to_string(), 4));
+        let names: Vec<_> = all_plcs()
+            .into_iter()
+            .map(|p| p.name.clone())
+            .filter(|n| n.starts_with("regorder_"))
+            .collect();
+        assert_eq!(names, ["regorder_b", "regorder_a"]);
     }
 }
