@@ -1767,14 +1767,38 @@ pub fn create_ads_port(cfg: AdsConfig) -> AsynResult<AdsRuntime> {
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let _ = shared.trace.set(runtime_handle.port_handle().clone());
 
+    let port_name = &shared.cfg.port_name;
     if connect(&shared).is_err() {
         shared.print(
             TraceMask::ERROR,
-            format_args!(
-                "{DRIVER_NAME}:{DRIVER_NAME}: connect failed for port {}.",
-                shared.cfg.port_name
-            ),
+            format_args!("{DRIVER_NAME}:{DRIVER_NAME}: connect failed for port {port_name}."),
         );
+    } else {
+        match shared
+            .client()
+            .and_then(|c| c.read_state(shared.cfg.ams_port))
+        {
+            Ok((AdsState::Run, _)) => shared.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:{DRIVER_NAME}: connection established for port '{port_name}'"
+                ),
+            ),
+            Ok(_) => {}
+            Err(e) => {
+                let error = match e {
+                    AdsError::Ads(code) => format!("0x{code:x}"),
+                    other => other.to_string(),
+                };
+                shared.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:{DRIVER_NAME}: adsReadStateLock failed for port '{port_name}' error={error}"
+                    ),
+                );
+                disconnect(&shared);
+            }
+        }
     }
 
     let cyclic = {
@@ -1857,19 +1881,44 @@ fn disconnect(shared: &Arc<AdsShared>) {
 /// IOC — and every other device on it — down with one PLC reboot. This
 /// reconnects instead.
 fn cyclic_thread(shared: &Arc<AdsShared>) {
-    // C `oneAmsConnectionOKold_`.
+    // C `oneAmsConnectionOKold_` and `notConnectedCounter_`.
     let mut one_ok_old = false;
+    let mut not_connected: u32 = 0;
     while shared.running.load(Ordering::SeqCst) {
         thread::sleep(CYCLIC_PERIOD);
         if !shared.running.load(Ordering::SeqCst) {
             break;
         }
         let one_ok = cyclic_pass(shared);
-        if !one_ok && shared.cfg.auto_connect && one_ok_old {
-            shared.print(
-                TraceMask::ERROR,
-                format_args!("{DRIVER_NAME}:cyclicThread: No connection! Try to reconnect..."),
-            );
+        if one_ok {
+            not_connected = 0;
+        } else {
+            not_connected = not_connected.wrapping_add(1);
+            if not_connected < 100 || not_connected.is_multiple_of(100) {
+                shared.print(
+                    TraceMask::FLOW,
+                    format_args!(
+                        "{DRIVER_NAME}:cyclicThread: Not connected counter: {not_connected}."
+                    ),
+                );
+            }
+        }
+        if !one_ok && shared.cfg.auto_connect {
+            if one_ok_old {
+                shared.print(
+                    TraceMask::ERROR,
+                    format_args!("{DRIVER_NAME}:cyclicThread: No connection! Try to reconnect..."),
+                );
+            }
+            // The socket may be up with no runtime behind it; C drops it on
+            // every pass whose counter has bit 1 set.
+            if not_connected & 2 == 2 {
+                shared.print(
+                    TraceMask::ERROR,
+                    format_args!("cyclicThread: forcing disconnect."),
+                );
+                disconnect(shared);
+            }
         }
         one_ok_old = one_ok;
     }
@@ -1950,11 +1999,6 @@ fn cyclic_pass(shared: &Arc<AdsShared>) -> bool {
         }
     }
 
-    // Not one runtime answered: the socket is up but the PLC behind it is
-    // not talking. Drop it so the next pass reconnects from scratch.
-    if !any_connected {
-        disconnect(shared);
-    }
     any_connected
 }
 
