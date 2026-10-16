@@ -2,10 +2,9 @@
 //! serializing every wire operation through one OS thread (mirrors C's
 //! single-consumer `queue_func`/`qmesg` pair, `drvGM10.c:1311-1375` —
 //! `qmesg` enqueues from any EPICS scan thread, `queue_func` is the sole
-//! socket owner). `DeviceSupport::read`/`write` collapse C's PACT-then-
-//! completed-by-`queue_func` two-phase dance into one blocking round trip
-//! on [`Instrument::submit`] — legitimate since nothing else here depends
-//! on interleaving with other records' scans mid-flight.
+//! socket owner). Writes queue through [`Instrument::enqueue`] and complete
+//! the record from the actor, as C does. Reads block on
+//! [`Instrument::submit`]: the framework has no asynchronous read completion.
 
 use crate::cache::*;
 use crate::codec::*;
@@ -91,9 +90,13 @@ pub enum Command {
     AcknowledgeAlarms,
 }
 
+/// Run by the actor once its command was processed — C `queue_func`'s
+/// `rset->process` call (`drvGM10.c:1327-1332`).
+pub type Completion = Box<dyn FnOnce() + Send>;
+
 struct Job {
     command: Command,
-    done: mpsc::Sender<()>,
+    done: Completion,
 }
 
 /// Handle to a connected GM10 unit. Cheap to clone (`Arc`-backed); one
@@ -169,21 +172,24 @@ impl Instrument {
         self.interrupts.register(category)
     }
 
+    /// C `qmesg` (`drvGM10.c:1342-1373`): queue `command` behind every
+    /// earlier one; `done` runs after it. A gone actor drops `done` un-run.
+    pub fn enqueue(&self, command: Command, done: Completion) {
+        let _ = self.tx.send(Job { command, done });
+    }
+
     /// Block until the actor thread has finished processing `command`. C's
     /// `command_process` discards every handler's status (`drvGM10.c:1263-1309`),
     /// so there is none to return.
     pub fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
-        if self
-            .tx
-            .send(Job {
-                command,
-                done: done_tx,
-            })
-            .is_ok()
-        {
-            let _ = done_rx.recv();
-        }
+        self.enqueue(
+            command,
+            Box::new(move || {
+                let _ = done_tx.send(());
+            }),
+        );
+        let _ = done_rx.recv();
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -441,7 +447,7 @@ impl Actor {
     fn run(mut self, rx: mpsc::Receiver<Job>) {
         while let Ok(job) = rx.recv() {
             let _ = self.process(job.command);
-            let _ = job.done.send(());
+            (job.done)();
         }
     }
 
@@ -1077,5 +1083,26 @@ mod tests {
                 "_ERR,205\r\n",
             ]
         );
+    }
+
+    #[test]
+    fn enqueue_runs_completion_after_the_command() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(b"E0\r\n".to_vec());
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let cache = instrument.cache.clone();
+        instrument.enqueue(
+            Command::ClearError,
+            Box::new(move || {
+                let _ = tx.send(cache.lock().error.code);
+            }),
+        );
+        assert_eq!(rx.recv().unwrap(), -1);
+        let received = device.join().unwrap();
+        assert_eq!(received.last().unwrap(), "OErrorClear,0\r\n");
     }
 }

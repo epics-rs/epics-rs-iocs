@@ -15,8 +15,9 @@
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::server::database::WriteDoneSource;
 use epics_rs::base::server::device_support::{
-    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
+    DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, WriteStart,
 };
 use epics_rs::base::server::record::{Record, ScanType};
 use epics_rs::base::types::EpicsValue;
@@ -655,14 +656,41 @@ impl DeviceSupport for GmDevice {
     }
 
     fn write(&mut self, record: &mut dyn Record) -> CaResult<()> {
-        let Resolved { instrument, op } = self.resolved()?;
-        match *op {
+        let command = self.output_command(record)?;
+        self.resolved()?.instrument.submit(command);
+        Ok(())
+    }
+
+    /// C `write_*` sets PACT and `qmesg`s the command; `queue_func` ends the
+    /// cycle once it ran (`drvGM10.c:1311-1338`).
+    fn write_begin(
+        &mut self,
+        record: &mut dyn Record,
+        done: &WriteDoneSource<'_>,
+    ) -> CaResult<WriteStart> {
+        let command = self.output_command(record)?;
+        let (write_done, priority) = (done.write_done(), done.priority());
+        self.resolved()?.instrument.enqueue(
+            command,
+            Box::new(move || {
+                let _ = write_done.complete(priority, Ok(()));
+            }),
+        );
+        Ok(WriteStart::Pending)
+    }
+}
+
+impl GmDevice {
+    /// The command an output record's write queues.
+    fn output_command(&self, record: &dyn Record) -> CaResult<Command> {
+        let Resolved { op, .. } = self.resolved()?;
+        Ok(match *op {
             Operation::AnalogSet(addr) => {
                 let val = match record.get_field("VAL") {
                     Some(EpicsValue::Double(v)) => v,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                let command = match addr.family {
+                match addr.family {
                     ChannelFamily::Signal => Command::SetSignalOutput(addr.index, val),
                     ChannelFamily::Comm => Command::SetComm(addr.index, val),
                     ChannelFamily::Const => Command::SetConst(addr.index, val),
@@ -672,35 +700,34 @@ impl DeviceSupport for GmDevice {
                             "ao does not support Math addresses".into(),
                         ));
                     }
-                };
-                instrument.submit(command);
+                }
             }
             Operation::BinarySet(channel) => {
                 let on = match record.get_field("VAL") {
                     Some(EpicsValue::Enum(v)) => v != 0,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetBinaryOutput(channel, on));
+                Command::SetBinaryOutput(channel, on)
             }
-            Operation::ChanTrig => instrument.submit(Command::ReadAllData),
-            Operation::MiscTrig => instrument.submit(Command::ReadAllMisc),
-            Operation::InfoTrig => instrument.submit(Command::ReadAllInfos),
-            Operation::StatTrig => instrument.submit(Command::ReadStatus),
+            Operation::ChanTrig => Command::ReadAllData,
+            Operation::MiscTrig => Command::ReadAllMisc,
+            Operation::InfoTrig => Command::ReadAllInfos,
+            Operation::StatTrig => Command::ReadStatus,
             Operation::RecordingModeSet => {
                 let on = match record.get_field("VAL") {
                     Some(EpicsValue::Enum(v)) => v != 0,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetOpMode(on));
+                Command::SetOpMode(on)
             }
-            Operation::ErrorClearSet => instrument.submit(Command::ClearError),
-            Operation::AlarmAckSet => instrument.submit(Command::AcknowledgeAlarms),
+            Operation::ErrorClearSet => Command::ClearError,
+            Operation::AlarmAckSet => Command::AcknowledgeAlarms,
             Operation::ComputeCmdSet => {
                 let v = match record.get_field("VAL") {
                     Some(EpicsValue::Enum(v)) => v as u8,
                     _ => return Err(CaError::FieldNotFound("VAL".into())),
                 };
-                instrument.submit(Command::SetCompute(v));
+                Command::SetCompute(v)
             }
             Operation::AnalogVal(_)
             | Operation::IntegerVal(_)
@@ -725,8 +752,7 @@ impl DeviceSupport for GmDevice {
                     "GM10 device support: this operation is read-only".into(),
                 ));
             }
-        }
-        Ok(())
+        })
     }
 }
 
@@ -1227,5 +1253,34 @@ mod tests {
         device.write(&mut record).unwrap();
         let received = device_thread.join().unwrap();
         assert_eq!(received.last().unwrap(), "_ERR,205\r\n");
+    }
+
+    #[test]
+    fn bo_write_begin_queues_the_command_and_stays_pending() {
+        use epics_rs::base::server::database::{PvDatabase, WriteDone};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = crate::instrument::test_support::default_init_responses();
+        responses.push(one_record_fdata_binary());
+        let device_thread = spawn_fake_device(listener, responses);
+        let instrument = crate::instrument::Instrument::connect_to(addr).unwrap();
+        let f = factory(registry_with("gm10dev", instrument));
+        let ctx = DeviceSupportContext {
+            record_type: "bo",
+            dtyp: DTYP,
+            inp: "",
+            out: "gm10dev CHAN_TRIG",
+        };
+        let mut device = f(&ctx).unwrap();
+        let mut record = FakeRecord::new("bo");
+        device.init(&mut record).unwrap();
+        let db = PvDatabase::new();
+        let done = WriteDone::new(&db, "GM10:TRIG".into(), 0);
+        let start = device
+            .write_begin(&mut record, &WriteDoneSource::new(&done))
+            .unwrap();
+        assert!(matches!(start, WriteStart::Pending));
+        let received = device_thread.join().unwrap();
+        assert_eq!(received.last().unwrap(), "FData,1\r\n");
     }
 }
