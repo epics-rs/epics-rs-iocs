@@ -583,7 +583,9 @@ impl SessionWorker {
                         self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
                         return ServeOutcome::DisconnectRequested;
                     }
-                    Some(Control::Connect) => {}
+                    Some(Control::Connect) => {
+                        eprintln!("Session {} already connected (Activated)", self.handle.name);
+                    }
                     None => return ServeOutcome::Shutdown,
                 },
 
