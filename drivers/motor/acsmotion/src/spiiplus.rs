@@ -206,8 +206,8 @@ impl SpiiPlusController {
     /// successful set/motion command replies with only the prompt (empty after
     /// trimming); a query replies with the value.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C SPiiPlusComm::writeReadController: pasynOctetSyncIO->writeRead.
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_matches(['\r', '\n', '\0', ':', ' ']).to_string();
         if text.starts_with('?') {
