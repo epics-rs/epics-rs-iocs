@@ -27,7 +27,7 @@ use crate::params::MarccdParams;
 use crate::protocol::{
     cmd_set_bin, cmd_set_frameshift, cmd_set_gating, cmd_set_readout_mode, cmd_set_stability,
 };
-use crate::task::{Worker, start_det_task, start_image_task};
+use crate::task::{DriverLock, Worker, start_det_task, start_image_task};
 use crate::types::{
     Event, FrameType, TASK_ACQUIRE, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TriggerMode,
     test_task_status,
@@ -359,22 +359,26 @@ pub fn create_marccd_detector(
     // `image_event` (C `imageEventId`) is signalled by the det task in overlap
     // mode and awaited by the image task.
     let image_ev = Arc::new(Event::new());
-    let worker = || Worker {
-        port: handle.clone(),
-        start: start.clone(),
-        stop: stop.clone(),
-        image_event: image_ev.clone(),
-        acq_start: acq_start.clone(),
-        output: ArrayPublisher::new(array_output.clone()),
-        pool: pool.clone(),
-        owner: owner.clone(),
+    let worker = || -> Result<Worker, String> {
+        Ok(Worker {
+            port: handle.clone(),
+            lock: DriverLock::new(handle.clone())
+                .map_err(|e| format!("failed to start the marCCD lock thread: {e}"))?,
+            start: start.clone(),
+            stop: stop.clone(),
+            image_event: image_ev.clone(),
+            acq_start: acq_start.clone(),
+            output: ArrayPublisher::new(array_output.clone()),
+            pool: pool.clone(),
+            owner: owner.clone(),
+        })
     };
 
     let started = handle
         .with_driver_blocking::<MarccdDriver, _>(MarccdDriver::init)
         .map_err(|e| format!("marCCD init failed: {e}"))?;
     let tasks = if started {
-        vec![start_det_task(worker()), start_image_task(worker())]
+        vec![start_det_task(worker()?), start_image_task(worker()?)]
     } else {
         Vec::new()
     };
@@ -637,5 +641,48 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("{line}: {text:?}"))
         };
         assert!(at(&base) < at(&own));
+    }
+
+    /// reviewer5: C's marCCDTask holds the driver lock across acquireFrame's
+    /// "wait for acquisition to actually start" poll (marCCD.cpp:776-781,
+    /// epicsThreadSleep under lock), so a client's BinX write cannot reach
+    /// marServer until the task unlocks.
+    #[test]
+    fn r5_a_client_write_waits_out_the_acquire_poll() {
+        let name = "MARCCD_R5_LOCK";
+        // marState 0 forever: the exposure never reports started.
+        let log = fake_server(name, |c| {
+            if c.starts_with("get_mode") {
+                "1"
+            } else if c.starts_with("get_size") {
+                "64,32"
+            } else if c.starts_with("get_bin") {
+                "1,1"
+            } else if c.starts_with("get_") {
+                "0"
+            } else {
+                ""
+            }
+        });
+        let det =
+            create_marccd_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let (h, ad) = (det.port_handle().clone(), det.ad_params);
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sent_count(&log, "start") == 0 {
+            assert!(Instant::now() < deadline, "start never sent");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let writer = h.clone();
+        std::thread::spawn(move || {
+            let _ = writer.write_int32_blocking(ad.bin_x, 0, 2);
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(
+            sent_count(&log, "set_bin"),
+            0,
+            "set_bin reached marServer mid-poll"
+        );
+        std::mem::forget(det);
     }
 }

@@ -4,7 +4,7 @@
 //!
 //! As in `marCCD.cpp` they run under the driver lock, which here is the port
 //! actor: `writeInt32` / `writeFloat64` call them inline, and the worker
-//! threads reach them through `PortHandle::with_driver`. Each call blocks the
+//! threads reach them through `task::DriverLock`. Each call blocks the
 //! actor on the marServer port, which is a different port, so the round trip
 //! cannot interleave with another context's.
 
@@ -17,14 +17,14 @@ use epics_rs::asyn::user::AsynUser;
 use crate::driver::MarccdDriver;
 use crate::file_name::format_file_template;
 use crate::protocol::{
-    cmd_header_1, cmd_header_2, cmd_shutter, cmd_writefile, parse_f64, parse_int, parse_pair,
-    parse_state,
+    cmd_header_1, cmd_header_2, cmd_readout, cmd_shutter, cmd_writefile, parse_f64, parse_int,
+    parse_pair, parse_state,
 };
 use crate::types::{
     CamStatus, MARCCD_POLL_DELAY, MARCCD_SERVER_TIMEOUT, MAX_FILENAME_LEN, MAX_MESSAGE_SIZE,
     TASK_ACQUIRE, TASK_CORRECT, TASK_DEZINGER, TASK_READ, TASK_SERIES, TASK_STATE_BUSY,
-    TASK_STATUS_ERROR, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TASK_WRITE, secs, task_state,
-    task_status, test_task_status,
+    TASK_STATE_ERROR, TASK_STATUS_ERROR, TASK_STATUS_EXECUTING, TASK_STATUS_QUEUED, TASK_WRITE,
+    secs, task_state, task_status, test_task_status,
 };
 
 /// asyn subaddress of the single-device marServer octet port.
@@ -358,13 +358,72 @@ impl MarccdDriver {
     }
 
     /// Poll `getState` every `MARCCD_POLL_DELAY` while `busy` holds, as C's
-    /// `saveFile` loops do — sleeping with the driver lock held.
-    fn wait_state(&mut self, busy: impl Fn(i32) -> bool) {
+    /// task loops do — sleeping with the driver lock held.
+    pub(crate) fn wait_state(&mut self, busy: impl Fn(i32) -> bool) {
         let mut s = self.get_state();
         while busy(s) {
             std::thread::sleep(secs(MARCCD_POLL_DELAY));
             s = self.get_state();
         }
+    }
+
+    /// [`Self::wait_state`] as `readoutFrame` polls: an error once marServer
+    /// reports `TASK_STATE_ERROR`.
+    fn wait_state_or_error(&mut self, busy: impl Fn(i32) -> bool) -> CamStatus {
+        let mut s = self.get_state();
+        while busy(s) {
+            std::thread::sleep(secs(MARCCD_POLL_DELAY));
+            s = self.get_state();
+            if task_state(s) == TASK_STATE_ERROR {
+                return CamStatus::Error;
+            }
+        }
+        CamStatus::Success
+    }
+
+    /// C `readoutFrame`: all of it under the driver lock.
+    pub(crate) fn readout_frame(
+        &mut self,
+        buffer_number: i32,
+        file_name: Option<&str>,
+        wait: bool,
+    ) -> CamStatus {
+        let reading =
+            |s| test_task_status(s, TASK_READ, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0;
+        // Wait for the readout task to be done with the previous frame.
+        let status = self.wait_state_or_error(|s| reading(s) || task_state(s) >= TASK_STATE_BUSY);
+        if status.is_err() {
+            return status;
+        }
+        let file_name = file_name.filter(|n| !n.is_empty());
+        if let Some(name) = file_name {
+            self.set_str(self.ad.params.base.full_file_name, name);
+            self.callbacks();
+        }
+        self.write_server(&cmd_readout(buffer_number, file_name));
+
+        // Wait for the readout to start, then to complete.
+        let status = self.wait_state_or_error(|s| !reading(s));
+        if status.is_err() {
+            return status;
+        }
+        let status = self.wait_state_or_error(reading);
+        if status.is_err() || !wait {
+            return status;
+        }
+
+        // Wait for the correction to complete.
+        let status = self.wait_state_or_error(|s| {
+            test_task_status(s, TASK_CORRECT, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0
+        });
+        if status.is_err() || file_name.is_none() {
+            return status;
+        }
+        // A file was named: wait for the write to complete.
+        self.wait_state_or_error(|s| {
+            test_task_status(s, TASK_WRITE, TASK_STATUS_EXECUTING | TASK_STATUS_QUEUED) != 0
+                || task_state(s) >= TASK_STATE_BUSY
+        })
     }
 
     /// C `saveFile`.
