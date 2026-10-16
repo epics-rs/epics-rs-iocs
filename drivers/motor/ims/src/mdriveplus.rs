@@ -41,7 +41,9 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::{atof, atoi};
 
@@ -121,8 +123,10 @@ impl ImsMDrivePlusAxis {
     /// Connect an axis on `handle`, addressing it by `device_name` (empty for no
     /// party mode). `port` is the octet port under `handle`, whose output EOS a
     /// Lexium MDrive switches. As in C, a failed configuration is logged and the
-    /// axis is still created.
+    /// axis is still created. `motor_name` is the controller port, whose
+    /// `pasynUserSelf` C prints these lines on.
     pub fn new(handle: SyncIOHandle, motor_name: &str, device_name: String) -> Self {
+        let trace = MotorTrace::new(motor_name, 0);
         let mut axis = Self {
             handle,
             device_name,
@@ -132,9 +136,12 @@ impl ImsMDrivePlusAxis {
             has_encoder: false,
             homing: false,
         };
-        if axis.config_axis() == AsynStatus::Error {
-            eprintln!(
-                "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}"
+        if axis.config_axis(&trace) == AsynStatus::Error {
+            trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:ImsMDrivePlusMotorAxis(): controller config failed for motor port={motor_name}\n"
+                ),
             );
         }
         axis.read_home_and_limit_config();
@@ -162,11 +169,14 @@ impl ImsMDrivePlusAxis {
     /// C `configAxis`: up to three `PR VR` probes, then the `PR EE` encoder
     /// flag. An asyn error is logged and retried; any other reply shorter than
     /// two bytes ends the configuration without `PR EE`.
-    fn config_axis(&mut self) -> AsynStatus {
+    fn config_axis(&mut self, trace: &MotorTrace) -> AsynStatus {
         for _ in 0..3 {
             let resp = match self.handle.write_read(0, &self.framed("PR VR"), READ_BUF) {
                 Err(e) if e.status() == AsynStatus::Error => {
-                    eprintln!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.");
+                    trace.print_self(
+                        TraceMask::ERROR,
+                        format_args!("{DRIVER_NAME}:configAxis(): Version inquiry FAILED.\n"),
+                    );
                     continue;
                 }
                 Err(e) => e.partial_read().map(|p| p.data.clone()).unwrap_or_default(),
@@ -174,9 +184,12 @@ impl ImsMDrivePlusAxis {
             };
             let resp = resp.split(|&b| b == 0).next().unwrap_or_default();
             if resp.len() < 2 {
-                eprintln!(
-                    "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.",
-                    String::from_utf8_lossy(resp)
+                trace.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:configAxis(): Version inquiry FAILED version={}.\n",
+                        String::from_utf8_lossy(resp)
+                    ),
                 );
                 return AsynStatus::Error;
             }

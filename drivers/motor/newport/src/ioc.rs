@@ -256,7 +256,8 @@ pub fn ag_conex_create_controller_command() -> CommandDef {
             if connected.is_err() {
                 return Ok(CommandOutcome::Continue);
             }
-            let Some(axis) = ConexAxis::new(handle, controller_id) else {
+            let Some(axis) = ConexAxis::new(handle, controller_id, &MotorTrace::new(&port_name, 0))
+            else {
                 return Ok(CommandOutcome::Continue);
             };
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
@@ -299,7 +300,9 @@ pub fn agap_conex_create_controller_command() -> CommandDef {
             if connected.is_err() {
                 return Ok(CommandOutcome::Continue);
             }
-            let Some(controller) = AgapController::new(handle, controller_id) else {
+            let Some(controller) =
+                AgapController::new(handle, controller_id, MotorTrace::new(&port_name, 0))
+            else {
                 return Ok(CommandOutcome::Continue);
             };
             let controller = Arc::new(Mutex::new(controller));
@@ -360,7 +363,10 @@ pub fn ag_uc_create_controller_command() -> CommandDef {
                     "AG_UCController::AG_UCController: cannot connect to Agilis controller"
                 ),
             );
-            let controller = Arc::new(Mutex::new(AgUcController::new(handle)));
+            let controller = Arc::new(Mutex::new(AgUcController::new(
+                handle,
+                &MotorTrace::new(&port_name, 0),
+            )));
             AG_UC_CONTROLLERS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

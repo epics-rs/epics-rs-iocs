@@ -175,7 +175,7 @@ fn register_controller(
     }
     let controller = PhytronController::new(handle, ctrl_type, address);
     if reset_at_boot {
-        controller.reset_at_boot();
+        controller.reset_at_boot(&name);
     }
     let controller = Arc::new(Mutex::new(controller));
     registry_lock(registry).insert(

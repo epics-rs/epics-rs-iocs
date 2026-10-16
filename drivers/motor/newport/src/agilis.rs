@@ -40,7 +40,9 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use crate::util::{nint, parse_int_at};
 
@@ -184,8 +186,8 @@ pub struct AgUcController {
 impl AgUcController {
     /// Connect and initialise an Agilis controller: reset (`RS`), enter remote
     /// mode (`MR`), read the firmware version (`VE`) and detect the model.
-    /// Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle) -> Self {
+    /// Performs blocking serial I/O; `trace` is C's `pasynUserSelf`.
+    pub fn new(handle: SyncIOHandle, trace: &MotorTrace) -> Self {
         // Reset, then settle; the controller needs time after RS. C ignores
         // the RS/MR write status.
         let _ = write_raw(&handle, "RS");
@@ -200,16 +202,22 @@ impl AgUcController {
         );
         let model = match version {
             Err(_) => {
-                eprintln!(
-                    "AG_UCController::AG_UCController: cannot read version information from Agilis controller"
+                trace.print_self(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "AG_UCController::AG_UCController: cannot read version information from Agilis controller\n"
+                    ),
                 );
                 None
             }
             Ok(version) => {
                 let model = AgUcModel::from_version(&version);
                 if model.is_none() {
-                    eprintln!(
-                        "AG_UCController::AG_UCController: unknown model, firmware string={version}"
+                    trace.print_self(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "AG_UCController::AG_UCController: unknown model, firmware string={version}\n"
+                        ),
                     );
                 }
                 model
@@ -436,7 +444,10 @@ mod tests {
         let (handle, status) =
             SyncIOHandle::connect_port("AG_UC_NONE", 0, Duration::from_millis(10));
         assert!(status.is_err());
-        let controller = Arc::new(Mutex::new(AgUcController::new(handle)));
+        let controller = Arc::new(Mutex::new(AgUcController::new(
+            handle,
+            &MotorTrace::new("AG_UC_SELF", 0),
+        )));
         assert_eq!(controller.lock().unwrap().model(), None);
         let mut axis = AgUcAxis::new(controller, 0, true, 50, -50);
         let status = axis.poll(&AsynUser::new(0)).unwrap();
