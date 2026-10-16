@@ -11,6 +11,8 @@ const LOG_HTTP_WARNING: &str = "void ADTimePix::logHttpWarning(const char*, cons
 
 pub const REFRESH_PIXEL_CONFIG: &str = "asynStatus ADTimePix::refreshPixelConfigFromServal()";
 pub const WRITE_BPC_FILE: &str = "asynStatus ADTimePix::writeBPCfile(char**, int*)";
+pub const UPDATE_DETECTOR_FAMILY: &str =
+    "void ADTimePix::updateDetectorFamily(int, const std::string&, const std::string&)";
 pub const TIME_PIX_CALLBACK: &str = "void ADTimePix::timePixCallback()";
 pub const PROCESS_PRV_IMG_DATA_LINE: &str =
     "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)";

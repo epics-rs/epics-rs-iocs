@@ -23,6 +23,7 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 pub mod accum;
 mod adlog;
 pub mod driver;
+pub mod family;
 pub mod http;
 pub mod mask;
 pub mod params;

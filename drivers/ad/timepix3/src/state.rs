@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use parking_lot::Mutex;
 
 use crate::accum::Accumulator;
+use crate::family::DetectorFamily;
 
 /// What the port driver asks the background threads to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,10 @@ pub struct Shared {
     pub streams: Mutex<StreamPaths>,
     orientation: AtomicI32,
     acquiring: AtomicBool,
+    /// C `detectorFamily_`, as its `DetectorFamily` discriminant.
+    family: AtomicI32,
+    /// C `detectorFamilyApplied_`.
+    family_applied: AtomicBool,
 }
 
 impl Default for Shared {
@@ -63,6 +68,8 @@ impl Shared {
             streams: Mutex::new(StreamPaths::default()),
             orientation: AtomicI32::new(0),
             acquiring: AtomicBool::new(false),
+            family: AtomicI32::new(DetectorFamily::Unknown as i32),
+            family_applied: AtomicBool::new(false),
         }
     }
 
@@ -97,6 +104,18 @@ impl Shared {
 
     pub fn acquiring(&self) -> bool {
         self.acquiring.load(Ordering::Acquire)
+    }
+
+    pub fn family(&self) -> DetectorFamily {
+        DetectorFamily::from_i32(self.family.load(Ordering::Acquire))
+    }
+
+    /// Record `family`; true when C's `familyChanged || !detectorFamilyApplied_`
+    /// asks for the family defaults (ADTimePix.cpp:2110-2122).
+    pub fn note_family(&self, family: DetectorFamily) -> bool {
+        let old = self.family.swap(family as i32, Ordering::AcqRel);
+        let applied = self.family_applied.swap(true, Ordering::AcqRel);
+        old != family as i32 || !applied
     }
 
     /// Take the mask out for editing, growing it to the geometry first.

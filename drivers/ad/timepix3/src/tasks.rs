@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::accum::Update;
 use crate::adlog;
+use crate::family::DetectorFamily;
 use crate::http::{ServalHttp, TIMEOUT_POLL};
 use crate::params::TimePixParams;
 use crate::serval;
@@ -465,6 +466,8 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
         detector.pointer("/Config/GlobalTimestampInterval"),
     );
 
+    update_detector_family(ctx, &detector, &mut updates);
+
     // The detector orientation drives the mask geometry, so it also goes into
     // the shared state the mask code reads.
     if let Some(o) = detector
@@ -545,6 +548,86 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
 /// `Detector.Health` is a single object on Serval 3 and an array — one entry
 /// per SPIDR board — on Serval 4. Both shapes carry the same keys, so the
 /// scalars come from the first board.
+/// C `updateDetectorFamily` (ADTimePix.cpp:2107-2127), with the arguments
+/// `getDetector` passes it (serval_http.cpp:1351-1363).
+fn update_detector_family(ctx: &Ctx, detector: &Value, updates: &mut Vec<ParamSetValue>) {
+    let p = ctx.p;
+    let mpx_type = detector
+        .pointer("/Info/MpxType")
+        .and_then(Value::as_i64)
+        .and_then(|v| i32::try_from(v).ok())
+        .unwrap_or(0);
+    let chip_type = detector
+        .pointer("/Info/ChipType")
+        .map(serval::json_to_string)
+        .unwrap_or_default();
+    let chipboard_id = detector
+        .pointer("/Info/Boards/0/ChipboardId")
+        .map(serval::json_to_string)
+        .unwrap_or_default();
+    let family = DetectorFamily::detect(mpx_type, &chip_type, &chipboard_id);
+    let caps = family.capabilities();
+    let int = |reason: usize, v: i32| ParamSetValue::new(reason, 0, ParamValue::Int32(v));
+    updates.push(ParamSetValue::new(
+        p.chip_type,
+        0,
+        ParamValue::Octet(chip_type.as_bytes().into()),
+    ));
+    updates.push(int(p.detector_family, family as i32));
+    updates.push(int(p.cap_tdc, caps.supports_tdc.into()));
+    updates.push(int(p.cap_tof_hist, caps.supports_tof_histogram.into()));
+    updates.push(int(p.cap_dual_preview, caps.supports_dual_preview.into()));
+    updates.push(int(
+        p.cap_img_thresholds,
+        caps.supports_image_thresholds.into(),
+    ));
+
+    if ctx.shared.note_family(family) {
+        apply_family_defaults(&p, family, updates);
+        ctx.trace(
+            TraceMask::FLOW,
+            &adlog::log(
+                adlog::UPDATE_DETECTOR_FAMILY,
+                &format!(
+                    "Detector family {} (MpxType={mpx_type} ChipType={chip_type} ChipboardId={chipboard_id})",
+                    family.name()
+                ),
+            ),
+        );
+    }
+}
+
+/// C `applyFamilyDefaults` (ADTimePix.cpp:2155-2175): Medipix3 reads two
+/// thresholds in 12-bit high-gain mode.
+fn apply_family_defaults(
+    p: &TimePixParams,
+    family: DetectorFamily,
+    updates: &mut Vec<ParamSetValue>,
+) {
+    if family != DetectorFamily::Mpx3 {
+        return;
+    }
+    for reason in [p.img_ths, p.img1_ths, p.prv_img_ths, p.prv_img1_ths] {
+        updates.push(ParamSetValue::new(
+            reason,
+            0,
+            ParamValue::Octet(b"0,1"[..].into()),
+        ));
+    }
+    for (reason, v) in [
+        (p.prv_img_format, 3),
+        (p.prv_img1_format, 3),
+        (p.gain_mode, 1),
+        (p.pixel_depth, 12),
+        (p.i_delay0, 15),
+        (p.i_delay1, 15),
+        (p.i_delay2, 15),
+        (p.i_delay3, 10),
+    ] {
+        updates.push(ParamSetValue::new(reason, 0, ParamValue::Int32(v)));
+    }
+}
+
 fn health_blocks(detector: &Value) -> Vec<&Value> {
     match detector.get("Health") {
         Some(Value::Array(a)) => a.iter().collect(),
@@ -1281,6 +1364,77 @@ mod tests {
         let r = rail_voltages(&d);
         assert_eq!(r[0], (1.5, 1.4));
         assert_eq!(r[3], (0.0, 0.0));
+    }
+
+    fn idle_ctx(name: &str) -> Ctx {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let http = Arc::new(ServalHttp::new("http://127.0.0.1:1"));
+        let shared = Arc::new(Shared::new());
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let driver =
+            crate::driver::TimePix3Driver::new(name, http.clone(), shared.clone(), 0, cmd_tx)
+                .unwrap();
+        let (p, ad) = (driver.p, driver.ad.params);
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            driver,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        Ctx {
+            handle,
+            http,
+            shared,
+            p,
+            ad,
+            output: Arc::new(parking_lot::Mutex::new(NDArrayOutput::new())),
+            pool: DriverPool::standalone(0),
+        }
+    }
+
+    fn int_set(updates: &[ParamSetValue], reason: usize) -> Option<i32> {
+        updates.iter().rev().find_map(|u| match u {
+            ParamSetValue::Value {
+                reason: r,
+                value: ParamValue::Int32(v),
+                ..
+            } if *r == reason => Some(*v),
+            _ => None,
+        })
+    }
+
+    /// The family and its capabilities are published on every detector read;
+    /// the Medipix3 defaults only when the family first appears or changes
+    /// (ADTimePix.cpp:2107-2127, :2155-2175).
+    #[test]
+    fn the_family_defaults_are_applied_when_the_family_changes() {
+        let ctx = idle_ctx("TPX_FAMILY");
+        let p = ctx.p;
+        let mpx3 = serde_json::json!({"Info": {"MpxType": 5, "Boards": [{"ChipboardId": "41"}]}});
+        let mut u = Vec::new();
+        update_detector_family(&ctx, &mpx3, &mut u);
+        assert_eq!(int_set(&u, p.detector_family), Some(2));
+        assert_eq!(int_set(&u, p.cap_img_thresholds), Some(1));
+        assert_eq!(int_set(&u, p.cap_tdc), Some(0));
+        assert_eq!(int_set(&u, p.pixel_depth), Some(12));
+        assert_eq!(int_set(&u, p.i_delay3), Some(10));
+
+        let mut u = Vec::new();
+        update_detector_family(&ctx, &mpx3, &mut u);
+        assert_eq!(int_set(&u, p.detector_family), Some(2));
+        assert_eq!(int_set(&u, p.pixel_depth), None);
+
+        let tpx3 = serde_json::json!({"Info": {"ChipType": "tpx3"}});
+        let mut u = Vec::new();
+        update_detector_family(&ctx, &tpx3, &mut u);
+        assert_eq!(int_set(&u, p.detector_family), Some(1));
+        assert_eq!(int_set(&u, p.cap_tdc), Some(1));
+        assert_eq!(int_set(&u, p.pixel_depth), None);
+        assert_eq!(ctx.shared.family(), DetectorFamily::Tpx3);
     }
 
     #[tokio::test]
