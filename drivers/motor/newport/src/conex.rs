@@ -45,10 +45,6 @@ use crate::util::{leading_hex, parse_int_at, parse_value_at};
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
 
-/// Command line terminator (CR/LF), appended by the driver on output; the
-/// reply is split by the port's input EOS. See [`crate::smc100`].
-const TERMINATOR: &[u8] = b"\r\n";
-
 // C `CONEX_TIMEOUT` (2 s) is applied where the transport is opened —
 // `SyncIOHandle::from_handle` in `crate::ioc` — not per write here.
 
@@ -223,7 +219,7 @@ fn parse_closed_loop(resp: &str) -> Option<bool> {
     Some((0x1e..=0x34).contains(&status))
 }
 
-// --- Command formatters (bare text, C `outString_`; the driver frames them).
+// --- Command formatters (bare text, C `outString_`).
 
 fn cmd_set_acceleration(id: i32, accel_egu: f64) -> String {
     format!("{id}AC{accel_egu:.6}")
@@ -277,23 +273,16 @@ fn parse_error(what: &str) -> AsynError {
     conex_err(format!("CONEX: could not parse {what} response"))
 }
 
-// --- Raw framed serial I/O (usable before `ConexAxis` exists, e.g. in `new`).
-
-fn framed(cmd: &str) -> Vec<u8> {
-    let mut framed = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-    framed.extend_from_slice(cmd.as_bytes());
-    framed.extend_from_slice(TERMINATOR);
-    framed
-}
+// --- Raw serial I/O (usable before `ConexAxis` exists, e.g. in `new`).
 
 fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    handle.write_octet(0, &framed(cmd))?;
+    handle.write_octet(0, cmd.as_bytes())?;
     Ok(())
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
     // C writeReadController: pasynOctetSyncIO->writeRead.
-    let reply = handle.write_read(0, &framed(cmd), READ_BUF)?;
+    let reply = handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }
 
