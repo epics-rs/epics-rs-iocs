@@ -1,5 +1,5 @@
-# Animatics SmartMotor: one motor record for chain axis $(AXIS=0)
-# (DTYP SMARTMOTOR_$(CARD)_$(AXIS=0)).
+# Animatics SmartMotor: one motor record for chain axis $(S)
+# (DTYP "SmartMotor", OUT #C$(C) S$(S)).
 #
 # The SmartMotor is an integrated servo working in encoder counts. Positions
 # travel the driver boundary in counts, so MRES = 1 and EGU = counts. VELO
@@ -7,7 +7,8 @@
 # SmartMotor; the plus/minus travel-limit switches are reported.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "SMARTMOTOR_$(CARD)_$(AXIS=0)")
+    field(DTYP, "SmartMotor")
+    field(OUT,  "#C$(C) S$(S) @")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=100000.0)")
     field(ACCL, "$(ACCL=0.5)")

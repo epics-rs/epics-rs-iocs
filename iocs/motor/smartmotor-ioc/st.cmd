@@ -24,17 +24,16 @@ asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
 # ---- SmartMotor controller ----
-# SmartMotorSetup(maxControllers, [scanRate]) is accepted for startup-script
-# parity; the asyn-rs port allocates per SmartMotorConfig call.
+# SmartMotorSetup(num_cards, scan_rate in Hz)
 SmartMotorSetup(1, 10)
 
-# SmartMotorConfig(card, asynPort, [movingPollMs], [idlePollMs]) - one DTYP
-# per motor found, SMARTMOTOR_$(CARD)_0 up the chain.
-SmartMotorConfig(0, "$(SERIAL)", 100, 1000)
+# SmartMotorConfig(card, asyn port) - one signal per motor found, S0 up the
+# chain.
+SmartMotorConfig(0, "$(SERIAL)")
 
-# Motor record for chain axis 0; load one per motor with AXIS=n. The
+# Motor record for chain axis 0; load one per motor with S=n. The
 # SmartMotor works in encoder counts, so MRES = 1 and EGU = counts.
-dbLoadRecords("$(SMARTMOTOR_IOC)/db/smartmotor.template", "P=$(P),M=m1,CARD=$(CARD)")
+dbLoadRecords("$(SMARTMOTOR_IOC)/db/smartmotor.template", "P=$(P),M=m1,C=$(CARD),S=0")
 
 iocInit()
 

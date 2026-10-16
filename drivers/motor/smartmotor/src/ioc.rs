@@ -1,11 +1,8 @@
 //! `SmartMotorSetup` / `SmartMotorConfig` iocsh commands for the Animatics
-//! SmartMotor.
-//!
-//! Mirrors C `SmartMotorConfig(card, port)`: look up the serial octet port,
-//! count the motors on it ([`SmartMotorController::new`]), and register each
-//! behind a `DTYP`-keyed motor device support (`SMARTMOTOR_{card}_{axis}`).
-//! `SmartMotorSetup` (which only sized a controller array in C) is accepted as a
-//! no-op for startup-script parity.
+//! SmartMotor, C's model-1 interface: records reach axis `signal` of `card`
+//! through `DTYP "SmartMotor"` and `OUT "#C card S signal"`. Config connects
+//! and identifies the controller at once, where C's `motor_init` does so at
+//! iocInit.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,56 +10,43 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::base::server::record::DevSup;
 
-use motor_common::iocsh::{
-    arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
-};
-use motor_common::{MotorHolder, TraceUser};
+use motor_common::iocsh::{arg_int_req, arg_str_req, req_int, req_string};
+use motor_common::model1::{Model1, SCAN_RATE};
+use motor_common::model1_device;
 
 use crate::smartmotor::{SmartMotorAxis, SmartMotorController};
 
 /// Serial command timeout (C `COMM_TIMEOUT` 2 s).
 const SMARTMOTOR_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Build the `SmartMotorSetup(maxControllers, [scanRate])` no-op command
-/// (startup-script parity; the asyn-rs port allocates per `SmartMotorConfig`).
+/// `device(motor,VME_IO,devSmartMotor,"SmartMotor")` (devSmartMotorMotor.dbd:3).
+static DEV_SMART_MOTOR: DevSup = model1_device("devSmartMotor", "SmartMotor");
+
+/// `SmartMotor_NUM_CARDS` (drvSmartMotor.cc:57).
+static SMART_MOTOR: Model1 = Model1::new(&DEV_SMART_MOTOR, 7, SCAN_RATE);
+
+/// `SmartMotorSetup(num_cards, scan_rate)`.
 pub fn smartmotor_setup_command() -> CommandDef {
-    CommandDef::new(
-        "SmartMotorSetup",
-        vec![arg_int_req("maxControllers"), arg_int_opt("scanRate")],
-        "SmartMotorSetup(maxControllers, [scanRate]) - Accepted for parity; SmartMotorConfig allocates per call",
-        move |args: &[ArgValue], _ctx: &CommandContext| {
-            let max = req_int(args, 0, "maxControllers")?;
-            if max < 1 {
-                return Err("SmartMotorSetup: maxControllers must be > 0".into());
-            }
-            Ok(CommandOutcome::Continue)
-        },
-    )
+    SMART_MOTOR.setup_command("SmartMotorSetup")
 }
 
-/// Build the `SmartMotorConfig(card, asynPort, [movingPollMs], [idlePollMs])`
-/// command bound to `holder`.
-pub fn smartmotor_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// `SmartMotorConfig(card, name)`.
+pub fn smartmotor_config_command() -> CommandDef {
     CommandDef::new(
         "SmartMotorConfig",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_int_req("Card being configured"),
+            arg_str_req("asyn port name"),
         ],
-        "SmartMotorConfig(card, asynPort, [movingPollMs], [idlePollMs]) - \
-         Create one Animatics SmartMotor or a daisy chain of them \
-         (DTYP SMARTMOTOR_{card}_{axis})",
+        "SmartMotorConfig(card, name)",
         move |args: &[ArgValue], ctx: &CommandContext| {
             let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("SmartMotorConfig: card must be >= 0".into());
+            if !SMART_MOTOR.has_card(card) {
+                return Ok(CommandOutcome::Continue);
             }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
+            let asyn_port = req_string(args, 1, "asyn port name")?;
 
             let port = get_port(&asyn_port).ok_or_else(|| {
                 format!(
@@ -76,22 +60,9 @@ pub fn smartmotor_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
 
             for axis in 0..num_axes {
                 let ax = SmartMotorAxis::new(controller.clone(), axis);
-                let dtyp_key = format!("SMARTMOTOR_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(
-                    ctx,
-                    TraceUser::Model1,
-                    dtyp_key,
-                    motor,
-                    moving_poll_ms,
-                    idle_poll_ms,
-                );
+                SMART_MOTOR.install(ctx, card, axis as i32, motor)?;
             }
-
-            println!(
-                "SmartMotorConfig: card={card} asynPort={asyn_port} axes={num_axes} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=SMARTMOTOR_{card}_0..)"
-            );
             Ok(CommandOutcome::Continue)
         },
     )
