@@ -5,8 +5,8 @@
 //! the wire; commands are `{n}CMD` and queries `{n}CMD?` reply with a leading
 //! `#` (e.g. `#MMC-200 …`, `#8`, `#0.000000,0.000000`). Motion commands take
 //! no reply — only `?` queries are read — so this port pairs
-//! [`Mmc200Controller::write`] (fire-and-forget) with
-//! [`Mmc200Controller::query`] (write + read) exactly as the C driver pairs
+//! `Mmc200Controller::write` (fire-and-forget) with
+//! `Mmc200Controller::query` (write + read) exactly as the C driver pairs
 //! `writeController` with `writeReadController`.
 //!
 //! ## Units
