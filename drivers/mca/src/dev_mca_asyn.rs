@@ -512,7 +512,7 @@ mod tests {
         )
         .unwrap();
         let (dev, rec, outcome) = init_dev(&format!("@asyn({name})"));
-        assert!(matches!(outcome, DeviceInitOutcome::Live));
+        assert!(matches!(outcome, DeviceInitOutcome::Ok(_)));
         writes.lock().unwrap().clear();
         Fixture {
             _runtime: runtime,
