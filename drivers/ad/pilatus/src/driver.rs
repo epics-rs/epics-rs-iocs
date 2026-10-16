@@ -9,12 +9,13 @@ use std::sync::Arc;
 
 use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynError, AsynResult};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode};
@@ -162,6 +163,7 @@ impl PortDriver for PilatusDriver {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
+        let mut status = Ok(());
         if function == params.acquire {
             self.ad.set_acquire(value)?;
         } else {
@@ -196,11 +198,28 @@ impl PortDriver for PilatusDriver {
                 self.send(Cmd::ReadStatus);
             }
         } else if function < p.first() {
-            self.ad.write_int32_pool(function, value)?;
+            status = self.ad.write_int32_pool(function, value).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "pilatusDetector:writeInt32: error, status={} function={function}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("pilatusDetector:writeInt32: function={function}, value={value}"),
+            ),
+        }
+        status
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
@@ -309,6 +328,12 @@ impl PortDriver for PilatusDriver {
         // Parameters below FIRST_PILATUS_PARAM need no extra work beyond the
         // `set_float64` above, which is all `ADDriver::writeFloat64` does.
 
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("pilatusDetector:writeFloat64: function={function}, value={value:.6}"),
+        );
         self.ad.port_base.call_param_callbacks(0)?;
         Ok(())
     }
@@ -326,21 +351,37 @@ impl PortDriver for PilatusDriver {
             .port_base
             .set_string_param(function, user.addr, value.clone())?;
 
+        let mut status = Ok(());
         if function == p.bad_pixel_file {
-            self.send(Cmd::ReadBadPixelFile(value));
+            self.send(Cmd::ReadBadPixelFile(value.clone()));
         } else if function == p.flat_field_file {
-            self.send(Cmd::ReadFlatFieldFile(value));
+            self.send(Cmd::ReadFlatFieldFile(value.clone()));
         } else if function == params.base.file_path {
-            self.send(Cmd::ImgPath(value));
+            self.send(Cmd::ImgPath(value.clone()));
         } else if function == p.oscill_axis {
             self.send(Cmd::Raw(cmd_oscill_axis(&value)));
         } else if function == p.cbf_template_file {
             self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
         } else {
-            return self.ad.write_octet(user, data);
+            status = self.ad.write_octet(user, data).map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(0)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
+        if let Err(e) = status {
+            return Err(AsynError::Status {
+                status: e.status(),
+                message: format!(
+                    "pilatusDetector:writeOctet: status={}, function={function}, value={value}",
+                    e.status() as i32
+                ),
+            });
+        }
+        user.print(
+            TraceMask::IO_DRIVER,
+            file!(),
+            line!(),
+            format_args!("pilatusDetector:writeOctet: function={function}, value={value}"),
+        );
         Ok(data.len())
     }
 }
