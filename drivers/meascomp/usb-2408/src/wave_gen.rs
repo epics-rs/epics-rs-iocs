@@ -2,7 +2,6 @@ use meascomp::analog_out::AOutScanConfig;
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
-use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::trace::TraceMask;
 
 use crate::params::*;
@@ -350,15 +349,12 @@ pub fn stop_wave_gen(
 /// ANALOG_OUT_RANGE.
 pub fn restore_outputs(
     params: &MultiFunctionParams,
-    int: impl Fn(usize, i32) -> AsynResult<i32>,
-) -> AsynResult<Vec<(i32, i32)>> {
-    let mut restore = Vec::new();
-    for ch in 0..MAX_ANALOG_OUT as i32 {
-        if int(params.wave_gen_enable, ch)? != 0 {
-            restore.push((ch, int(params.analog_out_range, ch)?));
-        }
-    }
-    Ok(restore)
+    int: impl Fn(usize, i32) -> i32,
+) -> Vec<(i32, i32)> {
+    (0..MAX_ANALOG_OUT as i32)
+        .filter(|&ch| int(params.wave_gen_enable, ch) != 0)
+        .map(|ch| (ch, int(params.analog_out_range, ch)))
+        .collect()
 }
 
 #[cfg(test)]

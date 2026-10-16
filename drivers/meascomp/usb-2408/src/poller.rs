@@ -103,19 +103,18 @@ fn poller_loop(
         let restart = if state.lock().is_ok_and(|st| st.wave_dig.running) {
             WaveDigScan::read_restart(
                 &params,
-                |r, a| handle.read_int32_blocking(r, a),
-                |r, a| handle.read_float64_blocking(r, a),
+                |r, a| handle.read_int32_blocking(r, a).unwrap_or(0),
+                |r, a| handle.read_float64_blocking(r, a).unwrap_or(0.0),
             )
-            .ok()
-            .flatten()
         } else {
             None
         };
 
         // What a generator that ends this cycle puts back.
         let wave_gen_restore = if state.lock().is_ok_and(|st| st.wave_gen.running) {
-            wave_gen::restore_outputs(&params, |r, a| handle.read_int32_blocking(r, a))
-                .unwrap_or_default()
+            wave_gen::restore_outputs(&params, |r, a| {
+                handle.read_int32_blocking(r, a).unwrap_or(0)
+            })
         } else {
             Vec::new()
         };

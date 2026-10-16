@@ -59,10 +59,16 @@ impl MultiFunctionDriver {
 
         // Defaults
         base.set_float64_param(params.poll_sleep_ms, 0, 50.0)?;
-        base.set_int32_param(params.wave_dig_num_points, 0, max_input_points as i32)?;
+        // C's ctor defaults (drvMultiFunction.cpp:457-473).
+        base.set_int32_param(params.wave_gen_user_num_points, 0, 1)?;
+        base.set_int32_param(params.wave_gen_int_num_points, 0, 1)?;
+        base.set_int32_param(params.wave_dig_num_points, 0, 1)?;
+        base.set_int32_param(params.wave_dig_run, 0, 0)?;
+        base.set_int32_param(params.wave_gen_run, 0, 0)?;
+        for ch in 0..MAX_ANALOG_OUT as i32 {
+            base.set_int32_param(params.analog_out_range, ch, uldaq_sys::BIP10VOLTS)?;
+        }
         base.set_int32_param(params.wave_gen_num_points, 0, max_output_points as i32)?;
-        base.set_int32_param(params.wave_gen_user_num_points, 0, max_output_points as i32)?;
-        base.set_int32_param(params.wave_gen_int_num_points, 0, max_output_points as i32)?;
         base.set_float64_param(params.wave_gen_user_dwell, 0, 0.001)?;
         base.set_float64_param(params.wave_gen_int_dwell, 0, 0.001)?;
         for ch in 0..MAX_ANALOG_OUT {
@@ -75,7 +81,7 @@ impl MultiFunctionDriver {
             base.set_int32_param(params.analog_in_type, ch as i32, 0)?;
             base.set_int32_param(params.analog_in_range, ch as i32, uldaq_sys::BIP10VOLTS)?;
             base.set_int32_param(params.temperature_scale, ch as i32, uldaq_sys::TS_CELSIUS)?;
-            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_K)?;
+            base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
         }
 
         // Device info
@@ -198,14 +204,14 @@ impl MultiFunctionDriver {
         updates: &mut Vec<ParamSetValue>,
     ) -> AsynResult<bool> {
         let p = self.params;
-        let wave_type = self.base.get_int32_param(p.wave_gen_wave_type, channel)?;
+        let wave_type = self.int(p.wave_gen_wave_type, channel);
         let user = wave_type == wave_gen::WAVE_TYPE_USER;
         let (points_param, dwell_param) = if user {
             (p.wave_gen_user_num_points, p.wave_gen_user_dwell)
         } else {
             (p.wave_gen_int_num_points, p.wave_gen_int_dwell)
         };
-        let num_points = self.base.get_int32_param(points_param, 0)?;
+        let num_points = self.int(points_param, 0);
         // C compares as size_t, so a negative count is too large as well.
         if num_points < 0 || num_points as usize > self.max_output_points {
             trace.print(
@@ -217,19 +223,15 @@ impl MultiFunctionDriver {
             );
             return Ok(false);
         }
-        let dwell = self.base.get_float64_param(dwell_param, 0)?;
+        let dwell = self.float(dwell_param, 0);
         let wave = wave_gen::InternalWave {
             wave_type,
             num_points: num_points as usize,
             dwell,
-            offset: self.base.get_float64_param(p.wave_gen_offset, channel)?,
-            amplitude: self.base.get_float64_param(p.wave_gen_amplitude, channel)?,
-            pulse_width: self
-                .base
-                .get_float64_param(p.wave_gen_pulse_width, channel)?,
-            pulse_delay: self
-                .base
-                .get_float64_param(p.wave_gen_pulse_delay, channel)?,
+            offset: self.float(p.wave_gen_offset, channel),
+            amplitude: self.float(p.wave_gen_amplitude, channel),
+            pulse_width: self.float(p.wave_gen_pulse_width, channel),
+            pulse_delay: self.float(p.wave_gen_pulse_delay, channel),
         };
         self.base
             .set_int32_param(p.wave_gen_num_points, 0, num_points)?;
@@ -269,21 +271,21 @@ impl MultiFunctionDriver {
             }
             Ok(-1)
         };
-        let ext_trigger = self.base.get_int32_param(p.wave_gen_ext_trigger, 0)? != 0;
-        let ext_clock = self.base.get_int32_param(p.wave_gen_ext_clock, 0)? != 0;
-        let continuous = self.base.get_int32_param(p.wave_gen_continuous, 0)? != 0;
-        let retrigger = self.base.get_int32_param(p.wave_gen_retrigger, 0)? != 0;
+        let ext_trigger = self.int(p.wave_gen_ext_trigger, 0) != 0;
+        let ext_clock = self.int(p.wave_gen_ext_clock, 0) != 0;
+        let continuous = self.int(p.wave_gen_continuous, 0) != 0;
+        let retrigger = self.int(p.wave_gen_retrigger, 0) != 0;
 
         let mut span: Option<(i32, i32)> = None;
         let mut first_type = -1;
         let mut wave_type = -1;
         let mut saved = [0.0f64; MAX_ANALOG_OUT];
         for ch in 0..MAX_ANALOG_OUT as i32 {
-            saved[ch as usize] = f64::from(self.base.get_int32_param(p.analog_out_value, ch)?);
-            if self.base.get_int32_param(p.wave_gen_enable, ch)? == 0 {
+            saved[ch as usize] = f64::from(self.int(p.analog_out_value, ch));
+            if self.int(p.wave_gen_enable, ch) == 0 {
                 continue;
             }
-            wave_type = self.base.get_int32_param(p.wave_gen_wave_type, ch)?;
+            wave_type = self.int(p.wave_gen_wave_type, ch);
             let first = span.map_or(ch, |(first, _)| first);
             if span.is_none() {
                 first_type = wave_type;
@@ -305,15 +307,13 @@ impl MultiFunctionDriver {
         };
 
         // defineWaveform has set these.
-        let num_points = self.base.get_int32_param(p.wave_gen_num_points, 0)?.max(0) as usize;
-        let dwell = self.base.get_float64_param(p.wave_gen_dwell, 0)?;
+        let num_points = self.int(p.wave_gen_num_points, 0).max(0) as usize;
+        let dwell = self.float(p.wave_gen_dwell, 0);
         let num_chans = (last_chan - first_chan + 1) as usize;
         let mut waveform = vec![0.0f64; num_chans * num_points];
         for i in 0..num_chans {
             let k = first_chan as usize + i;
-            let input = if self.base.get_int32_param(p.wave_gen_wave_type, k as i32)?
-                == wave_gen::WAVE_TYPE_USER
-            {
+            let input = if self.int(p.wave_gen_wave_type, k as i32) == wave_gen::WAVE_TYPE_USER {
                 &wave_gen_state.user_waveforms[k]
             } else {
                 &wave_gen_state.int_waveforms[k]
@@ -321,9 +321,8 @@ impl MultiFunctionDriver {
             // C reads the user scaling at the scan index, not the channel.
             let (amplitude, offset) = if wave_type == wave_gen::WAVE_TYPE_USER {
                 (
-                    self.base
-                        .get_float64_param(p.wave_gen_amplitude, i as i32)?,
-                    self.base.get_float64_param(p.wave_gen_offset, i as i32)?,
+                    self.float(p.wave_gen_amplitude, i as i32),
+                    self.float(p.wave_gen_offset, i as i32),
                 )
             } else {
                 (1.0, 0.0)
@@ -387,35 +386,44 @@ impl MultiFunctionDriver {
 
     /// C `computeWaveGenTimes`: both generator time axes, posted when a
     /// point count or dwell is written.
-    fn compute_wave_gen_times(&self) -> AsynResult<[ParamSetValue; 2]> {
+    fn compute_wave_gen_times(&self) -> [ParamSetValue; 2] {
         let p = &self.params;
-        let axis = |points, dwell, wf| -> AsynResult<ParamSetValue> {
-            let times = wave_dig::time_axis(
-                self.base.get_int32_param(points, 0)?,
-                self.base.get_float64_param(dwell, 0)?,
-            );
-            Ok(ParamSetValue::new(
-                wf,
-                0,
-                ParamValue::Float32Array(times.into()),
-            ))
+        let axis = |points, dwell, wf| {
+            let times = wave_dig::time_axis(self.int(points, 0), self.float(dwell, 0));
+            ParamSetValue::new(wf, 0, ParamValue::Float32Array(times.into()))
         };
-        Ok([
+        [
             axis(
                 p.wave_gen_user_num_points,
                 p.wave_gen_user_dwell,
                 p.wave_gen_user_time_wf,
-            )?,
+            ),
             axis(
                 p.wave_gen_int_num_points,
                 p.wave_gen_int_dwell,
                 p.wave_gen_int_time_wf,
-            )?,
-        ])
+            ),
+        ]
     }
 
-    fn wave_gen_restore(&self) -> AsynResult<Vec<(i32, i32)>> {
-        wave_gen::restore_outputs(&self.params, |r, a| self.base.get_int32_param(r, a))
+    fn wave_gen_restore(&self) -> Vec<(i32, i32)> {
+        wave_gen::restore_outputs(&self.params, |r, a| self.int(r, a))
+    }
+
+    /// C `getIntegerParam`, whose status every caller ignores: an unset
+    /// value reads as the 0 an untouched local would hold here.
+    fn int(&self, reason: usize, addr: i32) -> i32 {
+        self.base.get_int32_param(reason, addr).unwrap_or(0)
+    }
+
+    /// C `getDoubleParam`; see [`Self::int`].
+    fn float(&self, reason: usize, addr: i32) -> f64 {
+        self.base.get_float64_param(reason, addr).unwrap_or(0.0)
+    }
+
+    /// C `getUIntDigitalParam`; see [`Self::int`].
+    fn uint(&self, reason: usize, addr: i32) -> u32 {
+        self.base.get_uint32_param(reason, addr).unwrap_or(0)
     }
 
     /// A WaveGen setting write: `defineWaveform(addr)`, then
@@ -436,7 +444,7 @@ impl MultiFunctionDriver {
         if !st.wave_gen.running {
             return Ok(0);
         }
-        let restore = self.wave_gen_restore()?;
+        let restore = self.wave_gen_restore();
         let stopped = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, trace);
         Ok(stopped | self.start_wave_gen(&dev, &mut st.wave_gen, trace, updates)?)
     }
@@ -445,10 +453,7 @@ impl MultiFunctionDriver {
     /// rejects the TC settings with ERR_BAD_AI_CHAN_TYPE otherwise, so C
     /// writes them only then.
     fn is_thermocouple(&self, chan: i32) -> bool {
-        self.base
-            .get_int32_param(self.params.analog_in_type, chan)
-            .unwrap_or(0)
-            != 0
+        self.int(self.params.analog_in_type, chan) != 0
     }
 
     /// C `setOpenThermocoupleDetect`.
@@ -513,7 +518,7 @@ impl PortDriver for MultiFunctionDriver {
         let mut wave_arrays: Vec<ParamSetValue> = Vec::new();
 
         if reason == self.params.wave_dig_num_points {
-            let dwell = self.base.get_float64_param(self.params.wave_dig_dwell, 0)?;
+            let dwell = self.float(self.params.wave_dig_dwell, 0);
             wave_arrays.push(wave_dig::compute_wave_dig_times(&self.params, value, dwell));
         } else if reason == self.params.counter_reset {
             let dev = self.device.lock().unwrap();
@@ -524,10 +529,7 @@ impl PortDriver for MultiFunctionDriver {
             );
         } else if reason == self.params.analog_out_value {
             // Only write immediately if sync mode is disabled
-            let sync_enable = self
-                .base
-                .get_int32_param(self.params.analog_out_sync_enable, 0)
-                .unwrap_or(0);
+            let sync_enable = self.int(self.params.analog_out_sync_enable, 0);
             if sync_enable == 0 {
                 if self.state.lock().unwrap().wave_gen.running {
                     trace.report_error(
@@ -539,9 +541,7 @@ impl PortDriver for MultiFunctionDriver {
                     return trace::asyn_status(-1);
                 }
                 let dev = self.device.lock().unwrap();
-                let range = self
-                    .base
-                    .get_int32_param(self.params.analog_out_range, addr)?;
+                let range = self.int(self.params.analog_out_range, addr);
                 status = trace.report(
                     &dev.analog_out(addr, range, uldaq_sys::AOUT_FF_NOSCALEDATA, value as f64),
                     FUNCTION,
@@ -555,13 +555,8 @@ impl PortDriver for MultiFunctionDriver {
                 let mut values = vec![0.0f64; MAX_ANALOG_OUT];
                 let mut ranges = vec![uldaq_sys::BIP10VOLTS; MAX_ANALOG_OUT];
                 for ch in 0..MAX_ANALOG_OUT {
-                    values[ch] = self
-                        .base
-                        .get_int32_param(self.params.analog_out_value, ch as i32)?
-                        as f64;
-                    ranges[ch] = self
-                        .base
-                        .get_int32_param(self.params.analog_out_range, ch as i32)?;
+                    values[ch] = self.int(self.params.analog_out_value, ch as i32) as f64;
+                    ranges[ch] = self.int(self.params.analog_out_range, ch as i32);
                 }
                 // C `writeAnalogOutSync` does not print its status.
                 status = trace::status_of(&dev.analog_out_array(
@@ -587,17 +582,13 @@ impl PortDriver for MultiFunctionDriver {
             if value != 0 {
                 // The TC type and open-detect settings the records already
                 // hold could not be pushed while the channel read volts.
-                let tc = self
-                    .base
-                    .get_int32_param(self.params.thermocouple_type, addr)?;
+                let tc = self.int(self.params.thermocouple_type, addr);
                 status = trace.report(
                     &dev.ai_set_config(uldaq_sys::AI_CFG_CHAN_TC_TYPE, addr as u32, tc as i64),
                     FUNCTION,
                     "Set thermocouple type",
                 );
-                let detect = self
-                    .base
-                    .get_int32_param(self.params.thermocouple_open_detect, addr)?;
+                let detect = self.int(self.params.thermocouple_open_detect, addr);
                 self.set_open_tc_detect(&dev, addr, detect);
             }
         } else if reason == self.params.thermocouple_type && self.is_thermocouple(addr) {
@@ -617,19 +608,16 @@ impl PortDriver for MultiFunctionDriver {
             // stop only when running. The busy record echoes the driver's own
             // value back, so an unguarded start would hit ERR_ALREADY_ACTIVE.
             if value != 0 && !st.wave_dig.running {
-                let scan = WaveDigScan::read(
-                    &self.params,
-                    |r, a| self.base.get_int32_param(r, a),
-                    |r, a| self.base.get_float64_param(r, a),
-                )?;
+                let scan =
+                    WaveDigScan::read(&self.params, |r, a| self.int(r, a), |r, a| self.float(r, a));
                 (status, wave_arrays) =
                     wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace);
             } else if value == 0 && st.wave_dig.running {
                 let restart = WaveDigScan::read_restart(
                     &self.params,
-                    |r, a| self.base.get_int32_param(r, a),
-                    |r, a| self.base.get_float64_param(r, a),
-                )?;
+                    |r, a| self.int(r, a),
+                    |r, a| self.float(r, a),
+                );
                 wave_arrays = wave_dig::stop_wave_dig(
                     &dev,
                     &mut st.wave_dig,
@@ -652,7 +640,7 @@ impl PortDriver for MultiFunctionDriver {
             if value != 0 && !st.wave_gen.running {
                 status = self.start_wave_gen(&dev, &mut st.wave_gen, &trace, &mut wave_arrays)?;
             } else if value == 0 && st.wave_gen.running {
-                let restore = self.wave_gen_restore()?;
+                let restore = self.wave_gen_restore();
                 status = wave_gen::stop_wave_gen(&dev, &mut st.wave_gen, &restore, &trace);
             }
         } else if self.wave_gen_settings().contains(&reason) {
@@ -661,7 +649,7 @@ impl PortDriver for MultiFunctionDriver {
         if reason == self.params.wave_gen_user_num_points
             || reason == self.params.wave_gen_int_num_points
         {
-            wave_arrays.extend(self.compute_wave_gen_times()?);
+            wave_arrays.extend(self.compute_wave_gen_times());
         }
 
         self.finish_write(user, value, status, wave_arrays)
@@ -674,9 +662,7 @@ impl PortDriver for MultiFunctionDriver {
 
         // Frequency change → update dwell
         if reason == self.params.wave_gen_freq && value > 0.0 {
-            let num_points =
-                self.base
-                    .get_int32_param(self.params.wave_gen_num_points, 0)? as f64;
+            let num_points = self.int(self.params.wave_gen_num_points, 0) as f64;
             let dwell = 1.0 / (value * num_points);
             self.base
                 .set_float64_param(self.params.wave_gen_dwell, 0, dwell)?;
@@ -689,14 +675,12 @@ impl PortDriver for MultiFunctionDriver {
                 self.wave_gen_setting_changed(device_addr(addr), &self.trace(), &mut updates)?;
             self.apply_updates(updates)?;
         } else if reason == self.params.wave_dig_dwell {
-            let num_points = self
-                .base
-                .get_int32_param(self.params.wave_dig_num_points, 0)?;
+            let num_points = self.int(self.params.wave_dig_num_points, 0);
             let times = wave_dig::compute_wave_dig_times(&self.params, num_points, value);
             self.apply_updates(vec![times])?;
         }
         if reason == self.params.wave_gen_user_dwell || reason == self.params.wave_gen_int_dwell {
-            let times = self.compute_wave_gen_times()?;
+            let times = self.compute_wave_gen_times();
             self.apply_updates(times.into())?;
         }
 
@@ -746,25 +730,21 @@ impl PortDriver for MultiFunctionDriver {
             return error(format_args!("addr={addr} max={}", MAX_ANALOG_OUT - 1));
         }
         let reason = user.reason;
-        let mut num_points = self.base.get_int32_param(p.wave_gen_num_points, 0)?;
-        let time_axis = |points, dwell| -> AsynResult<Vec<f32>> {
-            Ok(wave_dig::time_axis(
-                self.base.get_int32_param(points, 0)?,
-                self.base.get_float64_param(dwell, 0)?,
-            ))
-        };
+        let mut num_points = self.int(p.wave_gen_num_points, 0);
+        let time_axis =
+            |points, dwell| wave_dig::time_axis(self.int(points, 0), self.float(dwell, 0));
         let st = self.state.lock().unwrap();
         let data: std::borrow::Cow<'_, [f32]> = if reason == p.wave_gen_user_wf {
             st.wave_gen.user_waveforms[addr as usize].as_slice().into()
         } else if reason == p.wave_gen_int_wf {
             st.wave_gen.int_waveforms[addr as usize].as_slice().into()
         } else if reason == p.wave_gen_user_time_wf {
-            time_axis(p.wave_gen_user_num_points, p.wave_gen_user_dwell)?.into()
+            time_axis(p.wave_gen_user_num_points, p.wave_gen_user_dwell).into()
         } else if reason == p.wave_gen_int_time_wf {
-            time_axis(p.wave_gen_int_num_points, p.wave_gen_int_dwell)?.into()
+            time_axis(p.wave_gen_int_num_points, p.wave_gen_int_dwell).into()
         } else if reason == p.wave_dig_time_wf {
-            num_points = self.base.get_int32_param(p.wave_dig_num_points, 0)?;
-            time_axis(p.wave_dig_num_points, p.wave_dig_dwell)?.into()
+            num_points = self.int(p.wave_dig_num_points, 0);
+            time_axis(p.wave_dig_num_points, p.wave_dig_dwell).into()
         } else {
             return error(format_args!("unknown function={reason}"));
         };
@@ -825,9 +805,7 @@ impl PortDriver for MultiFunctionDriver {
         let mut direction = 0;
 
         if reason == self.params.digital_output {
-            direction = self
-                .base
-                .get_uint32_param(self.params.digital_direction, 0)?;
+            direction = self.uint(self.params.digital_direction, 0);
             let dev = self.device.lock().unwrap();
             let io_mask = (1u32 << NUM_IO_BITS) - 1;
             if mask & direction == io_mask {

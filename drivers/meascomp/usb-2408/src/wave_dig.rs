@@ -1,6 +1,5 @@
 use std::time::SystemTime;
 
-use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
@@ -69,41 +68,38 @@ impl WaveDigScan {
     /// store the caller is: the port actor directly, the poller by request.
     pub fn read(
         params: &MultiFunctionParams,
-        int: impl Fn(usize, i32) -> AsynResult<i32>,
-        float: impl Fn(usize, i32) -> AsynResult<f64>,
-    ) -> AsynResult<Self> {
-        let first_chan = int(params.wave_dig_first_chan, 0)?.max(0) as usize;
-        let num_chans = int(params.wave_dig_num_chans, 0)?.max(0) as usize;
+        int: impl Fn(usize, i32) -> i32,
+        float: impl Fn(usize, i32) -> f64,
+    ) -> Self {
+        let first_chan = int(params.wave_dig_first_chan, 0).max(0) as usize;
+        let num_chans = int(params.wave_dig_num_chans, 0).max(0) as usize;
         let ranges = (first_chan..first_chan + num_chans)
             .map(|chan| int(params.analog_in_range, chan as i32))
-            .collect::<AsynResult<Vec<_>>>()?;
-        Ok(Self {
+            .collect();
+        Self {
             first_chan,
             num_chans,
             // C hands a non-positive count to ulAInScan, which refuses it.
-            num_points: int(params.wave_dig_num_points, 0)?.max(0) as usize,
-            dwell: float(params.wave_dig_dwell, 0)?,
-            input_mode: int(params.analog_in_mode, 0)?,
+            num_points: int(params.wave_dig_num_points, 0).max(0) as usize,
+            dwell: float(params.wave_dig_dwell, 0),
+            input_mode: int(params.analog_in_mode, 0),
             ranges,
-            ext_trigger: int(params.wave_dig_ext_trigger, 0)? != 0,
-            ext_clock: int(params.wave_dig_ext_clock, 0)? != 0,
-            continuous: int(params.wave_dig_continuous, 0)? != 0,
-            retrigger: int(params.wave_dig_retrigger, 0)? != 0,
-            burst_mode: int(params.wave_dig_burst_mode, 0)? != 0,
-        })
+            ext_trigger: int(params.wave_dig_ext_trigger, 0) != 0,
+            ext_clock: int(params.wave_dig_ext_clock, 0) != 0,
+            continuous: int(params.wave_dig_continuous, 0) != 0,
+            retrigger: int(params.wave_dig_retrigger, 0) != 0,
+            burst_mode: int(params.wave_dig_burst_mode, 0) != 0,
+        }
     }
 
     /// What `stopWaveDig` restarts with: the current settings, read when the
     /// scan ends, if WAVEDIG_AUTO_RESTART is set.
     pub fn read_restart(
         params: &MultiFunctionParams,
-        int: impl Fn(usize, i32) -> AsynResult<i32>,
-        float: impl Fn(usize, i32) -> AsynResult<f64>,
-    ) -> AsynResult<Option<Self>> {
-        if int(params.wave_dig_auto_restart, 0)? == 0 {
-            return Ok(None);
-        }
-        Self::read(params, int, float).map(Some)
+        int: impl Fn(usize, i32) -> i32,
+        float: impl Fn(usize, i32) -> f64,
+    ) -> Option<Self> {
+        (int(params.wave_dig_auto_restart, 0) != 0).then(|| Self::read(params, int, float))
     }
 }
 
