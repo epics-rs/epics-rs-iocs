@@ -4724,7 +4724,6 @@ version = "0.1.0"
 dependencies = [
  "asyn-rs",
  "epics-rs",
- "log",
  "parking_lot",
 ]
 

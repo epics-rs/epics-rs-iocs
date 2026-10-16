@@ -50,8 +50,8 @@
 //!   caller treats it as a length. [`AdsType::element_size`] returns `None`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -62,16 +62,20 @@ use asyn_rs::interfaces::InterfaceType;
 use asyn_rs::interrupt::{InterruptManager, InterruptValue};
 use asyn_rs::param::{ParamType, ParamValue};
 use asyn_rs::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
+use asyn_rs::port_handle::PortHandle;
 use asyn_rs::runtime::config::RuntimeConfig;
 use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 
 use epics_rs::base::server::recgbl::alarm_status;
 
-use crate::ads::defs::{ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, LOCAL_PORT_BASE};
+use crate::ads::defs::{
+    ADSIGRP_MEMORY_BYTE, ADSIGRP_SYM_VALBYHND, LOCAL_PORT_BASE, error_to_string,
+};
 use crate::ads::sumup::{self, SumEntry};
 use crate::ads::{AdsClient, AdsError, AdsState, AdsType, AmsAddr, AmsNetId, NotificationSample};
-use crate::convert::{self, WriteValue};
+use crate::convert::{self, ConvertError, WriteValue};
 use crate::drvinfo::{DataSource, DrvInfo, DrvInfoDefaults, PlcAddress, TimeBase};
 use crate::octet::{self, Command, OctetError};
 use crate::time::{filetime_from_dwords, windows_to_system_time};
@@ -255,9 +259,20 @@ pub struct AdsShared {
     running: AtomicBool,
     /// Wall time of the last completed bulk cycle, for `adsPollInfo`.
     bulk_elapsed: Mutex<Duration>,
+    /// The port's own trace (C `pasynUserSelf`), bound once its runtime
+    /// exists.
+    trace: OnceLock<PortHandle>,
 }
 
 impl AdsShared {
+    /// C `asynPrint(pasynUserSelf, ...)`.
+    fn print(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
+        if let Some(port) = self.trace.get() {
+            port.trace()
+                .print(Some(port.port_name()), None, 0, mask, args);
+        }
+    }
+
     fn client(&self) -> Result<Arc<AdsClient>, AdsError> {
         self.client.lock().clone().ok_or(AdsError::NotConnected)
     }
@@ -292,12 +307,14 @@ impl AdsShared {
     /// `plc_time_raw` is the sample's PLC timestamp in FILETIME ticks; `0` means
     /// "the PLC did not stamp this one", which sends the parameter to the IOC
     /// clock exactly as C `refreshParamTime` does (adsAsynPortDriver.cpp:4176).
-    fn publish(&self, reason: usize, data: &[u8], plc_time_raw: u64) {
+    ///
+    /// `false` when `reason` names no parameter (C `getAdsParamInfo` failing),
+    /// which the caller reports.
+    fn publish(&self, reason: usize, data: &[u8], plc_time_raw: u64) -> bool {
         let fire = {
             let mut params = self.params.lock();
             let Some(p) = params.get_mut(reason).and_then(Option::as_mut) else {
-                log::error!("ADS: sample for unknown parameter {reason}");
-                return;
+                return false;
             };
 
             let decoded = if p.is_array {
@@ -317,7 +334,17 @@ impl AdsShared {
                     p.alarm = (alarm_status::NO_ALARM, NO_ALARM_SEV);
                 }
                 Err(e) => {
-                    log::error!("ADS: {}: {e}", p.info.raw);
+                    // C reads past a short sample without a word.
+                    if let ConvertError::Unsupported { plc, asyn } = e {
+                        self.print(
+                            TraceMask::ERROR,
+                            format_args!(
+                                "{DRIVER_NAME}:adsUpdateParameter: Type combination not supported. PLC type = {}, ASYN type= {}",
+                                plc.as_str(),
+                                asyn_type_to_string(asyn)
+                            ),
+                        );
+                    }
                     p.alarm = (alarm_status::READ_ALARM, INVALID_ALARM);
                     p.timestamp = SystemTime::now();
                 }
@@ -327,6 +354,7 @@ impl AdsShared {
         if let Some(iv) = fire {
             self.interrupts.notify(iv);
         }
+        true
     }
 
     /// Raise an alarm on one parameter without a new value (C `setAlarmParam`).
@@ -392,10 +420,9 @@ impl AdsShared {
             })
             .collect();
 
+        // refresh_param prints C's line for whatever failed.
         for reason in pending {
-            if let Err(e) = self.refresh_param(reason) {
-                log::warn!("ADS: refresh of parameter {reason} failed: {e}");
-            }
+            let _ = self.refresh_param(reason);
         }
     }
 
@@ -422,23 +449,36 @@ impl AdsShared {
         // Symbolic: the PLC tells us the type and size; `.ADR.` carries both.
         let mut handle = None;
         if let Some(name) = &symbol {
-            let entry = client.get_symbol_info(ams_port, name)?;
+            let entry = client.get_symbol_info(ams_port, name).inspect_err(|e| {
+                self.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:adsGetSymInfoByName: Get symbolic information failed for {name} with: {}",
+                        CStatus(e)
+                    ),
+                )
+            })?;
             plc_type = entry.data_type;
             plc_size = entry.size;
 
             // Give the old handle back before asking for a new one, or the PLC
-            // leaks one per refresh (C `adsReleaseSymbolicHandle`, :1279). C
-            // zeroes the handle *before* the message that reports the failure to
-            // release it (:3800-3806), so its log always reads `0xffffffff`.
+            // leaks one per refresh (C `adsReleaseSymbolicHandle`, :1279, with
+            // its error message blocked).
             let stale = self.params.lock()[reason]
                 .as_mut()
                 .and_then(|p| p.handle.take());
-            if let Some(stale) = stale
-                && let Err(e) = client.release_symbol_handle(ams_port, stale)
-            {
-                log::debug!("ADS: releasing handle 0x{stale:x} of '{name}' failed: {e}");
+            if let Some(stale) = stale {
+                let _ = client.release_symbol_handle(ams_port, stale);
             }
-            handle = Some(client.get_symbol_handle(ams_port, name)?);
+            handle = Some(client.get_symbol_handle(ams_port, name).inspect_err(|e| {
+                self.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:adsGetSymHandleByName: Create handle for {name} failed with: {}",
+                        CStatus(e)
+                    ),
+                )
+            })?);
         }
 
         // C `updateParamInfoWithPLCInfo` (:1224-1246): a variable is an array
@@ -481,7 +521,11 @@ impl AdsShared {
                 let (g, o) = p.wire_address().ok_or(AdsError::NotConnected)?;
                 (g, o, p.plc_size)
             };
-            let data = client.read(ams_port, group, offset, size)?;
+            // C `updateParamInfoWithPLCInfo` tries the first read twice.
+            let data = match self.read_param(&client, ams_port, group, offset, size) {
+                Ok(data) => data,
+                Err(_) => self.read_param(&client, ams_port, group, offset, size)?,
+            };
             self.publish(reason, &data, 0);
         }
 
@@ -489,6 +533,38 @@ impl AdsShared {
             p.refresh_needed = false;
         }
         Ok(())
+    }
+
+    /// The read of C `adsReadParam`, with its error lines.
+    fn read_param(
+        &self,
+        client: &AdsClient,
+        ams_port: u16,
+        group: u32,
+        offset: u32,
+        size: u32,
+    ) -> Result<Vec<u8>, AdsError> {
+        client
+            .read(ams_port, group, offset, size)
+            .inspect_err(|e| match e {
+                AdsError::ShortRead { need, got } => self.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:adsReadParam: Read bytes differ from parameter plc size ({got} vs {need})."
+                    ),
+                ),
+                AdsError::Ads(code) => self.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:adsReadParam: AdsSyncReadReqEx2 failed: {} ({code}).",
+                        error_to_string(*code)
+                    ),
+                ),
+                other => self.print(
+                    TraceMask::ERROR,
+                    format_args!("{DRIVER_NAME}:adsReadParam: AdsSyncReadReqEx2 failed: {other}."),
+                ),
+            })
     }
 
     fn add_notification(&self, reason: usize) -> Result<(), AdsError> {
@@ -506,7 +582,17 @@ impl AdsShared {
                 Duration::from_secs_f64(p.info.max_delay_time_ms / 1000.0),
             )
         };
-        let handle = client.add_notification(ams_port, group, offset, size, cycle, delay)?;
+        let handle = client
+            .add_notification(ams_port, group, offset, size, cycle, delay)
+            .inspect_err(|e| {
+                self.print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{DRIVER_NAME}:adsAddDataCallback: Add device notification failed with: {}",
+                        CStatus(e)
+                    ),
+                )
+            })?;
         self.notifications.lock().insert(handle, reason);
         let mut params = self.params.lock();
         let p = param_mut(&mut params, reason)?;
@@ -530,10 +616,9 @@ impl AdsShared {
             (p.info.ams_port, handle)
         };
         self.notifications.lock().remove(&handle);
-        if let Ok(client) = self.client()
-            && let Err(e) = client.del_notification(ams_port, handle)
-        {
-            log::debug!("ADS: cancelling notification 0x{handle:x} failed: {e}");
+        // C `adsDelDataCallback` with its error message blocked.
+        if let Ok(client) = self.client() {
+            let _ = client.del_notification(ams_port, handle);
         }
     }
 
@@ -630,10 +715,6 @@ impl AdsShared {
                 },
             ],
             None => {
-                log::info!(
-                    "ADS: AMS port {ams_port} has no {TS_SYMBOL_HI}/{TS_SYMBOL_LO}; \
-                     bulk-read samples will carry the IOC timestamp"
-                );
                 [SumEntry {
                     index_group: ADSIGRP_MEMORY_BYTE,
                     index_offset: 0,
@@ -656,23 +737,23 @@ impl AdsShared {
             .map(|g| (g.ams_port, g.entries.clone(), g.reasons.clone()))
             .collect();
 
-        for (ams_port, entries, reasons) in groups {
+        for (i, (ams_port, entries, reasons)) in groups.into_iter().enumerate() {
             if entries.len() <= 2 {
                 continue; // clock only
             }
             let resp = match client.sum_up_read(ams_port, &entries) {
                 Ok(r) => r,
                 Err(e) => {
-                    log::warn!("ADS: sum-up read on AMS port {ams_port} failed: {e}");
+                    // C `printf`, not asynPrint.
+                    match e.code() {
+                        Some(code) => println!("Sum read {i} failed: status {code}"),
+                        None => println!("Sum read {i} failed: status {e}"),
+                    }
                     continue;
                 }
             };
-            let (results, _layout) = match sumup::decode_response(&resp, &entries) {
-                Ok(r) => r,
-                Err(e) => {
-                    log::warn!("ADS: sum-up response on AMS port {ams_port} is malformed: {e}");
-                    continue;
-                }
+            let Ok((results, _layout)) = sumup::decode_response(&resp, &entries) else {
+                continue;
             };
 
             // Slots 0/1 are the PLC clock, high dword then low. Either failing
@@ -690,10 +771,29 @@ impl AdsShared {
                 let Some(reason) = reasons[slot] else {
                     continue;
                 };
+                let drv_info = self.params.lock()[reason]
+                    .as_ref()
+                    .map(|p| p.info.raw.clone());
+                let Some(drv_info) = drv_info else {
+                    self.print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "{DRIVER_NAME}:bulkReadThread: getAdsParamInfo() for hUser {reason} failed"
+                        ),
+                    );
+                    continue;
+                };
                 match result {
-                    Ok(data) => self.publish(reason, data, plc_time),
-                    Err(e) => {
-                        log::warn!("ADS: bulk read of parameter {reason} failed: {e}");
+                    Ok(data) => {
+                        self.publish(reason, data, plc_time);
+                    }
+                    Err(_) => {
+                        self.print(
+                            TraceMask::ERROR,
+                            format_args!(
+                                "{DRIVER_NAME}:bulkReadThread: bulk read for {drv_info} ({slot}) failed"
+                            ),
+                        );
                         self.alarm(reason, alarm_status::READ_ALARM, INVALID_ALARM);
                     }
                 }
@@ -703,12 +803,19 @@ impl AdsShared {
 
     /// One sample pushed by the PLC (C `adsDataCallback`, :157).
     fn on_notification(&self, sample: NotificationSample) {
+        // A cancel and a sample in flight cross. C keys the sample by hUser,
+        // which outlives the cancel, so it has no line for this.
         let Some(&reason) = self.notifications.lock().get(&sample.handle) else {
-            // A cancel and a sample in flight cross; C logs and drops it too.
-            log::debug!("ADS: notification for unknown handle 0x{:x}", sample.handle);
             return;
         };
-        self.publish(reason, &sample.data, sample.timestamp);
+        if !self.publish(reason, &sample.data, sample.timestamp) {
+            self.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:adsDataCallback: getAdsParamInfo() for hUser {reason} failed"
+                ),
+            );
+        }
     }
 }
 
@@ -775,6 +882,45 @@ fn param_type_for(iface: InterfaceType) -> Option<ParamType> {
     })
 }
 
+/// C `driverName`.
+const DRIVER_NAME: &str = "adsAsynPortDriver";
+
+/// C `ASYN_TRACE_INFO` (adsAsynPortDriverUtils.h:55), a bit asyn itself
+/// does not define.
+const TRACE_INFO: TraceMask = TraceMask::from_bits_retain(0x0040);
+
+/// C's `"%s (0x%lx)", adsErrorToString(status), status`. An error that is
+/// not an ADS status prints as itself: what AdsLib reports for it is not
+/// known here.
+struct CStatus<'a>(&'a AdsError);
+
+impl std::fmt::Display for CStatus<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            AdsError::Ads(code) => write!(f, "{} (0x{code:x})", error_to_string(*code)),
+            other => write!(f, "{other}"),
+        }
+    }
+}
+
+/// C `asynTypeToString` (adsAsynPortDriverUtils.cpp:270).
+fn asyn_type_to_string(t: ParamType) -> &'static str {
+    match t {
+        ParamType::Int32 => "asynParamInt32",
+        ParamType::Int64 => "asynParamInt64",
+        ParamType::Float64 => "asynParamFloat64",
+        ParamType::UInt32Digital => "asynParamUInt32Digital",
+        ParamType::Octet => "asynParamOctet",
+        ParamType::Int8Array => "asynParamInt8Array",
+        ParamType::Int16Array => "asynParamInt16Array",
+        ParamType::Int32Array => "asynParamInt32Array",
+        ParamType::Float32Array => "asynParamFloat32Array",
+        ParamType::Float64Array => "asynParamFloat64Array",
+        ParamType::GenericPointer => "asynParamGenericPointer",
+        _ => "asynUnknownType",
+    }
+}
+
 fn asyn_err(msg: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
@@ -817,6 +963,7 @@ impl AdsPortDriver {
             octet_buffer: Mutex::new(String::new()),
             running: AtomicBool::new(true),
             bulk_elapsed: Mutex::new(Duration::ZERO),
+            trace: OnceLock::new(),
             cfg,
         });
         shared.ensure_ams_port(shared.cfg.ams_port);
@@ -1154,10 +1301,9 @@ impl PortDriver for AdsPortDriver {
 
         // Resolve it against the PLC now if we can; the supervisor picks up
         // whatever is still `refresh_needed` when the link comes up.
-        if self.shared.is_connected()
-            && let Err(e) = self.shared.refresh_param(reason)
-        {
-            log::warn!("ADS: '{}' not resolved yet: {e}", req.drv_info);
+        // refresh_param prints C's line for whatever failed.
+        if self.shared.is_connected() {
+            let _ = self.shared.refresh_param(reason);
         }
 
         Ok(DrvUserInfo::from_reason(reason))
@@ -1475,11 +1621,15 @@ pub fn create_ads_port(cfg: AdsConfig) -> AsynResult<AdsRuntime> {
     let shared = driver.shared();
 
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let _ = shared.trace.set(runtime_handle.port_handle().clone());
 
-    if let Err(e) = connect(&shared) {
-        log::warn!(
-            "ADS: first connection to {} failed ({e}); the supervisor will retry",
-            shared.cfg.ip_addr
+    if connect(&shared).is_err() {
+        shared.print(
+            TraceMask::ERROR,
+            format_args!(
+                "{DRIVER_NAME}:{DRIVER_NAME}: connect failed for port {}.",
+                shared.cfg.port_name
+            ),
         );
     }
 
@@ -1515,7 +1665,8 @@ fn connect(shared: &Arc<AdsShared>) -> Result<(), AdsError> {
             shared.on_notification(sample);
         }
     });
-    let on_disconnect = Arc::new(|| log::warn!("ADS: the PLC closed the connection"));
+    // C has no hook here; cyclicThread reports the lost connection.
+    let on_disconnect = Arc::new(|| {});
 
     let local = AmsAddr {
         // Zero = derive it from our own IP, as Beckhoff's router does when
@@ -1532,12 +1683,6 @@ fn connect(shared: &Arc<AdsShared>) -> Result<(), AdsError> {
         on_notification,
         on_disconnect,
     )?;
-    log::info!(
-        "ADS: connected to {} ({}) as {}",
-        shared.cfg.ip_addr,
-        shared.cfg.remote_net_id,
-        client.local_addr().net_id
-    );
     *shared.client.lock() = Some(Arc::new(client));
     Ok(())
 }
@@ -1568,73 +1713,100 @@ fn disconnect(shared: &Arc<AdsShared>) {
 /// IOC — and every other device on it — down with one PLC reboot. This
 /// reconnects instead.
 fn cyclic_thread(shared: &Arc<AdsShared>) {
+    // C `oneAmsConnectionOKold_`.
+    let mut one_ok_old = false;
     while shared.running.load(Ordering::SeqCst) {
         thread::sleep(CYCLIC_PERIOD);
         if !shared.running.load(Ordering::SeqCst) {
             break;
         }
-
-        if !shared.is_connected() {
-            disconnect(shared);
-            if !shared.cfg.auto_connect {
-                continue;
-            }
-            if let Err(e) = connect(shared) {
-                log::debug!("ADS: reconnect to {} failed: {e}", shared.cfg.ip_addr);
-                continue;
-            }
+        let one_ok = cyclic_pass(shared);
+        if !one_ok && shared.cfg.auto_connect && one_ok_old {
+            shared.print(
+                TraceMask::ERROR,
+                format_args!("{DRIVER_NAME}:cyclicThread: No connection! Try to reconnect..."),
+            );
         }
+        one_ok_old = one_ok;
+    }
+}
 
-        let Ok(client) = shared.client() else {
-            continue;
-        };
-        let ams_ports: Vec<u16> = shared.ports.lock().iter().map(|p| p.ams_port).collect();
-        let mut any_connected = false;
-
-        for ams_port in ams_ports {
-            let (state, connected) = match client.read_state(ams_port) {
-                Ok((state, _device)) => (state, state == AdsState::Run),
-                Err(e) => {
-                    log::debug!("ADS: read state of AMS port {ams_port} failed: {e}");
-                    (AdsState::Invalid, false)
-                }
-            };
-            any_connected |= connected;
-
-            let (was_connected, state_changed, state_param) = {
-                let mut ports = shared.ports.lock();
-                let Some(port) = ports.iter_mut().find(|p| p.ams_port == ams_port) else {
-                    continue;
-                };
-                let was = port.connected;
-                let changed = port.state != state;
-                port.connected = connected;
-                port.state = state;
-                (was, changed, port.state_param)
-            };
-
-            // `.AMSPORTSTATE.` records see the runtime's state, whatever it is.
-            if state_changed {
-                if let Some(reason) = state_param {
-                    shared.publish(reason, &(state as u16).to_le_bytes(), 0);
-                }
-                log::info!("ADS: AMS port {ams_port} is now {}", state.as_str());
-            }
-
-            if was_connected && !connected {
-                shared.invalidate_ams_port(ams_port);
-            }
-            if connected {
-                shared.refresh_ams_port(ams_port);
-            }
-        }
-
-        // Not one runtime answered: the socket is up but the PLC behind it is
-        // not talking. Drop it so the next pass reconnects from scratch.
-        if !any_connected {
-            disconnect(shared);
+/// One supervision pass; whether any AMS port is in RUN (C
+/// `oneAmsConnectionOK`).
+fn cyclic_pass(shared: &Arc<AdsShared>) -> bool {
+    const FUNCTION: &str = "cyclicThread";
+    if !shared.is_connected() {
+        disconnect(shared);
+        // C reports a failed reconnect only through the AdsLib calls of
+        // `connect()`, which have no counterpart here.
+        if !shared.cfg.auto_connect || connect(shared).is_err() {
+            return false;
         }
     }
+
+    let Ok(client) = shared.client() else {
+        return false;
+    };
+    let ams_ports: Vec<u16> = shared.ports.lock().iter().map(|p| p.ams_port).collect();
+    let mut any_connected = false;
+
+    for ams_port in ams_ports {
+        // C reads the state with its error message blocked.
+        let (state, connected) = match client.read_state(ams_port) {
+            Ok((state, _device)) => (state, state == AdsState::Run),
+            Err(_) => (AdsState::Invalid, false),
+        };
+        any_connected |= connected;
+
+        let (was_connected, old_state, state_param) = {
+            let mut ports = shared.ports.lock();
+            let Some(port) = ports.iter_mut().find(|p| p.ams_port == ams_port) else {
+                continue;
+            };
+            let was = port.connected;
+            let old = port.state;
+            port.connected = connected;
+            port.state = state;
+            (was, old, port.state_param)
+        };
+
+        if was_connected && !connected {
+            shared.invalidate_ams_port(ams_port);
+            // C then `exit(-1)`s; this reconnects instead.
+            shared.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}: connection failed for port {}.",
+                    shared.cfg.port_name
+                ),
+            );
+        }
+        if connected {
+            shared.refresh_ams_port(ams_port);
+        }
+
+        // `.AMSPORTSTATE.` records see the runtime's state, whatever it is.
+        if old_state != state {
+            if let Some(reason) = state_param {
+                shared.publish(reason, &(state as u16).to_le_bytes(), 0);
+            }
+            shared.print(
+                TRACE_INFO,
+                format_args!(
+                    "{DRIVER_NAME}:{FUNCTION}: Ams-port, {ams_port}, state change: \"{}\" -> \"{}\".",
+                    old_state.as_str(),
+                    state.as_str()
+                ),
+            );
+        }
+    }
+
+    // Not one runtime answered: the socket is up but the PLC behind it is
+    // not talking. Drop it so the next pass reconnects from scratch.
+    if !any_connected {
+        disconnect(shared);
+    }
+    any_connected
 }
 
 /// Poll every sum-up group (C `bulkReadThread`, :617).
