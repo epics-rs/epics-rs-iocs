@@ -263,7 +263,6 @@ impl AsynMotor for C300Axis {
             velocity: 0.0,
             done,
             moving: !done,
-            direction: true,
             has_encoder: self.has_encoder,
             gain_support: self.has_encoder,
             ..MotorStatus::default()
