@@ -704,17 +704,24 @@ impl Actor {
             }
         }
 
-        let srangeao_payload = self.expect_ascii(&cmd_srangeao_query())?;
-        let ao_lines = parse_srangeao(&srangeao_payload);
-        let srangedo_payload = self.expect_ascii(&cmd_srangedo_query())?;
-        let do_lines = parse_srangedo(&srangedo_payload);
-        {
+        for (query, parse) in [
+            (cmd_srangeao_query(), parse_srangeao as fn(&[u8]) -> _),
+            (cmd_srangedo_query(), parse_srangedo),
+        ] {
+            let payload = self.expect_ascii(&query)?;
+            let parsed = parse(&payload);
             let mut cache = self.cache.lock();
-            for line in ao_lines.iter().chain(do_lines.iter()) {
+            for line in parsed.as_ref().unwrap_or_else(|lines| lines) {
                 if !cache.modules[line.index / 100].use_flag {
                     continue;
                 }
                 cache.meas_info[line.index].ch_mode = line.mode;
+            }
+            if parsed.is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SRange line is not a signal channel",
+                ));
             }
         }
 
@@ -1408,5 +1415,22 @@ mod tests {
         instrument.submit(Command::ClearError);
         assert!(instrument.get_error_flag());
         device.join().unwrap();
+    }
+
+    #[test]
+    fn srange_abort_keeps_earlier_lines_and_skips_the_info_scan() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(ascii_frame(b"E"));
+        responses.push(ascii_frame(b"xxxxxxxxx00001T\nxxxxxxxxxA0002M\nE"));
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        let mut info = instrument.register_interrupt(InterruptCategory::Info);
+        instrument.submit(Command::ReadAllInfos);
+        assert_eq!(instrument.cache().meas_info[0].ch_mode, CH_MODE_DAC_RETRANS);
+        assert!(info.try_recv().is_err());
+        let received = device.join().unwrap();
+        assert_eq!(received.last().unwrap(), "SRangeAO?\r\n");
     }
 }

@@ -504,14 +504,22 @@ pub const CH_MODE_RELAY_FAIL: i32 = 2;
 /// Same module-`use_flag` caveat as [`parse_fchinfo`] applies here
 /// (`drvGM10.c:789-793`/`:835-839`) — this parser returns every candidate
 /// line; the caller gates storage on `Cache::modules[index / 100].use_flag`.
-fn parse_range_lines(payload: &[u8], mode_of: impl Fn(u8) -> i32) -> Vec<ChannelModeLine> {
+/// `Err` carries the lines before a non-`'0'` family byte, where C applied
+/// them and then aborted `load_infos` with `return 1`.
+fn parse_range_lines(
+    payload: &[u8],
+    mode_of: impl Fn(u8) -> i32,
+) -> Result<Vec<ChannelModeLine>, Vec<ChannelModeLine>> {
     let mut out = Vec::new();
     let mut p = 0usize;
     while p < payload.len() && payload[p] != b'E' {
         // `ptr += 9; if (*(ptr++) != '0') return 1;` (`drvGM10.c:784-785`).
         p += 9;
-        if p >= payload.len() || payload[p] != b'0' {
+        if p >= payload.len() {
             break;
+        }
+        if payload[p] != b'0' {
+            return Err(out);
         }
         p += 1;
         let digits_end = scan_digits(payload, p);
@@ -531,10 +539,10 @@ fn parse_range_lines(payload: &[u8], mode_of: impl Fn(u8) -> i32) -> Vec<Channel
         };
         p = nl + 1;
     }
-    out
+    Ok(out)
 }
 
-pub fn parse_srangeao(payload: &[u8]) -> Vec<ChannelModeLine> {
+pub fn parse_srangeao(payload: &[u8]) -> Result<Vec<ChannelModeLine>, Vec<ChannelModeLine>> {
     parse_range_lines(payload, |c| match c {
         b'S' => CH_MODE_DAC_SKIP,
         b'M' => CH_MODE_DAC_MANUAL,
@@ -543,7 +551,7 @@ pub fn parse_srangeao(payload: &[u8]) -> Vec<ChannelModeLine> {
     })
 }
 
-pub fn parse_srangedo(payload: &[u8]) -> Vec<ChannelModeLine> {
+pub fn parse_srangedo(payload: &[u8]) -> Result<Vec<ChannelModeLine>, Vec<ChannelModeLine>> {
     parse_range_lines(payload, |c| match c {
         b'A' => CH_MODE_RELAY_ALARM,
         b'M' => CH_MODE_RELAY_MANUAL,
@@ -896,16 +904,24 @@ mod tests {
         // address, then the mode char directly (no delimiter byte, per
         // the fixed `ptr += 4` in `drvGM10.c:794`).
         let payload = b"xxxxxxxxx00001T\nE";
-        let lines = parse_srangeao(payload);
+        let lines = parse_srangeao(payload).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].index, 0);
         assert_eq!(lines[0].mode, CH_MODE_DAC_RETRANS);
     }
 
     #[test]
+    fn srange_non_zero_family_byte_aborts_after_earlier_lines() {
+        let payload = b"xxxxxxxxx00001T\nxxxxxxxxxA0002M\nxxxxxxxxx00003M\nE";
+        let lines = parse_srangeao(payload).unwrap_err();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].index, 0);
+    }
+
+    #[test]
     fn srangedo_decodes_relay_modes() {
         let payload = b"xxxxxxxxx00003M\nE";
-        let lines = parse_srangedo(payload);
+        let lines = parse_srangedo(payload).unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].index, 2);
         assert_eq!(lines[0].mode, CH_MODE_RELAY_MANUAL);
