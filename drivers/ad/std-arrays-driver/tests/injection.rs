@@ -31,6 +31,11 @@ async fn a_waveform_write_is_published_as_an_ndarray() {
     rt.connect_downstream(sender);
 
     // Configure a 1-D Float64 array of length 8, non-append, OnUpdate.
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    handle
+        .write_int32(params.base.array_callbacks, 0, 1)
+        .await
+        .unwrap();
     handle
         .write_int32(params.base.data_type, 0, NDDataType::Float64 as u8 as i32)
         .await
@@ -88,6 +93,11 @@ async fn append_mode_publishes_a_growing_array_on_each_write() {
     let (sender, mut receiver) = ndarray_channel("SINK", 8);
     rt.connect_downstream(sender);
 
+    // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+    handle
+        .write_int32(params.base.array_callbacks, 0, 1)
+        .await
+        .unwrap();
     handle
         .write_int32(params.base.data_type, 0, NDDataType::Float64 as u8 as i32)
         .await

@@ -599,7 +599,11 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let (publish_tx, publish_rx) = rt::command_channel::<Arc<NDArray>>(PUBLISH_QUEUE);
-            let det = NdStdArraysDriver::new("NDSATEST", 0, publish_tx).unwrap();
+            let mut det = NdStdArraysDriver::new("NDSATEST", 0, publish_tx).unwrap();
+            // The ArrayCallbacks record's PINI; the driver leaves it undefined.
+            det.port_base
+                .set_int32_param(det.params.base.array_callbacks, 0, 1)
+                .unwrap();
             Self { det, publish_rx }
         }
 
