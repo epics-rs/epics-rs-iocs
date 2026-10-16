@@ -1,10 +1,6 @@
 # MW100 MX115 (digital input) channel.
 # Macros: P, DAU, HANDLE, ADDRESS (Signal channel address).
 # Port of yokogawaDasApp/Db/MW100_MX115_channel.db.
-#
-# Upstream-defect fix (MW100_MX115_channel.db Alarm1-4 THSV, 4 sites): same
-# "MAJR" typo as MW100_MX114_channel.db (see that file's header) — fixed to
-# "MAJOR" below.
 
 record(bi, "$(P)$(DAU):$(ADDRESS):DI")
 {
@@ -70,7 +66,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm1")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -104,7 +100,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm2")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -138,7 +134,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm3")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -172,7 +168,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm4")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
