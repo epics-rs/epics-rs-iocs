@@ -14,9 +14,10 @@ use epics_rs::pva::client_native::context::ConnectHandle;
 use epics_rs::pva::client_native::ops_v2::SubscriptionHandle;
 use epics_rs::pva::{PvField, PvaResult};
 
-use crate::convert::decode_nt_nd_array;
+use crate::convert::{ConvertError, decode_nt_nd_array};
 use crate::params::PvaParams;
 use crate::types::PvaCommand;
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 
 /// Bridges the PVA client's synchronous callbacks (`pvmonitor_handle`'s data
 /// callback and `connect().on_connect`/`on_disconnect`, none of which are
@@ -34,6 +35,7 @@ pub(crate) struct MonitorContext {
     pub cmd_rx: rt::CommandReceiver<PvaCommand>,
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
+    pub pool: Arc<NDArrayPool>,
     pub ad: ADBaseParams,
     pub pva: PvaParams,
     pub initial_pv_name: String,
@@ -293,8 +295,19 @@ async fn process_frame(ctx: &MonitorContext, conn: Option<&Connection>, raw: PvF
         return;
     }
 
-    let array = match decode_nt_nd_array(&raw) {
+    let array = match decode_nt_nd_array(&ctx.pool, &raw) {
         Ok(a) => a,
+        Err(ConvertError::PoolExhausted) => {
+            ctx.handle.trace().output(
+                ctx.handle.port_name(),
+                TraceMask::ERROR,
+                &format!(
+                    "pvaDriver::monitorEvent failed to alloc new NDArray - memory pool exhausted? (free: {})",
+                    ctx.pool.num_free_buffers()
+                ),
+            );
+            return;
+        }
         Err(e) => {
             ctx.handle.trace().output(
                 ctx.handle.port_name(),

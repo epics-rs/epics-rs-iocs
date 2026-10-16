@@ -31,6 +31,7 @@
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::codec::{Codec, CodecName};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::timestamp::{EPICS_EPOCH_OFFSET, EpicsTimestamp};
 use epics_rs::pva::pvdata::TypedScalarArray;
 use epics_rs::pva::{PvField, PvStructure, ScalarValue};
@@ -43,6 +44,8 @@ pub enum ConvertError {
     UnsupportedValueType(String),
     UnrecognizedCodec(String),
     InvalidDataType(i64),
+    /// The driver's pool refused the frame (pvaDriver.cpp:270-281).
+    PoolExhausted,
 }
 
 impl std::fmt::Display for ConvertError {
@@ -58,6 +61,7 @@ impl std::fmt::Display for ConvertError {
             Self::InvalidDataType(v) => {
                 write!(f, "invalid codec.parameters data type ordinal {v}")
             }
+            Self::PoolExhausted => write!(f, "the NDArray pool refused the frame"),
         }
     }
 }
@@ -251,7 +255,7 @@ fn convert_attribute(wire: &PvStructure) -> Result<Option<NDAttribute>, ConvertE
 
 /// Decode a wire `epics:nt/NTNDArray:1.0` structure (as delivered by
 /// `PvaClient::pvmonitor_handle`'s callback) into an `NDArray`.
-pub fn decode_nt_nd_array(value: &PvField) -> Result<NDArray, ConvertError> {
+pub fn decode_nt_nd_array(pool: &NDArrayPool, value: &PvField) -> Result<NDArray, ConvertError> {
     let s = match value {
         PvField::Structure(s) => s,
         _ => return Err(ConvertError::WrongFieldType("<top>")),
@@ -329,7 +333,9 @@ pub fn decode_nt_nd_array(value: &PvField) -> Result<NDArray, ConvertError> {
     let (dts_sec, dts_nsec) = read_time_t(s, "dataTimeStamp")?;
     let time_stamp = (dts_sec as f64 + dts_nsec as f64 * 1e-9) - EPICS_EPOCH_OFFSET as f64;
 
-    let mut array = NDArray::with_data(dims, data);
+    let mut array = pool
+        .wrap(dims, data)
+        .map_err(|_| ConvertError::PoolExhausted)?;
     array.unique_id = unique_id;
     array.timestamp = timestamp;
     array.time_stamp = time_stamp;
@@ -372,7 +378,8 @@ mod tests {
 
     fn decode(nt: &NtNdArray) -> NDArray {
         let value = nt_nd_array_value(nt);
-        decode_nt_nd_array(&value).unwrap_or_else(|e| panic!("decode failed: {e}"))
+        decode_nt_nd_array(&NDArrayPool::new(0), &value)
+            .unwrap_or_else(|e| panic!("decode failed: {e}"))
     }
 
     #[test]
@@ -453,7 +460,7 @@ mod tests {
     fn rejects_boolean_value_variant() {
         let nt = base_nt(NdArrayBuffer::Boolean(vec![true, false].into()), vec![]);
         let value = nt_nd_array_value(&nt);
-        let err = decode_nt_nd_array(&value).unwrap_err();
+        let err = decode_nt_nd_array(&NDArrayPool::new(0), &value).unwrap_err();
         assert!(matches!(err, ConvertError::UnsupportedValueType(_)));
     }
 
@@ -502,7 +509,7 @@ mod tests {
             )),
         };
         let value = nt_nd_array_value(&nt);
-        let err = decode_nt_nd_array(&value).unwrap_err();
+        let err = decode_nt_nd_array(&NDArrayPool::new(0), &value).unwrap_err();
         assert!(matches!(err, ConvertError::UnrecognizedCodec(_)));
     }
 
@@ -632,7 +639,7 @@ mod tests {
                 value: Box::new(PvField::Null),
             };
         }
-        let err = decode_nt_nd_array(&value).unwrap_err();
+        let err = decode_nt_nd_array(&NDArrayPool::new(0), &value).unwrap_err();
         assert_eq!(err, ConvertError::NoUnionFieldSelected);
     }
 }
