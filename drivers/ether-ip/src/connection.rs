@@ -9,7 +9,7 @@
 //! module is the only part that touches a socket.
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::cip::{self, CipClass, CipType, ParsedTag};
@@ -75,16 +75,23 @@ impl Connection {
         timeout: Duration,
         buffer_limit: usize,
     ) -> Result<Connection> {
-        let addr: SocketAddr = (host, port)
+        let Some(addr) = (host, port)
             .to_socket_addrs()
-            .map_err(|_| EipError::Resolve(host.to_string()))?
-            .next()
-            .ok_or_else(|| EipError::Resolve(host.to_string()))?;
+            .ok()
+            .and_then(|mut a| a.next())
+        else {
+            crate::eip_printf!(2, "EIP cannot find IP for '{host}'\n");
+            return Err(EipError::Resolve(host.to_string()));
+        };
 
-        let stream = TcpStream::connect_timeout(&addr, timeout)?;
+        let stream = TcpStream::connect_timeout(&addr, timeout).inspect_err(|_| {
+            crate::eip_printf!(3, "EIP cannot connect to {host}:{port}\n");
+        })?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
-        stream.set_nodelay(true)?;
+        stream.set_nodelay(true).inspect_err(|_| {
+            crate::eip_printf!(2, "EIP cannot set socket option to TCP_NODELAY\n");
+        })?;
 
         let mut c = Connection {
             stream,
@@ -94,11 +101,23 @@ impl Connection {
             identity: IdentityInfo::default(),
         };
 
-        c.list_services()?;
-        c.register_session()?;
+        if let Err(e) = c.list_services().and_then(|()| c.register_session()) {
+            crate::eip_printf!(1, "EIP_startup: target {host} does not respond\n");
+            return Err(e);
+        }
         // The C treats a failed identity read as a warning, not a failure.
         match c.read_identity() {
-            Ok(id) => c.identity = id,
+            Ok(id) => {
+                crate::eip_printf!(9, "------------------------------\n");
+                crate::eip_printf!(9, "Identity information of target:\n");
+                crate::eip_printf!(9, "    UINT vendor         = 0x{:04X}\n", id.vendor);
+                crate::eip_printf!(9, "    UINT device_type    = 0x{:04X}\n", id.device_type);
+                crate::eip_printf!(9, "    UINT revision       = 0x{:04X}\n", id.revision);
+                crate::eip_printf!(9, "    UDINT serial_number = 0x{:08X}\n", id.serial_number);
+                crate::eip_printf!(9, "    USINT name          = '{}'\n", id.name);
+                crate::eip_printf!(9, "------------------------------\n");
+                c.identity = id;
+            }
             Err(_) => crate::eip_printf!(1, "EIP_startup: cannot determine target's identity\n"),
         }
         Ok(c)
@@ -120,11 +139,9 @@ impl Connection {
 
     // -- framing ------------------------------------------------------------
 
-    /// Send one encapsulation frame and read the reply frame.
-    ///
-    /// The C reads until it has the 24-byte header, takes `header.length`, then
-    /// reads until it has that many more bytes (`EIP_read_connection_buffer`).
-    fn exchange(&mut self, request: &[u8], command: u16, tid: TransactionId) -> Result<Vec<u8>> {
+    /// Send one encapsulation frame and read the reply frame, unchecked:
+    /// `EIP_send_connection_buffer` then `EIP_read_connection_buffer`.
+    fn transact(&mut self, request: &[u8]) -> Result<Vec<u8>> {
         if request.len() > encap::BUFFER_SIZE {
             return Err(EipError::TooLarge {
                 size: request.len(),
@@ -134,18 +151,47 @@ impl Connection {
         self.stream.write_all(request).map_err(EipError::Send)?;
 
         let mut buf = vec![0u8; encap::HEADER_SIZE];
-        self.stream.read_exact(&mut buf)?;
-        let header = encap::EncapHeader::decode(&buf).ok_or(EipError::Malformed)?;
-
-        let body = header.length as usize;
-        if encap::HEADER_SIZE + body > encap::BUFFER_SIZE {
-            return Err(EipError::TooLarge {
-                size: encap::HEADER_SIZE + body,
-                limit: encap::BUFFER_SIZE,
-            });
+        let mut got = 0;
+        while got < buf.len() {
+            match self.stream.read(&mut buf[got..]) {
+                Ok(0) => {
+                    crate::eip_printf!(2, "EIP end-of-data after receiving {got} bytes\n");
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+                }
+                Ok(n) => got += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) {
+                        crate::eip_printf!(2, "EIP read timeout after receiving {got} bytes\n");
+                    } else {
+                        crate::eip_printf!(2, "EIP end-of-data after receiving {got} bytes\n");
+                    }
+                    return Err(e.into());
+                }
+            }
+            if got == encap::HEADER_SIZE && buf.len() == encap::HEADER_SIZE {
+                let length = u16::from_le_bytes([buf[2], buf[3]]) as usize;
+                let needed = encap::HEADER_SIZE + length;
+                if needed > encap::BUFFER_SIZE {
+                    crate::eip_printf!(2, "EIP response of {needed} bytes exceeds buffer\n");
+                    return Err(io::Error::from(io::ErrorKind::InvalidData).into());
+                }
+                buf.resize(needed, 0);
+            }
         }
-        buf.resize(encap::HEADER_SIZE + body, 0);
-        self.stream.read_exact(&mut buf[encap::HEADER_SIZE..])?;
+        Ok(buf)
+    }
+
+    /// Send one encapsulation frame and read the reply frame.
+    ///
+    /// The C reads until it has the 24-byte header, takes `header.length`, then
+    /// reads until it has that many more bytes (`EIP_read_connection_buffer`).
+    fn exchange(&mut self, request: &[u8], command: u16, tid: TransactionId) -> Result<Vec<u8>> {
+        let buf = self.transact(request)?;
+        let header = encap::EncapHeader::decode(&buf).ok_or(EipError::Malformed)?;
 
         if header.command != command {
             return Err(EipError::Malformed);
@@ -194,11 +240,30 @@ impl Connection {
 
     fn list_services(&mut self) -> Result<()> {
         let tid = TransactionId::generate();
-        let reply = self.exchange(
-            &encap::encode_list_services(tid),
-            encap::EC_LIST_SERVICES,
-            tid,
-        )?;
+        let reply = self
+            .transact(&encap::encode_list_services(tid))
+            .inspect_err(|e| match e {
+                EipError::Send(_) => crate::eip_printf!(2, "EIP list_services: send failed\n"),
+                _ => crate::eip_printf!(2, "EIP list_services: No response\n"),
+            })?;
+        let header = encap::EncapHeader::decode(&reply).ok_or(EipError::Malformed)?;
+        if header.command != encap::EC_LIST_SERVICES || header.status != 0 {
+            crate::eip_printf!(2, "EIP list_services: Invalid response\n");
+            dump_encap_header(&header);
+            return Err(EipError::Malformed);
+        }
+        if header.trans_id != tid {
+            crate::eip_printf!(
+                2,
+                "EIP list_services: Transaction id mismatch, got {} expected {tid}\n",
+                header.trans_id
+            );
+            dump_encap_header(&header);
+            return Err(EipError::TransactionMismatch {
+                got: header.trans_id.to_string(),
+                want: tid.to_string(),
+            });
+        }
         let items =
             encap::decode_list_services(&reply[encap::HEADER_SIZE..]).ok_or(EipError::Malformed)?;
         crate::eip_printf!(10, "ListServices reply\n");
@@ -226,14 +291,37 @@ impl Connection {
 
     fn register_session(&mut self) -> Result<()> {
         let tid = TransactionId::generate();
-        let reply = self.exchange(
-            &encap::encode_register_session(tid),
-            encap::EC_REGISTER_SESSION,
-            tid,
-        )?;
+        let reply = self
+            .transact(&encap::encode_register_session(tid))
+            .inspect_err(|e| match e {
+                EipError::Send(_) => crate::eip_printf!(2, "EIP register_session: send failed\n"),
+                _ => crate::eip_printf!(2, "EIP register_session: no response\n"),
+            })?;
         let header = encap::EncapHeader::decode(&reply).ok_or(EipError::Malformed)?;
+        let verbose = crate::EIP_VERBOSITY.load(std::sync::atomic::Ordering::Relaxed) >= 3;
+        if header.command != encap::EC_REGISTER_SESSION || header.status != 0 {
+            crate::eip_printf!(2, "EIP register_session received error\n");
+            if verbose {
+                dump_encap_header(&header);
+            }
+            return Err(EipError::Malformed);
+        }
         // Keep the session id the target handed back.
         self.session = header.session;
+        if header.trans_id != tid {
+            crate::eip_printf!(
+                2,
+                "EIP register_session: Transaction id mismatch, got {} expected {tid}\n",
+                header.trans_id
+            );
+            if verbose {
+                dump_encap_header(&header);
+            }
+            return Err(EipError::TransactionMismatch {
+                got: header.trans_id.to_string(),
+                want: tid.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -347,8 +435,33 @@ fn cip_error(response: &[u8], service: u8) -> EipError {
     }
 }
 
+/// `dump_EncapsulationHeader`: printed at level 0, i.e. always.
+fn dump_encap_header(h: &encap::EncapHeader) {
+    crate::eip_printf!(0, "EncapsulationHeader:\n");
+    crate::eip_printf!(
+        0,
+        "    UINT  command   = 0x{:02X} ({})\n",
+        h.command,
+        command_name(h.command)
+    );
+    crate::eip_printf!(0, "    UINT  length    = {} \n", h.length);
+    crate::eip_printf!(0, "    UDINT session   = 0x{:08X}\n", h.session);
+    crate::eip_printf!(
+        0,
+        "    UDINT status    = 0x{:08X}  ({})\n",
+        h.status,
+        encap::encap_status_text(h.status)
+    );
+    crate::eip_printf!(0, "    USINT context[8]= '{}'\n", h.trans_id);
+    crate::eip_printf!(0, "    UDINT options   = 0x{:08X}\n", h.options);
+}
+
+/// `EncapsulationHeader_command`.
 fn command_name(command: u16) -> &'static str {
     match command {
+        0x0000 => "Nop\n",
+        0x0064 => "ListInterfaces",
+        0x0070 => "SendUnitData",
         encap::EC_LIST_SERVICES => "ListServices",
         encap::EC_REGISTER_SESSION => "RegisterSession",
         encap::EC_UNREGISTER_SESSION => "UnRegisterSession",
