@@ -113,8 +113,7 @@ impl PortDriver for MarccdDriver {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(function, user.addr, value)?;
+                .set_int32_param(function, user.addr, value)?;
         }
 
         if function == params.acquire {
@@ -156,8 +155,7 @@ impl PortDriver for MarccdDriver {
 
         self.ad
             .port_base
-            .params
-            .set_float64(function, user.addr, value)?;
+            .set_float64_param(function, user.addr, value)?;
 
         if function == p.stability {
             self.send(Cmd::SetStability(value));

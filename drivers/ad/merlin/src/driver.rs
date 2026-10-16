@@ -514,8 +514,7 @@ impl PortDriver for MerlinDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
         if reason == self.init_param {
             self.initialise()?;
@@ -562,8 +561,7 @@ impl PortDriver for MerlinDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
             self.try_set(MPXVAR_THRESHOLD[i], &format!("{value:.6}"));

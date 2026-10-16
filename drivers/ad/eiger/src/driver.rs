@@ -245,9 +245,9 @@ impl EigerDriver {
     fn apply(&mut self, updates: Vec<ParamUpdate>) -> AsynResult<()> {
         for u in updates {
             match u {
-                ParamUpdate::Int32(i, v) => self.ad.port_base.params.set_int32(i, 0, v)?,
-                ParamUpdate::Float64(i, v) => self.ad.port_base.params.set_float64(i, 0, v)?,
-                ParamUpdate::Octet(i, v) => self.ad.port_base.params.set_string(i, 0, v)?,
+                ParamUpdate::Int32(i, v) => self.ad.port_base.set_int32_param(i, 0, v)?,
+                ParamUpdate::Float64(i, v) => self.ad.port_base.set_float64_param(i, 0, v)?,
+                ParamUpdate::Octet(i, v) => self.ad.port_base.set_string_param(i, 0, v)?,
             }
         }
         Ok(())
@@ -527,7 +527,7 @@ impl PortDriver for EigerDriver {
                 }
             }
         } else {
-            self.ad.port_base.params.set_int32(reason, addr, value)?;
+            self.ad.port_base.set_int32_param(reason, addr, value)?;
         }
 
         self.ad.port_base.call_param_callbacks(addr)
@@ -553,10 +553,10 @@ impl PortDriver for EigerDriver {
             self.put_f64(reason, value)?;
             self.status_message("Wavelength set")?;
         } else if reason == self.p.wavelength_epsilon {
-            self.ad.port_base.params.set_float64(reason, 0, value)?;
+            self.ad.port_base.set_float64_param(reason, 0, value)?;
             self.ops.reg.lock().set_epsilon(self.p.wavelength, value);
         } else if reason == self.p.energy_epsilon {
-            self.ad.port_base.params.set_float64(reason, 0, value)?;
+            self.ad.port_base.set_float64_param(reason, 0, value)?;
             let mut reg = self.ops.reg.lock();
             reg.set_epsilon(self.p.photon_energy, value);
             for t in params::thresholds(&self.p) {
@@ -565,7 +565,7 @@ impl PortDriver for EigerDriver {
         } else if self.ops.reg.lock().contains(reason) {
             self.put_f64(reason, value)?;
         } else {
-            self.ad.port_base.params.set_float64(reason, addr, value)?;
+            self.ad.port_base.set_float64_param(reason, addr, value)?;
         }
 
         self.ad.port_base.call_param_callbacks(addr)

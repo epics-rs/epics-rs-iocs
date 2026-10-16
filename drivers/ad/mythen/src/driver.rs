@@ -325,7 +325,7 @@ impl PortDriver for MythenDriver {
             });
         }
 
-        self.ad.port_base.params.set_int32(reason, addr, value)?;
+        self.ad.port_base.set_int32_param(reason, addr, value)?;
 
         if reason == acquire {
             let read_mode = self.int_param(self.p.read_mode);
@@ -383,7 +383,7 @@ impl PortDriver for MythenDriver {
             });
         }
 
-        self.ad.port_base.params.set_float64(reason, addr, value)?;
+        self.ad.port_base.set_float64_param(reason, addr, value)?;
 
         if reason == self.ad.params.acquire_time {
             self.det.set_exposure_time(value)?;

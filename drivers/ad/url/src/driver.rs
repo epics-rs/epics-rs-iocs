@@ -91,8 +91,7 @@ impl PortDriver for URLDriver {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
         if reason == self.ad.params.acquire {
             let status = self

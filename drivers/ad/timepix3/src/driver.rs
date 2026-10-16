@@ -703,7 +703,7 @@ impl TimePix3Driver {
             self.ad
                 .port_base
                 .set_int32_param(self.p.pixel_config_match_bp_c, addr, match_code)?;
-            self.ad.port_base.params.set_int64(
+            self.ad.port_base.set_int64_param(
                 self.p.pixel_config_mismatch_bytes,
                 addr,
                 mismatch,
@@ -881,7 +881,7 @@ impl PortDriver for TimePix3Driver {
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
 
-        self.ad.port_base.params.set_int32(reason, addr, value)?;
+        self.ad.port_base.set_int32_param(reason, addr, value)?;
 
         let p = self.p;
         let result = if reason == self.ad.params.acquire {
@@ -1044,7 +1044,7 @@ impl PortDriver for TimePix3Driver {
         let addr = user.addr;
         let acquiring = self.int(self.ad.params.acquire, 0) != 0;
 
-        self.ad.port_base.params.set_float64(reason, addr, value)?;
+        self.ad.port_base.set_float64_param(reason, addr, value)?;
 
         let p = self.p;
         let result = if reason == self.ad.params.acquire_time
@@ -1070,7 +1070,7 @@ impl PortDriver for TimePix3Driver {
         let reason = user.reason;
         let addr = user.addr;
         let value = String::from_utf8_lossy(data).into_owned();
-        self.ad.port_base.params.set_string(reason, addr, value)?;
+        self.ad.port_base.set_string_param(reason, addr, value)?;
 
         let p = self.p;
         // A path PV's "does it exist" readback (C `checkBPCPath`,

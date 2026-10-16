@@ -164,8 +164,7 @@ impl PortDriver for PilatusDriver {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(function, user.addr, value)?;
+                .set_int32_param(function, user.addr, value)?;
         }
 
         if function == params.acquire {
@@ -214,8 +213,7 @@ impl PortDriver for PilatusDriver {
             .unwrap_or(0.0);
         self.ad
             .port_base
-            .params
-            .set_float64(function, user.addr, value)?;
+            .set_float64_param(function, user.addr, value)?;
 
         if function == params.gain || function == p.energy || function == p.threshold {
             let auto_apply = self
@@ -246,8 +244,7 @@ impl PortDriver for PilatusDriver {
                 if let Some(v) = demanded {
                     self.ad
                         .port_base
-                        .params
-                        .set_float64(function, user.addr, v)?;
+                        .set_float64_param(function, user.addr, v)?;
                 }
                 self.send(Cmd::SetThreshold);
             } else {
@@ -255,8 +252,7 @@ impl PortDriver for PilatusDriver {
                 if function == p.threshold || function == p.energy {
                     self.ad
                         .port_base
-                        .params
-                        .set_float64(function, user.addr, old_value)?;
+                        .set_float64_param(function, user.addr, old_value)?;
                 }
             }
         } else if function == params.acquire_time
@@ -325,8 +321,7 @@ impl PortDriver for PilatusDriver {
 
         self.ad
             .port_base
-            .params
-            .set_string(function, user.addr, value.clone())?;
+            .set_string_param(function, user.addr, value.clone())?;
 
         if function == p.bad_pixel_file {
             self.send(Cmd::ReadBadPixelFile(value));

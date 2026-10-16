@@ -179,8 +179,7 @@ impl PortDriver for SimDetector {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(reason, user.addr, value)?;
+                .set_int32_param(reason, user.addr, value)?;
         }
 
         if reason == p.acquire {
@@ -210,8 +209,7 @@ impl PortDriver for SimDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         if self
             .sim

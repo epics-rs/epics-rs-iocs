@@ -117,8 +117,7 @@ impl PortDriver for Mar345Driver {
         // C: `setIntegerParam(function, value)` for every function.
         self.ad
             .port_base
-            .params
-            .set_int32(function, user.addr, value)?;
+            .set_int32_param(function, user.addr, value)?;
 
         let idle = self.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
         if function == params.acquire {
@@ -146,8 +145,7 @@ impl PortDriver for Mar345Driver {
                 // Abort operation.
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(params.status, 0, Status::Aborting as i32)?;
+                    .set_int32_param(params.status, 0, Status::Aborting as i32)?;
                 self.abort.signal();
             }
         } else if function < p.first() {

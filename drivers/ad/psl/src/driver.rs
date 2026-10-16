@@ -452,8 +452,7 @@ impl PortDriver for PslDetector {
         let was_acquiring = self.get_i32(self.ad.params.acquire) != 0;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
         let p = self.ad.params;
         if reason == p.acquire {
@@ -505,8 +504,7 @@ impl PortDriver for PslDetector {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         let p = self.ad.params;
         if reason == p.acquire_time {
@@ -529,8 +527,7 @@ impl PortDriver for PslDetector {
             .to_string();
         self.ad
             .port_base
-            .params
-            .set_string(reason, user.addr, text.clone())?;
+            .set_string_param(reason, user.addr, text.clone())?;
 
         let p = self.ad.params;
         if reason == p.base.file_path {

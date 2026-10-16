@@ -169,7 +169,7 @@ impl NdStdArraysDriver {
             self.port_base
                 .set_int32_param(self.params.acquire_busy, addr, 0)?;
         }
-        self.port_base.params.set_int32(reason, addr, value)
+        self.port_base.set_int32_param(reason, addr, value)
     }
 
     /// The allocation half of `writeXXXArray` (NDDriverStdArrays.cpp:153-218):

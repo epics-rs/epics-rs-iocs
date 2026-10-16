@@ -90,12 +90,11 @@ impl PortDriver for PvaDriver {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_int32(reason, user.addr, value)?;
+            .set_int32_param(reason, user.addr, value)?;
 
         if reason == self.ad.params.acquire {
             if value != 0 {
-                self.ad.port_base.params.set_int32(
+                self.ad.port_base.set_int32_param(
                     self.ad.params.num_images_counter,
                     user.addr,
                     0,
@@ -128,8 +127,7 @@ impl PortDriver for PvaDriver {
                 .to_vec();
             self.ad
                 .port_base
-                .params
-                .set_string(reason, user.addr, new_value.clone())?;
+                .set_string_param(reason, user.addr, new_value.clone())?;
             if self
                 .cmd_tx
                 .try_send(PvaCommand::Reconnect(new_value))
@@ -137,8 +135,7 @@ impl PortDriver for PvaDriver {
             {
                 self.ad
                     .port_base
-                    .params
-                    .set_string(reason, user.addr, old_value)?;
+                    .set_string_param(reason, user.addr, old_value)?;
             }
         } else {
             return self.ad.write_octet(user, data);

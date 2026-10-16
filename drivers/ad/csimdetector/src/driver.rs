@@ -147,7 +147,7 @@ impl CSimDetector {
             self.port_base
                 .set_int32_param(self.nd.acquire_busy, addr, 0)?;
         }
-        self.port_base.params.set_int32(reason, addr, value)
+        self.port_base.set_int32_param(reason, addr, value)
     }
 
     /// `ADCSimDetector::setAcquire` (ADCSimDetector.cpp:255-266).

@@ -204,30 +204,24 @@ impl PortDriver for D435iColorDriver {
             if let Some(mode) = self.stream_modes.get(value as usize).copied() {
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(reason, user.addr, value)?;
+                    .set_int32_param(reason, user.addr, value)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.rs_params.rs_res_x, 0, mode.width)?;
+                    .set_int32_param(self.rs_params.rs_res_x, 0, mode.width)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.rs_params.rs_res_y, 0, mode.height)?;
+                    .set_int32_param(self.rs_params.rs_res_y, 0, mode.height)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.rs_params.rs_frame_rate, 0, mode.fps)?;
+                    .set_int32_param(self.rs_params.rs_frame_rate, 0, mode.fps)?;
                 // Update AD params to match
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.ad.params.size_x, 0, mode.width)?;
+                    .set_int32_param(self.ad.params.size_x, 0, mode.width)?;
                 self.ad
                     .port_base
-                    .params
-                    .set_int32(self.ad.params.size_y, 0, mode.height)?;
-                self.ad.port_base.params.set_float64(
+                    .set_int32_param(self.ad.params.size_y, 0, mode.height)?;
+                self.ad.port_base.set_float64_param(
                     self.ad.params.acquire_time,
                     0,
                     1.0 / mode.fps as f64,
@@ -245,8 +239,7 @@ impl PortDriver for D435iColorDriver {
         } else {
             self.ad
                 .port_base
-                .params
-                .set_int32(reason, user.addr, value)?;
+                .set_int32_param(reason, user.addr, value)?;
 
             // Dirty flag routing
             if reason == self.rs_params.rs_auto_exposure
@@ -276,8 +269,7 @@ impl PortDriver for D435iColorDriver {
         let reason = user.reason;
         self.ad
             .port_base
-            .params
-            .set_float64(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value)?;
 
         let mut dirty = self.dirty.lock();
         if reason == self.rs_params.rs_exposure
