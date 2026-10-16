@@ -26,6 +26,7 @@ use crate::tasks;
 
 /// The line C prints when a Serval request fails: `logHttpFailure` or
 /// `logHttpWarning` with its context, method and path, or nothing.
+#[derive(Clone, Copy)]
 enum HttpPrint<'a> {
     None,
     Failure(&'a str, &'a str, &'a str),
@@ -451,6 +452,15 @@ impl TimePix3Driver {
             .ad
             .port_base
             .set_int32_param(self.p.http_code, 0, e.code());
+        self.log_http(e, print);
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("timepix3: {what}: {e}"),
+        }
+    }
+
+    /// C `logHttpFailure`/`logHttpWarning`, which leave HttpCode alone.
+    fn log_http(&mut self, e: &HttpError, print: HttpPrint) {
         let url = |path: &str| format!("{}{path}", self.http.base_url());
         let line = match print {
             HttpPrint::None => None,
@@ -465,10 +475,6 @@ impl TimePix3Driver {
             self.ad
                 .port_base
                 .trace_print(mask, format_args!("{}", line));
-        }
-        AsynError::Status {
-            status: AsynStatus::Error,
-            message: format!("timepix3: {what}: {e}"),
         }
     }
 
@@ -1173,19 +1179,38 @@ impl TimePix3Driver {
             return Err(MPX3_TRIGGER_MSG);
         }
 
+        // Serval re-binds the preview ports only once a prior measurement is
+        // stopped; a 404 means there was none (acquire.cpp:348-381).
+        let prior_stop = HttpPrint::Warning(
+            "acquireStart stop prior measurement",
+            "GET",
+            serval::MEASUREMENT_STOP,
+        );
+        if let Err(e) = self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
+            && e.code() != 404
+        {
+            self.log_http(&e, prior_stop);
+        }
         if let Ok(measurement) = self.http.get_json(serval::MEASUREMENT, TIMEOUT_POLL)
             && serval::measurement_is_running(&measurement)
-            && let Err(e) = self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL)
         {
-            self.http_failed(
-                "GET /measurement/stop",
-                &e,
-                HttpPrint::Warning(
-                    "acquireStart stop prior measurement",
-                    "GET",
-                    serval::MEASUREMENT_STOP,
+            let status = measurement
+                .pointer("/Info/Status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::ACQUIRE_START,
+                        &format!("Measurement is running (status: {status}), stopping it first"),
+                    )
                 ),
             );
+            if let Err(e) = self.http.get(serval::MEASUREMENT_STOP, TIMEOUT_POLL) {
+                self.log_http(&e, prior_stop);
+            }
         }
 
         self.init_acquisition().map_err(|_| FAILED)?;
@@ -2436,6 +2461,48 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let line = adlog::log(adlog::WRITE_INT32, "Entering acquire start");
+        assert!(text.contains(&line), "{text:?}");
+        std::mem::forget(runtime);
+    }
+
+    /// A start stops any prior measurement first and warns when Serval
+    /// refuses with anything but 404 (acquire.cpp:348-357).
+    #[test]
+    fn a_start_stops_a_prior_measurement_first() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_PRIOR_STOP";
+        let url = fake_serval("/measurement/stop");
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new(&url)),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let acquire = det.ad.params.acquire;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace().set_trace_mask(Some(name), TraceMask::WARNING);
+        let _ = h.write_int32_blocking(acquire, 0, 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let line =
+            format!("acquireStart stop prior measurement: GET {url}/measurement/stop HTTP 500");
         assert!(text.contains(&line), "{text:?}");
         std::mem::forget(runtime);
     }
