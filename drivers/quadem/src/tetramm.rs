@@ -542,11 +542,11 @@ impl PortDriver for TetrAmmDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.qe_write_int32(user.reason, user.addr, value)
+        self.qe_write_int32(user, value)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        self.qe_write_float64(user.reason, user.addr, value)
+        self.qe_write_float64(user, value)
     }
 }
 
@@ -975,7 +975,10 @@ mod tests {
     fn stopping_a_dead_meter_fails_the_acquire_write() {
         let mut drv = driver_on("QE_TETRA_DEAD", "127.0.0.1:1");
         let acquire = drv.base.nd_params.acquire;
-        assert!(drv.qe_write_int32(acquire, 0, 0).is_err());
+        assert!(
+            drv.qe_write_int32(&AsynUser::new(acquire).with_addr(0), 0)
+                .is_err()
+        );
     }
 
     #[test]

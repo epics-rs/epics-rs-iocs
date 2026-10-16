@@ -644,7 +644,7 @@ impl PortDriver for T4uDriver {
         // C++ returns here for its own functions, without callbacks; their
         // readbacks post when the meter's register dump comes back.
         if reason < t.first {
-            return self.qe_write_int32(reason, channel, value);
+            return self.qe_write_int32(user, value);
         }
         Ok(())
     }
@@ -679,7 +679,7 @@ impl PortDriver for T4uDriver {
             let _ = std::io::stdout().flush();
         }
         if reason < t.first {
-            return self.qe_write_float64(reason, channel, value);
+            return self.qe_write_float64(user, value);
         }
         Ok(())
     }

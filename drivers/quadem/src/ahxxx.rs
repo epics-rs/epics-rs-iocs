@@ -531,11 +531,11 @@ impl PortDriver for AhxxxDriver {
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
-        self.qe_write_int32(user.reason, user.addr, value)
+        self.qe_write_int32(user, value)
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
-        self.qe_write_float64(user.reason, user.addr, value)
+        self.qe_write_float64(user, value)
     }
 }
 
