@@ -15,6 +15,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::connect::{connect_controller, set_eos_ignored};
 use motor_common::iocsh::{arg_double_req, arg_int_req, arg_str_req, poll_intervals, req_string};
@@ -76,7 +77,10 @@ pub fn mcs2_create_controller_command() -> CommandDef {
                 ),
             );
             set_eos_ignored(&handle, mcs2::INPUT_EOS, mcs2::OUTPUT_EOS);
-            let controller = Arc::new(Mutex::new(Mcs2Controller::new(handle)));
+            let controller = Arc::new(Mutex::new(Mcs2Controller::new(
+                handle,
+                &MotorTrace::new(&port_name, 0),
+            )));
             for axis in 0..num_axes {
                 if unused_mask & (1 << axis) != 0 {
                     continue;

@@ -40,7 +40,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::motor::trace::MotorTrace;
 
 use motor_common::util::atof;
 
@@ -79,14 +81,30 @@ pub struct Mcs2Controller {
 impl Mcs2Controller {
     /// Connect to an MCS2 and read its serial number (`:DEV:SNUM?`), draining
     /// the error queue around it as the C constructor does. Performs blocking
-    /// I/O.
-    pub fn new(handle: SyncIOHandle) -> Self {
+    /// I/O; `trace` is C's `pasynUserSelf`.
+    pub fn new(handle: SyncIOHandle, trace: &MotorTrace) -> Self {
         let mut ctrl = Self {
             handle,
             ident: String::new(),
         };
         ctrl.clear_errors();
-        ctrl.ident = ctrl.query(":DEV:SNUM?").unwrap_or_default();
+        match ctrl.query(":DEV:SNUM?") {
+            Ok(ident) => ctrl.ident = ident,
+            Err(_) => trace.print_self(
+                TraceMask::ERROR,
+                format_args!(
+                    "SmarActMCS2MotorDriver:MCS2Controller: cannot connect to MCS2 controller\n"
+                ),
+            ),
+        }
+        // C prints the reply on the error mask whether or not it came.
+        trace.print_self(
+            TraceMask::ERROR,
+            format_args!(
+                "MCS2Controller::MCS2Controller: Device Name: {}\n",
+                ctrl.ident
+            ),
+        );
         ctrl.clear_errors();
         ctrl
     }
