@@ -20,10 +20,6 @@ epicsEnvSet("NCHANS", "2048")
 epicsEnvSet("CBUFFS", "500")
 epicsEnvSet("MAX_THREADS", "8")
 
-# NELEMENTS for the NDStdArrays output waveform: XSIZE * YSIZE * 3, so an RGB
-# frame at the full detector size fits.
-epicsEnvSet("NELEMENTS", "3145728")
-
 # $(ADSIMDETECTOR) is set to this crate's root by ioc_support at IOC startup.
 # The templates live in its db/ subdir.
 
@@ -36,6 +32,13 @@ simDetectorConfig("$(PORT)", $(XSIZE), $(YSIZE), 1, 0, 0)
 epicsEnvSet("EPICS_DB_INCLUDE_PATH", "$(ADCORE)/db")
 
 dbLoadRecords("$(ADSIMDETECTOR)/db/simDetector.template", "P=$(PREFIX),R=$(CAM),PORT=$(PORT),ADDR=0,TIMEOUT=1")
+
+# Create a standard arrays plugin, set it to get data from first simDetector driver.
+NDStdArraysConfigure("Image1", 20, 0, "$(PORT)", 0, 0, 0, 0, 0, 5)
+
+# This creates a waveform large enough for 2000x2000x3 (e.g. RGB color) arrays.
+# This waveform only allows transporting 8-bit images
+dbLoadRecords("NDStdArrays.template", "P=$(PREFIX),R=image1:,PORT=Image1,ADDR=0,TIMEOUT=1,NDARRAY_PORT=$(PORT),TYPE=Int8,FTVL=UCHAR,NELEMENTS=12000000")
 
 # Plugin chain
 < $(ADSIMDETECTOR)/simDetectorPlugins.cmd
