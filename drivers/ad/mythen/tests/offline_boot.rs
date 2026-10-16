@@ -11,6 +11,7 @@ use std::sync::Arc;
 use epics_rs::ad_core::driver::ADStatus;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+use epics_rs::asyn::error::AsynError;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
@@ -60,7 +61,12 @@ fn the_driver_is_created_when_the_detector_does_not_answer() {
             .unwrap(),
         b"Mythen FAILED TO CONNECT"
     );
-    assert_eq!(base.get_int32_param(driver.p.nmodules, 0).unwrap(), 0);
+    // C returns before setting SDNModules when `-get nmodules` fails
+    // (mythen.cpp:1362-1373), so it stays undefined.
+    assert!(matches!(
+        base.get_int32_param(driver.p.nmodules, 0),
+        Err(AsynError::ParamUndefined(r)) if r == driver.p.nmodules
+    ));
     assert_eq!(
         base.get_string_param(driver.p.firmware_version, 0).unwrap(),
         b""
