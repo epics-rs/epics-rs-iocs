@@ -546,20 +546,22 @@ impl PortDriver for PslDetector {
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(reason, user.addr, value)?;
+            .set_float64_param(reason, user.addr, value);
 
         let p = self.ad.params;
-        let status = if reason == p.acquire_time {
-            self.send(&protocol::set_exposure(value))
+        if reason == p.acquire_time {
+            status = self.send(&protocol::set_exposure(value));
         } else if reason == p.acquire_period {
-            self.send(&protocol::set_frame_time(value))
+            status = self.send(&protocol::set_frame_time(value));
         } else if reason == p.gain {
-            self.send(&protocol::set_chip_gain(value))
-        } else {
-            Ok(())
-        };
+            status = self.send(&protocol::set_chip_gain(value));
+        } else if reason < self.params.camera_name {
+            // ADDriver::writeFloat64 is asynPortDriver's (PSL.cpp:848).
+            status = self.ad.port_base.write_float64_param(user, value);
+        }
 
         let _ = self.get_config();
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -784,6 +786,44 @@ mod tests {
                 "{driver}: {text:?}"
             );
         }
+        std::mem::forget(runtime);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (PSL.cpp:848), whose
+    /// IO_DRIVER line precedes PSL's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "PSL_BASE_F64";
+        let det = detector(name);
+        let delay = det.ad.params.shutter_open_delay;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        h.write_float64_blocking(delay, 0, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("PSL:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
         std::mem::forget(runtime);
     }
 
