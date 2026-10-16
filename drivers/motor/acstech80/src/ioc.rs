@@ -81,7 +81,14 @@ pub fn spiiplus_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = SpiiPlusAxis::new(controller.clone(), index);
                 let dtyp_key = format!("SPIIPLUS_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "SPiiPlusConfig: card={card} asynPort={asyn_port} axes={num_axes} \

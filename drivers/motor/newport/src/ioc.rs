@@ -184,6 +184,7 @@ impl NewportHolder {
     fn install(
         &self,
         ctx: &CommandContext,
+        (port, addr): (&str, i32),
         dtyp_key: String,
         motor: Arc<Mutex<dyn AsynMotor>>,
         moving_poll_ms: u64,
@@ -195,6 +196,8 @@ impl NewportHolder {
             poll_loop,
             poll_cmd_tx,
         } = MotorBuilder::new(motor)
+            .port(port)
+            .addr(addr)
             .moving_poll_interval(Duration::from_millis(moving_poll_ms))
             .idle_poll_interval(Duration::from_millis(idle_poll_ms))
             .build();
@@ -255,7 +258,14 @@ impl NewportHolder {
                 let motor: Arc<Mutex<dyn AsynMotor>> =
                     Arc::new(Mutex::new(Smc100Axis::new(handle, SMC100_AXIS, wire_scale)));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&motor_port, 0),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "SMC100CreateController: motorPort={motor_port} serialPort={serial_port} wireScale={wire_scale} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
                 );
@@ -302,7 +312,14 @@ impl NewportHolder {
                 let dtyp_key = format!("CONEX_{motor_port}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&motor_port, 0),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "AG_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP={dtyp_key})"
                 );
@@ -357,7 +374,14 @@ impl NewportHolder {
                         .map_err(|e| format!("AGAP_CONEXCreateController: {e}"))?;
                     let dtyp_key = format!("AGAP_{motor_port}_{}", agap::axis_name(axis_index));
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&motor_port, axis_index as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "AGAP_CONEXCreateController: motorPort={motor_port} serialPort={serial_port} controllerID={controller_id} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=AGAP_{motor_port}_U, AGAP_{motor_port}_V)"
@@ -501,7 +525,14 @@ impl NewportHolder {
                 let dtyp_key = format!("AG_UC_{motor_port}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&motor_port, axis),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "AG_UCCreateAxis: motorPort={motor_port} axis={axis} hasLimits={has_limits} fwdAmp={forward_amplitude} revAmp={reverse_amplitude} (DTYP={dtyp_key})"
                 );
@@ -656,7 +687,14 @@ impl NewportHolder {
                 let dtyp_key = format!("XPS_{motor_port}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
 
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&motor_port, axis),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!(
                     "XPSCreateAxis: motorPort={motor_port} movePort={move_port} axis={axis} positioner={positioner_name} stepsPerUnit={steps_per_unit} (DTYP={dtyp_key})"
                 );
@@ -1261,7 +1299,14 @@ impl NewportHolder {
                     let ax = HxpAxis::new(controller.clone(), move_sock, axis_no);
                     let dtyp_key = format!("HXP_{motor_port}_{axis_no}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&motor_port, axis_no as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
 
                 let handle = connect_ip(&move_port, HXP_MOVE_TIMEOUT)?;
@@ -1519,7 +1564,14 @@ impl NewportHolder {
                         .map_err(|e| format!("ESP300CreateController: axis {axis}: {e}"))?;
                     let dtyp_key = format!("ESP300_{motor_port}_{}", axis - 1);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&motor_port, (axis - 1) as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "ESP300CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=ESP300_{motor_port}_{{0..{}}})",
@@ -1570,7 +1622,14 @@ impl NewportHolder {
                         .map_err(|e| format!("MM3000CreateController: axis {axis}: {e}"))?;
                     let dtyp_key = format!("MM3000_{motor_port}_{}", axis - 1);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&motor_port, (axis - 1) as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "MM3000CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM3000_{motor_port}_{{0..{}}})",
@@ -1630,7 +1689,14 @@ impl NewportHolder {
                         .map_err(|e| format!("MM4000CreateController: axis {axis}: {e}"))?;
                     let dtyp_key = format!("MM4000_{motor_port}_{}", axis - 1);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&motor_port, (axis - 1) as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "MM4000CreateController: motorPort={motor_port} serialPort={serial_port} firmware=\"{firmware}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=MM4000_{motor_port}_{{0..{}}})",
@@ -1682,7 +1748,14 @@ impl NewportHolder {
                         .map_err(|e| format!("PM500CreateController: axis {index}: {e}"))?;
                     let dtyp_key = format!("PM500_{motor_port}_{index}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&motor_port, index as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "PM500CreateController: motorPort={motor_port} serialPort={serial_port} ident=\"{ident}\" axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PM500_{motor_port}_{{0..{}}})",
@@ -1737,7 +1810,14 @@ impl NewportHolder {
                         .map_err(|e| format!("PMNC87xxCreateController: axis {index}: {e}"))?;
                     let dtyp_key = format!("PMNC_{motor_port}_{index}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&motor_port, index as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                 }
                 println!(
                     "PMNC87xxCreateController: motorPort={motor_port} asynPort={asyn_port} ident=\"{ident}\" model={model:?} axes={num_axes} poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=PMNC_{motor_port}_{{0..{}}})",

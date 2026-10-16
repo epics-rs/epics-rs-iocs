@@ -81,7 +81,14 @@ pub fn ensemble_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                         .map_err(|e| format!("EnsembleAsynConfig: axis {axis}: {e}"))?;
                     let dtyp_key = format!("ENSEMBLE_{card}_{axis}");
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                    holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                    holder.install(
+                        ctx,
+                        (&card.to_string(), axis),
+                        dtyp_key.clone(),
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                     println!("EnsembleAsynConfig: {dtyp_key} (axis={axis})");
                     found += 1;
                 }
@@ -171,7 +178,14 @@ pub fn a3200_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("A3200AsynConfig: axis {axis} ({axis_name}): {e}"))?;
                 let dtyp_key = format!("A3200_{card}_{axis_name}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), axis),
+                    dtyp_key.clone(),
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
                 println!("A3200AsynConfig: {dtyp_key} (axis={axis} name={axis_name})");
             }
 

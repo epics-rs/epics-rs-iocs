@@ -209,7 +209,14 @@ fn phytron_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -
                 .map_err(|e| format!("phytronCreateAxis: {e}"))?;
             let dtyp_key = format!("PHYTRON_{name}_{module}_{index}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                (&name, (module * 10 + index) as i32),
+                dtyp_key.clone(),
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
             println!("phytronCreateAxis: {dtyp_key} (module={module} index={index})");
             Ok(CommandOutcome::Continue)
         },

@@ -117,7 +117,14 @@ pub fn pic862_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let axis = PIC862Axis::new(controller).map_err(|e| format!("PIC862Config: {e}"))?;
             let dtyp_key = format!("PIC862_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                (&card.to_string(), 0),
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "PIC862Config: card={card} asynPort={asyn_port} addr={addr} \
@@ -193,7 +200,14 @@ pub fn pic663_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let axis = PIC663Axis::new(controller).map_err(|e| format!("PIC663Config: {e}"))?;
             let dtyp_key = format!("PIC663_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                (&card.to_string(), 0),
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "PIC663Config: card={card} asynPort={asyn_port} addr={addr} \
@@ -302,7 +316,14 @@ pub fn pic630_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIC630Config: {e}"))?;
                 let dtyp_key = format!("PIC630_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), signal as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -370,7 +391,14 @@ pub fn pic662_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
             let axis = PIC662Axis::new(controller).map_err(|e| format!("PIC662Config: {e}"))?;
             let dtyp_key = format!("PIC662_{card}_0");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                (&card.to_string(), 0),
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "PIC662Config: card={card} asynPort={asyn_port} \
@@ -445,7 +473,14 @@ pub fn pic844_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIC844Config: {e}"))?;
                 let dtyp_key = format!("PIC844_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), signal as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -529,7 +564,14 @@ pub fn pic848_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIC848Config: {e}"))?;
                 let dtyp_key = format!("PIC848_{card}_{signal}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), signal as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -609,7 +651,14 @@ pub fn pie516_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE516Config: {e}"))?;
                 let dtyp_key = format!("PIE516_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), axis as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -686,7 +735,14 @@ pub fn pie517_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE517Config: {e}"))?;
                 let dtyp_key = format!("PIE517_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), axis as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -764,7 +820,14 @@ pub fn pie710_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE710Config: {e}"))?;
                 let dtyp_key = format!("PIE710_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), axis as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(
@@ -842,7 +905,14 @@ pub fn pie816_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("PIE816Config: {e}"))?;
                 let dtyp_key = format!("PIE816_{card}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_obj));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), axis as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
 
             println!(

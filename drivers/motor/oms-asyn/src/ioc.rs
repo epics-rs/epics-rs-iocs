@@ -155,7 +155,14 @@ fn oms_create_axis_command(registry: &Registry, holder: &Arc<MotorHolder>) -> Co
                 .map_err(|e| format!("omsCreateAxis: {e}"))?;
             let dtyp_key = format!("OMS_{name}_{axis}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis_dev));
-            holder.install(ctx, dtyp_key.clone(), motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                (&name, axis as i32),
+                dtyp_key.clone(),
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
             println!("omsCreateAxis: {dtyp_key} (axis={axis})");
             Ok(CommandOutcome::Continue)
         },

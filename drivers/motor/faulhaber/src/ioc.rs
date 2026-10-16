@@ -90,7 +90,14 @@ pub fn mcdc2805_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("MCDC2805Config: node {node}: {e}"))?;
                 let dtyp_key = format!("MCDC2805_{card}_{node}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), node as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "MCDC2805Config: card={card} asynPort={asyn_port} nodes={num_axes} \

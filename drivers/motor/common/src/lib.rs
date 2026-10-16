@@ -60,9 +60,12 @@ impl MotorHolder {
     /// Wire one motor into a record + poll loop: build the device support and
     /// poll loop for `motor`, spawn the poll loop (starts idle), and store the
     /// device support under `dtyp_key` for later `dbLoadRecords` binding.
+    /// `(port, addr)` are the controller port and axis its trace lines print
+    /// on, C's `pasynUser` for the axis.
     pub fn install(
         &self,
         ctx: &CommandContext,
+        (port, addr): (&str, i32),
         dtyp_key: String,
         motor: Arc<Mutex<dyn AsynMotor>>,
         moving_poll_ms: u64,
@@ -74,6 +77,8 @@ impl MotorHolder {
             poll_loop,
             poll_cmd_tx,
         } = MotorBuilder::new(motor)
+            .port(port)
+            .addr(addr)
             .moving_poll_interval(Duration::from_millis(moving_poll_ms))
             .idle_poll_interval(Duration::from_millis(idle_poll_ms))
             .build();

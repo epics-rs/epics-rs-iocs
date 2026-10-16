@@ -217,6 +217,7 @@ fn create_axis(
         Arc::new(Mutex::new(PmacAxis::new(reg.controller.clone(), axis)));
     holder.install(
         ctx,
+        (name, axis),
         format!("PMAC_{name}_{axis}"),
         motor,
         reg.moving_poll_ms,
@@ -503,6 +504,7 @@ fn pmac_asyn_coord_create_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(cs_axis));
                 holder.install(
                     ctx,
+                    (&cs_name, axis as i32),
                     format!("PMACCS_{cs_name}_{axis}"),
                     motor,
                     moving_poll_ms,

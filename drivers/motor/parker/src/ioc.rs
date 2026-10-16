@@ -62,7 +62,14 @@ pub fn oem_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("OEMCreateController: axis {index}: {e}"))?;
                 let dtyp_key = format!("OEM_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "OEMCreateController: card={card} oemPort={oem_port} axes={num_axes} \
@@ -109,7 +116,14 @@ pub fn acr_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                     .map_err(|e| format!("ACRCreateController: axis {index}: {e}"))?;
                 let dtyp_key = format!("ACR_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "ACRCreateController: card={card} acrPort={acr_port} axes={num_axes} \

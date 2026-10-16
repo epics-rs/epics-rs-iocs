@@ -96,7 +96,14 @@ pub fn acsmotion_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = SpiiPlusAxis::new(controller.clone(), index, is_virtual);
                 let dtyp_key = format!("ACSMOTION_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "AcsMotionConfig: card={card} asynPort={asyn_port} axes={num_axes} \

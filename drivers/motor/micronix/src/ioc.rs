@@ -56,7 +56,14 @@ pub fn mmc200_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef
                     .map_err(|e| format!("MMC200CreateController: axis {index}: {e}"))?;
                 let dtyp_key = format!("MMC200_{motor_port}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&motor_port, index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "MMC200CreateController: motorPort={motor_port} serialPort={serial_port} \

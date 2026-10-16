@@ -81,9 +81,14 @@ impl MotorSimHolder {
                     )));
                     let motor: Arc<Mutex<dyn AsynMotor>> = axis.clone();
                     let dtyp_key = format!("motorSim_{motor_port}_{index}");
-                    holder
-                        .inner
-                        .install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                    holder.inner.install(
+                        ctx,
+                        (&motor_port, index as i32),
+                        dtyp_key,
+                        motor,
+                        moving_poll_ms,
+                        idle_poll_ms,
+                    );
                     holder
                         .axes
                         .lock()

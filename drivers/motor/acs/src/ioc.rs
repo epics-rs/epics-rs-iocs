@@ -64,7 +64,14 @@ pub fn mcb4b_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef 
                 let ax = Mcb4bAxis::new(controller.clone(), index);
                 let dtyp_key = format!("MCB4B_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "MCB4BCreateController: card={card} asynPort={asyn_port} axes={num_axes} \

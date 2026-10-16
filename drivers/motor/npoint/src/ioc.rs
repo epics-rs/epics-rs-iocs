@@ -59,7 +59,14 @@ pub fn c300_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = C300Axis::new(controller.clone(), index);
                 let dtyp_key = format!("C300_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "C300CreateController: card={card} asynPort={asyn_port} axes={num_axes} \

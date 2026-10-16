@@ -78,7 +78,14 @@ pub fn sc800_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = KohzuAxis::new(controller.clone(), index);
                 let dtyp_key = format!("SC800_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "SC800Config: card={card} asynPort={asyn_port} axes={num_axes} \

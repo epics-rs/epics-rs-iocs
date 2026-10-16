@@ -72,7 +72,14 @@ pub fn mcs2_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 let ax = Mcs2Axis::new(controller.clone(), index);
                 let dtyp_key = format!("MCS2_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+                holder.install(
+                    ctx,
+                    (&card.to_string(), index as i32),
+                    dtyp_key,
+                    motor,
+                    moving_poll_ms,
+                    idle_poll_ms,
+                );
             }
             println!(
                 "MCS2CreateController: card={card} asynPort={asyn_port} axes={num_axes} \
@@ -191,7 +198,14 @@ pub fn scu_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 .map_err(|e| format!("smarActSCUCreateAxis: {e}"))?;
             let dtyp_key = format!("SCU_{card}_{axis_no}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                (&card.to_string(), axis_no as i32),
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "smarActSCUCreateAxis: card={card} axisNo={axis_no} channel={channel} \
@@ -309,7 +323,14 @@ pub fn mcs_create_axis_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 .map_err(|e| format!("smarActMCSCreateAxis: {e}"))?;
             let dtyp_key = format!("MCS_{card}_{axis_no}");
             let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-            holder.install(ctx, dtyp_key, motor, moving_poll_ms, idle_poll_ms);
+            holder.install(
+                ctx,
+                (&card.to_string(), axis_no as i32),
+                dtyp_key,
+                motor,
+                moving_poll_ms,
+                idle_poll_ms,
+            );
 
             println!(
                 "smarActMCSCreateAxis: card={card} axisNo={axis_no} channel={channel} \
