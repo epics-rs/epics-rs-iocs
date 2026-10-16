@@ -26,13 +26,6 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! - **Lexium (`LMM`/`LMD`) `PR IS` switch discovery.** The C reads the whole
-//!   `IS` I/O-setup block in one shot by temporarily forcing a NUL input EOS on
-//!   the raw octet interface. The asyn-rs `SyncIOHandle` has no per-read EOS
-//!   override, so this port discovers home/limit switch inputs only for the
-//!   MForce path (`PR S1`..`PR S4`); on a Lexium the switch inputs stay
-//!   unconfigured (no home/limit switch status is surfaced, matching a drive
-//!   with none of S1-S4 set).
 //! - **`saveToNVM` (`S`) / `clearLockedRotor` (`CF`) / locked-rotor readback
 //!   (`PR LR`).** These are asyn extra-parameter actions driven by separate PVs,
 //!   outside the motor record, so they are not part of the [`AsynMotor`]
@@ -41,9 +34,13 @@
 //!   `motorStatusActualVelocity`, `motorStatusDirection` or `motorStatusPowerOn`,
 //!   so those are left at their defaults here too.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -55,6 +52,31 @@ const READ_BUF: usize = 80;
 /// Port EOS set at connect (ImsMDrivePlusMotorController.cpp:81-82).
 pub const INPUT_EOS: &[u8] = b"\n";
 pub const OUTPUT_EOS: &[u8] = b"\r\n";
+
+/// `PR IS` read buffer and timeout (C `resp[1024]`, `IMS_TIMEOUT`).
+const IS_READ_BUF: usize = 1024;
+const IS_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `(input, function)` per line of a `PR IS` block: C turns every non-digit
+/// into a separator and scans `%d %d %d` (input, function, active level) from
+/// each LF-terminated line; text after the last LF is not scanned.
+fn parse_input_setup(block: &[u8]) -> Vec<(i32, i32)> {
+    let mut lines: Vec<&[u8]> = block.split(|&b| b == b'\n').collect();
+    lines.pop();
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            let mut nums = line
+                .split(|b| !b.is_ascii_digit())
+                .filter(|f| !f.is_empty())
+                .map(|f| std::str::from_utf8(f).ok()?.parse::<i32>().ok());
+            match (nums.next(), nums.next(), nums.next()) {
+                (Some(Some(input)), Some(Some(function)), Some(Some(_))) => Some((input, function)),
+                _ => None,
+            }
+        })
+        .collect()
+}
 
 fn ims_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
@@ -158,8 +180,11 @@ impl ImsMDrivePlusAxis {
         }
 
         if vlow.contains("lmm") || vlow.contains("lmd") {
-            // Lexium switch config comes from `PR IS`, which needs a block read
-            // this port cannot do (see module docs) — leave switches unconfigured.
+            if let Ok(block) = self.read_input_setup(port) {
+                for (input_no, function) in parse_input_setup(&block) {
+                    self.set_switch(function, input_no);
+                }
+            }
         } else {
             // MForce: read the S1-S4 I/O setup and map any home/limit inputs.
             for input_no in 1..=4 {
@@ -174,6 +199,46 @@ impl ImsMDrivePlusAxis {
             self.has_encoder = atoi(&resp) != 0;
         }
         Ok(())
+    }
+
+    /// Lexium `PR IS`: the whole I/O-setup block, read with a NUL input EOS
+    /// under the port lock so the read runs to the timeout and gathers every
+    /// line (ImsMDrivePlusMotorController.cpp:221-237). The input EOS is put
+    /// back to `\n` as C does, on every path.
+    fn read_input_setup(&self, port: &PortHandle) -> AsynResult<Vec<u8>> {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1 << 48);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let user = || {
+            let mut u = AsynUser::new(0).with_addr(0).with_timeout(IS_READ_TIMEOUT);
+            u.block_token = Some(token);
+            u
+        };
+        port.submit_blocking(RequestOp::BlockProcess { all_devices: true }, user())?;
+        let read = (|| {
+            port.set_input_eos_blocking(user(), b"\0")?;
+            port.submit_blocking(
+                RequestOp::OctetWrite {
+                    data: self.framed("PR IS"),
+                },
+                user(),
+            )?;
+            match port.submit_blocking(
+                RequestOp::OctetRead {
+                    buf_size: IS_READ_BUF,
+                },
+                user(),
+            ) {
+                Ok(r) => Ok(r.data.unwrap_or_default()),
+                Err(e) => e.partial_read().map(|p| p.data.clone()).ok_or(e),
+            }
+        })();
+        let restored = port.set_input_eos_blocking(user(), INPUT_EOS);
+        let unblocked =
+            port.submit_blocking(RequestOp::UnblockProcess { all_devices: true }, user());
+        let block = read?;
+        restored?;
+        unblocked?;
+        Ok(block)
     }
 
     /// Map an I/O setup type code to the switch input it configures (C
@@ -358,5 +423,13 @@ mod tests {
         // Party mode: device name prepended with no separator.
         assert_eq!(frame("M06", "MA 100"), b"M06MA 100");
         assert_eq!(frame("", "PR P"), b"PR P");
+    }
+
+    #[test]
+    fn input_setup_scans_each_lf_terminated_line() {
+        // Non-digits are separators; the unterminated tail is not scanned.
+        let block = b"IS = 1, 1, 0\r\nIS = 2, 2, 1\r\nIS = 3, 0, 0\r\nIS = 4, 3";
+        assert_eq!(parse_input_setup(block), vec![(1, 1), (2, 2), (3, 0)]);
+        assert_eq!(parse_input_setup(b"junk\n"), vec![]);
     }
 }
