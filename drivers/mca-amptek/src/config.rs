@@ -7,6 +7,9 @@
 
 use std::fmt::Write as _;
 
+use epics_rs::asyn::drivers::option_parse::sscanf_int;
+use epics_rs::base::calc::engine::strtod::strtod;
+
 use crate::status::DppType;
 
 pub const CLOCK_STRINGS: &[&str] = &["AUTO", "20", "80"];
@@ -145,73 +148,27 @@ fn find_value_after<'a>(cfg: &'a str, key: &str) -> Option<&'a str> {
     Some(&cfg[pos + key.len()..])
 }
 
-/// The leading `[+-]?[0-9]*\.?[0-9]*` prefix of `s` -- what C's
-/// `sscanf(pos, "%lf", ...)`/`sscanf(pos, "%d", ...)` would consume for
-/// every value `sendConfiguration` ever actually emits (`sprintf("%f",
-/// ...)` never produces scientific notation, hex, or `inf`/`nan`, so
-/// those `%f`/`%d` grammar corners are not reproduced).
-fn leading_decimal(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        i += 1;
-    }
-    let mut end = i;
-    let mut seen_dot = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'0'..=b'9' => {
-                i += 1;
-                end = i;
-            }
-            b'.' if !seen_dot => {
-                seen_dot = true;
-                i += 1;
-            }
-            _ => break,
-        }
-    }
-    &s[..end]
-}
-
 /// `drvAmptek::parseConfigDouble` (`drvAmptek.cpp:661-690`): `"OFF"` ->
-/// `0.0`; else the leading decimal prefix; `None` if `key` isn't present
-/// or nothing numeric follows it (C's two distinct `asynError` returns,
-/// collapsed here since both leave the target param unchanged).
+/// `0.0`, else `sscanf(pos, "%lf")`; `None` if `key` isn't present or
+/// nothing converts (C's two `asynError` returns, collapsed here since
+/// both leave the target param unchanged).
 fn parse_config_double(cfg: &str, key: &str) -> Option<f64> {
     let rest = find_value_after(cfg, key)?;
     if rest.starts_with("OFF") {
         return Some(0.0);
     }
-    let prefix = leading_decimal(rest);
-    if prefix.is_empty() || prefix == "+" || prefix == "-" {
-        None
-    } else {
-        prefix.parse().ok()
-    }
+    let parsed = strtod(rest.as_bytes());
+    (parsed.len > 0).then_some(parsed.value)
 }
 
 /// `drvAmptek::parseConfigInt` (`drvAmptek.cpp:692-721`): as
-/// [`parse_config_double`] but `%d` (no decimal point).
+/// [`parse_config_double`] but `sscanf(pos, "%d")`.
 fn parse_config_int(cfg: &str, key: &str) -> Option<i32> {
     let rest = find_value_after(cfg, key)?;
     if rest.starts_with("OFF") {
         return Some(0);
     }
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        i += 1;
-    }
-    let digits_start = i;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == digits_start {
-        None
-    } else {
-        rest[..i].parse().ok()
-    }
+    sscanf_int(rest)
 }
 
 /// `drvAmptek::parseConfigEnum` (`drvAmptek.cpp:723-748`): the index of
@@ -415,5 +372,19 @@ mod tests {
     #[test]
     fn parse_config_int_stops_at_non_digit() {
         assert_eq!(parse_config_int("MCAC=1024;NEXT=1;", "MCAC="), Some(1024));
+    }
+
+    /// The full `%lf`/`%d` grammar: leading space, exponent, `inf`
+    /// (`drvAmptek.cpp:677,708`).
+    #[test]
+    fn parse_config_numbers_follow_sscanf() {
+        assert_eq!(parse_config_double("TPEA= 1.5e1;", "TPEA="), Some(15.0));
+        assert_eq!(
+            parse_config_double("GAIN=inf;", "GAIN="),
+            Some(f64::INFINITY)
+        );
+        assert_eq!(parse_config_double("GAIN=.;", "GAIN="), None);
+        assert_eq!(parse_config_int("MCAC= 12.5;", "MCAC="), Some(12));
+        assert_eq!(parse_config_int("MCAC=x;", "MCAC="), None);
     }
 }
