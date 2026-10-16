@@ -427,8 +427,7 @@ impl NewportHolder {
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
                 let handle = connect_serial(&serial_port, AG_UC_TIMEOUT)?;
-                let controller = AgUcController::new(handle)
-                    .map_err(|e| format!("AG_UCCreateController: {e}"))?;
+                let controller = AgUcController::new(handle);
                 let model = controller.model();
                 holder
                     .ag_uc_controllers
@@ -521,8 +520,7 @@ impl NewportHolder {
                     has_limits,
                     forward_amplitude,
                     reverse_amplitude,
-                )
-                .map_err(|e| format!("AG_UCCreateAxis: {e}"))?;
+                );
                 let dtyp_key = format!("AG_UC_{motor_port}_{axis}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
 
