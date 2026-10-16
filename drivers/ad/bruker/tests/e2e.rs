@@ -390,3 +390,21 @@ fn a_binning_write_does_not_depend_on_bis() {
     assert_eq!(sync.read_int32(ad.bin_y).unwrap(), 2);
     assert!(sync.write_int32(ad.bin_x, 3).is_err());
 }
+
+/// BISTask ignores its getDoubleParam status (BISDetector.cpp:498), so a scan
+/// with no ADAcquireTime ever written still goes out to BIS, as 0 s.
+#[test]
+fn a_scan_without_an_acquire_time_still_reaches_bis() {
+    let fixture = Fixture::new("APX_NOTIME");
+    let ad = fixture.detector.ad_params;
+
+    fixture.sync.write_int32(ad.acquire, 1).expect("acquire");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut sent = fixture.string(ad.string_to_server);
+    while !sent.starts_with("[Scan ") && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        sent = fixture.string(ad.string_to_server);
+    }
+    assert!(sent.contains("/scantime=0.000000"), "last command {sent:?}");
+}

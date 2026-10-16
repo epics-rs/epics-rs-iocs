@@ -131,7 +131,8 @@ impl BrukerDetector {
         self.ad.port_base.get_int32_param(reason, 0).unwrap_or(0)
     }
 
-    /// Build the next frame's file name (C `asynNDArrayDriver::createFileName`).
+    /// Build the next frame's file name (C `asynNDArrayDriver::createFileName`,
+    /// which refuses when any of its five reads fails, asynNDArrayDriver.cpp:205-210).
     fn create_file_name(&mut self) -> AsynResult<()> {
         let p = self.ad.params.base;
         let base = &mut self.ad.port_base;
@@ -140,7 +141,7 @@ impl BrukerDetector {
         let template =
             String::from_utf8_lossy(base.get_string_param(p.file_template, 0)?).into_owned();
         let number = base.get_int32_param(p.file_number, 0)?;
-        let auto_increment = base.get_int32_param(p.auto_increment, 0).unwrap_or(0);
+        let auto_increment = base.get_int32_param(p.auto_increment, 0)?;
 
         let full = filename::expand(&template, &path, &name, number);
         base.set_string_param(p.full_file_name, 0, full)?;
@@ -158,17 +159,25 @@ impl BrukerDetector {
     /// command socket has exactly one user and the parameters the command is
     /// built from are read where they are owned.
     fn start_scan(&mut self) -> AsynResult<()> {
-        self.create_file_name()?;
+        // C ignores createFileName's status and every read here
+        // (BISDetector.cpp:496-505): a failed name leaves the last one in
+        // NDFullFileName.
+        let _ = self.create_file_name();
 
         let p = self.ad.params;
         let frame_type =
             FrameType::from_i32(self.get_i32(p.frame_type)).unwrap_or(FrameType::Normal);
-        let acquire_time = self.ad.port_base.get_float64_param(p.acquire_time, 0)?;
+        let acquire_time = self
+            .ad
+            .port_base
+            .get_float64_param(p.acquire_time, 0)
+            .unwrap_or(0.0);
         let num_darks = self.get_i32(self.params.num_darks);
         let file_name = String::from_utf8_lossy(
             self.ad
                 .port_base
-                .get_string_param(p.base.full_file_name, 0)?,
+                .get_string_param(p.base.full_file_name, 0)
+                .unwrap_or_default(),
         )
         .into_owned();
 
@@ -193,11 +202,13 @@ impl BrukerDetector {
         let open_delay = self
             .ad
             .port_base
-            .get_float64_param(p.shutter_open_delay, 0)?;
+            .get_float64_param(p.shutter_open_delay, 0)
+            .unwrap_or(0.0);
         let close_delay = self
             .ad
             .port_base
-            .get_float64_param(p.shutter_close_delay, 0)?;
+            .get_float64_param(p.shutter_close_delay, 0)
+            .unwrap_or(0.0);
         self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT);
 
         // Opening: wait out the difference between the opening and the closing
