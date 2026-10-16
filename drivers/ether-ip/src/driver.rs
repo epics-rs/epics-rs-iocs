@@ -378,7 +378,7 @@ fn scan_loop(plc: Arc<Plc>) {
         }
     }
 
-    if let Some(mut c) = plc.conn.lock().take() {
+    if let Some(c) = plc.conn.lock().take() {
         c.shutdown();
     }
     plc.connected.store(false, Ordering::Relaxed);
@@ -474,7 +474,7 @@ fn scan_pass(plc: &Arc<Plc>, conn: &mut Option<Connection>) -> Option<Duration> 
     if failed {
         // Drop the session and reconnect on the next turn.
         crate::eip_printf_time!(4, "EIP disconnecting {}\n", plc.name);
-        if let Some(mut c) = conn.take() {
+        if let Some(c) = conn.take() {
             c.shutdown();
         }
         plc.connected.store(false, Ordering::Relaxed);

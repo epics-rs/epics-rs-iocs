@@ -132,10 +132,9 @@ impl Connection {
     }
 
     /// `UnRegisterSession`, best effort; the socket closes on drop either way.
-    pub fn shutdown(&mut self) {
-        let msg = encap::encode_unregister_session(self.session, TransactionId::generate());
-        let _ = self.stream.write_all(&msg);
-    }
+    /// `EIP_shutdown`. Consuming the connection is what keeps the
+    /// UnRegisterSession single: [`Drop`] sends it.
+    pub fn shutdown(self) {}
 
     // -- framing ------------------------------------------------------------
 
@@ -659,7 +658,13 @@ fn command_name(command: u16) -> &'static str {
 impl Drop for Connection {
     fn drop(&mut self) {
         if self.session != 0 {
-            self.shutdown();
+            crate::eip_printf!(
+                9,
+                "EIP sending UnRegisterSession encapsulation command, session ID 0x{:08X}\n",
+                self.session
+            );
+            let msg = encap::encode_unregister_session(self.session, TransactionId::generate());
+            let _ = self.stream.write_all(&msg);
         }
     }
 }
