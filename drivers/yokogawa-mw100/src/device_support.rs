@@ -22,6 +22,7 @@
 //!   always Input, Comm/Const are always Output. `family_category` is that
 //!   one dispatcher, reused everywhere the C source reuses it.
 
+use crate::codec;
 use crate::instrument::{Command, Instrument, InterruptCategory, Registry};
 use crate::link::{self, ChannelAddress, ChannelFamily};
 use epics_rs::base::error::{CaError, CaResult};
@@ -158,21 +159,19 @@ fn require_no_arg(arg: Option<&str>, record_type: &str, command: &str) -> CaResu
 }
 
 /// `MODULE_PRESENCE` (bi) / `MODULE_STRING` (stringin): a bare 0-5 module
-/// index (`MAX_MODULES`), with the same defensive first-byte digit check
+/// index (`MAX_MODULES`), with the same first-byte 0-5 check
 /// every `devMW100_*.c::init_record` applies before `atoi` (`atoi` returning
 /// 0 on a non-numeric argument is ambiguous with the genuinely valid address
 /// 0).
 fn parse_module_index(arg: Option<&str>, record_type: &str, command: &str) -> CaResult<usize> {
     let arg = arg.ok_or_else(|| bad(record_type, format!("{command} requires an argument")))?;
-    if !arg.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+    if !matches!(arg.as_bytes().first(), Some(b'0'..=b'5')) {
         return Err(bad(
             record_type,
-            format!("{command} argument must be numeric"),
+            format!("{command} argument must start with 0-5"),
         ));
     }
-    let i: i32 = arg
-        .parse()
-        .map_err(|_| bad(record_type, format!("{command} argument must be numeric")))?;
+    let i = codec::c_atoi(arg.as_bytes());
     if !(0..=5).contains(&i) {
         return Err(bad(
             record_type,
@@ -483,13 +482,11 @@ fn resolve_operation(
             "ERROR" => {
                 let arg =
                     arg.ok_or_else(|| bad(record_type, "ERROR requires a channel argument"))?;
-                let channel: u32 = arg
-                    .parse()
-                    .map_err(|_| bad(record_type, "ERROR channel must be numeric"))?;
-                if channel == 0 || channel > 3 {
+                let channel = codec::c_atoi(arg.as_bytes());
+                if !(1..=3).contains(&channel) {
                     return Err(bad(record_type, "ERROR channel must be 1-3"));
                 }
-                Ok(Operation::ErrorText(channel))
+                Ok(Operation::ErrorText(channel as u32))
             }
             "UNIT" => Ok(Operation::Unit(parse_signal_or_math_address(
                 arg,
@@ -1241,6 +1238,29 @@ mod tests {
         ));
         assert!(resolve_operation("stringin", "ERROR", Some("0"), &instrument).is_err());
         assert!(resolve_operation("stringin", "ERROR", Some("4"), &instrument).is_err());
+        // atoi: trailing text is ignored.
+        assert!(matches!(
+            resolve_operation("stringin", "ERROR", Some("3x"), &instrument).unwrap(),
+            Operation::ErrorText(3)
+        ));
+    }
+
+    #[test]
+    fn module_index_is_first_byte_gated_atoi() {
+        let instrument = connect_default_fixture();
+        assert!(matches!(
+            resolve_operation("stringin", "MODULE_STRING", Some("2x"), &instrument).unwrap(),
+            Operation::ModuleString(2)
+        ));
+        assert!(matches!(
+            resolve_operation("stringin", "MODULE_STRING", Some("004"), &instrument).unwrap(),
+            Operation::ModuleString(4)
+        ));
+        // First byte must be '0'..'5' (devMW100_stringin.c:122), even when
+        // atoi would land in range.
+        assert!(resolve_operation("stringin", "MODULE_STRING", Some("6"), &instrument).is_err());
+        assert!(resolve_operation("stringin", "MODULE_STRING", Some("+1"), &instrument).is_err());
+        assert!(resolve_operation("stringin", "MODULE_STRING", Some("06"), &instrument).is_err());
     }
 
     #[test]

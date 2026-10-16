@@ -10,6 +10,8 @@
 //! `constant[60]`), and via every `devMW100_*.c::init_record`'s own
 //! `switch(arg[0])` never having a `'W'` (VarConst) arm.
 
+use crate::codec::c_strtol;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelFamily {
     Signal,
@@ -62,37 +64,45 @@ pub fn parse_link(text: &str) -> Option<ParsedLink<'_>> {
 
 /// Parse a family-prefixed channel address: bare digits (`Signal`, 1-60),
 /// `A<n>` (`Math`, 1-300), `C<n>` (`Comm`, 1-300), `K<n>` (`Const`, 1-60).
-/// Returns `None` on a malformed or out-of-range address.
+/// The number is read with C `atoi`/`strtol` (`devMW100_ai.c:105-145`), so
+/// trailing text after the digits is ignored. Returns `None` on an
+/// out-of-range address.
 pub fn parse_channel_address(arg: &str) -> Option<ChannelAddress> {
-    let mut chars = arg.chars();
-    let first = chars.next()?;
-    let (family, digits, max): (_, &str, u32) = match first {
-        '0'..='9' => (ChannelFamily::Signal, arg, 60),
-        'A' => (ChannelFamily::Math, arg.get(1..)?, 300),
-        'C' => (ChannelFamily::Comm, arg.get(1..)?, 300),
-        'K' => (ChannelFamily::Const, arg.get(1..)?, 60),
-        _ => return None,
-    };
-    let index: u32 = digits.parse().ok()?;
-    if index == 0 || index > max {
-        return None;
-    }
-    Some(ChannelAddress { family, index })
+    parse_channel_address_end(arg).map(|(addr, _)| addr)
 }
 
-/// `ALARM:<addr>.<1-4>` — a channel address plus a mandatory `.N` sub-index
-/// (`devMW100_mbbi.c:1123-1133`).
+/// [`parse_channel_address`] plus the byte offset `strtol` leaves its end
+/// pointer at.
+fn parse_channel_address_end(arg: &str) -> Option<(ChannelAddress, usize)> {
+    let (family, start, max) = match *arg.as_bytes().first()? {
+        b'0'..=b'9' => (ChannelFamily::Signal, 0, 60),
+        b'A' => (ChannelFamily::Math, 1, 300),
+        b'C' => (ChannelFamily::Comm, 1, 300),
+        b'K' => (ChannelFamily::Const, 1, 60),
+        _ => return None,
+    };
+    let (value, len) = c_strtol(&arg.as_bytes()[start..]);
+    let index = value as i32;
+    if index <= 0 || index > max {
+        return None;
+    }
+    Some((
+        ChannelAddress {
+            family,
+            index: index as u32,
+        },
+        start + len,
+    ))
+}
+
+/// `ALARM:<addr>.<1-4>`: the `strtol` end pointer must be followed by `.`,
+/// one digit 1-4 and the end of the argument (`devMW100_mbbi.c:163-205`).
 pub fn parse_alarm_address(arg: &str) -> Option<(ChannelAddress, u8)> {
-    let (addr_part, sub_part) = arg.split_once('.')?;
-    let addr = parse_channel_address(addr_part)?;
-    if sub_part.len() != 1 {
-        return None;
+    let (addr, end) = parse_channel_address_end(arg)?;
+    match arg.as_bytes()[end..] {
+        [b'.', sub @ b'1'..=b'4'] => Some((addr, sub - b'0')),
+        _ => None,
     }
-    let sub = sub_part.as_bytes()[0];
-    if !(b'1'..=b'4').contains(&sub) {
-        return None;
-    }
-    Some((addr, sub - b'0'))
 }
 
 #[cfg(test)]
@@ -173,6 +183,26 @@ mod tests {
     }
 
     #[test]
+    fn address_number_uses_c_atoi() {
+        let signal = |index| ChannelAddress {
+            family: ChannelFamily::Signal,
+            index,
+        };
+        assert_eq!(parse_channel_address("1.5"), Some(signal(1)));
+        assert_eq!(parse_channel_address("07abc"), Some(signal(7)));
+        assert_eq!(
+            parse_channel_address("C+3"),
+            Some(ChannelAddress {
+                family: ChannelFamily::Comm,
+                index: 3
+            })
+        );
+        assert_eq!(parse_channel_address("A-3"), None);
+        // int truncation of the long: 2^32 + 5 reads back as 5.
+        assert_eq!(parse_channel_address("4294967301"), Some(signal(5)));
+    }
+
+    #[test]
     fn alarm_sub_address() {
         assert_eq!(
             parse_alarm_address("27.2"),
@@ -188,5 +218,17 @@ mod tests {
         assert_eq!(parse_alarm_address("27.5"), None);
         assert_eq!(parse_alarm_address("27"), None);
         assert_eq!(parse_alarm_address("27.12"), None);
+        // The strtol end pointer, not the first '.', anchors the sub-index.
+        assert_eq!(parse_alarm_address("27x.2"), None);
+        assert_eq!(
+            parse_alarm_address("A+12.4"),
+            Some((
+                ChannelAddress {
+                    family: ChannelFamily::Math,
+                    index: 12
+                },
+                4
+            ))
+        );
     }
 }
