@@ -38,9 +38,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::util::{atof, atoi, max_digits};
@@ -58,6 +60,24 @@ const MM4000_HOME: u8 = 0x20;
 
 /// Bounded replacement for C's unbounded MM4005 torque-off busy-wait.
 const TORQUE_OFF_MAX_TRIES: usize = 50;
+
+/// `asynPrint(pasynUser, ASYN_TRACE_ERROR, ...)` on the user connected to
+/// `(port, addr)`.
+fn print_error(port: &str, addr: i32, args: std::fmt::Arguments<'_>) {
+    PortManager::global()
+        .trace_manager()
+        .print(Some(port), Some(addr), 0, TraceMask::ERROR, args);
+}
+
+/// C `sendOnly`/`sendAndReceive` turn an exchange that did not write the
+/// whole command into `asynError`, whatever the port said: a refused queue
+/// prints and polls as status 3, not 4.
+fn c_exchange_error(e: AsynError, written: usize, requested: usize) -> AsynError {
+    if written == requested {
+        return e;
+    }
+    mm_err(e.message())
+}
 
 fn mm_err(message: String) -> AsynError {
     AsynError::Status {
@@ -123,6 +143,12 @@ struct Mm4000PollData {
 /// controller-wide poll. The caller holds the `Arc<Mutex<..>>` lock.
 pub struct Mm4000Controller {
     handle: SyncIOHandle,
+    /// The octet port C's `pController->pasynUser` prints its exchange
+    /// errors on.
+    serial_port: String,
+    /// The motor port whose axis users the poller prints on
+    /// (drvMotorAsyn.c:413).
+    motor_port: String,
     firmware: String,
     model: Mm4000Model,
     num_axes: usize,
@@ -138,9 +164,17 @@ impl Mm4000Controller {
     /// cover `num_axes`. `None` is C's refused config: a failed `VE;` says
     /// nothing, the other refusals print C's line. Performs blocking serial
     /// I/O.
-    pub fn new(handle: SyncIOHandle, num_axes: usize, cache_ttl: Duration) -> Option<Self> {
+    pub fn new(
+        handle: SyncIOHandle,
+        serial_port: &str,
+        motor_port: &str,
+        num_axes: usize,
+        cache_ttl: Duration,
+    ) -> Option<Self> {
         let mut ctrl = Self {
             handle,
+            serial_port: serial_port.to_owned(),
+            motor_port: motor_port.to_owned(),
             firmware: String::new(),
             model: Mm4000Model::Mm4000,
             num_axes,
@@ -178,14 +212,44 @@ impl Mm4000Controller {
 
     /// Write a command (C `sendOnly`); the port output EOS terminates it.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, cmd.as_bytes())?;
-        Ok(())
+        let (sent, e) = match self.handle.write_octet(0, cmd.as_bytes()) {
+            Ok(n) if n == cmd.len() => return Ok(()),
+            Ok(n) => (n, mm_err("short write".into())),
+            Err(e) => (e.partial_write().unwrap_or(0), e),
+        };
+        let e = c_exchange_error(e, sent, cmd.len());
+        print_error(
+            &self.serial_port,
+            0,
+            format_args!(
+                "drvMM4000Asyn:sendOnly: error sending command {cmd}, sent={sent}, status={}\n",
+                e.status() as i32
+            ),
+        );
+        Err(e)
     }
 
     /// Write a command and read the reply (C `sendAndReceive`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
+        let e = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
+            Ok(raw) => return Ok(String::from_utf8_lossy(&raw).into_owned()),
+            Err(e) => e,
+        };
+        let written = match e.octet_step() {
+            Some(OctetStep::Read) => cmd.len(),
+            _ => e.partial_write().unwrap_or(0),
+        };
+        let e = c_exchange_error(e, written, cmd.len());
+        print_error(
+            &self.serial_port,
+            0,
+            format_args!(
+                "drvMM4000Asyn:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+                e.status() as i32,
+                e.message()
+            ),
+        );
+        Err(e)
     }
 
     /// Controller-wide poll with a TTL cache: `MS;` + `TP;` + `TE;` at most
@@ -203,8 +267,12 @@ impl Mm4000Controller {
             problem: false,
             comms_error: false,
         };
-        match (self.write_read("MS;"), self.write_read("TP;")) {
-            (Ok(status_all), Ok(position_all)) => {
+        // C sends `TP;` only after `MS;` succeeded.
+        match self
+            .write_read("MS;")
+            .and_then(|ms| Ok((ms, self.write_read("TP;")?)))
+        {
+            Ok((status_all, position_all)) => {
                 for axis in 0..self.num_axes {
                     data.status_bytes[axis] = parse_axis_status(&status_all, axis);
                     data.positions[axis] = parse_axis_position(&position_all, axis);
@@ -215,7 +283,13 @@ impl Mm4000Controller {
                 match self.write_read("TE;") {
                     Ok(te) => {
                         if !te_ok(&te) {
-                            eprintln!("MM4000: controller error {te}");
+                            for axis in 0..self.num_axes {
+                                print_error(
+                                    &self.motor_port,
+                                    axis as i32,
+                                    format_args!("MM4000Poller: controller error {te}\n"),
+                                );
+                            }
                             data.problem = true;
                         }
                     }
@@ -224,7 +298,14 @@ impl Mm4000Controller {
             }
             // C MM4000Poller sets only motorAxisCommError; every other
             // parameter keeps the last value read.
-            _ => {
+            Err(e) => {
+                for axis in 0..self.num_axes {
+                    print_error(
+                        &self.motor_port,
+                        axis as i32,
+                        format_args!("MM4000Poller: error reading status={}\n", e.status() as i32),
+                    );
+                }
                 data = Mm4000PollData {
                     comms_error: true,
                     ..self.cache.clone()
@@ -484,6 +565,7 @@ mod tests {
         base: epics_rs::asyn::port::PortDriverBase,
         dead: Arc<AtomicBool>,
         reply: Vec<u8>,
+        sent: Arc<Mutex<Vec<String>>>,
     }
 
     impl epics_rs::asyn::port::PortDriver for Line {
@@ -494,7 +576,9 @@ mod tests {
             &mut self.base
         }
         fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-            self.reply = match String::from_utf8_lossy(data).trim_end() {
+            let cmd = String::from_utf8_lossy(data).trim_end().to_owned();
+            self.sent.lock().unwrap().push(cmd.clone());
+            self.reply = match cmd.as_str() {
                 "VE;" => b"VEMM4000 Version 2.04".to_vec(),
                 "TP;" => b"1TP5.0000".to_vec(),
                 "MS;" => b"1MS@".to_vec(),
@@ -523,10 +607,12 @@ mod tests {
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let dead = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(Mutex::new(Vec::new()));
         let line = Line {
             base: PortDriverBase::new("mm4000_dead", 1, PortFlags::default()),
             dead: dead.clone(),
             reply: Vec::new(),
+            sent: sent.clone(),
         };
         let (rt, _jh) = create_port_runtime(
             &claim_port("mm4000_dead").unwrap(),
@@ -535,13 +621,17 @@ mod tests {
         )
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
-        let ctrl = Mm4000Controller::new(io, 1, Duration::ZERO).unwrap();
+        let ctrl = Mm4000Controller::new(io, "mm4000_dead", "mm4000_dead_motor", 1, Duration::ZERO)
+            .unwrap();
         let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         let user = AsynUser::default();
         assert_eq!(axis.poll(&user).unwrap().position, 5.0);
 
         dead.store(true, Ordering::SeqCst);
+        sent.lock().unwrap().clear();
         let status = axis.poll(&user).unwrap();
+        // C sends `TP;` only after `MS;` succeeded.
+        assert_eq!(*sent.lock().unwrap(), ["MS;"]);
         assert!(status.comms_error);
         assert_eq!(status.position, 5.0, "a dead line reads back as 0");
         assert!(status.done);
@@ -561,6 +651,7 @@ mod tests {
                 base: PortDriverBase::new(name, 1, PortFlags::default()),
                 dead: Arc::new(AtomicBool::new(dead)),
                 reply: Vec::new(),
+                sent: Arc::default(),
             };
             let (rt, _jh) =
                 create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
@@ -568,10 +659,32 @@ mod tests {
             let io =
                 SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
             assert!(
-                Mm4000Controller::new(io, num_axes, Duration::ZERO).is_none(),
+                Mm4000Controller::new(io, name, name, num_axes, Duration::ZERO).is_none(),
                 "{name}"
             );
         }
+    }
+
+    /// drvMM4000Asyn.c:928,951: `nWrite != nWriteRequested` makes it asynError.
+    #[test]
+    fn an_exchange_short_of_the_command_is_asyn_error() {
+        let refused = AsynError::Status {
+            status: AsynStatus::Disconnected,
+            message: "port SERIAL1 not connected".into(),
+        };
+        let e = c_exchange_error(refused, 0, 3);
+        assert_eq!(
+            (e.status(), e.message()),
+            (AsynStatus::Error, "port SERIAL1 not connected".into())
+        );
+        let timeout = AsynError::Status {
+            status: AsynStatus::Timeout,
+            message: String::new(),
+        };
+        assert_eq!(
+            c_exchange_error(timeout, 3, 3).status(),
+            AsynStatus::Timeout
+        );
     }
 
     #[test]

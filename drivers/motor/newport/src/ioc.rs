@@ -1770,7 +1770,9 @@ impl NewportHolder {
                 // Six per-axis polls share one controller-wide exchange (see
                 // the HXP driver for the TTL rationale).
                 let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-                let Some(controller) = Mm4000Controller::new(handle, num_axes, cache_ttl) else {
+                let Some(controller) =
+                    Mm4000Controller::new(handle, &serial_port, &motor_port, num_axes, cache_ttl)
+                else {
                     return Ok(CommandOutcome::Continue);
                 };
                 let firmware = controller.firmware().to_string();
