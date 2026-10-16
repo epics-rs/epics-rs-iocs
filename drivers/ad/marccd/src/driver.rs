@@ -416,4 +416,23 @@ mod tests {
         assert_eq!(sent[0], "get_mode");
         assert!(sent[1].starts_with("set_bin"), "{sent:?}");
     }
+
+    #[test]
+    fn the_raw_buffer_is_charged_after_get_config() {
+        let (det, _) = after_init("MARCCD_RAW", |c| {
+            if c.starts_with("get_mode") {
+                "1"
+            } else if c.starts_with("get_size") {
+                "64,32"
+            } else if c.starts_with("get_bin") {
+                "2,2"
+            } else if c.starts_with("get_") {
+                "0"
+            } else {
+                ""
+            }
+        });
+        assert_eq!(det.pool().num_alloc_buffers(), 1);
+        assert_eq!(det.pool().allocated_bytes(), 128 * 64 * 2);
+    }
 }

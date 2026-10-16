@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use epics_rs::ad_core::driver::ADStatus;
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::DriverPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
@@ -521,6 +521,9 @@ pub(crate) fn start_cmd_task(
 }
 
 async fn cmd_loop(w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
+    // C `pData` (marCCD.cpp:1556-1560): allocated once and never read, so it
+    // stays charged on the pool for the driver's life.
+    let mut _raw_buffer: Option<DriverArray> = None;
     while let Some(cmd) = rx.recv().await {
         match cmd {
             Cmd::Init => {
@@ -538,6 +541,11 @@ async fn cmd_loop(w: Worker, mut rx: rt::CommandReceiver<Cmd>) {
                 }
                 srv.get_config().await;
                 srv.get_state().await;
+                let dims = vec![
+                    NDDimension::new(srv.get_i32(srv.ad.max_size_x).await as usize),
+                    NDDimension::new(srv.get_i32(srv.ad.max_size_y).await as usize),
+                ];
+                _raw_buffer = w.pool.alloc(dims, NDDataType::Int16).ok();
             }
             Cmd::StartAcquire => {
                 let s = w.get_state().await;
