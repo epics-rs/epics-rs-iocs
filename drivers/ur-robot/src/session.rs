@@ -142,16 +142,8 @@ impl Session {
     /// Handle the non-data control packages (`RTDE::receive`'s switch).
     fn apply_control_package(&mut self, cmd: u8, body: &[u8]) -> UrResult<()> {
         match cmd {
-            rtde::cmd::TEXT_MESSAGE => {
-                // First byte is the message length (rtde.cpp:370).
-                if let Some((&len, rest)) = body.split_first() {
-                    let n = (len as usize).min(rest.len());
-                    log::info!(
-                        "ur-robot: controller message: {}",
-                        String::from_utf8_lossy(&rest[..n])
-                    );
-                }
-            }
+            // rtde.cpp prints a text message only under its compiled-out DEBUG.
+            rtde::cmd::TEXT_MESSAGE => {}
             rtde::cmd::CONTROL_PACKAGE_SETUP_INPUTS => {
                 if rtde::input_setup_in_use(body) {
                     return Err(UrError::InputRegistersInUse);
