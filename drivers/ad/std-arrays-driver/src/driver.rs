@@ -125,8 +125,9 @@ impl NdStdArraysDriver {
         })
     }
 
-    fn get_i32(&self, reason: usize, default: i32) -> i32 {
-        self.port_base.get_int32_param(reason, 0).unwrap_or(default)
+    /// C reads these ignoring the status, so an unset param is 0.
+    fn get_i32(&self, reason: usize) -> i32 {
+        self.port_base.get_int32_param(reason, 0).unwrap_or(0)
     }
 
     /// `asynNDArrayDriver::setIntegerParam` (asynNDArrayDriver.cpp:636-663):
@@ -242,12 +243,11 @@ impl NdStdArraysDriver {
 
         // NDDriverStdArrays.cpp:141-142: silently ignore writes when not
         // acquiring.
-        if self.get_i32(self.params.acquire, 0) == 0 {
+        if self.get_i32(self.params.acquire) == 0 {
             return Ok(());
         }
 
-        let data_type_code =
-            self.get_i32(self.params.base.data_type, NDDataType::UInt8 as u8 as i32);
+        let data_type_code = self.get_i32(self.params.base.data_type);
         let data_type = match u8::try_from(data_type_code)
             .ok()
             .and_then(NDDataType::from_ordinal)
@@ -260,12 +260,12 @@ impl NdStdArraysDriver {
                 return Ok(());
             }
         };
-        let color_mode = self.get_i32(self.params.base.color_mode, 0);
-        let callback_mode = self.get_i32(self.ndsa.callback_mode, 0);
-        let append_mode = self.get_i32(self.ndsa.append_mode, 0);
-        let num_dimensions = self.get_i32(self.params.base.n_dimensions, 0).max(0) as usize;
-        let new_array = self.get_i32(self.ndsa.new_array, 0);
-        let array_callbacks = self.get_i32(self.params.base.array_callbacks, 0);
+        let color_mode = self.get_i32(self.params.base.color_mode);
+        let callback_mode = self.get_i32(self.ndsa.callback_mode);
+        let append_mode = self.get_i32(self.ndsa.append_mode);
+        let num_dimensions = self.get_i32(self.params.base.n_dimensions).max(0) as usize;
+        let new_array = self.get_i32(self.ndsa.new_array);
+        let array_callbacks = self.get_i32(self.params.base.array_callbacks);
 
         if append_mode == 0 || (append_mode == 1 && new_array != 0) {
             self.allocate_array(
@@ -279,14 +279,14 @@ impl NdStdArraysDriver {
 
         // arrayInfo_.nElements is the current buffer's element count.
         let total = self.current.as_ref().map(|a| a.data.len()).unwrap_or(0);
-        let next_element = self.get_i32(self.ndsa.next_element, 0).max(0) as usize;
+        let next_element = self.get_i32(self.ndsa.next_element).max(0) as usize;
 
         // NDDriverStdArrays.cpp:221-223: clamp the write to the buffer tail.
         let mut n = n_elements;
         if next_element + n >= total {
             n = total.saturating_sub(next_element);
         }
-        let stride = self.get_i32(self.ndsa.stride, 1).max(0) as usize;
+        let stride = self.get_i32(self.ndsa.stride).max(0) as usize;
 
         if let Some(array) = self.current.as_mut() {
             convert::copy_buffer(&mut array.data, next_element, stride, &input[..n]);
@@ -326,11 +326,11 @@ impl NdStdArraysDriver {
 
     /// `setArrayComplete` (NDDriverStdArrays.cpp:281-308).
     fn set_array_complete(&mut self) -> AsynResult<()> {
-        let num_images = self.get_i32(self.params.num_images, 0);
-        let num_images_counter = self.get_i32(self.params.num_images_counter, 0) + 1;
-        let callback_mode = self.get_i32(self.ndsa.callback_mode, 0);
-        let image_mode = self.get_i32(self.params.image_mode, 0);
-        let array_callbacks = self.get_i32(self.params.base.array_callbacks, 0);
+        let num_images = self.get_i32(self.params.num_images);
+        let num_images_counter = self.get_i32(self.params.num_images_counter) + 1;
+        let callback_mode = self.get_i32(self.ndsa.callback_mode);
+        let image_mode = self.get_i32(self.params.image_mode);
+        let array_callbacks = self.get_i32(self.params.base.array_callbacks);
 
         self.port_base
             .set_int32_param(self.params.num_images_counter, 0, num_images_counter)?;
@@ -357,7 +357,7 @@ impl NdStdArraysDriver {
         if self.current.is_none() {
             return Ok(());
         }
-        let counter = self.get_i32(self.params.base.array_counter, 0) + 1;
+        let counter = self.get_i32(self.params.base.array_counter) + 1;
         self.port_base
             .set_int32_param(self.params.base.array_counter, 0, counter)?;
 
@@ -392,7 +392,7 @@ impl NdStdArraysDriver {
         } else if reason == self.params.base.pool_pre_alloc {
             if let Some(template) = self.current.clone() {
                 let count = self
-                    .get_i32(self.params.base.pool_num_pre_alloc_buffers, 0)
+                    .get_i32(self.params.base.pool_num_pre_alloc_buffers)
                     .max(0) as usize;
                 self.pool
                     .pre_allocate_buffers(&template, count)
@@ -459,7 +459,7 @@ impl PortDriver for NdStdArraysDriver {
         } else if reason == self.ndsa.new_array {
             let _ = self.port_base.set_int32_param(self.ndsa.next_element, 0, 0);
         } else if reason == self.ndsa.array_complete {
-            if self.get_i32(self.ndsa.append_mode, 0) != 0 {
+            if self.get_i32(self.ndsa.append_mode) != 0 {
                 let _ = self.set_array_complete();
             }
         } else if self.ndsa.belongs_to_base(reason) {
