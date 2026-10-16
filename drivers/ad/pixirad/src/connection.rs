@@ -53,6 +53,23 @@ impl From<AsynError> for ServerError {
     }
 }
 
+impl From<ServerError> for AsynError {
+    fn from(e: ServerError) -> Self {
+        match e {
+            ServerError::Timeout => AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "timeout".into(),
+            },
+            ServerError::Transport(e) => e,
+            // C's `status = asynError` on a reply without `GOT:`.
+            e @ ServerError::Rejected(_) => AsynError::Status {
+                status: AsynStatus::Error,
+                message: e.to_string(),
+            },
+        }
+    }
+}
+
 pub type ServerResult<T> = Result<T, ServerError>;
 
 /// What one exchange with the box produced.

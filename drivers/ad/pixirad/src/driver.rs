@@ -27,7 +27,7 @@ use epics_rs::ad_core::plugin::channel::{
     ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
 };
 
-use crate::connection::PixiradServer;
+use crate::connection::{Exchange, PixiradServer};
 use crate::params::PixiradParams;
 use crate::protocol;
 use crate::task::{self, DataContext, StatusContext};
@@ -131,11 +131,12 @@ impl PixiradDetector {
 
         // The firmware will not take a high-voltage setting unless it differs
         // from the last one it saw, so the initial value is sent twice, once
-        // one volt off.
+        // one volt off. C ignores both statuses: a box that is not there yet
+        // still gets a driver.
         det.set_float64(det.params.hv_value, INITIAL_HV_VALUE - 1.0)?;
-        det.set_cooling_and_hv()?;
+        let _ = det.set_cooling_and_hv();
         det.set_float64(det.params.hv_value, INITIAL_HV_VALUE)?;
-        det.set_cooling_and_hv()?;
+        let _ = det.set_cooling_and_hv();
 
         det.identify()?;
         det.ad.port_base.call_param_callbacks(0)?;
@@ -144,14 +145,14 @@ impl PixiradDetector {
 
     /// Ask the box who it is (C's constructor).
     fn identify(&mut self) -> AsynResult<()> {
-        let reply = self.command(&protocol::get_firmware_version())?;
+        let reply = self.exchange(&protocol::get_firmware_version())?.reply;
         if let Some((serial, version)) = protocol::parse_firmware_version(&reply) {
             let base = &mut self.ad.port_base;
             base.set_string_param(self.ad.params.base.serial_number, 0, serial)?;
             base.set_string_param(self.ad.params.base.firmware_version, 0, version)?;
         }
 
-        let reply = self.command(&protocol::get_additional_info())?;
+        let reply = self.exchange(&protocol::get_additional_info())?.reply;
         // C added the length of the marker to a null `strstr` result and
         // published whatever was at that address.
         if let Some(info) = protocol::parse_additional_info(&reply) {
@@ -163,9 +164,13 @@ impl PixiradDetector {
         Ok(())
     }
 
-    /// Send one command; publish both sides of it and whether the box took it
-    /// (C `writeReadServer`).
-    fn command(&mut self, command: &str) -> AsynResult<String> {
+    /// Send one command and return its status (C `writeReadServer`).
+    fn command(&mut self, command: &str) -> AsynResult<()> {
+        self.exchange(command)?.result.map_err(AsynError::from)
+    }
+
+    /// Send one command; publish both sides of it and whether the box took it.
+    fn exchange(&mut self, command: &str) -> AsynResult<Exchange> {
         let exchange = self.server.command(command);
         let message = match &exchange.result {
             Ok(()) => "Server returned OK",
@@ -175,7 +180,7 @@ impl PixiradDetector {
         base.set_string_param(self.ad.params.status_message, 0, message)?;
         base.set_string_param(self.ad.params.string_to_server, 0, command)?;
         base.set_string_param(self.ad.params.string_from_server, 0, exchange.reply.clone())?;
-        Ok(exchange.reply)
+        Ok(exchange)
     }
 
     fn get_i32(&self, reason: usize) -> i32 {
@@ -207,8 +212,7 @@ impl PixiradDetector {
             self.get_f64(self.params.hv_value),
             self.get_i32(self.params.hv_state),
         );
-        self.command(&command)?;
-        Ok(())
+        self.command(&command)
     }
 
     /// `DAQ:! SET_SYNC` (C `setSync`).
@@ -220,8 +224,7 @@ impl PixiradDetector {
         let function = SyncOutFunction::from_i32(self.get_i32(self.params.sync_out_function))
             .unwrap_or(SyncOutFunction::Shutter);
         let command = protocol::set_sync(sync_in, sync_out, function);
-        self.command(&command)?;
-        Ok(())
+        self.command(&command)
     }
 
     fn frame_type(&self) -> FrameType {
@@ -266,18 +269,18 @@ impl PixiradDetector {
                 readout_mode,
             ),
         };
-        self.command(&command)?;
-        Ok(())
+        self.command(&command)
     }
 
     /// `DAQ:! AUTOCAL` between two threshold settings (C `doAutoCalibrate`).
     fn do_auto_calibrate(&mut self) -> AsynResult<()> {
         self.reset_frame_counters()?;
-        // The reference has to be off while the chip calibrates itself.
-        self.set_thresholds(0)?;
-        self.command(&protocol::autocal())?;
-        self.set_thresholds(1)?;
-        Ok(())
+        // The reference has to be off while the chip calibrates itself. C
+        // returns the AUTOCAL status alone.
+        let _ = self.set_thresholds(0);
+        let status = self.command(&protocol::autocal());
+        let _ = self.set_thresholds(1);
+        status
     }
 
     fn reset_frame_counters(&mut self) -> AsynResult<()> {
@@ -305,31 +308,31 @@ impl PixiradDetector {
             hv_mode,
         );
         self.reset_frame_counters()?;
-        self.command(&command)?;
-        Ok(())
+        self.command(&command)
     }
 
     /// Reboot the box and put back everything it forgot (C `systemReset`).
     fn system_reset(&mut self) -> AsynResult<()> {
         self.ad.port_base.call_param_callbacks(0)?;
-        self.command(&protocol::system_reset())?;
+        // C carries on through every step and returns the last one's status.
+        let _ = self.command(&protocol::system_reset());
         self.server.reconnect_after(DETECTOR_RESET_TIME);
 
-        self.set_sync()?;
-        self.set_thresholds(1)?;
+        let _ = self.set_sync();
+        let _ = self.set_thresholds(1);
 
         // Same firmware quirk as at startup: two different high-voltage values.
         let hv_value = self.get_f64(self.params.hv_value);
         let hv_state = self.get_i32(self.params.hv_state);
         self.set_float64(self.params.hv_value, hv_value - 1.0)?;
         self.set_int32(self.params.hv_state, 1)?;
-        self.set_cooling_and_hv()?;
+        let _ = self.set_cooling_and_hv();
         self.set_float64(self.params.hv_value, hv_value)?;
         self.set_int32(self.params.hv_state, hv_state)?;
-        self.set_cooling_and_hv()?;
+        let status = self.set_cooling_and_hv();
 
         self.set_int32(self.params.system_reset, 0)?;
-        Ok(())
+        status
     }
 }
 
@@ -356,7 +359,7 @@ impl PortDriver for PixiradDetector {
             if value != 0 && !was_acquiring {
                 status = self.start_acquire();
             } else if value == 0 && was_acquiring {
-                status = self.command(&protocol::acquisition_break()).map(|_| ());
+                status = self.command(&protocol::acquisition_break());
             }
         } else if reason == q.sync_in_polarity
             || reason == q.sync_out_polarity
@@ -607,4 +610,110 @@ pub fn create_pixirad_detector(
         queued_counter,
         threads,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
+    use epics_rs::asyn::registry::claim_port;
+
+    /// A box that answers `GOT:` to every command except those containing
+    /// `reject`; `None` is a box that never accepts the connection.
+    fn detector(name: &str, reject: Option<&'static str>) -> PixiradDetector {
+        let addr = match reject {
+            None => "127.0.0.1:1".to_string(),
+            Some(reject) => {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap().to_string();
+                std::thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        let command = String::from_utf8_lossy(&buf[..n]);
+                        let reply: &[u8] = if command.contains(reject) {
+                            b"NAK"
+                        } else {
+                            b"GOT: OK"
+                        };
+                        if stream.write_all(reply).is_err() {
+                            break;
+                        }
+                    }
+                });
+                addr
+            }
+        };
+        let ip = format!("{name}_IP");
+        let driver = DrvAsynIPPort::new(&ip, &addr).unwrap();
+        let (runtime, _) =
+            create_port_runtime(&claim_port(&ip).unwrap(), driver, RuntimeConfig::default())
+                .unwrap();
+        let handle = runtime.port_handle().clone();
+        std::mem::forget(runtime);
+        let shared = Arc::new(SharedState {
+            udp_buffers_read: AtomicI32::new(0),
+            queued_frames: AtomicI32::new(0),
+            max_buffers: 1,
+            udp_speed: AtomicU64::new(0),
+        });
+        let sensor = Sensor::from_size(476, 512).unwrap();
+        PixiradDetector::new(
+            name,
+            PixiradServer::new(handle),
+            sensor,
+            476,
+            512,
+            1 << 20,
+            shared,
+        )
+        .expect("C builds the driver whatever the box answers")
+    }
+
+    #[test]
+    fn a_dead_box_is_the_status_of_a_write_that_talks_to_it() {
+        let mut det = detector("PIXI_DEAD", None);
+        let q = det.params;
+        let e = det
+            .write_int32(&mut AsynUser::new(q.hv_state), 0)
+            .unwrap_err();
+        assert_ne!(e.status(), AsynStatus::Success);
+        assert!(
+            det.write_float64(&mut AsynUser::new(q.hit_threshold), 1.0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_reply_without_got_is_an_error() {
+        let mut det = detector("PIXI_NAK", Some("DAQ:! INIT"));
+        let q = det.params;
+        let e = det
+            .write_int32(&mut AsynUser::new(q.cooling_state), 1)
+            .unwrap_err();
+        assert_eq!(e.status(), AsynStatus::Error);
+        // A command the box takes is a success.
+        det.write_int32(&mut AsynUser::new(q.sync_in_polarity), 1)
+            .unwrap();
+    }
+
+    #[test]
+    fn auto_calibrate_reports_the_autocal_status_alone() {
+        let mut det = detector("PIXI_AUTOCAL_NAK", Some("AUTOCAL"));
+        let q = det.params;
+        assert!(
+            det.write_int32(&mut AsynUser::new(q.auto_calibrate), 1)
+                .is_err()
+        );
+
+        let mut det = detector("PIXI_THRESH_NAK", Some("SET_SENSOR_OPERATINGS"));
+        det.write_int32(&mut AsynUser::new(q.auto_calibrate), 1)
+            .unwrap();
+    }
 }
