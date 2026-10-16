@@ -32,6 +32,7 @@ use crate::params::{
 };
 use crate::rest::{self, ApiVersion, RestApi};
 use crate::stream::{StreamApi, StreamMessage};
+use crate::stream2::{Frame, Stream2Api};
 use crate::tiff;
 
 /// The only thing the control task waits for on a channel.
@@ -806,6 +807,7 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
                 codec: None,
                 attributes: attrs,
                 threshold_index: frame.threshold,
+                timestamp: None,
             },
             array_callbacks,
         )
@@ -1003,6 +1005,7 @@ async fn monitor_task(s: Arc<Shared>) {
                             None,
                             NDAttributeList::new(),
                             unique_id,
+                            None,
                         );
                         unique_id += 1;
                         ArrayPublisher::new(s.outputs.monitor.clone())
@@ -1030,28 +1033,35 @@ async fn stream_task(
     done_tx: rt::CommandSender<bool>,
 ) {
     let mut api: Option<StreamApi> = None;
+    let mut api2: Option<Stream2Api> = None;
 
     while start_rx.recv().await.is_some() {
         let version = s.get_int(s.p.stream_version).await;
-        // Stream2 (CBOR) is not ported.
-        if version != STREAM_VERSION_STREAM {
+        let connected = if version == STREAM_VERSION_STREAM {
+            if api.is_none() {
+                api = StreamApi::connect(&s.hostname).await.ok();
+            }
+            api.is_some()
+        } else {
+            if api2.is_none() {
+                api2 = Stream2Api::connect(&s.hostname).await.ok();
+            }
+            api2.is_some()
+        };
+        if !connected {
+            s.trace()
+                .err("streamTask", "mStreamAPI is null, Stream API not enabled?");
             let _ = done_tx.send(false).await;
             continue;
         }
 
-        if api.is_none() {
-            match StreamApi::connect(&s.hostname).await {
-                Ok(a) => api = Some(a),
-                Err(_) => {
-                    s.trace()
-                        .err("streamTask", "mStreamAPI is null, Stream API not enabled?");
-                    let _ = done_tx.send(false).await;
-                    continue;
-                }
+        let complete = match (api.as_mut(), api2.as_mut()) {
+            (Some(stream), _) if version == STREAM_VERSION_STREAM => {
+                stream_series(&s, stream).await
             }
-        }
-        let stream = api.as_mut().expect("just connected");
-        let complete = stream_series(&s, stream).await;
+            (_, Some(stream)) => stream2_series(&s, stream).await,
+            _ => unreachable!("connected above"),
+        };
         s.stream_complete.store(complete, Ordering::Release);
 
         s.fetch(s.p.stream_dropped).await;
@@ -1129,11 +1139,97 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                         codec: frame.codec,
                         attributes: NDAttributeList::new(),
                         threshold_index: 0,
+                        timestamp: None,
                     },
                     array_callbacks,
                 )
                 .await;
             }
+        }
+    }
+}
+
+/// [`stream_series`] for StreamVersion=Stream2 (the `mStream2API` branches of
+/// C `streamTask`).
+async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
+    let timeout = Duration::from_secs(1);
+    let ts_source = s.get_int(s.p.stream_as_ts_source).await != 0;
+
+    // C reads the status as an int in streamApi.h's code space
+    // (`Stream2Error::code`): 1 timeout, 2 stray packet, 3 error.
+    loop {
+        match stream.get_header(timeout).await {
+            Ok(()) => break,
+            Err(e) => match e.code() {
+                1 => {}
+                2 => s.trace().err("streamTask", "got stray packet, ignoring"),
+                3 => {
+                    s.trace().err("streamTask", "failed to get header packet");
+                    return false;
+                }
+                _ => {
+                    s.trace()
+                        .err("streamTask", "unknown err from mStreamAPI->getHeader()");
+                    return false;
+                }
+            },
+        }
+        if s.flags.stop.load(Ordering::Acquire) {
+            return false;
+        }
+    }
+
+    loop {
+        let num_thresholds = match stream.wait_frame(timeout).await {
+            Ok(Frame::End) => return true,
+            Ok(Frame::Image(n)) => n,
+            Err(e) => match e.code() {
+                1 => continue,
+                3 => {
+                    s.trace().err("streamTask", "failed to get frame packet");
+                    return false;
+                }
+                _ => {
+                    s.trace()
+                        .err("streamTask", "unknown err from mStreamAPI->waitFrame()");
+                    return false;
+                }
+            },
+        };
+
+        for thresh in 0..num_thresholds {
+            let decompress = s.get_int(s.p.stream_decompress).await != 0;
+            // UPSTREAM DEFECT (eigerDetector.cpp:1505): C does not test what
+            // getFrame returns and publishes `pArray` regardless, unset when the
+            // data type was unknown. Here that frame is skipped.
+            let Ok(frame) = stream.get_frame(thresh, decompress, ts_source) else {
+                continue;
+            };
+            let signed_data = s.get_int(s.p.signed_data).await != 0;
+            let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
+            let data = if signed_data && frame.codec.is_none() {
+                reinterpret_signed(frame.data)
+            } else {
+                frame.data
+            };
+            let mut attributes = NDAttributeList::new();
+            if let Some((number, energy)) = frame.threshold {
+                attributes.add(threshold_number_attr(number));
+                attributes.add(threshold_energy_attr(energy));
+            }
+            publish(
+                s,
+                Image {
+                    dims: frame.dims,
+                    data,
+                    codec: frame.codec,
+                    attributes,
+                    threshold_index: thresh,
+                    timestamp: frame.timestamp,
+                },
+                array_callbacks,
+            )
+            .await;
         }
     }
 }
@@ -1162,14 +1258,24 @@ fn build_array(
     codec: Option<epics_rs::ad_core::codec::Codec>,
     attributes: NDAttributeList,
     unique_id: i32,
+    timestamp: Option<EpicsTimestamp>,
 ) -> NDArray {
     let mut array = NDArray::with_data(
         vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
         data,
     );
     array.unique_id = unique_id;
-    array.timestamp = EpicsTimestamp::now();
-    array.time_stamp = array.timestamp.as_f64();
+    match timestamp {
+        // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337).
+        Some(ts) => {
+            array.timestamp = ts;
+            array.time_stamp = f64::from(ts.sec) + f64::from(ts.nsec) / 1.0e9;
+        }
+        None => {
+            array.timestamp = EpicsTimestamp::now();
+            array.time_stamp = array.timestamp.as_f64();
+        }
+    }
     array.attributes = attributes;
     array.codec = codec;
     array
@@ -1188,6 +1294,9 @@ struct Image {
     /// 0-based threshold index; picks `outputs.thresholds[i]`, which is C's
     /// asyn address `thresh + 1`.
     threshold_index: usize,
+    /// The stream2 frame time when STREAM_AS_TIMESTAMP_SOURCE is set; `None`
+    /// stamps the array now.
+    timestamp: Option<EpicsTimestamp>,
 }
 
 async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
@@ -1197,9 +1306,12 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
         codec,
         attributes,
         threshold_index,
+        timestamp,
     } = image;
     let counter = s.get_int(s.ad.base.array_counter).await + 1;
-    let array = Arc::new(build_array(dims, data, codec, attributes, counter));
+    let array = Arc::new(build_array(
+        dims, data, codec, attributes, counter, timestamp,
+    ));
 
     if array_callbacks {
         ArrayPublisher::new(s.outputs.main.clone())

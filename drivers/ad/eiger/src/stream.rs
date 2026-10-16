@@ -1,6 +1,6 @@
 //! SIMPLON ZeroMQ stream interface, version 1 (port of `streamApi.cpp`).
 //!
-//! The detector PUSHes multipart messages on tcp://<host>:9999. The C driver
+//! The detector PUSHes multipart messages on `tcp://HOST:9999`. The C driver
 //! links libzmq and pulls the parts one `zmq_msg_recv` at a time; this port uses
 //! `zeromq` (zmq.rs, pure Rust), whose `recv` hands back the whole multipart
 //! message, so the part-by-part state machine collapses into a match on the

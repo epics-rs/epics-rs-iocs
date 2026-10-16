@@ -3,7 +3,7 @@
 //!
 //! Source: `areaDetector/ADEiger/eigerApp/src/{eigerDetector,restApi,eigerParam,streamApi}.cpp`.
 //!
-//! Every C dependency has a pure-Rust replacement: `libzmq` → `zeromq`,
+//! Every C dependency has a pure-Rust replacement: `libzmq` → `zeromq`, tinycbor → [`stream2`]'s parser,
 //! `libhdf5` + the bslz4 HDF5 plugin → `hdf5-reader` + [`bslz4`], `libcurl` →
 //! `ureq`.
 
@@ -23,6 +23,7 @@ pub mod param;
 pub mod params;
 pub mod rest;
 pub mod stream;
+pub mod stream2;
 pub mod tasks;
 pub mod tiff;
 pub mod trace;
