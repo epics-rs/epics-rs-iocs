@@ -50,7 +50,8 @@
 //! counts-per-unit (CPU) integer fraction (`PI_PARA_MOT_CPU_Z`/`_N`,
 //! `getResolution`) used only to convert between the record's raw-step frame
 //! and the controller's EGU — at the asyn-rs motor boundary (already EGU) that
-//! conversion cancels, so it is dropped here: no CPU query, `MRES` = 1.
+//! conversion cancels, so it is dropped here: no CPU query. The record's
+//! `MRES` must still be the axis resolution: raw counts are integers.
 //!
 //! ## Config (single-step, matching upstream — not a two-step registry)
 //!
