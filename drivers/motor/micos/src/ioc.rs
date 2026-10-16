@@ -13,7 +13,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::connect_ip;
+use motor_common::connect::{connect_controller, connect_ip};
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -55,10 +55,17 @@ pub fn corvus_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_ip(&corvus_port, CORVUS_TIMEOUT)?;
-            let controller = Arc::new(Mutex::new(CorvusController::new(handle, num_axes as usize)));
-
             register_port(ctx, &port_name, num_axes as i32)?;
+
+            let (handle, _) = connect_controller(
+                &corvus_port,
+                CORVUS_TIMEOUT,
+                &port_name,
+                format_args!(
+                    "SMCcorvusController::SMCcorvusController: cannot connect to SMC corvus controller"
+                ),
+            );
+            let controller = Arc::new(Mutex::new(CorvusController::new(handle, num_axes as usize)));
 
             for index in 0..num_axes as usize {
                 let ax = CorvusAxis::new(controller.clone(), index)
