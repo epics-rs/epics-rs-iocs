@@ -527,7 +527,7 @@ mod tests {
                     message: "rejected".into(),
                 });
             }
-            self.base.params.set_int32(user.reason, user.addr, value)
+            self.base.set_int32_param(user.reason, user.addr, value)
         }
     }
 

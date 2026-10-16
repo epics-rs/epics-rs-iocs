@@ -364,9 +364,8 @@ impl FastSweepDriver {
             base.create_param(FAST_SWEEP_CURRENT_CHANNEL, ParamType::Int32)?;
         // C `setIntegerParam(fastSweepMaxChannels_, maxPoints_);
         // setIntegerParam(fastSweepCurrentChannel_, 0);` (`drvFastSweep.cpp:113-114`).
-        base.params
-            .set_int32(max_channels_idx, 0, max_points as i32)?;
-        base.params.set_int32(current_channel_idx, 0, 0)?;
+        base.set_int32_param(max_channels_idx, 0, max_points as i32)?;
+        base.set_int32_param(current_channel_idx, 0, 0)?;
 
         let shared = Arc::new(Shared {
             state: Mutex::new(SweepState::new(max_signals, max_points)),
@@ -527,7 +526,7 @@ impl PortDriver for FastSweepDriver {
         // C `setIntegerParam(command, value)` -- the 2-arg overload,
         // addr-0 always (see module doc's "every scalar param collapses to
         // addr 0" quirk).
-        self.base.params.set_int32(reason, 0, value)?;
+        self.base.set_int32_param(reason, 0, value)?;
 
         let r = self.shared.reasons;
         let mut result = Ok(());
@@ -545,14 +544,12 @@ impl PortDriver for FastSweepDriver {
             };
             if just_started {
                 self.base
-                    .params
-                    .set_int32(r[McaReason::Acquiring as usize], 0, 1)?;
+                    .set_int32_param(r[McaReason::Acquiring as usize], 0, 1)?;
             }
         } else if reason == r[McaReason::StopAcquire as usize] {
             self.shared.state.lock().unwrap().stop_acquire();
             self.base
-                .params
-                .set_int32(r[McaReason::Acquiring as usize], 0, 0)?;
+                .set_int32_param(r[McaReason::Acquiring as usize], 0, 0)?;
         } else if reason == r[McaReason::Erase as usize] {
             {
                 let mut state = self.shared.state.lock().unwrap();
@@ -562,8 +559,7 @@ impl PortDriver for FastSweepDriver {
                 state.start_time = Instant::now();
             }
             self.base
-                .params
-                .set_float64(r[McaReason::ElapsedRealTime as usize], 0, 0.0)?;
+                .set_float64_param(r[McaReason::ElapsedRealTime as usize], 0, 0.0)?;
         } else if reason == r[McaReason::NumChannels as usize] {
             let mut state = self.shared.state.lock().unwrap();
             // C caches the value (above) before this bounds check, and the
@@ -586,7 +582,7 @@ impl PortDriver for FastSweepDriver {
     /// C `writeFloat64` (`drvFastSweep.cpp:327-343`).
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        self.base.params.set_float64(reason, 0, value)?;
+        self.base.set_float64_param(reason, 0, value)?;
 
         let r = self.shared.reasons;
 
@@ -598,8 +594,7 @@ impl PortDriver for FastSweepDriver {
                 state.dwell_time
             };
             self.base
-                .params
-                .set_float64(r[McaReason::DwellTime as usize], 0, dwell)?;
+                .set_float64_param(r[McaReason::DwellTime as usize], 0, dwell)?;
         } else if reason == r[McaReason::PresetRealTime as usize] {
             self.shared.state.lock().unwrap().real_time = value;
         }

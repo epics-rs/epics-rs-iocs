@@ -222,7 +222,7 @@ impl EigerDriver {
 
         // The description is "<manufacturer> <model>".
         let description =
-            String::from_utf8_lossy(base.params.get_string(self.p.description, 0)?).into_owned();
+            String::from_utf8_lossy(base.get_string_param(self.p.description, 0)?).into_owned();
         let (manufacturer, model) = match description.split_once(' ') {
             Some((m, rest)) => (m.to_string(), rest.to_string()),
             None => (description.clone(), String::new()),
@@ -274,8 +274,7 @@ impl EigerDriver {
     fn string_param(&self, index: usize) -> AsynResult<String> {
         self.ad
             .port_base
-            .params
-            .get_string(index, 0)
+            .get_string_param(index, 0)
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     }
 
@@ -293,8 +292,7 @@ impl EigerDriver {
         let current = self
             .ad
             .port_base
-            .params
-            .get_float64(index, 0)
+            .get_float64_param(index, 0)
             .unwrap_or(f64::NAN);
         let updates = self.ops.put_f64(index, value, current).map_err(rest_err)?;
         self.apply(updates)
@@ -437,7 +435,7 @@ impl EigerDriver {
         } else if reason == self.p.file_perms {
             self.put_int(reason, value & FILE_PERMS_MASK)?;
         } else if Some(reason) == self.p.hv_reset {
-            let reset_time = self.ad.port_base.params.get_float64(
+            let reset_time = self.ad.port_base.get_float64_param(
                 self.p
                     .hv_reset_time
                     .expect("hv_reset implies hv_reset_time"),

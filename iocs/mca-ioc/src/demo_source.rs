@@ -98,8 +98,7 @@ pub fn connect(
     );
     let data_reason = base.create_param(DEMO_SOURCE_DATA, ParamType::Int32Array)?;
     let period_reason = base.create_param(DEMO_SOURCE_SCAN_PERIOD, ParamType::Float64)?;
-    base.params
-        .set_float64(period_reason, 0, period.as_secs_f64())?;
+    base.set_float64_param(period_reason, 0, period.as_secs_f64())?;
 
     let driver = DemoSourceDriver { base };
     let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;

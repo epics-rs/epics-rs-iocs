@@ -901,7 +901,7 @@ mod tests {
 
         // The store happens either way: the readback follows the record.
         assert_eq!(
-            driver.base.params.get_int32(params.disconnect, 0).ok(),
+            driver.base.get_int32_param(params.disconnect, 0).ok(),
             Some(1)
         );
     }

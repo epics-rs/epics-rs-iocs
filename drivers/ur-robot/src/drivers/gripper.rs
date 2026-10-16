@@ -229,7 +229,7 @@ impl GripperDriver {
     /// activation cycle.
     fn apply_pending_activation(&self, gripper: &mut RobotiqGripper) {
         let p = self.params;
-        if self.base.params.get_int32(p.activate, 0).unwrap_or(0) == 0 {
+        if self.base.get_int32_param(p.activate, 0).unwrap_or(0) == 0 {
             return;
         }
         if let Err(e) = gripper.activate(false) {
@@ -273,8 +273,8 @@ impl PortDriver for GripperDriver {
                 return Ok(());
             }
             if reason == p.set_position_range {
-                let min = self.base.params.get_int32(p.min_position, 0).unwrap_or(0);
-                let max = self.base.params.get_int32(p.max_position, 0).unwrap_or(0);
+                let min = self.base.get_int32_param(p.min_position, 0).unwrap_or(0);
+                let max = self.base.get_int32_param(p.max_position, 0).unwrap_or(0);
                 self.gripper.lock().set_native_position_range(min, max);
                 spdlog::debug(format_args!("setNativePositionRange(min={min}, max={max})"));
                 return Ok(());

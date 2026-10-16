@@ -196,8 +196,7 @@ impl PixiradDetector {
     fn get_f64(&self, reason: usize) -> f64 {
         self.ad
             .port_base
-            .params
-            .get_float64(reason, 0)
+            .get_float64_param(reason, 0)
             .unwrap_or(0.0)
     }
 
