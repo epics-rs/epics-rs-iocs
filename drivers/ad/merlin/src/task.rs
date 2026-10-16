@@ -12,6 +12,7 @@ use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::color::NDColorMode;
@@ -72,9 +73,7 @@ async fn status_loop(handle: PortHandle, ad: ADBaseParams, init_param: usize) {
     // Run the startup sequence on the port actor: it owns the command channel,
     // so this is the only way to touch the device without a second owner.
     let sync = SyncIOHandle::from_handle(handle.clone(), 0, Duration::from_secs(60));
-    if let Err(e) = sync.write_int32(init_param, 1) {
-        log::error!("merlin: startup sequence failed: {e}");
-    }
+    let _ = sync.write_int32(init_param, 1);
 
     loop {
         rt::sleep(STATUS_POLL).await;
@@ -116,7 +115,10 @@ async fn data_loop(ctx: AcquisitionContext) {
             // An idle detector sends nothing; that is not an error.
             Err(ChannelError::Timeout) => continue,
             Err(e) => {
-                log::error!("merlin: error on the Labview data channel: {e}");
+                ctx.data.trace(&format!(
+                    "merlinDetector:merlinTask: error in Labview data channel response, status={}",
+                    e.code()
+                ));
                 let _ = ctx
                     .handle
                     .set_params_and_notify(
@@ -186,10 +188,7 @@ async fn data_loop(ctx: AcquisitionContext) {
                     publish_profiles(&ctx, &body, array_counter, start, &acquisition_header).await;
                 }
                 DataHeader::Unknown => {
-                    log::error!(
-                        "merlin: unknown data frame type '{}'",
-                        String::from_utf8_lossy(&body[..body.len().min(MPX_MSG_DATATYPE_LEN)])
-                    );
+                    trace(&ctx.handle, "Unknown header type 3");
                 }
             }
         }
@@ -229,6 +228,27 @@ async fn data_loop(ctx: AcquisitionContext) {
     }
 }
 
+/// C prints these on `pasynUserSelf`, the detector port.
+fn trace(handle: &PortHandle, msg: &str) {
+    handle
+        .trace()
+        .output(handle.port_name(), TraceMask::ERROR, msg);
+}
+
+async fn set_status_message(ctx: &AcquisitionContext, msg: &str) {
+    let _ = ctx
+        .handle
+        .set_params_and_notify(
+            0,
+            vec![ParamSetValue::new(
+                ctx.ad_params.status_message,
+                0,
+                ParamValue::Octet(msg.as_bytes().into()),
+            )],
+        )
+        .await;
+}
+
 fn build_attributes(parsed: &[(String, NDAttrValue)], acquisition_header: &str) -> NDAttributeList {
     let mut attrs = NDAttributeList::new();
     for (name, value) in parsed {
@@ -259,11 +279,16 @@ async fn publish_image(
 ) {
     let header = match protocol::parse_mq_header(body) {
         Ok(h) => h,
-        Err(e) => {
-            log::error!("merlin: bad MQ1 frame header: {e}");
-            return;
-        }
+        Err(_) => return,
     };
+    if !matches!(header.pixel_depth, 8 | 16 | 32) {
+        trace(
+            &ctx.handle,
+            &format!("Unsupported bit depth {}", header.pixel_depth),
+        );
+        set_status_message(ctx, "Error: Unsupported bit depth").await;
+        return;
+    }
     let data = match image::decode_image(
         body,
         header.offset,
@@ -273,24 +298,8 @@ async fn publish_image(
         ctx.det_type.swaps_pixels(),
     ) {
         Ok(d) => d,
-        Err(e) => {
-            log::error!(
-                "merlin: cannot decode a {}-bit {}x{} frame: {e}",
-                header.pixel_depth,
-                header.x_size,
-                header.y_size
-            );
-            let _ = ctx
-                .handle
-                .set_params_and_notify(
-                    0,
-                    vec![ParamSetValue::new(
-                        ctx.ad_params.status_message,
-                        0,
-                        ParamValue::Octet("Error: unsupported frame".as_bytes().into()),
-                    )],
-                )
-                .await;
+        Err(_) => {
+            set_status_message(ctx, "Error: unsupported frame").await;
             return;
         }
     };
@@ -318,18 +327,18 @@ async fn publish_profiles(
 ) {
     let header = match protocol::parse_mq_header(body) {
         Ok(h) => h,
-        Err(e) => {
-            log::error!("merlin: bad PR1 frame header: {e}");
-            return;
-        }
+        Err(_) => return,
     };
     // The device echoes the PROFILES mask it acquired with; we can only lay
     // out a frame that carries both profiles and the sum.
     let expected = MPXPROFILES_XPROFILE | MPXPROFILES_YPROFILE | MPXPROFILES_SUM;
     if header.profile_select != expected {
-        log::error!(
-            "merlin: unsupported PROFILES mode {}",
-            header.profile_select
+        trace(
+            &ctx.handle,
+            &format!(
+                "merlinDetector:merlinTask: unsupported PROFILES mode {}",
+                header.profile_select
+            ),
         );
         return;
     }
@@ -342,10 +351,7 @@ async fn publish_profiles(
         ctx.det_type.swaps_pixels(),
     ) {
         Ok(p) => p,
-        Err(e) => {
-            log::error!("merlin: cannot decode a profile frame: {e}");
-            return;
-        }
+        Err(_) => return,
     };
 
     let _ = ctx

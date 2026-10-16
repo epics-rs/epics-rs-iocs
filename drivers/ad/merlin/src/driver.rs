@@ -140,12 +140,9 @@ impl MerlinDetector {
         self.get_threshold()?;
 
         // C read SOFTWAREVERSION into a local and threw it away.
-        match self.cmd.get(MPXVAR_GETSOFTWAREVERSION, default_timeout()) {
-            Ok(version) => {
-                let base = &mut self.ad.port_base;
-                base.set_string_param(self.ad.params.base.sdk_version, 0, version)?;
-            }
-            Err(e) => log::error!("merlin: could not read the Labview software version: {e}"),
+        if let Ok(version) = self.cmd.get(MPXVAR_GETSOFTWAREVERSION, default_timeout()) {
+            let base = &mut self.ad.port_base;
+            base.set_string_param(self.ad.params.base.sdk_version, 0, version)?;
         }
 
         let base = &mut self.ad.port_base;
@@ -171,11 +168,11 @@ impl MerlinDetector {
             DetectorType::MerlinXbpm | DetectorType::UomXbpm
         ) {
             let exposures = self.get_i32(self.ad.params.num_exposures);
-            self.set_or_log(MPXVAR_IMAGESTOSUM, &exposures.to_string());
+            self.try_set(MPXVAR_IMAGESTOSUM, &exposures.to_string());
             let bkg = self.get_i32(self.params.enable_background_corr);
-            self.set_or_log(MPXVAR_ENABLEBACKROUNDCORR, &bkg.to_string());
+            self.try_set(MPXVAR_ENABLEBACKROUNDCORR, &bkg.to_string());
             let sum = self.get_i32(self.params.enable_image_sum);
-            self.set_or_log(MPXVAR_ENABLEIMAGEAVERAGE, &sum.to_string());
+            self.try_set(MPXVAR_ENABLEIMAGEAVERAGE, &sum.to_string());
         }
 
         // Clamp the values the device will reject, writing the clamp back so
@@ -219,14 +216,14 @@ impl MerlinDetector {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
-        self.set_or_log(MPXVAR_NUMFRAMESPERTRIGGER, &num_exposures.to_string());
-        self.set_or_log(MPXVAR_COUNTERDEPTH, &counter_depth.to_string());
+        self.try_set(MPXVAR_NUMFRAMESPERTRIGGER, &num_exposures.to_string());
+        self.try_set(MPXVAR_COUNTERDEPTH, &counter_depth.to_string());
         // The device takes milliseconds.
-        self.set_or_log(
+        self.try_set(
             MPXVAR_ACQUISITIONTIME,
             &format!("{:.6}", acquire_time * 1000.0),
         );
-        self.set_or_log(
+        self.try_set(
             MPXVAR_ACQUISITIONPERIOD,
             &format!("{:.6}", acquire_period * 1000.0),
         );
@@ -242,9 +239,9 @@ impl MerlinDetector {
             // C sets no stop trigger for software triggering.
             TriggerMode::SoftwareTrigger => (TM_TRIG_SOFTWARE, None),
         };
-        self.set_or_log(MPXVAR_TRIGGERSTART, start);
+        self.try_set(MPXVAR_TRIGGERSTART, start);
         if let Some(stop) = stop {
-            self.set_or_log(MPXVAR_TRIGGERSTOP, stop);
+            self.try_set(MPXVAR_TRIGGERSTOP, stop);
         }
 
         // The server may lengthen the period to fit the readout time; take its
@@ -296,7 +293,7 @@ impl MerlinDetector {
         base.set_int32_param(self.ad.params.bin_y, 0, binning[1])?;
 
         let value = format!("{} {} {} {}", offset[0], offset[1], size[0], size[1]);
-        self.set_or_log(MPXVAR_ROI, &value);
+        self.try_set(MPXVAR_ROI, &value);
         Ok(())
     }
 
@@ -335,10 +332,10 @@ impl MerlinDetector {
         let step = self.get_f64(self.params.step_threshold_scan);
         let scan = self.get_i32(self.params.threshold_scan);
 
-        self.set_or_log(MPXVAR_THSTART, &format!("{start:.6}"));
-        self.set_or_log(MPXVAR_THSTOP, &format!("{stop:.6}"));
-        self.set_or_log(MPXVAR_THSTEP, &format!("{step:.6}"));
-        self.set_or_log(MPXVAR_THSSCAN, &scan.to_string());
+        self.try_set(MPXVAR_THSTART, &format!("{start:.6}"));
+        self.try_set(MPXVAR_THSTOP, &format!("{stop:.6}"));
+        self.try_set(MPXVAR_THSTEP, &format!("{step:.6}"));
+        self.try_set(MPXVAR_THSSCAN, &scan.to_string());
 
         for (name, reason) in [
             (MPXVAR_THSTART, self.params.start_threshold_scan),
@@ -369,7 +366,7 @@ impl MerlinDetector {
                     .port_base
                     .set_int32_param(self.params.enable_counter1, 0, v)?;
             }
-            self.set_or_log(MPXVAR_ENABLECOUNTER1, &v.to_string());
+            self.try_set(MPXVAR_ENABLECOUNTER1, &v.to_string());
         }
         if reason == self.params.continuous_rw {
             let mut v = self.get_i32(self.params.continuous_rw);
@@ -379,7 +376,7 @@ impl MerlinDetector {
                     .port_base
                     .set_int32_param(self.params.continuous_rw, 0, v)?;
             }
-            self.set_or_log(MPXVAR_CONTINUOUSRW, &v.to_string());
+            self.try_set(MPXVAR_CONTINUOUSRW, &v.to_string());
         }
 
         if let Some(v) = self.cmd.get_i32(MPXVAR_ENABLECOUNTER1, timeout) {
@@ -398,7 +395,6 @@ impl MerlinDetector {
     /// Apply one of the six canned Quad modes (C `SetQuadMode`).
     fn set_quad_mode(&mut self, mode: i32) -> AsynResult<()> {
         let Some(s) = quad_mode_settings(mode) else {
-            log::error!("merlin: unknown Quad mode {mode}");
             return Ok(());
         };
         self.shared
@@ -408,11 +404,11 @@ impl MerlinDetector {
             .port_base
             .set_int32_param(self.params.counter_depth, 0, s.counter_depth)?;
 
-        self.set_or_log(MPXVAR_COUNTERDEPTH, &s.counter_depth.to_string());
-        self.set_or_log(MPXVAR_ENABLECOUNTER1, &s.enable_counter1.to_string());
-        self.set_or_log(MPXVAR_CONTINUOUSRW, &s.continuous_rw.to_string());
-        self.set_or_log(MPXVAR_COLOURMODE, &s.colour_mode.to_string());
-        self.set_or_log(MPXVAR_CHARGESUMMING, &s.charge_summing.to_string());
+        self.try_set(MPXVAR_COUNTERDEPTH, &s.counter_depth.to_string());
+        self.try_set(MPXVAR_ENABLECOUNTER1, &s.enable_counter1.to_string());
+        self.try_set(MPXVAR_CONTINUOUSRW, &s.continuous_rw.to_string());
+        self.try_set(MPXVAR_COLOURMODE, &s.colour_mode.to_string());
+        self.try_set(MPXVAR_CHARGESUMMING, &s.charge_summing.to_string());
         Ok(())
     }
 
@@ -470,43 +466,33 @@ impl MerlinDetector {
 
             match image_mode {
                 MerlinImageMode::ThresholdScan => {
-                    if let Err(e) = self.cmd.command(MPXCMD_THSCAN, timeout) {
-                        log::error!("merlin: THSCAN failed: {e}");
-                    }
+                    let _ = self.cmd.command(MPXCMD_THSCAN, timeout);
                 }
                 MerlinImageMode::BackgroundCalibrate => {
-                    self.set_or_log(MPXVAR_BACKGROUNDCOUNT, &images_to_acquire.to_string());
-                    if let Err(e) = self.cmd.command(MPXCMD_BACKGROUNDACQUIRE, timeout) {
-                        log::error!("merlin: BCKGRND failed: {e}");
-                    }
+                    self.try_set(MPXVAR_BACKGROUNDCOUNT, &images_to_acquire.to_string());
+                    let _ = self.cmd.command(MPXCMD_BACKGROUNDACQUIRE, timeout);
                 }
                 _ => {
-                    self.set_or_log(MPXVAR_NUMFRAMESTOACQUIRE, &images_to_acquire.to_string());
+                    self.try_set(MPXVAR_NUMFRAMESTOACQUIRE, &images_to_acquire.to_string());
                     let cmd = if profile_mask & MPXPROFILES_IMAGE != 0 {
                         MPXCMD_STARTACQUISITION
                     } else {
                         MPXCMD_PROFILES
                     };
-                    if let Err(e) = self.cmd.command(cmd, timeout) {
-                        log::error!("merlin: {cmd} failed: {e}");
-                    }
+                    let _ = self.cmd.command(cmd, timeout);
                 }
             }
         } else if value == 0 && status == ADStatus::Acquire as i32 {
             self.ad
                 .port_base
                 .set_int32_param(self.ad.params.status, 0, ADStatus::Idle as i32)?;
-            if let Err(e) = self.cmd.command(MPXCMD_STOPACQUISITION, timeout) {
-                log::error!("merlin: STOPACQUISITION failed: {e}");
-            }
+            let _ = self.cmd.command(MPXCMD_STOPACQUISITION, timeout);
         }
         Ok(())
     }
 
-    fn set_or_log(&self, name: &str, value: &str) {
-        if let Err(e) = self.cmd.set(name, value, default_timeout()) {
-            log::error!("merlin: SET {name} {value} failed: {e}");
-        }
+    fn try_set(&self, name: &str, value: &str) {
+        let _ = self.cmd.set(name, value, default_timeout());
     }
 }
 
@@ -534,21 +520,16 @@ impl PortDriver for MerlinDetector {
         if reason == self.init_param {
             self.initialise()?;
         } else if reason == self.params.reset {
-            if let Err(e) = self.cmd.command(MPXCMD_RESET, default_timeout()) {
-                log::error!("merlin: RESET failed: {e}");
-            }
+            let _ = self.cmd.command(MPXCMD_RESET, default_timeout());
             // The Labview server cannot be reconnected to after a reset, so C
             // exits the IOC and relies on a supervisor to restart it. Keeping
             // the IOC up would leave every channel dead with no way back.
-            log::error!("merlin: RESET issued — exiting so the IOC can be restarted");
             self.ad.port_base.call_param_callbacks(0)?;
             std::process::exit(0);
         } else if reason == self.params.quad_merlin_mode {
             self.set_quad_mode(value)?;
         } else if reason == self.params.software_trigger {
-            if let Err(e) = self.cmd.command(MPXCMD_SOFTWARETRIGGER, default_timeout()) {
-                log::error!("merlin: SWTRIGGER failed: {e}");
-            }
+            let _ = self.cmd.command(MPXCMD_SOFTWARETRIGGER, default_timeout());
         } else if reason == self.ad.params.acquire {
             self.set_acquire(value)?;
         } else if reason == self.ad.params.trigger_mode
@@ -570,7 +551,7 @@ impl PortDriver for MerlinDetector {
         } else if reason == self.params.threshold_apply {
             self.get_threshold()?;
         } else if reason == self.params.profile_control {
-            self.set_or_log(MPXCMD_PROFILES, &value.to_string());
+            self.try_set(MPXCMD_PROFILES, &value.to_string());
         }
 
         self.ad.port_base.call_param_callbacks(0)?;
@@ -585,10 +566,10 @@ impl PortDriver for MerlinDetector {
             .set_float64(reason, user.addr, value)?;
 
         if let Some(i) = self.params.thresholds.iter().position(|p| *p == reason) {
-            self.set_or_log(MPXVAR_THRESHOLD[i], &format!("{value:.6}"));
+            self.try_set(MPXVAR_THRESHOLD[i], &format!("{value:.6}"));
             self.get_threshold()?;
         } else if reason == self.params.operating_energy {
-            self.set_or_log(MPXVAR_OPERATINGENERGY, &format!("{value:.6}"));
+            self.try_set(MPXVAR_OPERATINGENERGY, &format!("{value:.6}"));
             self.get_threshold()?;
         } else if reason == self.ad.params.acquire_time || reason == self.ad.params.acquire_period {
             self.set_acquire_params()?;
@@ -668,9 +649,7 @@ pub fn create_merlin_detector(
 
     // C sends this from the constructor, before the parameters exist, so a
     // restarted IOC never inherits a running acquisition.
-    if let Err(e) = cmd.command(MPXCMD_STOPACQUISITION, default_timeout()) {
-        log::error!("merlin: initial STOPACQUISITION failed: {e}");
-    }
+    let _ = cmd.command(MPXCMD_STOPACQUISITION, default_timeout());
 
     let det = MerlinDetector::new(
         port_name,
