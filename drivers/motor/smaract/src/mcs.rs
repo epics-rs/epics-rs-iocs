@@ -277,10 +277,11 @@ impl McsAxis {
         // Sensor type query (also a comms check).
         ctrl.get_val("GST", channel)?;
 
+        // C reads the position again rather than reusing checkType's `GP`.
         self.has_encoder = if self.is_rot {
             ctrl.get_angle(channel).is_ok()
         } else {
-            true
+            ctrl.get_val("GP", channel).is_ok()
         };
         Ok(())
     }
