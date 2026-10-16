@@ -44,21 +44,6 @@ macro_rules! asyn_print {
     };
 }
 
-/// The `status=%d` C prints: the `asynStatus` value, a param-library
-/// refusal as asynPortDriver's own code (asynDriver.h:56-61).
-pub fn status_code(e: &AsynError) -> i32 {
-    match e {
-        AsynError::ParamAccess { source, .. } => status_code(source),
-        AsynError::ParamAlreadyExists(_) => 6,
-        AsynError::ParamNotFound(_) => 7,
-        AsynError::TypeMismatch { .. } => 8,
-        AsynError::ParamIndexOutOfRange(_) => 9,
-        AsynError::ParamUndefined(_) => 10,
-        AsynError::AddressOutOfRange(_) => 11,
-        _ => e.status() as i32,
-    }
-}
-
 /// The `status`, `nRead` and `eomReason` C prints for a read it rejected.
 pub fn read_result(r: &AsynResult<ReadOutcome>) -> (AsynStatus, usize, u32) {
     match r {
@@ -110,7 +95,7 @@ pub fn ensure_input_eos(io: &OctetIo, port: &PortDriverBase, origin: &str) -> As
             *port,
             ERROR,
             "{origin}: error calling pasynOctetSyncIO->setInputEos, status={}",
-            status_code(&e)
+            e.c_status_code()
         );
         AsynError::Status {
             status: AsynStatus::Error,

@@ -55,7 +55,6 @@ use crate::drv_quad_em::{
 };
 use crate::octet::{OctetIo, create_ip_port};
 use crate::t4u_proto::{self as proto, CalTable, Calibration, ChannelCal, CmdName, DirectFrame};
-use crate::trace::status_code;
 
 /// C++ `epicsThreadSleep(1.0)` after an unexpected socket error.
 const ERROR_BACKOFF: Duration = Duration::from_secs(1);
@@ -430,7 +429,7 @@ impl T4uDriver {
             println!("Entered writeReadMeter()");
             println!(
                 "Write status {}",
-                result.as_ref().map_or_else(status_code, |_| 0)
+                result.as_ref().map_or_else(AsynError::c_status_code, |_| 0)
             );
         }
     }
@@ -1070,7 +1069,7 @@ fn middle_data_iteration(ctx: &DataContext, reader: &mut StreamReader) -> AsynRe
                 failed => {
                     // No payload within the timeout is C's asynTimeout.
                     let status =
-                        failed.map_or_else(|e| status_code(&e), |_| AsynStatus::Timeout as i32);
+                        failed.map_or_else(|e| e.c_status_code(), |_| AsynStatus::Timeout as i32);
                     println!("Error reading data payload: {status}.");
                     reader.flush();
                     return Ok(());

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
-use crate::trace::{self, AsynPrint};
+use crate::trace::AsynPrint;
 use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, handle_write_int32};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -580,7 +580,7 @@ struct StatusOr(i32);
 impl StatusOr {
     fn add<T>(&mut self, r: AsynResult<T>) {
         if let Err(e) = r {
-            self.0 |= trace::status_code(&e);
+            self.0 |= e.c_status_code();
         }
     }
 

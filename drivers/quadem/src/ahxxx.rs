@@ -100,7 +100,7 @@ impl AhxxxDriver {
         if let Err(e) = status {
             println!(
                 "drvAHxxx:drvAHxxx: error calling pasynOctetSyncIO->connect, status={}, error={}",
-                trace::status_code(&e),
+                e.c_status_code(),
                 e.message_display()
             );
             return Ok(Self {
@@ -312,7 +312,7 @@ impl QuadEmDevice for AhxxxDriver {
                         self.base.port_base,
                         ERROR,
                         "drvAHxxx:setAcquire: error calling pasynOctetSyncIO->writeRead, status={}",
-                        trace::status_code(&e)
+                        e.c_status_code()
                     );
                     status = Err(e);
                     break;
