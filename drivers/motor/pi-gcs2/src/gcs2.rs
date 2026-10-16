@@ -4,10 +4,9 @@
 //! core, base class) + `PIGCSMotorController.cpp` (the C-863/C-867/C-663/
 //! C-884/E-861/E-871/E-873 motor specialization) — the two classes the task
 //! scopes as "generic GCS2 stage-controller path". Commands are plain ASCII
-//! text terminated by `\n`; the driver owns output framing and the startup
-//! script sets only the input EOS (`\n`), as in the C module's
-//! `PIasynController` constructor (`pasynOctetSyncIO->setInputEos(...,"\n",1)`
-//! plus `setOutputEos(...,"",0)`). Axes are addressed by the GCS *name
+//! text terminated by `\n`; the driver owns output framing and
+//! `PIGCS2CreateController` sets input EOS `"\n"` and an empty output EOS, as
+//! the C `PIasynController` constructor does. Axes are addressed by the GCS *name
 //! string* returned by `SAI?` (e.g. `"1"`), not a bare index.
 //!
 //! ## Wire shape

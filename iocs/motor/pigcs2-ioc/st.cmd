@@ -20,11 +20,6 @@ drvAsynSerialPortConfigure("$(PORT)", "$(TTY)", 0, 0, 0)
 #drvAsynIPPortConfigure("$(PORT)", "192.168.1.100:50000", 0, 0, 0)
 asynSetOption("$(PORT)", -1, "baud", "115200")
 
-# GCS2 framing: replies are terminated by "\n". The driver owns the output
-# terminator, so only the input EOS is set here. Do NOT set an output EOS (it
-# would double-terminate).
-asynOctetSetInputEos("$(PORT)", 0, "\n")
-
 # ---- PI GCS2 controller ----
 # PIGCS2CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
 # Axes are auto-discovered via SAI? — the first numAxes of them (in
