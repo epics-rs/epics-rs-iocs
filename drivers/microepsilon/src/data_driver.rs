@@ -359,18 +359,12 @@ impl DataDriver {
         let Some(update) = update else {
             return Ok(());
         };
-        let (status, alarm_status_code, alarm_severity) = if update.valid {
-            (
-                AsynStatus::Success,
-                alarm_status::NO_ALARM,
-                AlarmSeverity::NoAlarm as u16,
-            )
+        // C sets only `auxStatus`; devAsynFloat64 maps asynError to
+        // READ_ALARM/INVALID, so no alarm of its own goes with the status.
+        let status = if update.valid {
+            AsynStatus::Success
         } else {
-            (
-                AsynStatus::Error,
-                alarm_status::COMM_ALARM,
-                AlarmSeverity::Invalid as u16,
-            )
+            AsynStatus::Error
         };
         for (i, &value) in update.values.iter().enumerate() {
             let addr = (i + 1) as i32;
@@ -379,8 +373,8 @@ impl DataDriver {
                 self.disp_reason,
                 addr,
                 status,
-                alarm_status_code,
-                alarm_severity,
+                alarm_status::NO_ALARM,
+                AlarmSeverity::NoAlarm as u16,
             )?;
             self.base.call_param_callbacks(addr)?;
         }
@@ -751,6 +745,25 @@ mod tests {
         let driver =
             DataDriver::new("test_data_port", rbk_handle, Arc::new(Mutex::new(None))).unwrap();
         (driver, rbk_runtime)
+    }
+
+    #[test]
+    fn an_invalid_push_carries_asyn_error_and_no_alarm_of_its_own() {
+        let (mut driver, _keep_alive) = make_test_driver();
+        driver.shared.lock().unwrap().pending_push = Some(PushUpdate {
+            values: [0.0; MAX_CHANNELS],
+            valid: false,
+        });
+        driver.apply_pending_push().unwrap();
+        for addr in A_DISP_CHAN1..=A_DISP_CHAN4 {
+            assert_eq!(
+                driver
+                    .base
+                    .get_param_status(driver.disp_reason, addr)
+                    .unwrap(),
+                (AsynStatus::Error, alarm_status::NO_ALARM, 0)
+            );
+        }
     }
 
     #[test]

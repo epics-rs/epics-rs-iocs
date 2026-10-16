@@ -266,7 +266,7 @@ pub struct PushUpdate {
     pub values: [f64; MAX_CHANNELS],
     /// `isValid` -- `false` means this push came from the
     /// `badPacketCount >= 2` invalid/alarm path (`capaNCDT6200Sup.c:442`),
-    /// and the caller should mark the record COMM_ALARM/INVALID rather
+    /// and the caller should push it as asynError rather
     /// than pushing `values` as good data.
     pub valid: bool,
 }
