@@ -47,10 +47,6 @@ use crate::util::{nint, parse_int_at};
 /// Response buffer size for a single controller reply.
 const READ_BUF: usize = 256;
 
-/// Command line terminator (CR/LF); this driver owns framing (see
-/// [`crate::conex`] for rationale).
-const TERMINATOR: &[u8] = b"\r\n";
-
 /// C `WRITE_DELAY`: the Agilis needs a short delay between serial writes.
 pub(crate) const WRITE_DELAY: Duration = Duration::from_millis(10);
 
@@ -161,24 +157,17 @@ fn ph_limit(axis_id: i32, lim: i32) -> bool {
     }
 }
 
-// --- Raw framed serial I/O, each followed by WRITE_DELAY (C spacing).
-
-fn framed(cmd: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-    out.extend_from_slice(cmd.as_bytes());
-    out.extend_from_slice(TERMINATOR);
-    out
-}
+// --- Raw serial I/O, each followed by WRITE_DELAY (C spacing).
 
 fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
-    handle.write_octet(0, &framed(cmd))?;
+    handle.write_octet(0, cmd.as_bytes())?;
     thread::sleep(WRITE_DELAY);
     Ok(())
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
     // C writeReadController: pasynOctetSyncIO->writeRead.
-    let reply = handle.write_read(0, &framed(cmd), READ_BUF)?;
+    let reply = handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
     thread::sleep(WRITE_DELAY);
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }

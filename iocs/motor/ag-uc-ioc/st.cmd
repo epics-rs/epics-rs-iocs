@@ -26,9 +26,10 @@ asynSetOption("$(SERIAL)", 0, "baud",   "921600")
 asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
-# The driver appends the CR/LF terminator itself (no output EOS); replies
-# are split by the input EOS.
+# Port EOS as the C example sets it (st.cmd.AG_UC:15-16);
+# the driver sends bare commands.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r\n")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r\n")
 
 # ---- Agilis controller + axes ----
 # AG_UCCreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs])
