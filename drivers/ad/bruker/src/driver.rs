@@ -21,6 +21,7 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
@@ -34,6 +35,12 @@ use crate::params::BrukerParams;
 use crate::protocol;
 use crate::task::{self, AcquisitionContext, StatusContext};
 use crate::types::*;
+
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "BISDetector:writeInt32: error, ",
+    done: "BISDetector:writeInt32: ",
+    list: OwnList::Zero,
+};
 
 /// The one thing the actor tells the acquisition task.
 pub enum TaskCommand {
@@ -200,75 +207,55 @@ impl PortDriver for BrukerDetector {
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
-        // C's setIntegerParam(function, value): list 0, and its status stands
-        // unless a branch below replaces it.
-        let mut status = self.ad.port_base.set_int32_param(reason, 0, value);
-
         let p = self.ad.params;
         let q = self.params;
-
-        if reason == p.acquire {
-            let idle = self.get_i32(p.status) == ADStatus::Idle as i32;
-            if value != 0 && idle {
-                // The actor, not the task, leaves Idle: two Acquire writes in a
-                // row cannot queue two acquisitions.
-                self.ad
-                    .port_base
-                    .set_int32_param(p.status, 0, ADStatus::Acquire as i32)?;
-                let _ = self.commands.try_send(TaskCommand::Start);
-            } else if value == 0 && !idle {
-                self.shared.stop_requested.store(true, Ordering::Release);
+        INT32_TAIL.write_int32(self, user, value, |det, user, status| {
+            if reason == p.acquire {
+                let idle = det.get_i32(p.status) == ADStatus::Idle as i32;
+                if value != 0 && idle {
+                    // The actor, not the task, leaves Idle: two Acquire writes in a
+                    // row cannot queue two acquisitions.
+                    let _ = det
+                        .ad
+                        .port_base
+                        .set_int32_param(p.status, 0, ADStatus::Acquire as i32);
+                    let _ = det.commands.try_send(TaskCommand::Start);
+                } else if value == 0 && !idle {
+                    det.shared.stop_requested.store(true, Ordering::Release);
+                }
+            } else if reason == p.bin_x {
+                if matches!(value, 1 | 2 | 4 | 8) {
+                    let max_size_x = det.get_i32(p.max_size_x);
+                    // There is one binning: X and Y are the same.
+                    let _ = det.ad.port_base.set_int32_param(p.bin_y, 0, value);
+                    det.command(
+                        &protocol::change_frame_size(max_size_x / value),
+                        BIS_DEFAULT_TIMEOUT,
+                    );
+                } else {
+                    det.trace_error(&format!(
+                        "BISDetector:writeInt32: invalid binning={value}, must be 1,2,4 or 8"
+                    ));
+                    return Err(AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: format!("binning {value} is not 1, 2, 4 or 8"),
+                    });
+                }
+            } else if reason == q.start_scan {
+                det.start_scan();
+            } else if reason == q.epics_shutter {
+                // C called `ADDriver::setShutter` from the acquisition task, going
+                // past its own override on purpose: in EPICS shutter mode the
+                // shutter is not BIS's to drive. It is void there
+                // (BISDetector.cpp:541, :561).
+                det.ad.set_shutter(value != 0);
+            } else if reason < q.sfrm_timeout {
+                // FIRST_BIS_PARAM is BISSFRMTimeout (BISDetector.cpp:84).
+                return ADDriver::ad_write_int32(det, user, value);
             }
-        } else if reason == p.bin_x {
-            if matches!(value, 1 | 2 | 4 | 8) {
-                let max_size_x = self.get_i32(p.max_size_x);
-                // There is one binning: X and Y are the same.
-                self.ad.port_base.set_int32_param(p.bin_y, 0, value)?;
-                self.command(
-                    &protocol::change_frame_size(max_size_x / value),
-                    BIS_DEFAULT_TIMEOUT,
-                );
-            } else {
-                self.trace_error(&format!(
-                    "BISDetector:writeInt32: invalid binning={value}, must be 1,2,4 or 8"
-                ));
-                status = Err(AsynError::Status {
-                    status: AsynStatus::Error,
-                    message: format!("binning {value} is not 1, 2, 4 or 8"),
-                });
-            }
-        } else if reason == q.start_scan {
-            self.start_scan();
-        } else if reason == q.epics_shutter {
-            // C called `ADDriver::setShutter` from the acquisition task, going
-            // past its own override on purpose: in EPICS shutter mode the
-            // shutter is not BIS's to drive. It is void there
-            // (BISDetector.cpp:541, :561).
-            self.ad.set_shutter(value != 0);
-        } else if reason < q.sfrm_timeout {
-            // FIRST_BIS_PARAM is BISSFRMTimeout (BISDetector.cpp:84).
-            status = ADDriver::ad_write_int32(self, user, value);
-        }
 
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "BISDetector:writeInt32: error, status={} function={reason}, value={value}",
-                    e.c_status_code()
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("BISDetector:writeInt32: function={reason}, value={value}"),
-            ),
-        }
-        status
+            status
+        })
     }
 
     /// C inherits `ADDriver::writeOctet`.
