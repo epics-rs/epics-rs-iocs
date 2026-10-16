@@ -25,10 +25,10 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# MM4000 replies end in CR (the C example st.cmd sets EOS "\r" for RS-232).
-# The driver appends the CR command terminator itself, so no output EOS is
-# needed.
+# Port EOS as the C example sets it (Newport_MM4000.iocsh:23-24);
+# the driver sends bare commands.
 asynOctetSetInputEos("$(SERIAL)", 0, "\r")
+asynOctetSetOutputEos("$(SERIAL)", 0, "\r")
 
 # ---- MM4000 controller ----
 # MM4000CreateController(motorPort, serialPort, numAxes, [movingPollMs], [idlePollMs])

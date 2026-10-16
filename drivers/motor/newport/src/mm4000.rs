@@ -4,9 +4,9 @@
 //! asyn driver, the maintained reference). Commands are `{axis}CC{value}`
 //! with a 1-based unpadded axis prefix; values are formatted with the
 //! per-axis precision derived from the `TU` drive resolution (C
-//! `maxDigits`). The C example st.cmd sets input and output EOS `"\r"`; this
-//! driver owns framing (appends `\r`) and expects the port's input EOS to
-//! frame replies (`asynOctetSetInputEos("\r")` in st.cmd).
+//! `maxDigits`). Commands go out bare and the port EOS `"\r"` both ways comes
+//! from the startup script, as in C's Newport_MM4000.iocsh:23-24 (the C
+//! driver sets no EOS).
 //!
 //! ## Units
 //!
@@ -47,9 +47,6 @@ use crate::util::{atof, atoi, max_digits};
 
 /// Response buffer size for a single controller reply (C `BUFFER_SIZE` 160).
 const READ_BUF: usize = 256;
-
-/// Command line terminator (C example st.cmd output EOS `"\r"`).
-const TERMINATOR: &[u8] = b"\r";
 
 /// C status-byte masks (same layout as the MM3000).
 const MM4000_MOVING: u8 = 0x01;
@@ -177,22 +174,15 @@ impl Mm4000Controller {
         self.model
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
-    /// Write a command (C `sendOnly`); the terminator is appended here.
+    /// Write a command (C `sendOnly`); the port output EOS terminates it.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
     /// Write a command and read the reply (C `sendAndReceive`).
     fn write_read(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
