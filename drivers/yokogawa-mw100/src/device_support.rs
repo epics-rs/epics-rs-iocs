@@ -835,8 +835,9 @@ fn output_command(op: Operation, record: &dyn Record) -> CaResult<Command> {
         Operation::ErrorClearSet => Command::ClearError,
         Operation::AlarmAckSet => Command::AcknowledgeAlarms,
         Operation::ComputeCmdSet => {
+            // An mbbo without states serves VAL as DBF_USHORT.
             let v = match record.get_field("VAL") {
-                Some(EpicsValue::Enum(v)) => i32::from(v),
+                Some(EpicsValue::Enum(v) | EpicsValue::UShort(v)) => i32::from(v),
                 _ => return Err(CaError::FieldNotFound("VAL".into())),
             };
             Command::SetCompute(v)
@@ -1468,6 +1469,21 @@ mod tests {
             let received = device_thread.join().unwrap();
             assert_eq!(received.last().unwrap(), "EX2\r\n");
             assert!(!received.iter().any(|l| l.starts_with("EX4")));
+        });
+    }
+
+    #[test]
+    fn compute_cmd_without_states_writes() {
+        test_block_on(async {
+            let (db, device_thread) = wired_output(
+                Box::new(MbboRecord::new(0)),
+                "mw100dev COMPUTE_CMD",
+                vec![b"E0\r\n".to_vec()],
+            )
+            .await;
+            let (_, sevr) = put_and_complete(&db, EpicsValue::UShort(1)).await;
+            assert_eq!(sevr, AlarmSeverity::NoAlarm);
+            assert_eq!(device_thread.join().unwrap().last().unwrap(), "EX1\r\n");
         });
     }
 
