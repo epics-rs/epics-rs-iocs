@@ -33,6 +33,7 @@ use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Shared};
 use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, ImageLimits, parse_tcp_path};
+use crate::window::{Configuration, RollingSumStatus};
 
 /// C's `connectionPollPeriodSec_` (ADTimePix.cpp:1471).
 const CONNECTION_POLL: Duration = Duration::from_secs(5);
@@ -1146,15 +1147,13 @@ async fn prv_hst_accumulating(ctx: &Ctx) -> bool {
 /// :607-632): a reconfiguration posts the effective frames and the retention
 /// status, a refused frame its failure, and every frame FramesSummed.
 async fn post_window(ctx: &Ctx, which: Accum, update: &Update) {
-    use crate::window::RollingSumStatus;
     let p = &ctx.p;
-    let (effective, summed, status, tag, configure, process) = match which {
+    let (effective, summed, status, tag, process) = match which {
         Accum::Img => (
             p.img_effective_frames,
             p.img_frames_summed,
             p.img_retention_status,
             "Img",
-            adlog::CONFIGURE_IMG_ROLLING_WINDOW,
             adlog::PROCESS_IMG_FRAME,
         ),
         Accum::PrvHst => (
@@ -1162,7 +1161,6 @@ async fn post_window(ctx: &Ctx, which: Accum, update: &Update) {
             p.prv_hst_frames_summed,
             p.prv_hst_retention_status,
             "PrvHst",
-            adlog::CONFIGURE_PRV_HST_ROLLING_WINDOW,
             adlog::PROCESS_PRV_HST_FRAME,
         ),
     };
@@ -1178,36 +1176,14 @@ async fn post_window(ctx: &Ctx, which: Accum, update: &Update) {
     };
     let mut updates = Vec::new();
     if let Some(c) = update.window_config {
-        let mb = c.budget_bytes / (1024 * 1024);
-        if c.status != RollingSumStatus::Ok {
-            let message = format!("Unavailable: {}", c.status.name());
-            ctx.trace(
-                TraceMask::WARNING,
-                &adlog::warn(
-                    configure,
-                    &format!(
-                        "{tag} rolling window unavailable: {message}; geometry={}, budget={mb} MiB",
-                        c.element_count
-                    ),
-                ),
-            );
-            updates.extend([int(effective, 0), text(status, message)]);
-        } else {
-            let message = if c.limited {
-                let message = format!(
-                    "Capped: {}/{} frames, {mb} MiB",
-                    c.effective_frames, c.requested_frames
-                );
-                ctx.trace(
-                    TraceMask::WARNING,
-                    &adlog::warn(configure, &format!("{tag} rolling window {message}")),
-                );
-                message
-            } else {
-                format!("OK: {} frames, {mb} MiB", c.effective_frames)
-            };
-            updates.extend([int(effective, c.effective_frames), text(status, message)]);
+        let report = which.window_report(&c);
+        if let Some(warning) = &report.warning {
+            ctx.trace(TraceMask::WARNING, warning);
         }
+        updates.extend([
+            int(effective, report.effective),
+            text(status, report.status),
+        ]);
     }
     if let Some(push) = update.window_push.filter(|&s| s != RollingSumStatus::Ok) {
         if push == RollingSumStatus::NumericOverflow {
@@ -1714,25 +1690,18 @@ async fn publish_accumulation(
     sum_n_param: usize,
     sum_n_addr: i32,
 ) {
-    ctx.post_int64_array(
-        sum_param,
-        sum_addr,
-        update
-            .running
-            .iter()
-            .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
-            .collect(),
-    );
+    ctx.post_int64_array(sum_param, sum_addr, int64_array(&update.running));
     if let Some(sum_n) = &update.sum_n {
-        ctx.post_int64_array(
-            sum_n_param,
-            sum_n_addr,
-            sum_n
-                .iter()
-                .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
-                .collect(),
-        );
+        ctx.post_int64_array(sum_n_param, sum_n_addr, int64_array(sum_n));
     }
+}
+
+/// An accumulation as the asynInt64Array interface carries it.
+pub(crate) fn int64_array(values: &[u64]) -> Vec<i64> {
+    values
+        .iter()
+        .map(|&v| i64::try_from(v).unwrap_or(i64::MAX))
+        .collect()
 }
 
 /// What the PrvHst NDArrays on addresses 4-7 are built from, copied out of
@@ -1774,13 +1743,60 @@ impl SumOutput {
 
 /// Which accumulation an array is built from, for its range-state latch.
 #[derive(Clone, Copy)]
-enum Accum {
+pub(crate) enum Accum {
     Img,
     PrvHst,
 }
 
+/// What C `configureImgRollingWindow` / `configurePrvHstRollingWindow` set
+/// for a configuration, and the WARN line they print with it
+/// (serval_stream.cpp:1005-1044, histogram_io.cpp:356-395).
+pub(crate) struct WindowReport {
+    pub effective: usize,
+    pub status: String,
+    pub warning: Option<String>,
+}
+
 impl Accum {
-    fn get(self, shared: &Shared) -> &parking_lot::Mutex<crate::accum::Accumulator> {
+    pub(crate) fn window_report(self, c: &Configuration) -> WindowReport {
+        let (tag, configure) = match self {
+            Self::Img => ("Img", adlog::CONFIGURE_IMG_ROLLING_WINDOW),
+            Self::PrvHst => ("PrvHst", adlog::CONFIGURE_PRV_HST_ROLLING_WINDOW),
+        };
+        let mb = c.budget_bytes / (1024 * 1024);
+        if c.status != RollingSumStatus::Ok {
+            let status = format!("Unavailable: {}", c.status.name());
+            let warning = adlog::warn(
+                configure,
+                &format!(
+                    "{tag} rolling window unavailable: {status}; geometry={}, budget={mb} MiB",
+                    c.element_count
+                ),
+            );
+            return WindowReport {
+                effective: 0,
+                status,
+                warning: Some(warning),
+            };
+        }
+        let (status, warning) = if c.limited {
+            let status = format!(
+                "Capped: {}/{} frames, {mb} MiB",
+                c.effective_frames, c.requested_frames
+            );
+            let warning = adlog::warn(configure, &format!("{tag} rolling window {status}"));
+            (status, Some(warning))
+        } else {
+            (format!("OK: {} frames, {mb} MiB", c.effective_frames), None)
+        };
+        WindowReport {
+            effective: c.effective_frames,
+            status,
+            warning,
+        }
+    }
+
+    pub(crate) fn get(self, shared: &Shared) -> &parking_lot::Mutex<crate::accum::Accumulator> {
         match self {
             Self::Img => &shared.img,
             Self::PrvHst => &shared.hst,

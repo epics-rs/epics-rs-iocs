@@ -273,6 +273,12 @@ impl Accumulator {
         })
     }
 
+    /// C `imgFramesSinceLastSumUpdate_ = imgSumUpdateIntervalFrames_`
+    /// (ADTimePix.cpp:772): the next frame publishes the window sum.
+    pub fn update_sum_on_next_frame(&mut self) {
+        self.since_update = self.update_interval;
+    }
+
     /// An interval below 1 would make `since_update >= interval` true on every
     /// frame *and* leave the counter meaningless; C never validates it.
     pub fn set_update_interval(&mut self, n: i32) {

@@ -6,13 +6,14 @@ use std::sync::Arc;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ADStatus};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::param::EnumEntry;
+use epics_rs::asyn::interfaces::InterfaceType;
+use epics_rs::asyn::param::{EnumEntry, ParamValue};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use serde_json::json;
 
-use crate::accum::RangeState;
+use crate::accum::{Accumulator, RangeState};
 use crate::adlog;
 use crate::calibration::PathPolicy;
 use crate::coordinator::{Phase, Resource};
@@ -23,7 +24,8 @@ use crate::mask::{self, Geometry, PIXEL_CONFIG_BYTES};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Shared};
-use crate::tasks;
+use crate::tasks::{self, Accum};
+use crate::window::{Configuration, RollingSumStatus};
 
 /// The line C prints when a Serval request fails: `logHttpFailure` or
 /// `logHttpWarning` with its context, method and path, or nothing.
@@ -434,6 +436,96 @@ impl TimePix3Driver {
             .port_base
             .set_int32_param(saturated, 0, i32::from(range != RangeState::Ok))?;
         self.ad.port_base.set_string_param(status, 0, range.name())
+    }
+
+    /// C `doCallbacksInt64Array` on address 0: subscribers only, not stored.
+    fn post_int64_array(&self, reason: usize, data: Vec<i64>) {
+        self.ad.port_base.notify_interface_value(
+            reason,
+            0,
+            InterfaceType::Int64Array,
+            ParamValue::Int64Array(data.into()),
+            0,
+            AsynStatus::Success,
+        );
+    }
+
+    /// The FramesToSum / RetentionLimitMB branches of C writeInt32
+    /// (ADTimePix.cpp:755-845): reconfigure a window that has a geometry
+    /// under the accumulator lock and set what `configure*RollingWindow`
+    /// sets, or "Waiting for ... geometry" when none has arrived; an Img
+    /// FramesToSum also hands out the new window sum.
+    fn reconfigure_window(
+        &mut self,
+        which: Accum,
+        publish_sum: bool,
+        apply: impl FnOnce(&mut Accumulator) -> Option<Configuration>,
+    ) -> AsynResult<()> {
+        let p = self.p;
+        let rate_samples = self.shared.rates.lock().prv_hst.sample_count();
+        let (config, summed, memory, sum) = {
+            let mut acc = which.get(&self.shared).lock();
+            let config = apply(&mut acc);
+            let ok = config.is_some_and(|c| c.status == RollingSumStatus::Ok);
+            let summed = if ok { acc.buffered_frames() } else { 0 };
+            let sum = (publish_sum && summed > 0).then(|| {
+                acc.update_sum_on_next_frame();
+                tasks::int64_array(acc.window().sum())
+            });
+            let memory = match which {
+                Accum::Img => tasks::img_memory_mb(&acc),
+                Accum::PrvHst => {
+                    tasks::prv_hst_memory_mb(&acc, rate_samples, tasks::PRV_HST_LINE_BUFFER)
+                }
+            };
+            (config, summed, memory, sum)
+        };
+        let (effective_param, summed_param, status_param, memory_param, sum_param, waiting) =
+            match which {
+                Accum::Img => (
+                    p.img_effective_frames,
+                    p.img_frames_summed,
+                    p.img_retention_status,
+                    p.img_memory_usage,
+                    p.img_image_sum_n_frames,
+                    "Waiting for image geometry",
+                ),
+                Accum::PrvHst => (
+                    p.prv_hst_effective_frames,
+                    p.prv_hst_frames_summed,
+                    p.prv_hst_retention_status,
+                    p.prv_hst_memory_usage,
+                    p.prv_hst_histogram_sum_n_frames,
+                    "Waiting for histogram geometry",
+                ),
+            };
+        let (effective, status) = match config {
+            None => (0, waiting.to_string()),
+            Some(c) => {
+                let report = which.window_report(&c);
+                if let Some(warning) = &report.warning {
+                    self.ad
+                        .port_base
+                        .trace_print(TraceMask::WARNING, format_args!("{warning}"));
+                }
+                (report.effective, report.status)
+            }
+        };
+        let base = &mut self.ad.port_base;
+        base.set_int32_param(
+            effective_param,
+            0,
+            i32::try_from(effective).unwrap_or(i32::MAX),
+        )?;
+        base.set_int32_param(summed_param, 0, i32::try_from(summed).unwrap_or(i32::MAX))?;
+        base.set_string_param(status_param, 0, &status)?;
+        base.set_float64_param(memory_param, 0, memory)?;
+        if let Some(sum) = sum {
+            // C posts FramesToSum and MemoryUsage before the array (:779-783).
+            base.call_param_callbacks(0)?;
+            self.post_int64_array(sum_param, sum);
+        }
+        Ok(())
     }
 
     fn dbl(&self, index: usize, addr: i32) -> f64 {
@@ -1834,15 +1926,21 @@ impl PortDriver for TimePix3Driver {
             let value = value.clamp(low, high);
             self.ad.port_base.set_int32_param(reason, 0, value)?;
             if reason == p.img_frames_to_sum {
-                self.shared.img.lock().set_frames_to_sum(value);
-            } else if reason == p.img_sum_update_interval_frames {
-                self.shared.img.lock().set_update_interval(value);
+                self.reconfigure_window(Accum::Img, true, |a| a.set_frames_to_sum(value))
+            } else if reason == p.img_retention_limit_mb {
+                self.reconfigure_window(Accum::Img, false, |a| a.set_retention_limit_mb(value))
             } else if reason == p.prv_hst_frames_to_sum {
-                self.shared.hst.lock().set_frames_to_sum(value);
-            } else if reason == p.prv_hst_sum_update_interval {
-                self.shared.hst.lock().set_update_interval(value);
+                self.reconfigure_window(Accum::PrvHst, false, |a| a.set_frames_to_sum(value))
+            } else if reason == p.prv_hst_retention_limit_mb {
+                self.reconfigure_window(Accum::PrvHst, false, |a| a.set_retention_limit_mb(value))
+            } else {
+                if reason == p.img_sum_update_interval_frames {
+                    self.shared.img.lock().set_update_interval(value);
+                } else if reason == p.prv_hst_sum_update_interval {
+                    self.shared.hst.lock().set_update_interval(value);
+                }
+                Ok(())
             }
-            Ok(())
         } else if reason == p.processed_img_output_type || reason == p.processed_hst_output_type {
             // ADTimePix.cpp:593-597, :605-609.
             if value != 0 && value != 1 {
@@ -1898,13 +1996,35 @@ impl PortDriver for TimePix3Driver {
             Ok(())
         } else if reason == p.prv_hst_data_reset {
             if value == 1 {
-                let range = {
+                // C resetPrvHstAccumulation (ADTimePix.cpp:1365-1416).
+                let rate_samples = self.shared.rates.lock().prv_hst.sample_count();
+                let (range, memory) = {
                     let mut hst = self.shared.hst.lock();
                     hst.reset();
-                    hst.report_range(RangeState::Ok)
+                    (
+                        hst.report_range(RangeState::Ok),
+                        tasks::prv_hst_memory_mb(&hst, rate_samples, tasks::PRV_HST_LINE_BUFFER),
+                    )
                 };
+                self.ad
+                    .port_base
+                    .set_int32_param(p.prv_hst_frames_summed, 0, 0)?;
                 if let Some(range) = range {
                     self.set_range(p.prv_hst_range_saturated, p.prv_hst_range_status, range)?;
+                }
+                let base = &mut self.ad.port_base;
+                base.set_int32_param(p.prv_hst_frame_count, 0, 0)?;
+                base.set_int64_param(p.prv_hst_total_counts, 0, 0)?;
+                base.set_float64_param(p.prv_hst_processing_time, 0, 0.0)?;
+                base.set_float64_param(p.prv_hst_memory_usage, 0, memory)?;
+                // Zero arrays clear the waveforms at once, sized to the last
+                // frame's bins or C's default 16000.
+                let bins = usize::try_from(self.int(p.prv_hst_frame_bin_size, 0))
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .unwrap_or(16000);
+                for reason in [p.prv_hst_histogram_data, p.prv_hst_histogram_sum_n_frames] {
+                    self.post_int64_array(reason, vec![0; bins]);
                 }
                 self.ad
                     .port_base
@@ -2447,6 +2567,128 @@ mod tests {
         assert_eq!(
             base.get_float64_param(p.img_memory_usage, 0).unwrap(),
             expected
+        );
+    }
+
+    /// Int64Array callbacks, as (reason, values).
+    type Recorded = Arc<parking_lot::Mutex<Vec<(usize, Vec<i64>)>>>;
+
+    /// A driver whose Int64Array callbacks are recorded.
+    fn array_recording_driver(name: &str) -> (TimePix3Driver, Arc<Shared>, Recorded) {
+        use epics_rs::asyn::interrupt::{InterruptFilter, InterruptManager};
+        use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let shared = Arc::new(Shared::new());
+        let mut det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            shared.clone(),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        det.ad.port_base.interrupts = InterruptManager::owned_by(InterruptGate::opened());
+        let arrays = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = arrays.clone();
+        std::mem::forget(det.ad.port_base.interrupts.register_sync_callback(
+            InterruptFilter {
+                addr: Some(0),
+                ..Default::default()
+            },
+            move |iv| {
+                if let ParamValue::Int64Array(a) = &iv.value {
+                    seen.lock().push((iv.reason, a.to_vec()));
+                }
+            },
+        ));
+        (det, shared, arrays)
+    }
+
+    /// ADTimePix.cpp:755-845: FramesToSum and RetentionLimitMB reconfigure a
+    /// window that has a geometry at once, and say so when it has none.
+    #[test]
+    fn a_window_write_reconfigures_and_posts_the_window() {
+        let (mut det, shared, arrays) = array_recording_driver("TPX_WINDOW_WRITE");
+        let p = det.p;
+        {
+            let mut img = shared.img.lock();
+            img.set_update_interval(5);
+            img.add_shaped(&[1, 2], &[2, 1], 2);
+            img.add_shaped(&[3, 4], &[2, 1], 2);
+        }
+        det.write_int32(&mut AsynUser::new(p.img_frames_to_sum), 1)
+            .unwrap();
+        assert_eq!(
+            (
+                det.int(p.img_effective_frames, 0),
+                det.int(p.img_frames_summed, 0),
+                det.text(p.img_retention_status, 0),
+            ),
+            (1, 1, "OK: 1 frames, 512 MiB".to_string())
+        );
+        assert_eq!(*arrays.lock(), vec![(p.img_image_sum_n_frames, vec![3, 4])]);
+        // C sets the update counter due, so the next frame publishes the sum.
+        assert!(shared.img.lock().add(&[5, 6]).sum_n.is_some());
+
+        det.write_int32(&mut AsynUser::new(p.img_retention_limit_mb), 1)
+            .unwrap();
+        assert_eq!(shared.img.lock().retention_limit_mb(), 1);
+        assert_eq!(det.text(p.img_retention_status, 0), "OK: 1 frames, 1 MiB");
+
+        det.write_int32(&mut AsynUser::new(p.prv_hst_frames_to_sum), 3)
+            .unwrap();
+        assert_eq!(
+            (
+                det.int(p.prv_hst_effective_frames, 0),
+                det.text(p.prv_hst_retention_status, 0),
+            ),
+            (0, "Waiting for histogram geometry".to_string())
+        );
+        assert_eq!(
+            arrays.lock().len(),
+            1,
+            "only an Img FramesToSum posts the sum"
+        );
+    }
+
+    /// C resetPrvHstAccumulation (ADTimePix.cpp:1365-1416).
+    #[test]
+    fn a_prv_hst_reset_posts_the_cleared_metrics_and_zero_arrays() {
+        let (mut det, shared, arrays) = array_recording_driver("TPX_HST_RESET");
+        let p = det.p;
+        shared.hst.lock().add(&[1, 2, 3]);
+        let base = &mut det.ad.port_base;
+        base.set_int32_param(p.prv_hst_frame_bin_size, 0, 3)
+            .unwrap();
+        base.set_int32_param(p.prv_hst_frames_summed, 0, 1).unwrap();
+        base.set_int32_param(p.prv_hst_frame_count, 0, 5).unwrap();
+        base.set_int64_param(p.prv_hst_total_counts, 0, 6).unwrap();
+        base.set_float64_param(p.prv_hst_processing_time, 0, 1.5)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(p.prv_hst_data_reset), 1)
+            .unwrap();
+        let base = &det.ad.port_base;
+        assert_eq!(
+            (
+                det.int(p.prv_hst_frames_summed, 0),
+                det.int(p.prv_hst_frame_count, 0),
+                base.get_int64_param(p.prv_hst_total_counts, 0).unwrap(),
+                base.get_float64_param(p.prv_hst_processing_time, 0)
+                    .unwrap(),
+            ),
+            (0, 0, 0, 0.0)
+        );
+        // The window keeps its zeroed 3-u64 sum.
+        assert_eq!(
+            base.get_float64_param(p.prv_hst_memory_usage, 0).unwrap(),
+            24.0 / (1024.0 * 1024.0) + tasks::PRV_HST_LINE_BUFFER as f64 / (1024.0 * 1024.0) + 0.1
+        );
+        assert_eq!(
+            *arrays.lock(),
+            vec![
+                (p.prv_hst_histogram_data, vec![0; 3]),
+                (p.prv_hst_histogram_sum_n_frames, vec![0; 3]),
+            ]
         );
     }
 
