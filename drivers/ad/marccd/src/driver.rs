@@ -149,15 +149,13 @@ impl PortDriver for MarccdDriver {
             .get_int32_param(params.acquire, 0)
             .unwrap_or(0);
 
-        if function == params.acquire {
-            self.ad.set_acquire(value)?;
+        // List 0; the status stands unless the base class replaces it.
+        let mut status = if function == params.acquire {
+            self.ad.set_acquire(value)
         } else {
-            self.ad
-                .port_base
-                .set_int32_param(function, user.addr, value)?;
-        }
+            self.ad.port_base.set_int32_param(function, 0, value)
+        };
 
-        let mut status = Ok(());
         if function == params.acquire {
             let state = self.get_state();
             if value != 0
@@ -228,10 +226,7 @@ impl PortDriver for MarccdDriver {
         let function = user.reason;
         let p = self.p;
 
-        let mut status = self
-            .ad
-            .port_base
-            .set_float64_param(function, user.addr, value);
+        let mut status = self.ad.port_base.set_float64_param(function, 0, value);
 
         if function == p.stability {
             self.write_server(&cmd_set_stability(value));
@@ -472,6 +467,20 @@ pub(crate) mod tests {
             stop: Arc::new(Event::new()),
         };
         MarccdDriver::new(name, 0, links).unwrap()
+    }
+
+    /// marCCD.cpp:1261, :1336: setIntegerParam / setDoubleParam(function,
+    /// value) are list 0 whatever the address.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let mut d = driver("MARCCD_LIST0");
+        let (int, float) = (d.p.series_file_digits, d.p.tiff_timeout);
+        d.write_int32(&mut AsynUser::new(int).with_addr(1), 3)
+            .unwrap();
+        d.write_float64(&mut AsynUser::new(float).with_addr(1), 2.5)
+            .unwrap();
+        assert_eq!(d.ad.port_base.get_int32_param(int, 0).unwrap(), 3);
+        assert_eq!(d.ad.port_base.get_float64_param(float, 0).unwrap(), 2.5);
     }
 
     /// Build the detector on `name`'s fake server, then send it a `set_bin`.
