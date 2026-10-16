@@ -45,7 +45,7 @@ impl PvaDriver {
         max_memory: usize,
         cmd_tx: rt::CommandSender<PvaCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let pva_params = PvaParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;

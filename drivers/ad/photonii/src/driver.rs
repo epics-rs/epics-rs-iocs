@@ -66,6 +66,7 @@ impl PhotonIIDetector {
     ) -> AsynResult<Self> {
         let mut ad = ADDriverBase::new(
             port_name,
+            1,
             PII_SIZE_X as i32,
             PII_SIZE_Y as i32,
             max_memory,

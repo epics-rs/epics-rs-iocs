@@ -44,7 +44,7 @@ impl URLDriver {
         max_memory: usize,
         acq_tx: rt::CommandSender<AcqCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory, ASYN_NONE)?;
+        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_NONE)?;
         let url_params = URLParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;

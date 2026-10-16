@@ -64,8 +64,14 @@ impl PilatusDriver {
         max_memory: usize,
         links: DriverLinks,
     ) -> AsynResult<Self> {
-        let mut ad =
-            ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
         let p = PilatusParams::create(&mut ad.port_base)?;
 
         let params = ad.params;

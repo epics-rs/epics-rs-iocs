@@ -107,7 +107,7 @@ impl SpecsAnalyserDriver {
             start,
             stop,
         } = shared;
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(port_name, 1, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let _ = max_buffers;
         let p = SpecsParams::create(&mut ad.port_base)?;
         let base = &mut ad.port_base;

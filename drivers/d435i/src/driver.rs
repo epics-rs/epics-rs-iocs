@@ -43,8 +43,14 @@ impl D435iColorDriver {
         dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
         caps: CameraCapabilities,
     ) -> AsynResult<Self> {
-        let mut ad =
-            ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
         let rs_params = D435iParams::create(&mut ad.port_base)?;
 
         let base = &mut ad.port_base;
@@ -314,8 +320,14 @@ impl D435iDepthDriver {
         max_size_y: i32,
         max_memory: usize,
     ) -> AsynResult<Self> {
-        let mut ad =
-            ADDriverBase::new(port_name, max_size_x, max_size_y, max_memory, ASYN_CANBLOCK)?;
+        let mut ad = ADDriverBase::new(
+            port_name,
+            1,
+            max_size_x,
+            max_size_y,
+            max_memory,
+            ASYN_CANBLOCK,
+        )?;
 
         let base = &mut ad.port_base;
         base.set_string_param(ad.params.base.manufacturer, 0, "Intel")?;

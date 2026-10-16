@@ -72,7 +72,8 @@ impl BrukerDetector {
         shared: Arc<SharedState>,
         commands: rt::CommandSender<TaskCommand>,
     ) -> AsynResult<Self> {
-        let mut ad = ADDriverBase::new(port_name, MAX_SIZE, MAX_SIZE, max_memory, ASYN_CANBLOCK)?;
+        let mut ad =
+            ADDriverBase::new(port_name, 1, MAX_SIZE, MAX_SIZE, max_memory, ASYN_CANBLOCK)?;
         let params = BrukerParams::create(&mut ad.port_base)?;
         let p = ad.params;
 

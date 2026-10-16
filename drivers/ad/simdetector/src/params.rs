@@ -204,7 +204,7 @@ mod tests {
     use epics_rs::ad_core::plugin::runtime::ASYN_NONE;
 
     fn fixture() -> (ADDriverBase, SimParams) {
-        let mut ad = ADDriverBase::new("SIMTEST", 64, 64, 0, ASYN_NONE).unwrap();
+        let mut ad = ADDriverBase::new("SIMTEST", 1, 64, 64, 0, ASYN_NONE).unwrap();
         let sim = SimParams::create(&mut ad.port_base).unwrap();
         (ad, sim)
     }
