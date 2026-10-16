@@ -279,17 +279,21 @@ fn parse_error(what: &str) -> AsynError {
 
 // --- Raw framed serial I/O (usable before `ConexAxis` exists, e.g. in `new`).
 
-fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
+fn framed(cmd: &str) -> Vec<u8> {
     let mut framed = Vec::with_capacity(cmd.len() + TERMINATOR.len());
     framed.extend_from_slice(cmd.as_bytes());
     framed.extend_from_slice(TERMINATOR);
-    handle.write_octet(0, &framed)?;
+    framed
+}
+
+fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
+    handle.write_octet(0, &framed(cmd))?;
     Ok(())
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    write_raw(handle, cmd)?;
-    let reply = handle.read_octet(0, READ_BUF)?;
+    // C writeReadController: pasynOctetSyncIO->writeRead.
+    let reply = handle.write_read(0, &framed(cmd), READ_BUF)?;
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }
 

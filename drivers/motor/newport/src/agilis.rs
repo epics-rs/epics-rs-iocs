@@ -177,8 +177,8 @@ fn write_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<()> {
 }
 
 fn write_read_raw(handle: &SyncIOHandle, cmd: &str) -> AsynResult<String> {
-    handle.write_octet(0, &framed(cmd))?;
-    let reply = handle.read_octet(0, READ_BUF)?;
+    // C writeReadController: pasynOctetSyncIO->writeRead.
+    let reply = handle.write_read(0, &framed(cmd), READ_BUF)?;
     thread::sleep(WRITE_DELAY);
     Ok(String::from_utf8_lossy(&reply).into_owned())
 }
