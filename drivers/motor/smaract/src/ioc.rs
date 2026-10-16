@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epics_rs::asyn::interfaces::motor::AsynMotor;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::iocsh::registry::*;
 
 use motor_common::connect::{EosRefusal, connect_serial, connect_with_eos};
@@ -266,10 +267,10 @@ pub fn mcs_create_controller_command() -> CommandDef {
             let io_port = req_string(args, 1, "I/O port name [string]")?;
             let disable_speed = c_int(args, 5) != 0;
             if disable_speed {
-                println!(
+                errlog_vprintf(format_args!(
                     "SmarActMCSController({port_name}): WARNING - The speed set commands have \
-                     been disabled for this controller"
-                );
+                     been disabled for this controller\n"
+                ));
             }
             let controller = connect_with_eos(
                 &io_port,
