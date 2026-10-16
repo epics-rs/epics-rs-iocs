@@ -195,9 +195,9 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
     let ad_params = det.ad.params;
     let url_params = det.url_params;
     let pool = det.ad.pool.clone();
+    let queued_counter = det.ad.queued_counter.clone();
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task_handle = start_acquisition_task(AcquisitionContext {
         acq_rx,
