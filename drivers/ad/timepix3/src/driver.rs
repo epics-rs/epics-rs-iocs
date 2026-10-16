@@ -1675,10 +1675,29 @@ impl PortDriver for TimePix3Driver {
             Ok(())
         } else if reason == p.img_image_data_reset {
             if value == 1 {
-                self.shared.img.lock().reset();
+                // C resetImgAccumulation (serval_stream.cpp:1421).
+                let range = {
+                    let mut img = self.shared.img.lock();
+                    img.reset();
+                    img.report_range(RangeState::Ok)
+                };
+                if let Some(range) = range {
+                    self.set_range(p.img_range_saturated, p.img_range_status, range)?;
+                }
                 self.ad
                     .port_base
                     .set_int32_param(p.img_image_data_reset, 0, 0)?;
+            }
+            Ok(())
+        } else if reason == p.write_processed_img {
+            // ADTimePix.cpp:586-592; the task stores 0 once the arrays are out.
+            if value == 1 {
+                self.cmd_tx
+                    .try_send(Command::PushProcessedImg)
+                    .map_err(|_| AsynError::Status {
+                        status: AsynStatus::Error,
+                        message: "timepix3: the connection task is not running".into(),
+                    })?;
             }
             Ok(())
         } else if reason == p.write_processed_hst {

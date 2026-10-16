@@ -74,6 +74,8 @@ pub struct Accumulator {
     frame_count: u64,
     total_counts: u64,
     range: RangeState,
+    /// The caller's geometry of the last frame (C `get_width`/`get_height`).
+    shape: Vec<usize>,
 }
 
 impl Default for Accumulator {
@@ -95,7 +97,13 @@ impl Accumulator {
             frame_count: 0,
             total_counts: 0,
             range: RangeState::Ok,
+            shape: Vec::new(),
         }
+    }
+
+    /// The geometry `add_shaped` last recorded; empty after a reset.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
     }
 
     /// C `imgRangeState_` / `prvHstRangeState_`.
@@ -179,6 +187,15 @@ impl Accumulator {
         self.since_update = 0;
         self.frame_count = 0;
         self.total_counts = 0;
+        self.shape.clear();
+    }
+
+    /// `add`, recording the frame's geometry for the arrays built later from
+    /// the accumulation.
+    pub fn add_shaped(&mut self, frame: &[u32], shape: &[usize]) -> Update {
+        let update = self.add(frame);
+        self.shape = shape.to_vec();
+        update
     }
 
     pub fn add(&mut self, frame: &[u32]) -> Update {

@@ -29,6 +29,8 @@ pub enum Command {
     RefreshDetector,
     /// C `pushProcessedHstToPlugins` on a `TPX3_HST_WRITE_PROCESSED` write of 1.
     PushProcessedHst,
+    /// C `pushProcessedImgToPlugins` on a `TPX3_IMG_WRITE_PROCESSED` write of 1.
+    PushProcessedImg,
 }
 
 /// Where the three preview channels stream from, as Serval's `Base` PVs give
