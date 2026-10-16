@@ -405,6 +405,10 @@ impl PortDriver for PixiradDetector {
 
     fn write_octet(&mut self, user: &mut AsynUser, value: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
+        if reason != self.params.autocal_conf {
+            // C has no writeOctet and inherits `ADDriver::writeOctet`.
+            return self.ad.write_octet(user, value);
+        }
         let text = String::from_utf8_lossy(value)
             .trim_end_matches('\0')
             .to_string();

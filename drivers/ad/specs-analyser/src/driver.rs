@@ -521,6 +521,11 @@ impl PortDriver for SpecsAnalyserDriver {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let function = user.reason;
         let addr = user.addr;

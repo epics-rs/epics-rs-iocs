@@ -77,6 +77,11 @@ impl PortDriver for URLDriver {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     /// Mirrors C++ `URLDriver::writeInt32`: only `ADAcquire` is special-cased
     /// (start/stop-signals the acquisition task, gated on `ADStatus` being
     /// idle or not); every other Int32 param falls through to the same

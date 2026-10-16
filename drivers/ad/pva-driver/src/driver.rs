@@ -144,10 +144,7 @@ impl PortDriver for PvaDriver {
                     .set_string(reason, user.addr, old_value)?;
             }
         } else {
-            self.ad
-                .port_base
-                .params
-                .set_string(reason, user.addr, new_value)?;
+            return self.ad.write_octet(user, data);
         }
 
         self.ad.port_base.call_param_callbacks(0)?;

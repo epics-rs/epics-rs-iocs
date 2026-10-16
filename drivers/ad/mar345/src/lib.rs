@@ -45,9 +45,6 @@
 //!   only the observable `ADMaxSizeX`/`ADMaxSizeY = 3450` writes are reproduced.
 //! * **`ADAcquireBusy` is not driven.** `mar345.cpp` only ever writes
 //!   `ADAcquire` (never `ADAcquireBusy`); this port matches that exactly.
-//! * **Base-class `writeOctet` side effects are not reproduced.** mar345 does not
-//!   override `writeOctet`; the default stores the string but does not track
-//!   `NDFilePathExists` or reload `NDAttributesFile`.
 
 pub mod driver;
 pub mod file_name;

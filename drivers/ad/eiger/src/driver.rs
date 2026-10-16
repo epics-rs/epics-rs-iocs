@@ -598,7 +598,7 @@ impl PortDriver for EigerDriver {
         {
             self.put_str(reason, &value)?;
         } else {
-            self.ad.port_base.params.set_string(reason, addr, value)?;
+            return self.ad.write_octet(user, data);
         }
 
         self.ad.port_base.call_param_callbacks(addr)?;

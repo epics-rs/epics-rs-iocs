@@ -150,6 +150,11 @@ impl PortDriver for D435iColorDriver {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         let acquire_idx = self.ad.params.acquire;
@@ -346,6 +351,11 @@ impl PortDriver for D435iDepthDriver {
 
     fn base_mut(&mut self) -> &mut PortDriverBase {
         &mut self.ad.port_base
+    }
+
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
     }
 }
 

@@ -44,10 +44,6 @@
 //! * **`getConfig` parse failures fall back to 0.** Where a `get_size` /
 //!   `get_bin` reply cannot be parsed this port stores 0; C leaves the previous
 //!   `sscanf` target unchanged.
-//! * **Base-class `writeOctet` side effects are not reproduced.** marCCD does
-//!   not override `writeOctet`; the base `asynNDArrayDriver::writeOctet` updates
-//!   `NDFilePathExists` (via `checkPath`) and reloads `NDAttributesFile`. This
-//!   port only stores the string, so `NDFilePathExists` is not tracked.
 //! * **`ADAcquireBusy` is cleared directly by the worker** at acquisition
 //!   completion (alongside `ADAcquire`), approximating
 //!   `asynNDArrayDriver::setIntegerParam`'s side effect for the common

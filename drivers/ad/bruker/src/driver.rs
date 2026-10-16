@@ -6,7 +6,6 @@
 //! — reach the parameter library through the actor and never call into the
 //! driver directly (see the invariant in [`crate::connection`]).
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
@@ -166,20 +165,6 @@ impl BrukerDetector {
         self.command(&command, BIS_COMMAND_TIMEOUT)
     }
 
-    /// Report whether the directory BIS is told to write into exists here too
-    /// (`asynNDArrayDriver::checkPath`, which the C base class ran on every
-    /// `FilePath` write).
-    fn check_path(&mut self) -> AsynResult<()> {
-        let p = self.ad.params.base;
-        let path = String::from_utf8_lossy(self.ad.port_base.get_string_param(p.file_path, 0)?)
-            .into_owned();
-        let exists = !path.is_empty() && Path::new(&path).is_dir();
-        self.ad
-            .port_base
-            .set_int32_param(p.file_path_exists, 0, exists as i32)?;
-        Ok(())
-    }
-
     /// BIS drives the shutter itself when the shutter is wired to the detector
     /// (C `BISDetector::setShutter`).
     fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
@@ -282,22 +267,9 @@ impl PortDriver for BrukerDetector {
         status
     }
 
+    /// C inherits `ADDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, value: &[u8]) -> AsynResult<usize> {
-        let reason = user.reason;
-        let text = String::from_utf8_lossy(value)
-            .trim_end_matches('\0')
-            .to_string();
-        self.ad
-            .port_base
-            .params
-            .set_string(reason, user.addr, text)?;
-
-        if reason == self.ad.params.base.file_path {
-            self.check_path()?;
-        }
-
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(value.len())
+        self.ad.write_octet(user, value)
     }
 }
 

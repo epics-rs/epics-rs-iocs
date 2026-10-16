@@ -198,13 +198,8 @@ impl PortDriver for PhotonIIDetector {
             self.ad.port_base.call_param_callbacks(0)?;
             return Ok(value.len());
         }
-        self.ad.port_base.params.set_string(
-            reason,
-            user.addr,
-            String::from_utf8_lossy(value).into_owned(),
-        )?;
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(value.len())
+        // C has no writeOctet and inherits `ADDriver::writeOctet`.
+        self.ad.write_octet(user, value)
     }
 }
 

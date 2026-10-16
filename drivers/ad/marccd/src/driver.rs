@@ -171,24 +171,9 @@ impl PortDriver for MarccdDriver {
         Ok(())
     }
 
+    /// C inherits `ADDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let function = user.reason;
-
-        // C receives a NUL-terminated `char *`; waveform records pad with NULs.
-        let payload = data.split(|&b| b == 0).next().unwrap_or(&[]);
-        let value = String::from_utf8_lossy(payload).into_owned();
-
-        self.ad
-            .port_base
-            .params
-            .set_string(function, user.addr, value)?;
-        // marCCD does not override writeOctet; every octet parameter is simply
-        // stored. (Deviation: the base `asynNDArrayDriver::writeOctet` side
-        // effects — NDFilePathExists via checkPath, NDAttributesFile reload —
-        // are not reproduced; see the crate docs.)
-
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(data.len())
+        self.ad.write_octet(user, data)
     }
 }
 

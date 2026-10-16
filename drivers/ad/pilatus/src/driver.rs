@@ -340,9 +340,9 @@ impl PortDriver for PilatusDriver {
             self.send(Cmd::Raw(cmd_oscill_axis(&value)));
         } else if function == p.cbf_template_file {
             self.send(Cmd::Raw(cmd_cbf_template_file(&value)));
+        } else {
+            return self.ad.write_octet(user, data);
         }
-        // Parameters below FIRST_PILATUS_PARAM need no extra work beyond the
-        // `set_string` above.
 
         self.ad.port_base.call_param_callbacks(0)?;
         Ok(data.len())

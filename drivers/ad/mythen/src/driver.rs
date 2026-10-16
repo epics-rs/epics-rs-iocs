@@ -406,12 +406,9 @@ impl PortDriver for MythenDriver {
         self.ad.port_base.call_param_callbacks(addr)
     }
 
+    /// `mythen::writeOctet` (mythen.cpp:1062-1085) handles no octet of its
+    /// own and calls `ADDriver::writeOctet`.
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
-        let reason = user.reason;
-        let addr = user.addr;
-        let value = String::from_utf8_lossy(data).into_owned();
-        self.ad.port_base.params.set_string(reason, addr, value)?;
-        self.ad.port_base.call_param_callbacks(addr)?;
-        Ok(data.len())
+        self.ad.write_octet(user, data)
     }
 }

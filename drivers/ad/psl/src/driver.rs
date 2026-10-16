@@ -530,6 +530,8 @@ impl PortDriver for PslDetector {
             self.command(&protocol::set_record_name(&text))?;
         } else if reason == self.params.tiff_comment {
             self.command(&protocol::set_record_tag(&text))?;
+        } else {
+            self.ad.write_octet(user, value)?;
         }
 
         self.get_config()?;

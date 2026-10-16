@@ -130,6 +130,11 @@ impl PortDriver for SimDetector {
         &mut self.ad.port_base
     }
 
+    /// C inherits `ADDriver::writeOctet`.
+    fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+        self.ad.write_octet(user, data)
+    }
+
     /// `simDetector::writeInt32` (simDetector.cpp:891-957).
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
@@ -364,6 +369,29 @@ mod tests {
                 .set_int32_param(self.det.sim.reset_image, 0, 0)
                 .unwrap();
         }
+    }
+
+    /// simDetector inherits `asynNDArrayDriver::writeOctet`, so an
+    /// `NDAttributesFile` write loads the set and a `FilePath` write runs
+    /// `checkPath`.
+    #[test]
+    fn octet_writes_reach_the_asyn_nd_array_driver_branches() {
+        let mut f = Fixture::new();
+        let p = f.det.ad.params.base;
+        let xml = br#"<Attributes><Attribute name="G" type="PARAM" source="GAIN" datatype="DOUBLE"/></Attributes>"#;
+        f.det
+            .write_octet(&mut AsynUser::new(p.attributes_file), xml)
+            .unwrap();
+        assert_eq!(f.get_i32(p.attributes_status), 0);
+
+        let dir = std::env::temp_dir();
+        f.det
+            .write_octet(
+                &mut AsynUser::new(p.file_path),
+                dir.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(f.get_i32(p.file_path_exists), 1);
     }
 
     #[test]
