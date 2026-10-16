@@ -115,7 +115,7 @@ impl PortDriver for URLDriver {
                 line!(),
                 format_args!(
                     "URLDriver:writeInt32 error, status={} function={reason}, value={value}",
-                    e.status() as i32
+                    e.c_status_code()
                 ),
             ),
             Ok(()) => user.print(
@@ -244,6 +244,39 @@ mod tests {
             Err(AsynError::ParamInvalidList(1))
         ));
         assert!(matches!(acq_rx.try_recv(), Ok(AcqCommand::Start)));
+    }
+
+    /// URLDriver.cpp:327-330 prints setIntegerParam's asynParamInvalidList.
+    #[test]
+    fn a_refused_write_prints_the_param_librarys_status() {
+        use epics_rs::asyn::services::PortServices;
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "URL_STATUS_CODE";
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let mut det = URLDriver::new(port, 1 << 20, acq_tx).unwrap();
+        let manager = PortServices::global().trace().clone();
+        let log = std::env::temp_dir().join(format!("url-status-{}.log", std::process::id()));
+        let file = std::fs::File::create(&log).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let reason = det.ad.params.acquire;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        assert!(det.write_int32(&mut user, 1).is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let _ = std::fs::remove_file(&log);
+        assert!(
+            text.contains(&format!(
+                "URLDriver:writeInt32 error, status=11 function={reason}, value=1"
+            )),
+            "{text}"
+        );
     }
 
     #[test]
