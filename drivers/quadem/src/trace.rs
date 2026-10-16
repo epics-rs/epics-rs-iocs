@@ -82,6 +82,24 @@ pub fn print_read_error(handle: &PortHandle, origin: &str, read: &AsynResult<Rea
     );
 }
 
+/// `setAcquire`'s "Make sure the input EOS is set" (drvAHxxx.cpp:465-472,
+/// drvTetrAMM.cpp:464-471, drvPCR4.cpp:356-363): a refusal is printed and
+/// fails the acquire. `origin` is C's `"%s::%s"` (or `"%s:%s"`) prefix.
+pub fn ensure_input_eos(io: &OctetIo, port: &PortDriverBase, origin: &str) -> AsynResult<()> {
+    io.set_input_eos(b"\r\n").map_err(|e| {
+        asyn_print!(
+            *port,
+            ERROR,
+            "{origin}: error calling pasynOctetSyncIO->setInputEos, status={}",
+            status_code(&e)
+        );
+        AsynError::Status {
+            status: AsynStatus::Error,
+            message: e.message(),
+        }
+    })
+}
+
 /// C's `outString_` / `inString_` as a `getStatus` leaves them, for its
 /// `"error, outString=%s, inString=%s"` line.
 #[derive(Default)]

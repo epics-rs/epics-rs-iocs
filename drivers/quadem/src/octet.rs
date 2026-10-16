@@ -3,17 +3,16 @@
 //!
 //! # Input EOS
 //!
-//! C++ sets the port's input EOS once in the driver constructor
-//! (`drvTetrAMM.cpp:465`) and then toggles it at runtime: `""` before a binary
-//! data read, back to `"\r\n"` on stop. That makes the port's EOS mean two
-//! different things depending on which thread last wrote it, and the read
-//! thread and the command path race for it.
+//! C++ sets the port's input EOS to `"\r\n"` at the top of every setAcquire
+//! (`drvTetrAMM.cpp:465`) and to `""` before a binary data read (:523). That
+//! makes the port's EOS mean two different things depending on which thread
+//! last wrote it, and the read thread and the command path race for it.
 //!
-//! This port keeps the constructor-time [`OctetIo::set_input_eos`] — the only
-//! write to that cell — and selects the framing per operation:
-//! [`OctetIo::write_read`] and [`OctetIo::read_line`] are EOS-terminated,
-//! while [`OctetIo::read_binary`] suppresses the EOS for the duration of the
-//! read (`RequestOp::OctetReadBinary`). The bytes on the wire and the bytes
+//! This port only ever writes `"\r\n"` to that cell — at construction and at
+//! the top of every setAcquire, as C does — and selects the framing per
+//! operation: [`OctetIo::write_read`] and [`OctetIo::read_line`] are
+//! EOS-terminated, while [`OctetIo::read_binary`] suppresses the EOS for the
+//! duration of the read (`RequestOp::OctetReadBinary`). The bytes on the wire and the bytes
 //! delivered to the parser are identical; only the ownership of the EOS state
 //! changes, from shared mutable to per-call.
 
@@ -185,8 +184,7 @@ impl OctetIo {
         self.locked(move |port| port.read_binary(buf_size))?
     }
 
-    /// `pasynOctetSyncIO->setInputEos`. Called once at driver construction;
-    /// nothing writes this cell afterwards. C's SyncIO EOS setters take
+    /// `pasynOctetSyncIO->setInputEos`. C's SyncIO EOS setters take
     /// `lockPort`, not `queueLockPort`, so they succeed on a port whose device
     /// is down — the constructor runs before the meter is reachable.
     pub fn set_input_eos(&self, eos: &[u8]) -> AsynResult<()> {
@@ -312,8 +310,40 @@ pub fn connect_octet(port_name: &str, timeout: Duration) -> (OctetIo, AsynResult
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+
+    /// A registered octet port that refuses every input EOS.
+    struct NoInputEos(PortDriverBase);
+
+    impl PortDriver for NoInputEos {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+        fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
+            Err(AsynError::Status {
+                status: AsynStatus::Error,
+                message: "no input EOS".into(),
+            })
+        }
+    }
+
+    pub(crate) fn eos_refusing_port(name: &str) -> (OctetIo, PortRuntimeHandle) {
+        let driver = NoInputEos(PortDriverBase::new(name, 1, PortFlags::default()));
+        let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        epics_rs::asyn::asyn_record::register_port(
+            name,
+            runtime.port_handle().clone(),
+            &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
+        )
+        .unwrap();
+        let io = OctetIo::new(runtime.port_handle().clone(), Duration::from_millis(100));
+        (io, runtime)
+    }
 
     /// The driver constructors set the EOS before the meter is reachable.
     #[test]

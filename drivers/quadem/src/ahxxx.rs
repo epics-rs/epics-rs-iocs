@@ -112,9 +112,9 @@ impl AhxxxDriver {
                 qe_port_name: qe_port_name.to_string(),
             });
         }
-        // C++ sets the input EOS in setAcquire; it is constant for the port's
-        // whole life, so it is set once here. See `octet`.
-        io.set_input_eos(b"\r\n")?;
+        // C++ sets the input EOS only in setAcquire, where a refusal fails the
+        // acquire; it is set here too so the firmware query frames on it.
+        let _ = io.set_input_eos(b"\r\n");
 
         // C++ constructor: resolution_ = 24, model from the modelName argument.
         base.port_base
@@ -280,6 +280,7 @@ impl QuadEmDevice for AhxxxDriver {
         let num_average = self.base.port_base.get_int32_param(p.num_average, 0)?;
         let read_format =
             QeReadFormat::from_i32(self.base.port_base.get_int32_param(p.read_format, 0)?);
+        trace::ensure_input_eos(&self.io, &self.base.port_base, "drvAHxxx:setAcquire")?;
 
         if value == 0 {
             // A one-shot acquisition that already finished stopped the meter
@@ -924,6 +925,20 @@ mod tests {
             .read_int32_blocking(rt.params.model, 0)
             .unwrap();
         assert_eq!(model, QeModel::Ah501d as i32);
+    }
+
+    /// C++ sets the input EOS only in setAcquire (drvAHxxx.cpp:465-472): a
+    /// port that refuses it keeps the driver and fails the acquire instead.
+    #[test]
+    fn an_input_eos_refusal_fails_the_acquire_not_the_port() {
+        let (_meter, _runtime) = crate::octet::tests::eos_refusing_port("QE_AH_NOEOS_IP");
+        let rt = create_ahxxx("QE_AH_NOEOS", "QE_AH_NOEOS_IP", 4, 0, "AH501D").unwrap();
+        let err = rt
+            .port_handle()
+            .write_int32_blocking(rt.nd_params.acquire, 0, 1)
+            .unwrap_err();
+        assert_eq!(err.status(), epics_rs::asyn::error::AsynStatus::Error);
+        assert_eq!(err.message(), "no input EOS");
     }
 
     #[test]
