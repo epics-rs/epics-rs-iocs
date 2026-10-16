@@ -108,9 +108,7 @@ impl PilatusDriver {
     }
 
     fn send(&self, cmd: Cmd) {
-        if let Err(e) = self.cmd_tx.try_send(cmd) {
-            log::error!("pilatus: command queue full or closed, dropped {:?}", e.0);
-        }
+        let _ = self.cmd_tx.try_send(cmd);
     }
 }
 

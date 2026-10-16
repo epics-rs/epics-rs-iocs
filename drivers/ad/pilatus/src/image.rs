@@ -105,7 +105,10 @@ pub fn decode_tiff(path: &Path) -> Result<TiffImage, String> {
 /// stride. Row-major addressing uses the *width*, matching the bad index's
 /// `ybad * nx + xbad`; the two only agreed on a square detector. This uses
 /// `ygood * nx + xgood`, so the height is no longer a parameter.
-pub fn parse_bad_pixel_file(text: &str, nx: i32) -> Result<Vec<BadPixel>, String> {
+///
+/// An entry that does not scan fails with the number of items `fscanf`
+/// converted, which C reports.
+pub fn parse_bad_pixel_file(text: &str, nx: i32) -> Result<Vec<BadPixel>, i32> {
     let mut rest = text;
     let mut out = Vec::new();
 
@@ -114,18 +117,22 @@ pub fn parse_bad_pixel_file(text: &str, nx: i32) -> Result<Vec<BadPixel>, String
         if skip_ws(rest).is_empty() {
             break;
         }
+        let mut converted = 0;
         let mut scan = || -> Option<(i32, i32, i32, i32)> {
             let (xbad, s) = scan_i32(rest)?;
+            converted = 1;
             let s = expect_lit(s, ",")?;
             let (ybad, s) = scan_i32(s)?;
+            converted = 2;
             let (xgood, s) = scan_i32(s)?;
+            converted = 3;
             let s = expect_lit(s, ",")?;
             let (ygood, s) = scan_i32(s)?;
             rest = s;
             Some((xbad, ybad, xgood, ygood))
         };
         let Some((xbad, ybad, xgood, ygood)) = scan() else {
-            return Err("too few items, should be 4".to_string());
+            return Err(converted);
         };
         out.push(BadPixel {
             bad_index: ybad as i64 * nx as i64 + xbad as i64,
@@ -353,8 +360,8 @@ mod tests {
 
     #[test]
     fn bad_pixel_file_short_record_is_an_error() {
-        assert!(parse_bad_pixel_file("10,20 11", 10).is_err());
-        assert!(parse_bad_pixel_file("10,20 11,", 10).is_err());
+        assert_eq!(parse_bad_pixel_file("10,20 11", 10), Err(3));
+        assert_eq!(parse_bad_pixel_file("10,20 11,", 10), Err(3));
         // The literal ',' does not skip whitespace, matching fscanf.
         assert!(parse_bad_pixel_file("10 ,20 11,20", 10).is_err());
     }

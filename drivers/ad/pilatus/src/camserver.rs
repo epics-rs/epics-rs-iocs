@@ -18,6 +18,7 @@ use epics_rs::asyn::error::{AsynError, AsynStatus};
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::params::PilatusParams;
@@ -125,9 +126,14 @@ impl Ctx {
     /// in one actor message.
     pub async fn callbacks(&mut self) {
         let updates = std::mem::take(&mut self.batch.updates);
-        if let Err(e) = self.handle.set_params_and_notify(0, updates).await {
-            log::error!("pilatus: callParamCallbacks failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify(0, updates).await;
+    }
+
+    /// An `asynPrint` on `pasynUserSelf`.
+    pub fn trace(&self, mask: TraceMask, msg: &str) {
+        self.handle
+            .trace()
+            .output(self.handle.port_name(), mask, msg);
     }
 
     /// Flush pending writes so a following read observes them. The actor
@@ -156,10 +162,7 @@ impl Ctx {
         self.flush().await;
         match self.handle.read_octet(reason, 0, max_chars).await {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) => {
-                log::error!("pilatus: getStringParam({reason}) failed: {e}");
-                String::new()
-            }
+            Err(_) => String::new(),
         }
     }
 
@@ -189,8 +192,15 @@ impl Ctx {
         {
             Ok(_) => CamStatus::Success,
             Err(e) => {
-                log::error!("pilatus: writeCamserver failed, sent {cmd:?}: {e}");
-                classify(&e)
+                let status = classify(&e);
+                self.trace(
+                    TraceMask::ERROR,
+                    &format!(
+                        "pilatusDetector:writeCamserver, status={}, sent\n{cmd}",
+                        status.code()
+                    ),
+                );
+                status
             }
         };
 
@@ -255,17 +265,24 @@ impl Ctx {
         if status == CamStatus::Timeout && timeout == 0.0 {
             return CamStatus::Success;
         }
+        // C prints these on pasynUserCamserver.
+        let cam_trace = |msg: &str| {
+            self.cam_port
+                .trace()
+                .output(self.cam_port.port_name(), TraceMask::ERROR, msg);
+        };
         if status != CamStatus::Success {
-            log::error!(
-                "pilatus: readCamserver timeout={timeout}, status={:?}, received {:?}",
-                status,
+            cam_trace(&format!(
+                "pilatusDetector:readCamserver, timeout={timeout:.6}, status={} received {} bytes\n{}",
+                status.code(),
+                self.from.len(),
                 self.from
-            );
+            ));
         } else if !reply_is_ok(&self.from) {
-            log::error!(
-                "pilatus: unexpected response from camserver, no OK, response={:?}",
+            cam_trace(&format!(
+                "pilatusDetector:readCamserver unexpected response from camserver, no OK, response={}",
                 self.from
-            );
+            ));
             self.set_str(self.ad.status_message, "Error from camserver");
             status = CamStatus::Error;
         } else {

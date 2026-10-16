@@ -19,6 +19,7 @@ use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
+use epics_rs::asyn::trace::TraceMask;
 use parking_lot::Mutex;
 
 use crate::camserver::Ctx;
@@ -276,8 +277,12 @@ async fn reset_module_power(w: &mut Worker, version: (i32, i32, i32)) {
     let (major, minor, patch) = version;
     // This command only exists on camserver 7.9.0 and higher.
     if major < 7 || (major == 7 && minor < 9) {
-        log::error!(
-            "pilatus: ResetModulePower not supported on version {major}.{minor}.{patch} of camserver"
+        w.ctx.trace(
+            TraceMask::ERROR,
+            &format!(
+                "pilatusDetector::resetModulePower ResetModulePower not supported on \
+                 version {major}.{minor}.{patch} of camserver"
+            ),
         );
         return;
     }
@@ -304,21 +309,18 @@ async fn pilatus_status(
     if *first_status_call {
         let status = ctx.cam_write_read("version", 1.0).await;
         if !status.is_err() {
-            match parse_version(ctx.from()) {
-                Some(v) => {
-                    ctx.set_str(ctx.p.tvx_version, v.version_string.clone());
-                    ctx.set_str(ctx.ad.base.sdk_version, v.version_string);
-                    if let Some(x) = v.major {
-                        version.0 = x;
-                    }
-                    if let Some(x) = v.minor {
-                        version.1 = x;
-                    }
-                    if let Some(x) = v.patch {
-                        version.2 = x;
-                    }
+            if let Some(v) = parse_version(ctx.from()) {
+                ctx.set_str(ctx.p.tvx_version, v.version_string.clone());
+                ctx.set_str(ctx.ad.base.sdk_version, v.version_string);
+                if let Some(x) = v.major {
+                    version.0 = x;
                 }
-                None => log::error!("pilatus: cannot parse camserver version reply"),
+                if let Some(x) = v.minor {
+                    version.1 = x;
+                }
+                if let Some(x) = v.patch {
+                    version.2 = x;
+                }
             }
             ctx.set_i32(ctx.ad.status, ADStatus::Idle as i32);
         } else {
@@ -368,8 +370,11 @@ async fn read_bad_pixel_file(w: &mut Worker, file: &str) {
     }
     let text = match std::fs::read_to_string(file) {
         Ok(t) => t,
-        Err(e) => {
-            log::error!("pilatus: cannot open bad pixel file {file}: {e}");
+        Err(_) => {
+            w.ctx.trace(
+                TraceMask::ERROR,
+                &format!("pilatusDetector::readBadPixelFile, cannot open file {file}"),
+            );
             w.ctx.callbacks().await;
             return;
         }
@@ -381,7 +386,10 @@ async fn read_bad_pixel_file(w: &mut Worker, file: &str) {
             w.ctx.set_i32(reason, n);
         }
         // C returns without updating NUM_BAD_PIXELS, which it zeroed above.
-        Err(e) => log::error!("pilatus: bad pixel file {file}: {e}"),
+        Err(n) => w.ctx.trace(
+            TraceMask::ERROR,
+            &format!("pilatusDetector::readBadPixelFile, too few items ={n}, should be 4"),
+        ),
     }
     w.ctx.callbacks().await;
 }
@@ -402,7 +410,12 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
     let (mut data, _desc) = match read {
         Ok(v) => v,
         Err(_) => {
-            log::error!("pilatus: error reading flat field file {file}");
+            w.ctx.trace(
+                TraceMask::ERROR,
+                &format!(
+                    "pilatusDetector::readFlatFieldFile, error reading flat field file {file}"
+                ),
+            );
             w.ctx.callbacks().await;
             return;
         }
@@ -413,10 +426,6 @@ async fn read_flat_field_file(w: &mut Worker, file: &str) {
         // the average would be 0/0 = NaN and would poison every corrected
         // pixel. Skip normalization: leave FlatFieldValid = 0 (set above) and
         // do not publish a NaN-based flat field.
-        log::error!(
-            "pilatus: flat field file {file} has no pixel >= MinFlatField \
-             {min_flat_field}; flat field not applied"
-        );
         w.ctx.callbacks().await;
         return;
     };
@@ -480,7 +489,14 @@ async fn wait_for_file_to_exist(
                 let modified = match f.metadata().and_then(|m| m.modified()) {
                     Ok(m) => m,
                     Err(e) => {
-                        log::error!("pilatus: error calling fstat on {}: {e}", file.display());
+                        ctx.trace(
+                            TraceMask::ERROR,
+                            &format!(
+                                "pilatusDetector::waitForFileToExist error calling fstat, errno={} {}",
+                                e.raw_os_error().unwrap_or(0),
+                                file.display()
+                            ),
+                        );
                         return CamStatus::Error;
                     }
                 };
@@ -503,11 +519,18 @@ async fn wait_for_file_to_exist(
     }
 
     if !opened {
-        log::error!(
-            "pilatus: timeout waiting for file to be created {}",
-            file.display()
+        ctx.trace(
+            TraceMask::ERROR,
+            &format!(
+                "pilatusDetector::waitForFileToExist timeout waiting for file to be created {}",
+                file.display()
+            ),
         );
         if file_exists {
+            ctx.trace(
+                TraceMask::ERROR,
+                "  file exists but is more than 10 seconds old, possible clock synchronization problem",
+            );
             ctx.set_str(
                 ctx.ad.status_message,
                 "Image file is more than 10 seconds old",
@@ -556,12 +579,27 @@ async fn read_tiff(
                 decoded = Some(img);
                 break;
             }
-            Ok(img) => log::error!(
-                "pilatus: image size incorrect = {}x{}, should be {nx}x{ny}",
-                img.width,
-                img.height
+            Ok(img) if img.width as usize != nx => ctx.trace(
+                TraceMask::ERROR,
+                &format!(
+                    "pilatusDetector::readTiff, image width incorrect ={}, should be {nx}",
+                    img.width
+                ),
             ),
-            Err(e) => log::debug!("pilatus: error reading TIFF file {}: {e}", file.display()),
+            Ok(img) => ctx.trace(
+                TraceMask::ERROR,
+                &format!(
+                    "pilatusDetector::readTiff, image length incorrect ={}, should be {ny}",
+                    img.height
+                ),
+            ),
+            Err(_) => ctx.trace(
+                TraceMask::FLOW,
+                &format!(
+                    "pilatusDetector::readTiff, error reading TIFF file {}",
+                    file.display()
+                ),
+            ),
         }
         // Sleep, but check for the stop event so a long acquisition can abort.
         if ctx.stop.wait_timeout(secs(FILE_READ_DELAY)) {
@@ -574,10 +612,6 @@ async fn read_tiff(
     let Some(img) = decoded else {
         // Fixed (upstream-c-defects.md #8): the retry loop timed out without a
         // valid frame. Do not fabricate a buffer or publish it.
-        log::error!(
-            "pilatus: timeout reading TIFF file {}; image not published",
-            file.display()
-        );
         return Err(CamStatus::Error);
     };
     let (mut data, description) = (img.data, img.description);
@@ -610,12 +644,15 @@ async fn read_image_file(
         )
         .await
     } else if ends_with_ignore_case(file, ".cbf") {
-        log::error!("pilatus: CBF image files are not supported by this port, fileName={file}");
         ctx.set_str(ctx.ad.status_message, "CBF files are not supported");
         Err(CamStatus::Error)
     } else {
-        log::error!(
-            "pilatus: unsupported image file name extension, expected .tif or .cbf, fileName={file}"
+        ctx.trace(
+            TraceMask::ERROR,
+            &format!(
+                "pilatusDetector::readImageFile, unsupported image file name extension, \
+                 expected .tif or .cbf, fileName={file}"
+            ),
         );
         ctx.set_str(
             ctx.ad.status_message,
@@ -674,13 +711,8 @@ async fn create_file_name(ctx: &mut Ctx) -> String {
     let file_number = ctx.get_i32(base.file_number).await.unwrap_or(0);
     let auto_increment = ctx.get_i32(base.auto_increment).await.unwrap_or(0);
 
-    let full = match format_file_template(&template, &file_path, &file_name, file_number) {
-        Some(s) => s,
-        None => {
-            log::error!("pilatus: cannot expand NDFileTemplate {template:?}");
-            String::new()
-        }
-    };
+    let full =
+        format_file_template(&template, &file_path, &file_name, file_number).unwrap_or_default();
     if auto_increment != 0 {
         ctx.set_i32(base.file_number, file_number + 1);
     }
