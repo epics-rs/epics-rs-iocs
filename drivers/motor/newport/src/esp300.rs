@@ -43,9 +43,9 @@ fn trim_reply(raw: &[u8]) -> String {
     s.trim_end_matches(['\r', '\n']).to_string()
 }
 
-/// Command line terminator (C output EOS `"\r"`). This driver owns framing
-/// explicitly, like its siblings (see [`crate::smc100`]).
-const TERMINATOR: &[u8] = b"\r";
+/// Port EOS set at connect (C `input_terminator`/`output_terminator`, drvESP300.cc:649-650, :679-684).
+pub const INPUT_EOS: &[u8] = b"\n";
+pub const OUTPUT_EOS: &[u8] = b"\r";
 
 /// Maximum axes per controller (C `ESP300_MAX_AXIS`).
 pub(crate) const ESP300_MAX_AXES: usize = 6;
@@ -133,16 +133,9 @@ impl Esp300Controller {
         self.num_axes
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
-    }
-
     /// Write a command (C `send_mess`); the terminator is appended here.
     fn write(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
+        self.handle.write_octet(0, cmd.as_bytes())?;
         Ok(())
     }
 
@@ -152,7 +145,7 @@ impl Esp300Controller {
         // later reply; write_read flushes first. The ESP300 firmware can
         // still put an unsolicited hard-limit error (E35..E42) ahead of the
         // real reply, which C recv_mess re-reads past.
-        let reply = trim_reply(&self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?);
+        let reply = trim_reply(&self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?);
         if is_unsolicited_limit_error(&reply) {
             return self.read_once();
         }

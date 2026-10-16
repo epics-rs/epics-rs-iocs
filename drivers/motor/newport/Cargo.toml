@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 epics-rs = { workspace = true, features = ["asyn", "motor"] }
+motor-common = { path = "../common" }
 # The holder stores poll-loop command senders (tokio mpsc) created by
 # motor-rs's MotorBuilder; only the `sync` channel type is needed here.
 tokio = { version = "1", features = ["sync"] }

@@ -24,11 +24,6 @@ asynSetOption("$(SERIAL)", 0, "bits",   "8")
 asynSetOption("$(SERIAL)", 0, "parity", "none")
 asynSetOption("$(SERIAL)", 0, "stop",   "1")
 
-# ESP300 replies end in CR/LF: frame reads on LF (the driver strips the CR,
-# as the C driver does). The driver appends the CR command terminator itself,
-# so no output EOS is needed.
-asynOctetSetInputEos("$(SERIAL)", 0, "\n")
-
 # ---- ESP300 controller (axes discovered automatically) ----
 # ESP300CreateController(motorPort, serialPort, [movingPollMs], [idlePollMs])
 ESP300CreateController("$(PORT)", "$(SERIAL)", 100, 1000)

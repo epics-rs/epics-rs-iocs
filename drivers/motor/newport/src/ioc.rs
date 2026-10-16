@@ -33,11 +33,12 @@ use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::motor::builder::{MotorBuilder, MotorSetup};
 use epics_rs::motor::device_support::MotorDeviceSupport;
 use epics_rs::motor::poll_loop::PollCommand;
+use motor_common::connect::connect_with_eos;
 
 use crate::agap::{self, AgapAxis, AgapController};
 use crate::agilis::{AgUcAxis, AgUcController};
 use crate::conex::ConexAxis;
-use crate::esp300::{Esp300Axis, Esp300Controller};
+use crate::esp300::{self, Esp300Axis, Esp300Controller};
 use crate::hxp::{HXP_GROUP, HxpAxis, HxpController, MoveCoordSys, NUM_HXP_AXES};
 use crate::mm3000::{Mm3000Axis, Mm3000Controller};
 use crate::mm4000::{Mm4000Axis, Mm4000Controller};
@@ -1484,7 +1485,12 @@ impl NewportHolder {
                 let serial_port = req_string(args, 1, "serialPort")?;
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-                let handle = connect_serial(&serial_port, ESP300_TIMEOUT)?;
+                let handle = connect_with_eos(
+                    &serial_port,
+                    ESP300_TIMEOUT,
+                    esp300::INPUT_EOS,
+                    esp300::OUTPUT_EOS,
+                )?;
                 let controller = Esp300Controller::new(handle)
                     .map_err(|e| format!("ESP300CreateController: {e}"))?;
                 let ident = controller.ident().to_string();
