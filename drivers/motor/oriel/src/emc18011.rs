@@ -39,7 +39,8 @@
 //! driver multiplies the record's raw steps by a fixed `drive_resolution`
 //! (0.01) to reach mm and divides on readback; at the asyn-rs motor boundary,
 //! which is dial-frame EGU, that scaling cancels, so this port works directly in
-//! mm: `MRES` is 1 and `EGU` is mm.
+//! mm (`EGU` is mm). The record's `MRES` must still be `drive_resolution`:
+//! raw counts are integers, so it is the step.
 //!
 //! ## Deviations from C (documented)
 //!
