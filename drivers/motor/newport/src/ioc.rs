@@ -96,6 +96,8 @@ const MM3000_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// MM4000 serial command timeout (C drvMM4000Asyn `TIMEOUT` 2 s).
 const MM4000_TIMEOUT: Duration = Duration::from_secs(2);
+/// C drvMM4000Asyn `MM4000_MAX_AXES`.
+const MM4000_MAX_AXES: i64 = 8;
 
 /// PM500 serial command timeout (C drvPM500 `SERIAL_TIMEOUT` 2 s).
 const PM500_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1680,25 +1682,34 @@ impl NewportHolder {
             move |args: &[ArgValue], ctx: &CommandContext| {
                 let motor_port = req_string(args, 0, "motorPort")?;
                 let serial_port = req_string(args, 1, "serialPort")?;
+                // C `MM4000AsynConfig` prints its refusals and returns an
+                // error iocsh discards (NewportRegister.cc:105), so none of
+                // them fails the command.
                 let num_axes = match &args[2] {
-                    ArgValue::Int(v) if *v >= 1 => *v as usize,
-                    _ => return Err("numAxes must be a positive integer".into()),
+                    ArgValue::Int(v) if (1..=MM4000_MAX_AXES).contains(v) => *v as usize,
+                    _ => {
+                        println!("MM4000Config: numAxes must in range 1 to {MM4000_MAX_AXES}");
+                        return Ok(CommandOutcome::Continue);
+                    }
                 };
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-                let handle = connect_serial(&serial_port, MM4000_TIMEOUT)?;
+                let Ok(handle) = connect_serial(&serial_port, MM4000_TIMEOUT) else {
+                    println!("MM4000AsynConfig: cannot connect to asyn port {serial_port}");
+                    return Ok(CommandOutcome::Continue);
+                };
                 // Six per-axis polls share one controller-wide exchange (see
                 // the HXP driver for the TTL rationale).
                 let cache_ttl = Duration::from_millis(moving_poll_ms / 2);
-                let controller = Mm4000Controller::new(handle, num_axes, cache_ttl)
-                    .map_err(|e| format!("MM4000CreateController: {e}"))?;
+                let Some(controller) = Mm4000Controller::new(handle, num_axes, cache_ttl) else {
+                    return Ok(CommandOutcome::Continue);
+                };
                 let firmware = controller.firmware().to_string();
                 let model = controller.model();
                 let controller = Arc::new(Mutex::new(controller));
 
                 for axis in 1..=num_axes {
-                    let ax = Mm4000Axis::new(controller.clone(), axis)
-                        .map_err(|e| format!("MM4000CreateController: axis {axis}: {e}"))?;
+                    let ax = Mm4000Axis::new(controller.clone(), axis);
                     let dtyp_key = format!("MM4000_{motor_port}_{}", axis - 1);
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                     holder.install(

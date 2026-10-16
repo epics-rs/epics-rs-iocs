@@ -99,6 +99,12 @@ fn parse_axis_position(position_all: &str, axis: usize) -> Option<f64> {
     Some(atof(field.get(3..)?))
 }
 
+/// C's axis count: the `epicsStrtok_r(.., ",", ..)` token count, which
+/// skips empty fields (an empty reply has none).
+fn strtok_count(reply: &str) -> usize {
+    reply.split(',').filter(|t| !t.is_empty()).count()
+}
+
 /// C controller-error check: `TE;` reply byte 2 is `@` when error-free.
 fn te_ok(te_reply: &str) -> bool {
     te_reply.as_bytes().get(2) == Some(&b'@')
@@ -129,8 +135,10 @@ impl Mm4000Controller {
     /// Connect and identify an MM4000/4005/4006 (C `MM4000AsynConfig`):
     /// `VE;` up to 3 tries → firmware/model, then `TP;` — the number of
     /// comma-separated fields is the axis count on the wire, which must
-    /// cover `num_axes`. Performs blocking serial I/O.
-    pub fn new(handle: SyncIOHandle, num_axes: usize, cache_ttl: Duration) -> AsynResult<Self> {
+    /// cover `num_axes`. `None` is C's refused config: a failed `VE;` says
+    /// nothing, the other refusals print C's line. Performs blocking serial
+    /// I/O.
+    pub fn new(handle: SyncIOHandle, num_axes: usize, cache_ttl: Duration) -> Option<Self> {
         let mut ctrl = Self {
             handle,
             firmware: String::new(),
@@ -140,28 +148,22 @@ impl Mm4000Controller {
             fetched_at: None,
             cache_ttl,
         };
-        let mut ve = String::new();
-        for _ in 0..3 {
-            if let Ok(reply) = ctrl.write_read("VE;") {
-                ve = reply;
-                break;
-            }
-        }
-        if ve.is_empty() {
-            return Err(mm_err("MM4000: no response to VE identity query".into()));
-        }
+        let ve = (0..3).find_map(|_| ctrl.write_read("VE;").ok())?;
         ctrl.firmware = ve.get(2..).unwrap_or("").to_string(); // skip "VE"
-        ctrl.model = detect_model(&ctrl.firmware)
-            .ok_or_else(|| mm_err(format!("MM4000: invalid model = {}", ctrl.firmware)))?;
+        let Some(model) = detect_model(&ctrl.firmware) else {
+            println!("MM4000AsynConfig: invalid model = {}", ctrl.firmware);
+            return None;
+        };
+        ctrl.model = model;
 
-        let tp = ctrl.write_read("TP;")?;
-        let total_axes = tp.split(',').count();
+        // C ignores the `TP;` status; a failed read leaves an empty buffer.
+        let tp = ctrl.write_read("TP;").unwrap_or_default();
+        let total_axes = strtok_count(&tp);
         if total_axes < num_axes {
-            return Err(mm_err(format!(
-                "MM4000: actual number of axes={total_axes} < numAxes={num_axes}"
-            )));
+            println!("MM4000AsynConfig: actual number of axes={total_axes} < numAxes={num_axes}");
+            return None;
         }
-        Ok(ctrl)
+        Some(ctrl)
     }
 
     /// Firmware version from `VE;` (the `VE` prefix stripped).
@@ -257,38 +259,22 @@ impl Mm4000Axis {
     /// Construct axis `axis` (1-based), running the C per-axis init queries:
     /// `TC` (closed-loop state — read for wire parity, C stores it unused),
     /// `TU` (drive resolution → command precision), `XH` (home preset),
-    /// `TL`/`TR` (travel limits). Performs blocking serial I/O under the
-    /// controller lock.
-    pub fn new(controller: Arc<Mutex<Mm4000Controller>>, axis: usize) -> AsynResult<Self> {
+    /// `TL`/`TR` (travel limits). C checks none of these replies, so a
+    /// failed one reads as an empty buffer (`atof` → 0). Performs blocking
+    /// serial I/O under the controller lock.
+    pub fn new(controller: Arc<Mutex<Mm4000Controller>>, axis: usize) -> Self {
         let (model, digits, home_preset, low_limit, high_limit) = {
             let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = ctrl.write_read(&format!("{axis}TC"))?;
-            // C `atof(&inputBuff[3])`: skip the echoed `nTU` prefix.
-            let step_size = atof(
-                ctrl.write_read(&format!("{axis}TU"))?
-                    .get(3..)
-                    .unwrap_or(""),
-            );
-            if step_size <= 0.0 || !step_size.is_finite() {
-                return Err(mm_err(format!(
-                    "MM4000 axis {axis}: invalid TU resolution {step_size}"
-                )));
-            }
-            let home_preset = atof(
-                ctrl.write_read(&format!("{axis}XH"))?
-                    .get(3..)
-                    .unwrap_or(""),
-            );
-            let low_limit = atof(
-                ctrl.write_read(&format!("{axis}TL"))?
-                    .get(3..)
-                    .unwrap_or(""),
-            );
-            let high_limit = atof(
-                ctrl.write_read(&format!("{axis}TR"))?
-                    .get(3..)
-                    .unwrap_or(""),
-            );
+            // C `atof(&inputBuff[3])`: skip the echoed `nCC` prefix.
+            let query = |cc: &str| {
+                let reply = ctrl.write_read(&format!("{axis}{cc}")).unwrap_or_default();
+                atof(reply.get(3..).unwrap_or(""))
+            };
+            query("TC");
+            let step_size = query("TU");
+            let home_preset = query("XH");
+            let low_limit = query("TL");
+            let high_limit = query("TR");
             (
                 ctrl.model(),
                 max_digits(step_size),
@@ -297,7 +283,7 @@ impl Mm4000Axis {
                 high_limit,
             )
         };
-        Ok(Self {
+        Self {
             controller,
             axis,
             model,
@@ -305,7 +291,7 @@ impl Mm4000Axis {
             home_preset,
             low_limit,
             high_limit,
-        })
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Mm4000Controller> {
@@ -550,7 +536,7 @@ mod tests {
         .unwrap();
         let io = SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_secs(1));
         let ctrl = Mm4000Controller::new(io, 1, Duration::ZERO).unwrap();
-        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1).unwrap();
+        let mut axis = Mm4000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
         let user = AsynUser::default();
         assert_eq!(axis.poll(&user).unwrap().position, 5.0);
 
@@ -559,6 +545,40 @@ mod tests {
         assert!(status.comms_error);
         assert_eq!(status.position, 5.0, "a dead line reads back as 0");
         assert!(status.done);
+    }
+
+    /// C `MM4000AsynConfig` returns before any axis on a silent `VE;`
+    /// (drvMM4000Asyn.c:817-825) and on fewer `TP;` fields than numAxes
+    /// (:853-857).
+    #[test]
+    fn config_refusals_create_no_controller() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        for (name, dead, num_axes) in [("mm4000_silent", true, 1), ("mm4000_short", false, 2)] {
+            let line = Line {
+                base: PortDriverBase::new(name, 1, PortFlags::default()),
+                dead: Arc::new(AtomicBool::new(dead)),
+                reply: Vec::new(),
+            };
+            let (rt, _jh) =
+                create_port_runtime(&claim_port(name).unwrap(), line, RuntimeConfig::default())
+                    .unwrap();
+            let io =
+                SyncIOHandle::from_handle(rt.port_handle().clone(), 0, Duration::from_millis(100));
+            assert!(
+                Mm4000Controller::new(io, num_axes, Duration::ZERO).is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn axis_count_is_the_strtok_token_count() {
+        assert_eq!(strtok_count(""), 0);
+        assert_eq!(strtok_count("1TP5.0"), 1);
+        assert_eq!(strtok_count("1TP5.0,,2TP1.0,"), 2);
     }
 
     #[test]
