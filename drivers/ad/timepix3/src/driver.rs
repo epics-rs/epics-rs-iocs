@@ -1385,7 +1385,7 @@ impl PortDriver for TimePix3Driver {
             self.init_acquisition()
         } else if reason == self.ad.params.image_mode {
             if acquiring {
-                self.acquire_stop()?;
+                let _ = self.acquire_stop();
             }
             if value == 0 {
                 self.ad
@@ -1516,7 +1516,7 @@ impl PortDriver for TimePix3Driver {
             || reason == p.global_timestamp_interval
         {
             if acquiring {
-                self.acquire_stop()?;
+                let _ = self.acquire_stop();
             }
             self.init_acquisition()
         } else if reason == p.stem_dwell_time || reason == p.tof_min || reason == p.tof_max {
@@ -1940,21 +1940,75 @@ mod tests {
         }
     }
 
-    /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).
-    #[test]
-    fn a_rotation_rereads_the_detector() {
-        use std::io::{Read, Write};
+    /// A Serval that answers `{}` to everything but a request line holding
+    /// `fail`, which gets a 500.
+    fn fake_serval(fail: &'static str) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
-            for mut stream in listener.incoming().flatten() {
-                let mut buf = [0; 4096];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream);
+                let (mut request, mut length) = (String::new(), 0);
+                let _ = reader.read_line(&mut request);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let status = if request.contains(fail) {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                };
+                let _ = reader.get_mut().write_all(
+                    format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                    .as_bytes(),
                 );
             }
         });
+        url
+    }
+
+    /// An acquisition that will not stop does not keep a timing write from
+    /// reaching Serval (ADTimePix.cpp:533, :1095-1097).
+    #[test]
+    fn a_failed_stop_does_not_block_the_timing_write() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_STOP_FAIL",
+            Arc::new(ServalHttp::new(&fake_serval("/measurement/stop"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let ad = det.ad.params;
+        det.ad.port_base.set_int32_param(ad.acquire, 0, 1).unwrap();
+        det.write_float64(&mut AsynUser::new(ad.acquire_time), 0.5)
+            .unwrap();
+        det.ad
+            .port_base
+            .set_int32_param(ad.num_images, 0, 7)
+            .unwrap();
+        det.write_int32(&mut AsynUser::new(ad.image_mode), 0)
+            .unwrap();
+        assert_eq!(det.int(ad.num_images, 0), 1);
+    }
+
+    /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).
+    #[test]
+    fn a_rotation_rereads_the_detector() {
+        let url = fake_serval("\0");
         let (cmd_tx, mut cmd_rx) = rt::command_channel::<Command>(1);
         let mut det = TimePix3Driver::new(
             "TPX_ROTATE",
