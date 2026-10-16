@@ -595,7 +595,10 @@ mod tests {
             create_mar345_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
         let h = det.port_handle().clone();
         // The marServer port: its driver is no Mar345Driver, so no hold.
-        let ip = crate::driver::tests::server_handle(name);
+        let ip = epics_rs::asyn::asyn_record::get_port(&format!("{name}_IP"))
+            .unwrap()
+            .handle
+            .clone();
         let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         ip.trace().set_trace_file(
@@ -604,7 +607,7 @@ mod tests {
         );
         let worker = Worker {
             port: ip.clone(),
-            server_port: ip.clone(),
+            server_port: Arc::new(crate::driver::tests::server_user(name)),
             ad: det.ad_params,
             p: det.mar345_params,
             from: String::new(),
