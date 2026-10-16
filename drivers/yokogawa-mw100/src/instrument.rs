@@ -176,19 +176,20 @@ impl Instrument {
     }
 
     /// Block until the actor thread has finished processing `command`.
-    pub fn submit(&self, command: Command) -> io::Result<()> {
+    /// Returns nothing: C's queue reports no status to the record
+    /// (`queue_func`, drvMW100.c:1398-1424), so a device or wire error cannot alarm.
+    pub fn submit(&self, command: Command) {
         let (done_tx, done_rx) = mpsc::channel();
-        self.tx
+        if self
+            .tx
             .send(Job {
                 command,
                 done: done_tx,
             })
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-            })?;
-        done_rx.recv().map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "instrument actor thread is gone")
-        })?
+            .is_ok()
+        {
+            let _ = done_rx.recv();
+        }
     }
 
     fn cache(&self) -> parking_lot::MutexGuard<'_, Cache> {
@@ -467,7 +468,7 @@ impl Instrument {
     /// `mw100_channel_start` (`drvMW100.c:1832-1866`): the first-scan async
     /// read-refresh for a single channel, collapsed to a blocking round
     /// trip. Signal channels with no recognized type are a silent no-op.
-    pub fn channel_start(&self, family: ChannelFamily, channel: u32) -> io::Result<()> {
+    pub fn channel_start(&self, family: ChannelFamily, channel: u32) {
         let command = match family {
             ChannelFamily::Signal => match self.channel_type(channel) {
                 ChannelType::InputAnalog | ChannelType::InputInteger | ChannelType::InputBinary => {
@@ -476,7 +477,7 @@ impl Instrument {
                 ChannelType::OutputBinary | ChannelType::OutputAnalog => {
                     Command::ReadSignalOutput(channel)
                 }
-                ChannelType::None | ChannelType::Unknown => return Ok(()),
+                ChannelType::None | ChannelType::Unknown => return,
             },
             ChannelFamily::Math => Command::ReadMath(channel),
             ChannelFamily::Comm => Command::ReadComm(channel),
@@ -1208,7 +1209,7 @@ mod tests {
         assert!(!instrument.get_error_flag());
 
         let mut error_rx = instrument.register_interrupt(InterruptCategory::Error);
-        assert!(instrument.submit(Command::ClearError).is_err());
+        instrument.submit(Command::ClearError);
         assert!(instrument.get_error_flag());
         assert_eq!(
             instrument.get_error(1),
