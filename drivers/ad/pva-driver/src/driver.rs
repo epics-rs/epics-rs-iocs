@@ -4,6 +4,7 @@ use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::user::AsynUser;
@@ -196,17 +197,18 @@ impl PvaRuntime {
 /// priority/stack size) — same framework limitation as the rest of this
 /// workspace's AD ports (e.g. ad-url).
 pub fn create_pva_detector(
-    port_name: &str,
+    claim: &PortClaim,
     pv_name: &str,
     max_memory: usize,
 ) -> AsynResult<PvaRuntime> {
+    let port_name = claim.name();
     let (cmd_tx, cmd_rx) = rt::command_channel::<PvaCommand>(16);
 
     let det = PvaDriver::new(port_name, pv_name, max_memory, cmd_tx)?;
     let ad_params = det.ad.params;
     let pva_params = det.pva_params;
     let pool = det.ad.pool.clone();
-    let (runtime_handle, _) = create_port_runtime(det, RuntimeConfig::default())?;
+    let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
     let queued_counter = Arc::new(QueuedArrayCounter::new());
 
