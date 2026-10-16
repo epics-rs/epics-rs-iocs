@@ -32,9 +32,9 @@ PIJEDSSetup(1, 10)
 PIJEDSConfig(0, "$(SERIAL)", 0)
 
 # One motor record per detected axis (DTYP "PIJEDS", OUT #C$(CARD) S0, S1, ...).
-# The E-516 is a closed-loop piezo positioner: positions travel the driver
-# boundary in physical units (µm), so MRES = drive_resolution (1e-3) and
-# EGU = um. Homing and hardware limit switches are not supported.
+# The E-516 is a closed-loop piezo positioner; the driver scales the record's
+# steps by drive_resolution (1e-3 um), as C, so MRES = 1e-3 gives EGU = um.
+# Homing and hardware limit switches are not supported.
 dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m1,C=$(CARD),S=0")
 dbLoadRecords("$(PIJENA_IOC)/db/pijeds.template", "P=$(P),M=m2,C=$(CARD),S=1")
 

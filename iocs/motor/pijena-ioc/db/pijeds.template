@@ -2,9 +2,9 @@
 # axis with S = 0-based signal (DTYP "PIJEDS", OUT #C$(C) S$(S)); the driver maps
 # index 0,1,2,... to controller axes 0,1,2,...
 #
-# The E-516 is a CLOSED-LOOP capacitive-feedback piezo positioner. Positions
-# travel the driver boundary in physical units (µm); MRES = drive_resolution
-# (1e-3 = 1/10^3) sets the record's raw-count resolution and EGU is um. Motion
+# The E-516 is a CLOSED-LOOP capacitive-feedback piezo positioner. The driver
+# scales the record's steps by drive_resolution (1e-3 um) into um, as C; MRES
+# defaults to drive_resolution so EGU is um. Motion
 # completion is inferred from the feedback position settling. Homing and
 # hardware limit switches are not supported; VELO maps to the controller's slew
 # rate.
