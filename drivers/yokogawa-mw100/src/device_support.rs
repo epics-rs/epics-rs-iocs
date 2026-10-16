@@ -516,8 +516,7 @@ fn resolve_operation(
 /// Records whose C `init_record` seeds an initial value directly
 /// (`devMW100_ao.c:146-150`: VAL via `mw100_analog_get`;
 /// `devMW100_bo.c:178-185`: RVAL via `mw100_binary_get`, then `return 0`,
-/// so `boRecord.c:156-161` sets `val = rval ? 1 : 0`). The bo record's own
-/// init tail derives RVAL from VAL, so bo is seeded through VAL.
+/// so `boRecord.c:156-161` sets `val = rval ? 1 : 0`).
 fn seed_initial_value(
     instrument: &Instrument,
     op: Operation,
@@ -530,7 +529,7 @@ fn seed_initial_value(
         }
         Operation::BinarySet(channel) => {
             let v = instrument.binary_get(channel);
-            record.put_field("VAL", EpicsValue::Enum(u16::from(v != 0)))?;
+            record.put_field("RVAL", EpicsValue::ULong(v as u32))?;
         }
         _ => {}
     }
@@ -928,6 +927,7 @@ mod tests {
     };
     use epics_rs::base::runtime::task::test_block_on;
     use epics_rs::base::server::database::{PvDatabase, WriteDone};
+    use epics_rs::base::server::device_support::wire_device_to_record;
     use epics_rs::base::server::recgbl::alarm_status;
     use epics_rs::base::server::record::{AlarmSeverity, FieldDesc};
     use epics_rs::base::server::records::bo::BoRecord;
@@ -1398,7 +1398,7 @@ mod tests {
     }
 
     async fn wire_record(
-        mut record: Box<dyn Record>,
+        record: Box<dyn Record>,
         link: &str,
         instrument: Arc<Instrument>,
     ) -> PvDatabase {
@@ -1409,14 +1409,14 @@ mod tests {
             inp: "",
             out: link,
         };
-        let mut device = f(&ctx).unwrap();
-        device.init(&mut *record).unwrap();
+        let device = f(&ctx).unwrap();
         let db = PvDatabase::new();
         db.add_record("TEST", record).await.unwrap();
         let rec = db.get_record("TEST").unwrap();
         let mut inst = rec.write();
         inst.common.dtyp = DTYP.into();
-        inst.device = Some(device);
+        // The framework's init, so the record's own status-0 arm runs.
+        wire_device_to_record(&mut inst, device);
         drop(inst);
         db
     }
