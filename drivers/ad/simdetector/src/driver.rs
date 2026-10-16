@@ -162,18 +162,15 @@ impl PortDriver for SimDetector {
         }
         self.ad.port_base.call_param_callbacks(0)?;
 
-        // C `setIntegerParam(function, value)`, which for ADAcquire is
-        // intercepted by asynNDArrayDriver::setIntegerParam to drive
+        // C `status = setIntegerParam(function, value)`: list 0, and for
+        // ADAcquire intercepted by asynNDArrayDriver::setIntegerParam to drive
         // ADAcquireBusy.
-        if reason == p.acquire {
-            self.ad.set_acquire(value)?;
+        let mut status = if reason == p.acquire {
+            self.ad.set_acquire(value)
         } else {
-            self.ad
-                .port_base
-                .set_int32_param(reason, user.addr, value)?;
-        }
+            self.ad.port_base.set_int32_param(reason, 0, value)
+        };
 
-        let mut status = Ok(());
         if reason == p.acquire {
             if value != 0 && !acquiring {
                 let _ = self.start_tx.try_send(Signal);
@@ -212,10 +209,7 @@ impl PortDriver for SimDetector {
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         // Both branches replace the store's status (simDetector.cpp:973-980).
-        let _ = self
-            .ad
-            .port_base
-            .set_float64_param(reason, user.addr, value);
+        let _ = self.ad.port_base.set_float64_param(reason, 0, value);
         let status = if self
             .sim
             .float64_write_dirties_image(reason, self.ad.params.gain)
@@ -403,6 +397,17 @@ mod tests {
                 .set_int32_param(self.det.sim.reset_image, 0, 0)
                 .unwrap();
         }
+    }
+
+    /// simDetector.cpp:922: setIntegerParam(function, value) is list 0
+    /// whatever the address.
+    #[test]
+    fn a_write_at_another_address_sets_list_zero() {
+        let mut f = Fixture::new();
+        let reason = f.det.sim.reset_image;
+        let mut user = AsynUser::new(reason).with_addr(1);
+        f.det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(f.get_i32(reason), 1);
     }
 
     /// simDetector inherits `asynNDArrayDriver::writeOctet`, so an
