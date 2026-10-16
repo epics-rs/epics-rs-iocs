@@ -171,24 +171,37 @@ impl PortDriver for MarccdDriver {
         let function = user.reason;
         let p = self.p;
 
-        self.ad
+        let mut status = self
+            .ad
             .port_base
-            .set_float64_param(function, user.addr, value)?;
+            .set_float64_param(function, user.addr, value);
 
         if function == p.stability {
             self.send(Cmd::SetStability(value));
+        } else if function < p.gate_mode {
+            // ADDriver::writeFloat64 is asynPortDriver's (marCCD.cpp:1344).
+            status = self.ad.port_base.write_float64_param(user, value);
         }
-        // Parameters below FIRST_MARCCD_PARAM need no extra work beyond the
-        // `set_float64` above, which is all `ADDriver::writeFloat64` does.
 
         let _ = self.ad.port_base.call_param_callbacks(0);
-        user.print(
-            TraceMask::IO_DRIVER,
-            file!(),
-            line!(),
-            format_args!("marCCD:writeFloat64: function={function}, value={value:.6}"),
-        );
-        Ok(())
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "marCCD:writeFloat64: error, status={} function={function}, value={value:.6}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("marCCD:writeFloat64: function={function}, value={value:.6}"),
+            ),
+        }
+        status
     }
 
     /// C inherits `ADDriver::writeOctet`.
@@ -499,5 +512,50 @@ mod tests {
         });
         assert_eq!(det.pool().num_alloc_buffers(), 1);
         assert_eq!(det.pool().allocated_bytes(), 128 * 64 * 2);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (marCCD.cpp:1344), whose
+    /// IO_DRIVER line precedes marCCD's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "MARCCD_BASE_F64";
+        let mut d = MarccdDriver::new(
+            port,
+            0,
+            DriverLinks {
+                cmd_tx: rt::command_channel::<Cmd>(1).0,
+                stop: Arc::new(Event::new()),
+            },
+        )
+        .unwrap();
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("marccd-trace-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let gain = d.ad.params.gain;
+        let mut user = AsynUser::new(gain).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        d.write_float64(&mut user, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base =
+            format!("asynPortDriver:writeFloat64: function={gain}, name=GAIN, value=2.000000");
+        let own = format!("marCCD:writeFloat64: function={gain}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
     }
 }
