@@ -1300,6 +1300,7 @@ impl TimePix3Driver {
         );
 
         // The monitor and the stream workers leave on the phase change.
+        let p = self.p;
         let had_remote = claim.snapshot.has(Resource::RemoteMeasurement);
         let mut stop_succeeded = !had_remote;
         let mut remote_stopped = !had_remote;
@@ -1338,6 +1339,12 @@ impl TimePix3Driver {
                 }
             }
         }
+
+        // C `resetAcquisitionRuntimeState` (acquisition_runtime.cpp:108-153).
+        for rate in [p.prv_img_acq_rate, p.img_acq_rate, p.prv_hst_acq_rate] {
+            let _ = self.ad.port_base.set_float64_param(rate, 0, 0.0);
+        }
+        self.shared.img.lock().reset();
 
         if self.shared.acquisition.finish_stop(remote_stopped, fault) == Phase::Fault {
             let mut message = if reason.is_empty() {
@@ -2575,6 +2582,32 @@ mod tests {
             Some("tcp://listen@localhost:8089")
         );
         assert_eq!(paths.img, None);
+    }
+
+    /// A stop zeroes the stream rates and the Img accumulation
+    /// (acquisition_runtime.cpp:108-153, :211-212).
+    #[test]
+    fn a_stop_resets_the_acquisition_runtime_state() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_STOP_RESET",
+            Arc::new(ServalHttp::new(&fake_serval("\0"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let (p, acquire) = (det.p, det.ad.params.acquire);
+        det.write_int32(&mut AsynUser::new(acquire), 1).unwrap();
+        for rate in [p.prv_img_acq_rate, p.img_acq_rate, p.prv_hst_acq_rate] {
+            det.ad.port_base.set_float64_param(rate, 0, 5.0).unwrap();
+        }
+        det.shared.img.lock().add(&[1, 2, 3]);
+        det.write_int32(&mut AsynUser::new(acquire), 0).unwrap();
+        for rate in [p.prv_img_acq_rate, p.img_acq_rate, p.prv_hst_acq_rate] {
+            assert_eq!(det.dbl(rate, 0), 0.0);
+        }
+        assert_eq!(det.shared.img.lock().frame_count(), 0);
     }
 
     /// An accumulation setting reads back clamped to C's range
