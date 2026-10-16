@@ -4,9 +4,6 @@
 use std::sync::Arc;
 
 use epics_rs::ad_core::driver::ADDriverBase;
-use epics_rs::ad_core::ndarray_pool::NDArrayPool;
-use epics_rs::ad_core::params::ad_driver::ADDriverParams;
-use epics_rs::ad_core::plugin::channel::{NDArrayOutput, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -81,7 +78,20 @@ impl TimePix3Driver {
         max_memory: usize,
         cmd_tx: rt::CommandSender<Command>,
     ) -> AsynResult<Self> {
-        let mut ad = new_multi_addr_base(port_name, max_memory)?;
+        // ADDriver(portName, 8, ..., ASYN_MULTIDEVICE | ASYN_CANBLOCK, ...),
+        // ADTimePix.cpp:1072-1076.
+        let mut ad = ADDriverBase::new(
+            port_name,
+            MAX_ADDR,
+            0,
+            0,
+            max_memory,
+            PortFlags {
+                can_block: true,
+                multi_device: true,
+                ..Default::default()
+            },
+        )?;
         let p = TimePixParams::create(&mut ad.port_base)?;
 
         let mut driver = Self {
@@ -827,44 +837,6 @@ impl TimePix3Driver {
         let _ = self.cmd_tx.try_send(Command::AcquisitionStopped);
         Ok(())
     }
-}
-
-/// `ADDriverBase::new` builds its port with `max_addr = 1` and
-/// `multi_device = false`; ADTimePix3 is an `ASYN_MULTIDEVICE` port with
-/// `maxAddr = 8` (ADTimePix.cpp:1069), so the base is assembled here from the
-/// same public pieces.
-fn new_multi_addr_base(port_name: &str, max_memory: usize) -> AsynResult<ADDriverBase> {
-    let mut port_base = PortDriverBase::new(
-        port_name,
-        MAX_ADDR,
-        PortFlags {
-            can_block: true,
-            multi_device: true,
-            ..Default::default()
-        },
-    );
-    let params = ADDriverParams::create(&mut port_base)?;
-    port_base.set_string_param(params.base.port_name_self, 0, port_name)?;
-    port_base.set_int32_param(params.base.array_callbacks, 0, 1)?;
-    port_base.set_float64_param(
-        params.base.pool_max_memory,
-        0,
-        max_memory as f64 / 1_048_576.0,
-    )?;
-    port_base.set_int32_param(params.image_mode, 0, 0)?;
-    port_base.set_int32_param(params.num_images, 0, 1)?;
-    port_base.set_float64_param(params.acquire_time, 0, 1.0)?;
-    port_base.set_float64_param(params.acquire_period, 0, 1.0)?;
-
-    Ok(ADDriverBase {
-        port_base,
-        params,
-        pool: NDArrayPool::new(max_memory),
-        array_output: NDArrayOutput::new(),
-        queued_counter: Arc::new(QueuedArrayCounter::new()),
-        last_array: None,
-        attributes: Default::default(),
-    })
 }
 
 impl PortDriver for TimePix3Driver {
