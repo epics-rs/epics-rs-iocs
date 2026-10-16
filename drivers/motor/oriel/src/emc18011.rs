@@ -152,6 +152,16 @@ pub struct Emc18011Controller {
     ident: String,
     /// The 0-based index of the motor currently selected and in motion, if any.
     active: Option<usize>,
+    comm_state: CommState,
+}
+
+/// Controller communication state (C `cntrl->status`): one invalid `Z` reply
+/// is retried silently, a second in a row is a comm error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommState {
+    Normal,
+    Retry,
+    CommErr,
 }
 
 impl Emc18011Controller {
@@ -163,6 +173,7 @@ impl Emc18011Controller {
             handle,
             ident: "Oriel Encoder Mike 18011".to_string(),
             active: None,
+            comm_state: CommState::Normal,
         };
 
         let mut online = false;
@@ -363,7 +374,29 @@ impl AsynMotor for Emc18011Axis {
             return Ok(self.last_status.clone());
         }
 
-        let z = decode_z(ctrl.command("Z")?.chars().next().unwrap_or(Z_RUNUP));
+        // C drvEMC18011.cc:249-321: a missing or unknown `Z` reply keeps the
+        // previous status once (RETRY); a second in a row raises COMM_ERR.
+        let z_char = ctrl
+            .command("Z")
+            .ok()
+            .and_then(|r| r.chars().next())
+            .filter(|c| (Z_STOPPED..=Z_LSUP).contains(c));
+        let Some(z_char) = z_char else {
+            let hard = ctrl.comm_state != CommState::Normal;
+            ctrl.comm_state = if hard {
+                CommState::CommErr
+            } else {
+                CommState::Retry
+            };
+            drop(ctrl);
+            if hard {
+                self.last_status.comms_error = true;
+                self.last_status.problem = true;
+            }
+            return Ok(self.last_status.clone());
+        };
+        ctrl.comm_state = CommState::Normal;
+        let z = decode_z(z_char);
 
         let mut position = self.prev_position;
         if !z.moving {
