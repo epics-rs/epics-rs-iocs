@@ -84,10 +84,11 @@ pub struct C300Controller {
 impl C300Controller {
     /// Connect to a C300 and unlock it (`SYS:PASS:CEN "nPoint"`), matching the C
     /// constructor. Performs blocking I/O.
-    pub fn new(handle: SyncIOHandle, num_axes: usize) -> AsynResult<Self> {
+    pub fn new(handle: SyncIOHandle, num_axes: usize) -> Self {
         let ctrl = Self { handle, num_axes };
-        ctrl.write_only("SYS:PASS:CEN \"nPoint\"")?;
-        Ok(ctrl)
+        // C ignores the unlock's status (C300MotorDriver.cpp:68-69).
+        let _ = ctrl.write_only("SYS:PASS:CEN \"nPoint\"");
+        ctrl
     }
 
     /// Number of axes configured for this controller.
@@ -279,6 +280,14 @@ impl AsynMotor for C300Axis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_controller_of_a_missing_port_is_still_built() {
+        let (handle, _) = SyncIOHandle::connect_port("C300_NONE", 0, std::time::Duration::ZERO);
+        let controller = Arc::new(Mutex::new(C300Controller::new(handle, 1)));
+        let axis = C300Axis::new(controller, 0);
+        assert!(!axis.has_encoder);
+    }
 
     #[test]
     fn parse_at_reads_offset_field() {

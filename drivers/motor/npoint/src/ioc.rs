@@ -11,7 +11,7 @@ use std::time::Duration;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::base::server::iocsh::registry::*;
 
-use motor_common::connect::connect_ip;
+use motor_common::connect::connect_controller;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
@@ -45,12 +45,16 @@ pub fn c300_create_controller_command() -> CommandDef {
             }
             let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
-            let handle = connect_ip(&asyn_port, C300_TIMEOUT)?;
-            let controller = C300Controller::new(handle, num_axes as usize)
-                .map_err(|e| format!("C300CreateController: {e}"))?;
-            let controller = Arc::new(Mutex::new(controller));
-
             register_port(ctx, &port_name, num_axes as i32)?;
+
+            let (handle, _) = connect_controller(
+                &asyn_port,
+                C300_TIMEOUT,
+                &port_name,
+                format_args!("C300MotorDriver:C300Controller: cannot connect to C300 controller"),
+            );
+            let controller = C300Controller::new(handle, num_axes as usize);
+            let controller = Arc::new(Mutex::new(controller));
 
             for index in 0..num_axes as usize {
                 let ax = C300Axis::new(controller.clone(), index);
