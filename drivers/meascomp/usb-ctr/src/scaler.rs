@@ -40,14 +40,14 @@ impl ScalerState {
 }
 
 /// Configure counters and start the continuous counter scan for scaler mode.
-/// C `USBCTR::startScaler` (drvUSBCTR.cpp:887); the preset loads are C
-/// `setScalerPresets` (:1040).
+/// C `USBCTR::startScaler` (drvUSBCTR.cpp:887), which reports each failure
+/// and marks the scaler running regardless.
 pub fn start_scaler(
     device: &DaqDevice,
     state: &mut ScalerState,
     num_counters: usize,
     trace: &SelfTrace,
-) -> Result<(), String> {
+) {
     // C writeInt32 calls setScalerPresets ahead of startScaler.
     set_scaler_presets(device, state, num_counters, trace);
     let num_counters = num_counters as i32;
@@ -66,33 +66,30 @@ pub fn start_scaler(
             CMM_OUTPUT_ON | CMM_OUTPUT_INITIAL_STATE_HIGH | CMM_GATING_ON | CMM_INVERT_GATE
         };
 
-        device
-            .counter_config_scan(
-                i,
-                &CounterScanConfig {
-                    measurement_type: CMT_COUNT,
-                    measurement_mode: mode,
-                    edge_detection: CED_RISING_EDGE,
-                    tick_size: CTS_TICK_20PT83ns,
-                    debounce_mode: CDM_NONE,
-                    debounce_time: CDT_DEBOUNCE_0ns,
-                    flags: CF_DEFAULT,
-                },
-            )
-            .map_err(|e| {
-                trace.print(
-                    TraceMask::ERROR,
-                    format_args!(
-                        "USBCTR::startScaler error calling ulCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}",
-                        e.code, e.message
-                    ),
-                );
-                format!("counter_config_scan({i}) error: {e}")
-            })?;
+        if let Err(e) = device.counter_config_scan(
+            i,
+            &CounterScanConfig {
+                measurement_type: CMT_COUNT,
+                measurement_mode: mode,
+                edge_detection: CED_RISING_EDGE,
+                tick_size: CTS_TICK_20PT83ns,
+                debounce_mode: CDM_NONE,
+                debounce_time: CDT_DEBOUNCE_0ns,
+                flags: CF_DEFAULT,
+            },
+        ) {
+            trace.print(
+                TraceMask::ERROR,
+                format_args!(
+                    "USBCTR::startScaler error calling ulCConfigScan, counter={i}, mode=0x{mode:x}, status={}, error={}",
+                    e.code, e.message
+                ),
+            );
+        }
     }
 
-    // Start continuous counter scan
-    let requested_rate = 10000.0; // Will be adjusted by driver
+    // C's `long rate = 100`.
+    let requested_rate = 100.0;
     let mut rate = requested_rate;
     let config = CInScanConfig {
         low_counter: 0,
@@ -101,30 +98,24 @@ pub fn start_scaler(
         options: SO_CONTINUOUS | SO_SINGLEIO,
         flags: CINSCAN_FF_CTR64_BIT,
     };
-
-    device
-        .counter_in_scan(&config, &mut rate, &mut state.scan_buffer)
-        .map_err(|e| {
-            // C prints its requested `long rate`, not the one ulCInScan returned.
-            trace.print(
-                TraceMask::ERROR,
-                format_args!(
-                    "USBCTR::startScaler error calling ulCInScan, firstCounter={}, lastCounter={}, samplesPerCounter={}, rate={}, options=0x{:x}, flags=0x{:x}, status={}, error={}",
-                    config.low_counter,
-                    config.high_counter,
-                    config.samples_per_counter,
-                    requested_rate as i32,
-                    config.options,
-                    config.flags,
-                    e.code,
-                    e.message
-                ),
-            );
-            format!("counter_in_scan error: {e}")
-        })?;
-
+    if let Err(e) = device.counter_in_scan(&config, &mut rate, &mut state.scan_buffer) {
+        // C prints its requested `long rate`, not the one ulCInScan returned.
+        trace.print(
+            TraceMask::ERROR,
+            format_args!(
+                "USBCTR::startScaler error calling ulCInScan, firstCounter={}, lastCounter={}, samplesPerCounter={}, rate={}, options=0x{:x}, flags=0x{:x}, status={}, error={}",
+                config.low_counter,
+                config.high_counter,
+                config.samples_per_counter,
+                requested_rate as i32,
+                config.options,
+                config.flags,
+                e.code,
+                e.message
+            ),
+        );
+    }
     state.running = true;
-    Ok(())
 }
 
 /// Load each non-zero preset as its counter's limit, and counter 0's output

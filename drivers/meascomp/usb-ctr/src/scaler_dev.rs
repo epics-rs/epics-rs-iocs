@@ -75,8 +75,7 @@ impl ScalerDriver for CtrScalerDriver {
             return Ok(());
         }
         if start {
-            // C `writeInt32` ignores `startScaler`'s status; it prints its own.
-            let _ = scaler::start_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);
+            scaler::start_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);
         } else {
             scaler::stop_scaler(&dev, &mut st.scaler, &st.trace);
         }
