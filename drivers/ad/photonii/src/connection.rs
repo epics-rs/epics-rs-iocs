@@ -5,11 +5,12 @@
 //! command even though both the driver actor and the acquisition task use this
 //! handle.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynStatus};
-use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::types::MAX_MESSAGE_SIZE;
@@ -47,12 +48,14 @@ impl From<AsynError> for ChannelError {
 /// The command channel to p2util.
 #[derive(Clone)]
 pub struct P2Util {
-    handle: PortHandle,
+    handle: Arc<SyncIOHandle>,
 }
 
 impl P2Util {
-    pub fn new(handle: PortHandle) -> Self {
-        Self { handle }
+    pub fn new(handle: SyncIOHandle) -> Self {
+        Self {
+            handle: Arc::new(handle),
+        }
     }
 
     fn user(&self, timeout: Duration) -> AsynUser {
@@ -62,7 +65,7 @@ impl P2Util {
     /// Send one command line and return p2util's reply (C `writePhotonII`,
     /// which is `asynOctetSyncIO::writeRead`: flush, write, read one line).
     pub fn write_read(&self, command: &str, timeout: Duration) -> Result<String, ChannelError> {
-        let result = self.handle.submit_blocking(
+        let result = self.handle.port()?.submit_blocking(
             RequestOp::OctetWriteRead {
                 data: command.as_bytes().to_vec(),
                 buf_size: MAX_MESSAGE_SIZE,
@@ -77,7 +80,7 @@ impl P2Util {
     /// Read one line p2util sent unprompted (C `readPhotonII`), e.g. the
     /// "wrote N bytes to ..." message that follows every frame.
     pub fn read(&self, timeout: Duration) -> Result<String, ChannelError> {
-        let result = self.handle.submit_blocking(
+        let result = self.handle.port()?.submit_blocking(
             RequestOp::OctetRead {
                 buf_size: MAX_MESSAGE_SIZE,
             },
