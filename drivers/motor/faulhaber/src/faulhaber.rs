@@ -36,10 +36,13 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, nint};
 
 /// Response buffer size (C `BUFF_SIZE`).
@@ -123,16 +126,19 @@ impl FaulhaberController {
         self.num_axes
     }
 
-    fn framed(node: usize, cmd: &str) -> Vec<u8> {
-        let prefix = node.to_string();
-        let mut out = Vec::with_capacity(prefix.len() + cmd.len());
-        out.extend_from_slice(prefix.as_bytes());
-        out.extend_from_slice(cmd.as_bytes());
+    fn framed(node: usize, cmd: impl AsRef<[u8]>) -> Vec<u8> {
+        let mut out = node.to_string().into_bytes();
+        out.extend_from_slice(cmd.as_ref());
         out
     }
 
     /// Send a write-only command to `node` (no reply expected).
     fn write_cmd(&self, node: usize, cmd: &str) -> AsynResult<()> {
+        self.write_bytes(node, cmd.as_bytes())
+    }
+
+    /// [`write_cmd`](Self::write_cmd) for a record string's raw bytes.
+    fn write_bytes(&self, node: usize, cmd: &[u8]) -> AsynResult<()> {
         self.handle.write_octet(0, &Self::framed(node, cmd))?;
         Ok(())
     }
@@ -178,6 +184,7 @@ pub struct FaulhaberAxis {
     /// Last integer position (counts); C `motor_info->position`.
     prev_position: i32,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl FaulhaberAxis {
@@ -217,6 +224,7 @@ impl FaulhaberAxis {
                 has_encoder: true,
                 ..MotorStatus::default()
             },
+            strings: MoveStrings::default(),
         })
     }
 
@@ -245,6 +253,17 @@ impl FaulhaberAxis {
         }
         Ok(())
     }
+
+    /// C `MOVE_ABS`/`MOVE_REL`: PREM and a blank lead the move's own
+    /// message, and its POST waits for the move to end.
+    fn load_target(&mut self, command: &str) -> AsynResult<()> {
+        let mut line = self.strings.arm();
+        if !line.is_empty() {
+            line.push(b' ');
+        }
+        line.extend_from_slice(command.as_bytes());
+        self.lock().write_bytes(self.node, &line)
+    }
 }
 
 impl AsynMotor for FaulhaberAxis {
@@ -263,10 +282,9 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.program_motion(&ctrl, velocity, acceleration)?;
-        ctrl.write_cmd(self.node, &format!("LA {}", nint(position)))?;
-        ctrl.write_cmd(self.node, "M")
+        self.program_motion(&self.lock(), velocity, acceleration)?;
+        self.load_target(&format!("LA {}", nint(position)))?;
+        self.lock().write_cmd(self.node, "M")
     }
 
     fn move_relative(
@@ -277,10 +295,9 @@ impl AsynMotor for FaulhaberAxis {
         velocity: f64,
         acceleration: f64,
     ) -> AsynResult<()> {
-        let ctrl = self.lock();
-        self.program_motion(&ctrl, velocity, acceleration)?;
-        ctrl.write_cmd(self.node, &format!("LR {}", nint(distance)))?;
-        ctrl.write_cmd(self.node, "M")
+        self.program_motion(&self.lock(), velocity, acceleration)?;
+        self.load_target(&format!("LR {}", nint(distance)))?;
+        self.lock().write_cmd(self.node, "M")
     }
 
     fn move_velocity(
@@ -292,6 +309,7 @@ impl AsynMotor for FaulhaberAxis {
     ) -> AsynResult<()> {
         // C JOG: set speed, then enter velocity mode with the signed rate.
         let rpm = vel_to_rpm(velocity, self.counts_per_rev);
+        self.strings.split();
         let ctrl = self.lock();
         ctrl.write_cmd(self.node, &format!("SP {}", rpm.abs()))?;
         ctrl.write_cmd(self.node, &format!("V {rpm}"))
@@ -311,6 +329,7 @@ impl AsynMotor for FaulhaberAxis {
         if !forward {
             rpm = -rpm;
         }
+        self.strings.split();
         let ctrl = self.lock();
         ctrl.write_cmd(self.node, &format!("HOSP{rpm}"))?;
         ctrl.write_cmd(self.node, "GOHOSEQ")
@@ -333,6 +352,23 @@ impl AsynMotor for FaulhaberAxis {
         ctrl.write_cmd(self.node, if enable { "EN" } else { "DI" })
     }
 
+    /// `PRIMITIVE`: a blank, then INIT.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut line = vec![b' '];
+        line.extend_from_slice(init);
+        self.lock().write_bytes(self.node, &line)
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
+    }
+
     fn set_pid_gain(&mut self, _user: &AsynUser, kind: PidGainKind, gain: f64) -> AsynResult<()> {
         // C SET_PGAIN/SET_IGAIN scale the 0..1 gain by 255; derivative is
         // unsupported.
@@ -349,7 +385,8 @@ impl AsynMotor for FaulhaberAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let mut ctrl = self.lock();
+        let controller = self.controller.clone();
+        let mut ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
         // C drvMCDC2805.cc:229-251: an empty or failed GST keeps the previous
         // status once (RETRY); a second in a row raises COMM_ERR. Nothing else
         // is sent on that poll.
@@ -402,6 +439,11 @@ impl AsynMotor for FaulhaberAxis {
         // Actual velocity → done (reliable across jog and velocity=0 stops).
         let velocity = gv.as_deref().map(|s| nint(atof(s))).unwrap_or(0);
         let done = velocity == 0;
+        if (done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            ctrl.write_bytes(self.node, &post)?;
+        }
         drop(ctrl);
 
         self.prev_position = new_position;
@@ -430,6 +472,138 @@ impl AsynMotor for FaulhaberAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Rig {
+        line: LineRig,
+        axis: FaulhaberAxis,
+        moving: Arc<AtomicBool>,
+        minus: Arc<AtomicBool>,
+        user: AsynUser,
+    }
+
+    impl Rig {
+        /// Node 1 at 1000 counts/rev, its setup traffic taken.
+        fn new(name: &str) -> Self {
+            let moving = Arc::new(AtomicBool::new(false));
+            let minus = Arc::new(AtomicBool::new(false));
+            let (m, l) = (moving.clone(), minus.clone());
+            let (line, io) =
+                LineRig::new(name, move |last| match last.get(1..).unwrap_or_default() {
+                    "VER" => "MCDC2805".into(),
+                    "GST" => "0000000".into(),
+                    "POS" => "0".into(),
+                    "GAST" => if l.load(Ordering::SeqCst) { "01" } else { "00" }.into(),
+                    "GV" => if m.load(Ordering::SeqCst) { "-60" } else { "0" }.into(),
+                    _ => String::new(),
+                });
+            let controller = Arc::new(Mutex::new(FaulhaberController::new(io, 2).unwrap()));
+            let axis = FaulhaberAxis::new(controller, 1, 1000.0).unwrap();
+            line.sent();
+            Self {
+                line,
+                axis,
+                moving,
+                minus,
+                user: AsynUser::new(0),
+            }
+        }
+
+        /// What one poll sent besides its queries.
+        fn poll_extra(&mut self) -> Vec<String> {
+            self.axis.poll(&self.user).unwrap();
+            self.line
+                .sent()
+                .into_iter()
+                .filter(|l| !["1GST", "1POS", "1GAST", "1GV"].contains(&l.as_str()))
+                .collect()
+        }
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// devMCDC2805.cc:185-189.
+    #[test]
+    fn init_goes_out_behind_a_blank() {
+        let mut r = Rig::new("mcdc_init");
+        r.axis.primitive(&r.user, b"EN").unwrap();
+        assert_eq!(r.line.sent(), ["1 EN"]);
+    }
+
+    /// devMCDC2805.cc:191-205: PREM and a blank lead `LA`/`LR`, for that
+    /// move only.
+    #[test]
+    fn prem_leads_the_target_message() {
+        let mut r = Rig::new("mcdc_prem");
+        r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
+        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1EN LA 100", "1M"]);
+        r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1LR -5", "1M"]);
+        r.axis.set_move_strings(&r.user, b"EN", None).unwrap();
+        r.axis.move_relative(&r.user, -5.0, 0.0, 0.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1EN LR -5", "1M"]);
+    }
+
+    /// devMCDC2805.cc:222-236 and 286-300: HOME and JOG strcpy their first
+    /// message over PREM, and their last message replaces the motion node
+    /// that held POST.
+    #[test]
+    fn split_moves_send_neither_prem_nor_post() {
+        let mut r = Rig::new("mcdc_split");
+        r.axis
+            .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
+            .unwrap();
+        r.axis.home(&r.user, 0.0, 1000.0, 0.0, false).unwrap();
+        assert_eq!(r.line.sent(), ["1HOSP-60", "1GOHOSEQ"]);
+        assert!(r.poll_extra().is_empty());
+        r.axis
+            .set_move_strings(&r.user, b"EN", Some(post(b"DI")))
+            .unwrap();
+        r.axis.move_velocity(&r.user, 0.0, 1000.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1SP 60", "1V 60"]);
+        assert!(r.poll_extra().is_empty());
+    }
+
+    /// drvMCDC2805.cc:360-366: POST once the move is done, not while it
+    /// runs.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let mut r = Rig::new("mcdc_post");
+        r.axis
+            .set_move_strings(&r.user, b"", Some(post(b"DI")))
+            .unwrap();
+        r.axis.move_absolute(&r.user, 100.0, 0.0, 0.0, 0.0).unwrap();
+        r.line.sent();
+        r.moving.store(true, Ordering::SeqCst);
+        assert!(r.poll_extra().is_empty());
+        r.moving.store(false, Ordering::SeqCst);
+        assert_eq!(r.poll_extra(), ["1DI"]);
+        assert!(r.poll_extra().is_empty(), "sent once");
+    }
+
+    /// drvMCDC2805.cc:361: a limit in the move's direction ends it too,
+    /// after the hold at the current position.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let mut r = Rig::new("mcdc_post_ls");
+        r.axis
+            .set_move_strings(&r.user, b"", Some(post(b"DI")))
+            .unwrap();
+        r.axis
+            .move_absolute(&r.user, -100.0, 0.0, 0.0, 0.0)
+            .unwrap();
+        r.line.sent();
+        r.moving.store(true, Ordering::SeqCst);
+        r.minus.store(true, Ordering::SeqCst);
+        assert_eq!(r.poll_extra(), ["1LA 0", "1M", "1DI"]);
+    }
 
     #[test]
     fn framed_prefixes_node() {
