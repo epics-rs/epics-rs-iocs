@@ -17,15 +17,17 @@ use epics_rs::ad_core::timestamp::EpicsTimestamp;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::{ParamSetValue, RequestOp};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 use serde_json::Value;
 
 use crate::accum::Update;
+use crate::adlog;
 use crate::http::{ServalHttp, TIMEOUT_POLL};
 use crate::params::TimePixParams;
 use crate::serval;
 use crate::state::{Command, Shared};
-use crate::stream::{Channel, Frame, FrameDecoder, parse_tcp_path};
+use crate::stream::{Channel, DecodeError, Frame, FrameDecoder, parse_tcp_path};
 
 /// C's `connectionPollPeriodSec_` (ADTimePix.cpp:1471).
 const CONNECTION_POLL: Duration = Duration::from_secs(5);
@@ -57,9 +59,13 @@ pub struct Ctx {
 
 impl Ctx {
     async fn set(&self, addr: i32, updates: Vec<ParamSetValue>) {
-        if let Err(e) = self.handle.set_params_and_notify(addr, updates).await {
-            log::error!("timepix3: parameter update failed: {e}");
-        }
+        let _ = self.handle.set_params_and_notify(addr, updates).await;
+    }
+
+    fn trace(&self, mask: TraceMask, line: &str) {
+        self.handle
+            .trace()
+            .output(self.handle.port_name(), mask, line);
     }
 
     async fn set_int(&self, reason: usize, addr: i32, value: i32) {
@@ -76,24 +82,18 @@ impl Ctx {
     /// `callParamCallbacks`.
     async fn set_int64(&self, reason: usize, addr: i32, value: i64) {
         let user = AsynUser::new(reason).with_addr(addr);
-        if let Err(e) = self
+        let _ = self
             .handle
             .submit_async(RequestOp::Int64Write { value }, user)
-            .await
-        {
-            log::error!("timepix3: int64 parameter update failed: {e}");
-        }
+            .await;
     }
 
     async fn set_int64_array(&self, reason: usize, addr: i32, data: Vec<i64>) {
         let user = AsynUser::new(reason).with_addr(addr);
-        if let Err(e) = self
+        let _ = self
             .handle
             .submit_async(RequestOp::Int64ArrayWrite { data }, user)
-            .await
-        {
-            log::error!("timepix3: int64 array update failed: {e}");
-        }
+            .await;
     }
 }
 
@@ -147,9 +147,7 @@ async fn connection_poll(
         match command {
             Command::AcquisitionStarted => {
                 ctx.shared.set_acquiring(true);
-                if acq_tx.try_send(()).is_err() {
-                    log::error!("timepix3: the acquisition poll is not running");
-                }
+                let _ = acq_tx.try_send(());
                 continue;
             }
             Command::AcquisitionStopped => {
@@ -278,8 +276,7 @@ async fn refresh_detector(ctx: &Arc<Ctx>) {
 
     let detector = match ctx.http.get_json(serval::DETECTOR, TIMEOUT_POLL) {
         Ok(d) => d,
-        Err(e) => {
-            log::warn!("timepix3: GET /detector: {e}");
+        Err(_) => {
             ctx.set_int(p.det_connected, 0, 0).await;
             return;
         }
@@ -631,57 +628,57 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
         )
         .await;
 
+        // C's first GET and its in-loop polls print different lines.
+        let mut first = true;
         while ctx.shared.acquiring() {
-            match ctx.http.get_json(serval::MEASUREMENT, TIMEOUT_POLL) {
-                Ok(m) => {
-                    let mut updates = Vec::new();
-                    if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
-                        updates.push(ParamSetValue::new(
-                            p.status,
-                            0,
-                            ParamValue::Octet(v.as_bytes().into()),
-                        ));
-                    }
-                    for (ptr, reason) in [
-                        ("/Info/ElapsedTime", p.elapsed_time),
-                        ("/Info/TimeLeft", p.time_left),
-                        ("/Info/PixelEventRate", p.pel_rate),
-                        ("/Info/TdcEventRate", p.tdc1_rate),
-                    ] {
-                        if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
-                            updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
-                        }
-                    }
-                    for (ptr, reason) in [
-                        ("/Info/FrameCount", p.frame_count),
-                        ("/Info/DroppedFrames", p.dropped_frames),
-                    ] {
-                        if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
-                            updates.push(ParamSetValue::new(
-                                reason,
-                                0,
-                                ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
-                            ));
-                        }
-                    }
-                    if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
-                        updates.push(ParamSetValue::new(
-                            p.start_time,
-                            0,
-                            ParamValue::Octet(v.as_bytes().into()),
-                        ));
-                    }
-                    ctx.set(0, updates).await;
-
-                    if !serval::measurement_is_running(&m) {
-                        break;
+            // A failed poll is retried after the sleep. UPSTREAM DEFECT
+            // (acquire.cpp:514-518): C `continue`s on an HTTP error without
+            // sleeping, so a Serval that goes away mid-acquisition leaves this
+            // thread spinning at 100% CPU.
+            let polled = poll_measurement(&ctx, first);
+            first = false;
+            if let Some(m) = polled {
+                let mut updates = Vec::new();
+                if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
+                    updates.push(ParamSetValue::new(
+                        p.status,
+                        0,
+                        ParamValue::Octet(v.as_bytes().into()),
+                    ));
+                }
+                for (ptr, reason) in [
+                    ("/Info/ElapsedTime", p.elapsed_time),
+                    ("/Info/TimeLeft", p.time_left),
+                    ("/Info/PixelEventRate", p.pel_rate),
+                    ("/Info/TdcEventRate", p.tdc1_rate),
+                ] {
+                    if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
+                        updates.push(ParamSetValue::new(reason, 0, ParamValue::Float64(v)));
                     }
                 }
-                Err(e) => {
-                    // UPSTREAM DEFECT (acquire.cpp:514-518): C `continue`s on an
-                    // HTTP error without sleeping, so a Serval that goes away
-                    // mid-acquisition leaves this thread spinning at 100% CPU.
-                    log::warn!("timepix3: GET /measurement: {e}");
+                for (ptr, reason) in [
+                    ("/Info/FrameCount", p.frame_count),
+                    ("/Info/DroppedFrames", p.dropped_frames),
+                ] {
+                    if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
+                        updates.push(ParamSetValue::new(
+                            reason,
+                            0,
+                            ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
+                        ));
+                    }
+                }
+                if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
+                    updates.push(ParamSetValue::new(
+                        p.start_time,
+                        0,
+                        ParamValue::Octet(v.as_bytes().into()),
+                    ));
+                }
+                ctx.set(0, updates).await;
+
+                if !serval::measurement_is_running(&m) {
+                    break;
                 }
             }
             tokio::time::sleep(ACQUISITION_POLL).await;
@@ -696,6 +693,38 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
             ],
         )
         .await;
+    }
+}
+
+/// One `GET /measurement`, printing C `timePixCallback`'s line for a failure.
+fn poll_measurement(ctx: &Ctx, first: bool) -> Option<Value> {
+    match ctx.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
+        Ok(body) => serde_json::from_str(&body)
+            .inspect_err(|e| {
+                let what = if first { "measurement" } else { "poll" };
+                ctx.trace(
+                    TraceMask::ERROR,
+                    &adlog::err(
+                        adlog::TIME_PIX_CALLBACK,
+                        &format!("timePixCallback: {what} JSON parse failed: {e}"),
+                    ),
+                );
+            })
+            .ok(),
+        Err(e) => {
+            let url = format!("{}{}", ctx.http.base_url(), serval::MEASUREMENT);
+            let line = if first {
+                adlog::http_failure("timePixCallback GET /measurement", "GET", &url, &e)
+                    .map(|l| (TraceMask::ERROR, l))
+            } else {
+                adlog::http_warning("timePixCallback poll GET /measurement", "GET", &url, &e)
+                    .map(|l| (TraceMask::WARNING, l))
+            };
+            if let Some((mask, line)) = line {
+                ctx.trace(mask, &line);
+            }
+            None
+        }
     }
 }
 
@@ -716,6 +745,33 @@ impl StreamKind {
         match self {
             Self::PrvHst => Channel::Histogram,
             _ => Channel::Image,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::PrvImg => "PrvImg",
+            Self::Img => "Img",
+            Self::PrvHst => "PrvHst",
+        }
+    }
+
+    /// The C functions whose `__PRETTY_FUNCTION__` the image channels' asyn
+    /// lines carry: connect, worker thread, header parse. C's PrvHst code
+    /// prints with `printf`/`fprintf` instead, so it has none.
+    fn c_functions(self) -> Option<[&'static str; 3]> {
+        match self {
+            Self::PrvImg => Some([
+                "void ADTimePix::prvImgConnect()",
+                "void ADTimePix::prvImgWorkerThread()",
+                "bool ADTimePix::processPrvImgDataLine(char*, char*, size_t)",
+            ]),
+            Self::Img => Some([
+                "void ADTimePix::imgConnect()",
+                "void ADTimePix::imgWorkerThread()",
+                "bool ADTimePix::processImgDataLine(char*, char*, size_t)",
+            ]),
+            Self::PrvHst => None,
         }
     }
 
@@ -752,20 +808,38 @@ async fn stream_worker(ctx: Arc<Ctx>, kind: StreamKind) {
             continue;
         };
 
+        let name = kind.name();
+        if kind.c_functions().is_none() {
+            println!("PrvHst worker thread: Attempting to connect to {host}:{port}");
+        }
         let stream = match TcpStream::connect((host.as_str(), port)) {
             Ok(s) => s,
-            Err(e) => {
-                log::warn!("timepix3: {kind:?}: connecting to {host}:{port}: {e}");
+            Err(_) => {
+                let msg = format!("{name} TCP failed to connect to {host}:{port}");
+                match kind.c_functions() {
+                    Some([connect, ..]) => ctx.trace(TraceMask::ERROR, &adlog::err(connect, &msg)),
+                    None => {
+                        eprintln!("ERROR | ADTimePix::prvHstConnect: {msg}");
+                        println!(
+                            "PrvHst worker thread: Connection failed, will retry in {:.1} seconds",
+                            RECONNECT_WAIT.as_secs_f64()
+                        );
+                    }
+                }
                 tokio::time::sleep(RECONNECT_WAIT).await;
                 continue;
             }
         };
-        if let Err(e) = stream.set_read_timeout(Some(READ_TIMEOUT)) {
-            log::warn!("timepix3: {kind:?}: cannot set the read timeout: {e}");
+        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+        let msg = format!("{name} TCP connected to {host}:{port}");
+        match kind.c_functions() {
+            Some([connect, ..]) => ctx.trace(TraceMask::IO_DRIVER, &adlog::log(connect, &msg)),
+            None => {
+                println!("{msg}");
+                println!("PrvHst worker thread: Connection successful, starting data reception");
+            }
         }
-        log::info!("timepix3: {kind:?} stream connected to {host}:{port}");
         read_stream(&ctx, kind, stream).await;
-        log::info!("timepix3: {kind:?} stream closed");
     }
 }
 
@@ -775,12 +849,21 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
 
     while ctx.shared.acquiring() {
         match stream.read(&mut buf) {
-            Ok(0) => return, // The peer closed the stream.
+            Ok(0) => {
+                println!("{} TCP connection closed by peer", kind.name());
+                return;
+            }
             Ok(n) => decoder.push(&buf[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                log::warn!("timepix3: {kind:?}: read: {e}");
+                let msg = format!("{} TCP socket error: {}", kind.name(), strerror(&e));
+                match kind.c_functions() {
+                    Some([_, worker, _]) => {
+                        ctx.trace(TraceMask::IO_DRIVER, &adlog::log(worker, &msg))
+                    }
+                    None => println!("{msg}"),
+                }
                 return;
             }
         }
@@ -792,11 +875,59 @@ async fn read_stream(ctx: &Arc<Ctx>, kind: StreamKind, mut stream: TcpStream) {
                 Err(e) => {
                     // The payload length is unknown, so the stream cannot be
                     // resynchronised: drop the connection and start over.
-                    log::error!("timepix3: {kind:?}: {e}");
+                    decode_failed(ctx, kind, &e);
                     return;
                 }
             }
         }
+    }
+}
+
+/// The line C prints for a header it cannot use.
+fn decode_failed(ctx: &Ctx, kind: StreamKind, e: &DecodeError) {
+    match (kind.c_functions(), e) {
+        (Some([_, worker, _]), DecodeError::NoNewline) => ctx.trace(
+            TraceMask::IO_DRIVER,
+            &adlog::log(
+                worker,
+                &format!(
+                    "{} TCP buffer full without finding newline, resetting",
+                    kind.name()
+                ),
+            ),
+        ),
+        (None, DecodeError::NoNewline) => {
+            println!("PrvHst TCP buffer full without finding newline, resetting");
+        }
+        (Some([_, _, line]), DecodeError::Json(m)) => ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(line, &format!("JSON parse error: {m}")),
+        ),
+        (None, DecodeError::Json(m)) => {
+            eprintln!("ERROR | ADTimePix::processPrvHstDataLine: JSON parse error in PrvHst: {m}");
+        }
+        (Some([_, _, line]), DecodeError::Dimensions(w, h)) => ctx.trace(
+            TraceMask::ERROR,
+            &adlog::err(
+                line,
+                &format!("Invalid image dimensions: width={w}, height={h}"),
+            ),
+        ),
+        (None, DecodeError::BinSize(n)) => {
+            eprintln!("ERROR | ADTimePix::processPrvHstDataLine: Invalid bin size: {n}");
+        }
+        // C's `int` product wraps instead; and each channel's decoder only
+        // produces its own header's errors.
+        _ => {}
+    }
+}
+
+/// C `strerror(errno)`: the OS text without Rust's " (os error N)" suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(end) => text[..end].to_string(),
+        None => text,
     }
 }
 
@@ -944,9 +1075,8 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
             )
             .await;
         }
-        // The decoder is created for the channel, so this cannot happen; a
-        // mismatch means the channel's Format PV disagrees with the port.
-        (kind, _) => log::error!("timepix3: {kind:?}: the stream carries the wrong frame type"),
+        // The decoder is created for the channel, so this cannot happen.
+        _ => {}
     }
 }
 

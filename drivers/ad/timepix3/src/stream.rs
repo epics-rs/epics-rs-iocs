@@ -90,18 +90,32 @@ pub enum Frame {
     Histogram(HistogramFrame),
 }
 
+/// A header the decoder cannot get past. The frame is unrecoverable: the
+/// payload length is unknown, so the stream has to be torn down rather than
+/// guessed past. Each variant is one of C's error prints.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The header line was not JSON, or its fields are out of range. The frame
-    /// is unrecoverable: the payload length is unknown, so the stream has to be
-    /// torn down rather than guessed past.
-    BadHeader(String),
+    /// No newline within `MAX_HEADER` bytes.
+    NoNewline,
+    /// The header line is not JSON.
+    Json(String),
+    /// Image width or height out of range.
+    Dimensions(i64, i64),
+    /// Image payload size overflows `usize`.
+    Overflow,
+    /// Histogram bin count out of range.
+    BinSize(i64),
 }
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self::BadHeader(m) = self;
-        write!(f, "stream header: {m}")
+        match self {
+            Self::NoNewline => write!(f, "no newline in the header"),
+            Self::Json(e) => write!(f, "header is not JSON: {e}"),
+            Self::Dimensions(w, h) => write!(f, "dimensions {w}x{h}"),
+            Self::Overflow => write!(f, "payload size overflows"),
+            Self::BinSize(n) => write!(f, "binSize {n}"),
+        }
     }
 }
 
@@ -147,10 +161,7 @@ impl FrameDecoder {
     pub fn next_frame(&mut self) -> Result<Option<Frame>, DecodeError> {
         let Some(newline) = self.buf.iter().position(|&b| b == b'\n') else {
             if self.buf.len() > MAX_HEADER {
-                return Err(DecodeError::BadHeader(format!(
-                    "no newline in {} bytes",
-                    self.buf.len()
-                )));
+                return Err(DecodeError::NoNewline);
             }
             return Ok(None);
         };
@@ -162,8 +173,8 @@ impl FrameDecoder {
             self.buf.drain(..=newline);
             return self.next_frame();
         };
-        let header: Value = serde_json::from_slice(&line[brace..])
-            .map_err(|e| DecodeError::BadHeader(e.to_string()))?;
+        let header: Value =
+            serde_json::from_slice(&line[brace..]).map_err(|e| DecodeError::Json(e.to_string()))?;
 
         let (payload_len, frame) = match self.channel {
             Channel::Image => image_header(&header)?,
@@ -278,16 +289,13 @@ fn image_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
             .and_then(Value::as_str)
             .unwrap_or("uint16"),
     );
-    let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) else {
-        return Err(DecodeError::BadHeader(format!(
-            "dimensions {width}x{height}"
-        )));
+    let (Ok(w), Ok(h)) = (usize::try_from(width), usize::try_from(height)) else {
+        return Err(DecodeError::Dimensions(width, height));
     };
-    if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
-        return Err(DecodeError::BadHeader(format!(
-            "dimensions {width}x{height}"
-        )));
+    if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+        return Err(DecodeError::Dimensions(width, height));
     }
+    let (width, height) = (w, h);
     // UPSTREAM DEFECT (serval_stream.cpp:487): C computes `pixel_count =
     // width * height` in `int` *before* the range check, so a hostile or
     // corrupt header overflows the multiplication and the check passes on the
@@ -295,7 +303,7 @@ fn image_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
     let payload = width
         .checked_mul(height)
         .and_then(|n| n.checked_mul(format.bytes()))
-        .ok_or_else(|| DecodeError::BadHeader(format!("payload of {width}x{height} overflows")))?;
+        .ok_or(DecodeError::Overflow)?;
     Ok((
         payload,
         Pending::Image {
@@ -313,12 +321,13 @@ fn image_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
 
 fn histogram_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
     let bin_size = header_i64(header, "binSize", -1);
-    let Ok(bin_size) = usize::try_from(bin_size) else {
-        return Err(DecodeError::BadHeader(format!("binSize {bin_size}")));
+    let Ok(bins) = usize::try_from(bin_size) else {
+        return Err(DecodeError::BinSize(bin_size));
     };
-    if bin_size == 0 || bin_size > MAX_BINS {
-        return Err(DecodeError::BadHeader(format!("binSize {bin_size}")));
+    if bins == 0 || bins > MAX_BINS {
+        return Err(DecodeError::BinSize(bin_size));
     }
+    let bin_size = bins;
     Ok((
         bin_size * 4,
         Pending::Histogram {
