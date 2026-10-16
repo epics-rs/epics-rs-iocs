@@ -16,9 +16,9 @@ use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
-use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
+use epics_rs::ad_core::driver::write_tail::{OwnList, WriteTail};
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::{NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
@@ -29,6 +29,12 @@ use parking_lot::Mutex;
 use crate::params::Mar345Params;
 use crate::task::{Worker, start_task};
 use crate::types::{EraseMode, Event, Mode, Resolution, ScanSize, Status, TriggerMode};
+
+const INT32_TAIL: WriteTail = WriteTail {
+    error: "mar345:writeInt32: error, ",
+    done: "mar345:writeInt32: ",
+    list: OwnList::Zero,
+};
 
 /// The maximum image plate dimension (345 mm at 0.10 mm), C's `dims[0/1]` and
 /// the `ADMaxSizeX`/`ADMaxSizeY` the constructor writes.
@@ -129,62 +135,42 @@ impl PortDriver for Mar345Driver {
         let params = self.ad.params;
         let p = self.p;
 
-        // C: `status = setIntegerParam(function, value)` for every function,
-        // on list 0; it stands unless the base class replaces it.
-        let mut status = self.ad.port_base.set_int32_param(function, 0, value);
-
-        let idle = self.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
-        if function == params.acquire {
-            if value != 0 && idle {
-                // Wake the mar345 task to acquire.
-                self.mode.store(Mode::Acquire as i32, Ordering::SeqCst);
-                self.start.signal();
+        INT32_TAIL.write_int32(self, user, value, |det, user, mut status| {
+            let idle = det.mode.load(Ordering::SeqCst) == Mode::Idle as i32;
+            if function == params.acquire {
+                if value != 0 && idle {
+                    // Wake the mar345 task to acquire.
+                    det.mode.store(Mode::Acquire as i32, Ordering::SeqCst);
+                    det.start.signal();
+                }
+                if value == 0 && !idle {
+                    // Stop acquiring (ends exposure, does not abort).
+                    det.stop.signal();
+                }
+            } else if function == p.erase {
+                if value != 0 && idle {
+                    det.mode.store(Mode::Erase as i32, Ordering::SeqCst);
+                    det.start.signal();
+                }
+            } else if function == p.change_mode {
+                if value != 0 && idle {
+                    det.mode.store(Mode::Change as i32, Ordering::SeqCst);
+                    det.start.signal();
+                }
+            } else if function == p.abort {
+                if value != 0 && !idle {
+                    // Abort operation.
+                    let _ =
+                        det.ad
+                            .port_base
+                            .set_int32_param(params.status, 0, Status::Aborting as i32);
+                    det.abort.signal();
+                }
+            } else if function < p.first() {
+                status = ADDriver::ad_write_int32(det, user, value);
             }
-            if value == 0 && !idle {
-                // Stop acquiring (ends exposure, does not abort).
-                self.stop.signal();
-            }
-        } else if function == p.erase {
-            if value != 0 && idle {
-                self.mode.store(Mode::Erase as i32, Ordering::SeqCst);
-                self.start.signal();
-            }
-        } else if function == p.change_mode {
-            if value != 0 && idle {
-                self.mode.store(Mode::Change as i32, Ordering::SeqCst);
-                self.start.signal();
-            }
-        } else if function == p.abort {
-            if value != 0 && !idle {
-                // Abort operation.
-                self.ad
-                    .port_base
-                    .set_int32_param(params.status, 0, Status::Aborting as i32)?;
-                self.abort.signal();
-            }
-        } else if function < p.first() {
-            status = ADDriver::ad_write_int32(self, user, value);
-        }
-
-        let _ = self.ad.port_base.call_param_callbacks(0);
-        match &status {
-            Err(e) => user.print(
-                TraceMask::ERROR,
-                file!(),
-                line!(),
-                format_args!(
-                    "mar345:writeInt32: error, status={} function={function}, value={value}",
-                    e.c_status_code()
-                ),
-            ),
-            Ok(()) => user.print(
-                TraceMask::IO_DRIVER,
-                file!(),
-                line!(),
-                format_args!("mar345:writeInt32: function={function}, value={value}"),
-            ),
-        }
-        status
+            status
+        })
     }
 }
 
