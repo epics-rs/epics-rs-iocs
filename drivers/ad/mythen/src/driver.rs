@@ -327,7 +327,7 @@ impl StatusOr {
     /// `status |= step`.
     fn or(&mut self, step: AsynResult<()>) {
         if let Err(e) = step {
-            self.bits |= e.status() as i32;
+            self.bits |= e.c_status_code();
             self.err = Some(e);
         }
     }
