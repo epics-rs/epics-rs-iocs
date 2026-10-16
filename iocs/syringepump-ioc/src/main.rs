@@ -175,9 +175,6 @@ async fn main() -> CaResult<()> {
                     ctx.println(&format!("drvAsynSerialPortConfigure: {e}"));
                     return Ok(CommandOutcome::Continue);
                 }
-                ctx.println(&format!(
-                    "drvAsynSerialPortConfigure: octet port '{port}' -> {tty}"
-                ));
                 Ok(CommandOutcome::Continue)
             },
         ));
