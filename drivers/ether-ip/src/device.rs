@@ -409,6 +409,14 @@ impl DeviceSupport for EtherIpDevice {
     // an errlogPrintf, never touching pact (`devEtherIP.c:884-1007,1183-1205`)
     // — the record scans on: the `Err` shape, kept by every `?` below.
     fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        // C's mbbi/mbbo(Direct) `init_record` zero SHFT (devEtherIP.c:1331,
+        // 1355,1563,1597): the tag's NOBT bits are the raw value, unshifted.
+        if matches!(
+            record.record_type(),
+            "mbbi" | "mbbo" | "mbbiDirect" | "mbboDirect"
+        ) {
+            record.put_field("SHFT", EpicsValue::UShort(0))?;
+        }
         let (bits, count) = record_shape(record);
         let link = parse_link(&self.link_text, count, bits)
             .map_err(|e| CaError::InvalidValue(format!("devEtherIP: {e}")))?;
@@ -940,6 +948,33 @@ mod tests {
             v.extend_from_slice(&w.to_le_bytes());
         }
         v
+    }
+
+    #[test]
+    fn multi_bit_records_zero_shft_at_init() {
+        use epics_rs::base::server::records::{
+            mbbi::MbbiRecord, mbbi_direct::MbbiDirectRecord, mbbo::MbboRecord,
+            mbbo_direct::MbboDirectRecord,
+        };
+        let records: [Box<dyn Record>; 4] = [
+            Box::new(MbbiRecord::default()),
+            Box::new(MbbiDirectRecord::default()),
+            Box::new(MbboRecord::default()),
+            Box::new(MbboDirectRecord::default()),
+        ];
+        for mut record in records {
+            record.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+            // The link names no PLC, so init refuses after the SHFT reset.
+            let mut dev =
+                EtherIpDevice::new("@nosuchplc tag", record.record_type().starts_with("mbbo"));
+            let _ = dev.init(&mut *record);
+            assert_eq!(
+                record.get_field("SHFT"),
+                Some(EpicsValue::UShort(0)),
+                "{}",
+                record.record_type()
+            );
+        }
     }
 
     // -- link parsing --------------------------------------------------------
