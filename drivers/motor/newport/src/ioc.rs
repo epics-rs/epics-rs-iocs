@@ -24,12 +24,15 @@ use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
 use epics_rs::asyn::interfaces::motor::AsynMotor;
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::runtime::task::{StackSizeClass, ThreadPriority, spawn_dedicated_thread};
 use epics_rs::base::server::iocsh::registry::*;
 use epics_rs::base::server::record::DevSup;
 use epics_rs::motor::trace::MotorTrace;
-use motor_common::connect::{EosConnectError, EosRefusal, connect_serial, connect_with_eos};
+use motor_common::connect::{
+    EosConnectError, EosRefusal, connect_controller, connect_serial, connect_with_eos,
+};
 use motor_common::iocsh::{
     arg_double_opt, arg_double_req, arg_int_opt, arg_int_req, arg_str_opt, arg_str_req, opt_double,
     opt_int, opt_string, poll_intervals, req_double, req_string,
@@ -183,14 +186,20 @@ pub fn smc100_create_controller_command() -> CommandDef {
             }
 
             register_port(ctx, &port_name, num_axes)?;
-            if get_port(&serial_port).is_none() {
-                eprintln!(
+            let (handle, _) = connect_controller(
+                &serial_port,
+                SMC100_TIMEOUT,
+                &port_name,
+                format_args!(
                     "SMC100Controller::SMC100Controller: cannot connect to SMC100 controller"
-                );
-                return Ok(CommandOutcome::Continue);
-            }
+                ),
+            );
+            // C builds every axis on pasynUserController_, connected or not.
+            let mut controller_user = Some(handle);
             for axis in 0..num_axes {
-                let handle = connect_serial(&serial_port, SMC100_TIMEOUT)?;
+                let handle = controller_user.take().unwrap_or_else(|| {
+                    SyncIOHandle::connect_port(&serial_port, 0, SMC100_TIMEOUT).0
+                });
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(Smc100Axis::new(
                     handle,
                     (axis + 1) as u8,
