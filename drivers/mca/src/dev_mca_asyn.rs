@@ -980,7 +980,7 @@ record(calc, "{prefix}N") {{ field(CALC, "A+1") field(INPA, "{prefix}N") }}
                 let (name, factory) = mca_rs::mca_record_factory();
                 let (db, _) = IocBuilder::new()
                     .register_record_type(name, factory)
-                    .register_dynamic_device_support(mca_device_support)
+                    .register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
                     .db_string(&db, &HashMap::new())
                     .unwrap()
                     .build()
@@ -1072,7 +1072,7 @@ record(mca, "MCAHOLD") {
             let (name, factory) = mca_rs::mca_record_factory();
             let (db, _) = IocBuilder::new()
                 .register_record_type(name, factory)
-                .register_dynamic_device_support(mca_device_support)
+                .register_dynamic_device_support(&[("mca", &MCA_DEVICES)], mca_device_support)
                 .db_string(db, &HashMap::new())
                 .unwrap()
                 .build()
