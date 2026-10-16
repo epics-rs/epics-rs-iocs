@@ -1,12 +1,6 @@
 # GM10 InputInteger (pulse) channel (Signal address family).
 # Macros: P, DAU, HANDLE, ADDRESS (1-based Signal channel index).
 # Port of yokogawaDasApp/Db/GM10_pulse_input_channel.db.
-#
-# Upstream-defect fix (GM10_pulse_input_channel.db:77,111,145,179): THSV was
-# "MAJR" in all four Alarm<n> records — not an EPICS severity string, so
-# dbLoadRecords would reject it. Every other channel-family .db in this
-# module spells the same field "MAJOR" at the same ZRVL=3 slot, so the
-# in-file target is unambiguous; fixed here instead of reproduced.
 
 record(longin, "$(P)$(DAU):$(ADDRESS)")
 {
@@ -84,7 +78,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm1")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -118,7 +112,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm2")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -152,7 +146,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm3")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
@@ -186,7 +180,7 @@ record(mbbi,"$(P)$(DAU):$(ADDRESS):Alarm4")
     field(TWSV, "MAJOR")
     field(THVL, "3")
     field(THST, "Diff High Limit")
-    field(THSV, "MAJOR")
+    field(THSV, "MAJR")
     field(FRVL, "4")
     field(FRST, "Diff Low Limit")
     field(FRSV, "MAJOR")
