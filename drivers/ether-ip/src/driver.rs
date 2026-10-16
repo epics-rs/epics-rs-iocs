@@ -15,6 +15,7 @@ use tokio::sync::mpsc::Sender;
 use crate::cip::{self, CipType, ParsedTag};
 use crate::connection::{Connection, EipError};
 use crate::encap::{self, ETHERIP_PORT};
+use chrono::TimeZone;
 use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::ioc_app::InitHookState;
 use epics_rs::base::server::records::printf::format_g;
@@ -121,7 +122,7 @@ impl TagInfo {
 // Scan lists
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ListStats {
     pub list_errors: u32,
     pub last_scan_time: f64,
@@ -247,11 +248,11 @@ impl Plc {
 
     pub fn reset_statistics(&self) {
         *self.stats.lock() = PlcStats::default();
+        // C `reset_ScanList`; a zero `scheduled_time` is due at once.
         for list in self.scanlists.lock().iter() {
-            let mut s = list.stats.lock();
-            s.list_errors = 0;
-            s.min_scan_time = 0.0;
-            s.max_scan_time = 0.0;
+            list.enabled.store(true, Ordering::Relaxed);
+            *list.stats.lock() = ListStats::default();
+            *list.scheduled.lock() = Instant::now();
         }
     }
 
@@ -905,56 +906,274 @@ fn apply_response(item: &Item, sub: &[u8], transfer_time: f64) {
 // Diagnostics (`drvEtherIP_report`)
 // ---------------------------------------------------------------------------
 
-pub fn report(level: i32) {
-    for plc in all_plcs() {
-        let ident = plc.identity.lock().clone();
-        let (ip_addr, slot) = plc.addr.lock().clone();
+/// `ETHERIP_MAYOR` / `ETHERIP_MINOR` (drvEtherIP.h).
+const ETHERIP_MAYOR: u32 = 3;
+const ETHERIP_MINOR: u32 = 10;
+
+/// `epicsTimeToStrftime(.., "%Y/%m/%d %H:%M:%S.%04f", ..)` of seconds past
+/// the EPICS epoch, in local time.
+fn epics_strftime(epics_secs: f64) -> String {
+    let unix = epics_secs + EPICS_EPOCH_OFFSET;
+    let secs = unix.floor();
+    let nanos = ((unix - secs) * 1e9) as u32;
+    match chrono::Local.timestamp_opt(secs as i64, nanos).single() {
+        Some(t) => format!(
+            "{}.{:04}",
+            t.format("%Y/%m/%d %H:%M:%S"),
+            t.timestamp_subsec_nanos() / 100_000
+        ),
+        None => String::new(),
+    }
+}
+
+/// `dump_TagInfo`.
+fn dump_tag_info(info: &TagInfo, list: &ScanList, level: i32) {
+    println!(
+        "*** Tag '{}' @ 0x{:X}:",
+        info.string_tag, info as *const TagInfo as usize
+    );
+    let d = info.data.lock();
+    let elements = *info.elements.lock();
+    if level > 3 {
         println!(
-            "PLC '{}': IP {ip_addr}, slot {slot}, {}",
-            plc.name,
-            if plc.connected.load(Ordering::Relaxed) {
-                "connected"
-            } else {
-                "disconnected"
-            }
+            "  scanlist            : 0x{:X}",
+            list as *const ScanList as usize
         );
-        if let Some(id) = ident {
-            println!(
-                "  identity: '{}' vendor 0x{:04X} type 0x{:04X} rev 0x{:04X} serial 0x{:08X}",
-                id.name, id.vendor, id.device_type, id.revision, id.serial_number
-            );
+        println!(
+            "  compiled tag        : '{}', {elements} elements",
+            info.tag
+        );
+        println!("  cip read requ./resp.: {} / {}", d.r_request, d.r_response);
+        println!("  cip write req./resp.: {} / {}", d.w_request, d.w_response);
+        println!(
+            "  data_lock ID        : 0x{:X}",
+            &info.data as *const Mutex<TagData> as usize
+        );
+        println!(
+            "  data_size / valid   : {} / {}",
+            d.buf.len(),
+            d.valid_data_size
+        );
+        println!(
+            "  do_write/is_writing : {} / {}",
+            if d.do_write { "yes" } else { "no" },
+            if d.is_writing { "yes" } else { "no" }
+        );
+        crate::eip_printf!(0, "  data                : ");
+    }
+    if d.valid_data_size > 0 {
+        crate::eip_printf!(0, "{}", cip::dump_raw_cip_data(&d.buf, elements));
+    } else {
+        println!("-no data-");
+    }
+    if level > 3 {
+        println!(
+            "  transfer time       : {} secs",
+            format_g(d.transfer_time, 6)
+        );
+    }
+}
+
+/// `dump_ScanList`.
+fn dump_scan_list(list: &ScanList, level: i32) {
+    let s = list.stats.lock().clone();
+    println!(
+        "Scanlist {} secs @ 0x{:X}:",
+        format_g(list.period, 6),
+        list as *const ScanList as usize
+    );
+    println!(
+        "  Status        : {}",
+        if list.enabled.load(Ordering::Relaxed) {
+            "enabled"
+        } else {
+            "DISABLED"
         }
-        {
+    );
+    println!("  Last scan     : {}", epics_strftime(s.scan_time));
+    if level > 4 {
+        let now = Instant::now();
+        let due = *list.scheduled.lock();
+        let next = if due >= now {
+            epics_now() + (due - now).as_secs_f64()
+        } else {
+            epics_now() - (now - due).as_secs_f64()
+        };
+        println!("  Errors        : {}", s.list_errors);
+        // The monotonic schedule cannot step back, so C's schedule-error
+        // count stays 0 (see `scan_pass`).
+        println!("  Schedule Errs : 0");
+        println!("  Next scan     : {}", epics_strftime(next));
+        println!("  Min. scan time: {} secs", format_g(s.min_scan_time, 6));
+        println!("  Max. scan time: {} secs", format_g(s.max_scan_time, 6));
+        println!("  Last scan time: {} secs", format_g(s.last_scan_time, 6));
+    }
+    if level > 5 {
+        for info in list.tags.lock().iter() {
+            dump_tag_info(info, list, level);
+        }
+    }
+}
+
+/// `drvEtherIP_report`, also the driver's `dbior` report.
+pub fn report(level: i32) {
+    if level <= 0 {
+        println!(
+            "drvEtherIP V{ETHERIP_MAYOR}.{ETHERIP_MINOR} - ControlLogix 5000 PLC via EtherNet/IP"
+        );
+        return;
+    }
+    println!("drvEtherIP V{ETHERIP_MAYOR}.{ETHERIP_MINOR} report, -*- outline -*-");
+    if !initialized() {
+        println!(" drvEtherIP lock is 0, did you call drvEtherIP_init?");
+        return;
+    }
+    if level > 1 {
+        println!("  Mutex lock: 0x{:X}", &REGISTRY as *const _ as usize);
+    }
+    for plc in all_plcs() {
+        let (ip_addr, _) = plc.addr.lock().clone();
+        println!("* PLC '{}', IP '{ip_addr}'", plc.name);
+        if level > 1 {
+            let ident = plc.identity.lock().clone().unwrap_or_default();
             let s = plc.stats.lock();
-            println!("  errors: {}, slow scans: {}", s.plc_errors, s.slow_scans);
+            println!("  Interface name        : {}", ident.name);
+            println!("  Interface vendor      : 0x{:X}", ident.vendor);
+            println!("  Interface type        : 0x{:X}", ident.device_type);
+            println!("  Interface revision    : 0x{:X}", ident.revision);
+            println!("  Interface serial      : 0x{:X}", ident.serial_number);
+            println!("  scan thread slow count: {}", s.slow_scans);
+            println!("  connection errors     : {}", s.plc_errors);
         }
-        if level <= 0 {
-            continue;
-        }
-        for list in plc.scanlists.lock().iter() {
-            let s = list.stats.lock();
+        if level > 2 {
             println!(
-                "  scanlist {:.4} s: errors {}, scan time last/min/max {:.5}/{:.5}/{:.5} s",
-                list.period, s.list_errors, s.last_scan_time, s.min_scan_time, s.max_scan_time
+                "  Mutex lock            : 0x{:X}",
+                &plc.conn as *const Mutex<Option<Connection>> as usize
             );
-            if level <= 1 {
-                continue;
-            }
-            for info in list.tags.lock().iter() {
-                let d = info.data.lock();
+            if plc.started.load(Ordering::SeqCst) {
                 println!(
-                    "    tag '{}': {} elements, {} valid bytes, req/resp r {}/{} w {}/{}",
-                    info.string_tag,
-                    *info.elements.lock(),
-                    d.valid_data_size,
-                    d.r_request,
-                    d.r_response,
-                    d.w_request,
-                    d.w_response
+                    "  scan task ID          : 0x{:X} (running)",
+                    Arc::as_ptr(&plc) as usize
                 );
+            } else {
+                println!("  scan task ID          : 0x0 (-dead-)");
+            }
+            println!("  Now                   : {}", epics_strftime(epics_now()));
+            if level > 3 {
+                print!("** ");
+                Connection::dump(
+                    plc.conn.lock().as_ref(),
+                    BUFFER_LIMIT.load(Ordering::Relaxed) as usize,
+                    TIMEOUT_MS.load(Ordering::Relaxed),
+                );
+            }
+            if level > 4 {
+                for list in plc.scanlists.lock().iter() {
+                    print!("** ");
+                    dump_scan_list(list, level);
+                }
             }
         }
     }
+    println!();
+}
+
+/// `drvEtherIP_dump`: every tag and its value.
+pub fn dump() {
+    for plc in all_plcs() {
+        println!("PLC {}", plc.name);
+        for list in plc.scanlists.lock().iter() {
+            for info in list.tags.lock().iter() {
+                crate::eip_printf!(0, "{} ", info.string_tag);
+                let d = info.data.lock();
+                if d.valid_data_size > 0 {
+                    crate::eip_printf!(
+                        0,
+                        "{}",
+                        cip::dump_raw_cip_data(&d.buf, *info.elements.lock())
+                    );
+                } else {
+                    println!(" - no data -");
+                }
+            }
+        }
+    }
+    println!();
+}
+
+/// `drvEtherIP_list`: every tag each PLC publishes, over the connection
+/// the scan thread holds between passes.
+pub fn list() {
+    for plc in all_plcs() {
+        let (ip_addr, slot) = plc.addr.lock().clone();
+        println!("Tags on PLC '{}', IP {ip_addr}, slot {slot}", plc.name);
+        match plc.conn.lock().as_mut() {
+            Some(c) => {
+                c.list_tags();
+            }
+            // C sends on the closed socket and fails there.
+            None => {
+                crate::eip_printf!(9, "EIP list tags\n");
+                crate::eip_printf!(1, "EIP_list_tags: send failed\n");
+            }
+        }
+    }
+}
+
+/// `drvEtherIP_help`.
+pub fn help() {
+    let verbosity = crate::EIP_VERBOSITY.load(Ordering::Relaxed);
+    let timeout = TIMEOUT_MS.load(Ordering::Relaxed);
+    let limit = BUFFER_LIMIT.load(Ordering::Relaxed);
+    let default_limit = encap::DEFAULT_BUFFER_LIMIT;
+    print!(
+        "drvEtherIP V{ETHERIP_MAYOR}.{ETHERIP_MINOR} diagnostics routines:
+    EIP_verbosity(0-10)
+    -  define logging detail, currently set to {verbosity}
+    -  10: Dump all protocol details
+        9: Hexdump each sent/received buffer
+        6: show driver details
+        5: show write-related operations
+        4: DEFAULT: show basic startup plus error messages
+        2: show more error info
+        1: show severe error messages
+        0: keep quiet
+    EIP_timeout(<milliseconds>)
+    -  define the default timeout for connecting to PLC and reading responses
+       (default: {timeout} ms)
+    drvEtherIP_default_rate(<seconds>)
+    -  define the default scan rate
+       (if neither SCAN nor INP/OUT provide one)
+    EIP_buffer_limit(<bytes>)
+    -  Set buffer limit enforced by driver.
+       Currently {limit}, default: {default_limit}
+       The actual PLC limit is unknown, it might depend on the PLC or ENET model.
+       Can only be set before driver starts up.
+    drvEtherIP_define_PLC(<name>, <ip_addr>, <slot>)
+    -  define a PLC name (used by EPICS records) as IP
+       (DNS name or dot-notation) and slot (0...)
+    drvEtherIP_read_tag(<ip>, <slot>, <tag>, <elm.>, <timeout>)
+    -  call to test a round-trip single tag read
+       ip: IP address (numbers or name known by IOC
+       slot: Slot of the PLC controller (not ENET). 0, 1, ...
+       timeout: milliseconds
+    drvEtherIP_report(<level>)
+    -  level = 0..10
+    drvEtherIP_dump
+    -  dump all tags and values; short version of ..._report
+    drvEtherIP_list
+    -  list all tags that the PLC publishes
+    drvEtherIP_describe(<type ID>)
+    -  describe the tag type, used to inspect custom structures
+    drvEtherIP_reset_statistics
+    -  reset error counts and min/max scan times
+    drvEtherIP_restart
+    -  in case of communication errors, driver will restart,
+       so calling this one directly shouldn't be necessary
+       but is possible
+
+"
+    );
 }
 
 #[cfg(test)]
