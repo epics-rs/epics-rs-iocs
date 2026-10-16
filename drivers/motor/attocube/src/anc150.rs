@@ -98,26 +98,25 @@ impl Anc150Controller {
         out
     }
 
-    /// Read one prompt-framed response blob (echo, reply, ack, ending at the
-    /// `"> "` input EOS).
-    fn read_blob(&self) -> AsynResult<String> {
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+    /// Send a command and read its prompt-framed response blob (echo, reply,
+    /// ack, ending at the `"> "` input EOS). C sendOnly/sendAndReceive use
+    /// `pasynOctetSyncIO->writeRead`, which flushes a stray reply first.
+    fn exchange(&self, cmd: &str) -> AsynResult<String> {
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
     /// Send a command and discard the reply (C `sendOnly`, which still reads to
     /// keep the stream synchronized).
     fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let _ = self.read_blob()?;
+        let _ = self.exchange(cmd)?;
         Ok(())
     }
 
     /// Send a query and return its reply line (C `sendAndReceive`: the reply is
     /// the second `\r\n`-separated segment, between the echo and the ack).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let blob = self.read_blob()?;
+        let blob = self.exchange(cmd)?;
         let mut parts = blob.split("\r\n");
         let _echo = parts.next();
         match parts.next() {
