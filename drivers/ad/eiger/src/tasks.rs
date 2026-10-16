@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
 use epics_rs::ad_core::driver::ADStatus;
+use epics_rs::ad_core::error::ADResult;
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput};
 use epics_rs::ad_core::runtime as rt;
@@ -166,6 +168,7 @@ pub struct Shared {
     pub api: ApiVersion,
     pub hostname: String,
     pub outputs: Outputs,
+    pub pool: Arc<NDArrayPool>,
 
     /// Files downloaded but not yet reaped (mirrored into `PENDING_FILES`).
     pending_files: AtomicI32,
@@ -825,7 +828,16 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
     let active = active_thresholds(s).await;
     let array_callbacks = s.get_int(s.ad.base.array_callbacks).await != 0;
 
+    // C `break`s out of the threshold loop on a refused alloc
+    // (eigerDetector.cpp:1849), dropping the rest of that image's thresholds.
+    let mut skip_image = false;
     for frame in frames {
+        if frame.threshold == 0 {
+            skip_image = false;
+        }
+        if skip_image {
+            continue;
+        }
         let (number, energy) = active
             .get(frame.threshold)
             .copied()
@@ -834,7 +846,7 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
         attrs.add(threshold_number_attr(number));
         attrs.add(threshold_energy_attr(energy));
 
-        publish(
+        if publish(
             s,
             Image {
                 dims: frame.dims,
@@ -846,7 +858,12 @@ async fn parse_h5(s: &Arc<Shared>, data: &[u8]) -> Result<(), h5::Reported> {
             },
             array_callbacks,
         )
-        .await;
+        .await
+        .is_err()
+        {
+            trace.err("parseH5File", "couldn't allocate NDArray");
+            skip_image = true;
+        }
     }
     Ok(())
 }
@@ -1034,14 +1051,20 @@ async fn monitor_task(s: Arc<Shared>) {
             if let Ok(buf) = s.rest().get_monitor_image(timeout) {
                 match tiff::decode(&buf) {
                     Ok(image) => {
-                        let array = build_array(
+                        let Ok(array) = build_array(
+                            &s.pool,
                             image.dims,
                             image.data,
                             None,
                             NDAttributeList::new(),
                             unique_id,
                             None,
-                        );
+                        ) else {
+                            s.trace().err("parseTiffFile", "couldn't allocate NDArray");
+                            s.trace().err("monitorTask", "couldn't parse file");
+                            rt::sleep(MONITOR_PERIOD).await;
+                            continue;
+                        };
                         unique_id += 1;
                         ArrayPublisher::new(s.outputs.monitor.clone())
                             .publish(Arc::new(array))
@@ -1179,6 +1202,7 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                 // C's addresses 0 and 1. It also carries no ThresholdNumber /
                 // ThresholdEnergy attributes; only the HDF5 and stream2 paths add
                 // those.
+                let number = frame.frame;
                 let image = Image {
                     dims: frame.dims,
                     data: frame.data,
@@ -1187,7 +1211,16 @@ async fn stream_series(s: &Arc<Shared>, stream: &mut StreamApi) -> bool {
                     threshold_index: 0,
                     timestamp: None,
                 };
-                publish(s, image.signed_if(signed_data), array_callbacks).await;
+                // A refused alloc is getFrame's STREAM_ERROR (streamApi.cpp:370),
+                // which ends the series like any other failed frame above.
+                if publish(s, image.signed_if(signed_data), array_callbacks)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("StreamApi::getFrame: failed to allocate NDArray for frame {number}");
+                    s.trace().err("streamTask", "failed to get frame packet");
+                    return false;
+                }
             }
         }
     }
@@ -1264,7 +1297,14 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
                 threshold_index: thresh,
                 timestamp: frame.timestamp,
             };
-            publish(s, image.signed_if(signed_data), array_callbacks).await;
+            // A refused alloc is getFrame's STREAM_ERROR (stream2Api.cpp:290),
+            // skipped like the other failed frames above.
+            if publish(s, image.signed_if(signed_data), array_callbacks)
+                .await
+                .is_err()
+            {
+                eprintln!("Stream2Api::getFrame: failed to allocate NDArray for frame");
+            }
         }
     }
 }
@@ -1274,17 +1314,18 @@ async fn stream2_series(s: &Arc<Shared>, stream: &mut Stream2Api) -> bool {
 // ---------------------------------------------------------------------------
 
 fn build_array(
+    pool: &NDArrayPool,
     dims: [usize; 2],
     data: NDDataBuffer,
     codec: Option<epics_rs::ad_core::codec::Codec>,
     attributes: NDAttributeList,
     unique_id: i32,
     timestamp: Option<EpicsTimestamp>,
-) -> NDArray {
-    let mut array = NDArray::with_data(
+) -> ADResult<NDArray> {
+    let mut array = pool.wrap(
         vec![NDDimension::new(dims[0]), NDDimension::new(dims[1])],
         data,
-    );
+    )?;
     array.unique_id = unique_id;
     match timestamp {
         // C sets `timeStamp = ts.secPastEpoch + ts.nsec/1.e9` (stream2Api.cpp:337).
@@ -1299,7 +1340,7 @@ fn build_array(
     }
     array.attributes = attributes;
     array.codec = codec;
-    array
+    Ok(array)
 }
 
 /// Publish one image on the main output and on its threshold's output
@@ -1353,7 +1394,9 @@ impl Image {
     }
 }
 
-async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
+/// `Err` when the pool refuses the frame (C's `alloc` returning NULL); the
+/// caller prints C's line for its path.
+async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) -> ADResult<()> {
     let Image {
         dims,
         data,
@@ -1367,8 +1410,8 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
     let unique_id = s.get_int(s.ad.base.array_counter).await;
     let counter = unique_id + 1;
     let array = Arc::new(build_array(
-        dims, data, codec, attributes, unique_id, timestamp,
-    ));
+        &s.pool, dims, data, codec, attributes, unique_id, timestamp,
+    )?);
 
     if array_callbacks {
         ArrayPublisher::new(s.outputs.main.clone())
@@ -1417,6 +1460,7 @@ async fn publish(s: &Arc<Shared>, image: Image, array_callbacks: bool) {
         ),
     ])
     .await;
+    Ok(())
 }
 
 /// Build the shared state the tasks run on, plus the driver's signal handles.
@@ -1430,6 +1474,7 @@ pub fn shared(
     api: ApiVersion,
     hostname: String,
     outputs: Outputs,
+    pool: Arc<NDArrayPool>,
     signals: &Signals,
 ) -> Arc<Shared> {
     Arc::new(Shared {
@@ -1441,6 +1486,7 @@ pub fn shared(
         api,
         hostname,
         outputs,
+        pool,
         pending_files: AtomicI32::new(0),
         poll_stop: AtomicBool::new(false),
         poll_complete: AtomicBool::new(false),
@@ -1612,11 +1658,14 @@ mod tests {
             ApiVersion::V1_6_0,
             "127.0.0.1".to_string(),
             outputs,
+            NDArrayPool::new(0),
             &signals,
         );
 
         for _ in 0..2 {
-            publish(&s, image(NDDataBuffer::U16(vec![1, 2]), None), true).await;
+            publish(&s, image(NDDataBuffer::U16(vec![1, 2]), None), true)
+                .await
+                .unwrap();
         }
         let mut ids = Vec::new();
         for _ in 0..2 {

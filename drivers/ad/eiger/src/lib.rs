@@ -159,6 +159,7 @@ pub fn create_eiger_detector_on_port(
         api,
         hostname.to_string(),
         outputs.clone(),
+        pool.clone(),
         &signals,
     );
     let task_handles = tasks::start(shared, receivers);
