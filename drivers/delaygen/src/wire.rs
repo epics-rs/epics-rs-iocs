@@ -40,24 +40,27 @@ impl From<OctetFailure> for AsynError {
     }
 }
 
-/// Write `cmd`; a short write is `asynError`, as every C driver turns
-/// `nActual != nRequested` into one.
+/// Write `cmd`; any write that sent fewer bytes than `cmd` is `asynError`,
+/// as every C driver turns `nActual != nRequested` into one — including a
+/// refused `queueLockPort`, whose own status (e.g. asynDisconnected) C drops.
 fn write_all(link: &OctetLink, cmd: &str) -> Result<usize, OctetFailure> {
+    let short = |n: usize, message: String| OctetFailure {
+        error: AsynError::Status {
+            status: AsynStatus::Error,
+            message,
+        },
+        sent: n,
+        received: 0,
+    };
     match link.sync.write_octet(OCTET_REASON, cmd.as_bytes()) {
         Ok(n) if n == cmd.len() => Ok(n),
-        Ok(n) => Err(OctetFailure {
-            error: AsynError::Status {
-                status: AsynStatus::Error,
-                message: format!("wrote {n} of {} bytes", cmd.len()),
-            },
-            sent: n,
-            received: 0,
-        }),
-        Err(error) => Err(OctetFailure {
+        Ok(n) => Err(short(n, format!("wrote {n} of {} bytes", cmd.len()))),
+        Err(error) if cmd.is_empty() => Err(OctetFailure {
             error,
             sent: 0,
             received: 0,
         }),
+        Err(error) => Err(short(0, error.message())),
     }
 }
 
