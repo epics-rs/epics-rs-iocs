@@ -366,13 +366,13 @@ impl NewportHolder {
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 3, 4)?;
 
                 let handle = connect_serial(&serial_port, AGAP_TIMEOUT)?;
-                let controller = AgapController::new(handle, controller_id)
-                    .map_err(|e| format!("AGAP_CONEXCreateController: {e}"))?;
+                let Some(controller) = AgapController::new(handle, controller_id) else {
+                    return Ok(CommandOutcome::Continue);
+                };
                 let controller = Arc::new(Mutex::new(controller));
 
                 for axis_index in 0..agap::NUM_AXES {
-                    let axis = AgapAxis::new(controller.clone(), axis_index)
-                        .map_err(|e| format!("AGAP_CONEXCreateController: {e}"))?;
+                    let axis = AgapAxis::new(controller.clone(), axis_index);
                     let dtyp_key = format!("AGAP_{motor_port}_{}", agap::axis_name(axis_index));
                     let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(axis));
                     holder.install(
