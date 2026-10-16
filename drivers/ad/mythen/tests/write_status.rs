@@ -115,6 +115,25 @@ fn an_illegal_tau_still_reads_the_settings_back() {
     );
 }
 
+/// mythen never writes `pasynUser->errorMessage`: a refused command and an
+/// illegal tau reach the record as their status alone.
+#[test]
+fn a_failed_write_hands_the_record_no_message() {
+    let (mut driver, _received) = driver("MYTHEN_WS_MESSAGE");
+    let e = driver
+        .write_int32(&mut AsynUser::new(driver.p.setting), 1)
+        .unwrap_err();
+    assert_eq!(e.message(), "");
+    let e = driver
+        .write_float64(&mut AsynUser::new(driver.p.threshold), 7.0)
+        .unwrap_err();
+    assert_eq!(e.message(), "");
+    let e = driver
+        .write_float64(&mut AsynUser::new(driver.p.tau), -5.0)
+        .unwrap_err();
+    assert_eq!(e.message(), "");
+}
+
 #[test]
 fn a_failed_get_settings_is_an_error_status() {
     // Nothing listens, so the detector boots disconnected and getSettings is

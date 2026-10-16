@@ -317,10 +317,13 @@ impl MythenDriver {
 
 /// C's `int status` in `writeInt32` / `writeFloat64`: `status |= step()` keeps
 /// going after a failed step, and the write returns the OR of every status.
+/// mythen never writes the record's `pasynUser->errorMessage`; only the
+/// base-class write it calls does.
 #[derive(Default)]
 struct StatusOr {
     bits: i32,
-    err: Option<AsynError>,
+    last: Option<AsynStatus>,
+    message: String,
 }
 
 impl StatusOr {
@@ -328,18 +331,36 @@ impl StatusOr {
     fn or(&mut self, step: AsynResult<()>) {
         if let Err(e) = step {
             self.bits |= e.c_status_code();
-            self.err = Some(e);
+            self.last = Some(e.status());
         }
     }
 
     /// `status = step`.
     fn set(&mut self, step: AsynResult<()>) {
-        *self = Self::default();
+        let message = std::mem::take(&mut self.message);
+        *self = Self {
+            message,
+            ..Self::default()
+        };
         self.or(step);
     }
 
+    /// `status = ADDriver::writeXxx(pasynUser, value)`, whose errorMessage
+    /// the record keeps.
+    fn set_base(&mut self, step: AsynResult<()>) {
+        if let Err(e) = &step {
+            self.message = e.message();
+        }
+        self.set(step);
+    }
+
     fn into_result(self) -> AsynResult<()> {
-        self.err.map_or(Ok(()), Err)
+        self.last.map_or(Ok(()), |status| {
+            Err(AsynError::Status {
+                status,
+                message: self.message,
+            })
+        })
     }
 }
 
@@ -374,7 +395,7 @@ impl PortDriver for MythenDriver {
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "mythen: detector is busy".into(),
+                message: String::new(),
             });
         }
 
@@ -421,7 +442,7 @@ impl PortDriver for MythenDriver {
                 status.or(self.det.set_frames(frames, value));
             } else if reason < self.p.setting {
                 // `FIRST_SD_PARAM` is SDSetting (mythen.cpp:100, :1153).
-                status.set(ADDriver::ad_write_int32(self, user, value));
+                status.set_base(ADDriver::ad_write_int32(self, user, value));
             }
             status.or(self.refresh_settings());
         }
@@ -461,7 +482,7 @@ impl PortDriver for MythenDriver {
             );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
-                message: "mythen: detector is busy".into(),
+                message: String::new(),
             });
         }
 
@@ -493,7 +514,7 @@ impl PortDriver for MythenDriver {
             });
         } else if reason < self.p.setting {
             // ADDriver::writeFloat64 is asynPortDriver's (mythen.cpp:1210).
-            status.set(self.ad.port_base.write_float64_param(user, value));
+            status.set_base(self.ad.port_base.write_float64_param(user, value));
         }
 
         status.or(self.refresh_settings());
