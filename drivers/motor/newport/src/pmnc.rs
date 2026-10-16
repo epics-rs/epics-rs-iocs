@@ -46,12 +46,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
+use epics_rs::asyn::interfaces::motor::{
+    AsynMotor, MotorStatus, PidGainKind, PollFailure, PostMessage,
+};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::util::{atoi, nint};
+use motor_common::model1::MoveStrings;
 
 /// Response buffer size for a single controller reply (C `BUFF_SIZE` 100).
 const READ_BUF: usize = 256;
@@ -322,7 +325,12 @@ impl PmncController {
     /// Write one command and read its one prompt-framed reply (C
     /// `send_recv_mess`), returned trimmed.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        Self::trimmed(self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?)
+        self.command_bytes(cmd.as_bytes())
+    }
+
+    /// [`command`](Self::command) for a record string's raw bytes.
+    fn command_bytes(&self, cmd: &[u8]) -> AsynResult<String> {
+        Self::trimmed(self.handle.write_read(0, cmd, READ_BUF)?)
     }
 
     /// `STA` for one driver module (C `set_status`), read to `\n` instead of
@@ -363,6 +371,7 @@ pub struct PmncAxis {
     /// Consecutive polls without a position change (C `no_motion_count`).
     no_motion_count: u32,
     last_status: MotorStatus,
+    strings: MoveStrings,
 }
 
 impl PmncAxis {
@@ -383,6 +392,7 @@ impl PmncAxis {
             last_reading: 0,
             no_motion_count: 0,
             last_status: MotorStatus::default(),
+            strings: MoveStrings::default(),
         })
     }
 
@@ -421,6 +431,15 @@ impl PmncAxis {
         ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
         Ok(())
     }
+
+    /// PREM as its own message ahead of the move's commands
+    /// (devPMNC87xx.cc:204-219).
+    fn send_prem(ctrl: &PmncController, prem: &[u8]) -> AsynResult<()> {
+        if !prem.is_empty() {
+            ctrl.command_bytes(prem)?;
+        }
+        Ok(())
+    }
 }
 
 impl AsynMotor for PmncAxis {
@@ -439,8 +458,10 @@ impl AsynMotor for PmncAxis {
     ) -> AsynResult<()> {
         let d = self.def.driver_num;
         let target = nint(position) as i64;
+        let prem = self.strings.arm();
         let ctrl = self.lock();
         self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
+        Self::send_prem(&ctrl, &prem)?;
         if self.is_8753() {
             // Open loop: no absolute command — move relative to the
             // software-tracked position.
@@ -463,8 +484,10 @@ impl AsynMotor for PmncAxis {
     ) -> AsynResult<()> {
         let d = self.def.driver_num;
         let rel = nint(distance) as i64;
+        let prem = self.strings.arm();
         let ctrl = self.lock();
         self.send_speed(&ctrl, min_velocity, velocity, acceleration)?;
+        Self::send_prem(&ctrl, &prem)?;
         ctrl.command(&format!("REL A{d}={rel}"))?;
         ctrl.command(&format!("GO A{d}"))?;
         Ok(())
@@ -481,8 +504,12 @@ impl AsynMotor for PmncAxis {
         let accel = i64::from(nint(acceleration)).clamp(MIN_ACCEL, MAX_ACCEL);
         let velval = nint(velocity).unsigned_abs().min(MAX_VELOCITY as u32) as i64;
         let forward = velocity >= 0.0;
+        // C hangs POST off the first jog message, and the GO message's
+        // VELOCITY node replaces it, so C never sends it; not copied.
+        let prem = self.strings.arm();
         let ctrl = self.lock();
         ctrl.command(&format!("ACC A{d} {m}={accel}"))?;
+        Self::send_prem(&ctrl, &prem)?;
         if self.is_8753() {
             // Native slew commands.
             if forward {
@@ -510,8 +537,11 @@ impl AsynMotor for PmncAxis {
         _forward: bool,
     ) -> AsynResult<()> {
         // C sends no command for HOME_FOR/HOME_REV (the FIN/RIN paths are
-        // commented out) — homing is a silent no-op (module Deviations).
-        Ok(())
+        // commented out) — homing is a silent no-op (module Deviations) but
+        // for its PREM. C hangs POST off a message it never sends; not
+        // copied, POST goes at the next poll that sees the axis done.
+        let prem = self.strings.arm();
+        Self::send_prem(&self.lock(), &prem)
     }
 
     fn stop(&mut self, _user: &AsynUser, _acceleration: f64) -> AsynResult<()> {
@@ -566,6 +596,22 @@ impl AsynMotor for PmncAxis {
 
     fn set_pid_gain(&mut self, _user: &AsynUser, _kind: PidGainKind, _gain: f64) -> AsynResult<()> {
         // C sends no command for PID gains (IDLE_STATE) — quiet no-op.
+        Ok(())
+    }
+
+    /// `PRIMITIVE`: INIT as its own message.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        self.lock().command_bytes(init)?;
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
         Ok(())
     }
 
@@ -688,6 +734,12 @@ impl AsynMotor for PmncAxis {
                 ctrl.command(&format!("CHL A{d}={m}"))?;
             }
         }
+        // drvPMNC87xx.cc:511-537; C ignores the exchange's status too.
+        if (done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let _ = ctrl.command_bytes(&post);
+        }
         drop(ctrl);
 
         let vbas_supported = self.is_8753();
@@ -716,6 +768,126 @@ impl AsynMotor for PmncAxis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// An 8752 with one 8751 module on a [`LineRig`] whose `STA` byte is
+    /// `sta`, with the construction traffic taken.
+    fn strings_rig(name: &str) -> (LineRig, PmncAxis, Arc<AtomicU8>) {
+        let sta = Arc::new(AtomicU8::new(S8751_MOVE_DONE | S8751_POWER_ON));
+        let st = sta.clone();
+        let (line, io) = LineRig::new(name, move |last| match last {
+            "VER" => "Version 1.6.0>".into(),
+            "DRT" => "A0=2>".into(),
+            "STA 0" => format!("A0=0x{:02x}>", st.load(Ordering::SeqCst)),
+            "DIAG 0" => "A0=0x04>".into(),
+            "POS 0" => "A0=0>".into(),
+            _ => ">".into(),
+        });
+        let ctrl = PmncController::new(io.port().unwrap().clone(), Duration::from_secs(1));
+        let axis = PmncAxis::new(Arc::new(Mutex::new(ctrl.unwrap())), 0).unwrap();
+        line.sent();
+        (line, axis, sta)
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// What a poll sent besides its queries.
+    fn poll_extra(line: &LineRig, axis: &mut PmncAxis) -> Vec<String> {
+        axis.poll(&AsynUser::default()).unwrap();
+        line.sent()
+            .into_iter()
+            .filter(|l| !["STA 0", "DIAG 0", "POS 0"].contains(&l.as_str()))
+            .collect()
+    }
+
+    /// devPMNC87xx.cc:200-201 and 321-326: INIT is the whole message.
+    #[test]
+    fn init_goes_out_as_its_own_message() {
+        let (line, mut axis, _) = strings_rig("pmncInit");
+        axis.primitive(&AsynUser::default(), b"SER A0").unwrap();
+        assert_eq!(line.sent(), ["SER A0"]);
+    }
+
+    /// devPMNC87xx.cc:204-219: PREM is its own message ahead of each move's
+    /// command, for that move only; a home sends nothing else.
+    #[test]
+    fn prem_goes_ahead_of_the_move() {
+        let (line, mut axis, _) = strings_rig("pmncPrem");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"SER A0", None).unwrap();
+        axis.move_absolute(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "VEL A0 0=100",
+                "ACC A0 0=200",
+                "SER A0",
+                "ABS A0=5",
+                "GO A0"
+            ]
+        );
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            ["VEL A0 0=100", "ACC A0 0=200", "REL A0=5", "GO A0"]
+        );
+        axis.set_move_strings(&user, b"SER A0", None).unwrap();
+        axis.home(&user, 0.0, 100.0, 200.0, true).unwrap();
+        assert_eq!(line.sent(), ["SER A0"]);
+        axis.set_move_strings(&user, b"SER A0", None).unwrap();
+        axis.move_velocity(&user, 0.0, -100.0, 200.0).unwrap();
+        assert_eq!(
+            line.sent(),
+            [
+                "ACC A0 0=200",
+                "SER A0",
+                "VEL A0 0=100",
+                "REL A0=-1000000",
+                "GO A0"
+            ]
+        );
+    }
+
+    /// drvPMNC87xx.cc:511-537: POST once the move is done, not while it
+    /// runs; a jog's too.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let (line, mut axis, sta) = strings_rig("pmncPost");
+        let user = AsynUser::default();
+        for jog in [false, true] {
+            axis.set_move_strings(&user, b"", Some(post(b"NOS A0")))
+                .unwrap();
+            if jog {
+                axis.move_velocity(&user, 0.0, 100.0, 200.0).unwrap();
+            } else {
+                axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+            }
+            line.sent();
+            sta.store(S8751_POWER_ON, Ordering::SeqCst);
+            assert!(poll_extra(&line, &mut axis).is_empty());
+            sta.store(S8751_MOVE_DONE | S8751_POWER_ON, Ordering::SeqCst);
+            assert_eq!(poll_extra(&line, &mut axis), ["NOS A0"]);
+            assert!(poll_extra(&line, &mut axis).is_empty(), "sent once");
+        }
+    }
+
+    /// drvPMNC87xx.cc:495-496: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let (line, mut axis, sta) = strings_rig("pmncPostLs");
+        let user = AsynUser::default();
+        axis.set_move_strings(&user, b"", Some(post(b"NOS A0")))
+            .unwrap();
+        axis.move_relative(&user, 5.0, 0.0, 100.0, 200.0).unwrap();
+        line.sent();
+        sta.store(S8751_POWER_ON | S8751_FOR_LIMIT, Ordering::SeqCst);
+        assert_eq!(poll_extra(&line, &mut axis), ["NOS A0"]);
+    }
 
     #[test]
     fn model_and_change_eos_from_ident() {
