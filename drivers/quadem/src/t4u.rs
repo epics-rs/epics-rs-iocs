@@ -1187,6 +1187,31 @@ pub fn create_t4u_em(
     )
 }
 
+/// Why [`create_t4u_direct_em`] built no port.
+#[derive(Debug)]
+pub enum T4uDirectError {
+    /// The `std::logic_error` inicpp throws out of the constructor on a
+    /// malformed calibration file; its `what()`. C iocsh catches it and keeps
+    /// running (iocsh.cpp:1275-1284).
+    Thrown(String),
+    Asyn(AsynError),
+}
+
+impl From<AsynError> for T4uDirectError {
+    fn from(e: AsynError) -> Self {
+        Self::Asyn(e)
+    }
+}
+
+impl std::fmt::Display for T4uDirectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Thrown(what) => f.write_str(what),
+            Self::Asyn(e) => e.fmt(f),
+        }
+    }
+}
+
 /// C++ `drvT4UDirect_EMConfigure(portName, T4U_Address, ringBufferSize,
 /// base_port_num, cfgFileName)`: commands go to the T4U's telnet port, data
 /// arrives as UDP datagrams on `base_port_num`.
@@ -1197,18 +1222,13 @@ pub fn create_t4u_direct_em(
     base_port_num: u16,
     cfg_file_name: &str,
     max_memory: usize,
-) -> AsynResult<T4uRuntime> {
+) -> Result<T4uRuntime, T4uDirectError> {
     let variant = T4uVariant::Direct;
 
     // inicpp reads a file that will not open as an empty one, and throws out
-    // of the constructor on a malformed line, which nothing catches.
+    // of the constructor on a malformed line.
     let text = std::fs::read(cfg_file_name).unwrap_or_default();
-    let ini = proto::parse_ini(&String::from_utf8_lossy(&text)).unwrap_or_else(|what| {
-        eprintln!(
-            "terminate called after throwing an instance of 'std::logic_error'\n  what():  {what}"
-        );
-        std::process::abort()
-    });
+    let ini = proto::parse_ini(&String::from_utf8_lossy(&text)).map_err(T4uDirectError::Thrown)?;
     let Some(calibration) = proto::parse_calibration(&ini) else {
         println!("Error in calibration file.  Aborting.");
         // C++ `exit(1)`, which runs the epicsAtExit list through atexit().
@@ -1248,7 +1268,7 @@ pub fn create_t4u_direct_em(
 
     let (cmd_tx, cmd_rx) = sync_channel::<String>(proto::CMD_QUEUE_LEN);
 
-    build(
+    Ok(build(
         Build {
             port_name: port_name.to_string(),
             variant,
@@ -1259,7 +1279,7 @@ pub fn create_t4u_direct_em(
             max_memory,
         },
         CmdSink::Queued(cmd_tx),
-    )
+    )?)
 }
 
 fn build(spec: Build, cmd: CmdSink) -> AsynResult<T4uRuntime> {
@@ -1352,6 +1372,30 @@ mod tests {
 
     /// C++ returns from the constructor when `drvAsynIPPortConfigure` fails:
     /// the port exists with drvQuadEM's defaults, and no meter thread runs.
+    /// inicpp throws out of the constructor on a malformed line; C iocsh
+    /// catches it, so the IOC carries on and only this port is missing.
+    #[test]
+    fn a_malformed_calibration_file_is_thrown_not_fatal() {
+        let path = std::env::temp_dir().join(format!("t4u-bad-{}.ini", std::process::id()));
+        std::fs::write(&path, "[config\n").unwrap();
+        let err = create_t4u_direct_em(
+            "T4U_BADINI",
+            "127.0.0.1",
+            4,
+            5000,
+            path.to_str().unwrap(),
+            0,
+        )
+        .err()
+        .expect("no port");
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            matches!(&err, T4uDirectError::Thrown(what)
+                if what == "l.1: ini parsing failed, section not closed"),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn a_command_port_that_will_not_configure_keeps_the_port() {
         let rt = create_t4u_em("QE_T4U_BADHOST", "[bad", 4, 5000, 0).unwrap();

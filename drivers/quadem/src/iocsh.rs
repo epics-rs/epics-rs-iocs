@@ -18,7 +18,7 @@ use crate::drv_quad_em::QE_ADDR_ALL;
 use crate::fx4::{Fx4Runtime, create_fx4};
 use crate::nsls_em::{NslsEmRuntime, create_nsls_em};
 use crate::pcr4::{Pcr4Runtime, create_pcr4};
-use crate::t4u::{T4uRuntime, create_t4u_direct_em, create_t4u_em};
+use crate::t4u::{T4uDirectError, T4uRuntime, create_t4u_direct_em, create_t4u_em};
 
 /// Publish a configured quadEM port: the asyn port itself, the sub-ports the
 /// driver built for itself, then its twelve NDArray fan-outs.
@@ -499,15 +499,21 @@ pub fn t4u_direct_em_configure_command(
                 _ => 100_000_000,
             };
 
-            let rt = create_t4u_direct_em(
+            let rt = match create_t4u_direct_em(
                 &port_name,
                 &t4u_address,
                 ring_buffer_size,
                 base_port_num,
                 &cfg_file_name,
                 max_memory,
-            )
-            .map_err(|e| format!("drvT4UDirect_EMConfigure: {e}"))?;
+            ) {
+                Ok(rt) => rt,
+                Err(T4uDirectError::Thrown(what)) => {
+                    ctx.eprintln(&cpp_error(&what));
+                    return Ok(CommandOutcome::Failed);
+                }
+                Err(e) => return Err(format!("drvT4UDirect_EMConfigure: {e}")),
+            };
 
             register_quadem_port(
                 &mgr,
@@ -524,6 +530,17 @@ pub fn t4u_direct_em_configure_command(
             Ok(CommandOutcome::Continue)
         },
     )
+}
+
+/// iocsh's line for an exception a command throws (iocsh.cpp:1276-1278).
+fn cpp_error(what: &str) -> String {
+    let line = format!("C++ error: {what}");
+    if epics_rs::base::server::iocsh::use_ansi_color() {
+        use epics_rs::base::runtime::log::{ANSI_ESC_RED, ANSI_ESC_RESET};
+        format!("{ANSI_ESC_RED}{line}{ANSI_ESC_RESET}")
+    } else {
+        line
+    }
 }
 
 /// C++ takes the base port number as an `int` and passes it to `%d`; a value
