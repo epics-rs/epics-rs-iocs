@@ -478,6 +478,20 @@ pub(crate) mod tests {
         log.lock().iter().map(|c| c.matches(command).count()).sum()
     }
 
+    /// [`sent_count`] once it reaches `n` or 5 s pass. The fake server logs a
+    /// command after its read returns, so an unanswered write can complete
+    /// before its entry lands.
+    pub(crate) fn wait_sent(log: &Mutex<Vec<String>>, command: &str, n: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = sent_count(log, command);
+            if count >= n || Instant::now() >= deadline {
+                return count;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// marCCD.cpp:1250-1357 talks to marServer inside writeInt32 /
     /// writeFloat64, and ADDriver.cpp:96-98 reaches setShutter from there
     /// (:723-743): every round trip is done when the write returns.
@@ -539,7 +553,7 @@ pub(crate) mod tests {
             .unwrap();
         h.write_int32_blocking(ad.shutter_control, 0, 1).unwrap();
         assert_eq!(h.read_int32_blocking(ad.shutter_status, 0).unwrap(), 1);
-        assert_eq!(sent_count(&log, "shutter,1"), 1);
+        assert_eq!(wait_sent(&log, "shutter,1", 1), 1);
         std::mem::forget(det);
     }
 

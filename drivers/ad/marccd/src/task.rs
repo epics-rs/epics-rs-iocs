@@ -929,7 +929,7 @@ mod tests {
     /// and its `goto done` closes the shutter (:1235).
     #[test]
     fn a_series_refused_for_its_frame_type_closes_the_shutter() {
-        use crate::driver::tests::sent_count;
+        use crate::driver::tests::wait_sent;
         use epics_rs::ad_core::driver::ShutterMode;
         use std::time::Duration;
 
@@ -973,7 +973,7 @@ mod tests {
             assert!(Instant::now() < deadline, "the series never finished");
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(sent_count(&log, "shutter,0"), 1);
+        assert_eq!(wait_sent(&log, "shutter,0", 1), 1);
         std::mem::forget(det);
     }
 }
