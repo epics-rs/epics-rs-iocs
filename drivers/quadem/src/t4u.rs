@@ -1200,13 +1200,21 @@ pub fn create_t4u_direct_em(
 ) -> AsynResult<T4uRuntime> {
     let variant = T4uVariant::Direct;
 
-    // C++ aborts the IOC when the calibration file will not load; there is no
-    // usable default, since an unparsed table would send NaN slopes to the
-    // meter on the first range change.
-    let text = std::fs::read_to_string(cfg_file_name)
-        .map_err(|e| error(format!("T4U: reading {cfg_file_name}: {e}")))?;
-    let calibration =
-        proto::parse_calibration(&text).map_err(|e| error(format!("T4U: {cfg_file_name}: {e}")))?;
+    // inicpp reads a file that will not open as an empty one, and throws out
+    // of the constructor on a malformed line, which nothing catches.
+    let text = std::fs::read(cfg_file_name).unwrap_or_default();
+    let ini = proto::parse_ini(&String::from_utf8_lossy(&text)).unwrap_or_else(|what| {
+        eprintln!(
+            "terminate called after throwing an instance of 'std::logic_error'\n  what():  {what}"
+        );
+        std::process::abort()
+    });
+    let Some(calibration) = proto::parse_calibration(&ini) else {
+        println!("Error in calibration file.  Aborting.");
+        // C++ `exit(1)`, which runs the epicsAtExit list through atexit().
+        epics_rs::base::runtime::exit::call_at_exits();
+        std::process::exit(1);
+    };
 
     let mut runtimes = Vec::new();
     let link = command_port(
