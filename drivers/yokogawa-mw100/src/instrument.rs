@@ -707,6 +707,16 @@ impl Actor {
                     info.unit = line.unit.clone();
                     info.scale = line.scale;
                 }
+                // drvMW100.c:799: FD1 never reports a skipped channel.
+                if ch_status == ChStatus::Skip {
+                    let data = match line.family {
+                        InfoFamily::Signal => cache.ch_data.get_mut(line.index),
+                        InfoFamily::Math => cache.calc_data.get_mut(line.index),
+                    };
+                    if let Some(data) = data {
+                        data.data_status = DataStatus::SkipOff;
+                    }
+                }
             }
         }
 
@@ -1135,6 +1145,37 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn fe1_skipped_channel_reads_skip_off() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responses = vec![
+            b"E0\r\n".to_vec(),
+            cf0_one_input_analog_module(),
+            is0_all_zero(),
+            ascii_frame(b"N 0001DEGC ,003\nS A001\n"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+            one_record_fd1_binary(),
+            empty_fo1_binary(),
+            ascii_frame(b"E"),
+            ascii_frame(b"E"),
+        ];
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        device.join().unwrap();
+        assert_eq!(
+            instrument.get_data_status(ChannelFamily::Math, 1),
+            DataStatus::SkipOff
+        );
+        assert_eq!(
+            instrument.get_data_status(ChannelFamily::Math, 2),
+            DataStatus::Normal
+        );
+    }
 
     #[test]
     fn connect_runs_full_init_sequence_then_error_round_trip() {
