@@ -171,8 +171,9 @@ impl Pm304Controller {
     /// the port), without removing the PM600 echo — used during identification
     /// before the model is known.
     fn write_read_raw(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
-        let raw = self.handle.read_octet(0, READ_BUF)?;
+        // C send_mess/send_recv_mess: pasynOctetSyncIO->writeRead, which
+        // flushes first so a stray line cannot shift every later reply.
+        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         let text = String::from_utf8_lossy(&raw);
         Ok(text.trim_end_matches(['\r', '\n', '\0']).to_string())
     }
