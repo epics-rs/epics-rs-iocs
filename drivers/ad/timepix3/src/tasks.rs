@@ -232,7 +232,8 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
     serval_ok && det_ok
 }
 
-/// C `updateStatusFromConnection` (serval_http.cpp:148-164).
+/// C `updateStatusFromConnection` (serval_http.cpp:251-285), less its
+/// acquisition-phase messages: a connected detector reads "OK".
 fn connection_status(
     ctx: &Arc<Ctx>,
     serval_ok: bool,
@@ -1201,7 +1202,7 @@ async fn publish_image(
         return;
     }
     // C prints and drops a refused alloc before it counts
-    // (serval_stream.cpp:515-520, :1380-1385).
+    // (serval_stream.cpp:177-183, :808-814).
     let Ok(mut array) = ctx.pool.wrap(
         vec![NDDimension::new(width), NDDimension::new(height)],
         NDDataBuffer::U32(pixels),
