@@ -446,11 +446,12 @@ impl T4uDriver {
 
     /// C++ `P_Range` in `writeInt32`: clip, write register 3 and, in the direct
     /// driver, re-send the selected calibration table for the new range.
-    fn write_range(&mut self, channel: i32, value: i32) -> AsynResult<()> {
+    fn write_range(&mut self, channel: i32, value: i32) {
         let value = value.clamp(0, proto::NUM_RANGES as i32 - 1);
-        self.base
+        let _ = self
+            .base
             .port_base
-            .set_int32_param(self.params().range, channel, value)?;
+            .set_int32_param(self.params().range, channel, value);
         self.send(proto::cmd_write(proto::REG_T4U_RANGE, value));
 
         let full = self.state.lock().full;
@@ -473,7 +474,6 @@ impl T4uDriver {
         }
 
         self.state.lock().range = value;
-        Ok(())
     }
 
     /// C++ `P_WaitStateMode` in the direct driver's `writeInt32`: clear the
@@ -513,17 +513,17 @@ impl T4uDriver {
     /// C++ `P_AveragingTime` in `writeFloat64`: `NumAverage = int(averagingTime
     /// / sampleTime)`. Unlike the other quadEM drivers this truncates rather
     /// than rounding, because the T4U has no `readStatus` to recompute it.
-    fn write_averaging_time(&mut self, value: f64) -> AsynResult<()> {
+    fn write_averaging_time(&mut self, value: f64) {
         let num_average = {
             let mut st = self.state.lock();
             st.averaging_time = value;
             (value / st.sample_time) as i32
         };
-        self.base
+        let _ = self
+            .base
             .port_base
-            .set_int32_param(self.params().num_average, 0, num_average)?;
+            .set_int32_param(self.params().num_average, 0, num_average);
         self.shared.acq.lock().num_average = num_average;
-        Ok(())
     }
 }
 
@@ -579,9 +579,9 @@ impl PortDriver for T4uDriver {
         if self.variant == T4uVariant::Middle {
             println!("writeInt32: function {reason}");
         }
-        self.base
-            .port_base
-            .set_int32_param(reason, channel, value)?;
+        // C's `status |=` here never reaches the record: its own commands
+        // return asynSuccess and drvQuadEM's restarts the status.
+        let _ = self.base.port_base.set_int32_param(reason, channel, value);
         self.print_function_name("writeInt32", reason);
 
         if reason == t.bias_n_en {
@@ -601,7 +601,7 @@ impl PortDriver for T4uDriver {
         } else if reason == t.sample_freq {
             self.send(proto::cmd_write(proto::REG_T4U_FREQ, value));
         } else if reason == p.range {
-            self.write_range(channel, value)?;
+            self.write_range(channel, value);
         } else if reason == t.dac_mode {
             // Several functions share register 93, so the mode bits are cleared
             // before the new mode is set.
@@ -675,9 +675,11 @@ impl PortDriver for T4uDriver {
         let p = self.params();
         let t = self.t4u;
 
-        self.base
+        // As in `write_int32`, C drops this status.
+        let _ = self
+            .base
             .port_base
-            .set_float64_param(reason, channel, value)?;
+            .set_float64_param(reason, channel, value);
         self.print_function_name("writeFloat64", reason);
 
         if let Some(index) = t.pid_index(reason) {
@@ -689,7 +691,7 @@ impl PortDriver for T4uDriver {
         } else if reason == t.bias_p_voltage {
             self.send(proto::cmd_write(proto::REG_BIAS_P_VOLTAGE, value as i32));
         } else if reason == p.averaging_time {
-            self.write_averaging_time(value)?;
+            self.write_averaging_time(value);
         }
 
         if self.variant == T4uVariant::Middle {
@@ -1460,6 +1462,7 @@ fn build(spec: Build, cmd: CmdSink, claim: &PortClaim) -> AsynResult<T4uRuntime>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epics_rs::asyn::port::DrvUserRequest;
     use epics_rs::asyn::registry::claim_port;
 
     /// C++ compares a read-back calibration register with the selected table
@@ -1534,6 +1537,33 @@ mod tests {
         // writeReadMeter's status is ignored, as on a linked port.
         rt.port_handle()
             .write_int32_blocking(rt.params.range, 0, 1)
+            .unwrap();
+    }
+
+    /// drvT4U_EM's own functions return asynSuccess whatever
+    /// `setIntegerParam`/`setDoubleParam` returned (drvT4U_EM.cpp:444-449,
+    /// :500-506), so a list the port lacks leaves the record no error.
+    #[test]
+    fn a_t4u_write_ignores_its_set_param_status() {
+        let rt = create_t4u_em(
+            &claim_port("QE_T4U_SETPARAM").unwrap(),
+            "[bad",
+            4,
+            5000,
+            0,
+            &InterruptGate::opened(),
+        )
+        .unwrap();
+        let h = rt.port_handle();
+        let reason = |name: &str| {
+            h.drv_user_create_blocking(&DrvUserRequest::new(name, 0))
+                .unwrap()
+                .reason
+        };
+        let bad_list = crate::drv_quad_em::QE_MAX_DATA as i32 + 1;
+        h.write_int32_blocking(reason("QE_BIAS_N"), bad_list, 1)
+            .unwrap();
+        h.write_float64_blocking(reason("QE_BIAS_N_VOLTAGE"), bad_list, 1.0)
             .unwrap();
     }
 }
