@@ -24,6 +24,7 @@ use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::{ParamType, ParamValue};
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
@@ -77,15 +78,15 @@ fn spawn_producer(handle: PortHandle, data_reason: usize, max_signals: usize, pe
         .expect("failed to spawn the demo source producer thread");
 }
 
-/// Registers a new asyn port `port_name` that publishes `"DATA"`
-/// (`maxSignals` elements, once per `period`) and a fixed `"SCAN_PERIOD"`.
-/// The caller (this IOC's `main.rs`) still owns registering the port by
-/// name via `asyn_record::register_port` — this only builds and starts it.
+/// Builds the asyn port `claim` names, publishing `"DATA"` (`maxSignals`
+/// elements, once per `period`) and a fixed `"SCAN_PERIOD"`. The caller
+/// (this IOC's `main.rs`) publishes it through the claim.
 pub fn connect(
-    port_name: &str,
+    claim: &PortClaim,
     max_signals: usize,
     period: Duration,
 ) -> AsynResult<PortRuntimeHandle> {
+    let port_name = claim.name();
     let mut base = PortDriverBase::new(
         port_name,
         1,
@@ -101,7 +102,7 @@ pub fn connect(
         .set_float64(period_reason, 0, period.as_secs_f64())?;
 
     let driver = DemoSourceDriver { base };
-    let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let (runtime_handle, _actor) = create_port_runtime(claim, driver, RuntimeConfig::default())?;
     spawn_producer(
         runtime_handle.port_handle().clone(),
         data_reason,

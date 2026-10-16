@@ -89,10 +89,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::{get_port, register_port};
+use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
@@ -221,9 +222,10 @@ impl RontecDriver {
     /// because the iocsh wrapper drops `RontecConfig`'s status (`:618`).
     pub fn register(self, owner: &Arc<InterruptGate>) {
         let name = self.base.port_name.clone();
-        let registered = create_port_runtime(self, RuntimeConfig::default())
-            .ok()
-            .is_some_and(|(rt, _)| register_port(&name, rt.port_handle().clone(), owner).is_ok());
+        let registered = claim_port(&name).is_ok_and(|claim| {
+            create_port_runtime(&claim, self, RuntimeConfig::default())
+                .is_ok_and(|(rt, _)| claim.publish(rt.port_handle().clone(), owner).is_ok())
+        });
         if !registered {
             errlog_printf("RontecConfig ERROR: Can't register myself.\n");
         }
@@ -644,6 +646,7 @@ mod tests {
     use epics_rs::asyn::request::RequestResult;
 
     use super::*;
+    use epics_rs::asyn::registry::PortRegistry;
 
     #[test]
     fn c_atoi_parses_leading_digits_and_stops_at_the_first_non_digit() {
@@ -700,6 +703,7 @@ mod tests {
             },
         );
         let (serial_runtime, _serial_thread) = create_port_runtime(
+            &PortRegistry::new().claim("TESTRONTECSERIAL").unwrap(),
             NullTestDriver { base: serial_base },
             RuntimeConfig::default(),
         )
@@ -844,7 +848,12 @@ mod tests {
                 writes: writes.clone(),
                 input_eos: b"\r".to_vec(),
             };
-            let (serial_rt, _) = create_port_runtime(serial, config()).expect("serial runtime");
+            let (serial_rt, _) = create_port_runtime(
+                &PortRegistry::new().claim(&serial_name).unwrap(),
+                serial,
+                config(),
+            )
+            .expect("serial runtime");
             let d = RontecDriver::on_serial(
                 &rontec_name,
                 serial_rt.port_handle().clone(),
@@ -853,7 +862,12 @@ mod tests {
             )
             .expect("rontec driver");
             writes.lock().unwrap().clear();
-            let (rontec, _) = create_port_runtime(d, config()).expect("rontec runtime");
+            let (rontec, _) = create_port_runtime(
+                &PortRegistry::new().claim(&rontec_name).unwrap(),
+                d,
+                config(),
+            )
+            .expect("rontec runtime");
             let trace_path =
                 std::env::temp_dir().join(format!("mca-rontec-{tag}-{}.trace", std::process::id()));
             let file = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1113,6 +1127,7 @@ mod tests {
         base.set_auto_connect(false);
         base.init_connected(false);
         let (serial, _) = create_port_runtime(
+            &PortRegistry::new().claim("DOWNSER").unwrap(),
             FakeSerial {
                 base,
                 reply: rontec_reply,
@@ -1139,6 +1154,7 @@ mod tests {
         let sink = lines.clone();
         let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_owned()));
         let (serial, _) = create_port_runtime(
+            &PortRegistry::new().claim("DUPSER").unwrap(),
             FakeSerial {
                 base: PortDriverBase::new("DUPSER", 1, PortFlags::default()),
                 reply: rontec_reply,

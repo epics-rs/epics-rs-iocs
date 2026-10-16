@@ -17,6 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::base::error::CaResult;
@@ -105,17 +106,19 @@ async fn main() -> CaResult<()> {
                 let address_info = arg_string(args, 2)?.ok_or("addressInfo required")?;
                 let direct_mode = arg_ival(args, 3) != 0;
 
+                let claim =
+                    claim_port(&port_name).map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 let driver = AmptekDriver::new(&port_name, interface, &address_info, direct_mode)
                     .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 let (runtime_handle, _actor) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| format!("drvAmptekConfigure: {e}"))?;
                 ports
                     .lock()
                     .expect("port list poisoned")

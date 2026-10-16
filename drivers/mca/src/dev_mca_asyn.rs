@@ -484,8 +484,8 @@ fn mca_device_support(ctx: &DeviceSupportContext) -> Option<Box<dyn DeviceSuppor
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use epics_rs::asyn::asyn_record::register_port;
     use epics_rs::asyn::port::{DrvUserInfo, PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
     use epics_rs::asyn::runtime::config::RuntimeConfig;
     use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
     use epics_rs::base::runtime::interrupt_accept::InterruptGate;
@@ -591,13 +591,12 @@ mod tests {
             num_channels: reasons[McaReason::NumChannels as usize],
             refuse: refuse.map(McaReason::drv_info),
         };
-        let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
-        register_port(
-            name,
-            runtime.port_handle().clone(),
-            &InterruptGate::opened(),
-        )
-        .unwrap();
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) =
+            create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
+        claim
+            .publish(runtime.port_handle().clone(), &InterruptGate::opened())
+            .unwrap();
         let (dev, rec, outcome) = init_dev(&format!("@asyn({name})"));
         let f = Fixture {
             _runtime: runtime,

@@ -7,6 +7,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::base::error::CaResult;
@@ -91,18 +92,18 @@ async fn main() -> CaResult<()> {
                 };
 
                 let models = Arc::new(Mutex::new([Model::default(); K_INSTRMAX]));
-                let registered = LoveDriver::new(
-                    &lov_port,
-                    &ser_port,
-                    port.clone(),
-                    ser_addr,
-                    COMMAND_TIMEOUT,
-                    models.clone(),
-                )
-                .and_then(|driver| create_port_runtime(driver, RuntimeConfig::default()))
-                .and_then(|(runtime_handle, _actor_jh)| {
-                    epics_rs::asyn::asyn_record::register_port(
+                let registered = claim_port(&lov_port).and_then(|claim| {
+                    let driver = LoveDriver::new(
                         &lov_port,
+                        &ser_port,
+                        port.clone(),
+                        ser_addr,
+                        COMMAND_TIMEOUT,
+                        models.clone(),
+                    )?;
+                    let (runtime_handle, _actor_jh) =
+                        create_port_runtime(&claim, driver, RuntimeConfig::default())?;
+                    claim.publish(
                         runtime_handle.port_handle().clone(),
                         ctx.db().scan_control().interrupt_gate(),
                     )

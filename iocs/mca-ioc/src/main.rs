@@ -21,6 +21,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use epics_rs::asyn::registry::claim_port;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::base::error::CaResult;
@@ -111,15 +112,16 @@ async fn main() -> CaResult<()> {
                 let max_signals = arg_int(args, 1).ok_or("maxSignals required")? as usize;
                 let period = arg_double(args, 2).ok_or("period required")?;
 
+                let claim = claim_port(&port_name).map_err(|e| format!("DemoSourceConfig: {e}"))?;
                 let runtime_handle =
-                    demo_source::connect(&port_name, max_signals, Duration::from_secs_f64(period))
+                    demo_source::connect(&claim, max_signals, Duration::from_secs_f64(period))
                         .map_err(|e| format!("DemoSourceConfig: {e}"))?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| format!("DemoSourceConfig: {e}"))?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| format!("DemoSourceConfig: {e}"))?;
                 ports
                     .lock()
                     .expect("port list poisoned")
@@ -170,6 +172,7 @@ async fn main() -> CaResult<()> {
                 let data_string = arg_string(args, 4)?.unwrap_or_default();
                 let interval_string = arg_string(args, 5)?.unwrap_or_default();
 
+                let claim = claim_port(&port_name).map_err(|e| format!("initFastSweep: {e}"))?;
                 let (driver, subscriptions) = FastSweepDriver::connect(
                     &port_name,
                     &input_name,
@@ -180,15 +183,15 @@ async fn main() -> CaResult<()> {
                 )
                 .map_err(|e| format!("initFastSweep: {e}"))?;
                 let (runtime_handle, _actor) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("initFastSweep: {e}"))?;
                 mca::fastsweep::start(runtime_handle.port_handle().clone(), subscriptions);
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| format!("initFastSweep: {e}"))?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| format!("initFastSweep: {e}"))?;
                 ports
                     .lock()
                     .expect("port list poisoned")

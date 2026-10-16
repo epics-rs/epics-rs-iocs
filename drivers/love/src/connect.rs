@@ -65,7 +65,7 @@ mod tests {
     use super::*;
     use epics_rs::asyn::error::AsynResult;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-    use epics_rs::asyn::registry::{open_owner, register_port};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
     use epics_rs::asyn::user::AsynUser;
 
@@ -98,9 +98,11 @@ mod tests {
 
     fn publish<D: PortDriver>(name: &str, driver: impl FnOnce(PortDriverBase) -> D) -> PortHandle {
         let base = PortDriverBase::new(name, 1, PortFlags::default());
-        let (rt, _actor) = create_port_runtime(driver(base), RuntimeConfig::default()).unwrap();
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, driver(base), RuntimeConfig::default()).unwrap();
         let handle = rt.port_handle().clone();
-        register_port(name, handle.clone(), &open_owner()).unwrap();
+        claim.publish(handle.clone(), &open_owner()).unwrap();
         std::mem::forget(rt);
         handle
     }
@@ -126,8 +128,12 @@ mod tests {
                 ..PortFlags::default()
             },
         );
-        let (rt, _actor) = create_port_runtime(Bare(base), RuntimeConfig::default()).unwrap();
-        register_port("loveMultiSer", rt.port_handle().clone(), &open_owner()).unwrap();
+        let claim = claim_port("loveMultiSer").unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
         std::mem::forget(rt);
         let Err(e) = init_serial_port("loveMultiSer", 0) else {
             panic!("multi-device port accepted");

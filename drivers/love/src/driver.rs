@@ -805,11 +805,13 @@ mod tests {
     }
 
     fn love_on(serial: impl PortDriver, name: &str) -> LoveDriver {
+        use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::config::RuntimeConfig;
         use epics_rs::asyn::runtime::port::create_port_runtime;
 
-        let (runtime, _thread) =
-            create_port_runtime(serial, RuntimeConfig::default()).expect("serial port runtime");
+        let claim = claim_port(&serial.base().port_name.clone()).expect("serial port name");
+        let (runtime, _thread) = create_port_runtime(&claim, serial, RuntimeConfig::default())
+            .expect("serial port runtime");
         let models = std::sync::Arc::new(std::sync::Mutex::new([Model::default(); K_INSTRMAX]));
         let serial = runtime.port_handle().clone();
         LoveDriver::new(name, "SER", serial, 0, Duration::from_millis(100), models)
@@ -820,6 +822,7 @@ mod tests {
     /// lines, and the give-up prints "retries exceeded" (drvLove.c:739-767).
     #[test]
     fn timed_out_attempts_print_c_trace_lines() {
+        use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::runtime::config::RuntimeConfig;
         use epics_rs::asyn::runtime::port::create_port_runtime;
         use epics_rs::asyn::trace::TraceFile;
@@ -836,8 +839,9 @@ mod tests {
             ),
         };
         let love = love_on(serial, "LOVETESTTRCL");
+        let claim = claim_port("LOVETESTTRCL").expect("love port name");
         let (runtime, _thread) =
-            create_port_runtime(love, RuntimeConfig::default()).expect("love port runtime");
+            create_port_runtime(&claim, love, RuntimeConfig::default()).expect("love port runtime");
         let path = std::env::temp_dir().join(format!("love-trace-{}.txt", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         runtime.port_handle().trace().set_trace_file(
