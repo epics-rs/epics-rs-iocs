@@ -233,6 +233,10 @@ fn resolve_operation(
             let arg = arg.ok_or_else(|| bad(record_type, "VAL requires an address argument"))?;
             let addr = link::parse_channel_address(arg)
                 .ok_or_else(|| bad(record_type, format!("bad channel address '{arg}'")))?;
+            // devGM10_ao.c:99-139 has no `A` arm.
+            if addr.family == ChannelFamily::Math {
+                return Err(bad(record_type, "Math addresses are read-only"));
+            }
             if addr.family == ChannelFamily::Signal
                 && instrument.test_output_analog_signal(addr.index)
             {
@@ -935,6 +939,12 @@ mod tests {
     fn ao_val_rejects_nonexistent_signal_channel() {
         let instrument = connect_default_fixture();
         assert!(resolve_operation("ao", "VAL", Some("2"), &instrument).is_err());
+    }
+
+    #[test]
+    fn ao_val_rejects_math_address() {
+        let instrument = connect_default_fixture();
+        assert!(resolve_operation("ao", "VAL", Some("A1"), &instrument).is_err());
     }
 
     // -- resolve_operation: bi --
