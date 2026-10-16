@@ -558,12 +558,53 @@ impl TimePix3Driver {
         Ok(())
     }
 
-    /// C `sendMeasurementConfig` (serval_http.cpp:2033).
+    /// C `sendMeasurementConfig` (serval_http.cpp:2234-2322): the PUT merges
+    /// into a readback that must validate, and a rejected PUT re-reads it.
     fn send_measurement_config(&mut self) -> AsynResult<()> {
-        let current = self
-            .http
-            .get_json(serval::MEASUREMENT_CONFIG, TIMEOUT_CONFIG)
-            .map_err(|e| self.http_failed("GET /measurement/config", &e, HttpPrint::None))?;
+        let refused = |message: &str| AsynError::Status {
+            status: AsynStatus::Error,
+            message: format!("timepix3: GET /measurement/config: {message}"),
+        };
+        let body = match self.http.get(serval::MEASUREMENT_CONFIG, TIMEOUT_POLL) {
+            Ok(body) => body,
+            Err(e) => {
+                let message = serval::ConfigResponseError::HttpFailure.message();
+                self.set_text(self.p.write_msg, message)?;
+                return Err(self.http_failed(
+                    "GET /measurement/config",
+                    &e,
+                    HttpPrint::Failure(
+                        "sendMeasurementConfig GET /measurement/config",
+                        "GET",
+                        serval::MEASUREMENT_CONFIG,
+                    ),
+                ));
+            }
+        };
+        let current = match serval::parse_config_response(&body) {
+            Ok(current) => serval::parse_config_readback(&body)
+                .map(|_| current)
+                .map_err(|e| e.message()),
+            Err(e) => Err(e.message()),
+        };
+        let current = match current {
+            Ok(current) => current,
+            Err(message) => {
+                self.http_ok();
+                self.set_text(self.p.write_msg, message)?;
+                self.ad.port_base.trace_print(
+                    TraceMask::ERROR,
+                    format_args!(
+                        "{}",
+                        adlog::err(
+                            adlog::SEND_MEASUREMENT_CONFIG,
+                            &format!("sendMeasurementConfig GET /measurement/config: {message}"),
+                        )
+                    ),
+                );
+                return Err(refused(message));
+            }
+        };
         let cfg = serval::MeasurementConfig {
             scan_width: self.int(self.p.stem_scan_width, 0),
             scan_height: self.int(self.p.stem_scan_height, 0),
@@ -575,20 +616,105 @@ impl TimePix3Driver {
             tof_max: self.dbl(self.p.tof_max, 0),
         };
         let body = serval::measurement_config_body(&current, &cfg);
-        self.http
+        if let Err(e) = self
+            .http
             .put_json(serval::MEASUREMENT_CONFIG, &body, TIMEOUT_CONFIG)
-            .map_err(|e| {
-                self.http_failed(
-                    "PUT /measurement/config",
-                    &e,
-                    HttpPrint::Failure(
-                        "sendMeasurementConfig PUT /measurement/config",
-                        "PUT",
-                        serval::MEASUREMENT_CONFIG,
+        {
+            self.log_http(
+                &e,
+                HttpPrint::Failure(
+                    "sendMeasurementConfig PUT /measurement/config",
+                    "PUT",
+                    serval::MEASUREMENT_CONFIG,
+                ),
+            );
+            if self.get_measurement_config().is_err() {
+                self.ad.port_base.trace_print(
+                    TraceMask::WARNING,
+                    format_args!(
+                        "{}",
+                        adlog::warn(
+                            adlog::SEND_MEASUREMENT_CONFIG,
+                            "Failed to restore measurement configuration after rejected PUT",
+                        )
                     ),
-                )
-            })?;
+                );
+            }
+            // The rejected PUT stays the operator-visible result.
+            return Err(self.http_failed("PUT /measurement/config", &e, HttpPrint::None));
+        }
         self.http_ok();
+        Ok(())
+    }
+
+    /// C `getMeasurementConfig` (serval_http.cpp:2198-2232).
+    pub(crate) fn get_measurement_config(&mut self) -> AsynResult<()> {
+        let reply = self.http.get(serval::MEASUREMENT_CONFIG, TIMEOUT_POLL);
+        let snapshot = match &reply {
+            Ok(body) => serval::parse_config_readback(body),
+            Err(_) => Err(serval::ConfigReadbackError::HttpFailure),
+        };
+        let s = match snapshot {
+            Ok(s) => s,
+            Err(e) => {
+                let (code, body) = match &reply {
+                    Ok(body) => (200, body.as_str()),
+                    Err(e) => (e.code(), e.body()),
+                };
+                let url = format!("{}{}", self.http.base_url(), serval::MEASUREMENT_CONFIG);
+                for (mask, line) in [
+                    (
+                        TraceMask::IO_DRIVER,
+                        adlog::log(
+                            adlog::GET_MEASUREMENT_CONFIG,
+                            &format!(
+                                "GET {url} failed: {code} (Measurement.Config may not be supported): {}",
+                                adlog::trim_body(body)
+                            ),
+                        ),
+                    ),
+                    (
+                        TraceMask::ERROR,
+                        adlog::err(
+                            adlog::GET_MEASUREMENT_CONFIG,
+                            &format!("getMeasurementConfig: {}", e.message()),
+                        ),
+                    ),
+                ] {
+                    self.ad
+                        .port_base
+                        .trace_print(mask, format_args!("{}", line));
+                }
+                return Err(AsynError::Status {
+                    status: AsynStatus::Error,
+                    message: format!("timepix3: GET /measurement/config: {}", e.message()),
+                });
+            }
+        };
+        let p = self.p;
+        for (reason, v) in [
+            (p.stem_scan_width, s.stem_scan_width),
+            (p.stem_scan_height, s.stem_scan_height),
+            (p.stem_radius_outer, s.stem_radius_outer),
+            (p.stem_radius_inner, s.stem_radius_inner),
+        ] {
+            if let Some(v) = v {
+                self.ad.port_base.set_int32_param(reason, 0, v)?;
+            }
+        }
+        for (reason, v) in [
+            (p.stem_dwell_time, s.stem_dwell_time),
+            (p.tof_min, s.tof_min),
+            (p.tof_max, s.tof_max),
+        ] {
+            if let Some(v) = v {
+                self.ad.port_base.set_float64_param(reason, 0, v)?;
+            }
+        }
+        if let Some(v) = &s.tof_tdc_reference {
+            self.set_text(p.tof_tdc_reference, v)?;
+        }
+        self.ad.port_base.call_param_callbacks(0)?;
         Ok(())
     }
 
@@ -2262,11 +2388,15 @@ mod tests {
     /// A Serval that answers `{}` to everything but a request line holding
     /// `fail`, which gets a 500.
     fn fake_serval(fail: &'static str) -> String {
-        fake_serval_with(fail, "{}")
+        fake_serval_with(fail, &[])
     }
 
-    /// [`fake_serval`] answering `GET /measurement` with `measurement`.
-    fn fake_serval_with(fail: &'static str, measurement: &'static str) -> String {
+    /// [`fake_serval`] answering a request line that starts with a route's
+    /// prefix with that route's body.
+    fn fake_serval_with(
+        fail: &'static str,
+        routes: &'static [(&'static str, &'static str)],
+    ) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2292,11 +2422,10 @@ mod tests {
                 } else {
                     "200 OK"
                 };
-                let reply = if request.starts_with("GET /measurement ") {
-                    measurement
-                } else {
-                    "{}"
-                };
+                let reply = routes
+                    .iter()
+                    .find(|(prefix, _)| request.starts_with(prefix))
+                    .map_or("{}", |(_, body)| body);
                 let _ = reader.get_mut().write_all(
                     format!(
                         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
@@ -2396,7 +2525,10 @@ mod tests {
     fn the_monitor_stops_an_idle_measurement() {
         let runtime = crate::create_timepix3_detector(
             &epics_rs::asyn::registry::claim_port("TPX_MONITOR").unwrap(),
-            &fake_serval_with("\0", r#"{"Info": {"Status": "DA_IDLE"}}"#),
+            &fake_serval_with(
+                "\0",
+                &[("GET /measurement ", r#"{"Info": {"Status": "DA_IDLE"}}"#)],
+            ),
             0,
         )
         .unwrap();
@@ -2429,9 +2561,12 @@ mod tests {
             "TPX_MSMT_TYPES",
             Arc::new(ServalHttp::new(&fake_serval_with(
                 "\0",
-                r#"{"Info": {"PixelEventRate": 1200, "TdcEventRate": 3, "Tdc2EventRate": 4,
-                    "StartDateTime": 1700000000123, "ElapsedTime": 2.5, "TimeLeft": 0.5,
-                    "FrameCount": 9, "DroppedFrames": 1, "Status": "DA_STOPPED"}}"#,
+                &[(
+                    "GET /measurement ",
+                    r#"{"Info": {"PixelEventRate": 1200, "TdcEventRate": 3, "Tdc2EventRate": 4,
+                        "StartDateTime": 1700000000123, "ElapsedTime": 2.5, "TimeLeft": 0.5,
+                        "FrameCount": 9, "DroppedFrames": 1, "Status": "DA_STOPPED"}}"#,
+                )],
             ))),
             Arc::new(Shared::new()),
             0,
@@ -2468,7 +2603,10 @@ mod tests {
         let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
         let det = TimePix3Driver::new(
             name,
-            Arc::new(ServalHttp::new(&fake_serval_with("\0", "[]"))),
+            Arc::new(ServalHttp::new(&fake_serval_with(
+                "\0",
+                &[("GET /measurement ", "[]")],
+            ))),
             Arc::new(Shared::new()),
             0,
             cmd_tx,
@@ -2511,6 +2649,119 @@ mod tests {
             assert!(text.contains(&line), "{line}: {text:?}");
         }
         std::mem::forget(runtime);
+    }
+
+    const MEASUREMENT_CONFIG_READBACK: &str = r#"{"Stem": {"Scan": {"Width": 64,
+        "Height": 32, "DwellTime": 0.25}, "VirtualDetector": {"RadiusOuter": 9,
+        "RadiusInner": 3}}, "TimeOfFlight": {"TdcReference": ["PN0123", "NP0123"],
+        "Min": 1.5, "Max": 2.5}}"#;
+
+    fn measurement_config_of(det: &TimePix3Driver) -> (i32, i32, f64, i32, i32, String, f64, f64) {
+        let p = det.p;
+        (
+            det.int(p.stem_scan_width, 0),
+            det.int(p.stem_scan_height, 0),
+            det.dbl(p.stem_dwell_time, 0),
+            det.int(p.stem_radius_outer, 0),
+            det.int(p.stem_radius_inner, 0),
+            det.text(p.tof_tdc_reference, 0),
+            det.dbl(p.tof_min, 0),
+            det.dbl(p.tof_max, 0),
+        )
+    }
+
+    const READBACK: (i32, i32, f64, i32, i32, &str, f64, f64) =
+        (64, 32, 0.25, 9, 3, "PN0123,NP0123", 1.5, 2.5);
+
+    fn is_readback(seen: &(i32, i32, f64, i32, i32, String, f64, f64)) -> bool {
+        let r = READBACK;
+        *seen == (r.0, r.1, r.2, r.3, r.4, r.5.to_string(), r.6, r.7)
+    }
+
+    /// The Health scan re-reads Measurement.Config into the Stem and
+    /// TimeOfFlight PVs (ADTimePix.cpp:560, serval_http.cpp:2198-2232).
+    #[test]
+    fn the_health_scan_reads_back_the_measurement_config() {
+        let runtime = crate::create_timepix3_detector(
+            &epics_rs::asyn::registry::claim_port("TPX_MSMT_CFG_HEALTH").unwrap(),
+            &fake_serval_with(
+                "\0",
+                &[("GET /measurement/config ", MEASUREMENT_CONFIG_READBACK)],
+            ),
+            0,
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        let health = handle
+            .with_driver_blocking::<TimePix3Driver, _>(|d| d.p.health)
+            .unwrap();
+        handle.write_int32_blocking(health, 0, 1).unwrap();
+        let mut seen = None;
+        for _ in 0..500 {
+            seen = handle
+                .with_driver_blocking::<TimePix3Driver, _>(|d| measurement_config_of(d))
+                .ok();
+            if seen.as_ref().is_some_and(is_readback) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(seen.as_ref().is_some_and(is_readback), "{seen:?}");
+    }
+
+    /// A readback that fails C `parseConfigReadback` refuses the write
+    /// before any PUT (serval_http.cpp:2256-2265).
+    #[test]
+    fn an_invalid_measurement_config_readback_refuses_the_put() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_MSMT_CFG_INVALID",
+            Arc::new(ServalHttp::new(&fake_serval_with(
+                "PUT /measurement/config",
+                &[("GET /measurement/config ", r#"{"Stem": 1}"#)],
+            ))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.ad.port_base.set_int32_param(p.http_code, 0, 7).unwrap();
+        assert!(
+            det.write_int32(&mut AsynUser::new(p.stem_scan_width), 5)
+                .is_err()
+        );
+        assert_eq!(
+            det.text(p.write_msg, 0),
+            "measurement Stem field is not an object"
+        );
+        // The PUT, which this Serval refuses with a 500, never went out.
+        assert_eq!(det.int(p.http_code, 0), 200);
+    }
+
+    /// A rejected PUT restores the PVs from Serval's configuration and keeps
+    /// the PUT's HttpCode (serval_http.cpp:2307-2320).
+    #[test]
+    fn a_rejected_measurement_config_put_restores_the_readback() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_MSMT_CFG_REJECT",
+            Arc::new(ServalHttp::new(&fake_serval_with(
+                "PUT /measurement/config",
+                &[("GET /measurement/config ", MEASUREMENT_CONFIG_READBACK)],
+            ))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        assert!(
+            det.write_int32(&mut AsynUser::new(p.stem_scan_width), 5)
+                .is_err()
+        );
+        assert!(is_readback(&measurement_config_of(&det)));
+        assert_eq!(det.int(p.http_code, 0), 500);
     }
 
     /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).

@@ -556,6 +556,168 @@ pub fn parse_status_response(body: &str) -> Result<StatusSnapshot, StatusRespons
     Ok(snapshot)
 }
 
+/// C `ConfigResponseError` (serval_measurement.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigResponseError {
+    HttpFailure,
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+}
+
+impl ConfigResponseError {
+    /// C `configResponseErrorMessage` (serval_measurement.cpp:235-250).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::HttpFailure => "measurement configuration GET failed",
+            Self::EmptyBody => "empty measurement configuration response",
+            Self::MalformedJson => "malformed measurement configuration JSON",
+            Self::InvalidRoot => "measurement configuration JSON root is not an object",
+        }
+    }
+}
+
+/// C `parseConfigResponse` (serval_measurement.cpp:212-233) for a 200 reply.
+pub fn parse_config_response(body: &str) -> Result<Value, ConfigResponseError> {
+    if body.is_empty() {
+        return Err(ConfigResponseError::EmptyBody);
+    }
+    let config: Value =
+        serde_json::from_str(body).map_err(|_| ConfigResponseError::MalformedJson)?;
+    if config.is_object() {
+        Ok(config)
+    } else {
+        Err(ConfigResponseError::InvalidRoot)
+    }
+}
+
+/// A validated `GET /measurement/config` reply (C `ConfigSnapshot`,
+/// serval_measurement.h); `None` is a field Serval did not send.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ConfigSnapshot {
+    pub stem_scan_width: Option<i32>,
+    pub stem_scan_height: Option<i32>,
+    pub stem_dwell_time: Option<f64>,
+    pub stem_radius_outer: Option<i32>,
+    pub stem_radius_inner: Option<i32>,
+    pub tof_tdc_reference: Option<String>,
+    pub tof_min: Option<f64>,
+    pub tof_max: Option<f64>,
+}
+
+/// C `ConfigReadbackError` (serval_measurement.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigReadbackError {
+    HttpFailure,
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+    InvalidStem,
+    InvalidScan,
+    InvalidVirtualDetector,
+    InvalidTimeOfFlight,
+    InvalidMetric,
+    InvalidTdcReference,
+}
+
+impl ConfigReadbackError {
+    /// C `configReadbackErrorMessage` (serval_measurement.cpp:322-338).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::HttpFailure => "measurement configuration GET failed",
+            Self::EmptyBody => "empty measurement configuration response",
+            Self::MalformedJson => "malformed measurement configuration JSON",
+            Self::InvalidRoot => "measurement configuration root is not an object",
+            Self::InvalidStem => "measurement Stem field is not an object",
+            Self::InvalidScan => "measurement Stem.Scan field is not an object",
+            Self::InvalidVirtualDetector => {
+                "measurement Stem.VirtualDetector field is not an object"
+            }
+            Self::InvalidTimeOfFlight => "measurement TimeOfFlight field is not an object",
+            Self::InvalidMetric => "measurement configuration metric has an invalid value",
+            Self::InvalidTdcReference => "measurement TdcReference field is invalid",
+        }
+    }
+}
+
+impl From<ConfigResponseError> for ConfigReadbackError {
+    fn from(e: ConfigResponseError) -> Self {
+        match e {
+            ConfigResponseError::HttpFailure => Self::HttpFailure,
+            ConfigResponseError::EmptyBody => Self::EmptyBody,
+            ConfigResponseError::MalformedJson => Self::MalformedJson,
+            ConfigResponseError::InvalidRoot => Self::InvalidRoot,
+        }
+    }
+}
+
+/// C `parseConfigReadback` (serval_measurement.cpp:252-320) for a 200 reply:
+/// a null field is absent, a present one of the wrong kind fails the reply.
+pub fn parse_config_readback(body: &str) -> Result<ConfigSnapshot, ConfigReadbackError> {
+    use ConfigReadbackError as E;
+    let config = parse_config_response(body)?;
+
+    /// The field unless it is absent or null.
+    fn present<'a>(object: &'a Value, name: &str) -> Option<&'a Value> {
+        object.get(name).filter(|v| !v.is_null())
+    }
+    /// C `optionalConfigInt`: an integer (not a float) in i32 range.
+    fn int(object: &Value, name: &str) -> Result<Option<i32>, ConfigReadbackError> {
+        present(object, name)
+            .map(|v| {
+                v.as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or(E::InvalidMetric)
+            })
+            .transpose()
+    }
+    /// C `optionalConfigDouble`.
+    fn double(object: &Value, name: &str) -> Result<Option<f64>, ConfigReadbackError> {
+        present(object, name)
+            .map(|v| finite_double(v).ok_or(E::InvalidMetric))
+            .transpose()
+    }
+
+    let mut snapshot = ConfigSnapshot::default();
+    if let Some(stem) = present(&config, "Stem") {
+        if !stem.is_object() {
+            return Err(E::InvalidStem);
+        }
+        if let Some(scan) = present(stem, "Scan") {
+            if !scan.is_object() {
+                return Err(E::InvalidScan);
+            }
+            snapshot.stem_scan_width = int(scan, "Width")?;
+            snapshot.stem_scan_height = int(scan, "Height")?;
+            snapshot.stem_dwell_time = double(scan, "DwellTime")?;
+        }
+        if let Some(detector) = present(stem, "VirtualDetector") {
+            if !detector.is_object() {
+                return Err(E::InvalidVirtualDetector);
+            }
+            snapshot.stem_radius_outer = int(detector, "RadiusOuter")?;
+            snapshot.stem_radius_inner = int(detector, "RadiusInner")?;
+        }
+    }
+    if let Some(tof) = present(&config, "TimeOfFlight") {
+        if !tof.is_object() {
+            return Err(E::InvalidTimeOfFlight);
+        }
+        if let Some(references) = present(tof, "TdcReference") {
+            let references = references
+                .as_array()
+                .ok_or(E::InvalidTdcReference)?
+                .iter()
+                .map(|r| r.as_str().ok_or(E::InvalidTdcReference))
+                .collect::<Result<Vec<_>, _>>()?;
+            snapshot.tof_tdc_reference = Some(references.join(","));
+        }
+        snapshot.tof_min = double(tof, "Min")?;
+        snapshot.tof_max = double(tof, "Max")?;
+    }
+    Ok(snapshot)
+}
+
 /// C `strip_quotes` (serval_http.cpp:91).
 ///
 /// UPSTREAM DEFECT (serval_http.cpp:91-95): C removes the first and last
@@ -775,6 +937,68 @@ mod tests {
         assert!(!snap(None).is_running());
         assert!(!snap(None).is_idle());
         assert!(snap(None).is_remote_idle());
+    }
+
+    /// C `parseConfigReadback` (serval_measurement.cpp:252-320).
+    #[test]
+    fn a_measurement_config_reply_is_validated_as_c_does() {
+        use ConfigReadbackError as E;
+        let parse = parse_config_readback;
+        assert_eq!(parse(""), Err(E::EmptyBody));
+        assert_eq!(parse("{"), Err(E::MalformedJson));
+        assert_eq!(parse("[]"), Err(E::InvalidRoot));
+        assert_eq!(parse(r#"{"Stem": 1}"#), Err(E::InvalidStem));
+        assert_eq!(parse(r#"{"Stem": {"Scan": []}}"#), Err(E::InvalidScan));
+        assert_eq!(
+            parse(r#"{"Stem": {"VirtualDetector": "x"}}"#),
+            Err(E::InvalidVirtualDetector)
+        );
+        assert_eq!(parse(r#"{"TimeOfFlight": 2}"#), Err(E::InvalidTimeOfFlight));
+        assert_eq!(
+            parse(r#"{"TimeOfFlight": {"TdcReference": "PN0123"}}"#),
+            Err(E::InvalidTdcReference)
+        );
+        assert_eq!(
+            parse(r#"{"TimeOfFlight": {"TdcReference": ["a", 1]}}"#),
+            Err(E::InvalidTdcReference)
+        );
+        for bad in [
+            r#"{"Stem": {"Scan": {"Width": 1.5}}}"#,
+            r#"{"Stem": {"Scan": {"Height": 3000000000}}}"#,
+            r#"{"Stem": {"Scan": {"DwellTime": "1"}}}"#,
+            r#"{"Stem": {"VirtualDetector": {"RadiusInner": true}}}"#,
+            r#"{"TimeOfFlight": {"Min": "0"}}"#,
+        ] {
+            assert_eq!(parse(bad), Err(E::InvalidMetric), "{bad}");
+        }
+
+        // Null is absent at every level.
+        assert_eq!(
+            parse(r#"{"Stem": null, "TimeOfFlight": {"TdcReference": null, "Min": null}}"#),
+            Ok(ConfigSnapshot::default())
+        );
+        assert_eq!(
+            parse(
+                r#"{"Stem": {"Scan": {"Width": 64, "Height": -2, "DwellTime": 0.25},
+                    "VirtualDetector": {"RadiusOuter": 9, "RadiusInner": 3}},
+                    "TimeOfFlight": {"TdcReference": ["PN0123", "NP0123"], "Min": 1, "Max": 2.5},
+                    "Corrections": {}}"#
+            ),
+            Ok(ConfigSnapshot {
+                stem_scan_width: Some(64),
+                stem_scan_height: Some(-2),
+                stem_dwell_time: Some(0.25),
+                stem_radius_outer: Some(9),
+                stem_radius_inner: Some(3),
+                tof_tdc_reference: Some("PN0123,NP0123".into()),
+                tof_min: Some(1.0),
+                tof_max: Some(2.5),
+            })
+        );
+        assert_eq!(
+            parse_config_response("[]"),
+            Err(ConfigResponseError::InvalidRoot)
+        );
     }
 
     /// C `parseStatusResponse` (serval_measurement.cpp:131-196).

@@ -51,6 +51,14 @@ impl HttpError {
             _ => 0,
         }
     }
+
+    /// The reply body cpr would hold: empty unless Serval answered.
+    pub fn body(&self) -> &str {
+        match self {
+            Self::Status { body, .. } => body,
+            _ => "",
+        }
+    }
 }
 
 /// The base64 alphabet Serval encodes `PixelConfig` with.

@@ -211,6 +211,7 @@ async fn connection_poll(
             Command::RefreshStatus => {
                 refresh_dashboard(&ctx).await;
                 refresh_detector(&ctx).await;
+                refresh_measurement_config(&ctx).await;
                 continue;
             }
             Command::RefreshDetector => {
@@ -242,9 +243,21 @@ async fn connection_poll(
         if up && !was_up {
             refresh_dashboard(&ctx).await;
             refresh_detector(&ctx).await;
+            refresh_measurement_config(&ctx).await;
         }
         was_up = up;
     }
+}
+
+/// C `getMeasurementConfig`, which the Health scan and the reconnect refresh
+/// run (ADTimePix.cpp:560, serval_http.cpp:297-298).
+async fn refresh_measurement_config(ctx: &Arc<Ctx>) {
+    let _ = ctx
+        .handle
+        .with_driver::<TimePix3Driver, _>(|d| {
+            let _ = d.get_measurement_config();
+        })
+        .await;
 }
 
 /// C `checkConnection` (serval_http.cpp:274).

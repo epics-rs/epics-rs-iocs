@@ -27,6 +27,8 @@ pub const CHECK_PRV_IMG_PATH: &str = "asynStatus ADTimePix::checkPrvImgPath()";
 pub const CHECK_PRV_IMG1_PATH: &str = "asynStatus ADTimePix::checkPrvImg1Path()";
 pub const CHECK_BPC_PATH: &str = "asynStatus ADTimePix::checkBPCPath()";
 pub const CHECK_DACS_PATH: &str = "asynStatus ADTimePix::checkDACSPath()";
+pub const GET_MEASUREMENT_CONFIG: &str = "asynStatus ADTimePix::getMeasurementConfig()";
+pub const SEND_MEASUREMENT_CONFIG: &str = "asynStatus ADTimePix::sendMeasurementConfig()";
 pub const WRITE_INT32: &str = "virtual asynStatus ADTimePix::writeInt32(asynUser*, epicsInt32)";
 pub const WRITE_FLOAT64: &str =
     "virtual asynStatus ADTimePix::writeFloat64(asynUser*, epicsFloat64)";
@@ -50,7 +52,7 @@ pub fn log(func: &str, msg: &str) -> String {
 
 /// C `trimHttpBodyForLog`: control characters become spaces, the body is cut
 /// at 512 bytes and marked with `...`.
-fn trim_body(body: &str) -> String {
+pub fn trim_body(body: &str) -> String {
     const MAX: usize = 512;
     let bytes = body.as_bytes();
     let kept: Vec<u8> = bytes[..bytes.len().min(MAX)]
