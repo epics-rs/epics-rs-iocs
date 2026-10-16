@@ -737,7 +737,7 @@ const TCLCALL_PORT: i32 = 5001;
 const TCLCALL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// `tclcall(tclName, taskName, args)` (tclCall.cc): run a TCL script on
-/// the XPS at [`TCLCALL_IP`] over a socket of its own.
+/// the XPS at `TCLCALL_IP` over a socket of its own.
 pub fn tclcall_command() -> CommandDef {
     CommandDef::new(
         "tclcall",
