@@ -132,8 +132,8 @@ fn read_setup(ctx: &AcquisitionContext, sync: &SyncIOHandle) -> AcquireSetup {
         frame_type,
         acquire_time: sync.read_float64(ad.acquire_time).unwrap_or(0.0),
         count,
-        file_path: read_string(sync, ad.base.file_path),
-        file_name: read_string(sync, ad.base.file_name),
+        file_path: read_string(ctx, ad.base.file_path),
+        file_name: read_string(ctx, ad.base.file_name),
         file_number: sync.read_int32(ad.base.file_number).unwrap_or(0),
         array_callbacks: sync.read_int32(ad.base.array_callbacks).unwrap_or(1) != 0,
     }
@@ -489,11 +489,12 @@ async fn set_params(ctx: &AcquisitionContext, values: Vec<ParamSetValue>) {
     let _ = ctx.handle.set_params_and_notify(0, values).await;
 }
 
-fn read_string(sync: &SyncIOHandle, reason: usize) -> String {
-    match sync.read_octet(reason, MAX_MESSAGE_SIZE) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .to_string(),
+fn read_string(ctx: &AcquisitionContext, reason: usize) -> String {
+    match ctx
+        .handle
+        .get_string_param_blocking(reason, 0, MAX_MESSAGE_SIZE)
+    {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(_) => String::new(),
     }
 }
