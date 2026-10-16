@@ -191,7 +191,6 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
     let ad_params = det.ad.params;
     let url_params = det.url_params;
     let pool = det.ad.pool.clone();
-    let queued = det.ad.owner.queued().clone();
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
 
@@ -200,7 +199,6 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
         handle: runtime_handle.port_handle().clone(),
         publisher: ArrayPublisher::new(array_output.clone()),
         pool: pool.clone(),
-        queued,
         ad: ad_params,
         url: url_params,
     });
@@ -291,6 +289,67 @@ mod tests {
         h.write_int32_blocking(ad.acquire, 0, 0).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(next, 101);
+        std::mem::forget(rt);
+    }
+
+    #[test]
+    fn wait_for_plugins_holds_acquire_busy_until_the_frame_is_released() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("url-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("frame.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&png)
+            .unwrap();
+
+        let rt = create_url_detector(&claim_port("URL_BUSY").unwrap(), 1 << 20).unwrap();
+        let (tx, mut rx) = ndarray_channel("URL_BUSY_SINK", 8);
+        rt.connect_downstream(tx);
+        let (h, ad) = (rt.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    rt.url_params.url_name,
+                    0,
+                    ParamValue::Octet(format!("file://{}", png.display()).into_bytes().into()),
+                ),
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(ad.base.wait_for_plugins, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Single as i32),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let read = |reason| h.read_int32_blocking(reason, 0).unwrap();
+        let wait_for = |reason, value| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while read(reason) != value {
+                assert!(
+                    Instant::now() < deadline,
+                    "param {reason} never became {value}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        wait_for(ad.acquire, 0);
+        // Idle is the task's last store of the acquisition.
+        wait_for(ad.status, ADStatus::Idle as i32);
+        assert_eq!(read(ad.acquire_busy), 1, "busy cleared with a frame queued");
+        drop(rx.blocking_recv().expect("frame"));
+        wait_for(ad.acquire_busy, 0);
+        let _ = std::fs::remove_dir_all(&dir);
         std::mem::forget(rt);
     }
 }

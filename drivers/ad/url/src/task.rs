@@ -10,7 +10,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAt
 use epics_rs::ad_core::driver::{ADStatus, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{ArrayPublisher, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -28,22 +28,19 @@ pub(crate) struct AcquisitionContext {
     pub handle: PortHandle,
     pub publisher: ArrayPublisher,
     pub pool: Arc<NDArrayPool>,
-    pub queued: Arc<QueuedArrayCounter>,
     pub ad: ADBaseParams,
     pub url: URLParams,
 }
 
 impl AcquisitionContext {
-    async fn end_acquisition(&self, wait_for_plugins: bool) {
-        if wait_for_plugins {
-            self.queued.wait_until_zero(Duration::from_secs(5));
-        }
+    /// ADAcquireBusy follows the ADAcquire store (asynNDArrayDriver.cpp:636-663),
+    /// WaitForPlugins included.
+    async fn end_acquisition(&self) {
         let _ = self
             .handle
             .set_params_and_notify(
                 0,
                 vec![
-                    ParamSetValue::new(self.ad.acquire_busy, 0, ParamValue::Int32(0)),
                     ParamSetValue::new(self.ad.status, 0, ParamValue::Int32(ADStatus::Idle as i32)),
                     ParamSetValue::new(self.ad.acquire, 0, ParamValue::Int32(0)),
                 ],
@@ -248,10 +245,11 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             .handle
             .set_params_and_notify(
                 0,
-                vec![
-                    ParamSetValue::new(ctx.ad.num_images_counter, 0, ParamValue::Int32(0)),
-                    ParamSetValue::new(ctx.ad.acquire_busy, 0, ParamValue::Int32(1)),
-                ],
+                vec![ParamSetValue::new(
+                    ctx.ad.num_images_counter,
+                    0,
+                    ParamValue::Int32(0),
+                )],
             )
             .await;
 
@@ -362,12 +360,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             }
         }
 
-        let wait_for_plugins = ctx
-            .handle
-            .read_int32(ctx.ad.base.wait_for_plugins, 0)
-            .await
-            .unwrap_or(0)
-            != 0;
-        ctx.end_acquisition(wait_for_plugins).await;
+        ctx.end_acquisition().await;
     }
 }
