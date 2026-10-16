@@ -74,7 +74,7 @@ pub fn acsmotion_config_command() -> CommandDef {
             let comm = SpiiPlusComm::connect(&comm_port, &asyn_port)?;
             let owner = ctx.db().scan_control().interrupt_gate();
             register_comm_port(owner, &comm_port, num_axes as i32)?;
-            let controller = SpiiPlusController::new(comm, &port_name, num_axes);
+            let controller = SpiiPlusController::new(comm, &port_name, num_axes, &virtual_axes);
             let controller = Arc::new(Mutex::new(controller));
 
             register_controller_port(
@@ -84,8 +84,7 @@ pub fn acsmotion_config_command() -> CommandDef {
                 AcsMotionParams::new(controller.clone()),
             )?;
             for index in 0..num_axes {
-                let is_virtual = virtual_axes.contains(&index);
-                let ax = SpiiPlusAxis::new(controller.clone(), index, is_virtual);
+                let ax = SpiiPlusAxis::new(controller.clone(), index);
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
                 install(
                     ctx,

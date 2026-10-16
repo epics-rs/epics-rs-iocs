@@ -37,6 +37,7 @@
 //! and factors, reference position, PEG, disable-set-position guard, global
 //! variable read/write, ACSPL program start/stop).
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -62,6 +63,8 @@ const MST_MOTION: i32 = 1 << 5;
 
 /// Axis-status (`AST`) motion bit, used for dummy/virtual axes (C `poll`).
 const AST_MOTION: i32 = 1 << 5;
+/// C `SPIIPLUS_AXIS_STATUS_PEGREADY`.
+const AST_PEG_READY: i32 = 1 << 4;
 
 /// Fault-word (`FAULT`) bit masks (C `SPIIPLUS_FAULT_*`). NOTE: bit 0 is the
 /// RIGHT (high) limit and bit 1 is the LEFT (low) limit — the opposite ordering
@@ -175,6 +178,26 @@ impl Homing {
     }
 }
 
+/// What C's constructor sets on each `SPiiPlusAxis`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AxisSetup {
+    /// C `virtual_`, from the config `virtualAxisList`.
+    is_virtual: bool,
+    /// C `dummy_`, the `MFLAGS` `#DUMMY` bit.
+    dummy: bool,
+    /// C `resolution_`: controller units per step.
+    resolution: f64,
+}
+
+/// What an axis's poll last saw, for the profile thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AxisMotion {
+    /// C `moving_`.
+    moving: bool,
+    /// C `pegReady_`, the `AST` `#PEGREADY` bit.
+    peg_ready: bool,
+}
+
 /// Shared controller endpoint: owns the comm, the version string, the
 /// axis count, the setup flags, and each axis's homing parameters.
 pub struct SpiiPlusController {
@@ -183,23 +206,28 @@ pub struct SpiiPlusController {
     port: String,
     ident: String,
     num_axes: usize,
-    /// C `motorFlags_` as read at construction.
-    motor_flags: Vec<i32>,
-    /// C `stepperFactor_` / `encoderFactor_`.
-    stepper_factor: Vec<f64>,
+    /// C `encoderFactor_`.
     encoder_factor: Vec<f64>,
     /// C `virtualFeedbackPositionSupported_`: the firmware has `VPOS`.
     vpos_supported: bool,
+    setup: Vec<AxisSetup>,
+    motion: Vec<AxisMotion>,
     homing: Vec<Homing>,
 }
 
 impl SpiiPlusController {
     /// C `SPiiPlusController` constructor's queries: the firmware version
     /// (`?VR`), whether `VPOS` exists, and the setup arrays read over the
-    /// binary protocol. C ignores every status here, so a controller that
-    /// does not answer still gets its axes, with zeroed setup. Performs
-    /// blocking I/O.
-    pub fn new(comm: SpiiPlusComm, port: &str, num_axes: usize) -> Self {
+    /// binary protocol, which give each axis its `resolution_`;
+    /// `virtual_axes` is the config's `virtualAxisList`. C ignores every
+    /// status here, so a controller that does not answer still gets its
+    /// axes, with zeroed setup. Performs blocking I/O.
+    pub fn new(
+        comm: SpiiPlusComm,
+        port: &str,
+        num_axes: usize,
+        virtual_axes: &HashSet<usize>,
+    ) -> Self {
         let ident = comm.write_read_str("?VR").unwrap_or_default();
         let vpos_supported = comm.is_variable_defined("VPOS").unwrap_or(false);
         let span = Span::one(0, num_axes as i32 - 1);
@@ -219,15 +247,33 @@ impl SpiiPlusController {
                 let _ = comm.write_read_ack(&format!("FCLEAR {index}"));
             }
         }
+        let setup = (0..num_axes)
+            .map(|index| {
+                let flags = motor_flags[index];
+                let is_virtual = virtual_axes.contains(&index);
+                let stepper = flags & MFLAGS_MICRO != 0
+                    || (flags & MFLAGS_STEPPER != 0 && flags & MFLAGS_STEPENC == 0);
+                let resolution = if !is_virtual && stepper {
+                    stepper_factor[index]
+                } else {
+                    encoder_factor[index]
+                };
+                AxisSetup {
+                    is_virtual,
+                    dummy: flags & MFLAGS_DUMMY != 0,
+                    resolution,
+                }
+            })
+            .collect();
         Self {
             comm,
             port: port.to_string(),
             ident,
             num_axes,
-            motor_flags,
-            stepper_factor,
             encoder_factor,
             vpos_supported,
+            setup,
+            motion: vec![AxisMotion::default(); num_axes],
             homing: vec![Homing::default(); num_axes],
         }
     }
@@ -292,29 +338,17 @@ pub struct SpiiPlusAxis {
 }
 
 impl SpiiPlusAxis {
-    /// Construct axis `index` (0-based). `is_virtual` comes from the config
-    /// `virtualAxisList`; the dummy flag is the `MFLAGS` bit the controller
-    /// read at construction.
-    pub fn new(controller: Arc<Mutex<SpiiPlusController>>, index: usize, is_virtual: bool) -> Self {
-        let (dummy, resolution) = {
-            let ctrl = controller.lock().unwrap_or_else(|e| e.into_inner());
-            let flags = ctrl.motor_flags[index];
-            let stepper = flags & MFLAGS_MICRO != 0
-                || (flags & MFLAGS_STEPPER != 0 && flags & MFLAGS_STEPENC == 0);
-            let resolution = if !is_virtual && stepper {
-                ctrl.stepper_factor[index]
-            } else {
-                ctrl.encoder_factor[index]
-            };
-            (flags & MFLAGS_DUMMY != 0, resolution)
-        };
+    /// Construct axis `index` (0-based) with the setup the controller's
+    /// constructor gave it.
+    pub fn new(controller: Arc<Mutex<SpiiPlusController>>, index: usize) -> Self {
+        let setup = controller.lock().unwrap_or_else(|e| e.into_inner()).setup[index];
         Self {
             controller,
             axis: index,
-            reduced: dummy || is_virtual,
-            dummy,
-            resolution,
-            is_virtual,
+            reduced: setup.dummy || setup.is_virtual,
+            dummy: setup.dummy,
+            resolution: setup.resolution,
+            is_virtual: setup.is_virtual,
             last_direction: true,
         }
     }
@@ -467,11 +501,12 @@ impl AsynMotor for SpiiPlusAxis {
     }
 
     fn poll(&mut self, _user: &AsynUser) -> AsynResult<MotorStatus> {
-        let ctrl = self.lock();
+        let mut ctrl = self.lock();
         let a = self.axis;
 
         let apos = ctrl.query_double("APOS", a)? / self.resolution;
         let velocity = ctrl.query_double("FVEL", a)? / self.resolution;
+        let ast = ctrl.query_int("AST", a)?;
 
         let (moving, powered, high_limit, low_limit, homed, encoder) = if self.reduced {
             // Dummy/virtual: motion from AST, no faults; the encoder is the
@@ -481,7 +516,6 @@ impl AsynMotor for SpiiPlusAxis {
             } else {
                 apos
             };
-            let ast = ctrl.query_int("AST", a)?;
             ((ast & AST_MOTION) != 0, false, false, false, false, encoder)
         } else {
             let mst = ctrl.query_int("MST", a)?;
@@ -496,6 +530,12 @@ impl AsynMotor for SpiiPlusAxis {
                 (mflags & MFLAGS_HOME) != 0,
                 fpos / ctrl.encoder_factor[a],
             )
+        };
+        // C stores the poller's `moving` from before this axis's poll, the
+        // previous axis's; the profile thread's wait needs this axis's.
+        ctrl.motion[a] = AxisMotion {
+            moving,
+            peg_ready: ast & AST_PEG_READY != 0,
         };
         drop(ctrl);
 
@@ -638,12 +678,26 @@ mod tests {
         Arc<Mutex<SpiiPlusController>>,
         Arc<Mutex<crate::fake::Controller>>,
     ) {
+        fake_virtual(name, axes, setup, &[])
+    }
+
+    /// [`fake`] with the config's virtual axes.
+    fn fake_virtual(
+        name: &str,
+        axes: usize,
+        setup: &[(&str, &[f64])],
+        virtual_axes: &[usize],
+    ) -> (
+        Arc<Mutex<SpiiPlusController>>,
+        Arc<Mutex<crate::fake::Controller>>,
+    ) {
         let line = crate::fake::line(name);
         for (var, values) in setup {
             line.lock().unwrap().set(var, values);
         }
         let comm = SpiiPlusComm::connect(&format!("{name}Comm"), name).unwrap();
-        let ctrl = SpiiPlusController::new(comm, name, axes);
+        let virtual_axes = virtual_axes.iter().copied().collect();
+        let ctrl = SpiiPlusController::new(comm, name, axes, &virtual_axes);
         (Arc::new(Mutex::new(ctrl)), line)
     }
 
@@ -679,7 +733,7 @@ mod tests {
                 ("FPOS", &[6.0]),
             ],
         );
-        let mut axis = SpiiPlusAxis::new(ctrl, 0, false);
+        let mut axis = SpiiPlusAxis::new(ctrl, 0);
         line.lock().unwrap().sent.clear();
         let user = AsynUser::default();
         axis.move_absolute(&user, 10.0, 0.0, 4.0, 8.0).unwrap();
@@ -695,7 +749,7 @@ mod tests {
     #[test]
     fn a_servo_axis_uses_the_encoder_factor() {
         let (ctrl, line) = fake("spiiServo", 1, &[("STEPF", &[0.5]), ("EFAC", &[2.0])]);
-        let mut axis = SpiiPlusAxis::new(ctrl, 0, false);
+        let mut axis = SpiiPlusAxis::new(ctrl, 0);
         line.lock().unwrap().sent.clear();
         axis.set_position(&AsynUser::default(), 3.0).unwrap();
         assert_eq!(line.lock().unwrap().sent, ["SET RPOS(0)=6"]);
@@ -703,14 +757,49 @@ mod tests {
 
     #[test]
     fn a_virtual_axis_reads_vpos_when_the_firmware_has_it() {
-        let (ctrl, _) = fake(
+        let (ctrl, _) = fake_virtual(
             "spiiVpos",
             1,
-            &[("VPOS", &[8.0]), ("EFAC", &[2.0]), ("APOS", &[1.0])],
+            &[
+                ("VPOS", &[8.0]),
+                ("EFAC", &[2.0]),
+                ("STEPF", &[0.5]),
+                ("MFLAGS", &[f64::from(MFLAGS_MICRO)]),
+                ("APOS", &[1.0]),
+            ],
+            &[0],
         );
-        let mut axis = SpiiPlusAxis::new(ctrl, 0, true);
+        // A virtual microstepper still takes the encoder factor.
+        let mut axis = SpiiPlusAxis::new(ctrl, 0);
         let status = axis.poll(&AsynUser::default()).unwrap();
         assert_eq!((status.position, status.encoder_position), (0.5, 4.0));
+    }
+
+    #[test]
+    fn each_poll_keeps_its_own_axis_motion_and_peg_ready_for_the_profile() {
+        let (ctrl, line) = fake("spiiMotion", 2, &[("EFAC", &[1.0, 1.0])]);
+        // Axis 0 moving with PEG ready, axis 1 still.
+        line.lock()
+            .unwrap()
+            .set("MST", &[f64::from(MST_MOTION), 0.0]);
+        line.lock()
+            .unwrap()
+            .set("AST", &[f64::from(AST_PEG_READY), 0.0]);
+        let user = AsynUser::default();
+        let mut axes = [0, 1].map(|i| SpiiPlusAxis::new(ctrl.clone(), i));
+        for axis in &mut axes {
+            axis.poll(&user).unwrap();
+        }
+        assert_eq!(
+            ctrl.lock().unwrap().motion,
+            [
+                AxisMotion {
+                    moving: true,
+                    peg_ready: true
+                },
+                AxisMotion::default()
+            ]
+        );
     }
 
     #[test]
