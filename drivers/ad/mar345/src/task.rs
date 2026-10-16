@@ -477,8 +477,12 @@ impl Worker {
     /// C `mar345Task` main loop.
     async fn run(mut self) {
         let ad = self.ad;
-        let Ok(mut l) = self.port.hold_driver_blocking::<Mar345Driver>() else {
-            return;
+        let mut l = match self.port.hold_driver_blocking::<Mar345Driver>() {
+            Ok(l) => l,
+            Err(e) => {
+                self.trace_error(&format!("mar345:mar345Task: no driver lock: {e}"));
+                return;
+            }
         };
         loop {
             l.step(move |d| {
@@ -569,6 +573,54 @@ mod tests {
             h.get_string_param_blocking(ad.base.full_file_name, 0, 256)
                 .unwrap(),
             b"client"
+        );
+        std::mem::forget(det);
+    }
+
+    /// A worker whose hold fails says so on the port trace instead of
+    /// exiting silently.
+    #[test]
+    fn the_task_without_the_driver_lock_traces_and_exits() {
+        use epics_rs::asyn::trace::TraceFile;
+
+        let name = "MAR345_NOLOCK";
+        fake_server(name);
+        let det =
+            create_mar345_detector(&claim_port(name).unwrap(), &format!("{name}_IP"), 0).unwrap();
+        let h = det.port_handle().clone();
+        // The marServer port: its driver is no Mar345Driver, so no hold.
+        let ip = crate::driver::tests::server_handle(name);
+        let path = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        ip.trace().set_trace_file(
+            Some(ip.port_name()),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        let worker = Worker {
+            port: ip.clone(),
+            server_port: ip.clone(),
+            ad: det.ad_params,
+            p: det.mar345_params,
+            from: String::new(),
+            start: Arc::new(Event::new()),
+            stop: Arc::new(Event::new()),
+            abort: Arc::new(Event::new()),
+            mode: Arc::new(AtomicI32::new(0)),
+            acq_start: Arc::new(AtomicU64::new(0)),
+            output: ArrayPublisher::new(det.array_output().clone()),
+            pool: det.pool().clone(),
+            owner: h
+                .with_driver_blocking::<Mar345Driver, _>(|d| d.ad.owner.clone())
+                .unwrap(),
+        };
+        start_task(worker).join().unwrap();
+        ip.trace()
+            .set_trace_file(Some(ip.port_name()), TraceFile::default());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains("mar345:mar345Task: no driver lock"),
+            "{text:?}"
         );
         std::mem::forget(det);
     }
