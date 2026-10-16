@@ -1,12 +1,11 @@
 # Ported from epics-modules/SyringePump/SPApp/Db/ISCOAnalogIn.substitutions.
 # Two changes from upstream:
-#  1. `file "$(MODBUS)/db/aiFloat64.template"` rewritten to a bare filename
-#     resolved relative to this file's own directory (db/) -- dbLoadTemplate
-#     does not macro-expand `file` paths.
+#  1. `$(MODBUS)/db/` is `$(SYRINGEPUMP)/db/`: the modbus templates are
+#     copied into this directory.
 #  2. Row "D:RefillRateSP_RBV" -- fixed upstream defect: the raw file is
 #     missing the comma between the R and PORT columns present on every
 #     sibling A/B/C row; repaired to match that pattern.
-file "aiFloat64.template" {
+file "$(SYRINGEPUMP)/db/aiFloat64.template" {
 pattern
 {     R,                       PORT,  OFFSET,   DATA_TYPE,  LOPR,  HOPR, PREC,   EGU,       SCAN,   DESC}
 {A:PressureSP_RBV,        SP1_Reg_In_1,    0,     FLOAT32_BE,   0,    10,    4,  egu, "I/O Intr", "Register"}

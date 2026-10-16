@@ -170,13 +170,17 @@ async fn main() -> CaResult<()> {
                     };
                 }
 
-                let runtime = create_ads_port(cfg).map_err(|e| e.to_string())?;
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let runtime = create_ads_port(&claim, cfg).map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 rts.lock().unwrap().push(runtime);
                 Ok(CommandOutcome::Continue)
             },

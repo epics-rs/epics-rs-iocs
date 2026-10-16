@@ -3,9 +3,8 @@
 record(mbbo, "$(P)$(R)") {
     field(DTYP, "asynInt32")
     field(OUT,  "@asyn($(PORT),0,1.0)ANALOG_IN_MODE")
-    field(ZRST, "Differential")  field(ZRVL, "1")
-    field(ONST, "Single-ended")  field(ONVL, "2")
-    field(TWST, "Pseudo-diff")   field(TWVL, "3")
+    field(ZRST, "Differential")  field(ZRVL, "0")
+    field(ONST, "Single-ended")  field(ONVL, "1")
     field(VAL,  "$(MODE=0)")
     field(PINI, "YES")
 }

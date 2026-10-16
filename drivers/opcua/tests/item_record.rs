@@ -53,7 +53,11 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        _config: &SessionConfig,
+        _identity: &opcua::client::Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         Ok(self.0.clone())
     }
 }
@@ -114,8 +118,8 @@ impl UaConnection for Mock {
         &self,
         _subscription_id: u32,
         items: Vec<async_opcua::types::MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
-        Ok(vec![StatusCode::Good; items.len()])
+    ) -> Result<Vec<async_opcua::types::MonitoredItemCreateResult>, StatusCode> {
+        Ok(vec![Default::default(); items.len()])
     }
 
     async fn disconnect(&self) {}
@@ -129,7 +133,11 @@ fn offline() -> Arc<Registry> {
     struct Offline;
     #[async_trait]
     impl UaConnector for Offline {
-        async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+        async fn connect(
+            &self,
+            _config: &SessionConfig,
+            _identity: &opcua::client::Identity,
+        ) -> Result<Arc<dyn UaConnection>, String> {
             Err("no server".to_string())
         }
     }
@@ -150,7 +158,7 @@ fn live(mock: &Arc<Mock>) -> Arc<Registry> {
 
 fn bind(registry: &Arc<Registry>, name: &str, record: &mut dyn Record, link: &str) -> OpcuaDevice {
     record.init_record(0).expect("the record initialises");
-    let mut device = OpcuaDevice::new(registry.clone(), link.to_string());
+    let mut device = OpcuaDevice::new(registry.clone(), link.to_string(), record.record_type());
     device.set_record_info(name, ScanType::IoIntr);
     device.init(record).expect("the link binds");
     device
@@ -373,11 +381,13 @@ fn the_nodes_status_lands_in_statcode_and_stattext() {
 
 #[tokio::test]
 async fn an_element_record_may_bind_before_the_item_record_it_belongs_to() {
-    // The framework wires device support in `HashMap` order, so this is the order
-    // half the runs will take. The item exists from whichever record binds first;
-    // the item record's binding is the one that gives it its node and its session.
+    // Every record attaches (and so declares itself) at load, before any init;
+    // the inits may then run in either order. The item exists from whichever
+    // record binds first; the item record's binding is the one that gives it its
+    // node and its session.
     let mock = Arc::new(Mock::default());
     let registry = live(&mock);
+    registry.declare_record("ITEM", "opcuaItem");
 
     let mut element = LongoutRecord::new(0);
     let mut element_device = bind(&registry, "EL", &mut element, "ITEM");
@@ -403,14 +413,65 @@ async fn an_element_record_may_bind_before_the_item_record_it_belongs_to() {
     assert_eq!(writes[0][0].value.value, Some(Variant::Int32(5)));
 }
 
-#[tokio::test]
-async fn an_element_record_whose_item_record_is_not_in_the_database_is_reported() {
-    // The C refuses the link at load; this port cannot tell "not bound yet" from
-    // "not in the database" until every record has bound, so `start` is where it
-    // is found. The element must not take the IOC down, and must not be adopted.
-    let registry = offline();
+/// Init an element record whose link names `target`, expecting C's refusal.
+fn refused(registry: &Arc<Registry>, target: &str) -> String {
     let mut element = LongoutRecord::new(0);
-    let device = bind(&registry, "EL", &mut element, "MISSING");
+    element.init_record(0).expect("the record initialises");
+    let mut device = OpcuaDevice::new(registry.clone(), target.to_string(), "longout");
+    device.set_record_info("EL", ScanType::IoIntr);
+    device
+        .init(&mut element)
+        .expect_err("linkParser.cpp refuses the link")
+        .to_string()
+}
+
+#[test]
+fn an_element_record_naming_no_opc_ua_record_is_refused() {
+    let registry = offline();
+    let err = refused(&registry, "MISSING");
+    assert!(
+        err.contains("unknown subscription/session/opcuaItemRecord 'MISSING'"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_element_record_naming_a_record_of_another_type_is_refused() {
+    let registry = offline();
+    registry.declare_record("AI", "ai");
+    let err = refused(&registry, "AI");
+    assert!(
+        err.contains("record 'AI' is not of type opcuaItem"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_element_record_naming_an_item_record_whose_init_failed_is_refused() {
+    let registry = offline();
+    let mut item = OpcuaItemRecord::default();
+    let mut item_device =
+        OpcuaDevice::new(registry.clone(), "NOSESSION ns=2;s=X".into(), "opcuaItem");
+    item_device.set_record_info("ITEM", ScanType::Passive);
+    item_device
+        .init(&mut item)
+        .expect_err("the item record names no session");
+
+    let err = refused(&registry, "ITEM");
+    assert!(
+        err.contains("opcuaItemRecord 'ITEM' was not initialized correctly"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn an_element_record_bound_before_its_item_record_failed_is_left_unadopted() {
+    // The element's init ran first, so only `start` can report it. It must not
+    // take the IOC down, and must not be adopted.
+    let registry = offline();
+    registry.declare_record("ITEM", "opcuaItem");
+    let mut element = LongoutRecord::new(0);
+    let device = bind(&registry, "EL", &mut element, "ITEM");
 
     registry.start();
 

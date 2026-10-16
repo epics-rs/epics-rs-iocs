@@ -9,7 +9,7 @@
 //!
 //! Float64, push-only via I/O Intr (no read/write asynFloat64 methods at all
 //! -- `float64Methods = {}`, `capaNCDT6200Sup.c:566`):
-//! `A_DISP_CHAN{1-4}` = addr 1-4, all sharing [`DataDriver::disp_reason`]
+//! `A_DISP_CHAN{1-4}` = addr 1-4, all sharing `DataDriver::disp_reason`
 //! (one asynFloat64 interrupt source in C, addr-filtered per client --
 //! mirrored here as one asyn-rs param, addr-filtered by the framework's own
 //! `InterruptFilter`).
@@ -47,58 +47,24 @@
 //!    parameter to replicate this onto in the first place, so the reader
 //!    thread is simply spawned at the default OS thread priority; this is a
 //!    platform-level divergence, not a silently dropped feature.
-//! 8. **Per-iteration reconnect bookkeeping collapses to "once per outcome"
-//!    here**: C re-runs the `badPacketCount`/`isCommunicating`/maybe-disconnect
-//!    block (`capaNCDT6200Sup.c:434-459`) on *every* inner-loop pass,
-//!    including a partial read that completed no packet. The only case where
-//!    that matters is a `disconnectDevice()` that keeps *failing* while
-//!    `badPacketCount >= 2` -- each such pass re-invokes
-//!    `processDataPacket(pdpvt, 0)`. `DrvAsynIPPort::disconnect` (asyn-rs
-//!    0.22.1) is unconditionally infallible (`ip_port.rs:997-1007`), so that
-//!    branch can never loop in this port; running the classify/communicate/
-//!    disconnect sequence once per *actual* read outcome (this module's
-//!    [`reader_thread`], matching [`packet::apply_read_outcome`]'s calling
-//!    convention) is therefore behaviorally equivalent here, not an
-//!    observable simplification.
-//!
 //! # Fixed upstream defects (doc/upstream-c-defects.md)
 //!
 //! - **#43 -- Inert `IPport` configure argument** (`capaNCDT6200Sup.c:698-707`):
 //!   upstream validated the argument non-empty but never read it -- the TCP
-//!   port was always hardcoded to [`PROTOCOL_TCP_PORT`] regardless of what
+//!   port was always hardcoded to `PROTOCOL_TCP_PORT` regardless of what
 //!   string was passed. [`configure`] now honors it: parsed as the TCP port
-//!   number, defaulting to [`PROTOCOL_TCP_PORT`] (10001) when omitted (`""`)
+//!   number, defaulting to `PROTOCOL_TCP_PORT` (10001) when omitted (`""`)
 //!   or `"0"`.
 //!
 //! # Framework gaps (documented, not silently worked around)
 //!
-//! - **No `interruptAccept` equivalent**: C's `processDataPacket` gates the
-//!   averaging/push tail on the global `extern volatile int interruptAccept`
-//!   (set once iocInit's scan pass completes). epics-base-rs/asyn-rs 0.22.1
-//!   expose no equivalent flag (grepped exhaustively for `interrupt_accept`/
-//!   `InterruptAccept` across both crates: zero matches). [`reader_thread`]
-//!   always passes `true` to [`packet::process_data_packet`].
-//! - **No process-exit hook for driver crates**: C registers
-//!   `capaNCDT6200Shutdown` via `epicsAtExit`, itself installed from an
-//!   `initHookRegister` callback firing at `initHookAfterIocRunning`
-//!   (`capaNCDT6200Sup.c:498-518`), so the reader thread's `for(;;)` checks a
-//!   shutdown flag at each blocking point and exits cleanly on IOC shutdown.
-//!   epics-base-rs 0.22.1 has a real `init_hook_register`/`InitHookState`
-//!   (`epics_base_rs::server::ioc_app::init_hooks`) but no atExit/process-exit
-//!   hook exposed to driver crates -- grepped exhaustively (`atexit`/`AtExit`/
-//!   `ctrlc`/`signal::`) across epics-base-rs and asyn-rs; the only hits are
-//!   `ioc_app.rs`'s own internal Ctrl-C/SIGTERM handling, not registrable by a
-//!   driver crate. [`reader_thread`] therefore has no graceful-shutdown gate
-//!   and runs until process exit (matching this workspace's
-//!   `scaler974::poll_loop` precedent, which also has no shutdown flag) --
-//!   but unlike C, the socket is never explicitly closed on IOC exit.
 //! - **`PortRuntimeHandle` must outlive `configure()`**: dropping the last
 //!   [`PortRuntimeHandle`] closes its internal shutdown channel and the
 //!   actor thread exits (empirically confirmed: a `PortHandle` clone
-//!   registered via [`asyn_record::register_port`] survives, but every
+//!   published via [`asyn_record::PortClaim::publish`] survives, but every
 //!   request through it then fails with "actor channel closed"). This module
 //!   retains both runtimes it creates (the outer port and the `_RBK` port)
-//!   in [`KEPT_PORT_RUNTIMES`] for the process lifetime via
+//!   in `KEPT_PORT_RUNTIMES` for the process lifetime via
 //!   [`keep_port_runtime_alive`]. **This is a real defect, confirmed at every
 //!   hand-rolled `*Init`/`*Config` iocsh command in this workspace that
 //!   calls `create_port_runtime` directly**: `iocs/syringepump-ioc/src/main.rs`'s
@@ -115,7 +81,8 @@
 //!   module's own [`configure`] and `iocs/microepsilon-ioc`'s
 //!   `CapaNCDT6200ConfigInit` both retain their runtimes correctly.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -129,8 +96,11 @@ use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::exit::at_exit;
 use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::recgbl::alarm_status;
 use epics_rs::base::server::record::AlarmSeverity;
 
@@ -300,6 +270,8 @@ pub struct DataDriver {
     reader_started: bool,
     /// Taken by [`DataDriver::maybe_start_reader`] on first spawn.
     rbk_port_handle: Option<PortHandle>,
+    /// The database's `interruptAccept`, which `processDataPacket` waits on.
+    interrupt_accept: Arc<InterruptGate>,
 }
 
 impl DataDriver {
@@ -307,6 +279,7 @@ impl DataDriver {
         port_name: &str,
         rbk_port_handle: PortHandle,
         self_handle: Arc<Mutex<Option<PortHandle>>>,
+        interrupt_accept: Arc<InterruptGate>,
     ) -> AsynResult<Self> {
         // max_addr = 5 covers addr 0..=4: the disp channels (1-4) are the
         // only addresses ever run through the ParamList (`set_float64_param`/
@@ -330,6 +303,7 @@ impl DataDriver {
             self_handle,
             reader_started: false,
             rbk_port_handle: Some(rbk_port_handle),
+            interrupt_accept,
         })
     }
 
@@ -345,7 +319,10 @@ impl DataDriver {
         };
         let shared = self.shared.clone();
         let self_handle = self.self_handle.clone();
-        thread::spawn(move || reader_thread(rbk_port_handle, shared, self_handle));
+        let interrupt_accept = self.interrupt_accept.clone();
+        thread::spawn(move || {
+            reader_thread(rbk_port_handle, shared, self_handle, interrupt_accept)
+        });
     }
 
     /// [`PUSH_DISP_REASON`] handler: apply a reader-thread-staged
@@ -359,18 +336,12 @@ impl DataDriver {
         let Some(update) = update else {
             return Ok(());
         };
-        let (status, alarm_status_code, alarm_severity) = if update.valid {
-            (
-                AsynStatus::Success,
-                alarm_status::NO_ALARM,
-                AlarmSeverity::NoAlarm as u16,
-            )
+        // C sets only `auxStatus`; devAsynFloat64 maps asynError to
+        // READ_ALARM/INVALID, so no alarm of its own goes with the status.
+        let status = if update.valid {
+            AsynStatus::Success
         } else {
-            (
-                AsynStatus::Error,
-                alarm_status::COMM_ALARM,
-                AlarmSeverity::Invalid as u16,
-            )
+            AsynStatus::Error
         };
         for (i, &value) in update.values.iter().enumerate() {
             let addr = (i + 1) as i32;
@@ -379,9 +350,11 @@ impl DataDriver {
                 self.disp_reason,
                 addr,
                 status,
-                alarm_status_code,
-                alarm_severity,
+                alarm_status::NO_ALARM,
+                AlarmSeverity::NoAlarm as u16,
             )?;
+            // C calls every client on each push, changed value or not.
+            self.base.mark_param_changed(self.disp_reason, addr)?;
             self.base.call_param_callbacks(addr)?;
         }
         Ok(())
@@ -397,8 +370,18 @@ impl PortDriver for DataDriver {
         &mut self.base
     }
 
+    /// C `report` (`capaNCDT6200Sup.c:525`), the whole of it at every level.
+    fn report(&self, out: &mut dyn std::fmt::Write, _level: i32) {
+        let communicating = self.shared.lock().unwrap().is_communicating;
+        let _ = writeln!(
+            out,
+            " capaNCDT6200 RBK {}communicating",
+            if communicating { "" } else { "NOT " }
+        );
+    }
+
     /// No `asynDrvUser` interface in C at all -- every addr resolves to
-    /// *some* reason (see [`resolve_reason`]), never rejected at bind time.
+    /// *some* reason (see `resolve_reason`), never rejected at bind time.
     fn drv_user_create(&mut self, req: &DrvUserRequest) -> AsynResult<DrvUserInfo> {
         let addr = req.addr;
         Ok(DrvUserInfo::from_reason(resolve_reason(
@@ -463,21 +446,49 @@ impl PortDriver for DataDriver {
     }
 }
 
-/// `capaNCDT6200LongWait` (`capaNCDT6200Sup.c:238-249`): C sleeps in ten
-/// 3-second increments (30s total), checking a shutdown flag each time. This
-/// port has no shutdown flag to check (see the module doc's process-exit-hook
-/// gap), so the ten increments collapse to one sleep of the same total
-/// duration.
-fn long_wait() {
-    thread::sleep(Duration::from_secs(30));
+/// C `capaNCDT6200ShutdownRequest`, set by the atExit callback.
+static SHUTDOWN_REQUEST: AtomicBool = AtomicBool::new(false);
+
+fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUEST.load(Ordering::Relaxed)
 }
 
-/// `readerThread` (`capaNCDT6200Sup.c:254-462`). Runs until process exit (see
-/// the module doc's process-exit-hook gap).
+/// `capaNCDT6200ShutdownSetup` (`capaNCDT6200Sup.c:506-518`): the atExit
+/// callback is registered at `initHookAfterIocRunning`, after every
+/// configure, so it runs before the ports are torn down.
+fn shutdown_setup() {
+    static BEEN_HERE: Once = Once::new();
+    BEEN_HERE.call_once(|| {
+        let registered = AtomicBool::new(false);
+        init_hook_register(Arc::new(move |state| {
+            if state == InitHookState::AfterIocRunning && !registered.swap(true, Ordering::Relaxed)
+            {
+                at_exit("capaNCDT6200Shutdown", || {
+                    SHUTDOWN_REQUEST.store(true, Ordering::Relaxed)
+                });
+            }
+        }));
+    });
+}
+
+/// `capaNCDT6200LongWait` (`capaNCDT6200Sup.c:238-249`).
+fn long_wait() {
+    println!("capaNCDT6200LongWait called.");
+    for _ in 0..10 {
+        if shutdown_requested() {
+            return;
+        }
+        thread::sleep(Duration::from_secs(3));
+    }
+}
+
+/// `readerThread` (`capaNCDT6200Sup.c:254-462`). Returns once the IOC's
+/// atExit callbacks have asked it to.
 fn reader_thread(
     rbk_port_handle: PortHandle,
     shared: Arc<Mutex<SharedState>>,
     self_handle: Arc<Mutex<Option<PortHandle>>>,
+    interrupt_accept: Arc<InterruptGate>,
 ) {
     let initial_throttle = shared.lock().unwrap().pv_throttle;
     let mut reader_state = ReaderState::new(initial_throttle);
@@ -488,17 +499,44 @@ fn reader_thread(
     // `packet.rs`'s module doc, extended here to the cross-iteration case).
     let mut last_meas_value_counter: u32 = 0;
     let mut last_chan_values = [0.0f64; MAX_CHANNELS];
+    let mut port_open = false;
+    let rbk = rbk_port_handle.port_name().to_string();
+    // C `asynPrint(pasynUser, ASYN_TRACE_ERROR, ...)` on the RBK port.
+    let print_error = |args: std::fmt::Arguments<'_>| {
+        rbk_port_handle
+            .trace()
+            .print(Some(&rbk), None, 0, TraceMask::ERROR, args)
+    };
+    // `pasynUserCommon->errorMessage`: C prints it on success lines too, so
+    // it keeps the last failure's text.
+    let mut common_error = String::new();
 
     loop {
         if !reader_state.is_communicating {
-            let connected = rbk_port_handle
-                .submit_blocking(RequestOp::Connect, AsynUser::default())
-                .is_ok();
-            if !connected {
-                long_wait();
+            match rbk_port_handle.submit_blocking(RequestOp::Connect, AsynUser::default()) {
+                Ok(_) => {
+                    port_open = true;
+                    print_error(format_args!(
+                        "{rbk} Successfully connected to MicroEpsilon port: {common_error}."
+                    ));
+                }
+                Err(e) => {
+                    common_error = e.message();
+                    print_error(format_args!("{rbk} can't connect port: {common_error}"));
+                    long_wait();
+                }
+            }
+            if shutdown_requested() {
+                return;
             }
         }
 
+        // C resets `eopReached` only on an open port; otherwise it keeps the
+        // last pass's 1 and the read loop is skipped until a connect works.
+        if !port_open {
+            println!("Micro-Epsilon unit port is not open.");
+            continue;
+        }
         let mut tread = 0usize;
         let mut eop_reached = false;
         while !eop_reached {
@@ -515,6 +553,9 @@ fn reader_thread(
                 Duration::from_secs_f64(reader_state.read_timeout_secs),
             );
             let read_result = sync_handle.read_octet(TRANSPORT_REASON, want);
+            if shutdown_requested() {
+                return;
+            }
 
             let outcome = match read_result {
                 Ok(bytes) => {
@@ -531,60 +572,71 @@ fn reader_thread(
                         last_meas_value_counter = decoded.header.meas_value_counter;
                         last_chan_values = decoded.chan_values;
                         if packet::preamble_ok(&buf) {
-                            Some(ReadOutcome::GoodPacket)
+                            ReadOutcome::GoodPacket
                         } else {
-                            Some(ReadOutcome::BadPreamble)
+                            ReadOutcome::BadPreamble
                         }
                     } else {
-                        None
+                        ReadOutcome::Partial
                     }
                 }
-                Err(e) => Some(if is_asyn_timeout(&e) {
-                    ReadOutcome::Timeout
-                } else {
-                    ReadOutcome::ReadError
-                }),
-            };
-
-            // Quirk 9 (see module doc): only run the classify/communicate/
-            // disconnect sequence when this attempt actually produced an
-            // outcome -- a partial successful read (no outcome) just keeps
-            // accumulating.
-            let Some(outcome) = outcome else {
-                continue;
-            };
-
-            let should_process = packet::apply_read_outcome(&mut reader_state, outcome);
-            shared.lock().unwrap().is_communicating = reader_state.is_communicating;
-
-            if let Some(is_valid) = should_process {
-                let push = packet::process_data_packet(
-                    &mut reader_state,
-                    last_meas_value_counter,
-                    last_chan_values,
-                    is_valid,
-                    true, // interruptAccept gap, see module doc
-                );
-                {
-                    let mut s = shared.lock().unwrap();
-                    s.stats = reader_state.stats;
-                    s.measured_count = last_meas_value_counter;
-                }
-                if let Some(update) = push {
-                    shared.lock().unwrap().pending_push = Some(update);
-                    if let Some(h) = self_handle.lock().unwrap().as_ref() {
-                        let _ = h.write_int32_blocking(PUSH_DISP_REASON, 0, 0);
+                Err(e) => {
+                    print_error(format_args!("{rbk}: port read failed: {}", e.message()));
+                    if is_asyn_timeout(&e) {
+                        ReadOutcome::Timeout
+                    } else {
+                        // C waits before it counts the failure (`:428`).
+                        long_wait();
+                        if shutdown_requested() {
+                            return;
+                        }
+                        ReadOutcome::ReadError
                     }
+                }
+            };
+
+            if outcome == ReadOutcome::BadPreamble {
+                print_error(format_args!(
+                    "{rbk}: Could not find correct Preamble string: {common_error}"
+                ));
+            }
+            let push = packet::read_pass(
+                &mut reader_state,
+                outcome,
+                last_meas_value_counter,
+                last_chan_values,
+                interrupt_accept.is_open(),
+            );
+            if reader_state.bad_packet_count >= 2 {
+                println!("Process SCAN=I/O Intr records to set STAT/SEVR.");
+            }
+            // C's counters and `measValueCounter` are the reader's own
+            // fields, so `int32Read` sees every pass, processed or not.
+            {
+                let mut s = shared.lock().unwrap();
+                s.is_communicating = reader_state.is_communicating;
+                s.stats = reader_state.stats;
+                s.measured_count = last_meas_value_counter;
+            }
+            if let Some(update) = push {
+                shared.lock().unwrap().pending_push = Some(update);
+                if let Some(h) = self_handle.lock().unwrap().as_ref() {
+                    let _ = h.write_int32_blocking(PUSH_DISP_REASON, 0, 0);
                 }
             }
 
             if !reader_state.is_communicating {
-                let disconnected = rbk_port_handle
-                    .submit_blocking(RequestOp::Disconnect, AsynUser::default())
-                    .is_ok();
-                if disconnected {
-                    eop_reached = true;
-                    long_wait();
+                match rbk_port_handle.submit_blocking(RequestOp::Disconnect, AsynUser::default()) {
+                    Ok(_) => {
+                        eop_reached = true;
+                        port_open = false;
+                        println!("Successfully disconnected MicroEpsilon port: {rbk}.");
+                        long_wait();
+                    }
+                    Err(e) => {
+                        common_error = e.message();
+                        print_error(format_args!("{rbk} can't disconnect: {common_error}"));
+                    }
                 }
             }
         }
@@ -608,22 +660,22 @@ fn resolve_tcp_port(ip_port: &str) -> AsynResult<u16> {
 /// `capaNCDT6200Configure` + `setLink` (`capaNCDT6200Sup.c:467-496,682-791`):
 /// build the internal `_RBK` transport port (`noAutoConnect=1,
 /// noProcessEos=1`) and this driver's own outer port, wire the late-bound
-/// self-handle the reader thread needs (see [`DataDriver::self_handle`]), and
-/// register only the outer port -- the `_RBK` port stays unregistered/
-/// invisible, matching C.
+/// self-handle the reader thread needs (see `DataDriver::self_handle`).
+/// Both ports are registered, as C's `drvAsynIPPortConfigure` registers the
+/// `_RBK` one.
 pub fn configure(
     port_name: &str,
     ip_address: &str,
     ip_port: &str,
     owner: &Arc<InterruptGate>,
 ) -> AsynResult<()> {
+    // C prints and returns; the startup script goes on.
     if port_name.is_empty() || ip_address.is_empty() {
-        return Err(AsynError::Status {
-            status: AsynStatus::Error,
-            message: "Required argument not present".into(),
-        });
+        println!("Required argument not present");
+        return Ok(());
     }
     let tcp_port = resolve_tcp_port(ip_port)?;
+    shutdown_setup();
 
     let host = format!("{ip_address}:{tcp_port} TCP");
     let rbk_port_name = format!("{port_name}_RBK");
@@ -632,20 +684,36 @@ pub fn configure(
     // (`capaNCDT6200Sup.c:476`): noAutoConnect=1.
     rbk_driver.base_mut().init_auto_connect(false);
     // noProcessEos=1: no `push_interpose` call -- no EOS interpose installed.
-    let (rbk_runtime, _rbk_actor_jh) = create_port_runtime(rbk_driver, RuntimeConfig::default())?;
+    let rbk_claim = asyn_record::claim_port(&rbk_port_name)?;
+    let (rbk_runtime, _rbk_actor_jh) =
+        create_port_runtime(&rbk_claim, rbk_driver, RuntimeConfig::default())?;
     let rbk_port_handle = rbk_runtime.port_handle().clone();
+    rbk_claim.publish(rbk_port_handle.clone(), owner)?;
+
+    let Ok(claim) = asyn_record::claim_port(port_name) else {
+        println!("registerPort failed");
+        keep_port_runtime_alive(rbk_runtime);
+        return Ok(());
+    };
 
     let self_handle: Arc<Mutex<Option<PortHandle>>> = Arc::new(Mutex::new(None));
-    let driver = DataDriver::new(port_name, rbk_port_handle, self_handle.clone())?;
-    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())?;
+    let driver = DataDriver::new(
+        port_name,
+        rbk_port_handle,
+        self_handle.clone(),
+        owner.clone(),
+    )?;
+    let (runtime_handle, _actor_jh) =
+        create_port_runtime(&claim, driver, RuntimeConfig::default())?;
     *self_handle.lock().unwrap() = Some(runtime_handle.port_handle().clone());
 
-    asyn_record::register_port(port_name, runtime_handle.port_handle().clone(), owner)?;
+    claim.publish(runtime_handle.port_handle().clone(), owner)?;
 
     // See the module doc's `PortRuntimeHandle` gap note: both runtimes must
     // outlive this function.
     keep_port_runtime_alive(rbk_runtime);
     keep_port_runtime_alive(runtime_handle);
+    println!("capaNCDT6200:  Data port created -> host = {host}");
     Ok(())
 }
 
@@ -745,12 +813,70 @@ mod tests {
         let dummy = DummyPort {
             base: PortDriverBase::new("dummy_rbk_for_test", 1, PortFlags::default()),
         };
+        let claim = asyn_record::claim_port("dummy_rbk_for_test").unwrap();
         let (rbk_runtime, _jh) =
-            create_port_runtime(dummy, RuntimeConfig::default()).expect("rbk port runtime");
+            create_port_runtime(&claim, dummy, RuntimeConfig::default()).expect("rbk port runtime");
         let rbk_handle = rbk_runtime.port_handle().clone();
-        let driver =
-            DataDriver::new("test_data_port", rbk_handle, Arc::new(Mutex::new(None))).unwrap();
+        let driver = DataDriver::new(
+            "test_data_port",
+            rbk_handle,
+            Arc::new(Mutex::new(None)),
+            InterruptGate::new(),
+        )
+        .unwrap();
         (driver, rbk_runtime)
+    }
+
+    #[test]
+    fn an_invalid_push_carries_asyn_error_and_no_alarm_of_its_own() {
+        let (mut driver, _keep_alive) = make_test_driver();
+        driver.shared.lock().unwrap().pending_push = Some(PushUpdate {
+            values: [0.0; MAX_CHANNELS],
+            valid: false,
+        });
+        driver.apply_pending_push().unwrap();
+        for addr in A_DISP_CHAN1..=A_DISP_CHAN4 {
+            assert_eq!(
+                driver
+                    .base
+                    .get_param_status(driver.disp_reason, addr)
+                    .unwrap(),
+                (AsynStatus::Error, alarm_status::NO_ALARM, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn a_push_of_an_unchanged_value_still_reaches_the_records() {
+        let (mut driver, _keep_alive) = make_test_driver();
+        // A record only sees a push once iocInit has opened the gate.
+        driver.base.interrupts =
+            epics_rs::asyn::interrupt::InterruptManager::owned_by(InterruptGate::opened());
+        let mut rx = driver.base.interrupts.subscribe_async(256, 4096);
+        for _ in 0..2 {
+            driver.shared.lock().unwrap().pending_push = Some(PushUpdate {
+                values: [1.5; MAX_CHANNELS],
+                valid: true,
+            });
+            driver.apply_pending_push().unwrap();
+        }
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 2 * MAX_CHANNELS);
+    }
+
+    #[test]
+    fn the_report_says_whether_the_rbk_link_communicates() {
+        let (driver, _keep_alive) = make_test_driver();
+        let mut out = String::new();
+        driver.report(&mut out, 1);
+        assert_eq!(out, " capaNCDT6200 RBK NOT communicating\n");
+        driver.shared.lock().unwrap().is_communicating = true;
+        out.clear();
+        driver.report(&mut out, 0);
+        assert_eq!(out, " capaNCDT6200 RBK communicating\n");
     }
 
     #[test]

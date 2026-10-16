@@ -32,13 +32,13 @@
 //! (`capaNCDT6200.proto`'s `clearMathFunc` block has a single `%d`, filled
 //! from whatever value the record processes with). Ported as a single
 //! `ClearMathFunc` reason whose `write_int32` value IS the channel number --
-//! matching [`wire_config::format_clear_math_func`]'s signature -- rather
+//! matching [`crate::wire_config::format_clear_math_func`]'s signature -- rather
 //! than 4 separate reasons.
 //!
 //! # `queryChanStatus`/`queryStatus`: genuine duplicate fan-out targets
 //! Both wire commands (`$CHS` and `$STS`, two distinct protocol blocks) fan
 //! out into the exact same four `Chan{1-4}Stat` sinks. Not a typo upstream;
-//! reproduced as two distinct [`Command`] variants that both write the same
+//! reproduced as two distinct `Command` variants that both write the same
 //! four sink reasons.
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
@@ -270,7 +270,8 @@ impl ConfigDriver {
     }
 
     fn write_frame(&self, out: &str) -> AsynResult<()> {
-        self.handle.write_octet(TRANSPORT_REASON, out.as_bytes())?;
+        let frame = [out.as_bytes(), crate::connect::OUTPUT_EOS].concat();
+        self.handle.write_octet(TRANSPORT_REASON, &frame)?;
         Ok(())
     }
 

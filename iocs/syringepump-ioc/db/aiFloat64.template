@@ -1,5 +1,5 @@
 # Vendored, byte-for-byte, from epics-modbus-rs 0.22.1's db/aiFloat64.template.
-# Copied rather than referenced via a `$(MODBUS)` iocsh macro: unlike classic
+# Copied rather than referenced via a MODBUS iocsh macro: unlike classic
 # EPICS support modules, a crates.io dependency has no installed, runtime-
 # resolvable path to its own bundled db/ directory. See st.cmd's header
 # comment for the full ISCO/Vindum wiring rationale.

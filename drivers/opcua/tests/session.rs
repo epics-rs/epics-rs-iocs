@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+use epics_rs::base::runtime::log::{errlog_add_listener, errlog_flush, errlog_remove_listener};
 use opcua::client::{Notification, ServerInfo, UaConnection, UaConnector};
 use opcua::item::{Item, Leaf};
 use opcua::link::{InfoDefaults, LinkInfo, NodeIdentifier, RecordKind, parse_link};
@@ -31,6 +32,10 @@ struct Behaviour {
     write_status: Option<StatusCode>,
     /// Return one result short of what was asked for — a server that under-answers.
     truncate_read: bool,
+    /// The per-item status `CreateMonitoredItems` answers with.
+    monitor_status: Option<StatusCode>,
+    /// `CreateSubscription` fails with this.
+    subscription_error: Option<StatusCode>,
 }
 
 #[derive(Default)]
@@ -52,6 +57,8 @@ struct Mock {
     values: Mutex<HashMap<NodeId, Variant>>,
     sink: Mutex<Option<mpsc::UnboundedSender<Notification>>>,
     connects: Mutex<Vec<SessionConfig>>,
+    /// Refuse this many connect attempts before accepting one.
+    refuse_connects: Mutex<usize>,
 }
 
 impl Mock {
@@ -70,8 +77,17 @@ struct MockConnector(Arc<Mock>);
 
 #[async_trait]
 impl UaConnector for MockConnector {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        config: &SessionConfig,
+        _identity: &opcua::client::Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         self.0.connects.lock().push(config.clone());
+        let mut refuse = self.0.refuse_connects.lock();
+        if *refuse > 0 {
+            *refuse -= 1;
+            return Err("connect service failed with status BadNotConnected".into());
+        }
         Ok(self.0.clone())
     }
 }
@@ -144,6 +160,9 @@ impl UaConnection for Mock {
         sink: mpsc::UnboundedSender<Notification>,
     ) -> Result<u32, StatusCode> {
         self.calls.lock().subscriptions.push(config.clone());
+        if let Some(status) = self.behaviour.lock().subscription_error {
+            return Err(status);
+        }
         *self.sink.lock() = Some(sink);
         Ok(7)
     }
@@ -152,10 +171,22 @@ impl UaConnection for Mock {
         &self,
         _subscription_id: u32,
         items: Vec<async_opcua::types::MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
-        let n = items.len();
+    ) -> Result<Vec<async_opcua::types::MonitoredItemCreateResult>, StatusCode> {
+        let results = items
+            .iter()
+            .map(|item| async_opcua::types::MonitoredItemCreateResult {
+                status_code: self
+                    .behaviour
+                    .lock()
+                    .monitor_status
+                    .unwrap_or(StatusCode::Good),
+                revised_sampling_interval: item.requested_parameters.sampling_interval,
+                revised_queue_size: item.requested_parameters.queue_size,
+                ..Default::default()
+            })
+            .collect();
         self.calls.lock().monitored.extend(items);
-        Ok(vec![StatusCode::Good; n])
+        Ok(results)
     }
 
     async fn disconnect(&self) {
@@ -308,60 +339,151 @@ fn session_options_are_parsed() {
     config.set_option("debug", "2").unwrap();
     config.set_option("autoconnect", "no").unwrap();
     config.set_option("nodes-max", "100").unwrap();
-    config.set_option("read-timeout-min", "5.5").unwrap();
+    config.set_option("read-timeout-min", "5").unwrap();
     config.set_option("sec-mode", "SignAndEncrypt").unwrap();
-    config.set_option("sec-id", "user:secret").unwrap();
+    config.set_option("sec-id", "/etc/opcua/creds").unwrap();
     config.set_option("pki-dir", "/etc/pki").unwrap();
 
     assert_eq!(config.debug, 2);
     assert!(!config.autoconnect);
     assert_eq!(config.nodes_max, 100);
-    assert_eq!(config.read_timeout_min, 5.5);
+    assert_eq!(config.read_timeout_min, 5.0);
     assert_eq!(
         config.security_mode,
         opcua::client::SecurityMode::SignAndEncrypt
     );
-    assert_eq!(
-        config.identity,
-        opcua::client::Identity::UserName {
-            user: "user".into(),
-            password: "secret".into()
-        }
-    );
+    assert_eq!(config.identity_file.as_deref(), Some("/etc/opcua/creds"));
     assert_eq!(config.pki_dir.as_deref(), Some("/etc/pki"));
 }
 
 #[test]
-fn an_unknown_session_option_is_rejected() {
+fn a_bad_session_option_is_passed_over() {
+    // C reports an unknown name or bad mode and goes on; strtoul reads "x"
+    // as 0 and "0x10" as 16.
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    assert!(config.set_option("nonsense", "1").is_err());
-    assert!(config.set_option("nodes-max", "x").is_err());
+    config.set_option("nonsense", "1").unwrap();
+    config.set_option("sec-mode", "Bogus").unwrap();
+    config.set_option("nodes-max", "0x10").unwrap();
+    assert_eq!(config.nodes_max, 16);
+    config.set_option("nodes-max", "x").unwrap();
+    assert_eq!(config.nodes_max, 0);
+    assert_eq!(config.security_mode, opcua::client::SecurityMode::Best);
 }
 
 #[test]
-fn an_x509_identity_names_a_certificate_and_a_key() {
+fn sec_policy_takes_the_short_name_and_keeps_the_uri() {
     let mut config = SessionConfig::new("sess", "opc.tcp://host");
-    config
-        .set_option("sec-id", "cert:/tmp/id.der:/tmp/id.pem")
-        .unwrap();
+    config.set_option("sec-policy", "Basic256Sha256").unwrap();
     assert_eq!(
-        config.identity,
+        config.security_policy.as_deref(),
+        Some("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256")
+    );
+    // An unknown name is reported and leaves the policy alone.
+    config.set_option("sec-policy", "Rot13").unwrap();
+    assert_eq!(
+        config.security_policy.as_deref(),
+        Some("http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256")
+    );
+}
+
+#[test]
+fn an_illegal_autoconnect_is_the_one_option_error() {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(
+        config.set_option("autoconnect", "maybe"),
+        Err("illegal value 'm'".to_string())
+    );
+    assert!(config.autoconnect);
+}
+
+/// `setupIdentity` on a credentials file holding `contents`.
+fn identity_from(contents: &str) -> opcua::client::Identity {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = std::env::temp_dir().join(format!("opcua-creds-{}-{n}", std::process::id()));
+    std::fs::write(&file, contents).unwrap();
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.identity_file = Some(file.to_string_lossy().into_owned());
+    let identity = config.setup_identity();
+    std::fs::remove_file(file).unwrap();
+    identity
+}
+
+#[test]
+fn no_credentials_file_is_the_anonymous_token() {
+    let config = SessionConfig::new("sess", "opc.tcp://host");
+    assert_eq!(config.setup_identity(), opcua::client::Identity::Anonymous);
+}
+
+#[test]
+fn an_empty_sec_id_is_no_credentials_file() {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("sec-id", "/etc/opcua/creds").unwrap();
+    config.set_option("sec-id", "").unwrap();
+    assert_eq!(config.identity_file, None);
+    assert_eq!(config.setup_identity(), opcua::client::Identity::Anonymous);
+}
+
+#[test]
+fn a_credentials_file_with_user_and_pass_is_a_username_token() {
+    assert_eq!(
+        identity_from("# operator\nuser=op\npass=se=cret\n"),
+        opcua::client::Identity::UserName {
+            user: "op".into(),
+            password: "se=cret".into()
+        }
+    );
+}
+
+#[test]
+fn a_credentials_file_with_cert_and_key_is_a_certificate_token() {
+    let cert = std::env::temp_dir().join(format!("opcua-id-{}.der", std::process::id()));
+    std::fs::write(&cert, b"der").unwrap();
+    let identity = identity_from(&format!("cert={}\nkey=/tmp/id.pem\n", cert.display()));
+    std::fs::remove_file(&cert).unwrap();
+    assert_eq!(
+        identity,
         opcua::client::Identity::Certificate {
-            certificate: "/tmp/id.der".into(),
+            certificate: cert.to_string_lossy().into_owned(),
             private_key: "/tmp/id.pem".into()
         }
     );
-    assert!(config.set_option("sec-id", "cert:only-one").is_err());
+}
+
+#[test]
+fn an_unusable_credentials_file_falls_back_to_the_anonymous_token() {
+    use opcua::client::Identity::Anonymous;
+    // A commented-out setting, a lone user, a certificate that cannot be loaded.
+    assert_eq!(identity_from("#user=op\n#pass=secret\n"), Anonymous);
+    assert_eq!(identity_from("user=op\n"), Anonymous);
+    assert_eq!(
+        identity_from("cert=/nonexistent/id.der\nkey=/tmp/id.pem\n"),
+        Anonymous
+    );
+    // A directory opens for metadata but cannot be read as a certificate.
+    assert_eq!(
+        identity_from(&format!(
+            "cert={}\nkey=/tmp/id.pem\n",
+            std::env::temp_dir().display()
+        )),
+        Anonymous
+    );
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.identity_file = Some("/nonexistent/creds".into());
+    assert_eq!(config.setup_identity(), Anonymous);
 }
 
 #[test]
 fn subscription_options_are_parsed() {
     let mut config = SubscriptionConfig::new("subs", "sess");
-    config.set_option("priority", "5").unwrap();
-    config.set_option("debug", "1").unwrap();
+    config.set_option("priority", "5");
+    config.set_option("debug", "1");
     assert_eq!(config.priority, 5);
     assert_eq!(config.debug, 1);
-    assert!(config.set_option("nonsense", "1").is_err());
+    // Reported and passed over, as in the C.
+    config.set_option("nonsense", "1");
+    config.set_option("priority", "256");
+    assert_eq!(config.priority, 5);
 }
 
 // -------------------------------------------------------------------- connecting
@@ -426,6 +548,32 @@ async fn a_session_that_does_not_autoconnect_waits_for_the_connect_command() {
     handle.control(Control::Connect);
     until(|| handle.is_connected()).await;
     assert_eq!(mock.connects.lock().len(), 1);
+}
+
+/// An `opcuaConnect` while an autoconnecting session waits out its retry
+/// interval is C's `connect(true)`: it tries at once.
+#[tokio::test]
+async fn opcua_connect_cuts_the_autoconnect_retry_short() {
+    let mock = Mock::arc();
+    *mock.refuse_connects.lock() = 1;
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0],
+    );
+    until(|| mock.connects.lock().len() == 1).await;
+
+    // The retry interval is opcua_ConnectTimeout, 5 s; `until` gives up first.
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    assert_eq!(mock.connects.lock().len(), 2);
+
+    // Connected, opcuaConnect only reports it; no further attempt.
+    handle.control(Control::Connect);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(handle.is_connected());
+    assert_eq!(mock.connects.lock().len(), 2);
 }
 
 /// `bini=write` does not use the value just read: the item queues a write request
@@ -756,6 +904,35 @@ async fn a_connection_error_takes_the_session_down_and_tells_every_record() {
     assert_eq!(mock.calls.lock().disconnects, 1);
 }
 
+/// C prints the ACTIVATED -> CREATED transition (`SessionOpen62541.cpp:2520-2523`).
+#[tokio::test]
+async fn a_lost_connection_prints_disconnected() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+
+    mock.behave(|b| b.read_error = Some(StatusCode::BadConnectionClosed));
+    handle.request(Priority::Low, Request::Read { handle: 0 });
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert!(
+        lines
+            .lock()
+            .iter()
+            .any(|l| l == "OPC UA session sess: disconnected\n")
+    );
+}
+
 #[tokio::test]
 async fn requests_queued_for_a_lost_connection_are_dropped() {
     let mock = Mock::arc();
@@ -847,6 +1024,54 @@ async fn a_monitored_item_carries_the_links_monitoring_parameters() {
     assert_eq!(filter.deadband_value, 0.5);
 }
 
+/// C still runs `addMonitoredItems` for a subscription whose create failed, so
+/// each of its items is told the connection is lost.
+#[tokio::test]
+async fn a_refused_subscription_still_fails_its_items() {
+    let mock = Mock::arc();
+    mock.behave(|b| b.subscription_error = Some(StatusCode::BadTooManySubscriptions));
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0.clone()]);
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    handle.control(Control::Connect);
+    until(|| !mock.calls.lock().subscriptions.is_empty()).await;
+    until(|| item0.lock().state == ConnectionStatus::Down).await;
+
+    assert!(mock.calls.lock().monitored.is_empty());
+    let last = drain(&leaf0).pop().expect("the leaf has an update");
+    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
+    assert_eq!(last.status, StatusCode::BadSubscriptionIdInvalid);
+}
+
+/// `SubscriptionOpen62541::addMonitoredItems` files a connection loss for an
+/// item the server refuses to monitor.
+#[tokio::test]
+async fn a_refused_monitored_item_is_told_the_connection_is_lost() {
+    let mock = Mock::arc();
+    mock.behave(|b| b.monitor_status = Some(StatusCode::BadNodeIdUnknown));
+    let (item0, leaf0) = item("subs ns=2;s=Sensor", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    until(|| !mock.calls.lock().monitored.is_empty()).await;
+    until(|| item0.lock().state == ConnectionStatus::Down).await;
+
+    let last = drain(&leaf0).pop().expect("the leaf has an update");
+    assert_eq!(last.reason, ProcessReason::ConnectionLoss);
+    assert_eq!(last.status, StatusCode::BadNodeIdUnknown);
+}
+
 #[tokio::test]
 async fn an_unmonitored_item_gets_no_monitored_item() {
     let mock = Mock::arc();
@@ -895,4 +1120,173 @@ async fn a_value_the_server_pushes_reaches_the_item_its_handle_names() {
     assert_eq!(update.reason, ProcessReason::IncomingData);
     assert_eq!(update.data, Some(Variant::Int32(64)));
     assert!(leaf0.lock().queue.is_empty());
+}
+
+#[test]
+fn an_item_shows_itself_as_item_open62541_show_does() {
+    let (item0, _leaf0) = item("subs ns=2;s=Sensor register=y", INPUT);
+    let (handle, _worker) = session::create(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        Arc::new(MockConnector(Mock::arc())),
+    );
+    let mut item = item0.lock();
+    let info = item.leaves[0].lock().link.clone();
+    item.adopt(info, NodeId::new(2, "Sensor"), 0, handle);
+
+    assert_eq!(
+        item.show_line(),
+        "item ns=2;s=Sensor record=rec state=down status=BadServerNotConnected dataDirty=n context=subs@sess \
+         sampling=0(-1) deadband=0 qsize=0(1) cqsize=3 discard=old timestamp=server \
+         bini=read output=n monitor=y registered=-(y)"
+    );
+}
+
+#[tokio::test]
+async fn an_item_shows_what_the_server_revised() {
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("subs ns=2;s=Sensor sampling=250 qsize=4", INPUT);
+    let handle = spawn(
+        SessionConfig::new("sess", "opc.tcp://host"),
+        &mock,
+        vec![item0.clone()],
+    );
+    handle
+        .subscriptions
+        .lock()
+        .push(SubscriptionConfig::new("subs", "sess"));
+    until(|| item0.lock().revised_queue_size == 4).await;
+
+    let line = item0.lock().show_line();
+    assert!(line.contains(" sampling=250(250) "), "{line}");
+    assert!(line.contains(" qsize=4(4) "), "{line}");
+}
+
+#[test]
+fn an_item_shows_the_size_of_its_element_tree() {
+    const ITEM: RecordKind = RecordKind {
+        is_output: false,
+        is_item_record: true,
+    };
+    let mut item = Item::pending();
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, text, kind) in [
+        ("ITEM", "subs ns=2;s=Struct", ITEM),
+        ("A_B", "ITEM element=a.b", INPUT),
+        ("A_C", "ITEM element=a.c", INPUT),
+        ("D", "ITEM element=d", INPUT),
+    ] {
+        let leaf = Leaf::new(record.to_string(), link(text, kind), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+
+    let line = item.show_line();
+    assert!(line.ends_with(" dataNodes=2 dataLeafs=3"), "{line}");
+}
+
+#[test]
+fn the_element_map_reports_what_the_structure_cannot_supply() {
+    use async_opcua::types::custom::{
+        DataTypeTree, DynamicStructure, EncodingIds, ParentIds, ParsedStructureField,
+        StructTypeInfo,
+    };
+    use async_opcua::types::{ExtensionObject, StructureType, VariantScalarTypeId};
+
+    let field = |name: &str| ParsedStructureField {
+        name: name.into(),
+        type_id: async_opcua::types::DataTypeId::Int32.into(),
+        value_rank: -1,
+        array_dimensions: None,
+        is_optional: false,
+        scalar_type: VariantScalarTypeId::Int32,
+    };
+    let type_id = NodeId::new(2, 3000);
+    let info = Arc::new(StructTypeInfo {
+        structure_type: StructureType::Structure,
+        fields: vec![field("x"), field("y")],
+        index_by_name: [("x".to_string(), 0), ("y".to_string(), 1)].into(),
+        encoding_ids: EncodingIds {
+            binary_id: NodeId::new(2, 3001),
+            json_id: NodeId::new(2, 3002),
+            xml_id: NodeId::new(2, 3003),
+        },
+        is_abstract: false,
+        node_id: type_id.clone(),
+        name: "Point".into(),
+    });
+    let mut tree = DataTypeTree::new(ParentIds::new());
+    tree.add_type(
+        type_id,
+        async_opcua::types::custom::TypeInfo::Struct(info.clone()),
+    );
+    let tree = Arc::new(tree);
+    let point = DynamicStructure::new_struct(
+        info,
+        tree.clone(),
+        vec![Variant::Int32(1), Variant::Int32(2)],
+    )
+    .unwrap();
+    let value = Variant::ExtensionObject(ExtensionObject::from_message(point));
+
+    let mut item = Item::pending();
+    item.node_id = NodeId::new(2, "Pt");
+    item.type_tree = Some(tree);
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, text) in [
+        ("Y", "PT element=y"),
+        ("Z", "PT element=z"),
+        ("XQ", "PT element=x.q"),
+    ] {
+        let leaf = Leaf::new(record.to_string(), link(text, INPUT), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+
+    assert_eq!(
+        item.element_report(&value),
+        vec![
+            "Item ns=2;s=Pt: element z not found in Point".to_string(),
+            "Error: ns=2;s=Pt element x is no structured data but a Int32".to_string(),
+        ]
+    );
+}
+
+/// open62541's 1 s connectivity check on an idle session
+/// (`SessionOpen62541::connectionInactive`).
+#[tokio::test]
+async fn an_idle_session_whose_server_stops_answering_goes_inactive() {
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let id = errlog_add_listener({
+        let lines = lines.clone();
+        move |line: &str| lines.lock().push(line.to_string())
+    });
+    let mock = Mock::arc();
+    let (item0, _leaf0) = item("sess ns=2;s=Sensor monitor=n", INPUT);
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.autoconnect = false;
+    let handle = spawn(config, &mock, vec![item0]);
+    handle.control(Control::Connect);
+    until(|| handle.is_connected()).await;
+    mock.calls.lock().reads.clear();
+
+    // A check that is answered keeps the session up.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(handle.is_connected());
+    let state = NodeId::new(0, 2259u32);
+    assert!(
+        mock.calls
+            .lock()
+            .reads
+            .iter()
+            .any(|r| r.len() == 1 && r[0].node_id == state)
+    );
+
+    mock.behave(|b| b.read_error = Some(StatusCode::BadTimeout));
+    until(|| !handle.is_connected()).await;
+    errlog_flush();
+    errlog_remove_listener(id);
+    assert!(
+        lines
+            .lock()
+            .iter()
+            .any(|l| l == "OPC UA Session sess: server inactive\n")
+    );
 }

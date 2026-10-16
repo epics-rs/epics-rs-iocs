@@ -19,13 +19,16 @@
 //! constructor argument, milliseconds) between each poll, until it observes
 //! `scalerDone` become true — either because `counts[0] >= presetCount`, or
 //! because `arm(false)` set `scalerDone` directly from the record-processing
-//! thread while a poll was in flight. `read()`/`done()` (called from the
-//! record's SCAN cycle) never do live I/O themselves; they only read the
+//! thread while a poll was in flight. `read()` (called from the record's
+//! process cycle) never does live I/O itself; they only read the
 //! cache the poll thread maintains — matching C's `readInt32Array`, which
 //! only reads cached `scalerReadSingle` params. This is reproduced with a
 //! `std::thread` blocking on an `mpsc::Receiver<()>` "start" signal instead
 //! of an `epicsEventId`, and an `Arc<Mutex<PollState>>` instead of
-//! `asynPortDriver`'s param list.
+//! `asynPortDriver`'s param list. `scalerDone` is a [`DoneParam`]: set to 1
+//! in the constructor (`drvScaler974.cpp:89`), so the port's boot replay
+//! processes the scaler record at `iocRun`, and a change reaches the record
+//! as `devScalerAsyn`'s done interrupt.
 //!
 //! # Preserved upstream quirks (not "fixed")
 //! - **Only `arm(false)` (STOP) propagates a real I/O failure.** C
@@ -71,10 +74,8 @@
 //!   whose content is never inspected anywhere in the driver, only its
 //!   `asynStatus` (which is itself discarded by the `eventThread` caller).
 //!   The four-arg overload (STOP/START/CLEAR_ALL/SET_COUNT_PRESET) does a
-//!   single `writeRead` only. [`Scaler974Driver::poll_loop`] reproduces the
-//!   two-read shape (draining the second reply so a persistent connection's
-//!   line framing stays in sync) without inspecting its content;
-//!   [`Scaler974Driver::send`] does one write + one read.
+//!   single `writeRead` only. Both go through [`send_command`], which
+//!   reads the second reply without inspecting it.
 //! - **The `timeOut` macro (`drvScaler974.cpp:24`, `0.1`) is dead code** —
 //!   never referenced anywhere in the file. The only timeout actually used
 //!   is the local `double timeout = 1.0` inside `sendCommand`, applied to
@@ -93,13 +94,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use epics_rs::asyn::error::AsynError;
-use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::error::{AsynError, AsynResult};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::base::error::{CaError, CaResult};
 use epics_rs::scaler::MAX_SCALER_CHANNELS;
-use epics_rs::scaler::device_support::scaler_asyn::ScalerDriver;
+use epics_rs::scaler::device_support::scaler_asyn::{DoneInterrupt, DoneParam, ScalerDriver};
 
-use crate::wire::{encode_set_count_preset, parse_show_counts};
+use crate::connect::OctetLink;
+use crate::wire::{encode_set_count_preset, scan_show_counts};
 
 /// asyn reason used for octet transactions against the underlying serial
 /// port (mirrors `delaygen::wire::OCTET_REASON`/`love`'s `OCTET_REASON`).
@@ -130,7 +132,8 @@ struct PollState {
     /// fixed 64-element array required by [`ScalerDriver::read`] stays
     /// zero, matching a driver with `num_channels() == 4`.
     counts: [u32; MAX_SCALER_CHANNELS],
-    done: bool,
+    /// C `scalerDone`.
+    done: DoneParam,
     /// Raw (pre-`SET_COUNT_PRESET`-encoding) value from the last
     /// `write_preset` call, regardless of which channel it named — see
     /// the module doc's "no per-channel preset" quirk.
@@ -138,7 +141,7 @@ struct PollState {
 }
 
 pub struct Scaler974Driver {
-    handle: SyncIOHandle,
+    handle: OctetLink,
     state: Arc<Mutex<PollState>>,
     start_tx: mpsc::Sender<()>,
 }
@@ -151,10 +154,10 @@ impl Scaler974Driver {
     /// `crate::connect::connect_octet`'s doc for why `SyncIOHandle` isn't
     /// just cloned). `poll` is the constructor's poll interval in
     /// milliseconds.
-    pub fn new(handle: SyncIOHandle, poll_handle: SyncIOHandle, poll: i32) -> Self {
+    pub fn new(handle: OctetLink, poll_handle: OctetLink, poll: i32) -> Self {
         let state = Arc::new(Mutex::new(PollState {
             counts: [0; MAX_SCALER_CHANNELS],
-            done: false,
+            done: DoneParam::new(1),
             preset: 0,
         }));
         let (start_tx, start_rx) = mpsc::channel();
@@ -178,39 +181,39 @@ impl Scaler974Driver {
     /// the single-read overload used by STOP/START/CLEAR_ALL/
     /// SET_COUNT_PRESET.
     fn send(&self, command: &str) -> CaResult<()> {
-        self.handle
-            .write_octet(OCTET_REASON, command.as_bytes())
-            .map_err(asyn_to_ca)?;
-        self.handle
-            .read_octet(OCTET_REASON, COMMAND_REPLY_BUF)
-            .map_err(asyn_to_ca)?;
-        Ok(())
+        let mut status = Vec::new();
+        send_command(&self.handle, command, &mut status, COMMAND_REPLY_BUF, None)
+            .map_err(asyn_to_ca)
     }
 
-    /// C `eventThread` (`drvScaler974.cpp:217-254`).
+    /// C `eventThread` (`drvScaler974.cpp:217-254`). `response` and
+    /// `counts` are the thread's locals there, declared outside the loop:
+    /// a failed `SHOW_COUNTS` leaves both as the last poll left them, so
+    /// the record keeps its counts while the port is down.
     fn poll_loop(
-        handle: SyncIOHandle,
+        handle: OctetLink,
         state: Arc<Mutex<PollState>>,
         start_rx: mpsc::Receiver<()>,
         poll_interval: Duration,
     ) {
+        let mut response = Vec::new();
+        let mut counts = [0i32; MAX_CHANNELS];
         while start_rx.recv().is_ok() {
             loop {
-                // C's six-arg sendCommand("SHOW_COUNTS", ...): a writeRead
-                // into the data buffer, then a second, separate read into a
-                // status buffer whose content is never inspected. Both
-                // asynStatus results are discarded here too, matching
-                // `eventThread` never checking `status`.
-                let _ = handle.write_octet(OCTET_REASON, b"SHOW_COUNTS");
-                let data = handle
-                    .read_octet(OCTET_REASON, SHOW_COUNTS_DATA_BUF)
-                    .unwrap_or_default();
-                let _ = handle.read_octet(OCTET_REASON, SHOW_COUNTS_STATUS_BUF);
-
-                let parsed = parse_show_counts(&data);
+                // `eventThread` never checks the status.
+                let _ = send_command(
+                    &handle,
+                    "SHOW_COUNTS",
+                    &mut response,
+                    SHOW_COUNTS_DATA_BUF,
+                    Some(SHOW_COUNTS_STATUS_BUF),
+                );
+                scan_show_counts(&response, &mut counts);
                 let done = {
                     let mut st = state.lock().unwrap();
-                    apply_poll_result(&mut st, parsed)
+                    let done = apply_poll_result(&mut st, counts);
+                    st.done.call_callbacks();
+                    done
                 };
 
                 if done {
@@ -222,6 +225,40 @@ impl Scaler974Driver {
     }
 }
 
+/// C `Scaler974::sendCommand` (`drvScaler974.cpp:103-127`): a `writeRead`
+/// into `reply`, which a failure leaves untouched; with `status_read`, a
+/// second `read` (the `SHOW_COUNTS` status line, never inspected) only
+/// after the `writeRead` succeeded. Either failure prints C's one error
+/// line.
+fn send_command(
+    link: &OctetLink,
+    command: &str,
+    reply: &mut Vec<u8>,
+    reply_buf: usize,
+    status_read: Option<usize>,
+) -> AsynResult<()> {
+    let result = link
+        .sync
+        .write_read(OCTET_REASON, command.as_bytes(), reply_buf)
+        .and_then(|data| {
+            *reply = data;
+            match status_read {
+                Some(status_buf) => link.sync.read_octet(OCTET_REASON, status_buf).map(drop),
+                None => Ok(()),
+            }
+        });
+    if let Err(e) = &result {
+        link.print_self(
+            TraceMask::ERROR,
+            format_args!(
+                "Scaler974:sendCommand: writing command {command}, error={}",
+                e.message_display()
+            ),
+        );
+    }
+    result
+}
+
 /// C `eventThread`'s per-iteration state update (`drvScaler974.cpp:239-249`):
 /// "Get value of done in case scaler was stopped by scalerArm(0)" (i.e.
 /// `arm(false)` may have set `done` directly, concurrently, while a poll
@@ -230,11 +267,11 @@ impl Scaler974Driver {
 /// unit-testable without a live connection. Returns the (possibly
 /// unchanged) `done` value.
 fn apply_poll_result(st: &mut PollState, parsed: [i32; 4]) -> bool {
-    let mut done = st.done;
+    let mut done = st.done.get() != 0;
     if !done && (parsed[0] as u32) >= st.preset {
         done = true;
     }
-    st.done = done;
+    st.done.set(done as i32);
     for (slot, value) in st.counts.iter_mut().zip(parsed).take(MAX_CHANNELS) {
         *slot = value as u32;
     }
@@ -246,6 +283,7 @@ impl ScalerDriver for Scaler974Driver {
     fn reset(&mut self) -> CaResult<()> {
         let _ = self.send("STOP");
         let _ = self.send("CLEAR_ALL");
+        self.state.lock().unwrap().done.call_callbacks();
         Ok(())
     }
 
@@ -262,7 +300,9 @@ impl ScalerDriver for Scaler974Driver {
     fn write_preset(&mut self, _channel: usize, preset: u32) -> CaResult<u32> {
         let cmd = encode_set_count_preset(preset);
         let _ = self.send(&cmd);
-        self.state.lock().unwrap().preset = preset;
+        let mut st = self.state.lock().unwrap();
+        st.preset = preset;
+        st.done.call_callbacks();
         Ok(preset)
     }
 
@@ -271,26 +311,26 @@ impl ScalerDriver for Scaler974Driver {
     fn arm(&mut self, start: bool) -> CaResult<()> {
         if start {
             let _ = self.send("START");
-            self.state.lock().unwrap().done = false;
+            let st = self.state.lock().unwrap();
+            st.done.set(0);
             // C `epicsEventSignal(this->eventId)` — wake the poll thread.
             // The receiver can only be dropped if the poll thread panicked;
             // ignore a send failure the same way C has no recovery path
             // for a dead eventThread either.
             let _ = self.start_tx.send(());
+            st.done.call_callbacks();
             Ok(())
         } else {
             let result = self.send("STOP");
-            self.state.lock().unwrap().done = true;
+            let st = self.state.lock().unwrap();
+            st.done.set(1);
+            st.done.call_callbacks();
             result
         }
     }
 
-    /// C `devScalerAsyn.c` `scaler_done()`: read-and-clear.
-    fn done(&mut self) -> bool {
-        let mut st = self.state.lock().unwrap();
-        let was_done = st.done;
-        st.done = false;
-        was_done
+    fn register_done_interrupt(&mut self, user: DoneInterrupt) {
+        self.state.lock().unwrap().done.register(user);
     }
 
     /// C `#define MAX_CHANNELS 4`.
@@ -306,7 +346,7 @@ mod tests {
     fn fresh_state() -> PollState {
         PollState {
             counts: [0; MAX_SCALER_CHANNELS],
-            done: false,
+            done: DoneParam::new(0),
             preset: 0,
         }
     }
@@ -318,7 +358,7 @@ mod tests {
         let done = apply_poll_result(&mut st, [42, 1, 2, 3]);
         assert!(!done);
         assert_eq!(&st.counts[..4], &[42, 1, 2, 3]);
-        assert!(!st.done);
+        assert_eq!(st.done.get(), 0);
     }
 
     #[test]
@@ -327,7 +367,7 @@ mod tests {
         st.preset = 100;
         let done = apply_poll_result(&mut st, [100, 0, 0, 0]);
         assert!(done);
-        assert!(st.done);
+        assert_eq!(st.done.get(), 1);
 
         // A later poll with a lower count (e.g. hardware reset mid-poll)
         // must not un-latch done -- `!done` is required before comparing.
@@ -342,7 +382,7 @@ mod tests {
         // require counts to reach preset.
         let mut st = fresh_state();
         st.preset = 1_000_000;
-        st.done = true;
+        st.done.set(1);
         let done = apply_poll_result(&mut st, [0, 0, 0, 0]);
         assert!(done);
     }

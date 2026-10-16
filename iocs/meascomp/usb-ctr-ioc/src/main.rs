@@ -23,11 +23,6 @@ static SCALER_DEVICES: &[epics_rs::base::server::record::DevSup] =
 
 #[epics_rs::base::epics_main]
 async fn main() -> CaResult<()> {
-    // The drivers report every uldaq failure through `log`; without a
-    // backend installed those calls are no-ops and a failed ulAOut or
-    // ulAInScan leaves no trace anywhere. Defaults to warn-and-above.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
-
     let args: Vec<String> = std::env::args().collect();
     let script = if args.len() > 1 && !args[1].starts_with('-') {
         args[1].clone()
@@ -122,20 +117,25 @@ async fn main() -> CaResult<()> {
                     _ => 2048,
                 };
 
-                let ctr_rt = create_usb_ctr(&port_name, &unique_id, max_points)?;
+                // drvUSBCTR is an asynPortDriver: its base registers the port
+                // before the device is opened.
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let ctr_rt = create_usb_ctr(&claim, &unique_id, max_points)?;
 
                 *scaler_slot.lock().unwrap() = Some(CtrScalerDriver::new(
                     ctr_rt.device.clone(),
                     ctr_rt.state.clone(),
                 ));
 
-                let port_handle = ctr_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        ctr_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(ctr_rt);
                 Ok(CommandOutcome::Continue)

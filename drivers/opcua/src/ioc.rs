@@ -8,9 +8,11 @@
 
 use std::sync::Arc;
 
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::server::RecordFactory;
 
 use crate::client::ClientSecurity;
+use crate::link::split_escaped;
 use crate::queue::ConnectionStatus;
 use crate::record::OpcuaItemRecord;
 use crate::registry::Registry;
@@ -24,36 +26,30 @@ pub fn item_record_factory() -> (&'static str, RecordFactory) {
     )
 }
 
-/// One `key=value` option from an iocsh argument.
+/// The `key=value` options of an iocsh option tail (`iocshIntegration.cpp:150-163`):
+/// each argument holds `:`-separated options, and one that is not exactly
+/// `key=value` is reported and ignored.
 ///
-/// Deviation from the C, forced by two things at once. The C's option argument is
-/// an `iocshArgArgv` — a variadic tail — and it splits each token on `:` as well,
-/// so `opcuaSession(S, URL, "sec-mode=Sign:debug=1")` is one token carrying two
-/// options.
-///
-/// * Framework gap: `epics_rs`'s iocsh has no variadic argument type
-///   ([`ArgType`](epics_rs::base::server::iocsh::registry::ArgType) is String,
-///   Int or Double), so the IOC declares a fixed number of optional option slots.
-/// * The `:` split cannot be kept: this port's `sec-id` value is
-///   `<user>:<password>` (or `cert:<cert>:<key>`), so a `:` inside a value is
-///   meaningful. One `key=value` per argument, then.
-pub fn parse_option(token: &str) -> Result<(String, String), String> {
-    match token.split_once('=') {
-        Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
-        _ => Err(format!(
-            "option '{token}' must follow the 'key=value' format"
-        )),
+/// Framework gap: `epics_rs`'s iocsh has no variadic argument type
+/// ([`ArgType`](epics_rs::base::server::iocsh::registry::ArgType) is String,
+/// Int or Double), so the IOC declares a fixed number of optional option slots
+/// where the C takes an `iocshArgArgv` tail.
+pub fn parse_options<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Vec<(String, String)> {
+    let mut options = Vec::new();
+    for token in tokens {
+        for opt in split_escaped(token, ':') {
+            if opt.is_empty() {
+                continue;
+            }
+            match <[String; 2]>::try_from(split_escaped(&opt, '=')) {
+                Ok([key, value]) => options.push((key, value)),
+                Err(_) => errlog_vprintf(format_args!(
+                    "option '{opt}' must follow 'key=value' format - ignored\n"
+                )),
+            }
+        }
     }
-}
-
-pub fn parse_options<'a>(
-    tokens: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<(String, String)>, String> {
-    tokens
-        .into_iter()
-        .filter(|t| !t.is_empty())
-        .map(parse_option)
-        .collect()
+    options
 }
 
 /// `opcuaOptions(pattern, [options])` — the pattern selects sessions and
@@ -76,7 +72,11 @@ pub fn set_options(
     }
     for name in &names {
         for (key, value) in options {
-            registry.set_option(name, key, value)?;
+            // The C's catch: report, and apply nothing further.
+            if let Err(e) = registry.set_option(name, key, value) {
+                eprintln!("ERROR : {e}");
+                return Ok(names.len());
+            }
         }
     }
     Ok(names.len())
@@ -187,7 +187,7 @@ pub fn show_security(registry: &Registry, client: &ClientSecurity, session: &str
             handle.name,
             config.security_mode,
             config.security_policy.as_deref().unwrap_or("(best)"),
-            config.identity.describe(),
+            config.identity_file.as_deref().unwrap_or("anonymous"),
         ));
     }
     out
@@ -237,18 +237,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_option_is_one_key_and_one_value() {
+    fn an_argument_carries_colon_separated_options() {
+        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
         assert_eq!(
-            parse_option("sec-mode=Sign").unwrap(),
-            ("sec-mode".to_string(), "Sign".to_string())
+            parse_options(["sec-mode=Sign:debug=1", "batch-nodes=10"]),
+            pairs(&[("sec-mode", "Sign"), ("debug", "1"), ("batch-nodes", "10")])
         );
-        // The value keeps its colons — `sec-id` is `<user>:<password>`.
+        // An escaped colon stays in the value; empty options are skipped.
         assert_eq!(
-            parse_option("sec-id=user:secret").unwrap(),
-            ("sec-id".to_string(), "user:secret".to_string())
+            parse_options(["sec-id=C\\:/creds::"]),
+            pairs(&[("sec-id", "C:/creds")])
         );
-        assert!(parse_option("debug").is_err());
-        assert!(parse_option("=1").is_err());
+        // Not exactly one `=`: ignored, the rest still taken.
+        assert_eq!(
+            parse_options(["debug:a=b=c:=1:nodes-max=5"]),
+            pairs(&[("", "1"), ("nodes-max", "5")])
+        );
     }
 
     #[test]

@@ -11,14 +11,18 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
-    AttributeId, DataValue, EndpointDescription, MonitoredItemCreateRequest, NodeId, ReadValueId,
-    StatusCode, Variant, WriteValue,
+    AttributeId, DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, Variant, WriteValue,
 };
+use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::client::{Identity, SecurityMode, ServerInfo, UaConnection, UaConnector};
+use crate::client::{
+    Identity, SecurityMode, ServerInfo, UaConnection, UaConnector, security_policy_string,
+};
 use crate::defaults;
 use crate::item::Item;
 use crate::queue::{ConnectionStatus, ProcessReason};
@@ -27,6 +31,14 @@ use crate::subscription::SubscriptionConfig;
 /// The attributes one Read asks for per item: DataType and Value
 /// (`Session.h:359`, `no_of_properties_read`).
 const NO_OF_PROPERTIES_READ: usize = 2;
+
+/// The `connectivityCheckInterval` C sets once the session is activated
+/// (`SessionOpen62541.cpp:2427`).
+const CONNECTIVITY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `Server_ServerStatus_State` (ns=0;i=2259), what open62541's
+/// connectivity check reads.
+const SERVER_STATUS_STATE: u32 = 2259;
 
 /// `opcuaSession(NAME, URL, [options])` (`iocshIntegration.cpp:88-140`) plus the
 /// session options of `opcuaOptions` (`SessionOpen62541.cpp:159-260`).
@@ -49,7 +61,9 @@ pub struct SessionConfig {
     pub write_timeout_max: f64,
     pub security_mode: SecurityMode,
     pub security_policy: Option<String>,
-    pub identity: Identity,
+    /// `sec-id`: the credentials file [`Self::setup_identity`] reads at every
+    /// connect.
+    pub identity_file: Option<String>,
     /// `None` — the client's PKI store (`opcuaSetupPKI`), or the default.
     pub pki_dir: Option<String>,
     pub certificate_path: Option<String>,
@@ -75,7 +89,7 @@ impl SessionConfig {
             write_timeout_max: 0.0,
             security_mode: SecurityMode::Best,
             security_policy: None,
-            identity: Identity::Anonymous,
+            identity_file: None,
             pki_dir: None,
             certificate_path: None,
             private_key_path: None,
@@ -84,60 +98,189 @@ impl SessionConfig {
         }
     }
 
-    /// One `key=value` session option (`SessionOpen62541.cpp:159-260`).
-    pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), String> {
-        let number = |v: &str| -> Result<f64, String> {
-            v.parse()
-                .map_err(|_| format!("invalid value '{v}' for option '{name}'"))
-        };
-        let count = |v: &str| -> Result<u32, String> {
-            v.parse()
-                .map_err(|_| format!("invalid value '{v}' for option '{name}'"))
-        };
-        match name {
-            "debug" => self.debug = count(value)?,
-            "autoconnect" => {
-                self.autoconnect =
-                    matches!(value.chars().next(), Some('y' | 'Y' | 't' | 'T' | '1'));
+    /// The identity token the next connect presents
+    /// (`SessionOpen62541::setupIdentity`): what the `sec-id` credentials file
+    /// holds, or anonymous when there is none or it is unusable.
+    pub fn setup_identity(&self) -> Identity {
+        let Some(file) = &self.identity_file else {
+            if self.debug > 0 {
+                println!(
+                    "Session {}: (setupIdentity) setting Anonymous token",
+                    self.name
+                );
             }
+            return Identity::Anonymous;
+        };
+        // C goes on parsing the stream that failed to open, which reads nothing.
+        let text = std::fs::read_to_string(file).unwrap_or_else(|_| {
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: cannot open credentials file {file}\n",
+                self.name
+            ));
+            String::new()
+        });
+        let (mut user, mut pass, mut cert, mut key) = ("", "", "", "");
+        for line in text.lines() {
+            let Some(equ) = line.find('=') else { continue };
+            if line.find('#').is_some_and(|hash| hash < equ) {
+                continue;
+            }
+            let value = &line[equ + 1..];
+            match &line[..equ] {
+                "user" => user = value,
+                "pass" => pass = value,
+                "cert" => cert = value,
+                "key" => key = value,
+                _ => {}
+            }
+        }
+
+        if !user.is_empty() && !pass.is_empty() {
+            if self.debug > 0 {
+                println!(
+                    "Session {}: (setupIdentity) setting Username token ({user}/*****)",
+                    self.name
+                );
+            }
+            Identity::UserName {
+                user: user.to_string(),
+                password: pass.to_string(),
+            }
+        } else if !cert.is_empty() && !key.is_empty() {
+            if self.debug > 0 {
+                println!(
+                    "Session {}: (setupIdentity) loading identity certificate {cert}",
+                    self.name
+                );
+            }
+            // `loadFile` reads the whole file; an unreadable one is the same
+            // failure as a missing one.
+            match std::fs::read(cert) {
+                Ok(bytes) if !bytes.is_empty() => Identity::Certificate {
+                    certificate: cert.to_string(),
+                    private_key: key.to_string(),
+                },
+                result => {
+                    let reason = match result {
+                        Err(e) => strerror(&e),
+                        // `loadFile` of an empty file leaves errno at 0.
+                        Ok(_) => "Success".to_string(),
+                    };
+                    errlog_vprintf(format_args!(
+                        "OPC UA Session {}: loading client certificate {cert} failed: {reason}\n",
+                        self.name
+                    ));
+                    Identity::Anonymous
+                }
+            }
+        } else {
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: credentials file {file} does not contain settings for \
+                 Username token (user + pass) or Certificate token (cert + key [+ pass])\n",
+                self.name
+            ));
+            Identity::Anonymous
+        }
+    }
+
+    /// One `key=value` session option (`SessionOpen62541::setOption`). As in
+    /// the C a bad name or value is reported and passed over; `Err` is only
+    /// the C's exception (an illegal `autoconnect`), which ends the option list.
+    pub fn set_option(&mut self, name: &str, value: &str) -> Result<(), String> {
+        if self.debug > 0 || name == "debug" {
+            eprintln!("Session {}: setting option {name} to {value}", self.name);
+        }
+        // C reads every count with strtoul and stores it narrowed.
+        let count = || strtoul(value) as u32;
+        match name {
+            "sec-mode" => match SecurityMode::parse(value) {
+                Some(mode) => self.security_mode = mode,
+                None => errlog_vprintf(format_args!(
+                    "invalid security-mode (valid: best None Sign SignAndEncrypt)\n"
+                )),
+            },
+            "sec-policy" => {
+                // C matches the policy's short name and keeps its URI.
+                let supported = supported_security_policies();
+                match supported.iter().find(|(_, name)| *name == value) {
+                    Some((uri, _)) => self.security_policy = Some(uri.to_string()),
+                    None => {
+                        let valid: String = supported
+                            .iter()
+                            .map(|(_, name)| format!(" {name}"))
+                            .collect();
+                        errlog_vprintf(format_args!("invalid security policy (valid:{valid})\n"));
+                    }
+                }
+            }
+            // An empty name is C's empty `securityIdentityFile`: anonymous.
+            "sec-id" => self.identity_file = (!value.is_empty()).then(|| value.to_string()),
+            "debug" => self.debug = count(),
             "nodes-max" | "batch-nodes" => {
                 if name == "batch-nodes" {
-                    log::warn!(
-                        "DEPRECATION WARNING: option 'batch-nodes' is deprecated; use 'nodes-max'."
-                    );
+                    errlog_vprintf(format_args!(
+                        "DEPRECATED: option 'batch-nodes'; use 'nodes-max' instead\n"
+                    ));
                 }
-                self.nodes_max = count(value)?;
+                self.nodes_max = count();
             }
-            "read-nodes-max" => self.read_nodes_max = count(value)?,
-            "read-timeout-min" => self.read_timeout_min = number(value)?,
-            "read-timeout-max" => self.read_timeout_max = number(value)?,
-            "write-nodes-max" => self.write_nodes_max = count(value)?,
-            "write-timeout-min" => self.write_timeout_min = number(value)?,
-            "write-timeout-max" => self.write_timeout_max = number(value)?,
-            "sec-mode" => {
-                self.security_mode = SecurityMode::parse(value)
-                    .ok_or_else(|| format!("invalid security mode '{value}'"))?;
+            "read-nodes-max" => self.read_nodes_max = count(),
+            "read-timeout-min" => self.read_timeout_min = count() as f64,
+            "read-timeout-max" => self.read_timeout_max = count() as f64,
+            "write-nodes-max" => self.write_nodes_max = count(),
+            "write-timeout-min" => self.write_timeout_min = count() as f64,
+            "write-timeout-max" => self.write_timeout_max = count() as f64,
+            "autoconnect" => {
+                if let Some(c) = value.chars().next() {
+                    self.autoconnect = get_yes_no(c)?;
+                }
             }
-            "sec-policy" => self.security_policy = Some(value.to_string()),
-            "sec-id" => self.identity = parse_identity(value)?,
+            // Not C session options: the C sets these through opcuaSetupPKI
+            // and opcuaClientCertificate.
             "pki-dir" => self.pki_dir = Some(value.to_string()),
             "cert" => self.certificate_path = Some(value.to_string()),
             "key" => self.private_key_path = Some(value.to_string()),
-            _ => return Err(format!("unknown session option '{name}'")),
+            _ => errlog_vprintf(format_args!("unknown option '{name}' - ignored\n")),
         }
         Ok(())
     }
 
-    /// The endpoint to ask the server for.
-    pub fn endpoint_description(&self) -> EndpointDescription {
-        let policy = self
-            .security_policy
-            .clone()
-            .unwrap_or_else(|| security_policy_uri(self.security_mode).to_string());
+    /// `SessionOpen62541::setupSecurity` (`SessionOpen62541.cpp:1060-1086`):
+    /// of the server's opc.tcp endpoints whose mode and policy the session
+    /// accepts and whose policy the client supports, the one with the highest
+    /// security level. The session still connects to its own URL.
+    pub fn select_endpoint(
+        &self,
+        endpoints: &[EndpointDescription],
+    ) -> Option<EndpointDescription> {
+        let mode = self.security_mode.as_message_security_mode();
+        let mut selected: Option<&EndpointDescription> = None;
+        for e in endpoints {
+            let policy = e.security_policy_uri.as_ref();
+            if e.endpoint_url.as_ref().starts_with("opc.tcp")
+                && (self.security_mode == SecurityMode::Best || e.security_mode == mode)
+                && self
+                    .security_policy
+                    .as_deref()
+                    .is_none_or(|p| p.contains("#None") || p == policy)
+                && selected.is_none_or(|s| e.security_level > s.security_level)
+                && SecurityPolicy::from_uri(policy) != SecurityPolicy::Unknown
+            {
+                selected = Some(e);
+            }
+        }
+        selected.map(|e| EndpointDescription {
+            endpoint_url: self.url.as_str().into(),
+            ..e.clone()
+        })
+    }
+
+    /// The endpoint a `sec-mode=None` session connects to without discovery.
+    pub fn unsecured_endpoint(&self) -> EndpointDescription {
         EndpointDescription {
             endpoint_url: self.url.as_str().into(),
-            security_policy_uri: policy.as_str().into(),
-            security_mode: self.security_mode.as_message_security_mode(),
+            security_policy_uri: SecurityPolicy::None.to_uri().into(),
+            security_mode: MessageSecurityMode::None,
             ..Default::default()
         }
     }
@@ -176,38 +319,6 @@ fn batch_size(server_limit: u32, session_limit: u32) -> usize {
         (0, 0) => usize::MAX,
         (m, 0) | (0, m) => m as usize,
         (a, b) => a.min(b) as usize,
-    }
-}
-
-/// `sec-id` names an identity: a user name and password, or an X.509 identity
-/// certificate and its key.
-fn parse_identity(value: &str) -> Result<Identity, String> {
-    match value.split_once(':') {
-        Some(("cert", rest)) => match rest.split_once(':') {
-            Some((certificate, private_key)) => Ok(Identity::Certificate {
-                certificate: certificate.to_string(),
-                private_key: private_key.to_string(),
-            }),
-            None => Err(format!(
-                "identity 'cert:{rest}' needs a certificate and a key, 'cert:<cert>:<key>'"
-            )),
-        },
-        Some((user, password)) => Ok(Identity::UserName {
-            user: user.to_string(),
-            password: password.to_string(),
-        }),
-        None => Err(format!(
-            "identity '{value}' must be '<user>:<password>' or 'cert:<cert>:<key>'"
-        )),
-    }
-}
-
-fn security_policy_uri(mode: SecurityMode) -> &'static str {
-    match mode {
-        SecurityMode::None => "http://opcfoundation.org/UA/SecurityPolicy#None",
-        // The strongest policy the OPC UA specification currently requires a
-        // server to support (Part 7 profile "Basic256Sha256").
-        _ => "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256",
     }
 }
 
@@ -331,23 +442,49 @@ impl SessionWorker {
     /// The worker's whole life: connect, serve, reconnect.
     pub async fn run(mut self) {
         let mut connect_now = self.autoconnect();
+        // `opcuaConnect` asked for this attempt (C `connect(manual)`).
+        let mut manual = false;
         loop {
             if self.connection.is_none() {
                 if !connect_now {
                     match self.control.recv().await {
-                        Some(Control::Connect) => connect_now = true,
+                        Some(Control::Connect) => {
+                            connect_now = true;
+                            manual = true;
+                        }
                         Some(Control::Disconnect) => continue,
                         None => return,
                     }
                     continue;
                 }
-                if let Err(e) = self.connect().await {
-                    log::error!("session {}: {e}", self.handle.name);
+                let attempt = self.connect().await;
+                let was_manual = std::mem::take(&mut manual);
+                if let Err(e) = attempt {
+                    if was_manual || self.debug() > 0 {
+                        errlog_vprintf(format_args!("OPC UA session {}: {e}\n", self.handle.name));
+                    }
                     // `opcua_ConnectTimeout` is both the connect timeout and the
-                    // interval between attempts (`iocshVariables.h:24`).
+                    // interval between attempts (`iocshVariables.h:24`); an
+                    // `opcuaConnect` meanwhile is C's immediate `connect(true)`.
                     let retry = defaults::CONNECT_TIMEOUT.get().max(0.1);
-                    tokio::time::sleep(Duration::from_secs_f64(retry)).await;
-                    connect_now = self.autoconnect();
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(retry);
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => {
+                                connect_now = self.autoconnect();
+                                break;
+                            }
+                            control = self.control.recv() => match control {
+                                Some(Control::Connect) => {
+                                    connect_now = true;
+                                    manual = true;
+                                    break;
+                                }
+                                Some(Control::Disconnect) => {}
+                                None => return,
+                            },
+                        }
+                    }
                     continue;
                 }
             }
@@ -373,21 +510,46 @@ impl SessionWorker {
         self.handle.config.lock().autoconnect
     }
 
+    /// The `ACTIVATED` arm's first lines (`SessionOpen62541.cpp:2432-2445`).
+    fn report_connected(&self, identity: &Identity, endpoint: &EndpointDescription) {
+        let (user, token) = match identity {
+            Identity::Anonymous => ("Anonymous", ""),
+            Identity::UserName { user, .. } => (user.as_str(), " (username token)"),
+            Identity::Certificate { .. } => ("Certificate user", " (certificate token)"),
+        };
+        errlog_vprintf(format_args!(
+            "OPC UA session {}: connected as '{user}'{token} with security level {} (mode={:?}; policy={})\n",
+            self.handle.name,
+            endpoint.security_level,
+            endpoint.security_mode,
+            security_policy_string(endpoint.security_policy_uri.as_ref()),
+        ));
+        if endpoint.security_mode == MessageSecurityMode::None {
+            errlog_vprintf(format_args!(
+                "OPC UA session {}: WARNING - this session uses *** NO SECURITY ***\n",
+                self.handle.name
+            ));
+        }
+    }
+
+    fn debug(&self) -> u32 {
+        self.handle.config.lock().debug
+    }
+
     async fn connect(&mut self) -> Result<(), String> {
         let config = self.handle.config.lock().clone();
-        let connection = self.connector.connect(&config).await?;
-        self.server = connection
-            .server_info()
-            .await
-            .map_err(|e| format!("reading the server's capabilities failed: {e}"))?;
-        let type_tree = connection.type_tree().await.ok();
-        if type_tree.is_none() {
-            log::warn!(
-                "session {}: the server's type dictionary could not be read; \
-                 enumerations and structures will not resolve",
-                self.handle.name
-            );
+        let identity = config.setup_identity();
+        let connection = self.connector.connect(&config, &identity).await?;
+        if config.debug > 0 {
+            eprintln!("Session {}: connect service succeeded", self.handle.name);
         }
+        if let Some(endpoint) = connection.endpoint() {
+            self.report_connected(&identity, &endpoint);
+        }
+        // C reads each capability on its own and keeps its default when the
+        // read fails, with no print (`SessionOpen62541.cpp:2447-2484`).
+        self.server = connection.server_info().await.unwrap_or_default();
+        let type_tree = connection.type_tree().await.ok();
 
         self.rebuild_node_ids();
         self.register_nodes(&connection).await;
@@ -414,7 +576,6 @@ impl SessionWorker {
         *self.handle.status.lock() = ConnectionStatus::Up;
 
         self.start_subscriptions(&connection).await;
-        log::info!("session {} is up", self.handle.name);
         Ok(())
     }
 
@@ -423,6 +584,10 @@ impl SessionWorker {
         let Some(connection) = self.connection.clone() else {
             return ServeOutcome::Disconnected;
         };
+        // open62541's background connectivity check: one Read of the server
+        // state at a time, the next one an interval after the last answer.
+        let mut check = None;
+        let mut next_check = Instant::now() + CONNECTIVITY_CHECK_INTERVAL;
         loop {
             let flush_at = self.next_flush();
             tokio::select! {
@@ -433,7 +598,9 @@ impl SessionWorker {
                         self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
                         return ServeOutcome::DisconnectRequested;
                     }
-                    Some(Control::Connect) => {}
+                    Some(Control::Connect) => {
+                        eprintln!("Session {} already connected (Activated)", self.handle.name);
+                    }
                     None => return ServeOutcome::Shutdown,
                 },
 
@@ -447,8 +614,40 @@ impl SessionWorker {
                     None => return ServeOutcome::Shutdown,
                 },
 
+                _ = tokio::time::sleep_until(next_check.into()), if check.is_none() => {
+                    let connection = connection.clone();
+                    check = Some(Box::pin(async move {
+                        let node = ReadValueId {
+                            node_id: NodeId::new(0, SERVER_STATUS_STATE),
+                            attribute_id: AttributeId::Value as u32,
+                            ..Default::default()
+                        };
+                        connection.read(&[node]).await
+                    }));
+                }
+
+                result = async { check.as_mut().unwrap().await }, if check.is_some() => {
+                    check = None;
+                    next_check = Instant::now() + CONNECTIVITY_CHECK_INTERVAL;
+                    // Only a timed-out check is inactivity
+                    // (`SessionOpen62541::connectionInactive`).
+                    if result.err() == Some(StatusCode::BadTimeout) {
+                        errlog_vprintf(format_args!(
+                            "OPC UA Session {}: server inactive\n",
+                            self.handle.name
+                        ));
+                        self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
+                        return ServeOutcome::Disconnected;
+                    }
+                }
+
                 _ = tokio::time::sleep_until(flush_at.into()), if self.has_pending() => {
                     if !self.flush(&connection).await {
+                        // The ACTIVATED -> CREATED arm (`SessionOpen62541.cpp:2520-2523`).
+                        errlog_vprintf(format_args!(
+                            "OPC UA session {}: disconnected\n",
+                            self.handle.name
+                        ));
                         self.disconnect(&connection, ProcessReason::ConnectionLoss).await;
                         return ServeOutcome::Disconnected;
                     }
@@ -581,7 +780,19 @@ impl SessionWorker {
                 true
             }
             Err(status) => {
-                log::error!("session {}: read failed: {status}", self.handle.name);
+                if is_connection_error(status) {
+                    errlog_vprintf(format_args!(
+                        "OPC UA session {}: (requestRead) beginRead service failed with status {}\n",
+                        self.handle.name,
+                        status_name(status)
+                    ));
+                } else if self.debug() > 0 {
+                    println!(
+                        "Session {}: (readComplete) for read service failed with status {}",
+                        self.handle.name,
+                        status_name(status)
+                    );
+                }
                 for handle in handles {
                     if let Some(item) = items.get(*handle as usize) {
                         item.lock()
@@ -659,7 +870,19 @@ impl SessionWorker {
                 true
             }
             Err(status) => {
-                log::error!("session {}: write failed: {status}", self.handle.name);
+                if is_connection_error(status) {
+                    errlog_vprintf(format_args!(
+                        "OPC UA session {}: (requestWrite) beginWrite service failed with status {}\n",
+                        self.handle.name,
+                        status_name(status)
+                    ));
+                } else if self.debug() > 0 {
+                    println!(
+                        "Session {}: (writeComplete) for write service failed with status {}",
+                        self.handle.name,
+                        status_name(status)
+                    );
+                }
                 for item in &written {
                     item.lock()
                         .set_incoming_event(ProcessReason::WriteFailure, status);
@@ -674,7 +897,9 @@ impl SessionWorker {
     fn rebuild_node_ids(&self) {
         let map = self.handle.config.lock().namespace_map.clone();
         let mut remap: HashMap<u16, u16> = HashMap::new();
-        for (local, uri) in &map {
+        // An unread namespace array is no mapping to report on, as in C.
+        let read = !self.server.namespace_array.is_empty();
+        for (local, uri) in map.iter().filter(|_| read) {
             match self
                 .server
                 .namespace_array
@@ -684,11 +909,10 @@ impl SessionWorker {
                 Some(index) => {
                     remap.insert(*local, index as u16);
                 }
-                None => log::error!(
-                    "session {}: the server has no namespace '{uri}'; \
-                     items in namespace {local} keep their configured index",
+                None => errlog_vprintf(format_args!(
+                    "OPC UA session {}: locally mapped namespace '{uri}' not found on server\n",
                     self.handle.name
-                ),
+                )),
             }
         }
 
@@ -705,11 +929,8 @@ impl SessionWorker {
     }
 
     /// `RegisterNodes` for the items whose link asked for it
-    /// (`SessionOpen62541::registerNodes`).
-    ///
-    /// The C prints every registered item to stdout unconditionally
-    /// (`SessionOpen62541.cpp:1470` — `it->show(0)` outside any debug guard);
-    /// this logs one line at debug level instead.
+    /// (`SessionOpen62541::registerNodes`), each shown as C does, outside any
+    /// debug guard.
     async fn register_nodes(&self, connection: &Arc<dyn UaConnection>) {
         let items = self.handle.items.lock().clone();
         let to_register: Vec<(usize, NodeId)> = items
@@ -717,7 +938,10 @@ impl SessionWorker {
             .enumerate()
             .filter_map(|(i, item)| {
                 let item = item.lock();
-                item.link.register_node.then(|| (i, item.node_id.clone()))
+                item.link.register_node.then(|| {
+                    println!("{}", item.show_line());
+                    (i, item.node_id.clone())
+                })
             })
             .collect();
         if to_register.is_empty() {
@@ -727,15 +951,22 @@ impl SessionWorker {
         let ids: Vec<NodeId> = to_register.iter().map(|(_, id)| id.clone()).collect();
         match connection.register_nodes(&ids).await {
             Ok(registered) => {
+                if self.debug() > 0 {
+                    println!(
+                        "Session {}: (registerNodes) registerNodes service ok ({} nodes registered)",
+                        self.handle.name,
+                        registered.len()
+                    );
+                }
                 for ((i, _), id) in to_register.iter().zip(registered) {
-                    log::debug!("session {}: registered node {id}", self.handle.name);
                     items[*i].lock().registered_node_id = Some(id);
                 }
             }
-            Err(status) => log::error!(
-                "session {}: registering nodes failed: {status}",
-                self.handle.name
-            ),
+            Err(status) => errlog_vprintf(format_args!(
+                "OPC UA session {}: (registerNodes) registerNodes service failed with status {}\n",
+                self.handle.name,
+                status_name(status)
+            )),
         }
     }
 
@@ -748,10 +979,23 @@ impl SessionWorker {
         for config in &subscriptions {
             let (tx, rx) = mpsc::unbounded_channel();
             let id = match connection.create_subscription(config, tx).await {
-                Ok(id) => id,
+                Ok(id) => {
+                    if config.debug > 0 {
+                        errlog_vprintf(format_args!(
+                            "OPC UA subscription {} on session {} created (Good)\n",
+                            config.name, self.handle.name
+                        ));
+                    }
+                    Some(id)
+                }
                 Err(status) => {
-                    log::error!("subscription {}: create failed: {status}", config.name);
-                    continue;
+                    errlog_vprintf(format_args!(
+                        "OPC UA subscription {}: createSubscription on session {} failed ({})\n",
+                        config.name,
+                        self.handle.name,
+                        status_name(status)
+                    ));
+                    None
                 }
             };
 
@@ -768,41 +1012,79 @@ impl SessionWorker {
                 .map(|item| monitored_item_request(&item.lock()))
                 .collect();
             if !requests.is_empty() {
-                match connection.create_monitored_items(id, requests).await {
-                    Ok(statuses) => {
-                        for (item, status) in monitored.iter().zip(statuses) {
-                            if status.is_bad() {
-                                let item = item.lock();
-                                log::error!(
-                                    "subscription {}: monitoring {} failed: {status}",
-                                    config.name,
-                                    item.node_id
-                                );
-                            }
+                // C creates the items one call each, so a failed batch is every
+                // item failing with its status.
+                // C goes on to add the items of a subscription the server refused;
+                // open62541 then fails each on the unknown subscription id.
+                let refused = |status| {
+                    vec![
+                        MonitoredItemCreateResult {
+                            status_code: status,
+                            ..Default::default()
+                        };
+                        monitored.len()
+                    ]
+                };
+                let results = match id {
+                    Some(id) => connection
+                        .create_monitored_items(id, requests)
+                        .await
+                        .unwrap_or_else(refused),
+                    None => refused(StatusCode::BadSubscriptionIdInvalid),
+                };
+                for (item, result) in monitored.iter().zip(&results) {
+                    let mut item = item.lock();
+                    let status = result.status_code;
+                    if status.is_good() {
+                        item.revised_sampling_interval = result.revised_sampling_interval;
+                        item.revised_queue_size = result.revised_queue_size;
+                        if config.debug >= 5 {
+                            println!(
+                                "** OPC UA record {} monitored item {} succeeded with id {} \
+                                 revised sampling interval {} revised queue size {}",
+                                item.addressing_record(),
+                                item.wire_node_id(),
+                                result.monitored_item_id,
+                                result.revised_sampling_interval,
+                                result.revised_queue_size
+                            );
                         }
+                    } else {
+                        eprintln!(
+                            "OPC UA record {} monitored item {} failed with error {}",
+                            item.addressing_record(),
+                            item.wire_node_id(),
+                            status_name(status)
+                        );
+                        item.set_incoming_event(ProcessReason::ConnectionLoss, status);
                     }
-                    Err(status) => log::error!(
-                        "subscription {}: creating monitored items failed: {status}",
-                        config.name
-                    ),
+                }
+                if config.debug > 0 {
+                    let last = results
+                        .last()
+                        .map_or(StatusCode::Good, |result| result.status_code);
+                    println!(
+                        "Subscription {}@{}: created {} monitored items ({})",
+                        config.name,
+                        self.handle.name,
+                        monitored.len(),
+                        status_name(last)
+                    );
                 }
             }
 
+            if id.is_none() {
+                continue;
+            }
             // One dispatcher task per subscription: every value the server pushes
             // goes to the item its client handle names.
             let items = items.clone();
-            let name = config.name.clone();
             tokio::spawn(async move {
                 let mut rx = rx;
                 while let Some(notification) = rx.recv().await {
-                    match items.get(notification.client_handle as usize) {
-                        Some(item) => item
-                            .lock()
-                            .set_incoming_data(notification.value, ProcessReason::IncomingData),
-                        None => log::error!(
-                            "subscription {name}: a value arrived for the unknown item handle {}",
-                            notification.client_handle
-                        ),
+                    if let Some(item) = items.get(notification.client_handle as usize) {
+                        item.lock()
+                            .set_incoming_data(notification.value, ProcessReason::IncomingData);
                     }
                 }
             });
@@ -881,6 +1163,11 @@ fn monitored_item_request(item: &Item) -> MonitoredItemCreateRequest {
 }
 
 /// Which failures mean the session is gone rather than the request being bad.
+/// C `UA_StatusCode_name`: the code's name without the info bits.
+pub(crate) fn status_name(status: StatusCode) -> &'static str {
+    status.sub_code().name()
+}
+
 fn is_connection_error(status: StatusCode) -> bool {
     matches!(
         status,
@@ -892,4 +1179,75 @@ fn is_connection_error(status: StatusCode) -> bool {
             | StatusCode::BadSecureChannelClosed
             | StatusCode::BadTimeout
     )
+}
+
+/// C `strerror(errno)`: the message without Rust's `(os error N)` suffix.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error") {
+        Some(end) => text[..end].to_string(),
+        None => text,
+    }
+}
+
+/// C `strtoul(s, nullptr, 0)`: leading whitespace, an optional sign, then the
+/// longest prefix in base 16 (`0x`), 8 (`0`) or 10; nothing parsed is 0 and a
+/// minus sign wraps.
+pub(crate) fn strtoul(s: &str) -> u64 {
+    let s = s.trim_start();
+    let (negative, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (radix, digits) = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X"))
+        && hex.starts_with(|c: char| c.is_ascii_hexdigit())
+    {
+        (16, hex)
+    } else if s.starts_with('0') {
+        (8, s)
+    } else {
+        (10, s)
+    };
+    let mut value: u64 = 0;
+    for c in digits.chars() {
+        let Some(d) = c.to_digit(radix) else { break };
+        value = value.saturating_mul(radix as u64).saturating_add(d as u64);
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
+/// C `securitySupportedPolicies`: (URI, short name) of each policy the
+/// client can use, in the client library's order.
+fn supported_security_policies() -> Vec<(&'static str, &'static str)> {
+    use async_opcua::crypto::SecurityPolicy;
+    [
+        SecurityPolicy::None,
+        SecurityPolicy::Basic128Rsa15,
+        SecurityPolicy::Basic256,
+        SecurityPolicy::Basic256Sha256,
+        SecurityPolicy::Aes128Sha256RsaOaep,
+        SecurityPolicy::Aes256Sha256RsaPss,
+    ]
+    .into_iter()
+    .map(|policy| {
+        let uri = policy.to_uri();
+        (uri, uri.rsplit_once('#').map_or(uri, |(_, name)| name))
+    })
+    .collect()
+}
+
+/// C `getYesNo` (`linkParser.cpp:44`).
+pub(crate) fn get_yes_no(c: char) -> Result<bool, String> {
+    if "YyTt1".contains(c) {
+        Ok(true)
+    } else if "NnFf0".contains(c) {
+        Ok(false)
+    } else {
+        Err(format!("illegal value '{c}'"))
+    }
 }

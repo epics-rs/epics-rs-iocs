@@ -18,9 +18,8 @@
 # ISCO*/Vindum* register maps load via dbLoadTemplate (epics-base-rs 0.24.3,
 # registered as a builtin iocsh command) against db/*.substitutions -- ported
 # byte-for-byte from the real upstream ISCO*/Vindum*.substitutions files,
-# with each `file "$(MODBUS)/db/..."` path rewritten to a bare filename
-# (dbLoadTemplate does not macro-expand `file` paths; resolved relative to
-# the .substitutions file's own directory, i.e. db/). See each
+# with each `file "$(MODBUS)/db/..."` path rewritten to
+# `$(SYRINGEPUMP)/db/...`, where the modbus templates are copied. See each
 # db/*.substitutions file's own header for its exact deviations from
 # upstream.
 #

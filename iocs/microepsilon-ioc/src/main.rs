@@ -102,6 +102,8 @@ async fn main() -> CaResult<()> {
                     _ => return Err("ioAddr required".into()),
                 };
 
+                let claim = asyn_record::claim_port(&cfg_port)
+                    .map_err(|e| format!("CapaNCDT6200ConfigInit: {e}"))?;
                 let handle = connect_octet(&io_port, io_addr, COMMAND_TIMEOUT)
                     .map_err(|e| format!("CapaNCDT6200ConfigInit: {e}"))?;
                 let driver = ConfigDriver::new(&cfg_port, handle).map_err(|e| {
@@ -109,14 +111,14 @@ async fn main() -> CaResult<()> {
                 })?;
 
                 let (runtime_handle, _actor_jh) =
-                    create_port_runtime(driver, RuntimeConfig::default())
+                    create_port_runtime(&claim, driver, RuntimeConfig::default())
                         .map_err(|e| format!("CapaNCDT6200ConfigInit: {e}"))?;
-                asyn_record::register_port(
-                    &cfg_port,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        runtime_handle.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
                 // See drivers/microepsilon::data_driver's module doc
                 // (`PortRuntimeHandle` gap note): dropping the last handle
                 // to a port runtime closes its shutdown channel and the

@@ -204,15 +204,18 @@ impl ReaderState {
             disp_sum: [0.0; MAX_CHANNELS],
             disp_sum_count: 0,
             pv_throttle,
-            pv_throttle_counter: pv_throttle,
+            // C's calloc'd `pvThrottleCounter`: the first valid packet pushes.
+            pv_throttle_counter: 0,
             stats: LinkStats::default(),
         }
     }
 }
 
-/// One read attempt's classification, feeding [`apply_read_outcome`].
+/// One pass of `readerThread`'s read loop, classified (`capaNCDT6200Sup.c:400-432`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadOutcome {
+    /// A successful read that has not yet completed a packet.
+    Partial,
     /// `eopReached && preambleOK == 0` (`capaNCDT6200Sup.c:403-408`).
     GoodPacket,
     /// `eopReached && preambleOK != 0` (`capaNCDT6200Sup.c:409-416`).
@@ -223,16 +226,30 @@ pub enum ReadOutcome {
     ReadError,
 }
 
-/// `capaNCDT6200Sup.c:402-443`: update the running health/stat counters for
-/// one read attempt and report the resulting `isCommunicating` state plus
-/// whether `processDataPacket` should run this cycle (`Some(isValid)`), or
-/// not at all (`None`).
-pub fn apply_read_outcome(state: &mut ReaderState, outcome: ReadOutcome) -> Option<bool> {
-    let mut should_process = None;
+/// One pass of `readerThread`'s read loop (`capaNCDT6200Sup.c:400-443`),
+/// in C's order: a good packet is processed while `isCommunicating` still
+/// holds the previous pass's value, and the `badPacketCount` verdict runs
+/// on every pass, a partial read included. `meas_value_counter` and
+/// `chan_values` are the last decoded packet's.
+pub fn read_pass(
+    state: &mut ReaderState,
+    outcome: ReadOutcome,
+    meas_value_counter: u32,
+    chan_values: [f64; MAX_CHANNELS],
+    interrupt_accept: bool,
+) -> Option<PushUpdate> {
+    let mut push = None;
     match outcome {
+        ReadOutcome::Partial => {}
         ReadOutcome::GoodPacket => {
             state.stats.good_count += 1;
-            should_process = Some(true);
+            push = process_data_packet(
+                state,
+                meas_value_counter,
+                chan_values,
+                true,
+                interrupt_accept,
+            );
             state.bad_packet_count = 0;
         }
         ReadOutcome::BadPreamble => {
@@ -254,9 +271,15 @@ pub fn apply_read_outcome(state: &mut ReaderState, outcome: ReadOutcome) -> Opti
         state.read_timeout_secs = 5.0;
     } else if state.bad_packet_count >= 2 {
         state.is_communicating = false;
-        should_process = Some(false);
+        push = process_data_packet(
+            state,
+            meas_value_counter,
+            chan_values,
+            false,
+            interrupt_accept,
+        );
     }
-    should_process
+    push
 }
 
 /// Result of one [`process_data_packet`] call that reached the push stage.
@@ -266,7 +289,7 @@ pub struct PushUpdate {
     pub values: [f64; MAX_CHANNELS],
     /// `isValid` -- `false` means this push came from the
     /// `badPacketCount >= 2` invalid/alarm path (`capaNCDT6200Sup.c:442`),
-    /// and the caller should mark the record COMM_ALARM/INVALID rather
+    /// and the caller should push it as asynError rather
     /// than pushing `values` as good data.
     pub valid: bool,
 }
@@ -471,12 +494,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_read_outcome_good_packet_clears_bad_count_and_communicating() {
-        let mut state = ReaderState::new(5);
+    fn a_good_packet_clears_bad_count_and_communicating() {
+        let mut state = ReaderState::new(1);
         state.bad_packet_count = 3;
         state.is_communicating = false;
-        let outcome = apply_read_outcome(&mut state, ReadOutcome::GoodPacket);
-        assert_eq!(outcome, Some(true));
+        let push = read_pass(&mut state, ReadOutcome::GoodPacket, 1, [0.0; 4], true);
+        assert_eq!(push.map(|p| p.valid), Some(true));
         assert_eq!(state.bad_packet_count, 0);
         assert!(state.is_communicating);
         assert_eq!(state.read_timeout_secs, 5.0);
@@ -484,34 +507,71 @@ mod tests {
     }
 
     #[test]
-    fn apply_read_outcome_single_bad_preamble_does_not_flip_communicating() {
+    fn a_single_bad_preamble_does_not_flip_communicating() {
         let mut state = ReaderState::new(5);
         state.is_communicating = true;
-        let outcome = apply_read_outcome(&mut state, ReadOutcome::BadPreamble);
-        assert_eq!(outcome, None);
+        let push = read_pass(&mut state, ReadOutcome::BadPreamble, 0, [0.0; 4], true);
+        assert_eq!(push, None);
         assert_eq!(state.bad_packet_count, 1);
         assert!(state.is_communicating);
         assert_eq!(state.stats.bad_preamble_count, 1);
     }
 
     #[test]
-    fn apply_read_outcome_second_consecutive_bad_flips_communicating_and_forces_invalid_push() {
+    fn a_second_consecutive_bad_flips_communicating_and_forces_an_invalid_push() {
         let mut state = ReaderState::new(5);
         state.is_communicating = true;
-        apply_read_outcome(&mut state, ReadOutcome::BadPreamble);
-        let outcome = apply_read_outcome(&mut state, ReadOutcome::ReadError);
-        assert_eq!(outcome, Some(false));
+        read_pass(&mut state, ReadOutcome::BadPreamble, 0, [0.0; 4], true);
+        let push = read_pass(&mut state, ReadOutcome::ReadError, 0, [0.0; 4], true);
+        assert_eq!(push.map(|p| p.valid), Some(false));
         assert_eq!(state.bad_packet_count, 2);
         assert!(!state.is_communicating);
         assert_eq!(state.stats.bad_read_count, 1);
     }
 
     #[test]
-    fn apply_read_outcome_timeout_bumps_read_timeout_to_30s() {
+    fn a_timeout_bumps_read_timeout_to_30s() {
         let mut state = ReaderState::new(5);
-        apply_read_outcome(&mut state, ReadOutcome::Timeout);
+        read_pass(&mut state, ReadOutcome::Timeout, 0, [0.0; 4], true);
         assert_eq!(state.read_timeout_secs, 30.0);
         assert_eq!(state.stats.timeout_count, 1);
+    }
+
+    #[test]
+    fn the_first_good_packet_after_a_reconnect_counts_no_gap() {
+        // C processes the packet before `isCommunicating = 1`, so the gap
+        // left by the disconnection is not counted.
+        let mut state = ReaderState::new(1);
+        read_pass(&mut state, ReadOutcome::GoodPacket, 10, [0.0; 4], true);
+        read_pass(&mut state, ReadOutcome::Timeout, 10, [0.0; 4], true);
+        read_pass(&mut state, ReadOutcome::Timeout, 10, [0.0; 4], true);
+        assert!(!state.is_communicating);
+        read_pass(&mut state, ReadOutcome::GoodPacket, 500, [0.0; 4], true);
+        assert!(state.is_communicating);
+        assert_eq!(state.stats.missed_count, 0);
+        assert_eq!(state.stats.out_of_sequence_count, 0);
+    }
+
+    #[test]
+    fn a_partial_read_after_a_reconnect_still_carries_the_bad_verdict() {
+        // `badPacketCount` survives the reconnect, so C's first partial
+        // read pushes invalid and disconnects again.
+        let mut state = ReaderState::new(1);
+        read_pass(&mut state, ReadOutcome::Timeout, 0, [0.0; 4], true);
+        read_pass(&mut state, ReadOutcome::Timeout, 0, [0.0; 4], true);
+        let push = read_pass(&mut state, ReadOutcome::Partial, 0, [0.0; 4], true);
+        assert_eq!(push.map(|p| p.valid), Some(false));
+        assert!(!state.is_communicating);
+    }
+
+    #[test]
+    fn a_partial_read_with_no_bad_packet_marks_the_link_communicating() {
+        let mut state = ReaderState::new(1);
+        assert_eq!(
+            read_pass(&mut state, ReadOutcome::Partial, 0, [0.0; 4], true),
+            None
+        );
+        assert!(state.is_communicating);
     }
 
     #[test]
@@ -587,9 +647,15 @@ mod tests {
     fn process_data_packet_averages_across_throttled_cycles() {
         let mut state = ReaderState::new(2);
         state.is_communicating = true;
-        process_data_packet(&mut state, 1, [10.0, 0.0, 0.0, 0.0], true, true);
-        let update = process_data_packet(&mut state, 2, [20.0, 0.0, 0.0, 0.0], true, true).unwrap();
-        assert_eq!(update.values[0], 15.0);
+        // The first valid packet pushes on its own (C's counter starts at 0).
+        let first = process_data_packet(&mut state, 1, [10.0, 0.0, 0.0, 0.0], true, true).unwrap();
+        assert_eq!(first.values[0], 10.0);
+        assert_eq!(
+            process_data_packet(&mut state, 2, [20.0, 0.0, 0.0, 0.0], true, true),
+            None
+        );
+        let update = process_data_packet(&mut state, 3, [40.0, 0.0, 0.0, 0.0], true, true).unwrap();
+        assert_eq!(update.values[0], 30.0);
         assert!(update.valid);
     }
 

@@ -10,4 +10,3 @@ publish = false
 [dependencies]
 opcua = { path = "../../drivers/opcua" }
 epics-rs = { workspace = true, features = ["bridge"] }
-log = "0.4"

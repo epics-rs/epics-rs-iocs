@@ -7,7 +7,7 @@
 //! initial read covers all of them (`SessionOpen62541::connect` is likewise
 //! driven from an init hook).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_opcua::types::NodeId;
@@ -34,6 +34,12 @@ struct Inner {
     /// The item of each `opcuaItem` record, by record name — what an element
     /// record's link resolves to.
     item_records: HashMap<String, Arc<Mutex<Item>>>,
+    /// Every OPCUA record's type by name, declared as it attaches at load and
+    /// so before any init: what C's `dbFindRecord` + `RTYP` check in
+    /// `linkParser.cpp:213-232` reads, whatever order the records init in.
+    records: HashMap<String, String>,
+    /// `opcuaItem` records whose own init failed (C: `dpvt` left NULL).
+    failed_item_records: HashSet<String>,
 }
 
 /// What a record's device support gets when it binds its link.
@@ -107,7 +113,8 @@ impl Registry {
             .iter_mut()
             .find(|s| s.name == name)
             .expect("the subscription is on the session it was added to");
-        subscription.set_option(key, value)
+        subscription.set_option(key, value);
+        Ok(())
     }
 
     /// `opcuaMapNamespace` (`iocshIntegration.cpp:452-490`).
@@ -156,15 +163,9 @@ impl Registry {
     /// Start every session's worker. Called once, after `iocInit`, so that the
     /// items of every record are in place before the first connection.
     ///
-    /// Deviation, forced by the framework gap in [`Self::bind`]: an element
-    /// record whose link names an `opcuaItem` record that is not in the database
-    /// is reported here rather than refused at init. The C can refuse it, because
-    /// it parses the link as each record is *loaded* (`opcua_add_record` is a
-    /// device support extension, `devOpcua.cpp:88`), by which point every record
-    /// loaded before it is initialized; this port parses at `iocInit`, in an
-    /// order that says nothing about which record was loaded first, so "the item
-    /// record has not bound yet" and "there is no such item record" are only
-    /// distinguishable once every record has bound.
+    /// An element record whose `opcuaItem` record failed its init *after* the
+    /// element bound is reported here: init order is not load order in this
+    /// port, so only now is the item known never to be adopted.
     pub fn start(&self) -> usize {
         let mut inner = self.inner.lock();
         for (name, item) in &inner.item_records {
@@ -172,16 +173,13 @@ impl Registry {
             if item.is_adopted() {
                 continue;
             }
-            let records: Vec<String> = item
-                .leaves
-                .iter()
-                .map(|leaf| leaf.lock().record.clone())
-                .collect();
-            log::error!(
-                "no opcuaItem record '{name}' with OPCUA device support is loaded; \
-                 the records linked to it will never update: {}",
-                records.join(", ")
-            );
+            // C's `add_record` refuses each linking record (`devOpcua.cpp:107`).
+            for leaf in &item.leaves {
+                eprintln!(
+                    "{} Error in add_record : opcuaItemRecord '{name}' was not initialized correctly",
+                    leaf.lock().record
+                );
+            }
         }
 
         let workers = std::mem::take(&mut inner.workers);
@@ -210,6 +208,23 @@ impl Registry {
     /// through [`Self::item_of_record`], and whichever of the two binds first
     /// creates it. The item record's binding is the one that [`Item::adopt`]s it:
     /// gives it its node, its session and its client handle.
+    /// A record with OPCUA device support attached (`set_record_info`).
+    pub fn declare_record(&self, name: &str, record_type: &str) {
+        self.inner
+            .lock()
+            .records
+            .insert(name.to_string(), record_type.to_string());
+    }
+
+    /// An `opcuaItem` record's init failed; element records naming it are
+    /// refused from now on.
+    pub fn item_record_failed(&self, name: &str) {
+        self.inner
+            .lock()
+            .failed_item_records
+            .insert(name.to_string());
+    }
+
     pub fn bind(
         &self,
         record: &str,
@@ -223,6 +238,25 @@ impl Registry {
         )));
 
         if let LinkTarget::ItemRecord(item_record) = &link.target {
+            {
+                let inner = self.inner.lock();
+                match inner.records.get(item_record) {
+                    None => {
+                        return Err(format!(
+                            "unknown subscription/session/opcuaItemRecord '{item_record}'"
+                        ));
+                    }
+                    Some(t) if t != "opcuaItem" => {
+                        return Err(format!("record '{item_record}' is not of type opcuaItem"));
+                    }
+                    _ if inner.failed_item_records.contains(item_record) => {
+                        return Err(format!(
+                            "opcuaItemRecord '{item_record}' was not initialized correctly"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             let item = self.item_of_record(item_record);
             item.lock().leaves.push(leaf.clone());
             return Ok(Binding { item, leaf });

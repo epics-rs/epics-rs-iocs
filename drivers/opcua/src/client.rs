@@ -13,16 +13,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_opcua::client::custom_types::DataTypeTreeBuilder;
-use async_opcua::client::{ClientBuilder, DataChangeCallback, IdentityToken, Session};
+use async_opcua::client::{ClientBuilder, IdentityToken, Session, SubscriptionCallbacks};
+use async_opcua::crypto::SecurityPolicy;
 use async_opcua::types::{
-    DataValue, MessageSecurityMode, MonitoredItemCreateRequest, NodeId, ReadValueId, StatusCode,
-    TimestampsToReturn, Variant, WriteValue, custom::DataTypeTree,
+    DataValue, EndpointDescription, MessageSecurityMode, MonitoredItemCreateRequest,
+    MonitoredItemCreateResult, NodeId, ReadValueId, StatusCode, TimestampsToReturn, Variant,
+    WriteValue, custom::DataTypeTree,
 };
 use async_trait::async_trait;
+use epics_rs::base::runtime::log::errlog_vprintf;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::session::SessionConfig;
+use crate::session::{SessionConfig, status_name};
 use crate::subscription::SubscriptionConfig;
 
 /// Where the PKI file store lives when neither the client nor the session says.
@@ -76,23 +79,29 @@ pub trait UaConnection: Send + Sync {
         &self,
         subscription_id: u32,
         items: Vec<MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode>;
+    ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode>;
     async fn disconnect(&self);
+    /// The endpoint the session runs on, as the server described it.
+    fn endpoint(&self) -> Option<EndpointDescription> {
+        None
+    }
 }
 
 /// Opens sessions. The driver holds one; a test holds a double.
 #[async_trait]
 pub trait UaConnector: Send + Sync {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String>;
+    async fn connect(
+        &self,
+        config: &SessionConfig,
+        identity: &Identity,
+    ) -> Result<Arc<dyn UaConnection>, String>;
 }
 
 /// The `async-opcua` client.
 ///
-/// Accepted-and-documented: the C's `sec-id`/`ident-file` option selects an
-/// identity from a credentials file and its `opcuaSaveRejected` command writes
-/// rejected server certificates to a directory. `async-opcua` owns its own PKI
-/// (`pki_dir`, with `rejected/` and `trusted/` beneath it) and takes the identity
-/// directly, so the identity is configured here as an [`Identity`] and the
+/// Accepted-and-documented: the C's `opcuaSaveRejected` command writes rejected
+/// server certificates to a directory. `async-opcua` owns its own PKI
+/// (`pki_dir`, with `rejected/` and `trusted/` beneath it), so the
 /// rejected-certificate directory is fixed by the PKI layout instead of being
 /// separately settable.
 pub struct AsyncOpcuaConnector {
@@ -154,7 +163,11 @@ impl Default for AsyncOpcuaConnector {
 
 #[async_trait]
 impl UaConnector for AsyncOpcuaConnector {
-    async fn connect(&self, config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        config: &SessionConfig,
+        identity: &Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         // The session's own options win over the client-wide ones; what neither
         // sets falls back to the `async-opcua` default PKI location.
         let client = self.security();
@@ -182,23 +195,39 @@ impl UaConnector for AsyncOpcuaConnector {
             builder = builder.private_key_path(key);
         }
 
-        let mut client = builder
-            .client()
-            .map_err(|errors| format!("client configuration is invalid: {}", errors.join(", ")))?;
+        let mut client = builder.client().map_err(|errors| {
+            format!(
+                "security discovery and setup failed with status {}",
+                errors.join(", ")
+            )
+        })?;
 
-        let endpoint = config.endpoint_description();
-        let identity = config.identity.token()?;
-        let (session, event_loop) = client
-            .connect_to_matching_endpoint(endpoint, identity)
-            .await
-            .map_err(|e| format!("connecting to {} failed: {e}", config.url))?;
+        let identity = identity.token()?;
+        let connected = if config.security_mode == SecurityMode::None {
+            client.connect_to_endpoint_directly(config.unsecured_endpoint(), identity)
+        } else {
+            let endpoints = client
+                .get_server_endpoints_from_url(config.url.as_str())
+                .await
+                .map_err(|_| "security discovery and setup failed with status cantConnect")?;
+            let endpoint = config
+                .select_endpoint(&endpoints)
+                .ok_or("security discovery and setup failed with status noMatchingEndpoint")?;
+            client.connect_to_endpoint_directly(endpoint, identity)
+        };
+        let (session, event_loop) = connected.map_err(|e| {
+            format!(
+                "connect service failed with status {}",
+                status_name(e.status())
+            )
+        })?;
 
         let handle = event_loop.spawn();
         session
             .wait_for_connection()
             .await
             .then_some(())
-            .ok_or_else(|| format!("session to {} did not come up", config.url))?;
+            .ok_or_else(|| "connect service failed (session did not activate)".to_string())?;
 
         Ok(Arc::new(AsyncOpcuaConnection {
             session,
@@ -276,6 +305,7 @@ impl UaConnection for AsyncOpcuaConnection {
         config: &SubscriptionConfig,
         sink: mpsc::UnboundedSender<Notification>,
     ) -> Result<u32, StatusCode> {
+        let name = config.name.clone();
         self.session
             .create_subscription(
                 Duration::from_secs_f64(config.publishing_interval / 1000.0),
@@ -284,14 +314,24 @@ impl UaConnection for AsyncOpcuaConnection {
                 config.max_notifications_per_publish,
                 config.priority,
                 true,
-                DataChangeCallback::new(move |value, item| {
-                    // The channel is closed only when the driver is shutting the
-                    // session down, so a failed send is not worth logging.
-                    let _ = sink.send(Notification {
-                        client_handle: item.client_handle(),
-                        value,
-                    });
-                }),
+                SubscriptionCallbacks::new(
+                    // `SubscriptionOpen62541::subscriptionStatusChanged`.
+                    move |change| {
+                        errlog_vprintf(format_args!(
+                            "Subscription {name} status changed to {}\n",
+                            status_name(change.status)
+                        ))
+                    },
+                    move |value, item| {
+                        // The channel is closed only when the driver is shutting the
+                        // session down, so a failed send is not worth logging.
+                        let _ = sink.send(Notification {
+                            client_handle: item.client_handle(),
+                            value,
+                        });
+                    },
+                    |_, _| {},
+                ),
             )
             .await
     }
@@ -300,20 +340,40 @@ impl UaConnection for AsyncOpcuaConnection {
         &self,
         subscription_id: u32,
         items: Vec<MonitoredItemCreateRequest>,
-    ) -> Result<Vec<StatusCode>, StatusCode> {
+    ) -> Result<Vec<MonitoredItemCreateResult>, StatusCode> {
         let created = self
             .session
             .create_monitored_items(subscription_id, TimestampsToReturn::Both, items)
             .await?;
-        Ok(created.iter().map(|item| item.result.status_code).collect())
+        Ok(created.into_iter().map(|item| item.result).collect())
     }
 
     async fn disconnect(&self) {
         let _ = self.session.disconnect().await;
     }
+
+    fn endpoint(&self) -> Option<EndpointDescription> {
+        Some(self.session.endpoint_info().endpoint.clone())
+    }
 }
 
-/// How the client authenticates (`sec-id`, `SessionOpen62541.cpp:159-260`).
+/// C `Session::securityPolicyString`.
+pub fn security_policy_string(uri: &str) -> String {
+    if uri.is_empty() {
+        return "None".to_string();
+    }
+    let Some((_, name)) = uri.rsplit_once('#') else {
+        return "Invalid".to_string();
+    };
+    if SecurityPolicy::from_uri(uri) == SecurityPolicy::Unknown {
+        format!("{name} (unsupported)")
+    } else {
+        name.to_string()
+    }
+}
+
+/// How the client authenticates: what
+/// [`SessionConfig::setup_identity`] read from the `sec-id` credentials file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Identity {
     #[default]
@@ -330,15 +390,6 @@ pub enum Identity {
 }
 
 impl Identity {
-    /// What `opcuaShowSecurity` prints. A password is never shown.
-    pub fn describe(&self) -> String {
-        match self {
-            Identity::Anonymous => "anonymous".to_string(),
-            Identity::UserName { user, .. } => format!("username '{user}'"),
-            Identity::Certificate { certificate, .. } => format!("certificate '{certificate}'"),
-        }
-    }
-
     fn token(&self) -> Result<IdentityToken, String> {
         Ok(match self {
             Identity::Anonymous => IdentityToken::Anonymous,
@@ -349,7 +400,7 @@ impl Identity {
                 certificate,
                 private_key,
             } => IdentityToken::new_x509_path(certificate, private_key)
-                .map_err(|e| format!("reading the identity certificate failed: {e}"))?,
+                .map_err(|e| format!("loading client certificate {certificate} failed: {e}"))?,
         })
     }
 }

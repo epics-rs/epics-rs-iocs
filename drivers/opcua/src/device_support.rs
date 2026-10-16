@@ -44,6 +44,7 @@ use std::time::SystemTime;
 
 use async_opcua::types::Variant;
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf, PropertyPost,
@@ -174,6 +175,8 @@ struct EnumState {
 pub struct OpcuaDevice {
     registry: Arc<Registry>,
     link_text: String,
+    /// The record type the factory saw, declared to the registry at attach.
+    record_type: String,
     record_name: String,
     op: Op,
     is_output: bool,
@@ -195,10 +198,11 @@ pub struct OpcuaDevice {
 }
 
 impl OpcuaDevice {
-    pub fn new(registry: Arc<Registry>, link_text: String) -> Self {
+    pub fn new(registry: Arc<Registry>, link_text: String, record_type: &str) -> Self {
         Self {
             registry,
             link_text,
+            record_type: record_type.to_string(),
             record_name: String::new(),
             op: Op::Int32,
             is_output: false,
@@ -354,7 +358,7 @@ impl OpcuaDevice {
         let outgoing = match self.outgoing_value(record, &incoming, choices.as_deref()) {
             Ok(v) => v,
             Err(e) => {
-                log::error!("{}: cannot write: {e}", self.record_name);
+                errlog_vprintf(format_args!("{} : {e}\n", self.record_name));
                 self.alarm = Some((WRITE_ALARM, INVALID));
                 return Ok(());
             }
@@ -381,7 +385,15 @@ impl OpcuaDevice {
         incoming: &Variant,
         choices: Option<&EnumChoices>,
     ) -> Result<Variant, String> {
-        let err = |e: value::ConvError| e.to_string();
+        // C's outgoing wording (`DataElementOpen62541Leaf.h:1088-1135`).
+        let err = |e: value::ConvError| match e {
+            value::ConvError::Unsupported { from, to } => {
+                format!("unsupported conversion from {from} to {to} for outgoing data")
+            }
+            value::ConvError::OutOfRange { .. } => "value out of range".to_string(),
+            value::ConvError::NotAnArray => "OPC UA data type is not an array".to_string(),
+            other => other.to_string(),
+        };
         match self.op {
             Op::Int32 => value::write_scalar(long(record, "VAL")?, incoming, choices).map_err(err),
             Op::Int64 => value::write_scalar(int64(record, "VAL")?, incoming, choices).map_err(err),
@@ -443,13 +455,6 @@ impl OpcuaDevice {
     /// One update the record popped.
     fn deliver(&mut self, update: Update, record: &mut dyn Record) -> CaResult<DeviceReadOutcome> {
         self.timestamp = Some(update.timestamp);
-        if update.overrides > 0 {
-            log::warn!(
-                "{}: {} update(s) lost, the record's queue overran",
-                self.record_name,
-                update.overrides
-            );
-        }
 
         match update.reason {
             ProcessReason::ReadFailure => {
@@ -470,11 +475,6 @@ impl OpcuaDevice {
             ProcessReason::WriteRequest => {
                 if self.is_output {
                     self.send(record)?;
-                } else {
-                    log::warn!(
-                        "{}: bini=write has nothing to write on an input record",
-                        self.record_name
-                    );
                 }
                 // The C's `reason == writeRequest` arm is the write branch of
                 // the write dset — it requests the write and pops nothing.
@@ -518,7 +518,7 @@ impl OpcuaDevice {
         match self.store(&data, choices.as_deref(), record) {
             Ok(outcome) => Ok(outcome),
             Err(e) => {
-                log::error!("{}: incoming data unusable: {e}", self.record_name);
+                errlog_vprintf(format_args!("{} : {e}\n", self.record_name));
                 self.alarm = Some((READ_ALARM, INVALID));
                 // The C clears UDF even on a failed conversion: the scalar
                 // template cleared it at the pop and the array overload clears
@@ -605,7 +605,15 @@ impl OpcuaDevice {
         if !self.enums.values_defined {
             // Without state values the raw value *is* the state index: the C
             // returns 2 ("don't convert") and sets both fields
-            // (`devOpcua.cpp:766-770`, `:823-828`).
+            // (`devOpcua.cpp:766-770`, `:823-828`). mbbo masks and shifts RVAL
+            // in place first (`:813-816`); mbbi does not.
+            let raw = if self.is_output {
+                (raw & ulong(record, "MASK")?)
+                    .checked_shr(ulong(record, "SHFT")?)
+                    .unwrap_or(0)
+            } else {
+                raw
+            };
             put(record, "RVAL", EpicsValue::ULong(raw))?;
             let index = u16::try_from(raw).unwrap_or(u16::MAX);
             put(record, "VAL", EpicsValue::Enum(index))?;
@@ -770,17 +778,9 @@ impl OpcuaDevice {
         put(record, "VAL", EpicsValue::Double(value))?;
         Ok(DeviceReadOutcome::computed(DeviceUdf::Defined))
     }
-}
 
-impl DeviceSupport for OpcuaDevice {
-    fn dtyp(&self) -> &str {
-        DTYP
-    }
-
-    // Every C++ init failure is a `CATCH()` that returns an `S_*` status
-    // (`devOpcua.cpp:106-108`), never touching pact — the record scans on:
-    // the `Err` shape, kept by every `?` below.
-    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+    /// C `init_record` for this record: parse and bind its link.
+    fn bind_link(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
         let record_type = record.record_type();
         let (op, is_output) = Op::of(record_type).ok_or_else(|| {
             CaError::LinkError(format!(
@@ -796,18 +796,9 @@ impl DeviceSupport for OpcuaDevice {
             is_item_record: op == Op::Item,
         };
         let defaults = InfoDefaults::from_info(&self.info);
+        defaults.warn_deprecated(&self.record_name);
         let link = parse_link(&self.link_text, kind, &defaults, &*self.registry)
             .map_err(|e| CaError::LinkError(format!("{}: {e}", self.record_name)))?;
-
-        // `bini=write` is what an output record's own value is for; an input
-        // record has nothing to write. An item record does: its elements' values,
-        // which go out as one structure.
-        if link.bini == Bini::Write && !is_output && op != Op::Item {
-            log::warn!(
-                "{}: bini=write on the input record type '{record_type}'",
-                self.record_name
-            );
-        }
 
         let names = (
             link.session().unwrap_or_default().to_string(),
@@ -862,9 +853,27 @@ impl DeviceSupport for OpcuaDevice {
         }
         Ok(DeviceInitOutcome::ok())
     }
+}
+
+impl DeviceSupport for OpcuaDevice {
+    fn dtyp(&self) -> &str {
+        DTYP
+    }
+
+    // Every C++ init failure is a `CATCH()` that returns an `S_*` status
+    // (`devOpcua.cpp:106-108`), never touching pact — the record scans on:
+    // the `Err` shape, kept by every `?` below.
+    fn init(&mut self, record: &mut dyn Record) -> CaResult<DeviceInitOutcome> {
+        let outcome = self.bind_link(record);
+        if outcome.is_err() && record.record_type() == "opcuaItem" {
+            self.registry.item_record_failed(&self.record_name);
+        }
+        outcome
+    }
 
     fn set_record_info(&mut self, name: &str, _scan: ScanType) {
         self.record_name = name.to_string();
+        self.registry.declare_record(name, &self.record_type);
     }
 
     fn apply_record_info(&mut self, info: &HashMap<String, String>) {
@@ -1201,9 +1210,10 @@ pub fn factory(
         // The link text is the db field verbatim, so an INST_IO link still
         // carries its leading '@'.
         let link_text = raw.strip_prefix('@').unwrap_or(raw).trim();
-        Some(
-            Box::new(OpcuaDevice::new(registry.clone(), link_text.to_string()))
-                as Box<dyn DeviceSupport>,
-        )
+        Some(Box::new(OpcuaDevice::new(
+            registry.clone(),
+            link_text.to_string(),
+            ctx.record_type,
+        )) as Box<dyn DeviceSupport>)
     }
 }

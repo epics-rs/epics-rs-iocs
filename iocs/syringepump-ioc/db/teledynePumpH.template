@@ -3,7 +3,8 @@
 # Int32/Float64/Octet device support against `syringepump`'s
 # `TeledyneDriver` (`Family::H`, see `syringepump::driver`). PV names and
 # instantiation macros are unchanged from upstream -- only DTYP/INP/OUT
-# wiring changed. Upstream unit ($(u=6)) is fixed once per driver
+# wiring changed, plus SetRefillRateSend/SetDigitalSend, the asyn outputs
+# the two stream calcouts now write through. Upstream unit ($(u=6)) is fixed once per driver
 # instance by `TeledyneHInit`, not a per-link macro.
 #
 # Unlike teledynePumpD.template, this file's own PressSeq/MaxFlowSeq
@@ -41,7 +42,7 @@
 #     search, same as BDetStatus -- no reference implementation
 #     to port, so none is fabricated). Ported as-is: the SNAM reference
 #     is preserved unresolved: the raw stringin readback above each PARSE
-#     record (already wired to `GetVol`/`GetPress`/etc via asynOctet) is
+#     record (already wired to `GetVol`/`GetPress`/etc via asynOctetRead) is
 #     this port's functional readback path; the derived *Format ai
 #     records below each PARSE step stay permanently unpopulated,
 #     matching upstream's own non-functional behavior.
@@ -160,7 +161,7 @@ record(seq, "$(s):$(ta):$(ss):Scanner") {
 ######################################################################
 
 record(stringin, "$(s):$(ta):$(ss):Vol") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetRead")
    field(INP, "@asyn($(PORT),0) GetVol")
    field(FLNK, "$(s):$(ta):$(ss):VolPARSE")
 
@@ -191,7 +192,7 @@ record(ai, "$(s):$(ta):$(ss):VolFormat")
 ######################################################################
 
 record(stringin, "$(s):$(ta):$(ss):Pressure") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetRead")
    field(INP,  "@asyn($(PORT),0) GetPress")
    field(FLNK, "$(s):$(ta):$(ss):PressurePARSE")
 }
@@ -219,7 +220,7 @@ record(ai, "$(s):$(ta):$(ss):PressureFormat")
 #Subroutine call to format Pressure SP readback
 ######################################################################
 record(stringin,"$(s):$(ta):$(ss):PressSet_RBV") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetSetPress")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):PressSetPARSE")
@@ -247,7 +248,7 @@ record(ai, "$(s):$(ta):$(ss):PressSetFormat")
 #Subroutine call to format Flow SP readback
 ####################################################################
 record(stringin,"$(s):$(ta):$(ss):Flow") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetFlow")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):FlowPARSE")
@@ -275,7 +276,7 @@ record(ai, "$(s):$(ta):$(ss):FlowFormat")
 #Subroutine call to format MaxFlow_RBV readback
 ####################################################################
 record(stringin,"$(s):$(ta):$(ss):MaxFlow_RBV") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetMFlow")
     info(archive, "Monitor, 00:00:01, VAL")
     field(FLNK, "$(s):$(ta):$(ss):MaxFlow_RBVPARSE")
@@ -304,20 +305,20 @@ record(ai, "$(s):$(ta):$(ss):MaxFlow_RBVFormat")
 
 ####################################################################
 record(stringin, "$(s):$(ta):$(ss):Status") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetStatus")
 }
 
 
 
 record(stringin, "$(s):$(ta):$(ss):Units") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetUnit")
     field(SCAN, "1 second")
 }
 
 record(stringin, "$(s):$(ta):$(ss):Mode") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetMode")
     field(SCAN, "1 second")
 }
@@ -325,7 +326,7 @@ record(stringin, "$(s):$(ta):$(ss):Mode") {
 
 
 record(stringin, "$(s):$(ta):$(ss):ID") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetID")
     field(SCAN, "1 second")
 }
@@ -338,14 +339,14 @@ record(stringin, "$(s):$(ta):$(ss):ID") {
 # directly; writing this record processes CmdReply via FLNK, which
 # re-reads the cached reply.
 record(stringout, "$(s):$(ta):$(ss):Command") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetWrite")
    field(OUT, "@asyn($(PORT),0) SendCmd")
    field(FLNK, "$(s):$(ta):$(ss):CmdReply")
 
 }
 
 record(waveform, "$(s):$(ta):$(ss):CmdReply") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetRead")
    field(INP,  "@asyn($(PORT),0) SendCmd")
    field(FTVL, "CHAR")
    field(NELM, "80")
@@ -407,14 +408,20 @@ record(ao,"$(s):$(ta):$(ss):SetRefillRate") {
 }
 
 
+# asyn has no calcout device support (stream does), so the calcout writes
+# through SetRefillRateSend, as PressSend does for PressSet.
 record(calcout, "$(s):$(ta):$(ss):SetRefillRateCalc") {
   field(INPA, "$(s):$(ta):$(ss):SetRefillRate CP")
   field(CALC, "A*10")
   field(DOPT, "Use CALC")
-  field(OUT, "@asyn($(PORT),0) SetRefillRate")
-  field(DTYP, "asynFloat64")
+  field(OUT, "$(s):$(ta):$(ss):SetRefillRateSend PP")
   info(archive, "Monitor, 00:00:01, VAL")
 
+}
+
+record(ao, "$(s):$(ta):$(ss):SetRefillRateSend") {
+  field(DTYP, "asynFloat64")
+  field(OUT, "@asyn($(PORT),0) SetRefillRate")
 }
 
 
@@ -437,11 +444,15 @@ record(calcout, "$(s):$(ta):$(ss):SetDigitalCalc1") {
    field(DESC, "Digital Calc 1")
    field(INPA, "$(s):$(ta):$(ss):SetDigitalOut CP")
    field(CALC, "A")
-   field(DTYP, "asynInt32")
-   field(OUT, "@asyn($(PORT),0) SetDigital")
+   field(OUT, "$(s):$(ta):$(ss):SetDigitalSend PP")
    field(PINI, "NO")
    info(archive, "Monitor, 00:00:01, VAL")
 
+}
+
+record(longout, "$(s):$(ta):$(ss):SetDigitalSend") {
+   field(DTYP, "asynInt32")
+   field(OUT, "@asyn($(PORT),0) SetDigital")
 }
 
 

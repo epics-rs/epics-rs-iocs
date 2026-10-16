@@ -1,10 +1,9 @@
 # Ported from epics-modules/SyringePump/SPApp/Db/VindumWriteCoils.substitutions.
-# `file "$(MODBUS)/db/bo_bit.template"` rewritten to a bare filename resolved
-# relative to this file's own directory (db/) -- dbLoadTemplate does not
-# macro-expand `file` paths.
+# `$(MODBUS)/db/` is `$(SYRINGEPUMP)/db/`: the modbus
+# templates are copied into this directory.
 #
 # These are the bit values for the coil outputs starting at address 0 with function code 5.
-file "bo_bit.template" {
+file "$(SYRINGEPUMP)/db/bo_bit.template" {
 pattern
 {     R,            OFFSET,      ZNAM,    ONAM}
 {A:FillValve,            0,     Close,     Open}

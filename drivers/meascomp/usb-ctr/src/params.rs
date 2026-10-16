@@ -52,19 +52,30 @@ pub struct CtrParams {
     pub mcs_prescale_counter: usize,
     pub mcs_point0_action: usize,
 
-    // MCA-compatible
+    // MCA record (drvMca.h)
     pub mca_start_acquire: usize,
     pub mca_stop_acquire: usize,
     pub mca_erase: usize,
     pub mca_data: usize,
+    pub mca_read_status: usize,
+    pub mca_ch_advance_source: usize,
     pub mca_num_channels: usize,
     pub mca_dwell_time: usize,
-    pub mca_ch_advance_source: usize,
+    pub mca_preset_live: usize,
     pub mca_preset_real: usize,
-    pub mca_acquiring: usize,
-    pub mca_elapsed_real: usize,
-    pub mca_elapsed_live: usize,
+    pub mca_preset_counts: usize,
+    pub mca_preset_low_channel: usize,
+    pub mca_preset_high_channel: usize,
+    pub mca_preset_sweeps: usize,
+    pub mca_acquire_mode: usize,
+    pub mca_sequence: usize,
     pub mca_prescale: usize,
+    pub mca_acquiring: usize,
+    pub mca_elapsed_live: usize,
+    pub mca_elapsed_real: usize,
+    pub mca_elapsed_counts: usize,
+
+    pub model: usize,
 }
 
 impl CtrParams {
@@ -105,18 +116,57 @@ impl CtrParams {
             mcs_prescale_counter: base.create_param("MCS_PRESCALE_COUNTER", ParamType::Int32)?,
             mcs_point0_action: base.create_param("MCS_POINT0_ACTION", ParamType::Int32)?,
 
+            // C's order and drvMca.h's strings.
             mca_start_acquire: base.create_param("MCA_START_ACQUIRE", ParamType::Int32)?,
             mca_stop_acquire: base.create_param("MCA_STOP_ACQUIRE", ParamType::Int32)?,
             mca_erase: base.create_param("MCA_ERASE", ParamType::Int32)?,
             mca_data: base.create_param("MCA_DATA", ParamType::Int32Array)?,
+            mca_read_status: base.create_param("MCA_READ_STATUS", ParamType::Int32)?,
+            mca_ch_advance_source: base.create_param("MCA_CH_ADV_SOURCE", ParamType::Int32)?,
             mca_num_channels: base.create_param("MCA_NUM_CHANNELS", ParamType::Int32)?,
             mca_dwell_time: base.create_param("MCA_DWELL_TIME", ParamType::Float64)?,
-            mca_ch_advance_source: base.create_param("MCA_CH_ADVANCE_SOURCE", ParamType::Int32)?,
-            mca_preset_real: base.create_param("MCA_PRESET_REAL_TIME", ParamType::Float64)?,
-            mca_acquiring: base.create_param("MCA_ACQUIRING", ParamType::Int32)?,
-            mca_elapsed_real: base.create_param("MCA_ELAPSED_REAL_TIME", ParamType::Float64)?,
-            mca_elapsed_live: base.create_param("MCA_ELAPSED_LIVE_TIME", ParamType::Float64)?,
+            mca_preset_live: base.create_param("MCA_PRESET_LIVE", ParamType::Float64)?,
+            mca_preset_real: base.create_param("MCA_PRESET_REAL", ParamType::Float64)?,
+            mca_preset_counts: base.create_param("MCA_PRESET_COUNTS", ParamType::Float64)?,
+            mca_preset_low_channel: base
+                .create_param("MCA_PRESET_LOW_CHANNEL", ParamType::Int32)?,
+            mca_preset_high_channel: base
+                .create_param("MCA_PRESET_HIGH_CHANNEL", ParamType::Int32)?,
+            mca_preset_sweeps: base.create_param("MCA_PRESET_SWEEPS", ParamType::Int32)?,
+            mca_acquire_mode: base.create_param("MCA_ACQUIRE_MODE", ParamType::Int32)?,
+            mca_sequence: base.create_param("MCA_SEQUENCE", ParamType::Int32)?,
             mca_prescale: base.create_param("MCA_PRESCALE", ParamType::Int32)?,
+            mca_acquiring: base.create_param("MCA_ACQUIRING", ParamType::Int32)?,
+            mca_elapsed_live: base.create_param("MCA_ELAPSED_LIVE", ParamType::Float64)?,
+            mca_elapsed_real: base.create_param("MCA_ELAPSED_REAL", ParamType::Float64)?,
+            mca_elapsed_counts: base.create_param("MCA_ELAPSED_COUNTS", ParamType::Float64)?,
+
+            // C creates the SCALER_* drvInfo here; the scaler record reaches
+            // this driver through CtrScalerDriver instead.
+            model: base.create_param("MODEL", ParamType::Int32)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::asyn::port::PortFlags;
+
+    #[test]
+    fn the_mca_params_are_c_s_table() {
+        let mut base = PortDriverBase::new("ctr_params", MAX_MCS_COUNTERS, PortFlags::default());
+        let p = CtrParams::create(&mut base).unwrap();
+        // drvUSBCTR.cpp's createParam order: MCA_START_ACQUIRE is the 29th.
+        assert_eq!(p.mca_start_acquire, 28);
+        assert_eq!(p.mca_elapsed_counts, 48);
+        for (name, index) in [
+            ("MCA_CH_ADV_SOURCE", p.mca_ch_advance_source),
+            ("MCA_PRESET_REAL", p.mca_preset_real),
+            ("MCA_ELAPSED_LIVE", p.mca_elapsed_live),
+            ("MCA_ELAPSED_REAL", p.mca_elapsed_real),
+        ] {
+            assert_eq!(base.find_param(name), Some(index), "{name}");
+        }
     }
 }

@@ -759,3 +759,26 @@ record(mca, "MCASOFT") {
         });
     }
 }
+
+/// `mcaSupport.dbd`'s `device(mca,INST_IO,devMcaAsyn,"asynMCA")`; the dset
+/// (`devMcaAsyn.c:89-97`) fills init_record, send_msg and read_array.
+pub static DEV_MCA_ASYN: DevSup = DevSup {
+    name: "devMcaAsyn",
+    choice: ASYN_MCA_DTYP,
+    link_type: DbLinkType::InstIo,
+    dset: Dset::new(6, &[2, 4, 5], false),
+};
+
+/// Bind every `DTYP "asynMCA"` mca record to the port its INP names, and
+/// put `asynMCA` in the mca DTYP menu: a dynamic support adds no menu row,
+/// and mca has none of its own, so without the row `DTYP` reads empty.
+pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
+    register_device_row("mca", &DEV_MCA_ASYN);
+    app.register_dynamic_device_support(|ctx: &DeviceSupportContext| {
+        if ctx.dtyp != ASYN_MCA_DTYP {
+            return None;
+        }
+        let dev = connect(ctx.inp)?;
+        Some(Box::new(dev) as Box<dyn DeviceSupport>)
+    })
+}

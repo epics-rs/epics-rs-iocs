@@ -45,7 +45,11 @@ struct NoConnector;
 
 #[async_trait]
 impl UaConnector for NoConnector {
-    async fn connect(&self, _config: &SessionConfig) -> Result<Arc<dyn UaConnection>, String> {
+    async fn connect(
+        &self,
+        _config: &SessionConfig,
+        _identity: &opcua::client::Identity,
+    ) -> Result<Arc<dyn UaConnection>, String> {
         Err("no server".to_string())
     }
 }
@@ -66,7 +70,7 @@ fn registry() -> Arc<Registry> {
 /// state table it does not know it has.
 fn bind(registry: &Arc<Registry>, record: &mut dyn Record, link: &str) -> OpcuaDevice {
     record.init_record(0).expect("the record initialises");
-    let mut device = OpcuaDevice::new(registry.clone(), link.to_string());
+    let mut device = OpcuaDevice::new(registry.clone(), link.to_string(), record.record_type());
     device.set_record_info("REC", ScanType::IoIntr);
     device.init(record).expect("the link binds");
     device
@@ -556,6 +560,22 @@ fn nobt_and_shft_put_the_mask_over_the_nodes_bit_window() {
 }
 
 #[test]
+fn an_mbbo_without_state_values_reads_back_the_masked_shifted_raw() {
+    // devOpcua.cpp:813-828: mask, shift, then VAL is the shifted RVAL.
+    let registry = registry();
+    let mut record = MbboRecord::new(0);
+    record.put_field("NOBT", EpicsValue::UShort(3)).unwrap();
+    record.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(&mut device, &leaf, &mut record, Variant::UInt32(0x120));
+
+    assert_eq!(field(&record, "RVAL"), EpicsValue::ULong(2));
+    assert_eq!(field(&record, "VAL"), EpicsValue::UShort(2));
+}
+
+#[test]
 fn an_mbbo_value_no_state_carries_is_the_unknown_state() {
     let registry = registry();
     let mut record = MbboRecord::new(0);
@@ -895,7 +915,11 @@ fn an_uncertain_status_code_carries_its_value_with_a_minor_alarm() {
 fn a_record_type_with_no_opc_ua_device_support_is_refused() {
     let registry = registry();
     let mut record = epics_rs::base::server::records::calc::CalcRecord::new("");
-    let mut device = OpcuaDevice::new(registry.clone(), "S ns=2;s=Node monitor=n".to_string());
+    let mut device = OpcuaDevice::new(
+        registry.clone(),
+        "S ns=2;s=Node monitor=n".to_string(),
+        "calc",
+    );
     device.set_record_info("REC", ScanType::Passive);
 
     let err = device

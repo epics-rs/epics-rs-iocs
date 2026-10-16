@@ -232,7 +232,7 @@ record(ai,"$(s):$(ta):$(ss):MaxFlow_RBV") {
     field(PREC, "3")
 }
 record(stringin, "$(s):$(ta):$(ss):Status") {
-    field(DTYP, "asynOctet")
+    field(DTYP, "asynOctetRead")
     field(INP,  "@asyn($(PORT),0) GetStatus")
 }
 
@@ -246,13 +246,13 @@ record(stringin, "$(s):$(ta):$(ss):Status") {
 # string written to it" behavior without the missing subroutine. See
 # this file's header comment and `syringepump::driver`'s module doc.
 record(stringout, "$(s):$(ta):$(ss):Command") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetWrite")
    field(OUT, "@asyn($(PORT),0) SendCmd")
    field(FLNK, "$(s):$(ta):$(ss):CmdReply")
 }
 
 record(waveform, "$(s):$(ta):$(ss):CmdReply") {
-   field(DTYP, "asynOctet")
+   field(DTYP, "asynOctetRead")
    field(INP,  "@asyn($(PORT),0) SendCmd")
    field(FTVL, "CHAR")
    field(NELM, "80")

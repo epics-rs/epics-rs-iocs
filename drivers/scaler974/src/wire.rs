@@ -7,22 +7,16 @@
 //! and the `SET_COUNT_PRESET` command body.
 
 /// C `Scaler974::eventThread` (`drvScaler974.cpp:234-235`):
-/// `sscanf(response, "%d;%d;%d;%d;", &counts[0], &counts[1], &counts[2],
-/// &counts[3]);`. C `sscanf` stops at the first field it cannot convert
-/// (a non-digit where a `%d` is expected, or a literal `;` that doesn't
-/// match the input) and leaves every *remaining* output argument
-/// **uninitialized** -- reading it afterward is undefined behavior. This
-/// substitutes the campaign-standard defined fallback (see
-/// `love::wire::parse_dec`): a field sscanf could not fill is `0`, not
-/// garbage.
-pub fn parse_show_counts(data: &[u8]) -> [i32; 4] {
+/// `sscanf(response, "%d;%d;%d;%d;", &counts[0], ...)` into the thread's
+/// own `counts[]`. `sscanf` stops at the first field it cannot convert and
+/// leaves that field and the rest untouched, so they keep the previous
+/// poll's values.
+pub fn scan_show_counts(data: &[u8], counts: &mut [i32; 4]) {
     let text = String::from_utf8_lossy(data);
-    let mut counts = [0i32; 4];
     let mut rest = text.as_ref();
     for slot in counts.iter_mut() {
-        let (value, after) = match scan_int(rest) {
-            Some(pair) => pair,
-            None => break,
+        let Some((value, after)) = scan_int(rest) else {
+            break;
         };
         *slot = value;
         rest = match after.strip_prefix(';') {
@@ -30,7 +24,6 @@ pub fn parse_show_counts(data: &[u8]) -> [i32; 4] {
             None => break,
         };
     }
-    counts
 }
 
 /// C `sscanf` `%d`: skip leading whitespace, an optional sign, then decimal
@@ -82,30 +75,34 @@ pub fn encode_set_count_preset(preset: u32) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_show_counts_reads_four_semicolon_terminated_fields() {
-        assert_eq!(parse_show_counts(b"1234;5678;91;23;"), [1234, 5678, 91, 23]);
+    fn scan(data: &[u8], prev: [i32; 4]) -> [i32; 4] {
+        let mut counts = prev;
+        scan_show_counts(data, &mut counts);
+        counts
     }
 
     #[test]
-    fn parse_show_counts_defaults_missing_fields_to_zero() {
-        // Only two fields present -- C sscanf stops there; counts[2]/[3]
-        // default to 0 here instead of C's uninitialized-read UB.
-        assert_eq!(parse_show_counts(b"10;20;"), [10, 20, 0, 0]);
-        assert_eq!(parse_show_counts(b""), [0, 0, 0, 0]);
-        assert_eq!(parse_show_counts(b"garbage"), [0, 0, 0, 0]);
+    fn scan_show_counts_reads_four_semicolon_terminated_fields() {
+        assert_eq!(scan(b"1234;5678;91;23;", [0; 4]), [1234, 5678, 91, 23]);
     }
 
     #[test]
-    fn parse_show_counts_stops_at_missing_semicolon() {
-        // "10 20" has no ';' after the first field -> sscanf stops after
-        // converting field 0 only.
-        assert_eq!(parse_show_counts(b"10 20;30;40;"), [10, 0, 0, 0]);
+    fn scan_show_counts_keeps_the_fields_it_cannot_convert() {
+        let prev = [7, 8, 9, 10];
+        assert_eq!(scan(b"10;20;", prev), [10, 20, 9, 10]);
+        assert_eq!(scan(b"", prev), prev);
+        assert_eq!(scan(b"garbage", prev), prev);
     }
 
     #[test]
-    fn parse_show_counts_handles_negative_fields() {
-        assert_eq!(parse_show_counts(b"-1;2;-3;4;"), [-1, 2, -3, 4]);
+    fn scan_show_counts_stops_at_missing_semicolon() {
+        // No ';' after "10": sscanf converts field 0 only.
+        assert_eq!(scan(b"10 20;30;40;", [1, 2, 3, 4]), [10, 2, 3, 4]);
+    }
+
+    #[test]
+    fn scan_show_counts_handles_negative_fields() {
+        assert_eq!(scan(b"-1;2;-3;4;", [0; 4]), [-1, 2, -3, 4]);
     }
 
     #[test]

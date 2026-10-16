@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::base::error::CaResult;
-use epics_rs::scaler::device_support::scaler_asyn::ScalerDriver;
+use epics_rs::scaler::device_support::scaler_asyn::{DoneInterrupt, ScalerDriver};
 use epics_rs::scaler::records::scaler::MAX_SCALER_CHANNELS;
 use meascomp::device::DaqDevice;
 
@@ -22,7 +22,8 @@ use crate::scaler;
 ///
 /// Shares `device` and `state` with the port driver and its poller: the poller
 /// is what advances `ScalerState::counts` and raises `done` while a count is
-/// armed, exactly as it did before this record existed.
+/// armed, exactly as it did before this record existed. Each C `writeInt32`
+/// ends in `callParamCallbacks`, which delivers a changed `scalerDone_`.
 pub struct CtrScalerDriver {
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
@@ -37,9 +38,15 @@ impl CtrScalerDriver {
 impl ScalerDriver for CtrScalerDriver {
     fn reset(&mut self) -> CaResult<()> {
         let dev = self.device.lock().unwrap();
-        let mut st = self.state.lock().unwrap();
-        scaler::reset_scaler(&dev, &mut st.scaler);
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        // C writeInt32 leaves the scaler alone while the MCS runs.
+        if st.mcs.running {
+            return Ok(());
+        }
+        scaler::reset_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);
         st.scaler.presets = [0; MAX_COUNTERS];
+        st.scaler.done.call_callbacks();
         Ok(())
     }
 
@@ -52,35 +59,36 @@ impl ScalerDriver for CtrScalerDriver {
     }
 
     fn write_preset(&mut self, channel: usize, preset: u32) -> CaResult<u32> {
-        if channel < MAX_COUNTERS {
-            self.state.lock().unwrap().scaler.presets[channel] = preset as u64;
+        let mut st = self.state.lock().unwrap();
+        if channel < st.num_counters {
+            st.scaler.presets[channel] = preset as u64;
         }
+        st.scaler.done.call_callbacks();
         Ok(preset)
     }
 
     fn arm(&mut self, start: bool) -> CaResult<()> {
         let dev = self.device.lock().unwrap();
-        let mut st = self.state.lock().unwrap();
-        if start {
-            if let Err(e) = scaler::start_scaler(&dev, &mut st.scaler) {
-                log::error!("start_scaler error: {e}");
-            }
-        } else {
-            scaler::stop_scaler(&dev, &mut st.scaler);
+        let mut guard = self.state.lock().unwrap();
+        let st = &mut *guard;
+        if st.mcs.running {
+            return Ok(());
         }
+        if start {
+            scaler::start_scaler(&dev, &mut st.scaler, st.num_counters, &st.trace);
+        } else {
+            scaler::stop_scaler(&dev, &mut st.scaler, &st.trace);
+        }
+        st.scaler.done.set(0);
+        st.scaler.done.call_callbacks();
         Ok(())
     }
 
-    /// Read-and-clear, as C `devScalerAsyn.c::scaler_done` is: the record polls
-    /// this every process cycle and must see a completed count exactly once.
-    fn done(&mut self) -> bool {
-        let mut st = self.state.lock().unwrap();
-        let done = st.scaler.done;
-        st.scaler.done = false;
-        done
+    fn register_done_interrupt(&mut self, user: DoneInterrupt) {
+        self.state.lock().unwrap().scaler.done.register(user);
     }
 
     fn num_channels(&self) -> usize {
-        MAX_COUNTERS
+        self.state.lock().unwrap().num_counters
     }
 }
