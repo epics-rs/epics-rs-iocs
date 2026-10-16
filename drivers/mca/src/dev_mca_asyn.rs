@@ -43,7 +43,7 @@ use epics_rs::asyn::request::RequestOp;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::ca::server::ioc_app::{DeviceSupportContext, IocApplication};
 
-use mca_rs::record::{McaCommand, McaRecord, McaStatus};
+use mca_rs::record::{McaCommand, McaRecord, McaStatus, commands};
 
 use crate::interface::{ASYN_MCA_DTYP, McaReason};
 
@@ -287,6 +287,21 @@ impl DeviceSupport for DevMcaAsyn {
     fn write(&mut self, _record: &mut dyn Record) -> CaResult<()> {
         Ok(())
     }
+
+    /// The commands the record sends from its own `process()`: C's
+    /// `send_msg(pmca, mcaStopAcquire, NULL)` on a reached ROI preset
+    /// (`mcaRecord.c:797-800`).
+    fn handle_command(
+        &mut self,
+        _record: &mut dyn Record,
+        command: &str,
+        _args: &[EpicsValue],
+    ) -> CaResult<Vec<&'static str>> {
+        if command == commands::STOP_ACQUIRE {
+            let _ = self.send_command(McaCommand::StopAcquire);
+        }
+        Ok(Vec::new())
+    }
 }
 
 /// C `init_record`'s link/port half (`devMcaAsyn.c:141-181`):
@@ -330,4 +345,97 @@ pub fn register_dev_mca_asyn(app: IocApplication) -> IocApplication {
         let dev = connect(ctx.inp)?;
         Some(Box::new(dev) as Box<dyn DeviceSupport>)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+    use epics_rs::base::server::record::Record;
+
+    use super::*;
+
+    /// An asyn MCA driver that logs every int32 write's reason.
+    struct LoggingDriver {
+        base: PortDriverBase,
+        writes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl PortDriver for LoggingDriver {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
+            self.writes.lock().unwrap().push(user.reason);
+            self.base.params.set_int32(user.reason, user.addr, value)
+        }
+    }
+
+    struct Fixture {
+        _runtime: PortRuntimeHandle,
+        dev: DevMcaAsyn,
+        rec: McaRecord,
+        writes: Arc<Mutex<Vec<usize>>>,
+        reasons: [usize; McaReason::COUNT],
+    }
+
+    fn fixture(name: &str) -> Fixture {
+        let mut base = PortDriverBase::new(
+            name,
+            1,
+            PortFlags {
+                multi_device: false,
+                can_block: false,
+                destructible: false,
+            },
+        );
+        let reasons = McaReason::create_params(&mut base).unwrap();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let driver = LoggingDriver {
+            base,
+            writes: Arc::clone(&writes),
+        };
+        let (runtime, _actor) = create_port_runtime(driver, RuntimeConfig::default()).unwrap();
+        let mut dev = DevMcaAsyn {
+            handle: runtime.port_handle().clone(),
+            addr: 0,
+            reasons: [0; McaReason::COUNT],
+        };
+        let mut rec = McaRecord {
+            nmax: 8,
+            nuse: 8,
+            ..Default::default()
+        };
+        rec.init_record(0).unwrap();
+        rec.init_record(1).unwrap();
+        dev.init(&mut rec).unwrap();
+        writes.lock().unwrap().clear();
+        Fixture {
+            _runtime: runtime,
+            dev,
+            rec,
+            writes,
+            reasons,
+        }
+    }
+
+    #[test]
+    fn the_record_stop_command_reaches_the_driver() {
+        let mut f = fixture("MCATESTSTOP");
+        f.dev
+            .handle_command(&mut f.rec, commands::STOP_ACQUIRE, &[])
+            .unwrap();
+        assert_eq!(
+            *f.writes.lock().unwrap(),
+            [f.reasons[McaReason::StopAcquire as usize]]
+        );
+    }
 }
