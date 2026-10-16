@@ -163,22 +163,20 @@ impl Session {
                     }
                 }
             }
+            // A refused start or pause is printed, not thrown (rtde.cpp:458,473);
+            // the caller sees it as a state that did not change.
             rtde::cmd::CONTROL_PACKAGE_START => {
                 if rtde::decode_success(body) {
                     self.state = ConnState::Started;
                 } else {
-                    return Err(UrError::Protocol(
-                        "unable to start RTDE synchronization".into(),
-                    ));
+                    eprintln!("Unable to start synchronization");
                 }
             }
             rtde::cmd::CONTROL_PACKAGE_PAUSE => {
                 if rtde::decode_success(body) {
                     self.state = ConnState::Paused;
                 } else {
-                    return Err(UrError::Protocol(
-                        "unable to pause RTDE synchronization".into(),
-                    ));
+                    eprintln!("Unable to pause synchronization");
                 }
             }
             _ => {}
@@ -504,6 +502,16 @@ mod tests {
             matches!(&err, UrError::VariablesNotFound(v) if v == "robot_mode"),
             "got {err:?}"
         );
+        assert!(!s.is_started());
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_start_is_printed_not_returned() {
+        let (port, jh) =
+            spawn_controller(vec![(rtde::cmd::CONTROL_PACKAGE_START, vec![0])], vec![]);
+        let mut s = session_on(port);
+        s.send_start().unwrap();
         assert!(!s.is_started());
         jh.join().unwrap();
     }
