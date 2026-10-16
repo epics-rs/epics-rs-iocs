@@ -116,17 +116,15 @@ pub fn output_variables(
         for i in 12..=19 {
             vars.push(format!("output_double_register_{}", offset + i));
         }
+    } else if use_upper_range_registers {
+        eprintln!(
+            "Warning! The upper range of the double output registers are only available \
+             on PolyScope versions >3.9 or >5.3"
+        );
     } else {
-        log::warn!(
-            "ur-robot: PolyScope {}.{} is too old for the {} range of output registers; \
-             they will not be published",
-            version.major,
-            version.minor,
-            if use_upper_range_registers {
-                "upper"
-            } else {
-                "lower"
-            }
+        eprintln!(
+            "Warning! The lower range of the double output registers are only available \
+             on PolyScope versions >3.4"
         );
     }
 
