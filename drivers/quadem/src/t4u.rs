@@ -1073,6 +1073,22 @@ struct Build {
     max_memory: usize,
 }
 
+/// The command port, with the line both C++ constructors print after
+/// `drvAsynIPPortConfigure` whatever it returned.
+fn command_port(
+    port_name: &str,
+    host: &str,
+    variant: T4uVariant,
+) -> AsynResult<(OctetIo, PortRuntimeHandle)> {
+    let name = format!("TCP_Command_{port_name}");
+    let port = create_ip_port(&name, host, variant.timeout(), false, false);
+    println!(
+        "Attempted command port: {name} connection to: {host}\nStatus: {}",
+        if port.is_ok() { 0 } else { -1 }
+    );
+    port
+}
+
 /// C++ `drvT4U_EMConfigure(portName, qtHostAddress, ringBufferSize,
 /// base_port_num)`: the Qt middle layer listens for commands on `base_port_num`
 /// and streams data on `base_port_num + 1`.
@@ -1087,12 +1103,10 @@ pub fn create_t4u_em(
     max_memory: usize,
 ) -> AsynResult<T4uRuntime> {
     let variant = T4uVariant::Middle;
-    let (cmd_io, cmd_runtime) = create_ip_port(
-        &format!("TCP_Command_{port_name}"),
+    let (cmd_io, cmd_runtime) = command_port(
+        port_name,
         &format!("{qt_host_address}:{base_port_num}"),
-        variant.timeout(),
-        false,
-        false,
+        variant,
     )?;
     let (data_io, data_runtime) = create_ip_port(
         &format!("TCP_Data_{port_name}"),
@@ -1148,12 +1162,10 @@ pub fn create_t4u_direct_em(
         .checked_sub(1)
         .ok_or_else(|| error("T4U: the UDP data port must be at least 1"))?;
 
-    let (cmd_io, cmd_runtime) = create_ip_port(
-        &format!("TCP_Command_{port_name}"),
+    let (cmd_io, cmd_runtime) = command_port(
+        port_name,
         &format!("{t4u_address}:{}", proto::T4U_CMD_PORT),
-        variant.timeout(),
-        false,
-        false,
+        variant,
     )?;
     let (data_io, data_runtime) = create_ip_port(
         &format!("UDP_Data_{port_name}"),
