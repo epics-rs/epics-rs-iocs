@@ -75,8 +75,8 @@ pub fn anc150_config_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 OUTPUT_EOS,
                 EosRefusal::Ignored,
             )?;
-            let controller =
-                Anc150Controller::new(handle).map_err(|e| format!("ANC150AsynConfig: {e}"))?;
+            let controller = Anc150Controller::new(handle, &asyn_port)
+                .map_err(|e| format!("ANC150AsynConfig: {e}"))?;
             let ident = controller.ident().to_string();
             let controller = Arc::new(Mutex::new(controller));
 

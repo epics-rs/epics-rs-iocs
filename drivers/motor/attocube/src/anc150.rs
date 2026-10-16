@@ -35,9 +35,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
+use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus, OctetStep};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus};
+use epics_rs::asyn::manager::PortManager;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use motor_common::util::nint;
@@ -65,6 +67,8 @@ fn anc_err(message: impl Into<String>) -> AsynError {
 /// The caller holds the `Arc<Mutex<_>>` lock across a write→read exchange.
 pub struct Anc150Controller {
     handle: SyncIOHandle,
+    /// The octet port `pController->pasynUser` prints on.
+    serial_port: String,
     ident: String,
 }
 
@@ -72,9 +76,10 @@ impl Anc150Controller {
     /// Connect and identify an ANC150 (C `ANC150AsynConfig`): probe `ver` up to
     /// three times and require an `attocube …` reply. Performs blocking serial
     /// I/O.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    pub fn new(handle: SyncIOHandle, serial_port: &str) -> AsynResult<Self> {
         let mut ctrl = Self {
             handle,
+            serial_port: serial_port.to_owned(),
             ident: String::new(),
         };
         for _ in 0..3 {
@@ -93,32 +98,76 @@ impl Anc150Controller {
         &self.ident
     }
 
-    /// Send a command and read its prompt-framed response blob (echo, reply,
-    /// ack, ending at the `"> "` input EOS). C sendOnly/sendAndReceive use
-    /// `pasynOctetSyncIO->writeRead`, which flushes a stray reply first.
-    fn exchange(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
-    }
-
-    /// Send a command and discard the reply (C `sendOnly`, which still reads to
-    /// keep the stream synchronized).
+    /// Send a command and discard the reply (C `sendOnly`, which still reads
+    /// to keep the stream synchronized). `writeRead` flushes a stray reply
+    /// first.
     fn send_only(&self, cmd: &str) -> AsynResult<()> {
-        let _ = self.exchange(cmd)?;
-        Ok(())
+        let (sent, e) = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
+            Ok(_) => return Ok(()),
+            Err(e) => (
+                match e.octet_step() {
+                    Some(OctetStep::Read) => cmd.len(),
+                    _ => e.partial_write().unwrap_or(0),
+                },
+                e,
+            ),
+        };
+        let e = if sent == cmd.len() {
+            e
+        } else {
+            anc_err(e.message())
+        };
+        // C formats the command pointer with %d; the text is printed instead.
+        self.print_error(format_args!(
+            "drvANC150Asyn:sendOnly: error sending command {cmd}, sent={sent}, status={}\n",
+            e.status() as i32
+        ));
+        Err(e)
     }
 
-    /// Send a query and return its reply line (C `sendAndReceive`: the reply is
-    /// the second `\r\n`-separated segment, between the echo and the ack).
+    /// Send a query and return its reply line (C `sendAndReceive`): the
+    /// response must open with the echoed command and hold the echo, the
+    /// reply and the ack, each `\r\n`-terminated, or it is asynError.
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        let blob = self.exchange(cmd)?;
-        let mut parts = blob.split("\r\n");
-        let _echo = parts.next();
-        match parts.next() {
-            Some(reply) => Ok(reply.to_string()),
-            None => Err(anc_err("ANC150: malformed reply (no reply line)")),
-        }
+        let e = match self.handle.write_read(0, cmd.as_bytes(), READ_BUF) {
+            Ok(raw) => {
+                if let Some(reply) = parse_reply(cmd, &String::from_utf8_lossy(&raw)) {
+                    return Ok(reply.to_string());
+                }
+                // C prints whatever errorMessage the user last held.
+                anc_err("")
+            }
+            // A failed writeRead keeps its own status in C.
+            Err(e) => e,
+        };
+        self.print_error(format_args!(
+            "drvANC150Asyn:sendAndReceive error calling writeRead, output={cmd} status={}, error={}\n",
+            e.status() as i32,
+            e.message()
+        ));
+        Err(e)
     }
+
+    fn print_error(&self, args: std::fmt::Arguments<'_>) {
+        PortManager::global().trace_manager().print(
+            Some(&self.serial_port),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            args,
+        );
+    }
+}
+
+/// C `sendAndReceive`'s framing: the response opens with the echoed
+/// command and holds the echo, the reply and the ack, each `\r\n`-terminated.
+fn parse_reply<'a>(cmd: &str, blob: &'a str) -> Option<&'a str> {
+    if !blob.starts_with(cmd) {
+        return None;
+    }
+    let (_echo, rest) = blob.split_once("\r\n")?;
+    let (reply, ack) = rest.split_once("\r\n")?;
+    ack.contains("\r\n").then_some(reply)
 }
 
 /// Compute the move plan (C `motorAxisMove`): the step count magnitude, its
@@ -425,6 +474,24 @@ mod tests {
         let (pos, done) = slew(0.0, 10.0, -0.1, 2.0);
         assert_eq!(pos, 10.0);
         assert!(done);
+    }
+
+    /// drvANC150Asyn.cc:835-856.
+    #[test]
+    fn a_reply_needs_the_echo_and_three_lines() {
+        assert_eq!(
+            parse_reply("getf 1", "getf 1\r\nfrequency = 1000\r\nOK\r\n"),
+            Some("frequency = 1000")
+        );
+        assert_eq!(
+            parse_reply("getf 1", "getf 2\r\nfrequency = 1000\r\nOK\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_reply("getf 1", "getf 1\r\nfrequency = 1000\r\nOK"),
+            None
+        );
+        assert_eq!(parse_reply("getf 1", "getf 1\r\n"), None);
     }
 
     #[test]
