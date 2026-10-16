@@ -35,7 +35,7 @@ pub fn eip_printf(level: i32, args: std::fmt::Arguments<'_>) {
     let _ = std::io::stderr().write_fmt(args);
 }
 
-/// `EIP_printf_time`: [`eip_printf`] behind a local `%Y/%m/%d %H:%M:%S.%04f`
+/// `EIP_printf_time`: [`fn@eip_printf`] behind a local `%Y/%m/%d %H:%M:%S.%04f`
 /// stamp.
 pub fn eip_printf_time(level: i32, args: std::fmt::Arguments<'_>) {
     if level > EIP_VERBOSITY.load(Ordering::Relaxed) {
