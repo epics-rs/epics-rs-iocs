@@ -961,6 +961,10 @@ impl PortDriver for TimePix3Driver {
         } else if reason == p.write_data {
             self.file_writer().and_then(|()| self.get_server())
         } else if reason == p.detector_orientation {
+            let value = if (0..8).contains(&value) { value } else { 0 };
+            self.ad
+                .port_base
+                .set_int32_param(p.detector_orientation, 0, value)?;
             self.rotate_layout(value)
         } else if reason == p.bias_volt
             || reason == p.bias_enable
@@ -984,8 +988,21 @@ impl PortDriver for TimePix3Driver {
             || reason == p.i_delay2
             || reason == p.i_delay3
         {
+            if reason == p.gain_mode && !(0..=3).contains(&value) {
+                self.ad.port_base.set_int32_param(p.gain_mode, 0, 0)?;
+            }
+            if reason == p.pixel_depth && ![1, 6, 12, 24].contains(&value) {
+                self.ad.port_base.set_int32_param(p.pixel_depth, 0, 12)?;
+            }
             self.init_acquisition()
         } else if reason == self.ad.params.num_images || reason == self.ad.params.trigger_mode {
+            if reason == self.ad.params.trigger_mode
+                && !(0..serval::TRIGGER_MODES.len() as i32).contains(&value)
+            {
+                self.ad
+                    .port_base
+                    .set_int32_param(self.ad.params.trigger_mode, 0, 0)?;
+            }
             // Single image mode carries exactly one image (C ADTimePix.cpp:519).
             if reason == self.ad.params.num_images
                 && self.int(self.ad.params.image_mode, 0) == 0
@@ -1282,6 +1299,32 @@ mod tests {
             .read_int32_array(&AsynUser::new(p.pixel_config_diff), &mut buf)
             .unwrap();
         assert_eq!((n, buf), (4, [5, 6, 0, 0]));
+    }
+
+    /// An out-of-range GainMode, PixelDepth, TriggerMode or orientation is
+    /// stored as C's default (ADTimePix.cpp:631-634, :649-657, :705-708).
+    #[test]
+    fn an_out_of_range_setting_reads_back_the_default() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_CLAMP",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let trigger_mode = det.ad.params.trigger_mode;
+        for (reason, written, stored) in [
+            (p.gain_mode, 4, 0),
+            (p.pixel_depth, 8, 12),
+            (trigger_mode, 9, 0),
+            (p.detector_orientation, 8, 0),
+        ] {
+            let _ = det.write_int32(&mut AsynUser::new(reason), written);
+            assert_eq!(det.int(reason, 0), stored, "reason {reason}");
+        }
     }
 
     /// The Medipix3 detector settings go to Serval like the Timepix3 ones
