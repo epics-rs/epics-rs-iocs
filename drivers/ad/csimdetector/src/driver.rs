@@ -12,6 +12,7 @@ use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::registry::PortClaim;
 use epics_rs::asyn::runtime::config::RuntimeConfig;
 use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::driver::ndarray_driver::NDArrayDriverBase;
@@ -231,16 +232,34 @@ impl PortDriver for CSimDetector {
 
         self.set_integer_param(addr, reason, value)?;
 
+        let mut status = Ok(());
         if reason == self.nd.acquire {
             self.set_acquire(value);
         } else if self.sim.belongs_to_base(reason) {
             // `asynNDArrayDriver::writeInt32`: the pool parameters act, the rest
             // is just the parameter write already done above.
-            self.write_int32_pool(reason)?;
+            status = self.write_int32_pool(reason).map(drop);
         }
 
-        self.port_base.call_param_callbacks(addr)?;
-        Ok(())
+        let _ = self.port_base.call_param_callbacks(addr);
+        match &status {
+            Err(e) => user.print(
+                TraceMask::ERROR,
+                file!(),
+                line!(),
+                format_args!(
+                    "ADCSimDetector:writeInt32 error, status={} function={reason}, value={value}",
+                    e.status() as i32
+                ),
+            ),
+            Ok(()) => user.print(
+                TraceMask::IO_DRIVER,
+                file!(),
+                line!(),
+                format_args!("ADCSimDetector:writeInt32: function={reason}, value={value}"),
+            ),
+        }
+        status
     }
 
     // `writeFloat64` is not overridden by `ADCSimDetector`, and neither
