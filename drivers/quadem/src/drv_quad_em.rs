@@ -1171,23 +1171,29 @@ async fn do_data_callbacks(ctx: &CallbackContext, num_read: usize) -> bool {
     for s in &samples {
         flat.extend_from_slice(s);
     }
-    let mut all = ctx.pool.wrap(
+    // C dereferences a refused alloc unchecked (drvQuadEM.cpp:333, :351); here
+    // that array is dropped after the pool's limit line.
+    if let Ok(mut all) = ctx.pool.wrap(
         vec![NDDimension::new(QE_MAX_DATA), NDDimension::new(num_read)],
         NDDataBuffer::F64(flat),
-    );
-    all.unique_id = counter;
-    all.timestamp = ts;
-    all.time_stamp = time_stamp;
-    ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
-        .publish(Arc::new(all))
-        .await;
+    ) {
+        all.unique_id = counter;
+        all.timestamp = ts;
+        all.time_stamp = time_stamp;
+        ArrayPublisher::new(ctx.outputs[QE_ADDR_ALL].clone())
+            .publish(Arc::new(all))
+            .await;
+    }
 
     // Addresses 0-10: one [numRead] array per data item.
     for item in 0..QE_MAX_DATA {
         let column: Vec<f64> = samples.iter().map(|s| s[item]).collect();
-        let mut single = ctx
+        let Ok(mut single) = ctx
             .pool
-            .wrap(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column));
+            .wrap(vec![NDDimension::new(num_read)], NDDataBuffer::F64(column))
+        else {
+            continue;
+        };
         single.unique_id = counter;
         single.timestamp = ts;
         single.time_stamp = time_stamp;
