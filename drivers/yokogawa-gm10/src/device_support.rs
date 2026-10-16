@@ -465,17 +465,23 @@ struct Resolved {
 pub struct GmDevice {
     registry: Arc<Registry>,
     link_text: String,
+    /// The C dset of this record type has `get_ioint_info` (input records).
+    has_ioint_info: bool,
     is_io_intr: bool,
     resolved: Option<Resolved>,
+    /// Keeps the never-fired `dummy_ioscanpvt` receiver open.
+    dummy_ioscan: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl GmDevice {
-    fn new(registry: Arc<Registry>, link_text: String) -> Self {
+    fn new(registry: Arc<Registry>, link_text: String, record_type: &str) -> Self {
         Self {
             registry,
             link_text,
+            has_ioint_info: matches!(record_type, "ai" | "bi" | "longin" | "mbbi" | "stringin"),
             is_io_intr: false,
             resolved: None,
+            dummy_ioscan: None,
         }
     }
 
@@ -528,7 +534,15 @@ impl DeviceSupport for GmDevice {
     }
 
     fn io_intr_receiver(&mut self) -> Option<epics_rs::base::runtime::sync::mpsc::Receiver<()>> {
-        let resolved = self.resolved.as_ref()?;
+        let Some(resolved) = self.resolved.as_ref() else {
+            // An invalid input record gets `dummy_ioscanpvt` (`devGM10_ai.c:179-180`).
+            if !self.has_ioint_info {
+                return None;
+            }
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            self.dummy_ioscan = Some(tx);
+            return Some(rx);
+        };
         let category = operation_interrupt_category(resolved.op)?;
         Some(resolved.instrument.register_interrupt(category))
     }
@@ -804,10 +818,11 @@ pub fn factory(
         // has its leading `@` marker. Same strip-and-trim as the framework's
         // own builtin INST_IO devices (e.g. builtin_devices::stdio).
         let link_text = raw.strip_prefix('@').unwrap_or(raw).trim();
-        Some(
-            Box::new(GmDevice::new(registry.clone(), link_text.to_string()))
-                as Box<dyn DeviceSupport>,
-        )
+        Some(Box::new(GmDevice::new(
+            registry.clone(),
+            link_text.to_string(),
+            ctx.record_type,
+        )) as Box<dyn DeviceSupport>)
     }
 }
 
@@ -1315,6 +1330,7 @@ mod tests {
 
     #[test]
     fn failed_init_is_silent_and_inert() {
+        use tokio::sync::mpsc::error::TryRecvError;
         let registry = registry_with("gm10dev", connect_default_fixture());
         let f = factory(registry);
         for (record_type, inp, out) in [
@@ -1334,7 +1350,11 @@ mod tests {
                 device.init(&mut record).unwrap(),
                 DeviceInitOutcome::DoNotConvert(DeviceUdf::Untouched)
             );
-            assert!(device.io_intr_receiver().is_none());
+            let mut io_intr = device.io_intr_receiver();
+            assert_eq!(io_intr.is_some(), record_type == "ai");
+            if let Some(rx) = io_intr.as_mut() {
+                assert!(rx.try_recv().is_err_and(|e| e == TryRecvError::Empty));
+            }
             if record_type == "ai" {
                 assert!(!device.read(&mut record).unwrap().did_compute());
             } else {
