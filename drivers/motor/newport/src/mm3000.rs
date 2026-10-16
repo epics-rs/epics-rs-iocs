@@ -484,39 +484,35 @@ impl Mm3000Axis {
             }
             return self.last_status.clone();
         };
-        self.last_status.comms_error = false;
+        // C writes the MS bits into the status before asking TP, and its
+        // exit stores them even when TP goes unanswered.
         let mstat = MsBits::from_byte(ms.as_bytes()[0]);
+        let s = &mut self.last_status;
+        s.comms_error = false;
+        s.done = !mstat.in_motion;
+        s.moving = mstat.in_motion;
+        s.direction = mstat.direction;
+        s.high_limit = mstat.plus_tl;
+        s.low_limit = mstat.minus_tl;
+        s.home = mstat.home_ls;
+        s.powered = mstat.powered;
 
         let Some(tp) = exchange(&mut ctrl, &format!("{a}TP")) else {
             if ctrl.comm_state == CommState::CommErr {
-                self.last_status.comms_error = true;
-                self.last_status.problem = true;
+                s.comms_error = true;
+                s.problem = true;
             }
-            return self.last_status.clone();
+            return s.clone();
         };
         drop(ctrl);
 
         // C: first space-delimited token, `atof`, cast to integer counts.
         let position = f64::from(nint(atof(tp.split_whitespace().next().unwrap_or(""))));
-
-        self.last_status = MotorStatus {
-            position,
-            encoder_position: if self.encoder_present { position } else { 0.0 },
-            velocity: 0.0, // C: "Parse motor velocity? NEEDS WORK"
-            done: !mstat.in_motion,
-            moving: mstat.in_motion,
-            direction: mstat.direction,
-            high_limit: mstat.plus_tl,
-            low_limit: mstat.minus_tl,
-            home: mstat.home_ls,
-            powered: mstat.powered,
-            problem: false,
-            comms_error: false,
-            gain_support: self.encoder_present,
-            has_encoder: self.encoder_present,
-            ..MotorStatus::default()
-        };
-        self.last_status.clone()
+        s.position = position;
+        s.encoder_position = if self.encoder_present { position } else { 0.0 };
+        s.velocity = 0.0; // C: "Parse motor velocity? NEEDS WORK"
+        s.problem = false;
+        s.clone()
     }
 }
 
@@ -637,6 +633,18 @@ mod tests {
         let s = &axis.last_status;
         assert_eq!(s.position, 1234.0);
         assert!(s.done && s.direction && s.powered && s.has_encoder);
+    }
+
+    /// An unanswered TP is a RETRY, but C's exit still stores the MS bits
+    /// it decoded before asking.
+    #[test]
+    fn a_silent_tp_keeps_the_ms_bits() {
+        let (ctrl, sent) = mm3000_line("mm3000SilentTp", &[("RC", "1=dc"), ("1MS", "%")]);
+        let axis = Mm3000Axis::new(Arc::new(Mutex::new(ctrl)), 1);
+        assert_eq!(*sent.lock().unwrap(), ["1TPE", "1MS", "1TP"]);
+        let s = &axis.last_status;
+        assert!(s.moving && s.direction && s.home && !s.comms_error && !s.problem);
+        assert_eq!(s.position, 0.0);
     }
 
     #[test]
