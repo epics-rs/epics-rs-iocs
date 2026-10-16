@@ -57,9 +57,9 @@ impl MultiFunctionDriver {
         );
         let params = MultiFunctionParams::create(&mut base)?;
 
-        // Defaults
+        // C's ctor defaults (drvMultiFunction.cpp:457-473) and no others:
+        // a param C leaves unset must not override its record's db value.
         base.set_float64_param(params.poll_sleep_ms, 0, 50.0)?;
-        // C's ctor defaults (drvMultiFunction.cpp:457-473).
         base.set_int32_param(params.wave_gen_user_num_points, 0, 1)?;
         base.set_int32_param(params.wave_gen_int_num_points, 0, 1)?;
         base.set_int32_param(params.wave_dig_num_points, 0, 1)?;
@@ -68,19 +68,7 @@ impl MultiFunctionDriver {
         for ch in 0..MAX_ANALOG_OUT as i32 {
             base.set_int32_param(params.analog_out_range, ch, uldaq_sys::BIP10VOLTS)?;
         }
-        base.set_int32_param(params.wave_gen_num_points, 0, max_output_points as i32)?;
-        base.set_float64_param(params.wave_gen_user_dwell, 0, 0.001)?;
-        base.set_float64_param(params.wave_gen_int_dwell, 0, 0.001)?;
-        for ch in 0..MAX_ANALOG_OUT {
-            base.set_int32_param(params.wave_gen_enable, ch as i32, 1)?;
-        }
-        base.set_int32_param(params.wave_dig_num_chans, 0, MAX_ANALOG_IN as i32)?;
-        base.set_int32_param(params.analog_in_mode, 0, uldaq_sys::AI_DIFFERENTIAL)?;
-
         for ch in 0..MAX_ANALOG_IN {
-            base.set_int32_param(params.analog_in_type, ch as i32, 0)?;
-            base.set_int32_param(params.analog_in_range, ch as i32, uldaq_sys::BIP10VOLTS)?;
-            base.set_int32_param(params.temperature_scale, ch as i32, uldaq_sys::TS_CELSIUS)?;
             base.set_int32_param(params.thermocouple_type, ch as i32, uldaq_sys::TC_J)?;
         }
 
