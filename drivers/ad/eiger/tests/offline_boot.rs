@@ -110,6 +110,6 @@ fn the_port_has_cs_eleven_addresses() {
     ));
     assert!(matches!(
         base.get_int32_param(counter, MAX_ASYN_ADDRESS as i32),
-        Err(AsynError::AddressOutOfRange(_))
+        Err(AsynError::ParamInvalidList(_))
     ));
 }
