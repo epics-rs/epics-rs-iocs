@@ -19,7 +19,7 @@ pub const SYNC1: u8 = 0xF5;
 pub const SYNC2: u8 = 0xFA;
 
 /// `DP5Protocol.h enum PID1_TYPE` -- only the values the packets below use.
-mod pid1 {
+pub(crate) mod pid1 {
     pub const REQ_STATUS: u8 = 0x01;
     pub const REQ_SPECTRUM: u8 = 0x02;
     /// `PID1_REQ_SCOPE_MISC` (`DP5Protocol.h:101`) -- used for the
@@ -36,9 +36,9 @@ mod pid1 {
 /// NetFinder-specific PID2 values, kept separate from [`pid2_rcv`] since
 /// they live under a different PID1 namespace
 /// (`PID1_REQ_SCOPE_MISC`/`PID1_RCV_SCOPE_MISC`) and are used only by
-/// [`build_netfinder_direct_request`]/[`parse_netfinder_direct_response_header`]
+/// [`build_netfinder_direct_request`] and `net_finder::parse_direct_response`
 /// (`doAmptekNetFinderPacket`, `ConsoleHelper.cpp:199-261`).
-mod pid2_netfinder {
+pub(crate) mod pid2_netfinder {
     /// `PID2_SEND_NETFINDER_READBACK` (`DP5Protocol.h:137`): the outbound
     /// direct-query request's PID2.
     pub const READBACK_REQUEST: u8 = 0x07;
@@ -202,48 +202,6 @@ pub fn pack_out(pid1: u8, pid2: u8, data: &[u8]) -> Vec<u8> {
 /// test asserting the two produce identical bytes.
 pub fn build_netfinder_direct_request() -> Vec<u8> {
     pack_out(pid1::REQ_SCOPE_MISC, pid2_netfinder::READBACK_REQUEST, &[])
-}
-
-/// `doAmptekNetFinderPacket`'s inbound-response validation
-/// (`ConsoleHelper.cpp:232-252`): check `SYNC1 SYNC2
-/// PID1_RCV_SCOPE_MISC RCVPT_NETFINDER_READBACK`, then return the `LEN`
-/// bytes of DATA following the 6-byte header.
-///
-/// # Preserved upstream quirk
-/// Unlike [`parse_packet`], this does **not** verify the trailing
-/// checksum -- C's `doAmptekNetFinderPacket` never calls
-/// `ParsePacketStatus`/`TestPacketCkSumOK` on this response, it only
-/// checks the 4-byte header and the `LEN < iSize` bound
-/// (`ConsoleHelper.cpp:236-237`) before trusting the payload. Reproduced
-/// as-is rather than silently adding a check the vendor's own reference
-/// client skips, since a firmware quirk that fails this checksum but
-/// still carries a valid discovery reply cannot be ruled out without
-/// hardware to test against.
-///
-/// # Restructuring vs. C
-/// Requires `6 + LEN <= raw.len()` before slicing out the DATA region.
-/// C's equivalent check is only `LEN < iSize` (`ConsoleHelper.cpp:237`)
-/// against a fixed, zero-initialized 1024-byte buffer, so a claimed LEN
-/// that runs past the bytes actually received there silently reads
-/// zero-padding rather than crashing; a Rust slice has no such padding,
-/// so this returns `None` instead -- for every real NetFinder readback
-/// (always well over 24 bytes) the two conditions coincide.
-pub fn parse_netfinder_direct_response_header(raw: &[u8]) -> Option<&[u8]> {
-    if raw.len() < 6 {
-        return None;
-    }
-    if raw[0] != SYNC1
-        || raw[1] != SYNC2
-        || raw[2] != pid1::RCV_SCOPE_MISC
-        || raw[3] != pid2_netfinder::READBACK_RESPONSE
-    {
-        return None;
-    }
-    let len = usize::from(raw[4]) * 256 + usize::from(raw[5]);
-    if 6 + len > raw.len() {
-        return None;
-    }
-    Some(&raw[6..6 + len])
 }
 
 /// A parsed response packet: `ParsePacketStatus` + `ParsePacket`'s outcome
@@ -691,30 +649,5 @@ mod tests {
     fn netfinder_direct_request_matches_the_c_literal() {
         const C_LITERAL: [u8; 8] = [0xF5, 0xFA, 0x03, 0x07, 0x00, 0x00, 0xFE, 0x07];
         assert_eq!(build_netfinder_direct_request(), C_LITERAL);
-    }
-
-    #[test]
-    fn netfinder_direct_response_header_extracts_data() {
-        let mut raw = vec![SYNC1, SYNC2, 0x82, 0x08, 0x00, 0x04];
-        raw.extend_from_slice(&[1, 2, 3, 4]);
-        raw.extend_from_slice(&[0xAA, 0xBB]); // unverified trailer
-        assert_eq!(
-            parse_netfinder_direct_response_header(&raw),
-            Some(&[1, 2, 3, 4][..])
-        );
-    }
-
-    #[test]
-    fn netfinder_direct_response_header_rejects_wrong_pid() {
-        let mut raw = vec![SYNC1, SYNC2, 0x80, 0x01, 0x00, 0x00];
-        raw.extend_from_slice(&[0, 0]);
-        assert_eq!(parse_netfinder_direct_response_header(&raw), None);
-    }
-
-    #[test]
-    fn netfinder_direct_response_header_rejects_len_exceeding_received_bytes() {
-        // Header claims 4 bytes of data but none were actually received.
-        let raw = vec![SYNC1, SYNC2, 0x82, 0x08, 0x00, 0x04];
-        assert_eq!(parse_netfinder_direct_response_header(&raw), None);
     }
 }

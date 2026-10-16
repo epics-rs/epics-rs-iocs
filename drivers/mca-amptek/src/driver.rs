@@ -93,7 +93,7 @@
 //!
 //! See also `ascii_cmd.rs`'s `AsciiCmdUtilities.h:17` note.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -111,7 +111,7 @@ use crate::ascii_cmd;
 use crate::config::{self, ConfigFields, MAX_SCAS, ScaFields};
 use crate::protocol::{self, ReceivedPacket, TransmitPacketType};
 use crate::status::{self, Dp5Status};
-use crate::transport::{AmptekUdpTransport, NETFINDER_BROADCAST_PORT};
+use crate::transport::AmptekUdpTransport;
 
 /// The param address every request uses: the port is not
 /// `ASYN_MULTIDEVICE` (`drvAmptek.cpp:68`), so `pasynManager->getAddr` gives
@@ -529,13 +529,10 @@ impl AmptekDriver {
             protocol_error(format!("Cannot resolve address: {}", self.address_info))
         })?;
 
-        let confirmed = if self.direct_mode {
+        let (confirmed, _num_devices) = if self.direct_mode {
             self.transport.connect_direct(ip)?
         } else {
-            self.transport.discover_default(
-                SocketAddrV4::new(Ipv4Addr::BROADCAST, NETFINDER_BROADCAST_PORT),
-                ip,
-            )?
+            self.transport.connect_default(ip)?
         };
         if !confirmed {
             return Err(protocol_error(format!(

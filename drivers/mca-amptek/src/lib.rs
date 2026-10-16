@@ -25,9 +25,6 @@
 //! * Serial (`DppInterfaceSerial`) -- unimplemented even in the upstream
 //!   C driver itself (`ConnectDpp`'s and `SendCommand`'s serial branches
 //!   are both empty no-ops), so there is nothing to port.
-//! * NetFinder broadcast discovery's per-network-interface enumeration
-//!   (`osiSockDiscoverBroadcastAddresses`) -- scoped down to a single
-//!   global broadcast; see [`transport::AmptekUdpTransport::discover_broadcast`].
 
 pub mod ascii_cmd;
 pub mod config;

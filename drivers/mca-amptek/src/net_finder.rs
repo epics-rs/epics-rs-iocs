@@ -68,29 +68,31 @@ pub fn build_direct_request() -> Vec<u8> {
     protocol::build_netfinder_direct_request()
 }
 
-/// `CNetFinder::AddEntry`'s `SockAddr` extraction
-/// (`NetFinder.cpp:276-342`) applied to a
-/// [`protocol::parse_netfinder_direct_response_header`]-validated
-/// direct-query response: `SockAddr = SockAddr_ByteToULong(&buffer[20])`,
-/// i.e. the 4 bytes at DATA offset 20..24 (wire offset 26..30, since
-/// `AddEntry` is called on the header-trimmed buffer in C).
-///
-/// # Restructuring vs. C
-/// C composes those 4 bytes into an `in_addr` via
-/// `ByteToInaddr(b0,b1,b2,b3) = htonl((b0<<24)|(b1<<16)|(b2<<8)|b3)`
-/// specifically so the result's in-memory byte order matches what
-/// `inet_addr("b0.b1.b2.b3")` produces, purely so the two can be compared
-/// as raw `unsigned long`s. [`std::net::Ipv4Addr`] already models a
-/// 4-octet address with no such byte-order indirection, so this returns
-/// one directly and the caller compares it to the target `Ipv4Addr` with
-/// plain `==` -- equivalent to C's `lTestAddr == lDppAddr` comparison
-/// without needing to reproduce the `htonl`/`inet_addr` round trip.
-pub fn parse_direct_response(raw: &[u8]) -> Option<Ipv4Addr> {
-    let data = protocol::parse_netfinder_direct_response_header(raw)?;
-    if data.len() < 24 {
+/// `doAmptekNetFinderPacket`'s reply check (`ConsoleHelper.cpp:232-252`)
+/// and `CNetFinder::AddEntry`'s `SockAddr = buffer[20..24]`
+/// (`NetFinder.cpp:340`). `buf` is the zeroed receive buffer and `n` the
+/// datagram size; like C, the checksum is not verified and a `LEN` past
+/// the received bytes reads the zero padding.
+pub fn parse_direct_response(buf: &mut [u8; 1024], n: usize) -> Option<Ipv4Addr> {
+    let header = [
+        protocol::SYNC1,
+        protocol::SYNC2,
+        protocol::pid1::RCV_SCOPE_MISC,
+        protocol::pid2_netfinder::READBACK_RESPONSE,
+    ];
+    if buf[..4] != header {
         return None;
     }
-    Some(Ipv4Addr::new(data[20], data[21], data[22], data[23]))
+    let len = usize::from(buf[4]) * 256 + usize::from(buf[5]);
+    if len >= n {
+        return None;
+    }
+    // C shifts and zero-fills up to `len + 6`, past the buffer when
+    // `len > 1018` (UB); the copy stops at the buffer end here.
+    let end = (len + 6).min(buf.len());
+    buf.copy_within(6..end, 0);
+    buf[len.min(end)..end].fill(0);
+    Some(Ipv4Addr::new(buf[20], buf[21], buf[22], buf[23]))
 }
 
 #[cfg(test)]
@@ -145,30 +147,62 @@ mod tests {
         assert_eq!(build_direct_request().len(), 8);
     }
 
+    fn received(raw: &[u8]) -> [u8; 1024] {
+        let mut buf = [0u8; 1024];
+        buf[..raw.len()].copy_from_slice(raw);
+        buf
+    }
+
     #[test]
     fn parse_direct_response_extracts_ip() {
-        let mut data = vec![0u8; 24];
-        data[20..24].copy_from_slice(&[192, 168, 0, 42]);
-        let mut raw = vec![
+        let mut raw = vec![protocol::SYNC1, protocol::SYNC2, 0x82, 0x08, 0x00, 24];
+        raw.extend_from_slice(&[0u8; 20]);
+        raw.extend_from_slice(&[192, 168, 0, 42, 0, 0]);
+        assert_eq!(
+            parse_direct_response(&mut received(&raw), raw.len()),
+            Some(Ipv4Addr::new(192, 168, 0, 42))
+        );
+    }
+
+    /// C requires only `LEN < iSize` (`ConsoleHelper.cpp:237`): a short
+    /// reply is accepted and the address comes from the zero padding.
+    #[test]
+    fn parse_direct_response_accepts_short_data_as_c() {
+        let raw = [
             protocol::SYNC1,
             protocol::SYNC2,
             0x82,
             0x08,
             0x00,
-            data.len() as u8,
+            0x04,
+            1,
+            2,
         ];
-        raw.extend_from_slice(&data);
-        raw.extend_from_slice(&[0, 0]); // unverified trailer
         assert_eq!(
-            parse_direct_response(&raw),
-            Some(Ipv4Addr::new(192, 168, 0, 42))
+            parse_direct_response(&mut received(&raw), raw.len()),
+            Some(Ipv4Addr::UNSPECIFIED)
         );
-    }
-
-    #[test]
-    fn parse_direct_response_rejects_short_data() {
-        let mut raw = vec![protocol::SYNC1, protocol::SYNC2, 0x82, 0x08, 0x00, 0x04];
-        raw.extend_from_slice(&[1, 2, 3, 4]);
-        assert_eq!(parse_direct_response(&raw), None);
+        let raw = [
+            protocol::SYNC1,
+            protocol::SYNC2,
+            0x82,
+            0x08,
+            0x00,
+            0x08,
+            1,
+            2,
+        ];
+        assert_eq!(parse_direct_response(&mut received(&raw), raw.len()), None);
+        let raw = [
+            protocol::SYNC1,
+            protocol::SYNC2,
+            0x80,
+            0x01,
+            0x00,
+            0x00,
+            0,
+            0,
+        ];
+        assert_eq!(parse_direct_response(&mut received(&raw), raw.len()), None);
     }
 }
