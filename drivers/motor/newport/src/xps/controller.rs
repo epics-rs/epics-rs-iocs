@@ -315,7 +315,7 @@ impl XpsController {
 
     /// A snapshot of the latched trajectory for the execute command to run on
     /// its own socket. `None` if nothing has been built+verified since the last
-    /// [`define_profile`] (which also guarantees `profile` still matches the
+    /// [`Self::define_profile`] (which also guarantees `profile` still matches the
     /// built trajectory: defining a new profile clears it).
     pub fn execution_plan(&self) -> Option<ExecutionPlan> {
         let built = self.built_trajectory.as_ref()?;
