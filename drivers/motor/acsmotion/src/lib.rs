@@ -8,6 +8,7 @@ mod fake;
 pub mod ioc;
 pub mod ioc_aux;
 pub mod ioc_comm;
+mod profile;
 pub mod spiiplus;
 
 pub use spiiplus::{AcsMotionParams, SpiiPlusAxis, SpiiPlusController};

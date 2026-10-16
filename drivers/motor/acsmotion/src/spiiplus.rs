@@ -31,8 +31,8 @@
 //!
 //! ## Not modeled (documented)
 //!
-//! The binary bulk poll (replaced by ASCII queries), profile / PVT moves and
-//! the profile thread, and the other aux
+//! The binary bulk poll (replaced by ASCII queries), the profile execute
+//! and readback (the profile thread), and the other aux
 //! asyn parameters (MFLAGS/MFLAGSX bit fields, safe-torque-off, encoder offsets
 //! and factors, reference position, PEG, disable-set-position guard, global
 //! variable read/write, ACSPL program start/stop).
@@ -47,10 +47,11 @@ use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::port::PortDriverBase;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
-use epics_rs::motor::controller_port::{ControllerParams, ParamWrite};
+use epics_rs::motor::controller_port::{ControllerCtx, ControllerParams, ParamWrite};
 
 use crate::bincomm::Span;
 use crate::comm::SpiiPlusComm;
+use crate::profile::{PulseParams, SpiiProfile};
 
 /// Port EOS set at connect: C sets it in ACS_Motion.iocsh:28-29 and
 /// SPiiPlusCommDriver.cpp:425-426 restores it after every binary poll.
@@ -126,7 +127,7 @@ fn home_code(method: i32, forward: bool) -> Option<i32> {
 
 const SP_HOME_NONE: i32 = 0;
 
-fn spiiplus_err(message: impl Into<String>) -> AsynError {
+pub(crate) fn spiiplus_err(message: impl Into<String>) -> AsynError {
     AsynError::Status {
         status: AsynStatus::Error,
         message: message.into(),
@@ -291,6 +292,16 @@ impl SpiiPlusController {
     /// The homing parameters of axis `axis`.
     pub fn homing(&self, axis: usize) -> Homing {
         self.homing[axis]
+    }
+
+    /// C `pComm_`.
+    pub(crate) fn comm(&self) -> &SpiiPlusComm {
+        &self.comm
+    }
+
+    /// Axis `axis`'s C `resolution_`.
+    pub(crate) fn resolution(&self, axis: usize) -> f64 {
+        self.setup[axis].resolution
     }
 
     /// Send a set/motion command (C `writeReadAck`).
@@ -578,11 +589,14 @@ struct HomingParams {
     curr_limit: usize,
 }
 
-/// `SPiiPlusController::writeInt32` / `writeFloat64` for the homing
-/// parameters: each is stored per axis for `home()` to read.
+/// C `SPiiPlusController`'s parameters and profile on the controller
+/// port: the homing parameters, stored per axis for `home()` to read, and
+/// the profile move.
 pub struct AcsMotionParams {
     controller: Arc<Mutex<SpiiPlusController>>,
     params: Option<HomingParams>,
+    pub(crate) pulse: Option<PulseParams>,
+    pub(crate) profile: SpiiProfile,
 }
 
 impl AcsMotionParams {
@@ -590,12 +604,17 @@ impl AcsMotionParams {
         Self {
             controller,
             params: None,
+            pulse: None,
+            profile: SpiiProfile::default(),
         }
     }
 
+    pub(crate) fn lock(&self) -> MutexGuard<'_, SpiiPlusController> {
+        self.controller.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn set(&self, addr: i32, set: impl FnOnce(&mut Homing)) {
-        let mut ctrl = self.controller.lock().unwrap_or_else(|e| e.into_inner());
-        set(&mut ctrl.homing[addr as usize]);
+        set(&mut self.lock().homing[addr as usize]);
     }
 }
 
@@ -608,7 +627,48 @@ impl ControllerParams for AcsMotionParams {
             offset_neg: base.create_param("SPIIPLUS_HOMING_OFFSET_NEG", ParamType::Float64)?,
             curr_limit: base.create_param("SPIIPLUS_HOMING_CURR_LIMIT", ParamType::Float64)?,
         });
+        let mode = base.create_param("SPIIPLUS_PULSE_MODE", ParamType::Int32)?;
+        let pos = base.create_param("SPIIPLUS_PULSE_POS", ParamType::Float64Array)?;
+        // C reads NUM_PULSES from the base's PROFILE_NUM_PULSES, never this.
+        base.create_param("SPIIPLUS_NUM_PULSES", ParamType::Int32)?;
+        let axis = base.create_param("SPIIPLUS_PULSE_AXIS", ParamType::Int32)?;
+        // The PEG output's: runProfile reads them.
+        for (name, kind) in [
+            ("SPIIPLUS_PEG_ENG_ENC_CODE", ParamType::Octet),
+            ("SPIIPLUS_PEG_OUT_ASSIGN_CODE", ParamType::Octet),
+            ("SPIIPLUS_POUTS_OUTPUT_INDEX", ParamType::Int32),
+            ("SPIIPLUS_POUTS_BIT_CODE", ParamType::Octet),
+            ("SPIIPLUS_PULSE_WIDTH", ParamType::Float64),
+        ] {
+            base.create_param(name, kind)?;
+        }
+        self.pulse = Some(PulseParams { mode, pos, axis });
         Ok(())
+    }
+
+    fn write_float64_array(
+        &mut self,
+        ctx: &mut ControllerCtx<'_>,
+        user: &AsynUser,
+        value: &[f64],
+    ) -> AsynResult<()> {
+        if self.is_pulse_positions(user.reason) {
+            return self.write_pulse_positions(ctx, user, value);
+        }
+        ctx.write_float64_array(self, user, value)
+    }
+
+    fn define_profile(
+        &mut self,
+        ctx: &mut ControllerCtx<'_>,
+        addr: i32,
+        positions: &[f64],
+    ) -> AsynResult<()> {
+        self.define_axis_profile(ctx, addr, positions)
+    }
+
+    fn build_profile(&mut self, ctx: &mut ControllerCtx<'_>) -> AsynResult<()> {
+        self.build(ctx)
     }
 
     fn write_int32(
