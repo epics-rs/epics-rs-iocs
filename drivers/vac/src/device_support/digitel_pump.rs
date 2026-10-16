@@ -361,7 +361,8 @@ impl DeviceSupport for DigitelPump {
         record: &mut dyn Record,
         done: &DeviceDoneSource<'_>,
     ) -> CaResult<ReadStart> {
-        let Some(live) = self.live.as_mut() else {
+        // The pass a completion re-entered is `pact == 1`: `read` decodes.
+        let Some(live) = self.live.as_mut().filter(|_| !done.pact()) else {
             return Ok(ReadStart::Synchronous);
         };
         let job = &live.job;
@@ -689,5 +690,51 @@ mod tests {
             log.contains("devDigitelPumpCallback V:IP1 Read reply too small=0\n"),
             "{log}"
         );
+    }
+
+    /// The pass a completion re-enters is C `readWrite_dg` with `pact == 1`:
+    /// it decodes what landed and queues nothing.
+    #[test]
+    fn the_continuation_pass_does_not_queue_again() {
+        let port = "DGREENTRY";
+        let claim = claim_port_driver(port).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let driver = DrvAsynIPPort::new(port, &addr).unwrap();
+        let _runtime = PortManager::new()
+            .register_port(claim, driver, &open_owner())
+            .unwrap();
+        let mut dev = DigitelPump::new(AsynLink {
+            port_name: port.into(),
+            addr: 0,
+            timeout: None,
+            drv_info: "0".into(),
+        });
+        dev.set_record_info("V:IP2", ScanType::Passive);
+        let mut rec = d500();
+        assert!(matches!(dev.init(&mut rec), Ok(o) if o == DeviceInitOutcome::ok()));
+        let job = dev.live.as_ref().unwrap().job.clone();
+        job.exchange.lock().unwrap().err_count = 0;
+        let db = PvDatabase::new();
+        let done = DeviceDone::new(&db, &RecordInstance::new("V:IP2", d500()));
+
+        let start = dev
+            .read_begin(&mut rec, &DeviceDoneSource::new(&done))
+            .unwrap();
+        assert!(matches!(start, ReadStart::Pending));
+        // The listener never answers: the exchange ends on its timeout, and
+        // the cell is free to queue again, as it is when C re-enters.
+        let deadline = std::time::Instant::now() + 4 * IO_TIMEOUT;
+        while job.exchange.lock().unwrap().err_count == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exchange never ended"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let again = dev
+            .read_begin(&mut rec, &DeviceDoneSource::continuing(&done))
+            .unwrap();
+        assert!(matches!(again, ReadStart::Synchronous));
     }
 }
