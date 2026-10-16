@@ -250,13 +250,6 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             )
             .await;
 
-        let mut image_counter = ctx
-            .handle
-            .read_int32(ctx.ad.base.array_counter, 0)
-            .await
-            .unwrap_or(0);
-        let mut num_images_counter = 0i32;
-
         loop {
             let start_time = EpicsTimestamp::now();
             let acquire_period = ctx
@@ -280,18 +273,23 @@ async fn acquisition_loop_async(mut ctx: AcquisitionContext) {
             set_shutter_via_handle(&ctx.handle, &ctx.ad, true).await;
             let _ = ctx.handle.call_param_callbacks(0).await;
 
-            image_counter += 1;
-            num_images_counter += 1;
+            // C re-reads both counters every frame (URLDriver.cpp:231-233), so a
+            // write to either during acquisition is where the next frame counts
+            // from. acquire_one_image stores them only on success, as C does.
+            let image_counter = ctx
+                .handle
+                .read_int32(ctx.ad.base.array_counter, 0)
+                .await
+                .unwrap_or(0)
+                + 1;
+            let num_images_counter = ctx
+                .handle
+                .read_int32(ctx.ad.num_images_counter, 0)
+                .await
+                .unwrap_or(0)
+                + 1;
             let image_result =
                 acquire_one_image(&ctx, start_time, image_counter, num_images_counter).await;
-
-            if image_result.is_err() {
-                // Failed fetch/decode: this iteration's counters didn't advance
-                // (matches C++, which only increments NDArrayCounter/
-                // ADNumImagesCounter inside the `imageStatus == asynSuccess` branch).
-                image_counter -= 1;
-                num_images_counter -= 1;
-            }
 
             set_shutter_via_handle(&ctx.handle, &ctx.ad, false).await;
             let _ = ctx.handle.call_param_callbacks(0).await;

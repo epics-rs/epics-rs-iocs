@@ -244,4 +244,57 @@ mod tests {
             "ADShutterControl did not reach ADDriver::setShutter"
         );
     }
+
+    #[test]
+    fn a_counter_written_during_acquisition_is_where_the_next_frame_counts_from() {
+        use epics_rs::ad_core::driver::ImageMode;
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use epics_rs::asyn::param::ParamValue;
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::request::ParamSetValue;
+
+        let dir = std::env::temp_dir().join(format!("url-counter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("frame.png");
+        image::DynamicImage::ImageLuma8(image::GrayImage::new(2, 2))
+            .save(&png)
+            .unwrap();
+
+        let rt = create_url_detector(&claim_port("URL_COUNTER").unwrap(), 1 << 20).unwrap();
+        let (tx, mut rx) = ndarray_channel("URL_COUNTER_SINK", 8);
+        rt.connect_downstream(tx);
+        let (h, ad) = (rt.port_handle(), rt.ad_params);
+        h.set_params_and_notify_blocking(
+            0,
+            vec![
+                ParamSetValue::new(
+                    rt.url_params.url_name,
+                    0,
+                    ParamValue::Octet(format!("file://{}", png.display()).into_bytes().into()),
+                ),
+                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(
+                    ad.image_mode,
+                    0,
+                    ParamValue::Int32(ImageMode::Continuous as i32),
+                ),
+                ParamSetValue::new(ad.acquire_period, 0, ParamValue::Float64(0.2)),
+            ],
+        )
+        .unwrap();
+
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let first = rx.blocking_recv().expect("first frame").unique_id;
+        h.write_int32_blocking(ad.base.array_counter, 0, 100)
+            .unwrap();
+        let mut next = rx.blocking_recv().expect("next frame").unique_id;
+        // A frame already past its counter read when the write landed.
+        if next == first + 1 {
+            next = rx.blocking_recv().expect("next frame").unique_id;
+        }
+        h.write_int32_blocking(ad.acquire, 0, 0).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(next, 101);
+        std::mem::forget(rt);
+    }
 }
