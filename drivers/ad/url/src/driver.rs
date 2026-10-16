@@ -84,18 +84,16 @@ impl PortDriver for URLDriver {
         self.ad.write_octet(user, data)
     }
 
-    /// Mirrors C++ `URLDriver::writeInt32`: only `ADAcquire` is special-cased
+    /// C++ `URLDriver::writeInt32`: only `ADAcquire` is special-cased
     /// (start/stop-signals the acquisition task, gated on `ADStatus` being
-    /// idle or not); every other Int32 param falls through to the same
-    /// "set param, call callbacks" behavior as the base `ADDriver::writeInt32`
-    /// (this crate's `PortDriver::write_int32` default already does that).
+    /// idle or not); every other Int32 param goes to `ADDriver::writeInt32`.
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let reason = user.reason;
         self.ad
             .port_base
             .set_int32_param(reason, user.addr, value)?;
 
-        if reason == self.ad.params.acquire {
+        let status = if reason == self.ad.params.acquire {
             let status = self
                 .ad
                 .port_base
@@ -106,10 +104,20 @@ impl PortDriver for URLDriver {
             } else if value == 0 && status != ADStatus::Idle as i32 {
                 let _ = self.acq_tx.try_send(AcqCommand::Stop);
             }
-        }
+            Ok(())
+        } else if reason < self.url_params.url_name {
+            // `ADDriver::writeInt32` -> `asynNDArrayDriver::writeInt32`.
+            if reason == self.ad.params.shutter_control {
+                self.ad.set_shutter(value != 0)
+            } else {
+                self.ad.write_int32_pool(reason, value).map(|_| ())
+            }
+        } else {
+            Ok(())
+        };
 
         self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
+        status
     }
 }
 
@@ -191,4 +199,31 @@ pub fn create_url_detector(claim: &PortClaim, max_memory: usize) -> AsynResult<U
         queued_counter,
         task_handle: Some(task_handle),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use epics_rs::ad_core::driver::ShutterMode;
+
+    #[test]
+    fn a_base_class_write_reaches_addriver() {
+        let (acq_tx, _acq_rx) = rt::command_channel(1);
+        let mut det = URLDriver::new("URL_BASE_WRITE", 1 << 20, acq_tx).unwrap();
+        let p = det.ad.params;
+        det.ad
+            .port_base
+            .set_int32_param(p.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        let mut user = AsynUser::new(p.shutter_control);
+        det.write_int32(&mut user, 1).unwrap();
+        assert_eq!(
+            det.ad
+                .port_base
+                .get_int32_param(p.shutter_control_epics, 0)
+                .unwrap(),
+            1,
+            "ADShutterControl did not reach ADDriver::setShutter"
+        );
+    }
 }
