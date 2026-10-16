@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::accum::Update;
 use crate::adlog;
+use crate::coordinator::Phase;
 use crate::driver::TimePix3Driver;
 use crate::family::DetectorFamily;
 use crate::http::{ServalHttp, TIMEOUT_POLL};
@@ -235,8 +236,8 @@ async fn check_connection(ctx: &Arc<Ctx>) -> bool {
     serval_ok && det_ok
 }
 
-/// C `updateStatusFromConnection` (serval_http.cpp:251-285), less its
-/// acquisition-phase messages: a connected detector reads "OK".
+/// C `updateStatusFromConnection` (serval_http.cpp:251-285): a connected
+/// detector reports the acquisition phase.
 fn connection_status(
     ctx: &Arc<Ctx>,
     serval_ok: bool,
@@ -244,8 +245,15 @@ fn connection_status(
     updates: &mut Vec<ParamSetValue>,
 ) {
     let (message, status) = match (serval_ok, det_ok) {
-        (true, true) if ctx.shared.acquisition.monitoring() => ("OK", ADStatus::Acquire),
-        (true, true) => ("OK", ADStatus::Idle),
+        (true, true) => {
+            let acquisition = ctx.shared.acquisition.snapshot();
+            let status = match acquisition.phase {
+                Phase::Starting | Phase::Running | Phase::Stopping => ADStatus::Acquire,
+                Phase::Fault => ADStatus::Error,
+                Phase::Idle => ADStatus::Idle,
+            };
+            (acquisition.connected_status_message(), status)
+        }
         (false, false) => ("SERVAL and detector disconnected", ADStatus::Disconnected),
         (false, true) => ("SERVAL disconnected", ADStatus::Disconnected),
         (true, false) => ("Detector disconnected", ADStatus::Disconnected),
@@ -1415,6 +1423,52 @@ mod tests {
             } if *r == reason => Some(*v),
             _ => None,
         })
+    }
+
+    fn octet_set(updates: &[ParamSetValue], reason: usize) -> Option<String> {
+        updates.iter().rev().find_map(|u| match u {
+            ParamSetValue::Value {
+                reason: r,
+                value: ParamValue::Octet(v),
+                ..
+            } if *r == reason => Some(String::from_utf8_lossy(v).into_owned()),
+            _ => None,
+        })
+    }
+
+    /// A connected detector reports the acquisition phase, not "OK"
+    /// (serval_http.cpp:251-275, acquisition_coordinator.cpp:143-160).
+    #[test]
+    fn a_connected_detector_reports_the_acquisition_phase() {
+        let ctx = Arc::new(idle_ctx("TPX_CONN_PHASE"));
+        let coordinator = &ctx.shared.acquisition;
+        assert!(coordinator.begin_start());
+        assert!(coordinator.note_resource(crate::coordinator::Resource::RemoteMeasurement));
+        assert!(coordinator.note_resource(crate::coordinator::Resource::MonitorThread));
+        assert!(coordinator.commit_start());
+        let mut updates = Vec::new();
+        connection_status(&ctx, true, true, &mut updates);
+        assert_eq!(
+            octet_set(&updates, ctx.ad.status_message).as_deref(),
+            Some("Acquisition running")
+        );
+        assert_eq!(
+            int_set(&updates, ctx.ad.status),
+            Some(ADStatus::Acquire as i32)
+        );
+
+        coordinator.begin_stop(true);
+        coordinator.finish_stop(true, true);
+        let mut updates = Vec::new();
+        connection_status(&ctx, true, true, &mut updates);
+        assert_eq!(
+            octet_set(&updates, ctx.ad.status_message).as_deref(),
+            Some("Acquisition fault; retry acquisition")
+        );
+        assert_eq!(
+            int_set(&updates, ctx.ad.status),
+            Some(ADStatus::Error as i32)
+        );
     }
 
     /// The family and its capabilities are published on every detector read;
