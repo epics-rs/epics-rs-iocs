@@ -41,6 +41,7 @@ use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind, PollFailure};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::log::errlog_message;
 
 use crate::util::{atof, max_digits};
 
@@ -102,8 +103,8 @@ impl Pm500Controller {
             comm_state: CommState::Normal,
         };
         // C sends SCUM 1 and SENAINT $AF and reads (ignoring) one reply each.
-        let _ = ctrl.exchange("SCUM 1");
-        let _ = ctrl.exchange("SENAINT $AF");
+        let _ = ctrl.command("SCUM 1");
+        let _ = ctrl.command("SENAINT $AF");
 
         // Identity probe (C sends SVN? twice: existence check, then read).
         if ctrl.command("SVN?").unwrap_or_default().is_empty() {
@@ -136,21 +137,16 @@ impl Pm500Controller {
         self.num_axes
     }
 
-    /// Write a command message and read its reply (C `send_mess`, which
-    /// flushes stale input first, + `recv_mess`).
-    fn exchange(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
-    }
-
-    /// Write one command message and read its one reply — C's motor task
-    /// pairs every `send_mess` with a `recv_mess` (`cmnd_response = true`),
-    /// so even pure motion messages consume a response. C `recv_mess` logs
-    /// a "system error" on an `SE` reply but still returns it.
+    /// Write one command message and read its one reply: C `send_mess`,
+    /// which flushes stale input first, + `recv_mess`, which logs a "system
+    /// error" on an `SE` reply but still returns it. C's motor task pairs
+    /// every `send_mess` with a `recv_mess` (`cmnd_response = true`), so even
+    /// pure motion messages consume a response.
     fn command(&self, cmd: &str) -> AsynResult<String> {
-        let reply = self.exchange(cmd)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?;
+        let reply = String::from_utf8_lossy(&raw).into_owned();
         if reply.starts_with("SE") {
-            eprintln!("PM500 system error: {reply}");
+            errlog_message("recv_mess(): PM500 system error.\n");
         }
         Ok(reply)
     }
