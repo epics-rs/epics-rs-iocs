@@ -87,9 +87,9 @@ impl Model1 {
 
     /// Whether `Config` may fill `card`: C returns ERROR, silently, for a
     /// card outside the table `Setup` sized, or with no `Setup` at all.
-    pub fn has_card(&self, card: i64) -> bool {
+    pub fn has_card(&self, card: i32) -> bool {
         match *self.setup.lock().unwrap_or_else(|e| e.into_inner()) {
-            Some((num_cards, _)) => (0..num_cards as i64).contains(&card),
+            Some((num_cards, _)) => (0..num_cards).contains(&card),
             None => false,
         }
     }
@@ -99,7 +99,7 @@ impl Model1 {
     pub fn install(
         &self,
         ctx: &CommandContext,
-        card: i64,
+        card: i32,
         signal: i32,
         motor: Arc<Mutex<dyn AsynMotor>>,
     ) -> Result<(), String> {
@@ -110,7 +110,7 @@ impl Model1 {
             .map_or(self.default_scan_rate, |(_, rate)| rate);
         let user = TraceUser::Model1 {
             device: self.row.choice,
-            card: card as i32,
+            card,
             signal,
         };
         install(
