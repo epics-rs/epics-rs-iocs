@@ -134,10 +134,12 @@ impl Instrument {
     /// post-connect `E0` greeting, run the fixed load sequence (modules
     /// first, everything else indexes off it), then start the queue thread.
     fn start(&self, stream: TcpStream) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<Job>();
         let mut actor = Actor {
             stream,
             cache: self.cache.clone(),
             interrupts: self.interrupts.clone(),
+            requeue: tx.clone(),
         };
 
         match actor.read_response()? {
@@ -156,7 +158,6 @@ impl Instrument {
         actor.load_data_values(None)?;
         actor.load_misc_values(true, true, None)?;
 
-        let (tx, rx) = mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("gm10-instrument".to_string())
             .spawn(move || actor.run(rx))?;
@@ -442,6 +443,8 @@ pub struct Actor {
     stream: TcpStream,
     cache: Arc<Mutex<Cache>>,
     interrupts: Arc<Interrupts>,
+    /// Its own queue, for the record-less `qmesg` of `load_status`.
+    requeue: mpsc::Sender<Job>,
 }
 
 impl Actor {
@@ -649,10 +652,11 @@ impl Actor {
         self.interrupts.fire(InterruptCategory::Status);
 
         if was_settings_mode && !self.cache.lock().settings_mode {
-            // C enqueues this fire-and-forget (`qmesg(..., NULL, ...)`,
-            // `drvGM10.c:646`); running it inline keeps this single
-            // worker thread the only actor either way.
-            self.load_infos()?;
+            // `qmesg(dq, NULL, CMD_READ_ALL_INFOS, ..)` (`drvGM10.c:646`).
+            let _ = self.requeue.send(Job {
+                command: Command::ReadAllInfos,
+                done: Box::new(|| {}),
+            });
         }
         Ok(())
     }
@@ -1454,5 +1458,39 @@ mod tests {
         assert_eq!(instrument.get_compute_mode(), 2);
         assert!(instrument.get_settings_mode());
         device.join().unwrap();
+    }
+
+    #[test]
+    fn leaving_settings_mode_queues_the_info_reload_behind_pending_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut responses = default_init_responses();
+        responses.push(ascii_frame(b"ORec,1\r\n"));
+        responses.push(ascii_frame(b"OMath,1\r\n"));
+        responses.push(ascii_frame(b"ORec,0\r\n"));
+        responses.push(ascii_frame(b"OMath,0\r\n"));
+        responses.push(b"E0\r\n".to_vec());
+        for _ in 0..4 {
+            responses.push(ascii_frame(b"E"));
+        }
+        let device = spawn_fake_device(listener, responses);
+        let instrument = Instrument::connect_to(addr).unwrap();
+        instrument.submit(Command::ReadStatus);
+        // Both queued before the actor can finish the ReadStatus round trips.
+        instrument.enqueue(Command::ReadStatus, Box::new(|| {}));
+        instrument.enqueue(Command::ClearError, Box::new(|| {}));
+        let received = device.join().unwrap();
+        assert_eq!(
+            received[received.len() - 7..],
+            [
+                "ORec?\r\n",
+                "OMath?\r\n",
+                "OErrorClear,0\r\n",
+                "FChInfo\r\n",
+                "SRangeAO?\r\n",
+                "SRangeDO?\r\n",
+                "SRangeMath?\r\n",
+            ]
+        );
     }
 }
