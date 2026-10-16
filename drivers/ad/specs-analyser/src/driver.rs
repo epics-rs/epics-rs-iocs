@@ -521,17 +521,12 @@ impl PortDriver for SpecsAnalyserDriver {
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
         let function = user.reason;
-        let addr = user.addr;
-        let old_value = self
-            .ad
-            .port_base
-            .get_int32_param(function, addr)
-            .unwrap_or(0);
-        self.ad.port_base.set_int32_param(function, addr, value)?;
+        let old_value = self.ad.port_base.get_int32_param(function, 0).unwrap_or(0);
+        let _ = self.ad.port_base.set_int32_param(function, 0, value);
         let adstatus = self
             .ad
             .port_base
-            .get_int32_param(self.ad.params.status, addr)
+            .get_int32_param(self.ad.params.status, 0)
             .unwrap_or(0);
         let idle_like = adstatus == ADStatus::Idle as i32
             || adstatus == ADStatus::Error as i32
@@ -544,14 +539,12 @@ impl PortDriver for SpecsAnalyserDriver {
                 self.start.signal();
             }
             if value == 0 && adstatus != ADStatus::Idle as i32 {
-                self.ad
-                    .port_base
-                    .set_int32_param(self.p.pause_acq, addr, 0)?;
-                self.ad.port_base.set_int32_param(
+                let _ = self.ad.port_base.set_int32_param(self.p.pause_acq, 0, 0);
+                let _ = self.ad.port_base.set_int32_param(
                     self.ad.params.status,
-                    addr,
+                    0,
                     ADStatus::Aborted as i32,
-                )?;
+                );
                 self.stop.signal();
                 let _ = self.with_wire(|link| link.command_response("Abort"));
             }
@@ -559,7 +552,7 @@ impl PortDriver for SpecsAnalyserDriver {
             let connected = self
                 .ad
                 .port_base
-                .get_int32_param(self.p.connected, addr)
+                .get_int32_param(self.p.connected, 0)
                 .unwrap_or(0);
             if connected == 0 {
                 result = self.reconnect();
@@ -572,50 +565,53 @@ impl PortDriver for SpecsAnalyserDriver {
             let acquire = self
                 .ad
                 .port_base
-                .get_int32_param(self.ad.params.acquire, addr)
+                .get_int32_param(self.ad.params.acquire, 0)
                 .unwrap_or(0);
             if value == 1 {
                 if old_value == 0 && acquire == 1 {
                     let _ = self.with_wire(|link| link.command_response("Pause"));
-                    self.ad.port_base.set_string_param(
+                    let _ = self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
-                        addr,
+                        0,
                         "Acquisition paused",
-                    )?;
+                    );
                 } else {
-                    self.ad
+                    let _ = self
+                        .ad
                         .port_base
-                        .set_int32_param(self.p.pause_acq, addr, old_value)?;
+                        .set_int32_param(self.p.pause_acq, 0, old_value);
                 }
             } else if value == 0 {
                 if old_value == 1 && acquire == 1 {
                     let _ = self.with_wire(|link| link.command_response("Resume"));
-                    self.ad.port_base.set_string_param(
+                    let _ = self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
-                        addr,
+                        0,
                         "Acquiring data...",
-                    )?;
+                    );
                 } else {
-                    self.ad
+                    let _ = self
+                        .ad
                         .port_base
-                        .set_int32_param(self.p.pause_acq, addr, old_value)?;
+                        .set_int32_param(self.p.pause_acq, 0, old_value);
                 }
             }
         } else if function == self.p.non_energy_channels {
             let confirmed = self.set_confirm_int("NumNonEnergyChannels".to_string(), value);
-            self.ad.port_base.set_int32_param(
+            let _ = self.ad.port_base.set_int32_param(
                 function,
-                addr,
+                0,
                 *confirmed.as_ref().unwrap_or(&old_value),
-            )?;
+            );
             result = confirmed.map(|_| ());
         } else if function == self.p.safe_state && value != 0 {
             if idle_like {
                 let _ = self.with_wire(|link| link.command_response("SetSafeState"));
             } else {
-                self.ad
+                let _ = self
+                    .ad
                     .port_base
-                    .set_int32_param(self.p.safe_state, addr, old_value)?;
+                    .set_int32_param(self.p.safe_state, 0, old_value);
                 // C only passes the refusal to debug() (specsAnalyser.cpp:883).
                 result = Err(AsynError::Status {
                     status: AsynStatus::Error,
@@ -629,27 +625,26 @@ impl PortDriver for SpecsAnalyserDriver {
             .cloned()
         {
             let confirmed = self.set_confirm_int(raw_name, value);
-            self.ad.port_base.set_int32_param(
+            let _ = self.ad.port_base.set_int32_param(
                 function,
-                addr,
+                0,
                 *confirmed.as_ref().unwrap_or(&old_value),
-            )?;
+            );
             result = confirmed.map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(addr)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
         result
     }
 
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let function = user.reason;
-        let addr = user.addr;
         let old_value = self
             .ad
             .port_base
-            .get_float64_param(function, addr)
+            .get_float64_param(function, 0)
             .unwrap_or(0.0);
-        self.ad.port_base.set_float64_param(function, addr, value)?;
+        let _ = self.ad.port_base.set_float64_param(function, 0, value);
         let mut result: AsynResult<()> = Ok(());
 
         // C's writeFloat64 only ever dispatches to the dynamic
@@ -662,15 +657,15 @@ impl PortDriver for SpecsAnalyserDriver {
             .cloned()
         {
             let confirmed = self.set_confirm_double(raw_name, value);
-            self.ad.port_base.set_float64_param(
+            let _ = self.ad.port_base.set_float64_param(
                 function,
-                addr,
+                0,
                 *confirmed.as_ref().unwrap_or(&old_value),
-            )?;
+            );
             result = confirmed.map(|_| ());
         }
 
-        self.ad.port_base.call_param_callbacks(addr)?;
+        let _ = self.ad.port_base.call_param_callbacks(0);
         result
     }
 }
@@ -861,5 +856,21 @@ mod tests {
             (e.status(), e.message()),
             (AsynStatus::Error, String::new())
         );
+    }
+
+    /// writeInt32/writeFloat64 set and post list 0 whatever the address
+    /// (`specsAnalyser.cpp:781`, `938`), as `getAddr` gives a non-multidevice
+    /// port's user.
+    #[test]
+    fn a_write_at_another_address_lands_on_list_zero() {
+        let mut d = offline("SPECS_LIST0");
+        let samples = d.p.snapshot_values;
+        let mut user = AsynUser::new(samples).with_addr(1);
+        d.write_int32(&mut user, 7).unwrap();
+        assert_eq!(d.ad.port_base.get_int32_param(samples, 0).unwrap(), 7);
+        let energy = d.p.kinetic_energy;
+        let mut user = AsynUser::new(energy).with_addr(1);
+        d.write_float64(&mut user, 2.5).unwrap();
+        assert_eq!(d.ad.port_base.get_float64_param(energy, 0).unwrap(), 2.5);
     }
 }
