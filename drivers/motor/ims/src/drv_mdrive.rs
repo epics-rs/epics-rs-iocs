@@ -3,15 +3,20 @@
 //!
 //! Every command is prefixed by the drive's party-mode name, `1` to `8`.
 //! Commands get no reply; `PR` queries get one line.
+//!
+//! The record's INIT goes out once at init, behind the name and a blank;
+//! PREM and a blank lead a move's own command, and POST goes once that move
+//! is done or runs into a limit (devMDrive.cc:187-207, drvMDrive.cc:399-406).
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use epics_rs::asyn::error::AsynResult;
-use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure};
+use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PollFailure, PostMessage};
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 use epics_rs::base::runtime::log::errlog_printf;
 
+use motor_common::model1::MoveStrings;
 use motor_common::util::{atof, atoi, nint};
 
 /// `MDrive_NUM_CARDS`.
@@ -59,8 +64,8 @@ impl MDriveController {
             .unwrap_or_default()
     }
 
-    fn send(&self, msg: &str) {
-        let _ = self.handle.write_octet(0, msg.as_bytes());
+    fn send(&self, msg: impl AsRef<[u8]>) {
+        let _ = self.handle.write_octet(0, msg.as_ref());
     }
 }
 
@@ -152,6 +157,7 @@ pub struct DrvMDriveAxis {
     /// MRES/ERES, from `SET_ENC_RATIO`: `LOAD_POS` loads the encoder with
     /// DVAL/ERES.
     encoder_ratio: f64,
+    strings: MoveStrings,
 }
 
 impl DrvMDriveAxis {
@@ -171,6 +177,7 @@ impl DrvMDriveAxis {
             },
             position: 0,
             encoder_ratio: 1.0,
+            strings: MoveStrings::default(),
         }
     }
 
@@ -178,12 +185,39 @@ impl DrvMDriveAxis {
         self.controller.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `send_mess`: `name`, then `prem` and a blank when there is one, then
+    /// `command`.
+    fn line(&self, prem: &[u8], command: &str) -> Vec<u8> {
+        let mut line = self.name.as_bytes().to_vec();
+        if !prem.is_empty() {
+            line.extend_from_slice(prem);
+            line.push(b' ');
+        }
+        line.extend_from_slice(command.as_bytes());
+        line
+    }
+
     /// Send each command of a transaction.
     fn send(&self, commands: &[String]) -> AsynResult<()> {
         let ctrl = self.lock();
         for command in commands {
-            ctrl.send(&format!("{}{command}", self.name));
+            ctrl.send(self.line(b"", command));
         }
+        Ok(())
+    }
+
+    /// A move, home or jog: its PREM leads the last command, the motion
+    /// itself, and its POST becomes the one `poll` sends.
+    fn send_move(&mut self, commands: &[String]) -> AsynResult<()> {
+        let prem = self.strings.arm();
+        let Some((last, rest)) = commands.split_last() else {
+            return Ok(());
+        };
+        let ctrl = self.lock();
+        for command in rest {
+            ctrl.send(self.line(b"", command));
+        }
+        ctrl.send(self.line(&prem, last));
         Ok(())
     }
 
@@ -199,7 +233,7 @@ impl DrvMDriveAxis {
     /// The record's `SET_VELOCITY`, `SET_VEL_BASE`, `SET_ACCEL`, then
     /// `motion`.
     fn motion(
-        &self,
+        &mut self,
         min_velocity: f64,
         velocity: f64,
         acceleration: f64,
@@ -211,7 +245,7 @@ impl DrvMDriveAxis {
         ];
         Self::accel(&mut commands, acceleration);
         commands.push(motion);
-        self.send(&commands)
+        self.send_move(&commands)
     }
 }
 
@@ -255,7 +289,7 @@ impl AsynMotor for DrvMDriveAxis {
         let mut commands = vec![format!("VI={}", nint(min_velocity))];
         Self::accel(&mut commands, acceleration);
         commands.push(format!("SL={}", nint(velocity)));
-        self.send(&commands)
+        self.send_move(&commands)
     }
 
     /// devMDrive.cc sends the IM483's home command, ` F1000 0|1`, as is.
@@ -296,6 +330,24 @@ impl AsynMotor for DrvMDriveAxis {
 
     fn set_closed_loop(&mut self, _user: &AsynUser, enable: bool) -> AsynResult<()> {
         self.send(&[format!("DE={}", i32::from(enable))])
+    }
+
+    /// `PRIMITIVE`: INIT behind the name and a blank.
+    fn primitive(&mut self, _user: &AsynUser, init: &[u8]) -> AsynResult<()> {
+        let mut line = format!("{} ", self.name).into_bytes();
+        line.extend_from_slice(init);
+        self.lock().send(line);
+        Ok(())
+    }
+
+    fn set_move_strings(
+        &mut self,
+        _user: &AsynUser,
+        prem: &[u8],
+        post: Option<PostMessage>,
+    ) -> AsynResult<()> {
+        self.strings.set(prem, post);
+        Ok(())
     }
 
     /// `set_status`: `PR MV` for moving, `PR P` for the position, `PR I<n>`
@@ -345,6 +397,144 @@ impl AsynMotor for DrvMDriveAxis {
         status.problem = false;
         let speed = atof(&velocity).trunc();
         status.velocity = if status.direction { speed } else { -speed };
-        Ok(status.clone())
+        let status = status.clone();
+        let ls_active =
+            (status.high_limit && status.direction) || (status.low_limit && !status.direction);
+        if (status.done || ls_active)
+            && let Some(post) = self.strings.post_due()
+        {
+            let mut line = self.name.as_bytes().to_vec();
+            line.extend_from_slice(&post);
+            self.lock().send(line);
+        }
+        Ok(status)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use motor_common::testing::LineRig;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Rig {
+        line: LineRig,
+        axis: DrvMDriveAxis,
+        moving: Arc<AtomicBool>,
+        minus: Arc<AtomicBool>,
+        user: AsynUser,
+    }
+
+    impl Rig {
+        /// Drive `1` with its minus limit on input 2 and plus on input 1.
+        fn new(name: &str) -> Self {
+            let moving = Arc::new(AtomicBool::new(false));
+            let minus = Arc::new(AtomicBool::new(false));
+            let (m, l) = (moving.clone(), minus.clone());
+            let (line, io) = LineRig::new(name, move |last| {
+                let on = if last.ends_with("PR MV") {
+                    m.load(Ordering::SeqCst)
+                } else if last.ends_with("PR I2") {
+                    l.load(Ordering::SeqCst)
+                } else {
+                    false
+                };
+                u8::from(on).to_string()
+            });
+            let controller = Arc::new(Mutex::new(MDriveController::new(io)));
+            let drive = MDriveDrive {
+                encoder: false,
+                inputs: Inputs {
+                    plus: 1,
+                    minus: 2,
+                    home: 0,
+                },
+            };
+            Self {
+                line,
+                axis: DrvMDriveAxis::new(controller, 0, drive),
+                moving,
+                minus,
+                user: AsynUser::new(0),
+            }
+        }
+
+        fn move_to(&mut self, position: f64) {
+            self.axis
+                .move_absolute(&self.user, position, 1.0, 2.0, 0.0)
+                .unwrap();
+        }
+
+        /// What one poll sent besides its queries.
+        fn poll_extra(&mut self) -> Vec<String> {
+            self.axis.poll(&self.user).unwrap();
+            self.line
+                .sent()
+                .into_iter()
+                .filter(|l| !l.starts_with("1PR "))
+                .collect()
+        }
+    }
+
+    fn post(text: &[u8]) -> PostMessage {
+        let p = PostMessage::default();
+        p.set(text);
+        p
+    }
+
+    /// devMDrive.cc:187-191.
+    #[test]
+    fn init_goes_out_behind_the_name_and_a_blank() {
+        let mut r = Rig::new("mdrive_init");
+        r.axis.primitive(&r.user, b"EE=1").unwrap();
+        assert_eq!(r.line.sent(), ["1 EE=1"]);
+    }
+
+    /// devMDrive.cc:195-204: PREM and a blank lead the move's own message,
+    /// for that move only.
+    #[test]
+    fn prem_leads_the_move_message() {
+        let mut r = Rig::new("mdrive_prem");
+        r.axis.set_move_strings(&r.user, b"DE=1", None).unwrap();
+        r.move_to(100.0);
+        assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1DE=1 MA 100"]);
+        r.move_to(50.0);
+        assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1MA 50"]);
+        r.axis.set_move_strings(&r.user, b"DE=1", None).unwrap();
+        r.axis.home(&r.user, 1.0, 2.0, 0.0, true).unwrap();
+        assert_eq!(r.line.sent(), ["1VM=2", "1VI=1", "1DE=1  F1000 0"]);
+        r.axis.set_move_strings(&r.user, b"DE=1", None).unwrap();
+        r.axis.move_velocity(&r.user, 1.0, 3.0, 0.0).unwrap();
+        assert_eq!(r.line.sent(), ["1VI=1", "1DE=1 SL=3"]);
+    }
+
+    /// drvMDrive.cc:399-406: POST once the move is done, not while it runs.
+    #[test]
+    fn post_follows_the_move_once_done() {
+        let mut r = Rig::new("mdrive_post");
+        r.axis
+            .set_move_strings(&r.user, b"", Some(post(b"DE=0")))
+            .unwrap();
+        r.move_to(100.0);
+        r.line.sent();
+        r.moving.store(true, Ordering::SeqCst);
+        assert!(r.poll_extra().is_empty());
+        r.moving.store(false, Ordering::SeqCst);
+        assert_eq!(r.poll_extra(), ["1DE=0"]);
+        assert!(r.poll_extra().is_empty(), "sent once");
+    }
+
+    /// drvMDrive.cc:400: a limit in the move's direction ends it too.
+    #[test]
+    fn post_follows_a_move_a_limit_stops() {
+        let mut r = Rig::new("mdrive_post_ls");
+        r.axis
+            .set_move_strings(&r.user, b"", Some(post(b"DE=0")))
+            .unwrap();
+        r.move_to(-100.0);
+        r.line.sent();
+        r.moving.store(true, Ordering::SeqCst);
+        r.minus.store(true, Ordering::SeqCst);
+        assert_eq!(r.poll_extra(), ["1DE=0"]);
     }
 }
