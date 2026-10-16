@@ -150,7 +150,7 @@ impl Anf2Axis {
             .unwrap_or_else(|e| e.into_inner())
             .in_port
             .clone();
-        let force_read = ForceRead::connect(&in_port, 0, TIMEOUT);
+        let force_read = ForceRead::connect(&in_port, axis_no * AXIS_REG_OFFSET, TIMEOUT);
         if !force_read.connected() {
             println!(
                 "{in_port}: Error, unable to connect pasynUserForceRead_ to Modbus input driver"
@@ -503,5 +503,15 @@ mod tests {
         let corrected = Anf2Axis::correct_accel(500.0, 0.0, 2500.0, 1000.0);
         // accelTime = 2500 / 1000 = 2.5; corrected = (2500 - 500) / 2.5 = 800.
         assert!((corrected - 800.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_axis_forces_its_read_at_its_register_block() {
+        let (reason, taken) = crate::regs::fake::publish("anf2ForceReadIn");
+        crate::regs::fake::publish("anf2ForceReadOut");
+        let ctrl = Anf2Controller::new("anf2ForceReadIn", "anf2ForceReadOut", 1).unwrap();
+        let mut ax = Anf2Axis::new(Arc::new(Mutex::new(ctrl)), 2, 0, 1, 0).unwrap();
+        ax.poll(&AsynUser::new(0)).unwrap();
+        assert_eq!(*taken.lock().unwrap(), [(reason, 2 * AXIS_REG_OFFSET)]);
     }
 }
