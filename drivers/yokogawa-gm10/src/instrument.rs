@@ -304,7 +304,7 @@ impl Instrument {
     pub fn channel_get_expr(&self, channel: u32) -> String {
         let cache = self.cache();
         let mut expr = cache.calc_expr[(channel - 1) as usize].expr.clone();
-        expr.truncate(39);
+        expr.truncate(expr.floor_char_boundary(39));
         expr
     }
 
@@ -1068,6 +1068,13 @@ pub(crate) mod test_support {
     use super::*;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
+
+    #[test]
+    fn channel_get_expr_cuts_on_char_boundary() {
+        let instrument = Instrument::new("127.0.0.1".into());
+        instrument.cache().calc_expr[0].expr = format!("{}\u{b0}C", "x".repeat(38));
+        assert_eq!(instrument.channel_get_expr(1), "x".repeat(38));
+    }
 
     pub(crate) fn ascii_frame(body: &[u8]) -> Vec<u8> {
         let mut out = b"EAxx".to_vec();

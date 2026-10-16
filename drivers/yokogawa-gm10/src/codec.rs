@@ -172,7 +172,9 @@ pub fn chop_string_40(src: &str) -> (String, Option<String>) {
             return (src[..i].to_string(), Some(src[i + 1..].to_string()));
         }
         if i == 0 {
-            return (src[..39].to_string(), Some(src[39..].to_string()));
+            // C cuts at byte 39; never split a UTF-8 char here.
+            let cut = src.floor_char_boundary(39);
+            return (src[..cut].to_string(), Some(src[cut..].to_string()));
         }
         i -= 1;
     }
@@ -801,6 +803,14 @@ mod tests {
         let (chunk, rest) = chop_string_40("short message");
         assert_eq!(chunk, "short message");
         assert_eq!(rest, None);
+    }
+
+    #[test]
+    fn chop_string_40_no_space_cuts_on_char_boundary() {
+        let msg = format!("{}\u{b0}{}", "x".repeat(38), "y".repeat(10));
+        let (chunk, rest) = chop_string_40(&msg);
+        assert_eq!(chunk, "x".repeat(38));
+        assert_eq!(rest.unwrap(), format!("\u{b0}{}", "y".repeat(10)));
     }
 
     #[test]
