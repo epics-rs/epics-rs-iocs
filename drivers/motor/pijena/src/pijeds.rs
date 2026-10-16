@@ -206,6 +206,8 @@ impl PiJedsAxis {
             moving: false,
             last_status: MotorStatus {
                 done: true,
+                // C motor_init: encoder_present = YES, EA_PRESENT = 1.
+                has_encoder: true,
                 gain_support: true,
                 ..MotorStatus::default()
             },
@@ -355,6 +357,7 @@ impl AsynMotor for PiJedsAxis {
             comms_error: false,
             problem: false,
             gain_support: true,
+            has_encoder: true,
             ..MotorStatus::default()
         };
         Ok(self.last_status.clone())
@@ -406,15 +409,13 @@ mod tests {
         }
     }
 
-    /// C STOP_AXIS sends nothing and keeps the motion node, so a stage stopped
-    /// mid-travel still settles at its target and reports done.
-    #[test]
-    fn a_stop_mid_travel_still_ends_in_done() {
+    /// Axis 0 of an E-516 on a fresh [`Stage`] port named `port`.
+    fn stage_axis(port: &str) -> PiJedsAxis {
         use epics_rs::asyn::port::{PortDriverBase, PortFlags};
         use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
         let stage = Stage {
-            base: PortDriverBase::new("pijeds_stop", 1, PortFlags::default()),
+            base: PortDriverBase::new(port, 1, PortFlags::default()),
             pos: 0.0,
             target: 0.0,
             reply: Vec::new(),
@@ -425,16 +426,30 @@ mod tests {
             0,
             std::time::Duration::from_secs(1),
         );
-        let ctrl = Arc::new(Mutex::new(PiJedsController::new(io).unwrap()));
-        let mut axis = PiJedsAxis::new(ctrl, 0);
-        let user = AsynUser::default();
+        PiJedsAxis::new(Arc::new(Mutex::new(PiJedsController::new(io).unwrap())), 0)
+    }
 
+    /// C STOP_AXIS sends nothing and keeps the motion node, so a stage stopped
+    /// mid-travel still settles at its target and reports done.
+    #[test]
+    fn a_stop_mid_travel_still_ends_in_done() {
+        let mut axis = stage_axis("pijeds_stop");
+        let user = AsynUser::default();
         axis.move_absolute(&user, 5.0, 0.0, 0.0, 0.0).unwrap();
         assert!(!axis.poll(&user).unwrap().done);
         axis.stop(&user, 0.0).unwrap();
         let done = (0..20).any(|_| axis.poll(&user).unwrap().done);
         assert!(done, "the stage settled at 5 but never reported done");
         assert_eq!(axis.poll(&user).unwrap().position, 5.0);
+    }
+
+    /// C motor_init sets EA_PRESENT on every axis (drvPIJEDS.cc:666-667), so
+    /// MSTA bit 8 holds from boot and on every poll.
+    #[test]
+    fn every_axis_reports_an_encoder() {
+        let mut axis = stage_axis("pijeds_enc");
+        assert!(axis.last_status.has_encoder);
+        assert!(axis.poll(&AsynUser::default()).unwrap().has_encoder);
     }
 
     #[test]
