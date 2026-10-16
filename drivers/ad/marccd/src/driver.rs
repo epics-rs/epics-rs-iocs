@@ -20,7 +20,7 @@ use epics_rs::asyn::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
-use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
+use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode, ShutterMode};
 use epics_rs::ad_core::ndarray::NDDataType;
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ADBaseParams;
@@ -206,10 +206,20 @@ impl ADDriver for MarccdDriver {
         &mut self.ad
     }
 
-    /// `marCCD::setShutter` talks to marServer, so it runs on the worker.
+    /// `marCCD::setShutter` (marCCD.cpp:723-748): only the detector branch
+    /// talks to marServer, so only it runs on the worker; every other mode is
+    /// `ADDriver::setShutter` inside this write.
     fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
-        self.send(Cmd::SetShutter(open));
-        Ok(())
+        let mode = self
+            .ad
+            .port_base
+            .get_int32_param(self.ad.params.shutter_mode, 0)
+            .unwrap_or(0);
+        if ShutterMode::from_i32(mode) == Some(ShutterMode::DetectorOnly) {
+            self.send(Cmd::SetShutter(open));
+            return Ok(());
+        }
+        self.ad.set_shutter(open)
     }
 }
 
@@ -419,7 +429,6 @@ mod tests {
     /// overrides to drive a detector shutter through marServer (:723-729).
     #[test]
     fn shutter_control_reaches_marccds_set_shutter() {
-        use epics_rs::ad_core::driver::ShutterMode;
         let name = "MARCCD_SHUTTER";
         let log = fake_server(name, |c| if c.starts_with("get_") { "0" } else { "" });
         let det =
@@ -437,6 +446,33 @@ mod tests {
             assert!(Instant::now() < deadline, "ADShutterStatus stayed closed");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A non-detector mode is ADDriver::setShutter inside the write
+    /// (ADDriver.cpp:43-47), with no worker to reach.
+    #[test]
+    fn an_epics_shutter_is_set_inside_the_write() {
+        let mut d = MarccdDriver::new(
+            "MARCCD_EPICS_SHUTTER",
+            0,
+            DriverLinks {
+                cmd_tx: rt::command_channel::<Cmd>(1).0,
+                stop: Arc::new(Event::new()),
+            },
+        )
+        .unwrap();
+        let ad = d.ad.params;
+        d.ad.port_base
+            .set_int32_param(ad.shutter_mode, 0, ShutterMode::EpicsOnly as i32)
+            .unwrap();
+        d.ad_write_int32(&AsynUser::new(ad.shutter_control).with_addr(0), 1)
+            .unwrap();
+        assert_eq!(
+            d.ad.port_base
+                .get_int32_param(ad.shutter_control_epics, 0)
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
