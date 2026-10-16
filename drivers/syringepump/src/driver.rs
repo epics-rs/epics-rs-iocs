@@ -210,7 +210,8 @@ impl TeledyneDriver {
     }
 
     fn write_frame(&self, out: &str) -> AsynResult<()> {
-        self.handle.write_octet(OCTET_REASON, out.as_bytes())?;
+        let frame = [out.as_bytes(), crate::connect::EOS].concat();
+        self.handle.write_octet(OCTET_REASON, &frame)?;
         Ok(())
     }
 
@@ -454,6 +455,19 @@ impl PortDriver for TeledyneDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The writer frames the command, so a port that refuses the EOS still
+    /// sends the CR StreamDevice appends (AsynDriverInterface.cc:650-663).
+    #[test]
+    fn a_command_carries_its_cr_on_a_port_refusing_eos() {
+        let written = crate::connect::tests::eos_refusing_port("SP_FRAME_IO");
+        let handle =
+            crate::connect::connect_octet("SP_FRAME_IO", 0, std::time::Duration::from_secs(1))
+                .unwrap();
+        let drv = TeledyneDriver::new("SP_FRAME", handle, Family::D, 6);
+        drv.write_frame("6RUN").unwrap();
+        assert_eq!(written.lock().unwrap().as_slice(), b"6RUN\r");
+    }
 
     #[test]
     fn command_available_for_gates_h_only_commands() {

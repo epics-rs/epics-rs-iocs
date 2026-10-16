@@ -21,14 +21,44 @@
 use std::time::Duration;
 
 use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::user::AsynUser;
 
 /// `Terminator = CR;` in both `teled_d.proto` and `teled_h.proto` -- a bare
-/// CR (`\r`), applied to both input and output EOS.
+/// CR (`\r`). The writer appends it; asyn applies it only on input.
 pub const EOS: &[u8] = b"\r";
 
+/// C sets the EOS on a line that may still be down (`asynSetEos`'s
+/// QUEUE_EVEN_IF_NOT_CONNECTED).
+fn eos_user(addr: i32) -> AsynUser {
+    AsynUser::default()
+        .with_addr(addr)
+        .queue_even_if_not_connected()
+}
+
+/// StreamDevice `readHandler`'s EOS setup (AsynDriverInterface.cc:828-857):
+/// a port with no input EOS support is left alone, and a refused terminator
+/// is retried without its leading byte, then warned about. Never a failure.
+fn set_input_eos(port: &PortHandle, port_name: &str, addr: i32) {
+    let Ok(old) = port.get_input_eos_blocking(eos_user(addr)) else {
+        return;
+    };
+    let mut eos = EOS;
+    while !eos.is_empty() && eos != old.as_slice() {
+        match port.set_input_eos_blocking(eos_user(addr), eos) {
+            Ok(()) => return,
+            Err(e) if eos.len() == 1 => {
+                eprintln!("{port_name}: warning: pasynOctet->setInputEos() failed: {e}")
+            }
+            Err(_) => {}
+        }
+        eos = &eos[1..];
+    }
+}
+
 /// Connect a [`SyncIOHandle`] to a pre-configured octet port (serial or IP)
-/// by name and address, after applying [`EOS`] to both directions.
+/// by name and address, after applying [`EOS`] to its input.
 pub fn connect_octet(
     port_name: &str,
     addr: i32,
@@ -39,15 +69,10 @@ pub fn connect_octet(
             "octet port '{port_name}' not found (call drvAsynSerialPortConfigure/drvAsynIPPortConfigure first)"
         )
     })?;
-    // StreamDevice never fails on a refused EOS: it warns and reads on
-    // (AsynDriverInterface.cc:450-456, :842-857) and ignores the output
-    // status (:663, :689).
-    let _ = port
-        .handle
-        .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS);
-    let _ = port
-        .handle
-        .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), EOS);
+    set_input_eos(&port.handle, port_name, addr);
+    // StreamDevice appends the OutTerminator itself and clears asyn's,
+    // ignoring the result (AsynDriverInterface.cc:650-663).
+    let _ = port.handle.set_output_eos_blocking(eos_user(addr), b"");
     Ok(SyncIOHandle::from_handle(
         port.handle.clone(),
         addr,
@@ -56,15 +81,15 @@ pub fn connect_octet(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
-    use epics_rs::asyn::user::AsynUser;
+    use std::sync::{Arc, Mutex};
 
-    /// A port that refuses every EOS.
-    struct NoEos(PortDriverBase);
+    /// A port that refuses every EOS and keeps what is written to it.
+    struct NoEos(PortDriverBase, Arc<Mutex<Vec<u8>>>);
 
     impl PortDriver for NoEos {
         fn base(&self) -> &PortDriverBase {
@@ -72,6 +97,10 @@ mod tests {
         }
         fn base_mut(&mut self) -> &mut PortDriverBase {
             &mut self.0
+        }
+        fn write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.1.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
         }
         fn set_input_eos(&mut self, _user: &AsynUser, _eos: &[u8]) -> AsynResult<()> {
             Err(AsynError::Status {
@@ -87,10 +116,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_port_refusing_both_eos_still_connects() {
-        let name = "SP_NOEOS";
-        let driver = NoEos(PortDriverBase::new(name, 1, PortFlags::default()));
+    /// A published [`NoEos`] port and the bytes written to it.
+    pub(crate) fn eos_refusing_port(name: &str) -> Arc<Mutex<Vec<u8>>> {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let driver = NoEos(
+            PortDriverBase::new(name, 1, PortFlags::default()),
+            written.clone(),
+        );
         let claim = epics_rs::asyn::registry::claim_port(name).unwrap();
         let (rt, _actor) = create_port_runtime(&claim, driver, RuntimeConfig::default()).unwrap();
         claim
@@ -99,6 +131,13 @@ mod tests {
                 &epics_rs::base::runtime::interrupt_accept::InterruptGate::opened(),
             )
             .unwrap();
-        assert!(connect_octet(name, 0, Duration::from_secs(1)).is_ok());
+        std::mem::forget(rt);
+        written
+    }
+
+    #[test]
+    fn a_port_refusing_both_eos_still_connects() {
+        eos_refusing_port("SP_NOEOS");
+        assert!(connect_octet("SP_NOEOS", 0, Duration::from_secs(1)).is_ok());
     }
 }
