@@ -605,7 +605,15 @@ impl OpcuaDevice {
         if !self.enums.values_defined {
             // Without state values the raw value *is* the state index: the C
             // returns 2 ("don't convert") and sets both fields
-            // (`devOpcua.cpp:766-770`, `:823-828`).
+            // (`devOpcua.cpp:766-770`, `:823-828`). mbbo masks and shifts RVAL
+            // in place first (`:813-816`); mbbi does not.
+            let raw = if self.is_output {
+                (raw & ulong(record, "MASK")?)
+                    .checked_shr(ulong(record, "SHFT")?)
+                    .unwrap_or(0)
+            } else {
+                raw
+            };
             put(record, "RVAL", EpicsValue::ULong(raw))?;
             let index = u16::try_from(raw).unwrap_or(u16::MAX);
             put(record, "VAL", EpicsValue::Enum(index))?;

@@ -560,6 +560,22 @@ fn nobt_and_shft_put_the_mask_over_the_nodes_bit_window() {
 }
 
 #[test]
+fn an_mbbo_without_state_values_reads_back_the_masked_shifted_raw() {
+    // devOpcua.cpp:813-828: mask, shift, then VAL is the shifted RVAL.
+    let registry = registry();
+    let mut record = MbboRecord::new(0);
+    record.put_field("NOBT", EpicsValue::UShort(3)).unwrap();
+    record.put_field("SHFT", EpicsValue::UShort(4)).unwrap();
+    let mut device = bind(&registry, &mut record, "S ns=2;s=Node monitor=n");
+    let leaf = leaf(&registry);
+
+    incoming(&mut device, &leaf, &mut record, Variant::UInt32(0x120));
+
+    assert_eq!(field(&record, "RVAL"), EpicsValue::ULong(2));
+    assert_eq!(field(&record, "VAL"), EpicsValue::UShort(2));
+}
+
+#[test]
 fn an_mbbo_value_no_state_carries_is_the_unknown_state() {
     let registry = registry();
     let mut record = MbboRecord::new(0);
