@@ -188,42 +188,6 @@ impl BrukerDetector {
         self.command(&command, BIS_COMMAND_TIMEOUT);
         Ok(())
     }
-
-    /// BIS drives the shutter itself when the shutter is wired to the detector
-    /// (C `BISDetector::setShutter`).
-    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
-        let p = self.ad.params;
-        if ShutterMode::from_i32(self.get_i32(p.shutter_mode)) != Some(ShutterMode::DetectorOnly) {
-            return self.ad.set_shutter(open);
-        }
-
-        let open_delay = self
-            .ad
-            .port_base
-            .get_float64_param(p.shutter_open_delay, 0)
-            .unwrap_or(0.0);
-        let close_delay = self
-            .ad
-            .port_base
-            .get_float64_param(p.shutter_close_delay, 0)
-            .unwrap_or(0.0);
-        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT);
-
-        // Opening: wait out the difference between the opening and the closing
-        // time so the exposure is the length that was asked for, and never less
-        // than a millisecond so two commands do not go out back to back.
-        // Closing: wait out the closing time.
-        let delay = if open {
-            (open_delay - close_delay).max(0.001)
-        } else {
-            close_delay
-        };
-        if delay > 0.0 {
-            std::thread::sleep(std::time::Duration::from_secs_f64(delay));
-        }
-        self.ad.port_base.call_param_callbacks(0)?;
-        Ok(())
-    }
 }
 
 impl PortDriver for BrukerDetector {
@@ -275,8 +239,6 @@ impl PortDriver for BrukerDetector {
                     message: format!("binning {value} is not 1, 2, 4 or 8"),
                 });
             }
-        } else if reason == p.shutter_control {
-            self.set_shutter(value != 0)?;
         } else if reason == q.start_scan {
             self.start_scan()?;
         } else if reason == q.epics_shutter {
@@ -284,8 +246,9 @@ impl PortDriver for BrukerDetector {
             // past its own override on purpose: in EPICS shutter mode the
             // shutter is not BIS's to drive.
             self.ad.set_shutter(value != 0)?;
-        } else {
-            status = self.ad.write_int32_pool(reason, value).map(|_| ());
+        } else if reason < q.sfrm_timeout {
+            // FIRST_BIS_PARAM is BISSFRMTimeout (BISDetector.cpp:84).
+            status = ADDriver::ad_write_int32(self, user, value);
         }
 
         let _ = self.ad.port_base.call_param_callbacks(0);
@@ -322,6 +285,42 @@ impl ADDriver for BrukerDetector {
 
     fn ad_base_mut(&mut self) -> &mut ADDriverBase {
         &mut self.ad
+    }
+
+    /// BIS drives the shutter itself when the shutter is wired to the detector
+    /// (C `BISDetector::setShutter`).
+    fn set_shutter(&mut self, open: bool) -> AsynResult<()> {
+        let p = self.ad.params;
+        if ShutterMode::from_i32(self.get_i32(p.shutter_mode)) != Some(ShutterMode::DetectorOnly) {
+            return self.ad.set_shutter(open);
+        }
+
+        let open_delay = self
+            .ad
+            .port_base
+            .get_float64_param(p.shutter_open_delay, 0)
+            .unwrap_or(0.0);
+        let close_delay = self
+            .ad
+            .port_base
+            .get_float64_param(p.shutter_close_delay, 0)
+            .unwrap_or(0.0);
+        self.command(&protocol::shutter(open), BIS_COMMAND_TIMEOUT);
+
+        // Opening: wait out the difference between the opening and the closing
+        // time so the exposure is the length that was asked for, and never less
+        // than a millisecond so two commands do not go out back to back.
+        // Closing: wait out the closing time.
+        let delay = if open {
+            (open_delay - close_delay).max(0.001)
+        } else {
+            close_delay
+        };
+        if delay > 0.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64(delay));
+        }
+        self.ad.port_base.call_param_callbacks(0)?;
+        Ok(())
     }
 }
 
