@@ -8,7 +8,7 @@ use epics_rs::asyn::request::ParamSetValue;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
-use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool, PublishedArray};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -181,6 +181,8 @@ impl SimTaskContext {
 async fn sim_task(mut ctx: SimTaskContext) {
     let mut engine = SimEngine::new(Rng::from_entropy());
     let mut acquire = false;
+    // C `pArrays[0]`: the last image stays charged until the next convert.
+    let mut _last_image: Option<PublishedArray> = None;
 
     loop {
         if !acquire {
@@ -219,6 +221,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
         .await;
         ctx.set_shutter(true).await;
 
+        _last_image = None;
         let mut image = match ctx.compute_image(&mut engine).await {
             Ok(image) => image,
             Err(e) => {
@@ -266,6 +269,7 @@ async fn sim_task(mut ctx: SimTaskContext) {
 
         if !acquire {
             // `writeInt32` already stored ADAcquire=0.
+            _last_image = Some(image.share());
             continue;
         }
 
@@ -293,9 +297,11 @@ async fn sim_task(mut ctx: SimTaskContext) {
         // writes the NDTimeStamp / NDEpicsTSSec parameters.
         image.update_time_stamps_now();
 
+        let image = image.share();
         if array_callbacks {
-            ctx.publisher.publish(image).await;
+            ctx.publisher.publish(image.clone()).await;
         }
+        _last_image = Some(image);
 
         // See if acquisition is done.
         if image_mode == ImageMode::Single

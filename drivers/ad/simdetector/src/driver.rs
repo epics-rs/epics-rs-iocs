@@ -635,31 +635,25 @@ mod tests {
         assert_eq!(f.get_i32(p.shutter_status), 0);
     }
 
-    #[test]
-    fn wait_for_plugins_holds_acquire_busy_until_the_frame_is_released() {
+    /// An 8 x 8 detector set up for one 1 ms Single image, with the
+    /// parameters the IOC's PINI records seed.
+    fn single_image_detector(name: &str, array_callbacks: i32) -> SimDetectorRuntime {
         use epics_rs::ad_core::driver::ImageMode;
-        use epics_rs::ad_core::plugin::channel::ndarray_channel;
         use epics_rs::asyn::param::ParamValue;
         use epics_rs::asyn::registry::claim_port;
         use epics_rs::asyn::request::ParamSetValue;
-        use std::time::{Duration, Instant};
 
-        let rt = create_sim_detector(
-            &claim_port("SIM_BUSY").unwrap(),
-            8,
-            8,
-            NDDataType::UInt8,
-            0,
-            0,
-        )
-        .unwrap();
-        let (tx, mut rx) = ndarray_channel("SIM_BUSY_SINK", 8);
-        rt.connect_downstream(tx);
+        let rt =
+            create_sim_detector(&claim_port(name).unwrap(), 8, 8, NDDataType::UInt8, 0, 0).unwrap();
         let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
         h.set_params_and_notify_blocking(
             0,
             vec![
-                ParamSetValue::new(ad.base.array_callbacks, 0, ParamValue::Int32(1)),
+                ParamSetValue::new(
+                    ad.base.array_callbacks,
+                    0,
+                    ParamValue::Int32(array_callbacks),
+                ),
                 ParamSetValue::new(ad.base.wait_for_plugins, 0, ParamValue::Int32(1)),
                 ParamSetValue::new(
                     ad.image_mode,
@@ -720,7 +714,18 @@ mod tests {
             }
         }
         h.set_params_and_notify_blocking(0, seeds).unwrap();
+        rt
+    }
 
+    #[test]
+    fn wait_for_plugins_holds_acquire_busy_until_the_frame_is_released() {
+        use epics_rs::ad_core::plugin::channel::ndarray_channel;
+        use std::time::{Duration, Instant};
+
+        let rt = single_image_detector("SIM_BUSY", 1);
+        let (tx, mut rx) = ndarray_channel("SIM_BUSY_SINK", 8);
+        rt.connect_downstream(tx);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
         let read = |reason| h.read_int32_blocking(reason, 0).unwrap();
         let wait_for = |reason, value| {
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -737,6 +742,28 @@ mod tests {
         assert_eq!(read(ad.acquire_busy), 1, "busy cleared with a frame queued");
         drop(rx.blocking_recv().expect("frame"));
         wait_for(ad.acquire_busy, 0);
+        std::mem::forget(rt);
+    }
+
+    /// C keeps the last image in pArrays[0] until just before the next
+    /// convert (simDetector.cpp:696-700), published or not.
+    #[test]
+    fn the_last_image_stays_charged_after_the_acquisition() {
+        use std::time::{Duration, Instant};
+
+        let rt = single_image_detector("SIM_LAST", 0);
+        let (h, ad) = (rt.runtime_handle.port_handle(), rt.ad_params);
+        h.write_int32_blocking(ad.acquire, 0, 1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.read_int32_blocking(ad.base.array_counter, 0).unwrap() != 1
+            || h.read_int32_blocking(ad.acquire_busy, 0).unwrap() != 0
+        {
+            assert!(Instant::now() < deadline, "no image");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pool = rt.pool();
+        // pRaw_, pBackground_, pRamp_, pPeak_ and pArrays[0].
+        assert_eq!(pool.num_alloc_buffers() - pool.num_free_buffers(), 5);
         std::mem::forget(rt);
     }
 }
