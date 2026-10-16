@@ -25,6 +25,7 @@ use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{
     ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
 };
+use epics_rs::ad_core::plugin::runtime::ASYN_CANBLOCK;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::param::{EnumEntry, ParamType};
@@ -105,7 +106,7 @@ impl SpecsAnalyserDriver {
             start,
             stop,
         } = shared;
-        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory)?;
+        let mut ad = ADDriverBase::new(port_name, 0, 0, max_memory, ASYN_CANBLOCK)?;
         let _ = max_buffers;
         let p = SpecsParams::create(&mut ad.port_base)?;
         let base = &mut ad.port_base;
