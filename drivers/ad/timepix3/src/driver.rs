@@ -1192,13 +1192,32 @@ impl TimePix3Driver {
         {
             self.log_http(&e, prior_stop);
         }
-        if let Ok(measurement) = self.http.get_json(serval::MEASUREMENT, TIMEOUT_POLL)
-            && serval::measurement_is_running(&measurement)
+        let measurement = match self.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
+            Ok(body) if !body.is_empty() => match serval::parse_status_response(&body) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    self.ad.port_base.trace_print(
+                        TraceMask::WARNING,
+                        format_args!(
+                            "{}",
+                            adlog::warn(
+                                adlog::ACQUIRE_START,
+                                &format!(
+                                    "Failed to validate measurement status: {}, continuing after prior stop",
+                                    e.message()
+                                ),
+                            )
+                        ),
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+        if let Some(measurement) = measurement
+            && measurement.is_running()
         {
-            let status = measurement
-                .pointer("/Info/Status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
+            let status = measurement.status.unwrap_or_default();
             self.ad.port_base.trace_print(
                 TraceMask::IO_DRIVER,
                 format_args!(
@@ -1329,14 +1348,29 @@ impl TimePix3Driver {
                     );
                 }
             }
-            match self.http.get_json(serval::MEASUREMENT, TIMEOUT_POLL) {
-                Ok(m) => {
-                    measurement_valid = true;
-                    remote_stopped = !serval::measurement_is_running(&m);
-                    for (reason, value) in tasks::measurement_updates(&self.p, &m) {
-                        let _ = self.ad.port_base.set_param_value(reason, 0, value);
+            match self.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
+                Ok(body) => match serval::parse_status_response(&body) {
+                    Ok(m) => {
+                        measurement_valid = true;
+                        remote_stopped = m.is_remote_idle();
+                        for (reason, value) in tasks::measurement_updates(&self.p, &m) {
+                            let _ = self.ad.port_base.set_param_value(reason, 0, value);
+                        }
                     }
-                }
+                    Err(e) => self.ad.port_base.trace_print(
+                        TraceMask::ERROR,
+                        format_args!(
+                            "{}",
+                            adlog::err(
+                                adlog::STOP_ACQUISITION,
+                                &format!(
+                                    "transactional stop: invalid measurement response: {}",
+                                    e.message()
+                                ),
+                            )
+                        ),
+                    ),
+                },
                 Err(e) => {
                     self.log_http(
                         &e,
@@ -2228,6 +2262,11 @@ mod tests {
     /// A Serval that answers `{}` to everything but a request line holding
     /// `fail`, which gets a 500.
     fn fake_serval(fail: &'static str) -> String {
+        fake_serval_with(fail, "{}")
+    }
+
+    /// [`fake_serval`] answering `GET /measurement` with `measurement`.
+    fn fake_serval_with(fail: &'static str, measurement: &'static str) -> String {
         use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2253,9 +2292,15 @@ mod tests {
                 } else {
                     "200 OK"
                 };
+                let reply = if request.starts_with("GET /measurement ") {
+                    measurement
+                } else {
+                    "{}"
+                };
                 let _ = reader.get_mut().write_all(
                     format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
                     )
                     .as_bytes(),
                 );
@@ -2351,7 +2396,7 @@ mod tests {
     fn the_monitor_stops_an_idle_measurement() {
         let runtime = crate::create_timepix3_detector(
             &epics_rs::asyn::registry::claim_port("TPX_MONITOR").unwrap(),
-            &fake_serval("\0"),
+            &fake_serval_with("\0", r#"{"Info": {"Status": "DA_IDLE"}}"#),
             0,
         )
         .unwrap();
@@ -2372,6 +2417,100 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(seen, Some(idle));
+    }
+
+    /// The stop transaction posts every `GET /measurement` metric with its
+    /// param's type, and the status with its pipeline index
+    /// (acquisition_runtime.cpp:216-226, acquire.cpp:40-98).
+    #[test]
+    fn a_measurement_reply_posts_each_metric_with_its_param_type() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let mut det = TimePix3Driver::new(
+            "TPX_MSMT_TYPES",
+            Arc::new(ServalHttp::new(&fake_serval_with(
+                "\0",
+                r#"{"Info": {"PixelEventRate": 1200, "TdcEventRate": 3, "Tdc2EventRate": 4,
+                    "StartDateTime": 1700000000123, "ElapsedTime": 2.5, "TimeLeft": 0.5,
+                    "FrameCount": 9, "DroppedFrames": 1, "Status": "DA_STOPPED"}}"#,
+            ))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let (p, acquire) = (det.p, det.ad.params.acquire);
+        det.write_int32(&mut AsynUser::new(acquire), 1).unwrap();
+        det.write_int32(&mut AsynUser::new(acquire), 0).unwrap();
+        assert_eq!(det.int(p.pel_rate, 0), 1200);
+        assert_eq!(det.int(p.tdc1_rate, 0), 3);
+        assert_eq!(det.int(p.tdc2_rate, 0), 4);
+        assert_eq!(
+            det.ad.port_base.get_int64_param(p.start_time, 0).unwrap(),
+            1_700_000_000_123
+        );
+        assert_eq!(det.dbl(p.elapsed_time, 0), 2.5);
+        assert_eq!(det.dbl(p.time_left, 0), 0.5);
+        assert_eq!(det.int(p.frame_count, 0), 9);
+        assert_eq!(det.int(p.dropped_frames, 0), 1);
+        assert_eq!(det.text(p.status, 0), "DA_STOPPED");
+        assert_eq!(det.int(p.pipeline_state, 0), 3);
+    }
+
+    /// A `GET /measurement` reply that fails C `parseStatusResponse` is
+    /// warned about by the start and refused by the stop
+    /// (acquire.cpp:363-369, acquisition_runtime.cpp:226-235).
+    #[test]
+    fn an_invalid_measurement_reply_is_reported_by_start_and_stop() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        let name = "TPX_MSMT_INVALID";
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(4);
+        let det = TimePix3Driver::new(
+            name,
+            Arc::new(ServalHttp::new(&fake_serval_with("\0", "[]"))),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let acquire = det.ad.params.acquire;
+        let (runtime, _) = create_port_runtime(
+            &epics_rs::asyn::registry::claim_port(name).unwrap(),
+            det,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let h = runtime.port_handle().clone();
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        h.trace().set_trace_file(
+            Some(name),
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+        h.trace()
+            .set_trace_mask(Some(name), TraceMask::ERROR | TraceMask::WARNING);
+        h.write_int32_blocking(acquire, 0, 1).unwrap();
+        // An unconfirmed stop faults (acquisition_runtime.cpp:245-252).
+        assert!(h.write_int32_blocking(acquire, 0, 0).is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let why = "measurement JSON root is not an object";
+        for line in [
+            adlog::warn(
+                adlog::ACQUIRE_START,
+                &format!(
+                    "Failed to validate measurement status: {why}, continuing after prior stop"
+                ),
+            ),
+            adlog::err(
+                adlog::STOP_ACQUISITION,
+                &format!("transactional stop: invalid measurement response: {why}"),
+            ),
+        ] {
+            assert!(text.contains(&line), "{line}: {text:?}");
+        }
+        std::mem::forget(runtime);
     }
 
     /// A successful rotation re-reads `/detector` (ADTimePix.cpp:630-641).

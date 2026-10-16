@@ -416,15 +416,144 @@ pub fn measurement_config_body(current: &Value, c: &MeasurementConfig) -> Value 
 // Reading Serval's replies
 // ---------------------------------------------------------------------------
 
-/// `Info.Status` of `GET /measurement` — a measurement that is neither idle nor
-/// stopped has to be stopped before a new one starts (C `acquireStart`,
-/// acquire.cpp:113).
-pub fn measurement_is_running(measurement: &Value) -> bool {
-    match measurement.pointer("/Info/Status").and_then(Value::as_str) {
-        Some(status) => status != "DA_IDLE" && status != "DA_STOPPED",
-        // A missing or non-string status means "not running" in C.
-        None => false,
+/// A validated `GET /measurement` reply (C `StatusSnapshot`,
+/// serval_measurement.h); `None` is a field Serval did not send.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct StatusSnapshot {
+    pub pixel_event_rate: Option<i32>,
+    pub tdc1_event_rate: Option<i32>,
+    pub tdc2_event_rate: Option<i32>,
+    pub start_date_time: Option<i64>,
+    pub elapsed_time: Option<f64>,
+    pub time_left: Option<f64>,
+    pub frame_count: Option<i32>,
+    pub dropped_frames: Option<i32>,
+    pub status: Option<String>,
+}
+
+impl StatusSnapshot {
+    fn status_is_idle(&self) -> Option<bool> {
+        self.status
+            .as_deref()
+            .map(|s| s == "DA_IDLE" || s == "DA_STOPPED")
     }
+
+    /// A measurement `acquireStart` has to stop first (acquire.cpp:371-372).
+    pub fn is_running(&self) -> bool {
+        self.status_is_idle() == Some(false)
+    }
+
+    /// What ends `timePixCallback`'s poll (acquire.cpp:630-632).
+    pub fn is_idle(&self) -> bool {
+        self.status_is_idle() == Some(true)
+    }
+
+    /// C `isRemoteIdle` (acquisition_runtime.cpp:26): no status counts as
+    /// stopped.
+    pub fn is_remote_idle(&self) -> bool {
+        self.status_is_idle() != Some(false)
+    }
+}
+
+/// C `StatusResponseError` (serval_measurement.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusResponseError {
+    EmptyBody,
+    MalformedJson,
+    InvalidRoot,
+    InvalidInfo,
+    InvalidStatus,
+    InvalidMetric,
+}
+
+impl StatusResponseError {
+    /// C `statusResponseErrorMessage` (serval_measurement.cpp:198).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::EmptyBody => "empty measurement response",
+            Self::MalformedJson => "malformed measurement JSON",
+            Self::InvalidRoot => "measurement JSON root is not an object",
+            Self::InvalidInfo => "measurement Info field is not an object",
+            Self::InvalidStatus => "measurement Status field is not a string",
+            Self::InvalidMetric => "measurement metric has an invalid value",
+        }
+    }
+}
+
+/// C `boundedInt`: any finite number in i32 range, truncated.
+fn bounded_int(v: &Value) -> Option<i32> {
+    let f = v.as_f64()?;
+    (f.is_finite() && f >= f64::from(i32::MIN) && f <= f64::from(i32::MAX)).then_some(f as i32)
+}
+
+/// C `boundedInt64`: an integer in i64 range.
+fn bounded_int64(v: &Value) -> Option<i64> {
+    match v.as_u64() {
+        Some(u) => i64::try_from(u).ok(),
+        None => v.as_i64(),
+    }
+}
+
+/// C `finiteDouble`.
+fn finite_double(v: &Value) -> Option<f64> {
+    v.as_f64().filter(|f| f.is_finite())
+}
+
+/// C `parseStatusResponse` (serval_measurement.cpp:131): a present field of
+/// the wrong kind fails the whole reply, an absent one is left `None`.
+pub fn parse_status_response(body: &str) -> Result<StatusSnapshot, StatusResponseError> {
+    use StatusResponseError as E;
+    if body.is_empty() {
+        return Err(E::EmptyBody);
+    }
+    let m: Value = serde_json::from_str(body).map_err(|_| E::MalformedJson)?;
+    let Value::Object(m) = m else {
+        return Err(E::InvalidRoot);
+    };
+
+    fn field<T>(
+        info: &serde_json::Map<String, Value>,
+        name: &str,
+        parse: fn(&Value) -> Option<T>,
+    ) -> Result<Option<T>, StatusResponseError> {
+        info.get(name)
+            .map(|v| parse(v).ok_or(StatusResponseError::InvalidMetric))
+            .transpose()
+    }
+    fn status(v: &Value) -> Result<String, StatusResponseError> {
+        v.as_str()
+            .map(str::to_string)
+            .ok_or(StatusResponseError::InvalidStatus)
+    }
+
+    let mut snapshot = StatusSnapshot::default();
+    let info = match m.get("Info") {
+        Some(Value::Null) => None,
+        Some(Value::Object(info)) => Some(info),
+        Some(_) => return Err(E::InvalidInfo),
+        None => None,
+    };
+    if let Some(info) = info {
+        snapshot.pixel_event_rate = field(info, "PixelEventRate", bounded_int)?;
+        snapshot.tdc1_event_rate = field(info, "Tdc1EventRate", bounded_int)?;
+        snapshot.tdc2_event_rate = field(info, "Tdc2EventRate", bounded_int)?;
+        snapshot.start_date_time = field(info, "StartDateTime", bounded_int64)?;
+        snapshot.elapsed_time = field(info, "ElapsedTime", finite_double)?;
+        snapshot.time_left = field(info, "TimeLeft", finite_double)?;
+        snapshot.frame_count = field(info, "FrameCount", bounded_int)?;
+        snapshot.dropped_frames = field(info, "DroppedFrames", bounded_int)?;
+        if snapshot.tdc1_event_rate.is_none() {
+            snapshot.tdc1_event_rate = field(info, "TdcEventRate", bounded_int)?;
+        }
+        snapshot.status = info.get("Status").map(status).transpose()?;
+    }
+    if snapshot.status.is_none() {
+        snapshot.status = m.get("Status").map(status).transpose()?;
+    }
+    if snapshot.status.is_none() && m.get("Info") == Some(&Value::Null) {
+        snapshot.status = Some("DA_IDLE".into());
+    }
+    Ok(snapshot)
 }
 
 /// C `strip_quotes` (serval_http.cpp:91).
@@ -629,19 +758,76 @@ mod tests {
     }
 
     #[test]
-    fn a_running_measurement_is_anything_but_idle_or_stopped() {
-        assert!(!measurement_is_running(
-            &json!({"Info": {"Status": "DA_IDLE"}})
-        ));
-        assert!(!measurement_is_running(
-            &json!({"Info": {"Status": "DA_STOPPED"}})
-        ));
-        assert!(measurement_is_running(
-            &json!({"Info": {"Status": "DA_RECORDING"}})
-        ));
-        // A missing status is "not running" (C, acquire.cpp:126).
-        assert!(!measurement_is_running(&json!({})));
-        assert!(!measurement_is_running(&json!({"Info": {}})));
+    fn the_status_predicates_follow_their_c_callers() {
+        let snap = |status: Option<&str>| StatusSnapshot {
+            status: status.map(str::to_string),
+            ..StatusSnapshot::default()
+        };
+        for idle in ["DA_IDLE", "DA_STOPPED"] {
+            assert!(!snap(Some(idle)).is_running());
+            assert!(snap(Some(idle)).is_idle());
+            assert!(snap(Some(idle)).is_remote_idle());
+        }
+        assert!(snap(Some("DA_RECORDING")).is_running());
+        assert!(!snap(Some("DA_RECORDING")).is_idle());
+        assert!(!snap(Some("DA_RECORDING")).is_remote_idle());
+        // No status: not running, not idle for the poll, idle for the stop.
+        assert!(!snap(None).is_running());
+        assert!(!snap(None).is_idle());
+        assert!(snap(None).is_remote_idle());
+    }
+
+    /// C `parseStatusResponse` (serval_measurement.cpp:131-196).
+    #[test]
+    fn a_measurement_reply_is_validated_as_c_does() {
+        use StatusResponseError as E;
+        let parse = parse_status_response;
+        assert_eq!(parse(""), Err(E::EmptyBody));
+        assert_eq!(parse("{"), Err(E::MalformedJson));
+        assert_eq!(parse("[]"), Err(E::InvalidRoot));
+        assert_eq!(parse(r#"{"Info": 5}"#), Err(E::InvalidInfo));
+        assert_eq!(parse(r#"{"Info": {"Status": 3}}"#), Err(E::InvalidStatus));
+        assert_eq!(parse(r#"{"Status": null}"#), Err(E::InvalidStatus));
+        for bad in [
+            r#"{"Info": {"FrameCount": "7"}}"#,
+            r#"{"Info": {"FrameCount": 1e10}}"#,
+            r#"{"Info": {"DroppedFrames": null}}"#,
+            r#"{"Info": {"StartDateTime": 1.5}}"#,
+            r#"{"Info": {"StartDateTime": 18446744073709551615}}"#,
+            r#"{"Info": {"TdcEventRate": "x"}}"#,
+        ] {
+            assert_eq!(parse(bad), Err(E::InvalidMetric), "{bad}");
+        }
+
+        let s = parse(
+            r#"{"Info": {"PixelEventRate": 12.9, "TdcEventRate": 4, "Tdc2EventRate": 5,
+                "StartDateTime": 1700000000000, "ElapsedTime": 1.5, "TimeLeft": 0.5,
+                "FrameCount": 3, "DroppedFrames": 0, "Status": "DA_RECORDING"}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.pixel_event_rate, Some(12));
+        // TdcEventRate stands in for a missing Tdc1EventRate.
+        assert_eq!(s.tdc1_event_rate, Some(4));
+        assert_eq!(s.tdc2_event_rate, Some(5));
+        assert_eq!(s.start_date_time, Some(1_700_000_000_000));
+        assert_eq!(s.elapsed_time, Some(1.5));
+        assert_eq!(s.frame_count, Some(3));
+        assert_eq!(s.status.as_deref(), Some("DA_RECORDING"));
+        let s = parse(r#"{"Info": {"Tdc1EventRate": 1, "TdcEventRate": 9}}"#).unwrap();
+        assert_eq!(s.tdc1_event_rate, Some(1));
+
+        assert_eq!(
+            parse(r#"{"Info": {}, "Status": "DA_STARTING"}"#)
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("DA_STARTING")
+        );
+        assert_eq!(
+            parse(r#"{"Info": null}"#).unwrap().status.as_deref(),
+            Some("DA_IDLE")
+        );
+        assert_eq!(parse("{}").unwrap(), StatusSnapshot::default());
     }
 
     #[test]

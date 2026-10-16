@@ -844,7 +844,7 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
                 .collect();
             ctx.set(0, updates).await;
 
-            if !serval::measurement_is_running(&m) {
+            if m.is_idle() {
                 break Some((false, ""));
             }
             if !ctx.shared.acquisition.monitoring() {
@@ -866,50 +866,63 @@ async fn acquisition_poll(ctx: Arc<Ctx>, mut start_rx: rt::CommandReceiver<()>) 
     }
 }
 
-/// C `publishMeasurementSnapshot` (acquire.cpp:40-60).
-pub(crate) fn measurement_updates(p: &TimePixParams, m: &Value) -> Vec<(usize, ParamValue)> {
+/// C `publishMeasurementSnapshot` (acquire.cpp:40-60) and
+/// `updateMeasurementStatusFromJson` (acquire.cpp:83-98).
+pub(crate) fn measurement_updates(
+    p: &TimePixParams,
+    m: &serval::StatusSnapshot,
+) -> Vec<(usize, ParamValue)> {
     let mut updates = Vec::new();
-    if let Some(v) = m.pointer("/Info/Status").and_then(Value::as_str) {
-        updates.push((p.status, ParamValue::Octet(v.as_bytes().into())));
-    }
-    for (ptr, reason) in [
-        ("/Info/ElapsedTime", p.elapsed_time),
-        ("/Info/TimeLeft", p.time_left),
-        ("/Info/PixelEventRate", p.pel_rate),
-        ("/Info/TdcEventRate", p.tdc1_rate),
+    for (v, reason) in [
+        (m.pixel_event_rate, p.pel_rate),
+        (m.tdc1_event_rate, p.tdc1_rate),
+        (m.tdc2_event_rate, p.tdc2_rate),
     ] {
-        if let Some(v) = m.pointer(ptr).and_then(Value::as_f64) {
+        if let Some(v) = v {
+            updates.push((reason, ParamValue::Int32(v)));
+        }
+    }
+    if let Some(v) = m.start_date_time {
+        updates.push((p.start_time, ParamValue::Int64(v)));
+    }
+    for (v, reason) in [(m.elapsed_time, p.elapsed_time), (m.time_left, p.time_left)] {
+        if let Some(v) = v {
             updates.push((reason, ParamValue::Float64(v)));
         }
     }
-    for (ptr, reason) in [
-        ("/Info/FrameCount", p.frame_count),
-        ("/Info/DroppedFrames", p.dropped_frames),
+    for (v, reason) in [
+        (m.frame_count, p.frame_count),
+        (m.dropped_frames, p.dropped_frames),
     ] {
-        if let Some(v) = m.pointer(ptr).and_then(Value::as_i64) {
-            updates.push((
-                reason,
-                ParamValue::Int32(i32::try_from(v).unwrap_or(i32::MAX)),
-            ));
+        if let Some(v) = v {
+            updates.push((reason, ParamValue::Int32(v)));
         }
     }
-    if let Some(v) = m.pointer("/Info/StartDateTime").and_then(Value::as_str) {
-        updates.push((p.start_time, ParamValue::Octet(v.as_bytes().into())));
+    if let Some(status) = &m.status {
+        let index = match status.as_str() {
+            "DA_STARTING" => 0,
+            "DA_RECORDING" => 1,
+            "DA_STOPPING" => 2,
+            "DA_IDLE" | "DA_STOPPED" => 3,
+            _ => -1,
+        };
+        updates.push((p.status, ParamValue::Octet(status.as_bytes().into())));
+        updates.push((p.pipeline_state, ParamValue::Int32(index)));
     }
     updates
 }
 
 /// One `GET /measurement`, printing C `timePixCallback`'s line for a failure;
 /// the error is the reason the acquisition rolls back with.
-fn poll_measurement(ctx: &Ctx, first: bool) -> Result<Value, &'static str> {
+fn poll_measurement(ctx: &Ctx, first: bool) -> Result<serval::StatusSnapshot, &'static str> {
     match ctx.http.get(serval::MEASUREMENT, TIMEOUT_POLL) {
-        Ok(body) => serde_json::from_str(&body).map_err(|e| {
+        Ok(body) => serval::parse_status_response(&body).map_err(|e| {
             let what = if first { "measurement" } else { "poll" };
             ctx.trace(
                 TraceMask::ERROR,
                 &adlog::err(
                     adlog::TIME_PIX_CALLBACK,
-                    &format!("timePixCallback: {what} JSON parse failed: {e}"),
+                    &format!("timePixCallback: invalid {what} response: {}", e.message()),
                 ),
             );
             if first {
