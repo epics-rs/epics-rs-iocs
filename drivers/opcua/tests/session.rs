@@ -411,6 +411,15 @@ fn no_credentials_file_is_the_anonymous_token() {
 }
 
 #[test]
+fn an_empty_sec_id_is_no_credentials_file() {
+    let mut config = SessionConfig::new("sess", "opc.tcp://host");
+    config.set_option("sec-id", "/etc/opcua/creds").unwrap();
+    config.set_option("sec-id", "").unwrap();
+    assert_eq!(config.identity_file, None);
+    assert_eq!(config.setup_identity(), opcua::client::Identity::Anonymous);
+}
+
+#[test]
 fn a_credentials_file_with_user_and_pass_is_a_username_token() {
     assert_eq!(
         identity_from("# operator\nuser=op\npass=se=cret\n"),

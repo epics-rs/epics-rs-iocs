@@ -205,7 +205,8 @@ impl SessionConfig {
                     }
                 }
             }
-            "sec-id" => self.identity_file = Some(value.to_string()),
+            // An empty name is C's empty `securityIdentityFile`: anonymous.
+            "sec-id" => self.identity_file = (!value.is_empty()).then(|| value.to_string()),
             "debug" => self.debug = count(),
             "nodes-max" | "batch-nodes" => {
                 if name == "batch-nodes" {
