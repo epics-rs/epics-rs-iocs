@@ -229,7 +229,7 @@ impl AmptekUdpTransport {
 
     /// `CDppSocket::SendPacketInet` (`DppSocket.cpp:452-506`): send
     /// `packet` to `target:10001`, sleep 50 ms, then accumulate up to
-    /// [`MAX_RESPONSE_SIZE`] bytes across up to [`MAX_RECV_ITERATIONS`]
+    /// `MAX_RESPONSE_SIZE` bytes across up to `MAX_RECV_ITERATIONS`
     /// receives, stopping early once exactly `expected_size` bytes have
     /// arrived (`iTotal == iRequestedSize`) or a receive times out
     /// (`iSize <= 0`). Errors (not "no response") only for actual socket

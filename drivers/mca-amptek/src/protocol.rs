@@ -23,7 +23,7 @@ mod pid1 {
     pub const REQ_STATUS: u8 = 0x01;
     pub const REQ_SPECTRUM: u8 = 0x02;
     /// `PID1_REQ_SCOPE_MISC` (`DP5Protocol.h:101`) -- used for the
-    /// NetFinder direct-query request ([`build_netfinder_direct_request`]).
+    /// NetFinder direct-query request ([`super::build_netfinder_direct_request`]).
     pub const REQ_SCOPE_MISC: u8 = 0x03;
     pub const REQ_CONFIG: u8 = 0x20;
     pub const VENDOR_REQ: u8 = 0xF0;
@@ -47,7 +47,7 @@ mod pid2_netfinder {
     pub const READBACK_RESPONSE: u8 = 0x08;
 }
 
-/// `DP5Protocol.h`: the receive-side PID2 values [`ReceivedPacket::classify`]
+/// `DP5Protocol.h`: the receive-side PID2 values [`parse_packet`]
 /// routes on, restricted to what `CConsoleHelper::ReceiveData` (and
 /// therefore `drvAmptek.cpp`) actually handles.
 mod pid2_rcv {
@@ -58,7 +58,7 @@ mod pid2_rcv {
 }
 
 /// `DP5Protocol.h enum PID2_ACK_TYPE` -- the status byte
-/// [`parse_packet_status`] can produce. `Ok` is C's `PID2_ACK_OK` (0x00);
+/// `parse_packet_status` can produce. `Ok` is C's `PID2_ACK_OK` (0x00);
 /// C's ad-hoc "packet invalid, will be overwritten" sentinel `0xFF`
 /// (`ConsoleHelper.cpp:408,457`) has no wire meaning here, so it is not a
 /// variant -- callers represent "no response received" as `Err`/`None` at

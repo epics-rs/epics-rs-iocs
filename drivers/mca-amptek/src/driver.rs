@@ -76,7 +76,7 @@
 //!   dispatch branch returns.
 //! - **`sendConfigurationFile`'s split-send discards the first half's
 //!   status** (`drvAmptek.cpp:400-435`): if the config string exceeds 512
-//!   bytes it is sent in two [`AmptekDriver::send_command_string`] calls,
+//!   bytes it is sent in two `AmptekDriver::send_command_string` calls,
 //!   and only the second's result is returned, even if the first failed.
 //!
 //! # Fixed (not reproduced) upstream defects
@@ -89,7 +89,7 @@
 //!   a well-formed configuration-readback response arriving in reply to a
 //!   `XMTPT_SEND_CONFIG_PACKET_EX` send would be misread as an
 //!   "Unrecognized Command" ack error, with the config text itself reported
-//!   as the "offending command". [`AmptekDriver::send_command_string`]
+//!   as the "offending command". `AmptekDriver::send_command_string`
 //!   instead only calls [`protocol::offending_command_text`] when
 //!   [`protocol::parse_packet`] classified the response as
 //!   [`ReceivedPacket::Ack`] -- a classification that (unlike `ParseCmd`)

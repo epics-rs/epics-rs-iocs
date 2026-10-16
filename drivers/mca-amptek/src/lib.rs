@@ -6,7 +6,7 @@
 //! `CConsoleHelper` -- a handful of `SendCommand`/`ReceiveData` calls and
 //! the ASCII configuration helpers -- not the ~10k-line `AmptekSrc` SDK
 //! tree at large. Ported here:
-//! * [`protocol`] -- binary wire framing/checksum ([`SendCommand.cpp`],
+//! * [`protocol`] -- binary wire framing/checksum (`SendCommand.cpp`,
 //!   `ParsePacket.cpp`, `DP5Protocol.h`).
 //! * [`status`] -- the DP4-format status block decode (`DP5Status.cpp`).
 //! * [`ascii_cmd`] -- ASCII `KEY=value;` configuration string helpers

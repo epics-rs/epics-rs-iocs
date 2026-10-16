@@ -16,7 +16,7 @@
 //! internal spaces in a config line (e.g. `"TPEA = 12.5;"`) survive
 //! whitespace removal and get sent to the device as part of the ASCII
 //! command, which the DP5 firmware's `KEY=value;` grammar does not
-//! tolerate. [`remove_whitespace`] here strips the *intended* set (tab,
+//! tolerate. `remove_whitespace` here strips the *intended* set (tab,
 //! LF, vertical tab, form feed, CR, space), matching the doc comment
 //! rather than the broken macro expansion.
 
