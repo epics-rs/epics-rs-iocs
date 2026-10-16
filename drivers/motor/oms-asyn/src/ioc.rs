@@ -104,9 +104,7 @@ fn oms_config_command(
                 Ok(fw) => println!("{cmd_name}: {controller_type} firmware: {fw}"),
                 Err(e) => println!("{cmd_name}: warning: firmware read failed: {e}"),
             }
-            controller
-                .init(&init_string)
-                .map_err(|e| format!("{cmd_name}: init failed: {e}"))?;
+            controller.init(&init_string);
 
             let controller = Arc::new(Mutex::new(controller));
             registry_lock(&registry).insert(

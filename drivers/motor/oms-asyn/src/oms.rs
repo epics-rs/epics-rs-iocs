@@ -158,14 +158,14 @@ impl OmsController {
     }
 
     /// Interrupt-clear and stop-all, then send an optional init string (C
-    /// `Init` preamble). Called once at controller creation.
-    pub fn init(&self, init_string: &str) -> AsynResult<()> {
-        self.send_only("IC;")?;
-        self.send_only("AM SA;")?;
+    /// `Init` preamble). Called once at controller creation. C ignores each
+    /// sendOnly's status here; a failure is only its printed line.
+    pub fn init(&self, init_string: &str) {
+        let _ = self.send_only("IC;");
+        let _ = self.send_only("AM SA;");
         if !init_string.is_empty() {
-            self.send_only(init_string)?;
+            let _ = self.send_only(init_string);
         }
-        Ok(())
     }
 }
 
@@ -557,6 +557,54 @@ mod tests {
         axis.set_encoder_ratio(&user, 4.0).unwrap();
         axis.move_absolute(&user, 10.0, 1.0, 100.0, 1000.0).unwrap();
         assert!(written.lock().unwrap().iter().any(|c| c == "AX;LO250;"));
+    }
+
+    /// A line that refuses every write; records what was offered.
+    struct DeadLine {
+        base: epics_rs::asyn::port::PortDriverBase,
+        written: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl epics_rs::asyn::port::PortDriver for DeadLine {
+        fn base(&self) -> &epics_rs::asyn::port::PortDriverBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut epics_rs::asyn::port::PortDriverBase {
+            &mut self.base
+        }
+        fn io_write_octet(&mut self, _user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
+            self.written
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(data).into_owned());
+            Err(oms_err("dead line"))
+        }
+    }
+
+    #[test]
+    fn init_sends_every_command_past_a_failed_send() {
+        use epics_rs::asyn::port::{PortDriverBase, PortFlags};
+        use epics_rs::asyn::registry::claim_port;
+        use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let port = DeadLine {
+            base: PortDriverBase::new("omsDeadInit", 1, PortFlags::default()),
+            written: written.clone(),
+        };
+        let (rt, _actor) = create_port_runtime(
+            &claim_port("omsDeadInit").unwrap(),
+            port,
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let io = SyncIOHandle::from_handle(
+            rt.port_handle().clone(),
+            0,
+            std::time::Duration::from_secs(1),
+        );
+        OmsController::new(io, "omsDeadInit", "MAXnet").init("AX LP0;");
+        assert_eq!(*written.lock().unwrap(), ["IC;", "AM SA;", "AX LP0;"]);
     }
 
     #[test]
