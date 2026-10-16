@@ -358,6 +358,8 @@ pub struct AmptekDriver {
     failed_sends: u32,
     /// `CConsoleHelper::NumDevices`: devices the last connect attempt found.
     num_devices: usize,
+    /// `CH_.DP5Proto.PIN`'s header, persistent across packets.
+    pin: protocol::PacketHeader,
     /// `CConsoleHelper::DP5Stat.m_DP5_Status`, the last successfully
     /// decoded status block. Initialized from an all-zero block (matching
     /// a zero-initialized C struct member) rather than `Option` -- every
@@ -434,6 +436,7 @@ impl AmptekDriver {
             acquiring: false,
             failed_sends: 0,
             num_devices: 0,
+            pin: protocol::PacketHeader::default(),
             last_status: status::process_status(&[0u8; 64]),
             spectrum: Vec::new(),
             hw_cfg_dp5: String::new(),
@@ -535,7 +538,7 @@ impl AmptekDriver {
     /// response and update the cached status/spectrum its packet carries.
     /// `None` is C's `false` (a framing error or an unrouted PID).
     fn receive_data(&mut self, raw: &[u8]) -> Option<ReceivedPacket> {
-        let packet = protocol::parse_packet(raw);
+        let packet = protocol::parse_packet(raw, &mut self.pin);
         match &packet {
             ReceivedPacket::Status { data } => self.last_status = status::process_status(data),
             ReceivedPacket::Spectrum { pid2, data } => {

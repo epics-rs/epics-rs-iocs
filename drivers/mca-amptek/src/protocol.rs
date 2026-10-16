@@ -307,33 +307,53 @@ pub fn decode_spectrum(pid2: u8, data: &[u8]) -> (usize, Vec<i32>) {
 /// the `LEN` the header claims (C indexes straight past the buffer end in
 /// that case, `ParsePacket.cpp:23-26` -- an upstream defect, not
 /// reproduced; see the crate-level defect list).
-fn parse_packet_status(raw: &[u8]) -> Result<(u8, u8, Vec<u8>), AckStatus> {
-    if raw.len() < 2 || raw[0] != SYNC1 {
-        return Err(AckStatus::SyncError);
+fn parse_packet_status(raw: &[u8], pin: &mut PacketHeader) -> Result<(u8, u8, Vec<u8>), AckStatus> {
+    let status = match framing(raw, pin) {
+        Ok(parsed) => return Ok(parsed),
+        Err(status) => status,
+    };
+    // `ParsePacket.cpp:47-48`: LEN/PID1/PID2 are whatever the last header
+    // that passed sync left in `PIN`.
+    println!(
+        "CParsePacket::ParsePacketStatus PIN->STATUS={}, PIN->LEN={}, PIN->PID1={}, PIN->PID2={}",
+        status, pin.len, pin.pid1, pin.pid2
+    );
+    Err(AckStatus::from_byte(status))
+}
+
+/// `PID2_ACK_*` codes: sync 1, length 3, checksum 4 (`DP5Protocol.h:237-256`).
+fn framing(raw: &[u8], pin: &mut PacketHeader) -> Result<(u8, u8, Vec<u8>), u8> {
+    if raw.len() < 2 || raw[0] != SYNC1 || raw[1] != SYNC2 {
+        return Err(1);
     }
-    if raw[1] != SYNC2 {
-        return Err(AckStatus::SyncError);
-    }
-    if raw.len() < 6 {
-        return Err(AckStatus::LenError);
-    }
-    if raw[4] >= 128 {
-        return Err(AckStatus::LenError);
+    if raw.len() < 6 || raw[4] >= 128 {
+        return Err(3);
     }
     let len = usize::from(raw[4]) * 256 + usize::from(raw[5]);
-    let pid1 = raw[2];
-    let pid2 = raw[3];
+    pin.len = len as u16;
+    pin.pid1 = raw[2];
+    pin.pid2 = raw[3];
     // header(6) + data(len) + checksum(2)
     if raw.len() < 6 + len + 2 {
-        return Err(AckStatus::LenError);
+        return Err(3);
     }
     let header_and_data = &raw[0..6 + len];
     let sum: u32 = header_and_data.iter().map(|&b| u32::from(b)).sum();
     let wire_checksum = u32::from(raw[6 + len]) * 256 + u32::from(raw[6 + len + 1]);
     if (sum.wrapping_add(wire_checksum)) & 0xFFFF != 0 {
-        return Err(AckStatus::ChecksumError);
+        return Err(4);
     }
-    Ok((pid1, pid2, raw[6..6 + len].to_vec()))
+    Ok((raw[2], raw[3], raw[6..6 + len].to_vec()))
+}
+
+/// The header fields of C's persistent `CH_.DP5Proto.PIN`
+/// (`DP5Protocol.h Packet_In`), kept across packets because
+/// `ParsePacketStatus` only overwrites them when sync and LEN pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PacketHeader {
+    pub len: u16,
+    pub pid1: u8,
+    pub pid2: u8,
 }
 
 /// `CParsePacket::PID2_TextToString` (`ParsePacket.cpp:51-117`).
@@ -399,8 +419,8 @@ pub fn parse_cmd(source: &str, status: AckStatus, data: &[u8]) -> String {
 /// triggers them, so a packet on one of those routes here classifies as
 /// [`ReceivedPacket::Error`] with `AckStatus::PidError`, matching C's own
 /// unmatched-PID fallthrough (`ParsePacket.cpp:156-158`).
-pub fn parse_packet(raw: &[u8]) -> ReceivedPacket {
-    let (pid1, pid2, data) = match parse_packet_status(raw) {
+pub fn parse_packet(raw: &[u8], pin: &mut PacketHeader) -> ReceivedPacket {
+    let (pid1, pid2, data) = match parse_packet_status(raw, pin) {
         Ok(parsed) => parsed,
         Err(status) => {
             return ReceivedPacket::Error { status };
@@ -457,17 +477,46 @@ mod tests {
     fn pack_and_parse_round_trip() {
         let payload = b"CLCK=AUTO;TPEA=12.500000;";
         let buf = pack_out(0x20, 0x02, payload);
-        let (pid1, pid2, data) = parse_packet_status(&buf).unwrap();
+        let (pid1, pid2, data) = parse_packet_status(&buf, &mut PacketHeader::default()).unwrap();
         assert_eq!(pid1, 0x20);
         assert_eq!(pid2, 0x02);
         assert_eq!(data, payload);
+    }
+
+    /// `ParsePacket.cpp:18-21`: a sync error leaves the previous header in
+    /// `PIN`; a checksum error still records the new one.
+    #[test]
+    fn packet_header_persists_across_sync_errors() {
+        let mut pin = PacketHeader::default();
+        let mut bad_cs = pack_out(0x82, 0x0C, &[1, 2]);
+        bad_cs[7] ^= 1;
+        assert_eq!(
+            parse_packet_status(&bad_cs, &mut pin),
+            Err(AckStatus::ChecksumError)
+        );
+        let seen = PacketHeader {
+            len: 2,
+            pid1: 0x82,
+            pid2: 0x0C,
+        };
+        assert_eq!(pin, seen);
+        let mut bad_sync = pack_out(0x01, 0x01, &[]);
+        bad_sync[1] = 0;
+        assert_eq!(
+            parse_packet_status(&bad_sync, &mut pin),
+            Err(AckStatus::SyncError)
+        );
+        assert_eq!(pin, seen);
     }
 
     #[test]
     fn parse_packet_status_rejects_bad_sync() {
         let mut buf = pack_out(0x01, 0x01, &[]);
         buf[0] = 0x00;
-        assert_eq!(parse_packet_status(&buf), Err(AckStatus::SyncError));
+        assert_eq!(
+            parse_packet_status(&buf, &mut PacketHeader::default()),
+            Err(AckStatus::SyncError)
+        );
     }
 
     #[test]
@@ -475,14 +524,17 @@ mod tests {
         let mut buf = pack_out(0x01, 0x01, &[]);
         let last = buf.len() - 1;
         buf[last] ^= 0xFF;
-        assert_eq!(parse_packet_status(&buf), Err(AckStatus::ChecksumError));
+        assert_eq!(
+            parse_packet_status(&buf, &mut PacketHeader::default()),
+            Err(AckStatus::ChecksumError)
+        );
     }
 
     #[test]
     fn parse_packet_status_rejects_truncated_buffer() {
         let buf = pack_out(0x20, 0x02, b"CLCK=AUTO;");
         assert_eq!(
-            parse_packet_status(&buf[..buf.len() - 3]),
+            parse_packet_status(&buf[..buf.len() - 3], &mut PacketHeader::default()),
             Err(AckStatus::LenError)
         );
     }
@@ -493,7 +545,7 @@ mod tests {
     fn parse_packet_routes_status() {
         let raw_status = vec![0u8; 64];
         let buf = pack_out(0x80, 0x01, &raw_status);
-        match parse_packet(&buf) {
+        match parse_packet(&buf, &mut PacketHeader::default()) {
             ReceivedPacket::Status { data } => assert_eq!(data, raw_status),
             other => panic!("expected Status, got {other:?}"),
         }
@@ -505,7 +557,7 @@ mod tests {
     fn parse_packet_routes_spectrum_across_the_full_pid2_range() {
         for pid2 in 0x01..=0x0Cu8 {
             let buf = pack_out(0x81, pid2, &[1, 2, 3]);
-            match parse_packet(&buf) {
+            match parse_packet(&buf, &mut PacketHeader::default()) {
                 ReceivedPacket::Spectrum { pid2: got, data } => {
                     assert_eq!(got, pid2);
                     assert_eq!(data, vec![1, 2, 3]);
@@ -574,7 +626,7 @@ mod tests {
     #[test]
     fn parse_packet_routes_config_readback() {
         let buf = pack_out(0x82, 0x07, b"CLCK=AUTO;");
-        match parse_packet(&buf) {
+        match parse_packet(&buf, &mut PacketHeader::default()) {
             ReceivedPacket::ConfigReadback { data } => assert_eq!(data, b"CLCK=AUTO;"),
             other => panic!("expected ConfigReadback, got {other:?}"),
         }
@@ -585,7 +637,7 @@ mod tests {
     fn parse_packet_routes_bare_ack() {
         let buf = pack_out(0xFF, 0x00, &[]);
         assert_eq!(
-            parse_packet(&buf),
+            parse_packet(&buf, &mut PacketHeader::default()),
             ReceivedPacket::Ack {
                 status: AckStatus::Ok,
                 data: vec![],
@@ -601,7 +653,7 @@ mod tests {
     #[test]
     fn parse_packet_routes_error_ack_to_ack_not_error() {
         let buf = pack_out(0xFF, 0x05, b"BADCMD=1;");
-        match parse_packet(&buf) {
+        match parse_packet(&buf, &mut PacketHeader::default()) {
             ReceivedPacket::Ack {
                 status: AckStatus::BadParam,
                 data,
@@ -646,7 +698,7 @@ mod tests {
     fn parse_packet_unmatched_pid_is_pid_error() {
         let buf = pack_out(0x03, 0x01, &[]);
         assert_eq!(
-            parse_packet(&buf),
+            parse_packet(&buf, &mut PacketHeader::default()),
             ReceivedPacket::Error {
                 status: AckStatus::PidError,
             }
@@ -657,12 +709,12 @@ mod tests {
     fn parse_packet_scope_misc_is_unprocessed() {
         for pid2 in [0x01, 0x02, 0x03, 0x04, 0x05, 0x0C] {
             assert_eq!(
-                parse_packet(&pack_out(0x82, pid2, &[])),
+                parse_packet(&pack_out(0x82, pid2, &[]), &mut PacketHeader::default()),
                 ReceivedPacket::Unprocessed
             );
         }
         assert!(matches!(
-            parse_packet(&pack_out(0x82, 0x06, &[])),
+            parse_packet(&pack_out(0x82, 0x06, &[]), &mut PacketHeader::default()),
             ReceivedPacket::Error { .. }
         ));
     }
