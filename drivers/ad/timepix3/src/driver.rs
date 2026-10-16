@@ -1358,16 +1358,27 @@ impl PortDriver for TimePix3Driver {
                     .set_int32_param(exists, 0, i32::from(ok))?;
             }
         }
-        if reason == p.tof_tdc_reference {
-            self.send_measurement_config()?;
+        let status = if reason == p.tof_tdc_reference {
+            self.send_measurement_config()
+        } else {
+            Ok(())
+        };
+        // The callbacks run on failure too (ADTimePix.cpp:463-465).
+        let callbacks = self.ad.port_base.call_param_callbacks(addr);
+        if let Err(e) = status.and(callbacks) {
+            let status = match e {
+                AsynError::Status { status, .. } => status,
+                _ => AsynStatus::Error,
+            };
+            return Err(AsynError::Status {
+                status,
+                message: format!(
+                    "ADTimePix:{}: status={}, function={reason}, paramName={name}, value={value}",
+                    adlog::WRITE_OCTET,
+                    status as i32
+                ),
+            });
         }
-
-        // UPSTREAM DEFECT (ADTimePix.cpp:371): C's writeOctet sets the
-        // parameter's status to reflect the validation it just did and then
-        // calls `callParamCallbacks`, which re-sets the status from the
-        // parameter library and discards it — the record never shows the
-        // failure. The status is left to the return value here.
-        self.ad.port_base.call_param_callbacks(addr)?;
         self.ad.port_base.trace_print(
             TraceMask::IO_DRIVER,
             format_args!(
@@ -1474,6 +1485,34 @@ mod tests {
             det.text(p.calibration_policy, 0),
             "Blocked: calibration root is not absolute"
         );
+    }
+
+    /// A failed writeOctet action reports C's errorMessage, not the
+    /// action's own (ADTimePix.cpp:467-470).
+    #[test]
+    fn a_failed_write_octet_reports_the_write_octet_message() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_OCTET_FAIL",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        let e = det
+            .write_octet(&mut AsynUser::new(p.tof_tdc_reference), b"PN\0x")
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "asyn: Error - ADTimePix:{}: status=3, function={}, paramName=TPX3_TOF_TDC_REFERENCE, value=PN",
+                adlog::WRITE_OCTET,
+                p.tof_tdc_reference
+            )
+        );
+        assert_eq!(det.text(p.tof_tdc_reference, 0), "PN");
     }
 
     /// writeOctet stores up to the first NUL and ignores a blank threshold
