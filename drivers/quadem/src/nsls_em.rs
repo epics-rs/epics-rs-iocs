@@ -349,7 +349,7 @@ impl QuadEmDevice for NslsEmDriver {
             self.shared.set_acquiring(true);
             self.shared.acquire_start.signal();
         }
-        self.base_set_acquire(value)?;
+        let _ = self.base_set_acquire(value);
         self.set_mode()
     }
 

@@ -934,9 +934,8 @@ pub trait QuadEmDevice {
     }
 
     /// `drvQuadEM::reset`: push every cached EPICS setting back to the meter,
-    /// re-read the status, then restore the acquire state. C++ discards each
-    /// setter's status, so the port keeps resetting even when the meter
-    /// rejects one command.
+    /// re-read the status, then restore the acquire state. C++ discards every
+    /// status, the last `setAcquire`'s included, and returns success.
     fn base_reset(&mut self) -> AsynResult<()> {
         let p = self.qe_base().params;
         let acquire_param = self.qe_base().nd_params.acquire;
@@ -967,7 +966,8 @@ pub trait QuadEmDevice {
         let _ = self.set_read_format(read_format);
         let _ = self.set_integration_time(integration_time);
         let _ = self.read_status();
-        self.set_acquire(acquire)
+        let _ = self.set_acquire(acquire);
+        Ok(())
     }
 }
 

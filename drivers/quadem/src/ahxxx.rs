@@ -143,7 +143,7 @@ impl AhxxxDriver {
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
         let resp = self.write_read_meter(out)?;
         if resp != "ACK" && resp != "AK" {
@@ -155,7 +155,7 @@ impl AhxxxDriver {
             return Err(error(format!("AHxxx: {out} -> {resp}, expected ACK")));
         }
         if prev_acquiring {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -274,6 +274,8 @@ impl QuadEmDevice for AhxxxDriver {
             while self.shared.is_reading_active() {
                 thread::sleep(HANDSHAKE_POLL);
             }
+            // C++ returns the last `TRG OFF` exchange's status.
+            let mut status = Ok(());
             loop {
                 // Both meter families are stopped: which one is on the far end
                 // is not known until the firmware string has been read.
@@ -289,6 +291,7 @@ impl QuadEmDevice for AhxxxDriver {
                         "drvAHxxx:setAcquire: error calling pasynOctetSyncIO->writeRead, status={}",
                         trace::status_code(&e)
                     );
+                    status = Err(e);
                     break;
                 }
                 // Flush, then read with a short timeout to drain any responses;
@@ -299,39 +302,43 @@ impl QuadEmDevice for AhxxxDriver {
                     break;
                 }
             }
-            self.base_set_acquire(0)?;
-            return Ok(());
+            let _ = self.base_set_acquire(0);
+            return status;
         }
 
-        self.base_set_acquire(1)?;
+        let _ = self.base_set_acquire(1);
 
         let num_acquire = proto::naq_value(acquire_mode, num_average);
-        let is_ah401 = self.is_ah401();
         let model = self.model;
-        let result = (|| -> AsynResult<()> {
-            // Put the device in the appropriate mode.
-            self.write_read_meter(proto::cmd_read_format(read_format))?;
+        // Put the device in the appropriate mode. As in C++ only the command
+        // that starts the meter decides the status.
+        let _ = self.write_read_meter(proto::cmd_read_format(read_format));
 
-            // In one-shot mode ask the meter for a specific number of samples.
-            // On the AH501BE the NAQ command starts the acquisition and is not
-            // echoed, so it is sent below instead.
-            if model != QeModel::Ah501be {
-                self.write_read_meter(&proto::cmd_naq(num_acquire))?;
-            }
+        // In one-shot mode ask the meter for a specific number of samples.
+        // On the AH501BE the NAQ command starts the acquisition and is not
+        // echoed, so it is sent below instead.
+        if model != QeModel::Ah501be {
+            let _ = self.write_read_meter(&proto::cmd_naq(num_acquire));
+        }
 
-            if trigger_mode == QeTriggerMode::ExtTrigger || trigger_mode == QeTriggerMode::ExtGate {
-                // External trigger mode: the meter waits for the trigger.
-                self.write_read_meter("TRG ON")?;
-            } else if is_ah401 {
-                // The AH401 series echoes an ACK after ACQ ON; the AH501s do not.
-                self.write_read_meter("ACQ ON")?;
-            } else if acquire_mode == QeAcquireMode::Single && model == QeModel::Ah501be {
-                self.io.write(&proto::cmd_naq(num_acquire))?;
-            } else {
-                self.io.write("ACQ ON")?;
-            }
-            Ok(())
-        })();
+        let started = if trigger_mode == QeTriggerMode::ExtTrigger
+            || trigger_mode == QeTriggerMode::ExtGate
+        {
+            // External trigger mode: the meter waits for the trigger.
+            self.write_read_meter("TRG ON").map(drop)
+        } else if self.is_ah401() {
+            // The AH401 series echoes an ACK after ACQ ON; the AH501s do not.
+            self.write_read_meter("ACQ ON").map(drop)
+        } else if acquire_mode == QeAcquireMode::Single && model == QeModel::Ah501be {
+            self.io.write(&proto::cmd_naq(num_acquire)).map(drop)
+        } else {
+            self.io.write("ACQ ON").map(drop)
+        };
+        // Binary mode overwrites it with the input-EOS call's status.
+        let status = match read_format {
+            QeReadFormat::Binary => Ok(()),
+            _ => started,
+        };
 
         {
             let mut acq = self.shared.acq.lock();
@@ -340,18 +347,15 @@ impl QuadEmDevice for AhxxxDriver {
             acq.read_format = read_format as i32;
         }
 
-        if let Err(e) = result {
-            // C++ `if (status) acquiring_ = 0;`
-            self.shared.set_acquiring(false);
-            return Err(e);
-        }
-
         // Setting the flag before the signal keeps the read thread from going
         // straight back to sleep; C++ orders it the other way because both
         // sides run under the port lock.
         self.shared.set_acquiring(true);
         self.shared.acquire_start.signal();
-        Ok(())
+        if status.is_err() {
+            self.shared.set_acquiring(false);
+        }
+        status
     }
 
     /// C++ `drvAHxxx::setRange`: `"RNG %d"`.
@@ -423,7 +427,7 @@ impl QuadEmDevice for AhxxxDriver {
     fn read_status(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
         let mut last = trace::StatusExchange::default();
         if let Err(e) = self.read_status_inner(&mut last) {
@@ -437,14 +441,14 @@ impl QuadEmDevice for AhxxxDriver {
             return Err(e);
         }
         if prev_acquiring {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
 
     /// C++ `drvAHxxx::reset`.
     fn reset(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
+        let _ = self.set_acquire(0);
         self.firmware_version = "Unknown".into();
         if let Ok(resp) = self.write_read_meter("VER ?") {
             self.firmware_version = resp;

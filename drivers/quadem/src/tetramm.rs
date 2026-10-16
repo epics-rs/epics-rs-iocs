@@ -46,7 +46,7 @@ pub struct TetrAmmDriver {
 impl TetrAmmDriver {
     fn new(
         port_name: &str,
-        qe_port_name: &str,
+        io: OctetIo,
         max_memory: usize,
         shared: Arc<QuadEmShared>,
     ) -> AsynResult<Self> {
@@ -55,7 +55,6 @@ impl TetrAmmDriver {
             .port_base
             .create_param(P_INTERLOCK_STATUS, epics_rs::asyn::param::ParamType::Int32)?;
 
-        let io = connect_octet(qe_port_name, proto::TETRAMM_TIMEOUT)?;
         // C++ `drvTetrAMM::drvTetrAMM`: setInputEos(pasynUserMeter_, "\r\n", 2).
         io.set_input_eos(b"\r\n")?;
 
@@ -99,10 +98,11 @@ impl TetrAmmDriver {
     }
 
     /// C++ `sendCommand`: stop acquisition around the command, require `ACK`.
+    /// As in C++, only the command's own status is returned.
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
         let resp = self.write_read_meter(out)?;
         if resp != "ACK" {
@@ -117,14 +117,14 @@ impl TetrAmmDriver {
             });
         }
         if prev_acquiring {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
 
     fn get_firmware_version(&mut self) -> AsynResult<()> {
         self.firmware_version = "Unknown".into();
-        self.set_acquire(0)?;
+        let _ = self.set_acquire(0);
         let resp = self.write_read_meter("VER:?")?;
         self.firmware_version = proto::parse_version(&resp).to_string();
         let idx = self.params().firmware;
@@ -148,7 +148,10 @@ impl QuadEmDevice for TetrAmmDriver {
         &self.shared
     }
 
-    /// C++ `drvTetrAMM::setAcquire`.
+    /// C++ `drvTetrAMM::setAcquire`. Stopping returns the status of the last
+    /// exchange that looked for the `ACK`; starting returns the `ACQ:ON` write's
+    /// in ASCII mode only, because C++ overwrites it in binary mode with the
+    /// input-EOS call's.
     fn set_acquire(&mut self, value: i32) -> AsynResult<()> {
         if value == 1 && self.shared.is_acquiring() {
             return Ok(());
@@ -162,6 +165,7 @@ impl QuadEmDevice for TetrAmmDriver {
             }
             let resp = self.write_read_meter("ACQ:OFF");
             let acked = matches!(&resp, Ok(r) if r == "ACK");
+            let mut status = resp.map(drop);
             if !acked {
                 // Drain until a response ends on EOS with a trailing ACK, or the
                 // read times out.
@@ -170,6 +174,7 @@ impl QuadEmDevice for TetrAmmDriver {
                         Ok(outcome) => {
                             let s = outcome.as_str();
                             if outcome.eom.contains(EomReason::EOS) && s.ends_with("ACK") {
+                                status = Ok(());
                                 break;
                             }
                             asyn_print!(
@@ -186,24 +191,37 @@ impl QuadEmDevice for TetrAmmDriver {
                                 "drvTetrAMM::setAcquire error waiting for ACK response, status={}",
                                 trace::status_code(&e)
                             );
+                            status = Err(e);
                             break;
                         }
                     }
                 }
             }
-            self.base_set_acquire(0)?;
+            let _ = self.base_set_acquire(0);
+            status
         } else {
-            self.base_set_acquire(1)?;
+            let _ = self.base_set_acquire(1);
             // C++ calls setAcquireParams() here: it is needed before NAQ and
             // also flushes any stale input.
-            self.set_acquire_params()?;
-            self.io.write("ACQ:ON")?;
+            let _ = self.set_acquire_params();
+            let written = self.io.write("ACQ:ON").map(drop);
+            let read_format = self
+                .base
+                .port_base
+                .get_int32_param(self.params().read_format, 0)?;
+            let status = match QeReadFormat::from_i32(read_format) {
+                QeReadFormat::Binary => Ok(()),
+                _ => written,
+            };
             self.shared.acquire_start.signal();
             while !self.shared.is_reading_active() {
                 thread::sleep(HANDSHAKE_POLL);
             }
+            if status.is_err() {
+                self.shared.set_acquiring(false);
+            }
+            status
         }
-        Ok(())
     }
 
     /// C++ `drvTetrAMM::setRange` writes the range to all four channels.
@@ -235,17 +253,18 @@ impl QuadEmDevice for TetrAmmDriver {
 
     /// C++ `setBiasState`: reset latched faults, switch the supply, and
     /// re-send the voltage (it is rejected while the bias is off).
+    /// Every command is sent; C++ returns the last one's status.
     fn set_bias_state(&mut self, value: i32) -> AsynResult<()> {
-        self.send_command("STATUS:RESET")?;
-        self.send_command(proto::cmd_bias_state(value != 0))?;
+        let _ = self.send_command("STATUS:RESET");
+        let mut status = self.send_command(proto::cmd_bias_state(value != 0));
         if value != 0 {
             let bv = self
                 .base
                 .port_base
                 .get_float64_param(self.params().bias_voltage, 0)?;
-            self.set_bias_voltage(bv)?;
+            status = self.set_bias_voltage(bv);
         }
-        Ok(())
+        status
     }
 
     fn set_bias_voltage(&mut self, value: f64) -> AsynResult<()> {
@@ -270,7 +289,7 @@ impl QuadEmDevice for TetrAmmDriver {
     fn read_status(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
         let mut last = trace::StatusExchange::default();
         if let Err(e) = self.read_status_inner(&mut last) {
@@ -284,7 +303,7 @@ impl QuadEmDevice for TetrAmmDriver {
             return Err(e);
         }
         if prev_acquiring {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -304,7 +323,7 @@ impl QuadEmDevice for TetrAmmDriver {
 
     /// C++ `drvTetrAMM::reset`.
     fn reset(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
+        let _ = self.set_acquire(0);
         let _ = self.send_command("HWRESET");
         let mut came_back = false;
         for _ in 0..RESET_WAIT_LOOPS {
@@ -330,7 +349,7 @@ impl TetrAmmDriver {
     fn set_acquire_params(&mut self) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
 
         let p = self.params();
@@ -384,7 +403,7 @@ impl TetrAmmDriver {
         let _ = self.write_read_meter(&proto::cmd_ntrg(ntrg));
 
         if prev_acquiring {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -723,7 +742,8 @@ pub fn create_tetramm(
 ) -> AsynResult<TetrAmmRuntime> {
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
 
-    let driver = TetrAmmDriver::new(port_name, qe_port_name, max_memory, shared.clone())?;
+    let io = connect_octet(qe_port_name, proto::TETRAMM_TIMEOUT)?;
+    let driver = TetrAmmDriver::new(port_name, io, max_memory, shared.clone())?;
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
     let pool = driver.base.pool.clone();
@@ -805,5 +825,70 @@ mod tests {
             ),
             "{text:?}"
         );
+    }
+
+    /// A meter on a local socket: every command is logged, `nak` is answered
+    /// with `NAK`, everything else with `ACK`.
+    fn ack_meter(nak: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            while reader.read_until(b'\r', &mut line).unwrap_or(0) > 0 {
+                let cmd = String::from_utf8_lossy(&line).trim().to_string();
+                line.clear();
+                let reply = if cmd == nak { "NAK\r\n" } else { "ACK\r\n" };
+                seen.lock().unwrap().push(cmd);
+                let _ = out.write_all(reply.as_bytes());
+            }
+        });
+        (addr, log)
+    }
+
+    fn driver_on(name: &str, host: &str) -> TetrAmmDriver {
+        let (io, runtime) = create_ip_port(
+            &format!("{name}_IP"),
+            host,
+            Duration::from_millis(200),
+            false,
+            true,
+        )
+        .unwrap();
+        // The port runtime must outlive the test; the driver only holds an
+        // octet user on it.
+        std::mem::forget(runtime);
+        // st.cmd's asynOctetSetOutputEos; the driver sets only the input EOS.
+        io.set_output_eos(b"\r").unwrap();
+        TetrAmmDriver::new(name, io, 0, QuadEmShared::new(16).0).unwrap()
+    }
+
+    #[test]
+    fn stopping_a_dead_meter_fails_the_acquire_write() {
+        let mut drv = driver_on("QE_TETRA_DEAD", "127.0.0.1:1");
+        let acquire = drv.base.nd_params.acquire;
+        assert!(drv.qe_write_int32(acquire, 0, 0).is_err());
+    }
+
+    #[test]
+    fn bias_on_is_sent_after_a_refused_status_reset() {
+        let (addr, log) = ack_meter("STATUS:RESET");
+        let mut drv = driver_on("QE_TETRA_BIAS", &addr);
+        let bias_state = drv.base.params.bias_state;
+        drv.base
+            .port_base
+            .set_int32_param(bias_state, 0, 1)
+            .unwrap();
+        // The last command's status is returned: HVS:<volts> was acknowledged.
+        assert!(drv.set_bias_state(1).is_ok());
+        let log = log.lock().unwrap();
+        let reset = log.iter().position(|c| c == "STATUS:RESET").unwrap();
+        assert_eq!(log[reset + 1], "HVS:ON");
+        assert!(log[reset + 2].starts_with("HVS:"), "{log:?}");
     }
 }

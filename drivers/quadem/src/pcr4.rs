@@ -110,7 +110,7 @@ impl Pcr4Driver {
     fn send_command(&mut self, out: &str) -> AsynResult<()> {
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
         let resp = self.write_read_meter(out)?;
         if resp != proto::ACK {
@@ -122,7 +122,7 @@ impl Pcr4Driver {
             return Err(error(format!("PCR4: {out} -> {resp}, expected ACK")));
         }
         if prev_acquiring {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -135,7 +135,7 @@ impl Pcr4Driver {
     /// the revision 0, and `readEnum` then refuses to offer range choices —
     /// which is what upstream's `default:` branch does for an unknown revision.
     fn get_firmware_version(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
+        let _ = self.set_acquire(0);
         self.firmware_version = "Unknown".into();
         let resp = self.write_read_meter(proto::CMD_VERSION)?;
         match proto::parse_version(&resp) {
@@ -172,7 +172,7 @@ impl Pcr4Driver {
         let averaging_time = self.base.port_base.get_float64_param(p.averaging_time, 0)?;
 
         if prev_acquiring || trigger_mode != 0 {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
 
         let sample_time = proto::sample_time(values_per_read);
@@ -200,7 +200,7 @@ impl Pcr4Driver {
         // In free-run the caller (setAcquire) starts the acquisition itself;
         // only a triggered acquisition is restarted from here.
         if prev_acquiring && trigger_mode != 0 {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -299,6 +299,8 @@ impl QuadEmDevice for Pcr4Driver {
             let _ = self.write_read_meter(proto::CMD_TRIGGER_STOP);
             let stopped = self.write_read_meter(proto::CMD_ACQUIRE_STOP);
             let acked = matches!(&stopped, Ok(resp) if resp == proto::ACK);
+            // C++ returns the status of the last exchange that looked for it.
+            let mut status = stopped.map(drop);
             if !acked {
                 // The ACK is somewhere in the stream of samples still in
                 // flight: read until a line ends in it, or until the meter
@@ -309,6 +311,7 @@ impl QuadEmDevice for Pcr4Driver {
                             if outcome.eom.contains(EomReason::EOS)
                                 && proto::ends_with_ack(&outcome.data)
                             {
+                                status = Ok(());
                                 break;
                             }
                             asyn_print!(
@@ -325,32 +328,32 @@ impl QuadEmDevice for Pcr4Driver {
                                 "drvPCR4::setAcquire error waiting for ACK response, status={}",
                                 trace::status_code(&e)
                             );
+                            status = Err(e);
                             break;
                         }
                     }
                 }
             }
 
-            self.base_set_acquire(0)?;
-            return Ok(());
+            let _ = self.base_set_acquire(0);
+            return status;
         }
 
-        self.base_set_acquire(1)?;
+        let _ = self.base_set_acquire(1);
         // Pushing the settings also flushes any stale input.
-        self.set_acquire_params()?;
+        let _ = self.set_acquire_params();
 
         let trigger_mode = self
             .base
             .port_base
             .get_int32_param(self.params().trigger_mode, 0)?;
-        if trigger_mode == 0 {
-            // A triggered acquisition was already started by TRIGGER:START in
-            // setAcquireParams; free-run needs the explicit start.
-            if let Err(e) = self.io.write(proto::CMD_ACQUIRE_START) {
-                self.shared.set_acquiring(false);
-                return Err(e);
-            }
-        }
+        // A triggered acquisition was already started by TRIGGER:START in
+        // setAcquireParams; free-run needs the explicit start.
+        let status = if trigger_mode == 0 {
+            self.io.write(proto::CMD_ACQUIRE_START).map(drop)
+        } else {
+            Ok(())
+        };
 
         // Setting the flag before the signal keeps the read thread from going
         // straight back to sleep; C++ orders it the other way because both
@@ -360,7 +363,10 @@ impl QuadEmDevice for Pcr4Driver {
         while !self.shared.is_reading_active() {
             thread::sleep(HANDSHAKE_POLL);
         }
-        Ok(())
+        if status.is_err() {
+            self.shared.set_acquiring(false);
+        }
+        status
     }
 
     fn set_acquire_mode(&mut self, _value: i32) -> AsynResult<()> {
@@ -390,16 +396,17 @@ impl QuadEmDevice for Pcr4Driver {
     /// C++ `drvPCR4::setBiasState`: `"BIAS:ON"`/`"BIAS:OFF"`, followed by the
     /// bias voltage — the meter rejects the voltage while the bias is off, so
     /// it has to be re-sent when the bias comes on.
+    /// Both commands are sent; C++ returns the last one's status.
     fn set_bias_state(&mut self, value: i32) -> AsynResult<()> {
-        self.send_command(proto::cmd_bias_state(value != 0))?;
+        let mut status = self.send_command(proto::cmd_bias_state(value != 0));
         if value != 0 {
             let volts = self
                 .base
                 .port_base
                 .get_float64_param(self.params().bias_voltage, 0)?;
-            self.set_bias_voltage(volts)?;
+            status = self.set_bias_voltage(volts);
         }
-        Ok(())
+        status
     }
 
     /// C++ `drvPCR4::setBiasVoltage`: `"SETBIAS:%f"`, skipped while the bias
@@ -423,7 +430,7 @@ impl QuadEmDevice for Pcr4Driver {
             .get_int32_param(self.params().trigger_mode, 0)?;
         let prev_acquiring = self.shared.is_acquiring();
         if prev_acquiring || trigger_mode != 0 {
-            self.set_acquire(0)?;
+            let _ = self.set_acquire(0);
         }
         let mut last = trace::StatusExchange::default();
         if let Err(e) = self.read_status_inner(&mut last) {
@@ -437,7 +444,7 @@ impl QuadEmDevice for Pcr4Driver {
             return Err(e);
         }
         if prev_acquiring || trigger_mode != 0 {
-            self.set_acquire(1)?;
+            let _ = self.set_acquire(1);
         }
         Ok(())
     }
@@ -451,7 +458,7 @@ impl QuadEmDevice for Pcr4Driver {
 
     /// C++ `drvPCR4::reset`.
     fn reset(&mut self) -> AsynResult<()> {
-        self.set_acquire(0)?;
+        let _ = self.set_acquire(0);
         // C++ ignores RESET's status: a meter that did not answer it is still
         // waited for, and reported when it never comes back.
         let _ = self.send_command(proto::CMD_RESET);
