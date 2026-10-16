@@ -28,8 +28,8 @@
 //! controller's native units, and divides back in `poll` (`APOS/resolution_`).
 //! At the asyn-rs motor boundary (EGU frame) that scale cancels, so this port
 //! drops it and works in the controller's native user units: positions pass
-//! through unscaled, the record's `MRES` is 1, and its `EGU` is the controller
-//! unit (typically mm). Consequently the encoder readback is `?FPOS` directly
+//! through unscaled, its `EGU` is the controller unit (typically mm), and its
+//! `MRES` must be the axis resolution (raw counts are integers). Consequently the encoder readback is `?FPOS` directly
 //! (already in user units), not `FPOS/EFAC` as in the raw-step C frame.
 //!
 //! ## Homing (deviation, documented)

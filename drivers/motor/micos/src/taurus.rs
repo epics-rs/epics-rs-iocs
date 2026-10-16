@@ -17,8 +17,9 @@
 //!
 //! The C driver's `axisRes = clPeriod` only bridges the record's raw-step
 //! boundary to the controller's engineering units and cancels at the EGU
-//! boundary, so it is dropped: the driver boundary is controller-native units
-//! with `MRES` = 1. `SMCTaurusChangeResolution` is not ported — set the record
+//! boundary, so it is dropped: the driver boundary is controller-native units,
+//! and the record's `MRES` must carry `axisRes` as its step (raw counts are
+//! integers). `SMCTaurusChangeResolution` is not ported — set the record
 //! `MRES` instead.
 //!
 //! ## Deviations (documented)

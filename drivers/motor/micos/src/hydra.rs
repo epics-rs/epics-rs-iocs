@@ -17,7 +17,8 @@
 //! The C driver's `axisRes` (`pitch/(4·polePairs)` for a stepper motor form, or
 //! `clPeriod` otherwise) only bridges the record's raw-step boundary to the
 //! controller's engineering units and cancels at the EGU boundary, so it is
-//! dropped: the driver boundary is controller-native units with `MRES` = 1. The
+//! dropped: the driver boundary is controller-native units, and the record's
+//! `MRES` must carry `axisRes` as its step (raw counts are integers). The
 //! `SMChydraChangeResolution` iocsh command (a runtime `axisRes` override) is
 //! not ported — set the record `MRES` instead. The motor form is still read
 //! (`getmotor`) because it selects the `set_closed_loop` behaviour.

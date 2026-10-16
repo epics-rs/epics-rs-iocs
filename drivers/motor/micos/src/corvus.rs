@@ -20,8 +20,9 @@
 //! The corvus works in physical units (the `pos`/`move` values are already
 //! engineering units). The C driver's `axisRes = pitch / (4 · polePairs)` only
 //! bridges the record's raw-step boundary to those units and cancels at the EGU
-//! boundary, so it is dropped: the driver boundary is controller-native units
-//! with `MRES` = 1. The `SMCcorvusChangeResolution` iocsh command (a runtime
+//! boundary, so it is dropped: the driver boundary is controller-native units,
+//! and the record's `MRES` must carry `axisRes` as its step (raw counts are
+//! integers). The `SMCcorvusChangeResolution` iocsh command (a runtime
 //! `axisRes` override) is likewise not ported — set the record `MRES` instead.
 //!
 //! ## Deviations (documented)

@@ -27,7 +27,8 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
 SMChydraCreateController(0, "$(IPPORT)", $(NAXES), 100, 500)
 
 # One motor record per axis (DTYP HYDRA_$(CARD)_0, _1). The driver reports
-# positions in controller-native engineering units, so MRES = 1.
+# positions in controller-native engineering units; the template's MRES is the
+# record step.
 dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
 dbLoadRecords("$(MICOS_IOC)/db/hydra.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
 

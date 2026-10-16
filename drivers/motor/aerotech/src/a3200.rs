@@ -20,7 +20,8 @@
 //!
 //! As in the Ensemble port, the C `stepSize = 1 / CountsPerUnit` scaling cancels
 //! at the asyn-rs [`AsynMotor`] (dial-frame EGU) boundary and is dropped: the
-//! driver works in the controller's user units with `MRES` = 1. Command values
+//! driver works in the controller's user units, and the record's `MRES` must be
+//! `stepSize` (raw counts are integers). Command values
 //! are formatted at a fixed [`PRECISION`] (the C derived a per-axis digit count
 //! from `stepSize`, which this port does not carry).
 //!

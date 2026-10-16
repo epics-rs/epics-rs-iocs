@@ -1,11 +1,11 @@
 # Micos SMC Taurus: one motor record per axis. Load once per axis with N =
 # 0-based axis index (DTYP TAURUS_$(CARD)_$(N)); the command prefix uses N + 1.
 #
-# The driver reports positions in controller-native engineering units (the
-# axisRes = clPeriod scale cancels at the EGU boundary), so MRES = 1 and
-# EGU = the controller's unit. Changing DHLM/DLLM pushes the soft limits to the
-# controller (setnlimit). If you want the record scaled into a different unit,
-# set MRES here instead of the (unported) ChangeResolution command.
+# The driver reports positions in controller-native engineering units. MRES is
+# the record's step (RRBV is an integer count and RDBD >= MRES), so set it to
+# the axis resolution, C's axisRes = clPeriod (motorMicos ships no Taurus
+# example). Changing DHLM/DLLM pushes the soft limits to the controller
+# (setnlimit).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "TAURUS_$(CARD)_$(N)")
@@ -14,7 +14,7 @@ record(motor, "$(P)$(M)") {
     field(ACCL, "$(ACCL=0.2)")
     field(DHLM, "$(HLM=100.0)")
     field(DLLM, "$(LLM=-100.0)")
-    field(MRES, "$(MRES=1.0)")
+    field(MRES, "$(MRES=0.0001)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
 }

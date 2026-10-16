@@ -2,9 +2,11 @@
 # the key registered by AcsMotionConfig (card + 0-based axis index).
 #
 # Positions/velocities/accelerations are the controller's native user units
-# (ACSPL+ APOS/PTP/VEL), with no resolution scaling in the driver, so MRES = 1
-# and EGU is the controller unit (typically mm). VELO/ACCL are in units/second
-# and units/second^2.
+# (ACSPL+ APOS/PTP/VEL), with no resolution scaling in the driver, and EGU is
+# the controller unit (typically mm). MRES is the record's step (RRBV is an
+# integer count and RDBD >= MRES), so set it to the axis resolution; the
+# default is the C example's (AcsMotion.substitutions). VELO/ACCL are in
+# units/second and units/second^2.
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "ACSMOTION_$(CTRL)_$(AXIS)")
@@ -13,7 +15,7 @@ record(motor, "$(P)$(M)") {
     field(ACCL, "$(ACCL=0.2)")
     field(DHLM, "$(HLM=100)")
     field(DLLM, "$(LLM=-100)")
-    field(MRES, "$(MRES=1.0)")
+    field(MRES, "$(MRES=0.0001)")
     field(EGU,  "$(EGU=mm)")
     field(PREC, "$(PREC=4)")
 }

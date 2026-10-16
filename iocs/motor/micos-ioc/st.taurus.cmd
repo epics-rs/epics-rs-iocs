@@ -28,7 +28,8 @@ asynOctetSetInputEos("$(IPPORT)", 0, "\r\n")
 SMCTaurusCreateController(0, "$(IPPORT)", $(NAXES), 100, 500)
 
 # One motor record per axis (DTYP TAURUS_$(CARD)_0, ...). The driver reports
-# positions in controller-native engineering units, so MRES = 1.
+# positions in controller-native engineering units; the template's MRES is the
+# record step.
 dbLoadRecords("$(MICOS_IOC)/db/taurus.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
 
 iocInit()
