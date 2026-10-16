@@ -11,21 +11,20 @@ use std::time::Duration;
 use epics_rs::asyn::asyn_record::get_port;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 
-/// asyn sub-address of a single-device octet port.
-const OCTET_ADDR: i32 = 0;
+use crate::worker::{OCTET_ADDR, Transport};
 
 /// Connect to an octet port created earlier in `st.cmd` by
 /// `drvAsynSerialPortConfigure` or `drvAsynIPPortConfigure`.
-pub fn connect_octet(port_name: &str, timeout: Duration) -> Result<SyncIOHandle, String> {
+pub fn connect_octet(port_name: &str, timeout: Duration) -> Result<Transport, String> {
     let port = get_port(port_name).ok_or_else(|| {
         format!(
             "octet port '{port_name}' not found (call drvAsynSerialPortConfigure or \
              drvAsynIPPortConfigure first)"
         )
     })?;
-    Ok(SyncIOHandle::from_handle(
-        port.handle.clone(),
-        OCTET_ADDR,
-        timeout,
+    Ok(Transport::new(
+        SyncIOHandle::from_handle(port.handle.clone(), OCTET_ADDR, timeout),
+        port.handle.trace().clone(),
+        port_name,
     ))
 }

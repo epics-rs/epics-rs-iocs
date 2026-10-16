@@ -11,7 +11,7 @@ use epics_rs::asyn::runtime::port::create_port_runtime;
 
 use crate::connect::connect_octet;
 use crate::runtime::IpPortRuntime;
-use crate::worker::{self, Transport};
+use crate::worker;
 use driver::{TPG261_TIMEOUT, TpgDriver, TpgWorker};
 
 /// `TPG261Config(port, octetPort, [pollPeriod])`.
@@ -25,11 +25,7 @@ pub fn create_tpg261(
     let params = driver.params();
 
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
-    let worker = TpgWorker::new(
-        Transport::new(io),
-        runtime_handle.port_handle().clone(),
-        params,
-    );
+    let worker = TpgWorker::new(io, runtime_handle.port_handle().clone(), params);
     let thread = worker::spawn(port_name, worker, commands, poll_period);
     Ok(IpPortRuntime::new(runtime_handle, thread))
 }

@@ -7,11 +7,14 @@
 //! write handlers enqueue. The write handlers must not touch the handle
 //! themselves — a blocking submit from the port-actor thread is not usable.
 
+use std::fmt;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::{TraceManager, TraceMask};
 
 /// Largest device reply any of the `ip` devices sends (`devMPC.c` reads at most
 /// 50 bytes, `devTPG261.c` 64).
@@ -20,15 +23,30 @@ const READ_BUF: usize = 128;
 /// asyn `pasynUser->reason` for a raw octet read/write on the transport port.
 const OCTET_REASON: usize = 0;
 
+/// The address C's device support connects at (`connectDevice(pasynUser, port, 0)`).
+pub const OCTET_ADDR: i32 = 0;
+
 /// The device end of a port: a write/read pair over the octet port, framed by
 /// the port's own input EOS (set in `st.cmd` with `asynOctetSetInputEos`).
 pub struct Transport {
     io: SyncIOHandle,
+    trace: Arc<TraceManager>,
+    port: String,
 }
 
 impl Transport {
-    pub fn new(io: SyncIOHandle) -> Self {
-        Self { io }
+    pub fn new(io: SyncIOHandle, trace: Arc<TraceManager>, port: &str) -> Self {
+        Self {
+            io,
+            trace,
+            port: port.to_string(),
+        }
+    }
+
+    /// C's `asynPrint(pasynUser, ...)` on the device support's octet user.
+    pub fn print(&self, mask: TraceMask, args: fmt::Arguments<'_>) {
+        self.trace
+            .print(Some(&self.port), Some(OCTET_ADDR), 0, mask, args);
     }
 
     /// Write `data` and read one EOS-delimited reply.
@@ -99,7 +117,6 @@ pub fn spawn<W: DeviceWorker>(
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            log::info!("ip: worker thread for '{name}' stopped");
         })
         .expect("failed to spawn the ip worker thread")
 }

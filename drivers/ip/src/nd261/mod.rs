@@ -156,7 +156,7 @@ pub fn create_nd261(
 
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let worker = Nd261Worker {
-        transport: Transport::new(io),
+        transport: io,
         handle: runtime_handle.port_handle().clone(),
         params,
     };

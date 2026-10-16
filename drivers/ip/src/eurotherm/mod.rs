@@ -208,9 +208,7 @@ pub fn create_eurotherm(
     let driver = EurothermDriver::new(port_name, group_address, commands)?;
 
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
-    let worker = EurothermWorker {
-        transport: Transport::new(io),
-    };
+    let worker = EurothermWorker { transport: io };
     let thread = worker::spawn(port_name, worker, rx, IDLE_TICK);
     Ok(IpPortRuntime::new(runtime_handle, thread))
 }

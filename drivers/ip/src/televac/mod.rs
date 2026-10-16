@@ -208,7 +208,7 @@ pub fn create_televac(
 
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let worker = TelevacWorker {
-        transport: Transport::new(io),
+        transport: io,
         handle: runtime_handle.port_handle().clone(),
         params,
         stations,

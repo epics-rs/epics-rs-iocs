@@ -278,7 +278,7 @@ pub fn create_mks(
 
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let worker = MksWorker {
-        transport: Transport::new(io),
+        transport: io,
         handle: runtime_handle.port_handle().clone(),
         params,
         gauges,
