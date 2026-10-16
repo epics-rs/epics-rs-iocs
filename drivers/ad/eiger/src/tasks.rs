@@ -1657,6 +1657,57 @@ mod tests {
         );
     }
 
+    /// eigerDetector.cpp:667-668 hands every float64 below mFirstParam to
+    /// ADDriver::writeFloat64, which is asynPortDriver's: its IO_DRIVER line
+    /// precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::port::PortDriver;
+        use epics_rs::asyn::trace::{TraceFile, TraceMask};
+        use epics_rs::asyn::user::{AsynUser, UserTrace};
+
+        let port = "EIGER_BASE_F64";
+        let (signals, _receivers) = signals();
+        let cfg = crate::driver::EigerConfig {
+            port_name: port.to_string(),
+            api: ApiVersion::V1_6_0,
+            model: Model::Eiger1,
+            max_size_x: 0,
+            max_size_y: 0,
+            max_memory: 0,
+        };
+        let rest = RestApi::new("127.0.0.1", agreeable_detector());
+        let mut det = crate::driver::EigerDriver::new(cfg, rest, signals).expect("driver");
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        det.write_float64(&mut user, 2.0).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("eigerDetector:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
+    }
+
     #[tokio::test]
     async fn the_unique_id_is_the_array_counter_before_its_increment() {
         use epics_rs::ad_core::plugin::channel::ndarray_channel;

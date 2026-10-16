@@ -530,6 +530,9 @@ impl EigerDriver {
             }
         } else if self.ops.reg.lock().contains(reason) {
             self.put_f64(reason, value)?;
+        } else if reason < self.p.state {
+            // ADDriver::writeFloat64 is asynPortDriver's (eigerDetector.cpp:667-668).
+            self.ad.port_base.write_float64_param(user, value)?;
         } else {
             self.ad.port_base.set_float64_param(reason, addr, value)?;
         }
