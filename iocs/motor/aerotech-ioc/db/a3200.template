@@ -1,6 +1,5 @@
-# Aerotech A3200: one motor record per axis. Load once per axis, matching an
-# axis discovered by A3200AsynConfig. DTYP is A3200_$(CTRL)_$(AXISNAME), where
-# AXISNAME is the controller's axis name string (e.g. X, Y, Z).
+# Aerotech A3200: one motor record per axis, ADDR the controller axis index
+# on the drvAsynMotorConfigure port PORT.
 #
 # The driver works in the A3200's user units (the C stepSize = 1/CountsPerUnit
 # scaling cancels at the EGU boundary) and EGU is whatever the controller's
@@ -10,7 +9,8 @@
 # those user units per second / per second^2.
 
 record(motor, "$(P)$(M)") {
-    field(DTYP, "A3200_$(CTRL)_$(AXISNAME)")
+    field(DTYP, "asynMotor")
+    field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
     field(VELO, "$(VELO=10.0)")
     field(ACCL, "$(ACCL=0.2)")
