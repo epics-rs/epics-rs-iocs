@@ -52,7 +52,7 @@
 //!   caller treats it as a length. [`AdsType::element_size`] returns `None`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -70,6 +70,7 @@ use asyn_rs::runtime::port::{PortRuntimeHandle, create_port_runtime};
 use asyn_rs::trace::TraceMask;
 use asyn_rs::user::AsynUser;
 
+use epics_rs::base::server::ioc_app::{InitHookState, init_hook_register};
 use epics_rs::base::server::recgbl::alarm_status;
 
 use crate::ads::defs::{
@@ -1372,6 +1373,16 @@ impl PortDriver for AdsPortDriver {
             return Ok(DrvUserInfo::from_reason(reason));
         }
 
+        // C counts across every port.
+        static LINKED: AtomicUsize = AtomicUsize::new(0);
+        let linked = LINKED.fetch_add(1, Ordering::Relaxed) + 1;
+        if linked == 1 {
+            println!("Linking EPICS PVs to PLC variables...");
+        }
+        if linked.is_multiple_of(1000) {
+            println!("{linked}...");
+        }
+
         let info = DrvInfo::parse(&req.drv_info, self.shared.cfg.drvinfo_defaults())
             .map_err(|e| asyn_err(format!("drvInfo '{}': {e}", req.drv_info)))?;
         self.shared.ensure_ams_port(info.ams_port);
@@ -1770,6 +1781,11 @@ pub fn create_ads_port(cfg: AdsConfig) -> AsynResult<AdsRuntime> {
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let _ = shared.trace.set(runtime_handle.port_handle().clone());
 
+    println!(
+        "bulk read time: {} ms",
+        shared.cfg.bulk_period().as_millis()
+    );
+
     let port_name = &shared.cfg.port_name;
     if connect(&shared).is_err() {
         shared.print(
@@ -1820,12 +1836,35 @@ pub fn create_ads_port(cfg: AdsConfig) -> AsynResult<AdsRuntime> {
     };
 
     register_port(&shared);
+    register_init_hook();
 
     Ok(AdsRuntime {
         runtime_handle,
         shared,
         threads: vec![cyclic, bulk],
     })
+}
+
+/// C `initHook`'s `getEpicsState` lines; registered once, as C's
+/// `initHookRegister` drops a repeated function.
+fn register_init_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let start = Mutex::new(Instant::now());
+        init_hook_register(Arc::new(move |state| match state {
+            InitHookState::AfterInitDevSup => *start.lock() = Instant::now(),
+            InitHookState::AfterInitDatabase => {
+                let took = start.lock().elapsed();
+                println!(
+                    "Database initialization took {}.{:05} seconds.",
+                    took.as_secs(),
+                    took.subsec_micros()
+                );
+            }
+            InitHookState::AfterScanInit => println!("Begin polling PLC!"),
+            _ => {}
+        }));
+    });
 }
 
 /// Open the TCP connection (C `adsConnect`, :3651).
