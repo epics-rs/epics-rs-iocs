@@ -400,7 +400,6 @@ impl AsynMotor for McsAxis {
             velocity: 0.0,
             done: !moving,
             moving,
-            direction: true,
             has_encoder: self.has_encoder,
             gain_support: self.has_encoder,
             homed,
