@@ -134,9 +134,8 @@ impl Mvp2001Controller {
     /// Write a data-returning command and read its reply, consuming the
     /// prepended terminator first (C `writeRead2xController`).
     fn query(&self, cmd: &str) -> AsynResult<String> {
-        self.handle.write_octet(0, &Self::framed(cmd))?;
         // First read: the prepended terminator (discarded).
-        let _ = self.handle.read_octet(0, READ_BUF)?;
+        let _ = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
         sleep(REPLY_DELAY);
         // Second read: the real reply.
         let raw = self.handle.read_octet(0, READ_BUF)?;
