@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::asyn_print;
 use crate::trace::AsynPrint;
-use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
+use epics_rs::ad_core::driver::ndarray_driver::{ArrayOwner, handle_pool_write_int32};
 use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
 use epics_rs::ad_core::ndarray_pool::DriverPool;
 use epics_rs::ad_core::params::ndarray_driver::NDArrayDriverParams;
@@ -895,8 +895,17 @@ pub trait QuadEmDevice {
         } else if reason == p.reset {
             status.add(self.reset());
             status.add(self.read_status());
-        } else {
-            status.add(self.qe_base().write_int32_pool(reason));
+        } else if reason < p.acquire_mode {
+            // FIRST_QE_COMMAND is P_AcquireMode (drvQuadEM.h:151).
+            let b = self.qe_base();
+            let template = b.owner.array(0);
+            status.add(handle_pool_write_int32(
+                &mut b.port_base,
+                &b.nd_params,
+                &b.pool,
+                reason,
+                template.as_deref(),
+            ));
         }
 
         // C's callParamCallbacks() posts address 0 only; the other addresses
@@ -1057,57 +1066,6 @@ impl QuadEmBase {
             outputs,
             owner,
         })
-    }
-
-    /// Pool branch of `asynNDArrayDriver::writeInt32`, which `drvQuadEM`
-    /// reaches through its `function < FIRST_QE_COMMAND` fallthrough.
-    ///
-    /// `NDPoolPreAllocBuffers` needs a template array (C++ `pArrays[0]`);
-    /// `drvQuadEM` never stores one, so pre-allocation only resets the request
-    /// parameter, exactly as it does upstream.
-    ///
-    /// Returns `true` when `param_index` named a pool control.
-    pub fn write_int32_pool(&mut self, param_index: usize) -> AsynResult<bool> {
-        let p = &self.nd_params;
-        if param_index == p.pool_empty_free_list {
-            self.pool.empty_free_list();
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if param_index == p.pool_poll_stats {
-            self.refresh_pool_stats()?;
-            Ok(true)
-        } else if param_index == p.pool_pre_alloc {
-            self.port_base.set_int32_param(p.pool_pre_alloc, 0, 0)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    fn refresh_pool_stats(&mut self) -> AsynResult<()> {
-        const MEGABYTE: f64 = 1_048_576.0;
-        let p = self.nd_params;
-        self.port_base.set_float64_param(
-            p.pool_max_memory,
-            0,
-            self.pool.max_memory() as f64 / MEGABYTE,
-        )?;
-        self.port_base.set_float64_param(
-            p.pool_used_memory,
-            0,
-            self.pool.allocated_bytes() as f64 / MEGABYTE,
-        )?;
-        self.port_base.set_int32_param(
-            p.pool_alloc_buffers,
-            0,
-            self.pool.num_alloc_buffers() as i32,
-        )?;
-        self.port_base.set_int32_param(
-            p.pool_free_buffers,
-            0,
-            self.pool.num_free_buffers() as i32,
-        )?;
-        Ok(())
     }
 
     /// Attach a downstream plugin to one asyn address' NDArray stream.
@@ -1551,6 +1509,33 @@ mod tests {
         assert_eq!(m.calls, ["set_acquire", "set_acquire_mode", "read_status"]);
         assert_eq!(m.base.port_base.get_int32_param(acquire, 0).unwrap(), 0);
         assert_eq!(m.shared.acq.lock().acquire_mode, single);
+    }
+
+    /// drvQuadEM never fills pArrays[0], so asynNDArrayDriver::preAllocateBuffers
+    /// prints its error line (asynNDArrayDriver.cpp:716-721).
+    #[test]
+    fn a_pre_alloc_prints_cs_no_template_line() {
+        use epics_rs::asyn::trace::TraceFile;
+        let mut m = FakeMeter::new(&[]);
+        let path = std::env::temp_dir().join(format!("qe-prealloc-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .set_trace_file(
+                Some("QE_FAKE_DISPATCH"),
+                TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+            );
+        let pre_alloc = m.base.nd_params.pool_pre_alloc;
+        m.qe_write_int32(pre_alloc, 0, 1).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            text.contains(
+                "asynNDArrayDriver::preAllocateBuffers: ERROR, must collect an array to get dimensions first"
+            ),
+            "{text:?}"
+        );
+        assert_eq!(m.base.port_base.get_int32_param(pre_alloc, 0).unwrap(), 0);
     }
 
     #[test]
