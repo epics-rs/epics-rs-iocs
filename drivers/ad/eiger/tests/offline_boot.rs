@@ -159,3 +159,53 @@ fn a_refused_write_prints_the_param_librarys_status() {
         "{text}"
     );
 }
+
+/// eigerDetector.cpp:2108-2120: an EIG_ name drvUserCreate cannot place is
+/// an ERR_ARGS line and asynError, with no errorMessage.
+#[test]
+fn an_unplaceable_eig_name_is_traced_with_no_message() {
+    use std::sync::Arc;
+
+    use epics_rs::asyn::port::{DrvUserRequest, PortDriver};
+    use epics_rs::asyn::services::PortServices;
+    use epics_rs::asyn::trace::TraceFile;
+
+    let port = "EIGER_DRV_USER";
+    let rest = RestApi::new("127.0.0.1", dead_port());
+    let (signals, _receivers) = tasks::signals();
+    let cfg = EigerConfig {
+        port_name: port.to_string(),
+        api: ApiVersion::V1_6_0,
+        model: Model::Eiger1,
+        max_size_x: 0,
+        max_size_y: 0,
+        max_memory: 0,
+    };
+    let mut driver = EigerDriver::new(cfg, rest, signals).expect("driver");
+    let manager = PortServices::global().trace().clone();
+    let log = std::env::temp_dir().join(format!("eiger-drvuser-{}.log", std::process::id()));
+    let file = std::fs::File::create(&log).unwrap();
+    manager.set_trace_file(
+        Some(port),
+        TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+    );
+    for name in ["EIG_XCI_x", "EIG_DCQ_x"] {
+        let e = driver
+            .drv_user_create(&DrvUserRequest::new(name, 0))
+            .unwrap_err();
+        assert_eq!(e.c_status_code(), 3);
+        assert_eq!(e.message(), "");
+    }
+    let text = std::fs::read_to_string(&log).unwrap();
+    let _ = std::fs::remove_file(&log);
+    assert!(
+        text.contains(
+            "eigerDetector::drvUserCreate: [EIG_XCI_x] couldn't match XC to any subsystem"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("eigerDetector::drvUserCreate: [EIG_DCQ_x] couldn't match Q to an asyn type"),
+        "{text}"
+    );
+}

@@ -589,14 +589,6 @@ impl EigerDriver {
     }
 }
 
-/// An asyn error carrying a driver-level message.
-pub(crate) fn asyn_err(message: String) -> AsynError {
-    AsynError::Status {
-        status: AsynStatus::Error,
-        message,
-    }
-}
-
 impl ADDriver for EigerDriver {
     fn ad_base(&self) -> &ADDriverBase {
         &self.ad
@@ -634,18 +626,27 @@ impl PortDriver for EigerDriver {
             return Err(AsynError::ParamNotFound(drv_info.to_string()));
         }
 
-        let sys = Sys::from_drv_info_code(&drv_info[4..6]).ok_or_else(|| {
-            asyn_err(format!(
+        // C's ERR_ARGS and asynError, with no errorMessage
+        // (eigerDetector.cpp:2108-2120).
+        let refuse = |msg: String| {
+            self.ops.trace.err("drvUserCreate", &msg);
+            AsynError::Status {
+                status: AsynStatus::Error,
+                message: String::new(),
+            }
+        };
+        let Some(sys) = Sys::from_drv_info_code(&drv_info[4..6]) else {
+            return Err(refuse(format!(
                 "[{drv_info}] couldn't match {} to any subsystem",
                 &drv_info[4..6]
-            ))
-        })?;
+            )));
+        };
         let asyn_type = match drv_info.as_bytes()[6] {
             b'I' => AsynType::Int32,
             b'D' => AsynType::Float64,
             b'S' => AsynType::Octet,
             c => {
-                return Err(asyn_err(format!(
+                return Err(refuse(format!(
                     "[{drv_info}] couldn't match {} to an asyn type",
                     c as char
                 )));
