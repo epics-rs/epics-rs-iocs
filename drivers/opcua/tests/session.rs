@@ -1037,3 +1037,69 @@ fn an_item_shows_the_size_of_its_element_tree() {
     let line = item.show_line();
     assert!(line.ends_with(" dataNodes=2 dataLeafs=3"), "{line}");
 }
+
+#[test]
+fn the_element_map_reports_what_the_structure_cannot_supply() {
+    use async_opcua::types::custom::{
+        DataTypeTree, DynamicStructure, EncodingIds, ParentIds, ParsedStructureField,
+        StructTypeInfo,
+    };
+    use async_opcua::types::{ExtensionObject, StructureType, VariantScalarTypeId};
+
+    let field = |name: &str| ParsedStructureField {
+        name: name.into(),
+        type_id: async_opcua::types::DataTypeId::Int32.into(),
+        value_rank: -1,
+        array_dimensions: None,
+        is_optional: false,
+        scalar_type: VariantScalarTypeId::Int32,
+    };
+    let type_id = NodeId::new(2, 3000);
+    let info = Arc::new(StructTypeInfo {
+        structure_type: StructureType::Structure,
+        fields: vec![field("x"), field("y")],
+        index_by_name: [("x".to_string(), 0), ("y".to_string(), 1)].into(),
+        encoding_ids: EncodingIds {
+            binary_id: NodeId::new(2, 3001),
+            json_id: NodeId::new(2, 3002),
+            xml_id: NodeId::new(2, 3003),
+        },
+        is_abstract: false,
+        node_id: type_id.clone(),
+        name: "Point".into(),
+    });
+    let mut tree = DataTypeTree::new(ParentIds::new());
+    tree.add_type(
+        type_id,
+        async_opcua::types::custom::TypeInfo::Struct(info.clone()),
+    );
+    let tree = Arc::new(tree);
+    let point = DynamicStructure::new_struct(
+        info,
+        tree.clone(),
+        vec![Variant::Int32(1), Variant::Int32(2)],
+    )
+    .unwrap();
+    let value = Variant::ExtensionObject(ExtensionObject::from_message(point));
+
+    let mut item = Item::pending();
+    item.node_id = NodeId::new(2, "Pt");
+    item.type_tree = Some(tree);
+    let (notify, _rx) = mpsc::channel(1);
+    for (record, text) in [
+        ("Y", "PT element=y"),
+        ("Z", "PT element=z"),
+        ("XQ", "PT element=x.q"),
+    ] {
+        let leaf = Leaf::new(record.to_string(), link(text, INPUT), notify.clone());
+        item.leaves.push(Arc::new(Mutex::new(leaf)));
+    }
+
+    assert_eq!(
+        item.element_report(&value),
+        vec![
+            "Item ns=2;s=Pt: element z not found in Point".to_string(),
+            "Error: ns=2;s=Pt element x is no structured data but a Int32".to_string(),
+        ]
+    );
+}
