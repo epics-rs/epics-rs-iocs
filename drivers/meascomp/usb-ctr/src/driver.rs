@@ -305,6 +305,18 @@ impl PortDriver for CtrDriver {
     /// the mca record and SIS38XX_waveform.template both go through: the data
     /// lives in McsState::mcs_buffers and only leaves the driver here.
     fn read_int32_array(&mut self, user: &AsynUser, buf: &mut [i32]) -> AsynResult<usize> {
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "USBCTR:readInt32Array: entry, command={}, signal={}, numRead={}, &data={:p}",
+                user.reason,
+                user.addr,
+                buf.len(),
+                buf.as_ptr()
+            ),
+        );
         if user.reason != self.params.mca_data {
             user.print(
                 TraceMask::ERROR,
@@ -324,9 +336,22 @@ impl PortDriver for CtrDriver {
         let Some(src) = st.mcs.mcs_buffers.get(counter) else {
             return Ok(0);
         };
-        let n = buf.len().min(src.len()).min(num_channels);
-        buf[..n].copy_from_slice(&src[..n]);
-        Ok(n)
+        // C copies nChans points but reports only the acquired ones, and
+        // never 0 so NORD stays non-zero.
+        let num_copy = buf.len().min(src.len()).min(num_channels);
+        buf[..num_copy].copy_from_slice(&src[..num_copy]);
+        let current_point = st.mcs.current_point;
+        let num_actual = buf.len().min(current_point).max(1);
+        user.print(
+            TraceMask::FLOW,
+            file!(),
+            line!(),
+            format_args!(
+                "USBCTR:readInt32Array: [signal={counter}]: read {num_actual} chans (numRead={}, numCopy={num_copy}, currentPoint={current_point}, nChans={num_channels})",
+                buf.len()
+            ),
+        );
+        Ok(num_actual)
     }
 
     /// MCS time base (seconds from the start of the scan).
@@ -373,12 +398,16 @@ impl PortDriver for CtrDriver {
             );
             trace::asyn_status(-1)?;
         }
+        let num_channels = self
+            .base
+            .get_int32_param(self.params.mca_num_channels, 0)
+            .unwrap_or(0)
+            .max(0) as usize;
         let st = self.state.lock().unwrap();
-        // Points actually acquired, as C readMCS reports them.
         let n = buf
             .len()
             .min(st.mcs.abs_time_buffer.len())
-            .min(st.mcs.current_point);
+            .min(num_channels);
         buf[..n].copy_from_slice(&st.mcs.abs_time_buffer[..n]);
         Ok(n)
     }
