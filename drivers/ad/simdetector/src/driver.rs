@@ -211,23 +211,22 @@ impl PortDriver for SimDetector {
     /// `simDetector::writeFloat64` (simDetector.cpp:965-993).
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
-        let mut status = self
+        // Both branches replace the store's status (simDetector.cpp:973-980).
+        let _ = self
             .ad
             .port_base
             .set_float64_param(reason, user.addr, value);
-
-        if self
+        let status = if self
             .sim
             .float64_write_dirties_image(reason, self.ad.params.gain)
         {
-            status = self
-                .ad
+            self.ad
                 .port_base
-                .set_int32_param(self.sim.reset_image, 0, 1);
-        }
-        // Otherwise C calls `ADDriver::writeFloat64`, which neither ADDriver nor
-        // asynNDArrayDriver override: asynPortDriver::writeFloat64 only sets the
-        // parameter (done above) and fires callbacks (done below).
+                .set_int32_param(self.sim.reset_image, 0, 1)
+        } else {
+            // ADDriver::writeFloat64 is asynPortDriver's (simDetector.cpp:979).
+            self.ad.port_base.write_float64_param(user, value)
+        };
 
         let _ = self.ad.port_base.call_param_callbacks(0);
         match &status {
@@ -861,5 +860,47 @@ mod tests {
         );
         assert!(pool.owner().array(0).is_some());
         std::mem::forget(rt);
+    }
+
+    /// ADDriver::writeFloat64 is asynPortDriver's (simDetector.cpp:979), whose
+    /// IO_DRIVER line precedes the driver's.
+    #[test]
+    fn a_base_class_float64_write_runs_asyn_port_drivers_write_float64() {
+        use epics_rs::asyn::trace::TraceFile;
+        use epics_rs::asyn::user::UserTrace;
+        let port = "SIM_F64_BASE";
+        let mut det = {
+            let (start_tx, _) = rt::command_channel::<Signal>(1);
+            let (stop_tx, _) = rt::command_channel::<Signal>(1);
+            SimDetector::new(port, 64, 48, NDDataType::UInt8, 0, start_tx, stop_tx).unwrap()
+        };
+        let manager = epics_rs::asyn::services::PortServices::global()
+            .trace()
+            .clone();
+        let path = std::env::temp_dir().join(format!("{port}-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        manager.set_trace_file(
+            Some(port),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        manager.set_trace_mask(Some(port), TraceMask::ERROR | TraceMask::IO_DRIVER);
+        let delay = det.ad.params.shutter_open_delay;
+        let mut user = AsynUser::new(delay).with_addr(0);
+        user.trace = Some(UserTrace {
+            manager,
+            port: port.into(),
+        });
+        let _ = det.write_float64(&mut user, 2.0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let base = format!(
+            "asynPortDriver:writeFloat64: function={delay}, name=SHUTTER_OPEN_DELAY, value=2.000000"
+        );
+        let own = format!("simDetector:writeFloat64: function={delay}, value=2.000000");
+        let at = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("{line}: {text:?}"))
+        };
+        assert!(at(&base) < at(&own));
     }
 }
