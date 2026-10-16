@@ -84,7 +84,7 @@ impl Detector {
     /// An `ASYN_TRACE_ERROR` line on the mythen port.
     pub fn trace_error(&self, message: &str) {
         self.trace
-            .output(&self.port_name, TraceMask::ERROR, message);
+            .output_device(&self.port_name, Some(0), 0, TraceMask::ERROR, message);
     }
 
     /// C `writeReadMeter`, mythen.cpp:239, which prints on every failed

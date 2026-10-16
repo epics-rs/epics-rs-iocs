@@ -43,7 +43,7 @@ impl SelfTrace {
     pub fn print(&self, mask: TraceMask, args: std::fmt::Arguments<'_>) {
         if let Some(port) = self.0.get() {
             port.trace()
-                .print(Some(port.port_name()), None, 0, mask, args);
+                .print(Some(port.port_name()), Some(0), 0, mask, args);
         }
     }
 

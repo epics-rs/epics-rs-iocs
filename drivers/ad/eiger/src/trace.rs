@@ -21,7 +21,9 @@ impl Trace {
     }
 
     fn out(&self, mask: TraceMask, msg: &str) {
-        PortServices::global().trace().output(&self.port, mask, msg);
+        PortServices::global()
+            .trace()
+            .output_device(&self.port, Some(0), 0, mask, msg);
     }
 
     /// eigerDetector.cpp `ERR`/`ERR_ARGS`.

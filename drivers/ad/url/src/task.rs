@@ -131,8 +131,10 @@ async fn acquire_one_image(
         Ok(decoded) => decoded,
         Err(message) => {
             if let Some(message) = message {
-                ctx.handle.trace().output(
+                ctx.handle.trace().output_device(
                     ctx.handle.port_name(),
+                    Some(0),
+                    0,
                     TraceMask::ERROR,
                     &format!("URLDriver:readImage: {message}"),
                 );

@@ -68,7 +68,7 @@ impl Ctx {
     fn trace(&self, mask: TraceMask, line: &str) {
         self.handle
             .trace()
-            .output(self.handle.port_name(), mask, line);
+            .output_device(self.handle.port_name(), Some(0), 0, mask, line);
     }
 
     async fn set_int(&self, reason: usize, addr: i32, value: i32) {

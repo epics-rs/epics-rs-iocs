@@ -135,7 +135,7 @@ impl Ctx {
     pub fn trace(&self, mask: TraceMask, msg: &str) {
         self.handle
             .trace()
-            .output(self.handle.port_name(), mask, msg);
+            .output_device(self.handle.port_name(), Some(0), 0, mask, msg);
     }
 
     /// Flush pending writes so a following read observes them. The actor

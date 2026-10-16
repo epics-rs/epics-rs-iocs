@@ -114,9 +114,13 @@ impl Worker {
 
     /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`.
     fn trace_error(&self, message: &str) {
-        self.port
-            .trace()
-            .output(self.port.port_name(), TraceMask::ERROR, message);
+        self.port.trace().output_device(
+            self.port.port_name(),
+            Some(0),
+            0,
+            TraceMask::ERROR,
+            message,
+        );
     }
 
     // -----------------------------------------------------------------------

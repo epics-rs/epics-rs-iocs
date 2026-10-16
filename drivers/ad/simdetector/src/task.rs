@@ -122,8 +122,10 @@ impl SimTaskContext {
     async fn compute_image(&self, engine: &mut SimEngine) -> Result<DriverArray, &'static str> {
         let (mut cfg, read_ok) = self.sim.read_config(&self.handle, &self.ad).await;
         if !read_ok {
-            self.handle.trace().output(
+            self.handle.trace().output_device(
                 self.handle.port_name(),
+                Some(0),
+                0,
                 TraceMask::ERROR,
                 "simDetector:computeImage: error getting parameters",
             );
@@ -228,8 +230,10 @@ async fn sim_task(mut ctx: SimTaskContext) {
                 // task hot, recomputing with no delay. Instead report the failure
                 // via ADStatusError and end the acquisition, so the task returns
                 // to waiting for the next start event rather than busy-looping.
-                ctx.handle.trace().output(
+                ctx.handle.trace().output_device(
                     ctx.handle.port_name(),
+                    Some(0),
+                    0,
                     TraceMask::ERROR,
                     &format!("simDetector:computeImage: {e}"),
                 );

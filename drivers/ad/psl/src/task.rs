@@ -215,8 +215,10 @@ fn read_frame(ctx: &AcquisitionContext) -> Result<(ImageHeader, Vec<u8>), Abort>
     while payload.len() < header.data_len {
         let want = (header.data_len - payload.len()).min(MAX_MESSAGE_SIZE);
         let block = session.read_image_block(want).map_err(|e| {
-            ctx.handle.trace().output(
+            ctx.handle.trace().output_device(
                 ctx.handle.port_name(),
+                Some(0),
+                0,
                 TraceMask::ERROR,
                 &format!(
                     "PSL:getImage: error reading image, status={}, dataLen={}, nCopied={}, \

@@ -96,7 +96,7 @@ impl Worker {
     fn trace(&self, mask: TraceMask, message: &str) {
         self.port
             .trace()
-            .output(self.port.port_name(), mask, message);
+            .output_device(self.port.port_name(), Some(0), 0, mask, message);
     }
 
     fn store_acq_start(&self, v: f64) {

@@ -484,9 +484,13 @@ async fn finish(ctx: &AcquisitionContext, sync: &SyncIOHandle, abort: Option<Abo
 
 /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`.
 fn trace_error(ctx: &AcquisitionContext, message: &str) {
-    ctx.handle
-        .trace()
-        .output(ctx.handle.port_name(), TraceMask::ERROR, message);
+    ctx.handle.trace().output_device(
+        ctx.handle.port_name(),
+        Some(0),
+        0,
+        TraceMask::ERROR,
+        message,
+    );
 }
 
 async fn set_params(ctx: &AcquisitionContext, values: Vec<ParamSetValue>) {

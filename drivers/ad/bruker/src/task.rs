@@ -429,9 +429,13 @@ async fn finish(ctx: &AcquisitionContext, abort: Option<Abort>) {
             ParamValue::Octet("Acquisition aborted".as_bytes().into()),
         )),
         Some(Abort::Error(message)) => {
-            ctx.handle
-                .trace()
-                .output(ctx.handle.port_name(), TraceMask::ERROR, message);
+            ctx.handle.trace().output_device(
+                ctx.handle.port_name(),
+                Some(0),
+                0,
+                TraceMask::ERROR,
+                message,
+            );
             updates.push(ParamSetValue::new(
                 ctx.ad_params.status_message,
                 0,

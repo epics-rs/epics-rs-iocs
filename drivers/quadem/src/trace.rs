@@ -28,7 +28,7 @@ impl AsynPrint for PortDriverBase {
 impl AsynPrint for PortHandle {
     fn asyn_print(&self, mask: TraceMask, args: fmt::Arguments<'_>) {
         self.trace()
-            .print(Some(self.port_name()), None, 0, mask, args);
+            .print(Some(self.port_name()), Some(0), 0, mask, args);
     }
 }
 
@@ -65,8 +65,17 @@ pub fn read_result(r: &AsynResult<ReadOutcome>) -> (AsynStatus, usize, u32) {
 /// `asynPrintIO(pasynUserSelf, mask, data, len, ...)` from a driver thread.
 pub fn print_io(handle: &PortHandle, mask: TraceMask, data: &[u8], args: fmt::Arguments<'_>) {
     let trace = handle.trace();
-    if trace.is_enabled(handle.port_name(), mask) {
-        trace.output_io(handle.port_name(), mask, data, &args.to_string(), "", 0);
+    if trace.is_enabled_device(handle.port_name(), 0, mask) {
+        trace.output_device_io(
+            handle.port_name(),
+            Some(0),
+            0,
+            mask,
+            data,
+            &args.to_string(),
+            "",
+            0,
+        );
     }
 }
 
@@ -117,5 +126,67 @@ impl StatusExchange {
         let resp = io.write_read(out, buf_size)?;
         self.inp.clone_from(&resp);
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use epics_rs::asyn::port::{PortDriver, PortFlags};
+    use epics_rs::asyn::registry::claim_port;
+    use epics_rs::asyn::runtime::config::RuntimeConfig;
+    use epics_rs::asyn::runtime::port::create_port_runtime;
+    use epics_rs::asyn::trace::TraceFile;
+    use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+
+    use super::*;
+
+    struct Meter(PortDriverBase);
+
+    impl PortDriver for Meter {
+        fn base(&self) -> &PortDriverBase {
+            &self.0
+        }
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.0
+        }
+    }
+
+    /// C's `pasynUserSelf` is connected to device 0, so on a multi-device
+    /// port a driver thread's line follows `asynSetTraceFile P 0`, not the
+    /// port-level file.
+    #[test]
+    fn a_driver_thread_line_goes_through_device_0() {
+        let name = "QE_SELF_DEV0";
+        let flags = PortFlags {
+            multi_device: true,
+            ..PortFlags::default()
+        };
+        let claim = claim_port(name).unwrap();
+        let (runtime, _actor) = create_port_runtime(
+            &claim,
+            Meter(PortDriverBase::new(name, 2, flags)),
+            RuntimeConfig::default(),
+        )
+        .unwrap();
+        let handle = runtime.port_handle().clone();
+        claim
+            .publish(handle.clone(), &InterruptGate::opened())
+            .unwrap();
+
+        let path = std::env::temp_dir().join(format!("qe-self-dev0-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        handle.trace().set_device_trace_file(
+            name,
+            0,
+            TraceFile::File(Arc::new(std::sync::Mutex::new(file))),
+        );
+
+        crate::asyn_print!(handle, ERROR, "drvQuadEM::readThread: line");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(text.ends_with("drvQuadEM::readThread: line\n"), "{text:?}");
     }
 }
