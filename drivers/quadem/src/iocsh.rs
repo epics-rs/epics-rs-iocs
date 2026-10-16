@@ -81,6 +81,15 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
                 Some(ArgValue::String(s)) => s.to_str()?.to_owned(),
                 _ => return Err("portName required".into()),
             };
+            let addr = match args.get(1) {
+                Some(ArgValue::Int(a)) => *a as i32,
+                _ => 0,
+            };
+            // C `asynSetEos` (asynShellCommands.c:238-240).
+            let user = epics_rs::asyn::user::AsynUser::default()
+                .with_addr(addr)
+                .with_timeout(std::time::Duration::from_secs(2))
+                .queue_even_if_not_connected();
             let eos = match args.get(2) {
                 Some(ArgValue::String(s)) => raw_from_escaped(s.to_str()?),
                 _ => Vec::new(),
@@ -90,13 +99,9 @@ fn eos_command(name: &'static str, input: bool) -> CommandDef {
                 return Ok(CommandOutcome::Continue);
             };
             let res = if input {
-                entry
-                    .handle
-                    .set_input_eos_blocking(epics_rs::asyn::user::AsynUser::default(), &eos)
+                entry.handle.set_input_eos_blocking(user, &eos)
             } else {
-                entry
-                    .handle
-                    .set_output_eos_blocking(epics_rs::asyn::user::AsynUser::default(), &eos)
+                entry.handle.set_output_eos_blocking(user, &eos)
             };
             if let Err(e) = res {
                 ctx.println(&format!("{name}: {e}"));
