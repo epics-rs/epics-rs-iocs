@@ -132,15 +132,21 @@ struct GaugeConfig {
     high: f64,
 }
 
+/// A gauge's `initAi`, which C runs once per record at iocInit: a failed
+/// read leaves the record with PACT set for good (`devAiMKS.c:265-267`).
+#[derive(Clone, Copy)]
+enum Gauge {
+    Unconfigured,
+    Dead,
+    /// `None` for a gauge type C does not know; it reads on with no range.
+    Live(Option<GaugeConfig>),
+}
+
 pub struct MksWorker {
     transport: Transport,
     handle: PortHandle,
     params: MksParams,
-    gauges: u8,
-    /// Filled by the first successful poll (the C did this in `init_record`,
-    /// which meant a controller that was offline at iocInit left the record
-    /// dead for the life of the IOC).
-    config: Option<Vec<Option<GaugeConfig>>>,
+    gauges: Vec<Gauge>,
 }
 
 impl MksWorker {
@@ -171,61 +177,56 @@ impl MksWorker {
         Ok(reply)
     }
 
-    /// Read `SU` and `SG` and publish the units, gauge type and range of every
-    /// gauge (`devAiMKS.c::initAi`).
-    fn configure(&mut self) -> Result<Vec<Option<GaugeConfig>>, ()> {
-        let units = self
-            .read_config(protocol::READ_UNITS, "MKS_UNITS")?
-            .trim()
-            .to_string();
-        let types = self.read_config(protocol::READ_GAUGE_TYPES, "MKS_GAUGE_TYPE")?;
+    /// `devAiMKS.c::initAi` for one gauge: read `SU` and `SG` and publish the
+    /// gauge's units, type and range.
+    fn configure(&self, gauge: u8) -> Gauge {
+        let addr = i32::from(gauge) - 1;
+        let who = format!("MKS_PRESSURE[{addr}]");
+        let Ok(units) = self.read_config(protocol::READ_UNITS, &who) else {
+            return Gauge::Dead;
+        };
+        let units = units.trim().to_string();
+        let Ok(types) = self.read_config(protocol::READ_GAUGE_TYPES, &who) else {
+            return Gauge::Dead;
+        };
         let multiplier = protocol::unit_multiplier(&units);
         let p = self.params;
 
-        let mut config = Vec::with_capacity(usize::from(self.gauges));
-        for gauge in 1..=self.gauges {
-            let addr = i32::from(gauge) - 1;
-            let code = protocol::gauge_type_field(&types, gauge).unwrap_or("");
-            let gauge_type = GaugeType::from_code(code);
-            let mut values = vec![
-                ParamSetValue::new(
-                    p.units,
+        let code = protocol::gauge_type_field(&types, gauge).unwrap_or("");
+        let mut values = vec![
+            ParamSetValue::new(p.units, addr, ParamValue::Octet(units.into_bytes().into())),
+            ParamSetValue::new(
+                p.gauge_type,
+                addr,
+                ParamValue::Octet(code.as_bytes().into()),
+            ),
+        ];
+        let config = match GaugeType::from_code(code) {
+            Some(gauge_type) => {
+                let (low, high) = gauge_type.limits();
+                let (low, high) = (low * multiplier, high * multiplier);
+                values.push(ParamSetValue::new(
+                    p.low_limit,
                     addr,
-                    ParamValue::Octet(units.clone().into_bytes().into()),
-                ),
-                ParamSetValue::new(
-                    p.gauge_type,
+                    ParamValue::Float64(low),
+                ));
+                values.push(ParamSetValue::new(
+                    p.high_limit,
                     addr,
-                    ParamValue::Octet(code.as_bytes().into()),
-                ),
-            ];
-            match gauge_type {
-                Some(gauge_type) => {
-                    let (low, high) = gauge_type.limits();
-                    let (low, high) = (low * multiplier, high * multiplier);
-                    values.push(ParamSetValue::new(
-                        p.low_limit,
-                        addr,
-                        ParamValue::Float64(low),
-                    ));
-                    values.push(ParamSetValue::new(
-                        p.high_limit,
-                        addr,
-                        ParamValue::Float64(high),
-                    ));
-                    config.push(Some(GaugeConfig { low, high }));
-                }
-                None => {
-                    self.transport.print(
-                        TraceMask::ERROR,
-                        format_args!("devAiMKS, unknown gauge type {code}"),
-                    );
-                    config.push(None);
-                }
+                    ParamValue::Float64(high),
+                ));
+                Some(GaugeConfig { low, high })
             }
-            self.publish(addr, values);
-        }
-        Ok(config)
+            None => {
+                self.transport.print(
+                    TraceMask::ERROR,
+                    format_args!("devAiMKS, unknown gauge type {code}"),
+                );
+                None
+            }
+        };
+        self.publish(addr, values);
+        Gauge::Live(config)
     }
 }
 
@@ -233,23 +234,22 @@ impl DeviceWorker for MksWorker {
     type Command = MksCommand;
 
     fn poll(&mut self) {
-        if self.config.is_none() {
-            match self.configure() {
-                Ok(config) => self.config = Some(config),
-                Err(()) => return,
-            }
-        }
-        let config = self.config.clone().unwrap_or_default();
         let p = self.params;
 
-        for gauge in 1..=self.gauges {
+        for gauge in 1..=self.gauges.len() as u8 {
             let addr = i32::from(gauge) - 1;
+            let slot = usize::from(gauge - 1);
+            if let Gauge::Unconfigured = self.gauges[slot] {
+                self.gauges[slot] = self.configure(gauge);
+            }
+            let Gauge::Live(limits) = self.gauges[slot] else {
+                continue;
+            };
             // C decodes only a 7-character reply (`callbackAi`).
             let raw = match self.transact(&protocol::read_pressure(gauge)) {
                 Ok(raw) if raw.len() == REPLY_LEN => raw,
                 _ => continue,
             };
-            let limits = config.get(usize::from(gauge - 1)).copied().flatten();
             let (value, code) = match protocol::parse_reading(&raw) {
                 Reading::Pressure(value) => (Some(value), status::OK),
                 Reading::AboveRange => (limits.map(|c| c.high), status::ABOVE_RANGE),
@@ -309,8 +309,7 @@ pub fn create_mks(
         transport: io,
         handle: runtime_handle.port_handle().clone(),
         params,
-        gauges,
-        config: None,
+        gauges: vec![Gauge::Unconfigured; usize::from(gauges)],
     };
     let thread = worker::spawn(port_name, worker, rx, poll_period);
     Ok(IpPortRuntime::new(runtime_handle, thread))
@@ -321,10 +320,10 @@ mod tests {
     use super::*;
     use crate::worker::test_support::{refused_transport, traced};
 
-    /// A dead controller fails initAi's units read with C's error line,
-    /// and the poll stops there.
+    /// A dead controller fails each gauge's initAi units read once, with
+    /// C's error line, and the gauge is never read or configured again.
     #[test]
-    fn a_failed_units_read_prints_devaimks_error() {
+    fn a_failed_units_read_kills_the_gauge_once() {
         let (transport, path, runtime) = refused_transport("MKS_TRACE");
         let mut worker = MksWorker {
             transport,
@@ -337,16 +336,23 @@ mod tests {
                 low_limit: 4,
                 high_limit: 5,
             },
-            gauges: 1,
-            config: None,
+            gauges: vec![Gauge::Unconfigured; 2],
         };
         worker.poll();
-        let lines = traced(&path);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(
-            lines[0].ends_with("devAiMKS ERROR, record=MKS_UNITS, nread=0, response="),
-            "{lines:?}"
-        );
-        assert!(worker.config.is_none());
+        worker.poll();
+        let errors: Vec<_> = traced(&path)
+            .into_iter()
+            .filter(|l| l.contains("devAiMKS"))
+            .collect();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        for (line, addr) in errors.iter().zip(0..) {
+            assert!(
+                line.ends_with(&format!(
+                    "devAiMKS ERROR, record=MKS_PRESSURE[{addr}], nread=0, response="
+                )),
+                "{errors:?}"
+            );
+        }
+        assert!(worker.gauges.iter().all(|g| matches!(g, Gauge::Dead)));
     }
 }
