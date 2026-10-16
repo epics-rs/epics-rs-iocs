@@ -16,7 +16,7 @@ epicsEnvSet("ASYN",  "PMNC1")
 epicsEnvSet("HOST",  "192.168.0.100:23")
 
 # ---- TCP octet port ----
-drvAsynIPPortConfigure("$(ASYN)", "$(HOST)", 0, 0, 1)
+drvAsynIPPortConfigure("$(ASYN)", "$(HOST)", 0, 0, 0)
 
 # PMNC prompt protocol: replies are terminated by the '>' prompt. The driver
 # appends the CR command terminator itself, so only the input EOS is set.
