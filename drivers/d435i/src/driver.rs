@@ -12,7 +12,7 @@ use epics_rs::asyn::user::AsynUser;
 use epics_rs::ad_core::driver::{ADDriver, ADDriverBase, ImageMode};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
-use epics_rs::ad_core::plugin::channel::{NDArrayOutput, NDArraySender, QueuedArrayCounter};
+use epics_rs::ad_core::plugin::channel::{NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 
 use crate::params::D435iParams;
@@ -397,9 +397,7 @@ pub struct D435iColorRuntime {
     pub rs_params: D435iParams,
     pool: Arc<NDArrayPool>,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     pc_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    pc_queued: Arc<QueuedArrayCounter>,
     #[allow(dead_code)]
     task_handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -417,8 +415,7 @@ impl D435iColorRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 
@@ -426,8 +423,7 @@ impl D435iColorRuntime {
         &self.pc_output
     }
 
-    pub fn connect_pc_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.pc_queued.clone());
+    pub fn connect_pc_downstream(&self, sender: NDArraySender) {
         self.pc_output.lock().add(sender);
     }
 }
@@ -437,7 +433,6 @@ pub struct D435iDepthRuntime {
     pub ad_params: ADBaseParams,
     pool: Arc<NDArrayPool>,
     array_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
 }
 
 impl D435iDepthRuntime {
@@ -453,8 +448,7 @@ impl D435iDepthRuntime {
         &self.array_output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.array_output.lock().add(sender);
     }
 }
@@ -503,33 +497,33 @@ pub fn create_d435i_detector(
     let color_ad_params = color_det.ad.params;
     let color_rs_params = color_det.rs_params;
     let color_pool = color_det.ad.pool.clone();
+    let color_queued = color_det.ad.owner.queued().clone();
     let (color_runtime_handle, _) =
         create_port_runtime(color_claim, color_det, RuntimeConfig::default())?;
     let color_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let color_queued = Arc::new(QueuedArrayCounter::new());
     let pc_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let pc_queued = Arc::new(QueuedArrayCounter::new());
 
     // --- Depth port ---
     let depth_det = D435iDepthDriver::new(depth_port_name, max_size_x, max_size_y, max_memory)?;
     let depth_ad_params = depth_det.ad.params;
     let depth_pool = depth_det.ad.pool.clone();
+    let depth_queued = depth_det.ad.owner.queued().clone();
     let (depth_runtime_handle, _) =
         create_port_runtime(depth_claim, depth_det, RuntimeConfig::default())?;
     let depth_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let depth_queued = Arc::new(QueuedArrayCounter::new());
 
     // --- Acquisition task (shared) ---
     let task_handle = start_acquisition_task(AcquisitionContext {
         acq_rx,
         color_handle: color_runtime_handle.port_handle().clone(),
         color_output: color_output.clone(),
-        color_queued: color_queued.clone(),
+        color_pool: color_pool.clone(),
+        color_queued,
         depth_handle: depth_runtime_handle.port_handle().clone(),
         depth_output: depth_output.clone(),
-        depth_queued: depth_queued.clone(),
+        depth_pool: depth_pool.clone(),
+        depth_queued,
         pc_output: pc_output.clone(),
-        pc_queued: pc_queued.clone(),
         dirty,
         color_ad: color_ad_params,
         depth_ad: depth_ad_params,
@@ -544,9 +538,7 @@ pub fn create_d435i_detector(
         rs_params: color_rs_params,
         pool: color_pool,
         array_output: color_output,
-        queued_counter: color_queued,
         pc_output,
-        pc_queued,
         task_handle: Some(task_handle),
     };
 
@@ -555,7 +547,6 @@ pub fn create_d435i_detector(
         ad_params: depth_ad_params,
         pool: depth_pool,
         array_output: depth_output,
-        queued_counter: depth_queued,
     };
 
     Ok((color_runtime, depth_runtime))

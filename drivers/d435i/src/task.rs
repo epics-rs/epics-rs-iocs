@@ -8,6 +8,7 @@ use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
 use epics_rs::ad_core::color::NDColorMode;
 use epics_rs::ad_core::driver::{ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataBuffer, NDDimension};
+use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, QueuedArrayCounter};
 use epics_rs::ad_core::runtime as rt;
@@ -58,15 +59,16 @@ pub(crate) struct AcquisitionContext {
     // Color port
     pub color_handle: PortHandle,
     pub color_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pub color_pool: Arc<NDArrayPool>,
     pub color_queued: Arc<QueuedArrayCounter>,
     // Depth port
     pub depth_handle: PortHandle,
     pub depth_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
+    pub depth_pool: Arc<NDArrayPool>,
     pub depth_queued: Arc<QueuedArrayCounter>,
     // Pointcloud output
+    /// Point clouds are the colour port's arrays.
     pub pc_output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    #[allow(dead_code)] // kept alive for QueuedArrayCounter
-    pub pc_queued: Arc<QueuedArrayCounter>,
     // Shared
     pub dirty: Arc<parking_lot::Mutex<DirtyFlags>>,
     pub color_ad: ADBaseParams,
@@ -534,7 +536,11 @@ async fn process_color_frame(
         ];
 
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let mut array = NDArray::with_data(dims, data);
+        // No C driver to follow: a refused frame is dropped after the pool's
+        // limit line.
+        let Ok(mut array) = ctx.color_pool.wrap(dims, data) else {
+            return;
+        };
         array.unique_id = array_counter;
         array.timestamp = ts;
         array.time_stamp = ts.as_f64();
@@ -584,7 +590,9 @@ async fn process_depth_frame(
     let dims = vec![NDDimension::new(w), NDDimension::new(h)];
 
     let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-    let mut array = NDArray::with_data(dims, data);
+    let Ok(mut array) = ctx.depth_pool.wrap(dims, data) else {
+        return;
+    };
     array.unique_id = array_counter;
     array.timestamp = ts;
     array.time_stamp = ts.as_f64();
@@ -625,14 +633,16 @@ async fn process_pointcloud(
             .collect();
 
         let ts = epics_rs::ad_core::timestamp::EpicsTimestamp::now();
-        let mut array = NDArray::with_data(
+        let Ok(mut array) = ctx.color_pool.wrap(
             vec![
                 NDDimension::new(3),
                 NDDimension::new(w),
                 NDDimension::new(h),
             ],
             NDDataBuffer::F32(data),
-        );
+        ) else {
+            return;
+        };
         array.unique_id = array_counter;
         array.timestamp = ts;
         array.time_stamp = ts.as_f64();
