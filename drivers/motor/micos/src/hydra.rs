@@ -347,7 +347,6 @@ impl AsynMotor for HydraAxis {
             velocity: 0.0,
             done: !moving,
             moving,
-            has_encoder: true,
             gain_support: true,
             high_limit,
             low_limit,

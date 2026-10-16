@@ -157,10 +157,7 @@ impl CorvusAxis {
             controller,
             axis_no,
             num_axes,
-            last_status: MotorStatus {
-                has_encoder: true,
-                ..MotorStatus::default()
-            },
+            last_status: MotorStatus::default(),
             axis_res,
             high_limit: 0.0,
             low_limit: 0.0,
