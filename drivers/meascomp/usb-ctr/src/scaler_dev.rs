@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use epics_rs::base::error::CaResult;
-use epics_rs::scaler::device_support::scaler_asyn::ScalerDriver;
+use epics_rs::scaler::device_support::scaler_asyn::{DoneInterrupt, ScalerDriver};
 use epics_rs::scaler::records::scaler::MAX_SCALER_CHANNELS;
 use meascomp::device::DaqDevice;
 
@@ -22,7 +22,8 @@ use crate::scaler;
 ///
 /// Shares `device` and `state` with the port driver and its poller: the poller
 /// is what advances `ScalerState::counts` and raises `done` while a count is
-/// armed, exactly as it did before this record existed.
+/// armed, exactly as it did before this record existed. Each C `writeInt32`
+/// ends in `callParamCallbacks`, which delivers a changed `scalerDone_`.
 pub struct CtrScalerDriver {
     device: Arc<Mutex<DaqDevice>>,
     state: Arc<Mutex<PollerState>>,
@@ -40,6 +41,7 @@ impl ScalerDriver for CtrScalerDriver {
         let mut st = self.state.lock().unwrap();
         scaler::reset_scaler(&dev, &mut st.scaler);
         st.scaler.presets = [0; MAX_COUNTERS];
+        st.scaler.done.call_callbacks();
         Ok(())
     }
 
@@ -52,9 +54,11 @@ impl ScalerDriver for CtrScalerDriver {
     }
 
     fn write_preset(&mut self, channel: usize, preset: u32) -> CaResult<u32> {
+        let mut st = self.state.lock().unwrap();
         if channel < MAX_COUNTERS {
-            self.state.lock().unwrap().scaler.presets[channel] = preset as u64;
+            st.scaler.presets[channel] = preset as u64;
         }
+        st.scaler.done.call_callbacks();
         Ok(preset)
     }
 
@@ -68,16 +72,13 @@ impl ScalerDriver for CtrScalerDriver {
         } else {
             scaler::stop_scaler(&dev, &mut st.scaler);
         }
+        st.scaler.done.set(0);
+        st.scaler.done.call_callbacks();
         Ok(())
     }
 
-    /// Read-and-clear, as C `devScalerAsyn.c::scaler_done` is: the record polls
-    /// this every process cycle and must see a completed count exactly once.
-    fn done(&mut self) -> bool {
-        let mut st = self.state.lock().unwrap();
-        let done = st.scaler.done;
-        st.scaler.done = false;
-        done
+    fn register_done_interrupt(&mut self, user: DoneInterrupt) {
+        self.state.lock().unwrap().scaler.done.register(user);
     }
 
     fn num_channels(&self) -> usize {

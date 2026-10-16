@@ -2,12 +2,15 @@ use meascomp::counter::{CInScanConfig, CounterScanConfig};
 use meascomp::device::DaqDevice;
 use uldaq_sys::*;
 
+use epics_rs::scaler::device_support::scaler_asyn::DoneParam;
+
 use crate::params::*;
 
 /// Shared scaler state between the driver (arm/reset) and poller (read/done).
 pub struct ScalerState {
     pub running: bool,
-    pub done: bool,
+    /// C `scalerDone_`.
+    pub done: DoneParam,
     pub counts: [u64; MAX_COUNTERS],
     pub presets: [u64; MAX_COUNTERS],
     /// Buffer for ulCInScan continuous mode (20 samples per counter).
@@ -24,7 +27,8 @@ impl ScalerState {
     pub fn new() -> Self {
         Self {
             running: false,
-            done: false,
+            // C `setIntegerParam(scalerDone_, 1)` (drvUSBCTR.cpp:417).
+            done: DoneParam::new(1),
             counts: [0; MAX_COUNTERS],
             presets: [0; MAX_COUNTERS],
             scan_buffer: vec![0u64; MAX_COUNTERS * 20],
@@ -93,7 +97,6 @@ pub fn start_scaler(device: &DaqDevice, state: &mut ScalerState) -> Result<(), S
         .map_err(|e| format!("counter_in_scan error: {e}"))?;
 
     state.running = true;
-    state.done = false;
     log::info!("Scaler started, rate={rate:.0} Hz");
     Ok(())
 }
@@ -143,11 +146,11 @@ pub fn read_scaler(device: &DaqDevice, state: &mut ScalerState) {
 
     if preset_reached || status == SS_IDLE {
         stop_scaler(device, state);
-        state.done = true;
     }
 }
 
-/// Stop the counter scan.
+/// Stop the counter scan. C `stopScaler` sets `scalerDone_` whether or not
+/// the scan was running.
 pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState) {
     if state.running {
         if let Err(e) = device.counter_in_scan_stop() {
@@ -155,16 +158,18 @@ pub fn stop_scaler(device: &DaqDevice, state: &mut ScalerState) {
         }
         state.running = false;
     }
+    state.done.set(1);
 }
 
 /// Reset all counters to zero.
 pub fn reset_scaler(device: &DaqDevice, state: &mut ScalerState) {
-    stop_scaler(device, state);
+    if state.running {
+        stop_scaler(device, state);
+    }
     for i in 0..MAX_COUNTERS {
         state.counts[i] = 0;
         if let Err(e) = device.counter_clear(i as i32) {
             log::warn!("counter_clear({i}) error: {e}");
         }
     }
-    state.done = false;
 }

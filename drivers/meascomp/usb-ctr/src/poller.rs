@@ -73,7 +73,7 @@ fn poller_loop(
                 if let Ok(mut st) = state.lock() {
                     if st.scaler.running {
                         scaler::read_scaler(&dev, &mut st.scaler);
-                        if st.scaler.done {
+                        if st.scaler.done.get() != 0 {
                             snap.scaler_done_snapshot = Some(st.scaler.counts);
                         }
                     } else if st.mcs.running {
@@ -170,6 +170,9 @@ fn poller_loop(
         // Callbacks for all addresses
         for addr in 0..MAX_MCS_COUNTERS as i32 {
             let _ = handle.call_param_callbacks_blocking(addr);
+        }
+        if let Ok(st) = state.lock() {
+            st.scaler.done.call_callbacks();
         }
 
         let elapsed = start.elapsed();
