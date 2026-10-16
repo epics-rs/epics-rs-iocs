@@ -355,14 +355,12 @@ impl LoveDriver {
     /// C `sendCommand` + `recvReply`, looped by C `executeCommand`.
     fn execute_command(&self, addr: i32, body: &str) -> AsynResult<Vec<u8>> {
         let frame = build_frame(addr, body);
-        let mut last_err = None;
 
         for _ in 0..MAX_ATTEMPTS {
             std::thread::sleep(K_TUNE);
 
             if let Err(e) = self.handle.write_octet(OCTET_REASON, frame.as_bytes()) {
                 if is_timeout(&e) {
-                    last_err = Some(e);
                     continue;
                 }
                 return Err(e);
@@ -370,10 +368,7 @@ impl LoveDriver {
 
             let raw = match self.handle.read_octet(OCTET_REASON, REPLY_BUF_SIZE) {
                 Ok(raw) => raw,
-                Err(e) if is_timeout(&e) => {
-                    last_err = Some(e);
-                    continue;
-                }
+                Err(e) if is_timeout(&e) => continue,
                 Err(e) => return Err(e),
             };
 
@@ -382,7 +377,9 @@ impl LoveDriver {
                 .map_err(eval_error_to_asyn);
         }
 
-        Err(last_err.unwrap_or_else(|| protocol_error("executeCommand retries exceeded")))
+        // C returns asynError, not the last attempt's asynTimeout, so the
+        // record alarms READ/WRITE rather than TIMEOUT.
+        Err(protocol_error("executeCommand retries exceeded"))
     }
 
     fn model_for(&self, addr: i32) -> Model {
@@ -600,5 +597,59 @@ mod tests {
     #[test]
     fn is_timeout_rejects_a_real_error() {
         assert!(!is_timeout(&protocol_error("boom")));
+    }
+
+    /// A serial port whose every write times out.
+    struct TimeoutSerial {
+        base: PortDriverBase,
+    }
+
+    impl PortDriver for TimeoutSerial {
+        fn base(&self) -> &PortDriverBase {
+            &self.base
+        }
+
+        fn base_mut(&mut self) -> &mut PortDriverBase {
+            &mut self.base
+        }
+
+        fn write_octet(&mut self, _user: &mut AsynUser, _data: &[u8]) -> AsynResult<usize> {
+            Err(AsynError::Status {
+                status: AsynStatus::Timeout,
+                message: "write timeout".into(),
+            })
+        }
+    }
+
+    fn love_on(serial: impl PortDriver, name: &str) -> LoveDriver {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+
+        let (runtime, _thread) =
+            create_port_runtime(serial, RuntimeConfig::default()).expect("serial port runtime");
+        let handle =
+            SyncIOHandle::from_handle(runtime.port_handle().clone(), 0, Duration::from_millis(100));
+        let models = std::sync::Arc::new(std::sync::Mutex::new([Model::default(); K_INSTRMAX]));
+        LoveDriver::new(name, handle, models).expect("love driver")
+    }
+
+    /// C `executeCommand` (drvLove.c:767-768) ends three timed-out attempts
+    /// with asynError.
+    #[test]
+    fn exhausted_retries_return_error_not_timeout() {
+        let serial = TimeoutSerial {
+            base: PortDriverBase::new(
+                "LOVETESTTMO",
+                1,
+                PortFlags {
+                    multi_device: false,
+                    can_block: true,
+                    destructible: true,
+                },
+            ),
+        };
+        let love = love_on(serial, "LOVETESTTMOL");
+        let err = love.execute_command(1, "00").unwrap_err();
+        assert_eq!(err.status(), AsynStatus::Error);
     }
 }
