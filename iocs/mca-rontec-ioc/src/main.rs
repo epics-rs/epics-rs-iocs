@@ -22,8 +22,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use epics_rs::asyn::runtime::config::RuntimeConfig;
-use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::base::error::CaResult;
 use epics_rs::base::runtime::log::errlog_printf;
 use epics_rs::base::server::iocsh::registry::*;
@@ -129,19 +127,7 @@ async fn main() -> CaResult<()> {
                         return Ok(CommandOutcome::Continue);
                     }
                 };
-                let Ok((runtime_handle, _actor_jh)) =
-                    create_port_runtime(driver, RuntimeConfig::default())
-                else {
-                    errlog_printf("RontecConfig ERROR: Can't register myself.\n");
-                    return Ok(CommandOutcome::Continue);
-                };
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    runtime_handle.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
-
+                driver.register(ctx.db().scan_control().interrupt_gate());
                 Ok(CommandOutcome::Continue)
             },
         ));

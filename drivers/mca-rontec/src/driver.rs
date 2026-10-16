@@ -86,15 +86,20 @@
 //!   request to `RONTEC_MAXCHANS`. A short reply is not an error, as in C:
 //!   it is logged and the persistent buffer is parsed anyway.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use epics_rs::asyn::asyn_record::get_port;
+use epics_rs::asyn::asyn_record::{get_port, register_port};
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::RequestOp;
+use epics_rs::asyn::runtime::config::RuntimeConfig;
+use epics_rs::asyn::runtime::port::create_port_runtime;
 use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
+use epics_rs::base::runtime::interrupt_accept::InterruptGate;
+use epics_rs::base::runtime::log::errlog_printf;
 
 use mca::interface::McaReason;
 
@@ -209,6 +214,19 @@ impl RontecDriver {
             ))
         })?;
         Self::on_serial(port_name, entry.handle, serial_port_name, serial_port_addr)
+    }
+
+    /// The tail of C `RontecConfig` (`drvMcaRontec.c:217-226`): publish the
+    /// port as `owner`'s. A refused name prints C's line and nothing fails,
+    /// because the iocsh wrapper drops `RontecConfig`'s status (`:618`).
+    pub fn register(self, owner: &Arc<InterruptGate>) {
+        let name = self.base.port_name.clone();
+        let registered = create_port_runtime(self, RuntimeConfig::default())
+            .ok()
+            .is_some_and(|(rt, _)| register_port(&name, rt.port_handle().clone(), owner).is_ok());
+        if !registered {
+            errlog_printf("RontecConfig ERROR: Can't register myself.\n");
+        }
     }
 
     /// The part of C `RontecConfig` after the serial port is found.
@@ -618,8 +636,6 @@ impl PortDriver for RontecDriver {
 #[cfg(test)]
 mod tests {
     use epics_rs::asyn::request::RequestResult;
-    use epics_rs::asyn::runtime::config::RuntimeConfig;
-    use epics_rs::asyn::runtime::port::create_port_runtime;
 
     use super::*;
 
@@ -1081,6 +1097,45 @@ mod tests {
             .expect("get eos")
             .data;
         assert_eq!(eos.as_deref(), Some(&b"\r"[..]));
+    }
+
+    /// C `registerPort` refuses a taken name and `RontecConfig` prints its
+    /// line (`drvMcaRontec.c:224-226`); the command does not fail.
+    #[test]
+    fn a_duplicate_port_prints_c_cant_register_line() {
+        use epics_rs::base::runtime::log::{
+            errlog_add_listener, errlog_flush, errlog_remove_listener,
+        };
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        let id = errlog_add_listener(move |m| sink.lock().unwrap().push(m.to_owned()));
+        let (serial, _) = create_port_runtime(
+            FakeSerial {
+                base: PortDriverBase::new("DUPSER", 1, PortFlags::default()),
+                reply: rontec_reply,
+                pending: Vec::new(),
+                writes: Default::default(),
+                input_eos: b"\r".to_vec(),
+            },
+            RuntimeConfig::default(),
+        )
+        .expect("serial runtime");
+        let gate = InterruptGate::opened();
+        for _ in 0..2 {
+            RontecDriver::on_serial("DUPRONTEC", serial.port_handle().clone(), "DUPSER", 0)
+                .expect("driver")
+                .register(&gate);
+        }
+        errlog_flush();
+        errlog_remove_listener(id);
+        let cant = "RontecConfig ERROR: Can't register myself.\n";
+        assert_eq!(
+            lines.lock().unwrap().iter().filter(|l| *l == cant).count(),
+            1,
+            "{:?}",
+            lines.lock().unwrap()
+        );
+        assert!(get_port("DUPRONTEC").is_some());
     }
 
     #[test]
