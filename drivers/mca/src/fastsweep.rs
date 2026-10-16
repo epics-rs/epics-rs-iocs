@@ -347,10 +347,12 @@ impl FastSweepDriver {
         let mut base = PortDriverBase::new(
             port_name,
             max_signals,
+            // C `ASYN_MULTIDEVICE` only: the driver does not block
+            // (`drvFastSweep.cpp:57`).
             PortFlags {
                 multi_device: true,
-                can_block: true,
-                destructible: true,
+                can_block: false,
+                destructible: false,
             },
         );
         let reasons = McaReason::create_params(&mut base)?;
@@ -775,6 +777,8 @@ mod tests {
         let (driver, subscriptions) =
             FastSweepDriver::connect("FSTESTNOINPUT", "FSTESTNOSUCHPORT", 1, 4, "", "").unwrap();
         assert_eq!(&*driver.base().port_name, "FSTESTNOINPUT");
+        let flags = driver.base().flags;
+        assert!(flags.multi_device && !flags.can_block && !flags.destructible);
         assert!(subscriptions.data.is_none());
         assert!(subscriptions.interval.is_none());
     }
