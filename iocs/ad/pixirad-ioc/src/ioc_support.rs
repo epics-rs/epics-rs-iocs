@@ -118,12 +118,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 )
             })?;
 
-            println!(
-                "pixiradConfig: port={port_name}, command={command_port}, \
-                 data=UDP {data_port}, status=UDP {status_port}, \
-                 size={max_size_x}x{max_size_y}"
-            );
-
             let rt = create_pixirad_detector(
                 &port_name,
                 command.handle.clone(),

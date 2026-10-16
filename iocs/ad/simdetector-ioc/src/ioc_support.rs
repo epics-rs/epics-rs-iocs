@@ -83,11 +83,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "simDetectorConfig: port={port_name}, size={size_x}x{size_y}, \
-                     dataType={data_type_code}, maxBuffers={max_buffers}, maxMemory={max_memory}"
-                );
-
                 let sim_rt = create_sim_detector(
                     &port_name,
                     size_x,

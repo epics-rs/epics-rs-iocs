@@ -66,11 +66,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "NDDriverStdArraysConfig: port={port_name}, maxBuffers={max_buffers}, \
-                     maxMemory={max_memory}"
-                );
-
                 let nd_rt = create_nd_std_arrays(&port_name, max_buffers, max_memory)
                     .map_err(|e| format!("failed to create NDDriverStdArrays: {e}"))?;
 

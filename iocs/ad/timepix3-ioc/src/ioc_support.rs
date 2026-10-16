@@ -56,10 +56,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "ADTimePixConfig: port={port_name}, serverURL={server_url}, maxMemory={max_memory}"
-                );
-
                 let runtime = create_timepix3_detector(&port_name, &server_url, max_memory)
                     .map_err(|e| format!("failed to create the TimePix3 detector: {e}"))?;
 
@@ -67,7 +63,8 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     &port_name,
                     runtime.port_handle().clone(),
                     ctx.db().scan_control().interrupt_gate(),
-                ).map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     runtime.pool.clone(),

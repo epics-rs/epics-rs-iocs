@@ -74,10 +74,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "eigerDetectorConfig: port={port_name}, host={hostname}, maxMemory={max_memory}"
-                );
-
                 let runtime = create_eiger_detector(&port_name, &hostname, max_memory)
                     .map_err(|e| format!("failed to create the Eiger detector: {e}"))?;
 

@@ -114,11 +114,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     format!("data port '{data_port}' not found (call drvAsynIPPortConfigure first)")
                 })?;
 
-                println!(
-                    "merlinDetectorConfig: port={port_name}, cmd={cmd_port}, data={data_port}, \
-                     size={size_x}x{size_y}, type={det_type:?}"
-                );
-
                 let rt = create_merlin_detector(
                     &port_name,
                     cmd.handle.clone(),

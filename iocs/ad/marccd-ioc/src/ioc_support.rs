@@ -69,11 +69,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 100_000_000,
                 };
 
-                println!(
-                    "marCCDConfig: port={port_name}, server={server_port}, \
-                     maxMemory={max_memory}"
-                );
-
                 let det = create_marccd_detector(&port_name, &server_port, max_memory)?;
 
                 epics_rs::asyn::asyn_record::register_port(

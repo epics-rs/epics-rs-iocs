@@ -84,11 +84,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 100_000_000,
                 };
 
-                println!(
-                    "pilatusDetectorConfig: port={port_name}, camserver={camserver_port}, \
-                     size={size_x}x{size_y}, maxMemory={max_memory}"
-                );
-
                 let det = create_pilatus_detector(
                     &port_name,
                     &camserver_port,

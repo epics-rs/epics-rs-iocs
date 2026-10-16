@@ -89,11 +89,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "ADCSimDetectorConfig: port={port_name}, numTimePoints={num_time_points}, \
-                     dataType={data_type_code}, maxBuffers={max_buffers}, maxMemory={max_memory}"
-                );
-
                 let sim_rt = create_c_sim_detector(
                     &port_name,
                     num_time_points,

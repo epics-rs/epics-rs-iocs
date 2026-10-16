@@ -82,10 +82,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 format!("status port '{status_port}' not found (call drvAsynIPPortConfigure first)")
             })?;
 
-            println!(
-                "BISDetectorConfig: port={port_name}, command={bis_port}, status={status_port}"
-            );
-
             let rt = create_bruker_detector(
                 &port_name,
                 command.handle.clone(),

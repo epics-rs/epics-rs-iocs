@@ -71,8 +71,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                 )
             })?;
 
-            println!("PSLConfig: port={port_name}, server={server_port}");
-
             let rt = create_psl_detector(&port_name, server.handle.clone(), max_memory)
                 .map_err(|e| format!("failed to create the PSL detector: {e}"))?;
 

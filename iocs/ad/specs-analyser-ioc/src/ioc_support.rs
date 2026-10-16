@@ -72,11 +72,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 100_000_000,
                 };
 
-                println!(
-                    "specsAnalyserConfig: port={port_name}, driverPort={driver_port}, \
-                     maxBuffers={max_buffers}, maxMemory={max_memory}"
-                );
-
                 let det = create_specs_analyser_detector(
                     &port_name,
                     &driver_port,

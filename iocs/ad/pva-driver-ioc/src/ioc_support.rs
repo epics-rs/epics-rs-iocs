@@ -69,10 +69,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "pvaDriverConfig: port={port_name}, pvName={pv_name}, maxMemory={max_memory}"
-                );
-
                 let det_runtime = create_pva_detector(&port_name, &pv_name, max_memory)
                     .map_err(|e| format!("failed to create pvAccess detector: {e}"))?;
 

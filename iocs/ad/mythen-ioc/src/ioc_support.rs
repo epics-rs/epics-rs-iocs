@@ -53,10 +53,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 0,
                 };
 
-                println!(
-                    "mythenConfig: port={port_name}, ipPort={ip_port_name}, maxMemory={max_memory}"
-                );
-
                 let runtime = create_mythen_detector(&port_name, &ip_port_name, max_memory)
                     .map_err(|e| format!("failed to create the Mythen detector: {e}"))?;
 

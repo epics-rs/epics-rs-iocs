@@ -76,8 +76,6 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     )
                 })?;
 
-                println!("PhotonIIConfig: port={port_name}, p2util={command_port}");
-
                 let rt = create_photonii_detector(&port_name, cmd.handle.clone(), max_memory)
                     .map_err(|e| format!("failed to create the PhotonII detector: {e}"))?;
 
