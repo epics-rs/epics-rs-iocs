@@ -166,7 +166,7 @@ impl SweepState {
         self.num_average = if self.callback_interval <= 0.0 {
             1
         } else {
-            (self.dwell_time / self.callback_interval).round() as i32
+            (self.dwell_time / self.callback_interval + 0.5) as i32
         }
         .max(1);
         self.accumulated = 0;
@@ -247,7 +247,7 @@ impl SweepState {
         let averaged: Vec<i32> = self
             .average_store
             .iter()
-            .map(|&sum| (sum / f64::from(self.accumulated)).round() as i32)
+            .map(|&sum| (0.5 + sum / f64::from(self.accumulated)) as i32)
             .collect();
         let updates = self.next_point(&averaged, reasons, current_channel_reason);
         self.average_store.iter_mut().for_each(|v| *v = 0.0);
@@ -715,6 +715,20 @@ mod tests {
         state.data_callback(&[2], &reasons, 999);
         state.data_callback(&[4], &reasons, 999);
         assert_eq!(state.p_data[0], 3);
+    }
+
+    /// C `(epicsInt32)(0.5 + pAverageStore_[i]/accumulated_)`
+    /// (`drvFastSweep.cpp:239`) truncates toward zero, so -2.5 becomes -2.
+    #[test]
+    fn data_callback_rounds_the_average_like_c() {
+        let mut state = SweepState::new(1, 4);
+        state.acquiring = true;
+        state.num_average = 2;
+        state.num_points = 4;
+        let reasons = dummy_reasons();
+        state.data_callback(&[-2], &reasons, 999);
+        state.data_callback(&[-3], &reasons, 999);
+        assert_eq!(state.p_data[0], -2);
     }
 
     /// C `nextPoint`'s per-signal write + always-publish current channel /
