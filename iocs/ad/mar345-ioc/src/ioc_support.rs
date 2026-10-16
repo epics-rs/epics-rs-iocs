@@ -69,14 +69,19 @@ pub fn register(ioc: &mut epics_rs::ad_plugins::ioc::AdIoc) {
                     _ => 100_000_000,
                 };
 
-                let det = create_mar345_detector(&port_name, &server_port, max_memory)?;
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
 
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    det.port_handle().clone(),
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                let det = create_mar345_detector(&claim, &server_port, max_memory)?;
+
+                claim
+                    .publish(
+                        det.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 mgr.set_driver(Arc::new(GenericDriverContext::new(
                     det.pool().clone(),
