@@ -57,6 +57,8 @@ pub struct ImageFrame {
     pub format: PixelFormat,
     pub frame_number: i32,
     pub time_at_frame: f64,
+    pub threshold_id: i32,
+    pub integration_size: i32,
     pub pixels: Vec<u32>,
 }
 
@@ -204,6 +206,8 @@ enum Pending {
         format: PixelFormat,
         frame_number: i32,
         time_at_frame: f64,
+        threshold_id: i32,
+        integration_size: i32,
     },
     Histogram {
         bin_size: usize,
@@ -223,12 +227,16 @@ impl Pending {
                 format,
                 frame_number,
                 time_at_frame,
+                threshold_id,
+                integration_size,
             } => Frame::Image(ImageFrame {
                 width,
                 height,
                 format,
                 frame_number,
                 time_at_frame,
+                threshold_id,
+                integration_size,
                 pixels: decode_be(payload, format),
             }),
             Self::Histogram {
@@ -283,6 +291,20 @@ fn header_i64(header: &Value, key: &str, default: i64) -> i64 {
     }
 }
 
+/// C `jsonImageThresholdId` (serval_stream.cpp:35-47): the first integer of
+/// `thresholdID`, `thresholdId`, `thresholdIndex`, else 0.
+fn threshold_id(header: &Value) -> i32 {
+    ["thresholdID", "thresholdId", "thresholdIndex"]
+        .iter()
+        .find_map(|key| match header.get(*key) {
+            Some(Value::Number(n)) if !n.is_f64() => {
+                n.as_i64().or_else(|| n.as_u64().map(|v| v as i64))
+            }
+            _ => None,
+        })
+        .map_or(0, |v| v as i32)
+}
+
 fn image_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
     let width = header_i64(header, "width", -1);
     let height = header_i64(header, "height", -1);
@@ -318,6 +340,8 @@ fn image_header(header: &Value) -> Result<(usize, Pending), DecodeError> {
                 .get("timeAtFrame")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0),
+            threshold_id: threshold_id(header),
+            integration_size: header_i64(header, "integrationSize", 0) as i32,
         },
     ))
 }
@@ -480,6 +504,37 @@ mod tests {
         assert_eq!(f.pixels, vec![0x0102_0304, 0xdead_beef]);
         // timeAtFrame absent → 0.0, as in C's j.value(...) default.
         assert_eq!(f.time_at_frame, 0.0);
+    }
+
+    /// C `jsonImageThresholdId` (serval_stream.cpp:35-47) and
+    /// `j.value("integrationSize", 0)`.
+    #[test]
+    fn an_image_header_carries_its_threshold_and_integration_size() {
+        for (fields, threshold, integration) in [
+            (r#""thresholdID":1,"integrationSize":5"#, 1, 5),
+            (r#""thresholdId":2"#, 2, 0),
+            (r#""thresholdIndex":3"#, 3, 0),
+            (r#""thresholdID":1.0,"thresholdIndex":4"#, 4, 0),
+            (r#""thresholdID":"1""#, 0, 0),
+            ("", 0, 0),
+        ] {
+            let sep = if fields.is_empty() { "" } else { "," };
+            let mut bytes =
+                format!(r#"{{"width":1,"height":1,"pixelFormat":"uint16"{sep}{fields}}}"#)
+                    .into_bytes();
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&[0, 7]);
+            let mut d = FrameDecoder::new(Channel::Image);
+            d.push(&bytes);
+            let Some(Frame::Image(f)) = d.next_frame().unwrap() else {
+                panic!("{fields}")
+            };
+            assert_eq!(
+                (f.threshold_id, f.integration_size),
+                (threshold, integration),
+                "{fields}"
+            );
+        }
     }
 
     #[test]

@@ -1185,6 +1185,16 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                         ADDR,
                         ParamValue::Float64(f.time_at_frame),
                     ),
+                    ParamSetValue::new(
+                        p.prv_img_threshold_id,
+                        ADDR,
+                        ParamValue::Int32(f.threshold_id),
+                    ),
+                    ParamSetValue::new(
+                        p.prv_img_integration_size,
+                        ADDR,
+                        ParamValue::Int32(f.integration_size),
+                    ),
                 ],
             )
             .await;
@@ -1192,6 +1202,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ctx,
                 PRV_IMG_ADDR,
                 f.frame_number,
+                f.threshold_id,
                 f.width,
                 f.height,
                 f.pixels,
@@ -1218,6 +1229,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ADDR,
                 vec![
                     ParamSetValue::new(p.img_frame_number, ADDR, ParamValue::Int32(f.frame_number)),
+                    ParamSetValue::new(p.img_threshold_id, ADDR, ParamValue::Int32(f.threshold_id)),
                     ParamSetValue::new(
                         p.img_time_at_frame,
                         ADDR,
@@ -1265,6 +1277,7 @@ async fn handle_frame(ctx: &Arc<Ctx>, kind: StreamKind, frame: Frame) {
                 ctx,
                 IMG_ADDR,
                 f.frame_number,
+                f.threshold_id,
                 f.width,
                 f.height,
                 f.pixels,
@@ -1730,6 +1743,7 @@ async fn publish_image(
     ctx: &Arc<Ctx>,
     addr: usize,
     frame_number: i32,
+    threshold_id: i32,
     width: usize,
     height: usize,
     pixels: Vec<u32>,
@@ -1764,9 +1778,16 @@ async fn publish_image(
     array.unique_id = frame_number;
     array.timestamp = EpicsTimestamp::now();
     array.time_stamp = array.timestamp.as_f64();
-    // C hands the frame the getAttributes set and no ColorMode attribute
-    // (serval_stream.cpp:292, :943); C ignores the status.
+    // C hands the frame the getAttributes set plus ThresholdID, and no
+    // ColorMode attribute (serval_stream.cpp:292-295, :943-946); C ignores
+    // the status.
     let _ = ctx.pool.owner().get_attributes(&mut array).await;
+    array.attributes.add(NDAttribute::new_static(
+        "ThresholdID",
+        "Serval jsonimage thresholdID",
+        NDAttrSource::Driver,
+        NDAttrValue::Int32(threshold_id),
+    ));
 
     ArrayPublisher::new(ctx.outputs[addr].clone())
         .publish(array)
@@ -2033,6 +2054,8 @@ mod tests {
                 format: crate::stream::PixelFormat::UInt16,
                 frame_number,
                 time_at_frame: 0.0,
+                threshold_id: 0,
+                integration_size: 0,
                 pixels: vec![1, 2],
             });
             handle_frame(&ctx, kind, frame).await;
@@ -2113,6 +2136,8 @@ mod tests {
                 format: crate::stream::PixelFormat::UInt16,
                 frame_number: 1,
                 time_at_frame: 0.0,
+                threshold_id: 0,
+                integration_size: 0,
                 pixels: vec![1, 2],
             });
             handle_frame(&ctx, kind, frame).await;
@@ -2128,8 +2153,46 @@ mod tests {
                 array.attributes.get("Exposure").map(|a| &a.value),
                 Some(&NDAttrValue::Float64(0.25))
             );
-            assert_eq!(array.attributes.len(), 1);
+            // C adds ThresholdID after getAttributes
+            // (serval_stream.cpp:292-295, :943-946).
+            assert_eq!(
+                array.attributes.get("ThresholdID").map(|a| &a.value),
+                Some(&NDAttrValue::Int32(0))
+            );
+            assert_eq!(array.attributes.len(), 2);
         }
+
+        // The header's threshold reaches the attribute and the stream's
+        // params (serval_stream.cpp:245-246, :894).
+        for kind in [StreamKind::PrvImg, StreamKind::Img] {
+            let frame = Frame::Image(crate::stream::ImageFrame {
+                width: 2,
+                height: 1,
+                format: crate::stream::PixelFormat::UInt16,
+                frame_number: 2,
+                time_at_frame: 0.0,
+                threshold_id: 1,
+                integration_size: 7,
+                pixels: vec![1, 2],
+            });
+            handle_frame(&ctx, kind, frame).await;
+            let rx = match kind {
+                StreamKind::Img => &mut rx_img,
+                _ => &mut rx,
+            };
+            let array = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("no array")
+                .unwrap();
+            assert_eq!(
+                array.attributes.get("ThresholdID").map(|a| &a.value),
+                Some(&NDAttrValue::Int32(1))
+            );
+        }
+        let int = |reason| ctx.handle.read_int32(reason, 0);
+        assert_eq!(int(p.prv_img_threshold_id).await.unwrap(), 1);
+        assert_eq!(int(p.prv_img_integration_size).await.unwrap(), 7);
+        assert_eq!(int(p.img_threshold_id).await.unwrap(), 1);
         std::mem::forget(runtime);
     }
 
@@ -2264,6 +2327,8 @@ mod tests {
                 format: crate::stream::PixelFormat::UInt16,
                 frame_number: 7,
                 time_at_frame: 0.0,
+                threshold_id: 0,
+                integration_size: 0,
                 pixels,
             });
             handle_frame(&ctx, StreamKind::Img, frame).await;
