@@ -1752,11 +1752,8 @@ pub fn mm4000_config_command() -> CommandDef {
         let num_axes = controller.num_axes();
         let controller = Arc::new(Mutex::new(controller));
         for axis in 1..=num_axes {
-            let ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
-            controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .model1_init_status();
+            let mut ax = Mm4000Axis::new(controller.clone(), axis, mm4000::MODEL1_POLL_FAILURE);
+            ax.model1_set_status();
             MM4000.install(ctx, card, (axis - 1) as i32, Arc::new(Mutex::new(ax)))?;
         }
         Ok(())
