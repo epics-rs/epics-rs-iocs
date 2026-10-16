@@ -1,19 +1,22 @@
-# Parker ACR / Aries: one motor record per axis. Load once per axis with ADDR =
-# 0-based axis index of port PORT; the axis name is AXIS$(ADDR).
+# Parker ACR / Aries: one motor record per axis, ADDR the 0-based axis index
+# of port PORT (axis name AXIS<ADDR>).
 #
-# The driver reports positions in controller counts (the position registers hold
-# pulses; PPU divides the commanded values only), so MRES = 1 and EGU = counts.
-# Done, limit, at-home and drive-power status come from the ?P register reads.
+# The record's steps are the controller's pulses; the driver divides them by
+# the PPU it reads. MRES and the motion fields are the C example's
+# (motor.substitutions.acr).
 
 record(motor, "$(P)$(M)") {
     field(DTYP, "asynMotor")
     field(OUT,  "@asyn($(PORT),$(ADDR))")
     field(SCAN, "Passive")
-    field(VELO, "$(VELO=10000)")
-    field(ACCL, "$(ACCL=0.5)")
-    field(DHLM, "$(HLM=10000000)")
-    field(DLLM, "$(LLM=-10000000)")
-    field(MRES, "$(MRES=1.0)")
-    field(EGU,  "$(EGU=counts)")
-    field(PREC, "$(PREC=0)")
+    field(VELO, "$(VELO=.05)")
+    field(VBAS, "$(VBAS=.01)")
+    field(ACCL, "$(ACCL=.5)")
+    field(BVEL, "$(BVEL=1)")
+    field(BACC, "$(BACC=.2)")
+    field(DHLM, "$(HLM=200)")
+    field(DLLM, "$(LLM=-2)")
+    field(MRES, "$(MRES=1.25e-7)")
+    field(EGU,  "$(EGU=mm)")
+    field(PREC, "$(PREC=5)")
 }
