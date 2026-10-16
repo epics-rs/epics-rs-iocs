@@ -19,7 +19,7 @@ use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
-use epics_rs::base::server::recgbl::alarm_status;
+use epics_rs::base::server::recgbl::{alarm_status, rec_gbl_record_error};
 use epics_rs::base::server::record::{AlarmSeverity, ProcessContext, Record, ScanType, menu_scan};
 use epics_rs::base::types::EpicsValue;
 
@@ -565,7 +565,15 @@ impl DeviceSupport for EtherIpDevice {
                     "lsi" => cip::get_string(raw, element, count_field(record, "SIZV"))
                         .map(|s| (EpicsValue::String(s.into()), true))
                         .ok_or(()),
-                    "waveform" => read_waveform(raw, element, record).map(|v| (v, true)),
+                    "waveform" => match read_waveform(raw, elements, record, &self.name) {
+                        Ok(Some(v)) => Ok((v, true)),
+                        Ok(None) => {
+                            drop(data);
+                            self.no_alarm();
+                            return Ok(DeviceReadOutcome::ok());
+                        }
+                        Err(()) => Err(()),
+                    },
                     _ => Err(()),
                 }
             }
@@ -839,42 +847,62 @@ impl EtherIpDevice {
     }
 }
 
-/// C `wf_read`. The CIP type picks the array type; the record coerces it to
-/// FTVL.
-///
-/// UPSTREAM FIX: the C reads elements `0 .. NELM`, ignoring the element index
-/// the link supplied -- even though `analyze_link` deliberately registers
-/// `last_element + count` elements with the driver, which is only meaningful if
-/// the read starts at `last_element`. `@PLC arr[5]` on a waveform with NELM=10
-/// therefore hands back `arr[0..10]` in the C. We read `arr[5..15]`, the range
-/// the registration reserves. Identical behaviour for the (usual) unindexed
-/// link, where `element == 0`.
-fn read_waveform(raw: &[u8], element: usize, record: &dyn Record) -> Result<EpicsValue, ()> {
+/// C `wf_read` (devEtherIP.c:1838-1925): elements `0..NELM`, whatever index
+/// the link named, typed by the tag's CIP type against FTVL. `Ok(None)` is
+/// C's silent pass when the tag holds fewer than NELM elements.
+fn read_waveform(
+    raw: &[u8],
+    elements: usize,
+    record: &dyn Record,
+    name: &str,
+) -> Result<Option<EpicsValue>, ()> {
+    const CHAR: i16 = 1;
+    const UCHAR: i16 = 2;
+    const LONG: i16 = 5;
+    const DOUBLE: i16 = 10;
     let nelm = count_field(record, "NELM");
-    match cip::typecode(raw) {
-        Some(CipType::Real) | Some(CipType::Lreal) => {
-            let mut v = Vec::with_capacity(nelm);
-            for i in 0..nelm {
-                v.push(cip::get_double(raw, element + i).ok_or(())?);
+    if elements < nelm {
+        return Ok(None);
+    }
+    let ftvl = f64_field(record, "FTVL") as i16;
+    let refuse = |message: &str| {
+        rec_gbl_record_error("Illegal field value", name, message);
+        Err(())
+    };
+    let value = match cip::typecode(raw) {
+        Some(CipType::Real | CipType::Lreal) => {
+            if ftvl != DOUBLE {
+                return refuse(
+                    "EtherIP: tag data type REAL or LREAL requires waveform FTVL==DOUBLE",
+                );
             }
-            Ok(EpicsValue::DoubleArray(v.into()))
+            let v: Option<Vec<f64>> = (0..nelm).map(|i| cip::get_double(raw, i)).collect();
+            EpicsValue::DoubleArray(v.ok_or(())?.into())
         }
         Some(CipType::Sint) => {
-            let mut v = Vec::with_capacity(nelm);
-            for i in 0..nelm {
-                v.push(cip::get_usint(raw, element + i).ok_or(())?);
+            if ftvl != CHAR && ftvl != UCHAR {
+                return refuse("EtherIP: tag data type requires waveform FTVL==CHAR/UCHAR");
             }
-            Ok(EpicsValue::CharArray(v.into()))
+            let v: Option<Vec<u8>> = (0..nelm).map(|i| cip::get_usint(raw, i)).collect();
+            EpicsValue::CharArray(v.ok_or(())?.into())
         }
-        Some(_) => {
-            let mut v = Vec::with_capacity(nelm);
-            for i in 0..nelm {
-                v.push(cip::get_dint(raw, element + i).ok_or(())?);
+        _ => {
+            let v: Option<Vec<i32>> = (0..nelm).map(|i| cip::get_dint(raw, i)).collect();
+            match ftvl {
+                LONG => EpicsValue::LongArray(v.ok_or(())?.into()),
+                // `*(s++) = dint_val`: each DINT truncated to its low byte.
+                CHAR => EpicsValue::CharArray(
+                    v.ok_or(())?
+                        .into_iter()
+                        .map(|d| d as u8)
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                _ => return refuse("EtherIP: tag type requires waveform FTVL==LONG or CHAR"),
             }
-            Ok(EpicsValue::LongArray(v.into()))
         }
-        None => Err(()),
-    }
+    };
+    Ok(Some(value))
 }
 
 fn nobt(record: &dyn Record) -> usize {
@@ -1046,6 +1074,27 @@ mod tests {
             assert_eq!(f64_field(&record, "VAL"), want_val, "udf={udf}");
             assert_eq!(tag.data.lock().do_write, want_write, "udf={udf}");
         }
+    }
+
+    /// devEtherIP.c:1853-1915: elements 0..NELM, nothing below NELM
+    /// registered elements, and FTVL checked against the CIP type.
+    #[test]
+    fn waveform_reads_from_element_zero_as_c_wf_read_does() {
+        use epics_rs::base::server::records::waveform::WaveformRecord;
+        let mut raw = CipType::Real.code().to_le_bytes().to_vec();
+        for v in [1.5f32, 2.5, 3.5, 4.5] {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut wf = WaveformRecord::default();
+        wf.put_field("NELM", EpicsValue::ULong(3)).unwrap();
+        wf.put_field("FTVL", EpicsValue::Short(10)).unwrap();
+        assert_eq!(
+            read_waveform(&raw, 4, &wf, "wf"),
+            Ok(Some(EpicsValue::DoubleArray(vec![1.5, 2.5, 3.5].into())))
+        );
+        assert_eq!(read_waveform(&raw, 2, &wf, "wf"), Ok(None));
+        wf.put_field("FTVL", EpicsValue::Short(5)).unwrap();
+        assert_eq!(read_waveform(&raw, 4, &wf, "wf"), Err(()));
     }
 
     // -- link parsing --------------------------------------------------------
