@@ -184,6 +184,18 @@ impl OctetIo {
     }
 }
 
+/// What C++ prints as `inString_` after a `writeReadMeter`: the reply, or on a
+/// failure whatever the read did transfer.
+pub fn reply_text(reply: AsynResult<String>) -> String {
+    match reply {
+        Ok(text) => text,
+        Err(e) => e
+            .partial_read()
+            .map(|p| String::from_utf8_lossy(&p.data).trim_end().to_string())
+            .unwrap_or_default(),
+    }
+}
+
 fn octet_user(timeout: Duration) -> AsynUser {
     AsynUser::new(OCTET_REASON)
         .with_addr(OCTET_ADDR)

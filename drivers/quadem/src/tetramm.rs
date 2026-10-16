@@ -19,7 +19,7 @@ use crate::drv_quad_em::{
     self as qe, CallbackContext, QE_MAX_INPUTS, QeAcquireMode, QeModel, QeReadFormat,
     QeTriggerMode, QeTriggerPolarity, QuadEmBase, QuadEmDevice, QuadEmParams, QuadEmShared,
 };
-use crate::octet::{OctetIo, ReadOutcome, connect_octet};
+use crate::octet::{OctetIo, ReadOutcome, connect_octet, reply_text};
 use crate::tetramm_proto as proto;
 use crate::{asyn_print, trace};
 
@@ -506,7 +506,8 @@ impl PortDriver for TetrAmmDriver {
         &mut self.base.port_base
     }
 
-    /// C++ `drvTetrAMM::report` at details 0.
+    /// C++ `drvTetrAMM::report`: above details 0 the meter is stopped, asked
+    /// for its network setup, and restarted after the base report.
     fn report(&mut self, out: &mut dyn std::fmt::Write, level: i32) {
         let _ = writeln!(
             out,
@@ -516,7 +517,23 @@ impl PortDriver for TetrAmmDriver {
             self.firmware_version,
             self.num_resync.load(Ordering::Relaxed)
         );
+        let mut prev_acquiring = false;
+        if level > 0 {
+            prev_acquiring = self.shared.is_acquiring();
+            let _ = self.set_acquire(0);
+            for (command, label) in [
+                ("IFCONFIG", "IFCONFIG response from meter:"),
+                ("IFCONFIG:LINK", "IFCONFIG:LINK: response from meter:"),
+                ("IFCONFIG:ICMP", "IFCONFIG:ICMP: response from meter:"),
+            ] {
+                let reply = reply_text(self.write_read_meter(command));
+                let _ = writeln!(out, "{label}\n{reply}");
+            }
+        }
         self.asyn_port_driver_report(out, level);
+        if prev_acquiring {
+            let _ = self.set_acquire(1);
+        }
     }
 
     fn write_int32(&mut self, user: &mut AsynUser, value: i32) -> AsynResult<()> {
@@ -908,6 +925,30 @@ mod tests {
             out,
             "drvTetrAMM: port=QE_TETRA_REPORT, IP port=QE_TETRA_REPORT, \
              firmware version=Unknown, numResync=3\nPort: QE_TETRA_REPORT\n"
+        );
+    }
+
+    #[test]
+    fn a_detailed_report_stops_the_meter_and_asks_its_network_setup() {
+        let (addr, log) = ack_meter("");
+        let mut drv = driver_on("QE_TETRA_IFCONFIG", &addr);
+        let mut out = String::new();
+        drv.report(&mut out, 1);
+        assert!(
+            out.contains(
+                "IFCONFIG response from meter:\nACK\n\
+                 IFCONFIG:LINK: response from meter:\nACK\n\
+                 IFCONFIG:ICMP: response from meter:\nACK\n"
+            ),
+            "{out}"
+        );
+        // The constructor's ACQ:OFF/VER:? come first.
+        assert!(
+            log.lock().unwrap().ends_with(
+                &["ACQ:OFF", "IFCONFIG", "IFCONFIG:LINK", "IFCONFIG:ICMP"].map(String::from)
+            ),
+            "{:?}",
+            log.lock().unwrap()
         );
     }
 
