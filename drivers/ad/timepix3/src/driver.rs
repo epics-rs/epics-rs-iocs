@@ -1292,10 +1292,36 @@ impl PortDriver for TimePix3Driver {
     fn write_octet(&mut self, user: &mut AsynUser, data: &[u8]) -> AsynResult<usize> {
         let reason = user.reason;
         let addr = user.addr;
-        let value = String::from_utf8_lossy(data).into_owned();
-        self.ad.port_base.set_string_param(reason, addr, value)?;
-
         let p = self.p;
+        // C stores the string up to its first NUL (ADTimePix.cpp:428-432).
+        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+        let value = String::from_utf8_lossy(&data[..end]).into_owned();
+        let name = self
+            .ad
+            .port_base
+            .params
+            .param_name(reason)
+            .unwrap_or("")
+            .to_owned();
+        if [p.img_ths, p.img1_ths, p.prv_img_ths, p.prv_img1_ths].contains(&reason)
+            && value.trim_start_matches([' ', '\t']).is_empty()
+        {
+            self.ad.port_base.trace_print(
+                TraceMask::IO_DRIVER,
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::WRITE_OCTET,
+                        &format!("Ignoring empty threshold list write for paramName={name}"),
+                    )
+                ),
+            );
+            return Ok(data.len());
+        }
+        self.ad
+            .port_base
+            .set_string_param(reason, addr, value.clone())?;
+
         // A path PV's "does it exist" readback (C `checkBPCPath`,
         // mask_io.cpp:320).
         for (path, exists) in [
@@ -1320,10 +1346,6 @@ impl PortDriver for TimePix3Driver {
         // parameter library and discards it — the record never shows the
         // failure. The status is left to the return value here.
         self.ad.port_base.call_param_callbacks(addr)?;
-        let name = self.ad.port_base.params.param_name(reason).unwrap_or("");
-        // C prints the value as the `char *` it was handed: up to the NUL.
-        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-        let value = String::from_utf8_lossy(&data[..end]);
         self.ad.port_base.trace_print(
             TraceMask::IO_DRIVER,
             format_args!(
@@ -1400,6 +1422,30 @@ impl PortDriver for TimePix3Driver {
 mod tests {
     use super::*;
     use epics_rs::ad_core::driver::ShutterMode;
+
+    /// writeOctet stores up to the first NUL and ignores a blank threshold
+    /// list (ADTimePix.cpp:424-440).
+    #[test]
+    fn a_blank_threshold_list_is_ignored_and_a_nul_ends_the_string() {
+        let (cmd_tx, _cmd_rx) = rt::command_channel::<Command>(1);
+        let mut det = TimePix3Driver::new(
+            "TPX_WRITE_OCTET",
+            Arc::new(ServalHttp::new("http://127.0.0.1:1")),
+            Arc::new(Shared::new()),
+            0,
+            cmd_tx,
+        )
+        .unwrap();
+        let p = det.p;
+        det.write_octet(&mut AsynUser::new(p.img_ths), b"1,2\0junk")
+            .unwrap();
+        assert_eq!(det.text(p.img_ths, 0), "1,2");
+        let n = det
+            .write_octet(&mut AsynUser::new(p.img_ths), b" \t")
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(det.text(p.img_ths, 0), "1,2");
+    }
 
     /// A processed-output type other than 0 or 1 reads back 0
     /// (ADTimePix.cpp:593-597, :605-609).
