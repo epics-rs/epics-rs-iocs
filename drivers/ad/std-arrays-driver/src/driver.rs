@@ -322,18 +322,20 @@ impl NdStdArraysDriver {
         if self.current.is_none() {
             return Ok(());
         }
-        let counter = self.get_i32(self.params.base.array_counter) + 1;
-        self.port_base
-            .set_int32_param(self.params.base.array_counter, 0, counter)?;
-
         // DEVIATION: C stamps `pArrays[0]` itself and hands the live pointer to
         // the plugin, so append-mode re-publishes share one growing buffer.
         // This port snapshots the buffer per publish, giving each queued frame
         // an independent copy (identical observable data, no shared-buffer race).
         // The copy comes from the pool so it is counted on this driver as
-        // `pArrays[0]` is.
+        // `pArrays[0]` is; C allocates nothing here, so a snapshot the pool
+        // refuses is dropped uncounted after the pool's limit line.
         let current = self.current.as_ref().unwrap();
-        let mut snapshot = self.pool.wrap(current.dims.clone(), current.data.clone());
+        let Ok(mut snapshot) = self.pool.wrap(current.dims.clone(), current.data.clone()) else {
+            return Ok(());
+        };
+        let counter = self.get_i32(self.params.base.array_counter) + 1;
+        self.port_base
+            .set_int32_param(self.params.base.array_counter, 0, counter)?;
         snapshot.attributes = current.attributes.clone();
         snapshot.codec = current.codec.clone();
         snapshot.unique_id = counter;
