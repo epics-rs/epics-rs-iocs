@@ -74,15 +74,19 @@ type SharedState = Arc<parking_lot::Mutex<NslsState>>;
 // Transport
 // ===========================================================================
 
-/// The sockets C++ builds in its constructor.
+/// What C++'s constructor leaves behind: the modules that answered the
+/// broadcast, and the command/data sockets when the requested one was found.
 struct Transport {
-    command: OctetIo,
-    data: OctetIo,
+    /// `None` when the constructor returned early. C++ keeps the port then,
+    /// with no meter link and no read thread.
+    link: Option<(OctetIo, OctetIo)>,
     /// The UDP, command and data sub-ports; dropping them closes the sockets,
     /// so [`NslsEmRuntime`] keeps them for the life of the port.
     runtimes: Vec<PortRuntimeHandle>,
     /// C++ `moduleInfo_`: every module that answered the broadcast.
     modules: Vec<proto::ModuleInfo>,
+    /// `findModule` failed, so C++ ran `report(stdout, 1)`.
+    find_failed: bool,
 }
 
 /// Build an IP port the way `drvAsynIPPortConfigure` does, with the EOS
@@ -102,79 +106,117 @@ fn ip_port(
     )
 }
 
-/// C++ `drvNSLS_EM::findModule`: broadcast `i`, collect the replies for
-/// `BROADCAST_TIMEOUT`, then open the two TCP ports of the requested module.
-fn find_module(port_name: &str, broadcast_address: &str, module_id: i32) -> AsynResult<Transport> {
+/// C++ constructor from the UDP port on, then `findModule`. Every failure is
+/// printed as C++ prints it and leaves `link` empty; none fails the port.
+fn find_module(
+    base: &PortDriverBase,
+    port_name: &str,
+    broadcast_address: &str,
+    module_id: i32,
+) -> Transport {
+    let mut transport = Transport {
+        link: None,
+        runtimes: Vec::new(),
+        modules: Vec::new(),
+        find_failed: false,
+    };
     // The discovery port carries no EOS: each reply is one datagram, and the
     // EOS interpose would keep reading past it until the read timed out.
-    let (udp, udp_runtime) = ip_port(
-        &format!("UDP_{port_name}"),
-        &format!("{broadcast_address}:{} UDP*", proto::BROADCAST_PORT),
-        false,
-        false,
-    )?;
+    let udp_name = format!("UDP_{port_name}");
+    let udp_host = format!("{broadcast_address}:{} UDP*", proto::BROADCAST_PORT);
+    let udp = match ip_port(&udp_name, &udp_host, false, false) {
+        Ok((udp, runtime)) => {
+            transport.runtimes.push(runtime);
+            udp
+        }
+        Err(e) => {
+            asyn_print!(
+                *base,
+                ERROR,
+                "drvNSLS_EM::drvNSLS_EM error calling drvAsynIPPortConfigure for broadcast port={udp_name}, IP={udp_host}, status={}",
+                trace::status_code(&e)
+            );
+            return transport;
+        }
+    };
 
-    udp.write_bytes(proto::DISCOVER_COMMAND)?;
+    match discover(base, &udp, port_name, module_id, &mut transport) {
+        Ok(link) => transport.link = Some(link),
+        Err(()) => {
+            asyn_print!(
+                *base,
+                ERROR,
+                "drvNSLS_EM::drvNSLS_EM error finding module, running asynReport to list modules found"
+            );
+            transport.find_failed = true;
+        }
+    }
+    transport
+}
 
-    let mut modules = Vec::new();
+/// C++ `drvNSLS_EM::findModule`: broadcast `i`, collect the replies for
+/// `BROADCAST_TIMEOUT`, then open the two TCP ports of the requested module.
+fn discover(
+    base: &PortDriverBase,
+    udp: &OctetIo,
+    port_name: &str,
+    module_id: i32,
+    transport: &mut Transport,
+) -> Result<(OctetIo, OctetIo), ()> {
+    // C++ discards the write status.
+    let _ = udp.write_bytes(proto::DISCOVER_COMMAND);
+
     let deadline = Instant::now() + proto::BROADCAST_TIMEOUT;
     let udp_reader = udp.with_timeout(proto::BROADCAST_READ_TIMEOUT);
     while Instant::now() < deadline {
         match udp_reader.read_binary(proto::DISCOVERY_BUFFER_SIZE) {
             Ok(outcome) if !outcome.data.is_empty() => {
                 let text = String::from_utf8_lossy(&outcome.data);
-                modules.extend(proto::parse_discovery(&text));
+                transport.modules.extend(proto::parse_discovery(&text));
             }
             Ok(_) => {}
             Err(e) if is_timeout(&e) => {}
-            Err(e) => return Err(e),
+            Err(_) => return Err(()),
         }
     }
 
-    let found = modules
-        .iter()
-        .find(|m| m.module_id == module_id)
-        .ok_or_else(|| {
-            error(format!(
-                "drvNSLS_EM: module {module_id} did not answer the broadcast on \
-                 {broadcast_address}; modules seen: {}",
-                if modules.is_empty() {
-                    "none".to_string()
-                } else {
-                    modules
-                        .iter()
-                        .map(|m| format!("{} at {}", m.module_id, m.ip))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                }
-            ))
-        })?;
+    let Some(found) = transport.modules.iter().find(|m| m.module_id == module_id) else {
+        asyn_print!(
+            *base,
+            ERROR,
+            "drvNSLS_EM:findModules: cannot find requested module {module_id} on network"
+        );
+        return Err(());
+    };
+    let ip = found.ip.clone();
+
+    let tcp_port = |name: String, port: u16, no_auto_connect: bool| {
+        ip_port(&name, &format!("{ip}:{port}"), no_auto_connect, true).map_err(|e| {
+            asyn_print!(
+                *base,
+                ERROR,
+                "drvNSLS_EM:findModules: error calling drvAsyIPPortConfigure for TCP port {name}, IP={ip}, status={}",
+                trace::status_code(&e)
+            );
+        })
+    };
 
     // Command port: C++ passes noAutoConnect=1 and drives the connection
     // itself around every transaction.
-    let (command, command_runtime) = ip_port(
-        &format!("TCP_Command_{port_name}"),
-        &format!("{}:{}", found.ip, proto::COMMAND_PORT),
-        true,
-        true,
-    )?;
-    command.set_input_eos(b"\r\n")?;
-    command.set_output_eos(b"\r")?;
-
-    let (data, data_runtime) = ip_port(
-        &format!("TCP_Data_{port_name}"),
-        &format!("{}:{}", found.ip, proto::DATA_PORT),
-        false,
+    let (command, command_runtime) = tcp_port(
+        format!("TCP_Command_{port_name}"),
+        proto::COMMAND_PORT,
         true,
     )?;
-    data.set_input_eos(b"\n")?;
+    transport.runtimes.push(command_runtime);
+    let _ = command.set_input_eos(b"\r\n");
+    let _ = command.set_output_eos(b"\r");
 
-    Ok(Transport {
-        command,
-        data,
-        runtimes: vec![udp_runtime, command_runtime, data_runtime],
-        modules,
-    })
+    let (data, data_runtime) = tcp_port(format!("TCP_Data_{port_name}"), proto::DATA_PORT, false)?;
+    transport.runtimes.push(data_runtime);
+    let _ = data.set_input_eos(b"\n");
+
+    Ok((command, data))
 }
 
 // ===========================================================================
@@ -183,7 +225,8 @@ fn find_module(port_name: &str, broadcast_address: &str, module_id: i32) -> Asyn
 
 pub struct NslsEmDriver {
     base: QuadEmBase,
-    command: OctetIo,
+    /// `None` when the module was not found: C++ keeps the port without one.
+    command: Option<OctetIo>,
     shared: Arc<QuadEmShared>,
     state: SharedState,
     /// C++ `ipAddress_`, `moduleID_`, `firmwareVersion_` and `moduleInfo_`,
@@ -206,14 +249,18 @@ impl NslsEmDriver {
     /// The connection is opened and closed around every transaction, as C++
     /// does with `pasynCommonSyncIO`.
     fn write_read_meter(&self, out: &str) -> AsynResult<String> {
+        // C++ dereferences a NULL asynUser here and crashes.
+        let Some(command) = &self.command else {
+            return Err(error("drvNSLS_EM: no module on the network"));
+        };
         // C++ discards the connect and first-write statuses; the writeRead
         // that follows reports the failure.
-        let _ = self.command.handle().connect_blocking();
+        let _ = command.handle().connect_blocking();
         let result = (|| -> AsynResult<String> {
             if out.len() > 1 {
-                let _ = self.command.write(out);
+                let _ = command.write(out);
             }
-            let reply = match self.command.write_read(out, proto::MAX_COMMAND_LEN) {
+            let reply = match command.write_read(out, proto::MAX_COMMAND_LEN) {
                 Ok(reply) => reply,
                 Err(e) => {
                     let partial = e.partial_read();
@@ -241,7 +288,7 @@ impl NslsEmDriver {
             }
             Ok(reply)
         })();
-        let _ = self.command.handle().disconnect_blocking();
+        let _ = command.handle().disconnect_blocking();
         result
     }
 
@@ -532,7 +579,7 @@ pub struct NslsEmRuntime {
     /// The `UDP_`, `TCP_Command_` and `TCP_Data_` ports this driver created for
     /// itself; C++ registers them by name, so `st.cmd` can trace them.
     pub sub_ports: Vec<PortRuntimeHandle>,
-    _read_thread: thread::JoinHandle<()>,
+    _read_thread: Option<thread::JoinHandle<()>>,
     _callback_thread: thread::JoinHandle<()>,
 }
 
@@ -553,8 +600,6 @@ pub fn create_nsls_em(
     ring_buffer_size: usize,
     max_memory: usize,
 ) -> AsynResult<NslsEmRuntime> {
-    let mut transport = find_module(port_name, broadcast_address, module_id)?;
-    let sub_ports = std::mem::take(&mut transport.runtimes);
     let (shared, trigger_rx) = QuadEmShared::new(ring_buffer_size);
     let state: SharedState = Arc::new(parking_lot::Mutex::new(NslsState {
         scale_factor: 0.0,
@@ -562,26 +607,40 @@ pub fn create_nsls_em(
     }));
 
     let mut base = QuadEmBase::new(port_name, max_memory)?;
-    base.port_base
-        .set_int32_param(base.params.model, 0, QeModel::NslsEm as i32)?;
-    base.port_base
-        .set_int32_param(base.params.values_per_read, 0, DEFAULT_VALUES_PER_READ)?;
-    shared.acq.lock().values_per_read = DEFAULT_VALUES_PER_READ;
+    let transport = find_module(&base.port_base, port_name, broadcast_address, module_id);
+    let (command, data) = transport.link.unzip();
+    if command.is_some() {
+        base.port_base
+            .set_int32_param(base.params.model, 0, QeModel::NslsEm as i32)?;
+        base.port_base
+            .set_int32_param(base.params.values_per_read, 0, DEFAULT_VALUES_PER_READ)?;
+        shared.acq.lock().values_per_read = DEFAULT_VALUES_PER_READ;
+    }
 
     let mut driver = NslsEmDriver {
         base,
-        command: transport.command,
+        command,
         shared: shared.clone(),
         state: state.clone(),
         ip_address: String::new(),
         module_id,
         firmware_version: String::new(),
-        modules: std::mem::take(&mut transport.modules),
+        modules: transport.modules,
     };
-    // C++ leaves the meter untouched at construction: it may be offline, and
-    // reset() is what the user runs once it is up. The scale factor still needs
-    // a value the read thread can use before the first status read.
-    driver.compute_scale_factor()?;
+    let sub_ports = transport.runtimes;
+    if driver.command.is_some() {
+        // C++ leaves the meter untouched at construction: it may be offline,
+        // and reset() is what the user runs once it is up. The scale factor
+        // still needs a value the read thread can use before the first status
+        // read.
+        driver.compute_scale_factor()?;
+    }
+    if transport.find_failed {
+        // C++ `report(stdout, 1)` right after "error finding module".
+        let mut out = String::new();
+        driver.report(&mut out, 1);
+        print!("{out}");
+    }
 
     let params = driver.base.params;
     let nd_params = driver.base.nd_params;
@@ -592,17 +651,20 @@ pub fn create_nsls_em(
     let (runtime_handle, _actor) = create_port_runtime(driver, RuntimeConfig::default())?;
     let handle = runtime_handle.port_handle().clone();
 
-    let read_ctx = ReadContext {
-        data: transport.data,
-        handle: handle.clone(),
-        params,
-        shared: shared.clone(),
-        state,
-    };
-    let read_thread_handle = thread::Builder::new()
-        .name("drvNSLS_EMTask".into())
-        .spawn(move || read_thread(read_ctx))
-        .expect("failed to spawn drvNSLS_EMTask");
+    // C++ creates the read thread only once the module is found.
+    let read_thread_handle = data.map(|data| {
+        let read_ctx = ReadContext {
+            data,
+            handle: handle.clone(),
+            params,
+            shared: shared.clone(),
+            state,
+        };
+        thread::Builder::new()
+            .name("drvNSLS_EMTask".into())
+            .spawn(move || read_thread(read_ctx))
+            .expect("failed to spawn drvNSLS_EMTask")
+    });
 
     let callback_thread = qe::start_callback_task(CallbackContext {
         trigger_rx,
@@ -665,7 +727,7 @@ mod tests {
         std::mem::forget(runtime);
         let drv = NslsEmDriver {
             base: QuadEmBase::new("QE_NSLS_REPORT", 0).unwrap(),
-            command,
+            command: Some(command),
             shared: QuadEmShared::new(16).0,
             state: Arc::new(parking_lot::Mutex::new(NslsState {
                 scale_factor: 5.722e-15,
@@ -697,6 +759,17 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    /// C++ keeps the port when no module answers: no link, no read thread,
+    /// and the constructor runs `report(stdout, 1)`.
+    #[test]
+    fn a_missing_module_leaves_the_port_without_a_link() {
+        let base = QuadEmBase::new("QE_NSLS_NF", 0).unwrap();
+        let transport = find_module(&base.port_base, "QE_NSLS_NF", "127.0.0.3", 9);
+        assert!(transport.link.is_none());
+        assert!(transport.find_failed);
+        assert!(transport.modules.is_empty());
     }
 
     #[test]
