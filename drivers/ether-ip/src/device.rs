@@ -13,13 +13,14 @@
 use std::sync::Arc;
 
 use epics_rs::base::error::{CaError, CaResult};
+use epics_rs::base::runtime::log::errlog_vprintf;
 use epics_rs::base::runtime::sync::mpsc;
 use epics_rs::base::server::device_support::{
     DeviceAlarm, DeviceInitOutcome, DeviceReadOutcome, DeviceSupport, DeviceUdf,
 };
 use epics_rs::base::server::ioc_app::DeviceSupportContext;
 use epics_rs::base::server::recgbl::alarm_status;
-use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType};
+use epics_rs::base::server::record::{AlarmSeverity, Record, ScanType, menu_scan};
 use epics_rs::base::types::EpicsValue;
 
 use crate::cip::{self, CipType};
@@ -278,6 +279,8 @@ fn put_bits(raw: &mut [u8], mut element: usize, mut mask: u32, bits: usize, rval
 pub struct EtherIpDevice {
     /// The record name, for C's `rec->name` in the lines it prints.
     name: String,
+    /// The record's SCAN, for C's `get_period`.
+    scan: ScanType,
     link_text: String,
     is_output: bool,
     link: Option<Link>,
@@ -291,6 +294,7 @@ impl EtherIpDevice {
     fn new(link_text: &str, is_output: bool) -> EtherIpDevice {
         EtherIpDevice {
             name: String::new(),
+            scan: ScanType::Passive,
             link_text: link_text.to_string(),
             is_output,
             link: None,
@@ -367,23 +371,34 @@ fn record_shape(record: &dyn Record) -> (usize, usize) {
     }
 }
 
-/// C `get_period`: the SCAN menu, in seconds. Passive / Event / I/O Intr have
-/// no period of their own.
-fn scan_period(record: &dyn Record) -> Option<f64> {
-    let scan = match record.get_field("SCAN") {
-        Some(EpicsValue::Enum(n)) => n,
-        _ => return None,
+/// C `get_period`: a periodic SCAN's menu label, when it says "second", read
+/// as `strtod` reads it. Anything else is no period.
+fn get_period(name: &str, scan: ScanType) -> Option<f64> {
+    let ScanType::Menu(index) = scan else {
+        return None;
     };
-    match scan {
-        3 => Some(10.0),
-        4 => Some(5.0),
-        5 => Some(2.0),
-        6 => Some(1.0),
-        7 => Some(0.5),
-        8 => Some(0.2),
-        9 => Some(0.1),
-        _ => None,
-    }
+    let label = menu_scan().label_at(index)?;
+    let period = label
+        .contains("second")
+        .then(|| strtod_prefix(label))
+        .flatten()
+        .filter(|p| p.is_finite());
+    crate::eip_printf!(
+        8,
+        "EIP record '{name}' scans at {:.1} secs\n",
+        period.unwrap_or(-1.0)
+    );
+    period
+}
+
+/// The number `strtod` takes off the front of `text`, or None when it takes
+/// nothing.
+fn strtod_prefix(text: &str) -> Option<f64> {
+    let t = text.trim_start();
+    (1..=t.len())
+        .rev()
+        .filter(|&n| t.is_char_boundary(n))
+        .find_map(|n| t[..n].parse::<f64>().ok())
 }
 
 impl DeviceSupport for EtherIpDevice {
@@ -391,8 +406,9 @@ impl DeviceSupport for EtherIpDevice {
         DTYP
     }
 
-    fn set_record_info(&mut self, name: &str, _scan: ScanType) {
+    fn set_record_info(&mut self, name: &str, scan: ScanType) {
         self.name = name.to_string();
+        self.scan = scan;
     }
 
     // Every C init_record/analyze_link failure returns an `S_*` status after
@@ -415,16 +431,30 @@ impl DeviceSupport for EtherIpDevice {
             CaError::InvalidValue(format!("devEtherIP: unknown PLC '{}'", link.plc_name))
         })?;
 
+        // devEtherIP.c:1021-1035: a non-positive period at each step falls
+        // through to the next.
+        let positive = |p: &f64| *p > 0.0;
         let period = link
             .period
-            .or_else(|| scan_period(record))
+            .filter(positive)
+            .or_else(|| get_period(&self.name, self.scan).filter(positive))
             .or_else(
                 || match driver::DEFAULT_RATE_MS.load(std::sync::atomic::Ordering::Relaxed) {
                     0 => None,
                     ms => Some(ms as f64 / 1000.0),
                 },
             )
-            .unwrap_or(1.0);
+            .unwrap_or_else(|| {
+                errlog_vprintf(format_args!(
+                    "devEtherIP ({}): cannot decode SCAN field, no scan flag given\n",
+                    self.name
+                ));
+                errlog_vprintf(format_args!(
+                    "Device support will use the default of 1 secs, "
+                ));
+                errlog_vprintf(format_args!("please complete the record configuration\n"));
+                1.0
+            });
 
         let tag = plc
             .add_tag(period, &link.string_tag, link.elements)
@@ -974,6 +1004,15 @@ mod tests {
             record.put_field("NOBT", EpicsValue::Short(2)).unwrap();
             assert_eq!(record_shape(&*record), (2, 1), "{}", record.record_type());
         }
+    }
+
+    #[test]
+    fn get_period_reads_the_scan_menu_label() {
+        assert_eq!(get_period("r", ScanType::SEC1), Some(1.0));
+        assert_eq!(get_period("r", ScanType::Menu(9)), Some(0.1));
+        assert_eq!(get_period("r", ScanType::SEC10), Some(10.0));
+        assert_eq!(get_period("r", ScanType::Passive), None);
+        assert_eq!(get_period("r", ScanType::IoIntr), None);
     }
 
     // -- link parsing --------------------------------------------------------
