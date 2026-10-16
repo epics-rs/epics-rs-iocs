@@ -170,7 +170,8 @@ pub fn analyze_link<P>(
             // infinite period already failed above: a bit flag never fails.
             spco::BIT => {
                 let (v, n) = strtod(&text[p + 2..]);
-                bit = v as usize;
+                // Only the low five bits reach the mask.
+                bit = size_t_from_double(v) as usize;
                 end = p + 2 + n;
             }
             _ => {}
@@ -241,6 +242,20 @@ pub fn analyze_link<P>(
         elements: last_element.wrapping_add(count),
     };
     Ok((link, plc))
+}
+
+/// C's `size_t bit = strtod(...)` as gcc compiles it for x86-64: a negative
+/// value wraps (so `B -1` selects bit 31 through `1U << bit`), and NaN or
+/// anything past 2^64 becomes 2^63.
+fn size_t_from_double(v: f64) -> u64 {
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if v > -TWO_63 && v < TWO_63 {
+        v as i64 as u64
+    } else if (TWO_63..2.0 * TWO_63).contains(&v) {
+        ((v - TWO_63) as i64 as u64) | (1 << 63)
+    } else {
+        1 << 63
+    }
 }
 
 /// C `strtod`: the value and how many bytes it took, `(0.0, 0)` when it
@@ -1454,6 +1469,14 @@ mod tests {
     #[test]
     fn e_flag_is_rejected_on_an_array_record() {
         assert!(parse_link("@plc1 REALS[7] E", 10, 0).is_err());
+    }
+
+    #[test]
+    fn a_negative_bit_selects_bit_31_as_cs_size_t_does() {
+        let l = parse_link("@plc1 Cnt B -1", 1, 0).unwrap();
+        assert_eq!(l.mask, 1 << 31);
+        let l = parse_link("@plc1 Cnt B -30", 1, 0).unwrap();
+        assert_eq!(l.mask, 1 << 2);
     }
 
     #[test]
