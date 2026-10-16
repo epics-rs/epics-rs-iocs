@@ -6,7 +6,7 @@
 //! how the C++ actually uses it — every call is synchronous).
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 use crate::error::{UrError, UrResult};
@@ -68,15 +68,15 @@ impl Session {
 
     pub fn connect(&mut self) -> UrResult<()> {
         self.buffer.clear(); // rtde.cpp:63 — reconnect must not reuse stale bytes.
-        let addr = (self.hostname.as_str(), self.port)
-            .to_socket_addrs()
-            .map_err(|e| UrError::Connect(format!("resolve {}: {e}", self.hostname)))?
-            .next()
-            .ok_or_else(|| UrError::Connect(format!("no address for {}", self.hostname)))?;
-
-        let sock = TcpStream::connect_timeout(&addr, self.timeout).map_err(|e| {
-            UrError::Connect(format!("could not connect to {addr}, verify the IP: {e}"))
-        })?;
+        // rtde.cpp:85 prints the asio error to cerr before throwing its own.
+        let sock =
+            crate::net::connect_tcp(&self.hostname, self.port, self.timeout).map_err(|e| {
+                eprintln!("{e}");
+                UrError::Connect(format!(
+                    "Error: Could not connect to: {} at {}, verify the IP",
+                    self.hostname, self.port
+                ))
+            })?;
         sock.set_nodelay(true).ok();
         sock.set_read_timeout(Some(self.timeout)).ok();
         sock.set_write_timeout(Some(self.timeout)).ok();

@@ -3,7 +3,8 @@
 /// Failure from any of the UR interfaces (RTDE, dashboard, script, gripper).
 #[derive(Debug, thiserror::Error)]
 pub enum UrError {
-    #[error("connect failed: {0}")]
+    /// The transport's own connect failure text (its C++ `what()`).
+    #[error("{0}")]
     Connect(String),
 
     #[error("{0} is not connected")]
