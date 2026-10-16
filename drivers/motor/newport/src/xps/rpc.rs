@@ -209,14 +209,14 @@ impl XpsSocket {
     /// return it with the terminator stripped. Self-contained: it does not rely
     /// on any port-level input EOS.
     fn query(&self, cmd: &str) -> XpsResult<XpsReply> {
-        self.handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-        let mut buf = Vec::new();
-        loop {
+        // C writeRead (asynOctetSocket.cpp:153) flushes stale input before the
+        // write; only the continuation chunks are plain reads.
+        let mut buf = self
+            .handle
+            .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)?;
+        while !buf.ends_with(XPS_TERMINATOR.as_bytes()) {
             let chunk = self.handle.read_octet(OCTET_REASON, READ_BUF)?;
             buf.extend_from_slice(&chunk);
-            if buf.ends_with(XPS_TERMINATOR.as_bytes()) {
-                break;
-            }
             if buf.len() > MAX_REPLY {
                 return Err(XpsError::Transport(AsynError::Status {
                     status: AsynStatus::Overflow,
@@ -242,8 +242,12 @@ impl XpsSocket {
     /// the move socket) so the write returns promptly.
     fn fire(&self, cmd: &str) -> XpsResult<()> {
         for _ in 0..MOVE_MAX_RETRIES {
-            self.handle.write_octet(OCTET_REASON, cmd.as_bytes())?;
-            match self.handle.read_octet(OCTET_REASON, READ_BUF) {
+            // C writeRead (asynOctetSocket.cpp:189), so a late reply to the
+            // previous move is flushed rather than read as this one's.
+            match self
+                .handle
+                .write_read(OCTET_REASON, cmd.as_bytes(), READ_BUF)
+            {
                 Err(AsynError::Status {
                     status: AsynStatus::Timeout,
                     ..
