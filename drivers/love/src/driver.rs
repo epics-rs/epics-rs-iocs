@@ -87,6 +87,7 @@ use std::time::Duration;
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::port::{DrvUserInfo, DrvUserRequest, PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::sync_io::SyncIOHandle;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::registry::{K_INSTRMAX, Model, ModelTable};
@@ -308,6 +309,28 @@ fn process_write_response(payload: &[u8]) -> AsynResult<()> {
     Ok(())
 }
 
+/// The tail C `sendCommand`/`recvReply` print after a failed transfer.
+fn status_text(status: AsynStatus) -> &'static str {
+    match status {
+        AsynStatus::Timeout => "asynTimeout",
+        AsynStatus::Overflow => "asynOverflow",
+        AsynStatus::Error => "asynError",
+        _ => "failed - unknown Asyn error",
+    }
+}
+
+/// C `evalMessage`'s `ASYN_TRACE_ERROR` line for each refusal.
+fn eval_error_line(e: &EvalError, count: usize) -> String {
+    match e {
+        EvalError::MissingStx => "drvLove::evalMessage start char missing\n".into(),
+        EvalError::TooShort => format!("drvLove::evalMessage message length ({count}) error\n"),
+        EvalError::DeviceError(text) => {
+            format!("drvLove::evalMessage error message received \"{text}\"\n")
+        }
+        EvalError::ChecksumMismatch => "drvLove::evalMessage checksum failed\n".into(),
+    }
+}
+
 fn eval_error_to_asyn(e: EvalError) -> AsynError {
     match e {
         EvalError::MissingStx => protocol_error("evalMessage start char missing"),
@@ -352,34 +375,69 @@ impl LoveDriver {
         })
     }
 
-    /// C `sendCommand` + `recvReply`, looped by C `executeCommand`.
+    /// C `sendCommand` + `recvReply`, looped by C `executeCommand`, with
+    /// their `ASYN_TRACE_ERROR` lines (drvLove.c:573-608, :736-767, :817-866).
     fn execute_command(&self, addr: i32, body: &str) -> AsynResult<Vec<u8>> {
         let frame = build_frame(addr, body);
 
-        for _ in 0..MAX_ATTEMPTS {
+        for retry in 0..MAX_ATTEMPTS {
             std::thread::sleep(K_TUNE);
 
             if let Err(e) = self.handle.write_octet(OCTET_REASON, frame.as_bytes()) {
+                self.trace_error(&format!(
+                    "drvLove::sendCommand - retries({retry}) {}\n",
+                    status_text(e.status())
+                ));
                 if is_timeout(&e) {
+                    self.trace_error("drvLove::executeCommand write timeout, retrying\n");
                     continue;
                 }
+                self.trace_error(&format!(
+                    "drvLove::executeCommand write failure - Sent \"{frame}\" \n"
+                ));
                 return Err(e);
             }
 
             let raw = match self.handle.read_octet(OCTET_REASON, REPLY_BUF_SIZE) {
                 Ok(raw) => raw,
-                Err(e) if is_timeout(&e) => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    self.trace_error(&format!("drvLove::recvReply {}\n", status_text(e.status())));
+                    if is_timeout(&e) {
+                        self.trace_error("drvLove::executeCommand read timeout, retrying\n");
+                        continue;
+                    }
+                    // C prints whatever the failed read left in inpMsg.
+                    let rcvd = e.partial_read().map(|p| p.data.as_slice()).unwrap_or(&[]);
+                    self.trace_read_failure(&frame, rcvd);
+                    return Err(e);
+                }
             };
 
-            return eval_message(&raw)
-                .map(|payload| payload.to_vec())
-                .map_err(eval_error_to_asyn);
+            return match eval_message(&raw) {
+                Ok(payload) => Ok(payload.to_vec()),
+                Err(e) => {
+                    self.trace_error(&eval_error_line(&e, raw.len()));
+                    self.trace_read_failure(&frame, &raw);
+                    Err(eval_error_to_asyn(e))
+                }
+            };
         }
 
+        self.trace_error("drvLove::executeCommand retries exceeded\n");
         // C returns asynError, not the last attempt's asynTimeout, so the
         // record alarms READ/WRITE rather than TIMEOUT.
         Err(protocol_error("executeCommand retries exceeded"))
+    }
+
+    fn trace_error(&self, msg: &str) {
+        self.base.trace_print(TraceMask::ERROR, msg);
+    }
+
+    fn trace_read_failure(&self, frame: &str, rcvd: &[u8]) {
+        self.trace_error(&format!(
+            "drvLove::executeCommand read failure - Sent \"{frame}\" Rcvd \"{}\" \n",
+            String::from_utf8_lossy(rcvd)
+        ));
     }
 
     fn model_for(&self, addr: i32) -> Model {
@@ -424,7 +482,9 @@ impl LoveDriver {
 
         let body = format_put_data(write_cmd, value);
         let payload = self.execute_command(addr, &body)?;
-        process_write_response(&payload)
+        process_write_response(&payload).inspect_err(|_| {
+            self.trace_error("drvLove::processWriteResponse write command failed\n")
+        })
     }
 }
 
@@ -631,6 +691,50 @@ mod tests {
             SyncIOHandle::from_handle(runtime.port_handle().clone(), 0, Duration::from_millis(100));
         let models = std::sync::Arc::new(std::sync::Mutex::new([Model::default(); K_INSTRMAX]));
         LoveDriver::new(name, handle, models).expect("love driver")
+    }
+
+    /// Every timed-out attempt prints C's sendCommand and executeCommand
+    /// lines, and the give-up prints "retries exceeded" (drvLove.c:739-767).
+    #[test]
+    fn timed_out_attempts_print_c_trace_lines() {
+        use epics_rs::asyn::runtime::config::RuntimeConfig;
+        use epics_rs::asyn::runtime::port::create_port_runtime;
+        use epics_rs::asyn::trace::TraceFile;
+
+        let serial = TimeoutSerial {
+            base: PortDriverBase::new(
+                "LOVETESTTRC",
+                1,
+                PortFlags {
+                    multi_device: false,
+                    can_block: true,
+                    destructible: true,
+                },
+            ),
+        };
+        let love = love_on(serial, "LOVETESTTRCL");
+        let (runtime, _thread) =
+            create_port_runtime(love, RuntimeConfig::default()).expect("love port runtime");
+        let path = std::env::temp_dir().join(format!("love-trace-{}.txt", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        runtime.port_handle().trace().set_trace_file(
+            Some("LOVETESTTRCL"),
+            TraceFile::File(std::sync::Arc::new(std::sync::Mutex::new(file))),
+        );
+        let user =
+            SyncIOHandle::from_handle(runtime.port_handle().clone(), 1, Duration::from_secs(5));
+        assert!(user.read_int32(0).is_err());
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        for line in [
+            "drvLove::sendCommand - retries(0) asynTimeout",
+            "drvLove::sendCommand - retries(2) asynTimeout",
+            "drvLove::executeCommand write timeout, retrying",
+            "drvLove::executeCommand retries exceeded",
+        ] {
+            assert!(out.contains(line), "missing {line:?} in {out:?}");
+        }
     }
 
     /// C `executeCommand` (drvLove.c:767-768) ends three timed-out attempts
