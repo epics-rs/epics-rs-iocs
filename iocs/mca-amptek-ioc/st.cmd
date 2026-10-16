@@ -5,7 +5,7 @@
 #   cargo run -p mca-amptek-ioc -- st.cmd
 #
 # Boots one Amptek DP5 asyn port over the Ethernet/UDP transport
-# (drvAmptekConfigure) and loads one mca record (devMcaAsyn) plus the full
+# (drvAmptekConfigure) and loads mca.db (an mca record on devMcaAsyn) plus the full
 # Amptek.db/Amptek_SCAn.db control record set, ported from upstream
 # iocBoot/iocAmptek/st_base.cmd.
 #
@@ -36,18 +36,18 @@
 drvAmptekConfigure("Amptek1", 0, "127.0.0.1", 1)
 
 # ---- records ----
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/mca.db", "P=mcaTest:,R=spectrum1,PORT=Amptek1,ADDR=0,NCHAN=8192")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/mca.db", "P=mcaTest:,M=mca1,NCHAN=8192,DTYP=asynMCA,INP=@asyn(Amptek1)")
 dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek.db", "P=mcaTest:,R=Amptek1:,PORT=Amptek1")
 
 # Amptek_SCAs.substitutions, expanded (see header comment).
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=0")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=1")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=2")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=3")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=4")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=5")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=6")
-dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=spectrum1,N=7")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=0")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=1")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=2")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=3")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=4")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=5")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=6")
+dbLoadRecords("$(MCA_AMPTEK_IOC)/db/Amptek_SCAn.db", "PORT=Amptek1,P=mcaTest:,R=Amptek1:,M=mca1,N=7")
 
 #------------------------------------------------------------------------------
 iocInit()

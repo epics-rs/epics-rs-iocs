@@ -78,6 +78,12 @@ async fn main() -> CaResult<()> {
     app = app.register_record_type(asyn_name, move || asyn_factory());
     let (mca_name, mca_factory) = mca_rs::mca_record_factory();
     app = app.register_record_type(mca_name, move || mca_factory());
+    // mca.db's busy and transform records: opt-in in epics-rs, as a C IOC
+    // links busy and std's .dbd.
+    app = app.register_record_type("busy", || Box::new(epics_rs::busy::BusyRecord::default()));
+    app = app.register_record_type("transform", || {
+        Box::new(epics_rs::base::server::records::transform::TransformRecord::default())
+    });
     app = epics_rs::asyn::adapter::register_asyn_device_support(app);
 
     // DemoSourceConfig(portName, maxSignals, period)

@@ -7,7 +7,7 @@
 # Boots a synthetic asyn signal source (DemoSourceConfig, this IOC's own
 # stand-in for a real scaler/waveform card -- not an upstream driver) and a
 # drvFastSweep software MCA (initFastSweep) sweeping it into 10 channels,
-# then loads one mca record bound to the FastSweep port via devMcaAsyn
+# then loads mca.db (an mca record and its helpers) on the FastSweep port via devMcaAsyn
 # (DTYP "asynMCA").
 #============================================================
 
@@ -23,7 +23,7 @@ DemoSourceConfig("SRC0", 1, 0.02)
 initFastSweep("FS0", "SRC0", 1, 10, "", "")
 
 # ---- records ----
-dbLoadRecords("$(MCA_IOC)/db/mca.db", "P=mca:,R=spectrum1,PORT=FS0,ADDR=0,NCHAN=10")
+dbLoadRecords("$(MCA_IOC)/db/mca.db", "P=mcaTest:,M=mca1,NCHAN=10,DTYP=asynMCA,INP=@asyn(FS0 0)")
 
 #------------------------------------------------------------------------------
 iocInit()

@@ -24,7 +24,7 @@ asynOctetSetOutputEos("serial1", 0, "\r")
 RontecConfig("Rontec1", "serial1", 0)
 
 # ---- records ----
-dbLoadRecords("$(MCA_RONTEC_IOC)/db/mca.db", "P=mca:,R=rontec1,PORT=Rontec1,ADDR=0,NCHAN=4096")
+dbLoadRecords("$(MCA_RONTEC_IOC)/db/mca.db", "P=mcaTest:,M=mca1,NCHAN=1024,DTYP=asynMCA,INP=@asyn(Rontec1)")
 dbLoadRecords("$(MCA_RONTEC_IOC)/db/RontecXFlash.db", "P=mcaTest:,R=Rontec1,PORT=serial1")
 
 dbLoadRecords("$(MCA_RONTEC_IOC)/db/asynRecord.db", "P=mcaTest:,R=serial1,PORT=serial1,ADDR=0,OMAX=256,IMAX=256")
