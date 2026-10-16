@@ -523,7 +523,7 @@ fn pmac_asyn_coord_create_command(holder: &Arc<MotorHolder>) -> CommandDef {
 mod tests {
     use super::*;
     use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
-    use epics_rs::asyn::registry::{open_owner, register_port};
+    use epics_rs::asyn::registry::{claim_port, open_owner};
     use epics_rs::asyn::runtime::{RuntimeConfig, create_port_runtime};
 
     /// A port with no EOS support of its own: both sets are refused.
@@ -552,8 +552,12 @@ mod tests {
     fn a_refused_eos_set_leaves_a_controller_whose_commands_fail() {
         let name = "pmacEosRefused";
         let base = PortDriverBase::new(name, 1, PortFlags::default());
-        let (rt, _actor) = create_port_runtime(Bare(base), RuntimeConfig::default()).unwrap();
-        register_port(name, rt.port_handle().clone(), &open_owner()).unwrap();
+        let claim = claim_port(name).unwrap();
+        let (rt, _actor) =
+            create_port_runtime(&claim, Bare(base), RuntimeConfig::default()).unwrap();
+        claim
+            .publish(rt.port_handle().clone(), &open_owner())
+            .unwrap();
         assert!(controller_on(name).write_read("I100").is_err());
         drop(rt);
     }

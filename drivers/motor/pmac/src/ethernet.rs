@@ -422,14 +422,18 @@ pub fn pmac_asyn_ip_configure_command() -> CommandDef {
                 driver.install_interpose(layer);
             }
 
-            let (handle, _jh) = create_port_runtime(driver, RuntimeConfig::default())
+            // Claimed before the port thread, whose auto-connect would reach
+            // the device under a duplicate name, as drvAsynIPPortConfigure.
+            let claim = epics_rs::asyn::asyn_record::claim_port(&port)
                 .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
-            epics_rs::asyn::asyn_record::register_port(
-                &port,
-                handle.port_handle().clone(),
-                ctx.db().scan_control().interrupt_gate(),
-            )
-            .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
+            let (handle, _jh) = create_port_runtime(&claim, driver, RuntimeConfig::default())
+                .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
+            claim
+                .publish(
+                    handle.port_handle().clone(),
+                    ctx.db().scan_control().interrupt_gate(),
+                )
+                .map_err(|e| format!("pmacAsynIPConfigure: {e}"))?;
             drop(handle);
 
             ctx.println(&format!(
