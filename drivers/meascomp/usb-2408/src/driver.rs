@@ -391,6 +391,35 @@ impl MultiFunctionDriver {
         ]
     }
 
+    /// C `computeWaveGenTimes`: both generator time axes, posted when a
+    /// point count or dwell is written.
+    fn compute_wave_gen_times(&self) -> AsynResult<[ParamSetValue; 2]> {
+        let p = &self.params;
+        let axis = |points, dwell, wf| -> AsynResult<ParamSetValue> {
+            let times = wave_dig::time_axis(
+                self.base.get_int32_param(points, 0)?,
+                self.base.get_float64_param(dwell, 0)?,
+            );
+            Ok(ParamSetValue::new(
+                wf,
+                0,
+                ParamValue::Float32Array(times.into()),
+            ))
+        };
+        Ok([
+            axis(
+                p.wave_gen_user_num_points,
+                p.wave_gen_user_dwell,
+                p.wave_gen_user_time_wf,
+            )?,
+            axis(
+                p.wave_gen_int_num_points,
+                p.wave_gen_int_dwell,
+                p.wave_gen_int_time_wf,
+            )?,
+        ])
+    }
+
     fn wave_gen_restore(&self) -> AsynResult<Vec<(i32, i32)>> {
         wave_gen::restore_outputs(&self.params, |r, a| self.base.get_int32_param(r, a))
     }
@@ -641,6 +670,11 @@ impl PortDriver for MultiFunctionDriver {
         } else if self.wave_gen_settings().contains(&reason) {
             status = self.wave_gen_setting_changed(addr, &trace, &mut wave_arrays)?;
         }
+        if reason == self.params.wave_gen_user_num_points
+            || reason == self.params.wave_gen_int_num_points
+        {
+            wave_arrays.extend(self.compute_wave_gen_times()?);
+        }
 
         self.finish_write(user, value, status, wave_arrays)
     }
@@ -673,6 +707,10 @@ impl PortDriver for MultiFunctionDriver {
                 .get_int32_param(self.params.wave_dig_num_points, 0)?;
             let times = wave_dig::compute_wave_dig_times(&self.params, num_points, value);
             self.apply_updates(vec![times])?;
+        }
+        if reason == self.params.wave_gen_user_dwell || reason == self.params.wave_gen_int_dwell {
+            let times = self.compute_wave_gen_times()?;
+            self.apply_updates(times.into())?;
         }
 
         self.base.call_param_callbacks(addr)?;

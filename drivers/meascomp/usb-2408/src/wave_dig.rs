@@ -363,14 +363,18 @@ pub fn compute_wave_dig_times(
     num_points: i32,
     dwell: f64,
 ) -> ParamSetValue {
-    let times = (0..num_points.max(0))
-        .map(|i| (f64::from(i) * dwell) as f32)
-        .collect::<Vec<_>>();
     ParamSetValue::new(
         params.wave_dig_time_wf,
         0,
-        ParamValue::Float32Array(times.into()),
+        ParamValue::Float32Array(time_axis(num_points, dwell).into()),
     )
+}
+
+/// The `i * dwell` time buffers of C `computeWaveDigTimes`/`computeWaveGenTimes`.
+pub fn time_axis(num_points: i32, dwell: f64) -> Vec<f32> {
+    (0..num_points.max(0))
+        .map(|i| (f64::from(i) * dwell) as f32)
+        .collect()
 }
 
 #[cfg(test)]
