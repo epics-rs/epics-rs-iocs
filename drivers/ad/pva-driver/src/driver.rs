@@ -240,9 +240,9 @@ pub fn create_pva_detector(
     let ad_params = det.ad.params;
     let pva_params = det.pva_params;
     let pool = det.ad.pool.clone();
+    let queued_counter = det.ad.queued_counter.clone();
     let (runtime_handle, _) = create_port_runtime(claim, det, RuntimeConfig::default())?;
     let array_output = Arc::new(parking_lot::Mutex::new(NDArrayOutput::new()));
-    let queued_counter = Arc::new(QueuedArrayCounter::new());
 
     let task_handle = start_pva_task(MonitorContext {
         cmd_rx,
