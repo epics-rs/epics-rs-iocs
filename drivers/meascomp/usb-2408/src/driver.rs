@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use epics_rs::asyn::asyn_record::PortClaim;
 use epics_rs::asyn::error::AsynResult;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
@@ -141,7 +142,7 @@ impl MultiFunctionDriver {
                 value,
             } = update
             {
-                self.base.params.set_value(reason, addr, value)?;
+                self.base.set_param_value(reason, addr, value)?;
             }
         }
         Ok(())
@@ -231,12 +232,10 @@ impl MultiFunctionDriver {
                 .get_float64_param(p.wave_gen_pulse_delay, channel)?,
         };
         self.base
-            .params
-            .set_int32(p.wave_gen_num_points, 0, num_points)?;
-        self.base.params.set_float64(p.wave_gen_dwell, 0, dwell)?;
+            .set_int32_param(p.wave_gen_num_points, 0, num_points)?;
+        self.base.set_float64_param(p.wave_gen_dwell, 0, dwell)?;
         self.base
-            .params
-            .set_float64(p.wave_gen_freq, 0, 1. / dwell / f64::from(num_points))?;
+            .set_float64_param(p.wave_gen_freq, 0, 1. / dwell / f64::from(num_points))?;
         if user {
             return Ok(true);
         }
@@ -269,7 +268,7 @@ impl MultiFunctionDriver {
             }
             // The record must not be left reading "Run": it follows this
             // parameter back to Stop.
-            this.base.params.set_int32(p.wave_gen_run, 0, 0)?;
+            this.base.set_int32_param(p.wave_gen_run, 0, 0)?;
             Ok(-1)
         };
         let ext_trigger = self.base.get_int32_param(p.wave_gen_ext_trigger, 0)? != 0;
@@ -355,13 +354,12 @@ impl MultiFunctionDriver {
             &saved,
             trace,
         ) {
-            self.base.params.set_int32(p.wave_gen_run, 0, 0)?;
+            self.base.set_int32_param(p.wave_gen_run, 0, 0)?;
             return Ok(code);
         }
         self.base
-            .params
-            .set_float64(p.wave_gen_dwell_actual, 0, wave_gen_state.dwell_actual)?;
-        self.base.params.set_float64(
+            .set_float64_param(p.wave_gen_dwell_actual, 0, wave_gen_state.dwell_actual)?;
+        self.base.set_float64_param(
             p.wave_gen_total_time,
             0,
             wave_gen_state.dwell_actual * num_points as f64,
@@ -512,7 +510,7 @@ impl PortDriver for MultiFunctionDriver {
             value
         };
 
-        self.base.params.set_int32(reason, addr, value)?;
+        self.base.set_int32_param(reason, addr, value)?;
 
         // Collected under the state lock, applied after it is dropped: both
         // helpers borrow the driver, and apply_updates needs it mutably.
@@ -631,7 +629,7 @@ impl PortDriver for MultiFunctionDriver {
                 (status, wave_arrays) =
                     wave_dig::start_wave_dig(&dev, &mut st.wave_dig, &self.params, &scan, &trace);
                 if status != 0 {
-                    self.base.params.set_int32(reason, addr, 0)?;
+                    self.base.set_int32_param(reason, addr, 0)?;
                 }
             } else if value == 0 && st.wave_dig.running {
                 let restart = WaveDigScan::read_restart(
@@ -679,7 +677,7 @@ impl PortDriver for MultiFunctionDriver {
     fn write_float64(&mut self, user: &mut AsynUser, value: f64) -> AsynResult<()> {
         let reason = user.reason;
         let addr = user.addr;
-        self.base.params.set_float64(reason, addr, value)?;
+        self.base.set_float64_param(reason, addr, value)?;
 
         // Frequency change → update dwell
         if reason == self.params.wave_gen_freq && value > 0.0 {
@@ -688,8 +686,7 @@ impl PortDriver for MultiFunctionDriver {
                     .get_int32_param(self.params.wave_gen_num_points, 0)? as f64;
             let dwell = 1.0 / (value * num_points);
             self.base
-                .params
-                .set_float64(self.params.wave_gen_dwell, 0, dwell)?;
+                .set_float64_param(self.params.wave_gen_dwell, 0, dwell)?;
         }
 
         let mut status: UlError = 0;
@@ -878,7 +875,7 @@ impl PortDriver for MultiFunctionDriver {
             }
         }
 
-        self.base.params.set_uint32(reason, addr, value, mask, 0)?;
+        self.base.set_uint32_param(reason, addr, value, mask, 0)?;
 
         self.base.call_param_callbacks(addr)?;
         if status == 0 {
@@ -911,8 +908,10 @@ impl MultiFunctionRuntime {
 }
 
 /// Create a USB-2408-2AO driver, start the port runtime actor and polling thread.
+/// `claim` is the port name taken before the device is opened, as C's
+/// `asynPortDriver` base registers it first.
 pub fn create_usb_2408(
-    port_name: &str,
+    claim: &PortClaim,
     unique_id: &str,
     max_input_points: usize,
     max_output_points: usize,
@@ -920,14 +919,15 @@ pub fn create_usb_2408(
     let device = DaqDevice::connect(unique_id)
         .map_err(|e| format!("failed to connect to USB-2408 device: {e}"))?;
 
-    let driver = MultiFunctionDriver::new(port_name, device, max_input_points, max_output_points)
-        .map_err(|e| format!("failed to create MultiFunctionDriver: {e}"))?;
+    let driver =
+        MultiFunctionDriver::new(claim.name(), device, max_input_points, max_output_points)
+            .map_err(|e| format!("failed to create MultiFunctionDriver: {e}"))?;
 
     let params = driver.params;
     let device = driver.device.clone();
     let state = driver.state.clone();
 
-    let (runtime_handle, _actor_jh) = create_port_runtime(driver, RuntimeConfig::default())
+    let (runtime_handle, _actor_jh) = create_port_runtime(claim, driver, RuntimeConfig::default())
         .map_err(|e| format!("failed to start the USB-2408 port runtime: {e}"))?;
 
     state

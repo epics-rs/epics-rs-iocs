@@ -85,15 +85,20 @@ async fn main() -> CaResult<()> {
                     _ => 2048,
                 };
 
-                let mf_rt = create_usb_2408(&port_name, &unique_id, max_in, max_out)?;
+                // drvMultiFunction is an asynPortDriver: its base registers the
+                // port before the device is opened.
+                let claim = match epics_rs::asyn::manager::claim_port_driver(&port_name) {
+                    Ok(claim) => claim,
+                    Err(e) => return Ok(ctx.cxx_error(e)),
+                };
+                let mf_rt = create_usb_2408(&claim, &unique_id, max_in, max_out)?;
 
-                let port_handle = mf_rt.port_handle().clone();
-                epics_rs::asyn::asyn_record::register_port(
-                    &port_name,
-                    port_handle,
-                    ctx.db().scan_control().interrupt_gate(),
-                )
-                .map_err(|e| e.to_string())?;
+                claim
+                    .publish(
+                        mf_rt.port_handle().clone(),
+                        ctx.db().scan_control().interrupt_gate(),
+                    )
+                    .map_err(|e| e.to_string())?;
 
                 *rt.lock().unwrap() = Some(mf_rt);
                 Ok(CommandOutcome::Continue)
