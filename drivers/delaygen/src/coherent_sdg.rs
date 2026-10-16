@@ -283,6 +283,7 @@ fn ok_or_device_error(prefix: &str, reply: &str) -> AsynResult<()> {
 fn device_write_read(port: &str, handle: &OctetLink, cmd: &str) -> AsynResult<String> {
     let result = write_read(handle, cmd);
     if let Err(f) = &result {
+        handle.reset();
         handle.print(
             TraceMask::ERROR,
             format_args!("{port} writeRead: error {} wrote \"{cmd}\"", f.status()),

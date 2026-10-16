@@ -27,6 +27,19 @@ impl OctetLink {
             .trace()
             .print(Some(self.port.port_name()), addr, 0, mask, args);
     }
+
+    /// C's recovery after a failed transaction: `lockPort`, then
+    /// `pasynCommon->disconnect` and `->connect` on this user, results
+    /// ignored.
+    pub fn reset(&self) {
+        if self.addr < 0 {
+            let _ = self.port.disconnect_blocking();
+            let _ = self.port.connect_blocking();
+        } else {
+            let _ = self.port.disconnect_addr_blocking(self.addr);
+            let _ = self.port.connect_addr_blocking(self.addr);
+        }
+    }
 }
 
 /// Connect an [`OctetLink`] to a pre-configured octet port (serial or IP)

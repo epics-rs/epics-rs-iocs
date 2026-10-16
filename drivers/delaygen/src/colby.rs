@@ -156,6 +156,7 @@ fn split_net_reply(reply: &str) -> Vec<String> {
 /// C `writeRead(pasynUser,outBuf,inpBuf,inputSize,iface)`.
 fn device_write_read(handle: &OctetLink, iface: Iface, cmd: &str) -> AsynResult<String> {
     let raw = write_read(handle, cmd).inspect_err(|f| {
+        handle.reset();
         handle.print(
             TraceMask::ERROR,
             format_args!(
@@ -178,6 +179,7 @@ fn device_write_read(handle: &OctetLink, iface: Iface, cmd: &str) -> AsynResult<
 /// assigned to a variable) — `let _ = ...` reproduces that verbatim.
 fn device_write_only(handle: &OctetLink, iface: Iface, cmd: &str) -> AsynResult<()> {
     let result = write_only(handle, cmd).inspect_err(|f| {
+        handle.reset();
         handle.print(
             TraceMask::ERROR,
             format_args!(
