@@ -136,6 +136,7 @@ pub fn spawn<W: DeviceWorker>(
 pub(crate) mod test_support {
     use std::path::PathBuf;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use epics_rs::asyn::drivers::ip_port::DrvAsynIPPort;
     use epics_rs::asyn::port::PortDriver;
@@ -154,13 +155,32 @@ pub(crate) mod test_support {
     /// A transport on a device that accepts the connection and never answers,
     /// so every read times out after the write went out.
     pub fn silent_transport(port: &str) -> (Transport, PathBuf, PortRuntimeHandle) {
+        let (transport, path, runtime, _) = answering_transport(port, b"");
+        (transport, path, runtime)
+    }
+
+    /// A device that answers every write with `reply` once the returned flag
+    /// is set, and stays silent until then.
+    pub fn answering_transport(
+        port: &str,
+        reply: &'static [u8],
+    ) -> (Transport, PathBuf, PortRuntimeHandle, Arc<AtomicBool>) {
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let answer = Arc::new(AtomicBool::new(false));
+        let answering = answer.clone();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+            let mut buf = [0u8; 256];
+            while stream.read(&mut buf).is_ok_and(|n| n > 0) {
+                if answering.load(Ordering::SeqCst) {
+                    let _ = stream.write_all(reply);
+                }
+            }
         });
-        transport_on(port, &addr, true)
+        let (transport, path, runtime) = transport_on(port, &addr, true);
+        (transport, path, runtime, answer)
     }
 
     fn transport_on(

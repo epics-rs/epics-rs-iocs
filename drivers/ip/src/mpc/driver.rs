@@ -4,21 +4,21 @@
 //! supply 1, address 1 is supply 2, matching the `parameter` field the C link
 //! carried (`@asyn(port addr)GET_PRESSURE 1`).
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
 
-use epics_rs::asyn::error::AsynResult;
+use epics_rs::asyn::error::{AsynResult, AsynStatus};
 use epics_rs::asyn::param::ParamType;
 use epics_rs::asyn::param::ParamValue;
 use epics_rs::asyn::port::{PortDriver, PortDriverBase, PortFlags};
 use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::request::ParamSetValue;
+use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use crate::asyn_error;
-use crate::mpc::protocol::{
-    self, DISPLAY_STRINGS, MpcError, NUM_SETPOINT_PAIRS, NUM_SUPPLIES, cmd,
-};
+use crate::mpc::protocol::{self, DISPLAY_STRINGS, NUM_SETPOINT_PAIRS, NUM_SUPPLIES, cmd};
 use crate::worker::{DeviceWorker, Transport};
 
 /// Command timeout (`MPC_TIMEOUT`, `devMPC.c:133`).
@@ -27,7 +27,13 @@ pub const MPC_TIMEOUT: Duration = Duration::from_secs(3);
 /// Commands the record write handlers hand to the worker thread.
 pub enum MpcCommand {
     /// A ready-made `~ AA XX d 00` frame; the reply is only checked for `OK`.
-    Write(String),
+    /// `who` stands where C prints the record name, `record` is the C write
+    /// routine (`writeAo`, `writeBo`, ...) that names it.
+    Write {
+        frame: String,
+        who: String,
+        record: &'static str,
+    },
 }
 
 /// Parameter indices of the MPC port.
@@ -157,10 +163,20 @@ impl MpcDriver {
         }
     }
 
-    fn send(&self, command: u8, data: &str) -> AsynResult<()> {
+    /// The parameter and address that stand where C prints `pr->name`.
+    fn who(&self, reason: usize, addr: i32) -> String {
+        let name = self.base.params.param_name(reason).unwrap_or_default();
+        format!("{name}[{addr}]")
+    }
+
+    fn send(&self, command: u8, data: &str, who: &str, record: &'static str) -> AsynResult<()> {
         let frame = protocol::build_command(self.address, command, data);
         self.commands
-            .send(MpcCommand::Write(frame))
+            .send(MpcCommand::Write {
+                frame,
+                who: who.to_string(),
+                record,
+            })
             .map_err(|_| asyn_error("MPC: the worker thread is gone"))
     }
 }
@@ -179,6 +195,13 @@ impl PortDriver for MpcDriver {
         let p = self.params;
         let supply = self.supply(addr)?;
         self.base.params.set_int32(reason, addr, value)?;
+        let record = if [p.set_unit, p.set_display, p.tsp_filament].contains(&reason) {
+            "writeMbbo"
+        } else {
+            "writeBo"
+        };
+        let who = self.who(reason, addr);
+        let send = |command, data: &str| self.send(command, data, &who, record);
 
         if reason == p.set_unit || reason == p.set_display {
             let choice = usize::try_from(value)
@@ -192,7 +215,7 @@ impl PortDriver for MpcDriver {
             } else {
                 cmd::SET_DISPLAY
             };
-            self.send(command, &format!("{supply}{choice}"))
+            send(command, &format!("{supply}{choice}"))
         } else if reason == p.start_stop {
             // devMPC.c:663 with MPC.db's ZNAM=START / ONAM=STOP.
             let command = if value == 0 {
@@ -200,28 +223,28 @@ impl PortDriver for MpcDriver {
             } else {
                 cmd::PUMP_STOP
             };
-            self.send(command, &supply.to_string())
+            send(command, &supply.to_string())
         } else if reason == p.keyboard_lock {
             let command = if value == 0 {
                 cmd::KEYBOARD_LOCK
             } else {
                 cmd::KEYBOARD_UNLOCK
             };
-            self.send(command, &supply.to_string())
+            send(command, &supply.to_string())
         } else if reason == p.set_auto_restart {
-            self.send(cmd::SET_AUTO_RESTART, yes_no(value))
+            send(cmd::SET_AUTO_RESTART, yes_no(value))
         } else if reason == p.tsp_auto_advance {
-            self.send(cmd::TSP_AUTO_ADVANCE, yes_no(value))
+            send(cmd::TSP_AUTO_ADVANCE, yes_no(value))
         } else if reason == p.tsp_off {
-            self.send(cmd::TSP_OFF, "")
+            send(cmd::TSP_OFF, "")
         } else if reason == p.tsp_clear {
-            self.send(cmd::TSP_CLEAR, "")
+            send(cmd::TSP_CLEAR, "")
         } else if reason == p.tsp_continuous {
-            self.send(cmd::TSP_CONTINUOUS, "")
+            send(cmd::TSP_CONTINUOUS, "")
         } else if reason == p.tsp_degas {
-            self.send(cmd::TSP_DEGAS, "")
+            send(cmd::TSP_DEGAS, "")
         } else if reason == p.tsp_filament {
-            self.send(cmd::TSP_FILAMENT, &value.to_string())
+            send(cmd::TSP_FILAMENT, &value.to_string())
         } else {
             Ok(())
         }
@@ -232,12 +255,14 @@ impl PortDriver for MpcDriver {
         let p = self.params;
         let supply = self.supply(addr)?;
         self.base.params.set_float64(reason, addr, value)?;
+        let who = self.who(reason, addr);
+        let send = |command, data: &str| self.send(command, data, &who, "writeAo");
 
         if reason == p.set_size {
-            return self.send(cmd::SET_SIZE, &format!("{supply},{}", value as i64));
+            return send(cmd::SET_SIZE, &format!("{supply},{}", value as i64));
         }
         if let Some(pair) = p.set_setpoint.iter().position(|&r| r == reason) {
-            return self.send(
+            return send(
                 cmd::SET_SETPOINT,
                 &protocol::setpoint_data(pair, supply, value),
             );
@@ -252,11 +277,13 @@ impl PortDriver for MpcDriver {
         let text = std::str::from_utf8(value)
             .map_err(|_| asyn_error("MPC: command strings must be ASCII"))?;
         self.base.params.set_string(reason, addr, text)?;
+        let who = self.who(reason, addr);
+        let send = |command, data: &str| self.send(command, data, &who, "writeSo");
 
         if reason == p.tsp_timed {
-            self.send(cmd::TSP_TIMED, text)?;
+            send(cmd::TSP_TIMED, text)?;
         } else if reason == p.tsp_sublimation {
-            self.send(cmd::TSP_SUBLIMATION, text)?;
+            send(cmd::TSP_SUBLIMATION, text)?;
         }
         Ok(value.len())
     }
@@ -273,6 +300,9 @@ pub struct MpcWorker {
     handle: PortHandle,
     params: MpcParams,
     address: u8,
+    /// C's per-record `prevReadStatus`, keyed by the name that stands for the
+    /// record; a missing entry is the zeroed `asynSuccess`.
+    prev_read: HashMap<String, AsynStatus>,
 }
 
 impl MpcWorker {
@@ -282,14 +312,94 @@ impl MpcWorker {
             handle,
             params,
             address,
+            prev_read: HashMap::new(),
         }
     }
 
-    /// One `~ AA XX d 00` transaction, returning the reply payload.
-    fn transact(&self, command: u8, data: &str) -> Result<String, String> {
+    fn print(&self, args: std::fmt::Arguments<'_>) {
+        self.transport.print(TraceMask::ERROR, args);
+    }
+
+    /// `devMPCCallback`: write the frame, read the reply, print what C prints,
+    /// and hand back C's `recBuf` — the payload of an `OK` reply (at least
+    /// "OK"), empty for a rejected one, which is never published. `None` where C leaves `pPvt->status` failed (or the callback
+    /// never ran), and the record routine stops before decoding.
+    fn callback(&mut self, frame: &str, who: &str) -> Option<String> {
+        match self.transport.write(frame.as_bytes()) {
+            Err(e) if e.never_ran() => return None,
+            Err(e) => {
+                self.print(format_args!(
+                    "devMPC::devMPCCallback write error, status={} error= {}",
+                    e.status() as i32,
+                    e.message_display()
+                ));
+                return None;
+            }
+            Ok(()) => {}
+        }
+        let read = self.transport.read_bytes();
+        let prev = self
+            .prev_read
+            .get(who)
+            .copied()
+            .unwrap_or(AsynStatus::Success);
+        let raw = match read {
+            Err(e) => {
+                if e.status() != prev {
+                    self.print(format_args!(
+                        "devMPC::devMPCCallback {who} read error, status={} error= {}",
+                        e.status() as i32,
+                        e.message_display()
+                    ));
+                    self.prev_read.insert(who.to_string(), e.status());
+                }
+                return None;
+            }
+            Ok(raw) => {
+                if prev != AsynStatus::Success {
+                    self.print(format_args!(
+                        "devMPC::devMPCCallback {who} read status back to normal"
+                    ));
+                    self.prev_read.insert(who.to_string(), AsynStatus::Success);
+                }
+                raw
+            }
+        };
+        if raw.len() < 4 {
+            self.print(format_args!(
+                "devMPC::devMPCCallback {who} message too small={}",
+                raw.len()
+            ));
+            return None;
+        }
+        Some(protocol::parse_reply(&String::from_utf8_lossy(&raw)).unwrap_or_default())
+    }
+
+    /// One read routine's transaction.
+    fn transact(&mut self, command: u8, data: &str, who: &str) -> Option<String> {
         let frame = protocol::build_command(self.address, command, data);
-        let raw = self.transport.write_read(frame.as_bytes())?;
-        protocol::parse_reply(&raw).map_err(|e: MpcError| e.to_string())
+        self.callback(&frame, who)
+    }
+
+    /// `checkRtnSize`.
+    fn rtn_size_ok(&self, who: &str, rec: &str, min: usize) -> bool {
+        if rec.len() < min {
+            self.print(format_args!(
+                "devMPC, {who} rtnSize={}, should be >{min}, response={rec}",
+                rec.len()
+            ));
+            return false;
+        }
+        true
+    }
+
+    /// `readSi`'s length check.
+    fn si_ok(&self, who: &str, rec: &str) -> bool {
+        if rec.len() > 39 {
+            self.print(format_args!("devMPC::readSi message too big in {who} "));
+            return false;
+        }
+        true
     }
 
     fn poll_supply(&mut self, addr: i32, supply: u8) {
@@ -297,110 +407,118 @@ impl MpcWorker {
         let s = supply.to_string();
         let mut values: Vec<ParamSetValue> = Vec::new();
 
-        match self.transact(cmd::READ_STATUS, &s) {
-            Ok(payload) => values.push(ParamSetValue::new(
+        let who = format!("MPC_STATUS[{addr}]");
+        if let Some(rec) = self.transact(cmd::READ_STATUS, &s, &who)
+            && self.si_ok(&who, &rec)
+            && !rec.is_empty()
+        {
+            values.push(ParamSetValue::new(
                 p.status,
                 addr,
-                ParamValue::Octet(payload.into_bytes().into()),
-            )),
-            Err(e) => log::error!("MPC: read status failed: {e}"),
+                ParamValue::Octet(rec.into_bytes().into()),
+            ));
         }
-        match self
-            .transact(cmd::READ_PRESSURE, &s)
-            .and_then(|payload| protocol::parse_pressure(&payload).map_err(|e| e.to_string()))
+        let who = format!("MPC_PRESSURE[{addr}]");
+        if let Some(rec) = self.transact(cmd::READ_PRESSURE, &s, &who)
+            && self.rtn_size_ok(&who, &rec, 9)
+            && let Ok(reading) = protocol::parse_pressure(&rec)
         {
-            Ok(reading) => {
-                values.push(ParamSetValue::new(
-                    p.pressure,
-                    addr,
-                    ParamValue::Float64(reading.value),
-                ));
-                values.push(ParamSetValue::new(
-                    p.pressure_egu,
-                    addr,
-                    ParamValue::Octet(reading.egu.into_bytes().into()),
-                ));
-            }
-            Err(e) => log::error!("MPC: read pressure failed: {e}"),
+            values.push(ParamSetValue::new(
+                p.pressure,
+                addr,
+                ParamValue::Float64(reading.value),
+            ));
+            values.push(ParamSetValue::new(
+                p.pressure_egu,
+                addr,
+                ParamValue::Octet(reading.egu.into_bytes().into()),
+            ));
         }
-        match self
-            .transact(cmd::READ_CURRENT, &s)
-            .and_then(|payload| protocol::parse_current(&payload).map_err(|e| e.to_string()))
+        let who = format!("MPC_CURRENT[{addr}]");
+        if let Some(rec) = self.transact(cmd::READ_CURRENT, &s, &who)
+            && self.rtn_size_ok(&who, &rec, 7)
+            && let Ok(reading) = protocol::parse_current(&rec)
         {
-            Ok(reading) => values.push(ParamSetValue::new(
+            values.push(ParamSetValue::new(
                 p.current,
                 addr,
                 ParamValue::Float64(reading.value),
-            )),
-            Err(e) => log::error!("MPC: read current failed: {e}"),
+            ));
         }
-        match self
-            .transact(cmd::READ_VOLTAGE, &s)
-            .and_then(|payload| protocol::parse_voltage(&payload).map_err(|e| e.to_string()))
+        let who = format!("MPC_VOLTAGE[{addr}]");
+        if let Some(rec) = self.transact(cmd::READ_VOLTAGE, &s, &who)
+            && self.rtn_size_ok(&who, &rec, 1)
+            && let Ok(reading) = protocol::parse_voltage(&rec)
         {
-            Ok(reading) => values.push(ParamSetValue::new(
+            values.push(ParamSetValue::new(
                 p.voltage,
                 addr,
                 ParamValue::Float64(reading.value),
-            )),
-            Err(e) => log::error!("MPC: read voltage failed: {e}"),
+            ));
         }
-        match self
-            .transact(cmd::READ_SIZE, &s)
-            .and_then(|payload| protocol::parse_size(&payload).map_err(|e| e.to_string()))
-        {
-            Ok(reading) => values.push(ParamSetValue::new(
-                p.size,
-                addr,
-                ParamValue::Float64(reading.value),
-            )),
-            Err(e) => log::error!("MPC: read pump size failed: {e}"),
+        let who = format!("MPC_SIZE[{addr}]");
+        if let Some(rec) = self.transact(cmd::READ_SIZE, &s, &who) {
+            if !rec.contains('L') {
+                self.print(format_args!(
+                    "devMPC::readAi, {who} cannot find L, response={rec}"
+                ));
+            } else if let Ok(reading) = protocol::parse_size(&rec) {
+                values.push(ParamSetValue::new(
+                    p.size,
+                    addr,
+                    ParamValue::Float64(reading.value),
+                ));
+            }
         }
         for pair in 0..NUM_SETPOINT_PAIRS {
             let number = protocol::setpoint_number(pair, supply);
-            match self.transact(cmd::READ_SETPOINT, &number.to_string()) {
-                Ok(payload) => {
-                    match protocol::parse_setpoint_value(&payload) {
-                        Ok(reading) => values.push(ParamSetValue::new(
-                            p.setpoint_value[pair],
-                            addr,
-                            ParamValue::Float64(reading.value),
-                        )),
-                        Err(e) => log::error!("MPC: setpoint {number} value: {e}"),
-                    }
-                    match protocol::parse_setpoint_state(&payload) {
-                        Ok(state) => values.push(ParamSetValue::new(
-                            p.setpoint_state[pair],
-                            addr,
-                            ParamValue::Int32(state),
-                        )),
-                        Err(e) => log::error!("MPC: setpoint {number} state: {e}"),
-                    }
-                }
-                Err(e) => log::error!("MPC: read setpoint {number} failed: {e}"),
+            // C reads the value (ai) and the state (bi) as two records; one
+            // read serves both here, so its lines carry the value's name.
+            let who = format!("MPC_SP{}_VAL[{addr}]", pair + 1);
+            let Some(rec) = self.transact(cmd::READ_SETPOINT, &number.to_string(), &who) else {
+                continue;
+            };
+            if self.rtn_size_ok(&who, &rec, 11)
+                && let Ok(reading) = protocol::parse_setpoint_value(&rec)
+            {
+                values.push(ParamSetValue::new(
+                    p.setpoint_value[pair],
+                    addr,
+                    ParamValue::Float64(reading.value),
+                ));
+            }
+            if let Ok(state) = protocol::parse_setpoint_state(&rec) {
+                values.push(ParamSetValue::new(
+                    p.setpoint_state[pair],
+                    addr,
+                    ParamValue::Int32(state),
+                ));
             }
         }
-        match self.transact(cmd::READ_AUTO_RESTART, "") {
-            Ok(payload) => values.push(ParamSetValue::new(
+        let who = format!("MPC_AUTO_RESTART[{addr}]");
+        if let Some(rec) = self.transact(cmd::READ_AUTO_RESTART, "", &who)
+            && !rec.is_empty()
+        {
+            values.push(ParamSetValue::new(
                 p.auto_restart,
                 addr,
-                ParamValue::Int32(protocol::parse_auto_restart(&payload)),
-            )),
-            Err(e) => log::error!("MPC: read auto-restart failed: {e}"),
+                ParamValue::Int32(protocol::parse_auto_restart(&rec)),
+            ));
         }
-        match self.transact(cmd::READ_TSP_STATUS, "") {
-            Ok(payload) => values.push(ParamSetValue::new(
+        let who = format!("MPC_TSP_STATUS[{addr}]");
+        if let Some(rec) = self.transact(cmd::READ_TSP_STATUS, "", &who)
+            && self.si_ok(&who, &rec)
+            && !rec.is_empty()
+        {
+            values.push(ParamSetValue::new(
                 p.tsp_status,
                 addr,
-                ParamValue::Octet(payload.into_bytes().into()),
-            )),
-            Err(e) => log::error!("MPC: read TSP status failed: {e}"),
+                ParamValue::Octet(rec.into_bytes().into()),
+            ));
         }
 
-        if !values.is_empty()
-            && let Err(e) = self.handle.set_params_and_notify_blocking(addr, values)
-        {
-            log::error!("MPC: publishing supply {supply} parameters failed: {e}");
+        if !values.is_empty() {
+            let _ = self.handle.set_params_and_notify_blocking(addr, values);
         }
     }
 }
@@ -415,14 +533,104 @@ impl DeviceWorker for MpcWorker {
     }
 
     fn handle(&mut self, command: Self::Command) {
-        let MpcCommand::Write(frame) = command;
-        match self.transport.write_read(frame.as_bytes()) {
-            Ok(raw) => {
-                if let Err(e) = protocol::parse_reply(&raw) {
-                    log::error!("MPC: command {frame:?} rejected: {e}");
-                }
-            }
-            Err(e) => log::error!("MPC: command {frame:?} failed: {e}"),
+        let MpcCommand::Write { frame, who, record } = command;
+        if let Some(rec) = self.callback(&frame, &who)
+            && rec.len() > 2
+        {
+            self.print(format_args!("devMPC::{record} message too big in {who}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::worker::test_support::{answering_transport, refused_transport, traced};
+
+    fn params() -> MpcParams {
+        let mut next = 0..;
+        let mut id = || next.next().unwrap();
+        MpcParams {
+            status: id(),
+            pressure: id(),
+            pressure_egu: id(),
+            current: id(),
+            voltage: id(),
+            size: id(),
+            setpoint_value: std::array::from_fn(|_| id()),
+            setpoint_state: std::array::from_fn(|_| id()),
+            auto_restart: id(),
+            tsp_status: id(),
+            set_unit: id(),
+            set_display: id(),
+            set_size: id(),
+            set_setpoint: std::array::from_fn(|_| id()),
+            start_stop: id(),
+            keyboard_lock: id(),
+            set_auto_restart: id(),
+            tsp_timed: id(),
+            tsp_off: id(),
+            tsp_filament: id(),
+            tsp_clear: id(),
+            tsp_auto_advance: id(),
+            tsp_continuous: id(),
+            tsp_sublimation: id(),
+            tsp_degas: id(),
+        }
+    }
+
+    /// devMPCCallback's read error prints once per record until the status
+    /// changes, then "back to normal"; a short OK payload trips checkRtnSize
+    /// and readAi's missing-L line.
+    #[test]
+    fn read_errors_print_on_change_and_short_payloads_print_rtn_size() {
+        let (transport, path, runtime, answer) =
+            answering_transport("MPC_DEVICE", b"05 OK 00 XX 3B");
+        let mut worker = MpcWorker::new(transport, runtime.port_handle().clone(), params(), 5);
+        worker.poll();
+        worker.poll();
+        answer.store(true, Ordering::SeqCst);
+        worker.poll();
+        worker.handle(MpcCommand::Write {
+            frame: "~ 05 37 1 00".into(),
+            who: "MPC_START[0]".into(),
+            record: "writeBo",
+        });
+        let lines = traced(&path);
+        let count = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
+
+        // 11 records per supply, two supplies: one error each across two polls.
+        assert_eq!(count(" read error, status=1 error= "), 22, "{lines:?}");
+        assert_eq!(count(" read status back to normal"), 22, "{lines:?}");
+        assert!(lines.iter().any(|l| {
+            l.ends_with("devMPC::devMPCCallback MPC_STATUS[0] read status back to normal")
+        }));
+        assert!(
+            lines.iter().any(
+                |l| l.ends_with("devMPC, MPC_PRESSURE[0] rtnSize=2, should be >9, response=XX")
+            )
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.ends_with("devMPC::readAi, MPC_SIZE[1] cannot find L, response=XX"))
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.ends_with("devMPC, MPC_SP1_VAL[0] rtnSize=2, should be >11, response=XX")
+            )
+        );
+        // "XX" is not more than 2 characters, so the write prints nothing.
+        assert_eq!(count("message too big"), 0, "{lines:?}");
+    }
+
+    /// A request the port refused never reached C's callback: no line.
+    #[test]
+    fn a_refused_request_prints_nothing() {
+        let (transport, path, runtime) = refused_transport("MPC_REFUSED");
+        MpcWorker::new(transport, runtime.port_handle().clone(), params(), 5).poll();
+        assert_eq!(traced(&path), Vec::<String>::new());
     }
 }

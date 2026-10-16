@@ -2143,7 +2143,6 @@ name = "ip-devices"
 version = "0.1.0"
 dependencies = [
  "epics-rs",
- "log",
  "thiserror 2.0.18",
 ]
 
