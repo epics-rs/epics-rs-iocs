@@ -18,10 +18,6 @@ epicsEnvSet("HOST",  "192.168.0.100:23")
 # ---- TCP octet port ----
 drvAsynIPPortConfigure("$(ASYN)", "$(HOST)", 0, 0, 0)
 
-# PMNC prompt protocol: replies are terminated by the '>' prompt. The driver
-# appends the CR command terminator itself, so only the input EOS is set.
-asynOctetSetInputEos("$(ASYN)", 0, ">")
-
 # ---- PMNC controller ----
 # PMNC87xxCreateController(motorPort, asynPort, [movingPollMs], [idlePollMs])
 # Autodiscovers driver modules and channels; one motor axis per channel.

@@ -1696,8 +1696,8 @@ impl NewportHolder {
     /// `drvAsynIPPortConfigure`), autodiscovers its driver modules and
     /// channels (`MPV` for the 8750, `DRT` for the 8752), and creates one
     /// motor axis per discovered channel (DTYP `PMNC_{motorPort}_{0..}`).
-    /// The port input EOS must be the `>` prompt
-    /// (`asynOctetSetInputEos(port, 0, ">")`). Replaces the C
+    /// The controller sets the port EOS itself (CR out, `>` prompt in), as C
+    /// `motor_init` does. Replaces the C
     /// `PMNC87xxSetup`/`PMNC87xxConfig` pair.
     pub fn pmnc87xx_create_controller_command(self: &Arc<Self>) -> CommandDef {
         let holder = self.clone();
@@ -1715,8 +1715,10 @@ impl NewportHolder {
                 let asyn_port = req_string(args, 1, "asynPort")?;
                 let (moving_poll_ms, idle_poll_ms) = poll_intervals(args, 2, 3)?;
 
-                let handle = connect_ip(&asyn_port, PMNC_TIMEOUT)?;
-                let controller = PmncController::new(handle)
+                let port = get_port(&asyn_port).ok_or_else(|| {
+                    format!("IP port '{asyn_port}' not found (call drvAsynIPPortConfigure first)")
+                })?;
+                let controller = PmncController::new(port.handle.clone(), PMNC_TIMEOUT)
                     .map_err(|e| format!("PMNC87xxCreateController: {e}"))?;
                 let ident = controller.ident().to_string();
                 let model = controller.model();

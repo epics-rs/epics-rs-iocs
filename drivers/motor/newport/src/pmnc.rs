@@ -11,9 +11,11 @@
 //! ## Prompt protocol
 //!
 //! Commands are terminated with CR (`\r`); the controller answers with the
-//! reply text followed by a `>` prompt. This driver appends the CR itself
-//! and expects the port input EOS to be the prompt (`asynOctetSetInputEos(">")`
-//! in st.cmd) so each [`PmncController::command`] reads exactly one reply.
+//! reply text followed by a `>` prompt. [`PmncController::new`] sets the port
+//! output EOS to CR and input EOS to the prompt, as C `motor_init` does, so
+//! each [`PmncController::command`] reads exactly one reply. On firmware
+//! 1.5.3/1.5.4, whose `STA` reply ends in `\n` instead, the input EOS is
+//! switched to `\n` around that one read (C `changeEOS`).
 //! Every command yields a prompt (C `cmnd_response = true`), so motion
 //! commands consume and discard their reply just like queries.
 //!
@@ -37,19 +39,15 @@
 //!
 //! ## Deviations from C (documented)
 //!
-//! - **changeEOS firmware unsupported.** C temporarily switches the port
-//!   input EOS to `\n` when reading `STA` on firmware 1.5.3/1.5.4 (which do
-//!   not terminate the status reply with a prompt). `SyncIOHandle` exposes no
-//!   per-read input-EOS switch, so this port reads `STA` against the standard
-//!   `>` prompt EOS; on those two firmware revisions the status read would
-//!   block until timeout. All other revisions are unaffected.
 //! - **Homing is a no-op**, exactly as C: `HOME_FOR`/`HOME_REV` send no
 //!   command (the `FIN`/`RIN` paths are commented out upstream).
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use epics_rs::asyn::error::{AsynError, AsynResult, AsynStatus};
 use epics_rs::asyn::interfaces::motor::{AsynMotor, MotorStatus, PidGainKind};
+use epics_rs::asyn::port_handle::PortHandle;
 use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::user::AsynUser;
 
@@ -59,7 +57,13 @@ use crate::util::{atoi, nint};
 const READ_BUF: usize = 256;
 
 /// Command line terminator (C `CMND_EOS`).
-const TERMINATOR: &[u8] = b"\r";
+const CMND_EOS: &[u8] = b"\r";
+
+/// Reply terminator for every command (C `PROMPT_EOS`).
+const PROMPT_EOS: &[u8] = b">";
+
+/// `STA` reply terminator on firmware 1.5.3/1.5.4 (C `NL_EOS`).
+const NL_EOS: &[u8] = b"\n";
 
 /// Identity substring that precedes the firmware digit (C `VER_STR`).
 const VER_STR: &str = "Version 1.";
@@ -195,10 +199,18 @@ fn model_from_ident(ident: &str) -> Option<(PmncModel, bool)> {
     Some((model, change_eos))
 }
 
+fn eos_user() -> AsynUser {
+    AsynUser::new(0).with_addr(0)
+}
+
 /// Shared controller endpoint: owns the octet handle and the cross-axis
 /// communication state. The caller holds the `Arc<Mutex<..>>` lock.
 pub struct PmncController {
     handle: SyncIOHandle,
+    /// The same port, for the per-read input-EOS switch.
+    port: PortHandle,
+    /// Firmware 1.5.3/1.5.4: `STA` replies end in `\n` (C `changeEOS`).
+    change_eos: bool,
     ident: String,
     model: PmncModel,
     axes: Vec<AxisDef>,
@@ -210,10 +222,14 @@ impl PmncController {
     /// identity (`VER`, up to 3 tries), decode the model, then enumerate axes
     /// — an 8750 lists its 8753 channels indirectly via `MPV`, an 8752 reads
     /// each module's type via `DRT` (8753 → 3 channels, 8751 → 1). Performs
-    /// blocking I/O. The port input EOS must already be the `>` prompt.
-    pub fn new(handle: SyncIOHandle) -> AsynResult<Self> {
+    /// blocking I/O.
+    pub fn new(port: PortHandle, timeout: Duration) -> AsynResult<Self> {
+        port.set_input_eos_blocking(eos_user(), PROMPT_EOS)?;
+        port.set_output_eos_blocking(eos_user(), CMND_EOS)?;
         let mut ctrl = Self {
-            handle,
+            handle: SyncIOHandle::from_handle(port.clone(), 0, timeout),
+            port,
+            change_eos: false,
             ident: String::new(),
             model: PmncModel::Pmnc8750,
             axes: Vec::new(),
@@ -235,16 +251,7 @@ impl PmncController {
         let (model, change_eos) = model_from_ident(&ctrl.ident)
             .ok_or_else(|| pmnc_err(format!("PMNC: unknown version = {}", ctrl.ident)))?;
         ctrl.model = model;
-        if change_eos {
-            // Firmware 1.5.3/1.5.4 terminate STA with `\n`, not the prompt;
-            // this port cannot switch the per-read input EOS, so status polls
-            // on those revisions may time out (module Deviations).
-            eprintln!(
-                "PMNC: firmware {} needs a '\\n' EOS on STA which is unsupported; \
-                 status polling may time out",
-                ctrl.ident
-            );
-        }
+        ctrl.change_eos = change_eos;
 
         // Axis enumeration.
         let mut axes = Vec::new();
@@ -310,18 +317,26 @@ impl PmncController {
         self.axes.get(index).copied()
     }
 
-    fn framed(cmd: &str) -> Vec<u8> {
-        let mut out = Vec::with_capacity(cmd.len() + TERMINATOR.len());
-        out.extend_from_slice(cmd.as_bytes());
-        out.extend_from_slice(TERMINATOR);
-        out
+    /// Write one command and read its one prompt-framed reply (C
+    /// `send_recv_mess`), returned trimmed.
+    fn command(&self, cmd: &str) -> AsynResult<String> {
+        Self::trimmed(self.handle.write_read(0, cmd.as_bytes(), READ_BUF)?)
     }
 
-    /// Write one command and read its one prompt-framed reply (C
-    /// `send_recv_mess`): the CR terminator is appended here, and the reply
-    /// text (everything up to the `>` prompt EOS) is returned trimmed.
-    fn command(&self, cmd: &str) -> AsynResult<String> {
-        let raw = self.handle.write_read(0, &Self::framed(cmd), READ_BUF)?;
+    /// `STA` for one driver module (C `set_status`), read to `\n` instead of
+    /// the prompt on `changeEOS` firmware and the prompt EOS restored after.
+    fn status(&self, driver: i32) -> AsynResult<String> {
+        let cmd = format!("STA {driver}");
+        if !self.change_eos {
+            return self.command(&cmd);
+        }
+        self.port.set_input_eos_blocking(eos_user(), NL_EOS)?;
+        let raw = self.handle.write_read(0, cmd.as_bytes(), READ_BUF);
+        self.port.set_input_eos_blocking(eos_user(), PROMPT_EOS)?;
+        Self::trimmed(raw?)
+    }
+
+    fn trimmed(raw: Vec<u8>) -> AsynResult<String> {
         Ok(String::from_utf8_lossy(&raw)
             .trim_matches(['\r', '\n', '>', ' '])
             .to_string())
@@ -586,7 +601,7 @@ impl AsynMotor for PmncAxis {
         };
 
         // 2. Status byte.
-        let sta = checked!(ctrl.command(&format!("STA {d}")));
+        let sta = checked!(ctrl.status(d));
         let mstat = parse_status_byte(&sta).unwrap_or(0);
 
         // 3. Aux status (8751 only).
