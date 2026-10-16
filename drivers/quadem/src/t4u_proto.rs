@@ -680,9 +680,12 @@ impl Ini {
     }
 }
 
+/// `inicpp`'s `whitespaces()`, the set its `trim` strips from both ends.
+const INI_WHITESPACE: [char; 6] = [' ', '\t', '\n', '\r', '\x0c', '\x0b'];
+
 /// `inicpp`'s `IniFile::decode`: lines split on `\n` alone, `#` and `;`
 /// comments erased wherever they start unless escaped with `\\`, then trimmed
-/// of spaces and tabs. `Err` is the `std::logic_error` text it throws.
+/// of `INI_WHITESPACE`. `Err` is the `std::logic_error` text it throws.
 pub fn parse_ini(text: &str) -> Result<Ini, String> {
     let mut ini = Ini::default();
     let mut section: Option<String> = None;
@@ -692,7 +695,7 @@ pub fn parse_ini(text: &str) -> Result<Ini, String> {
         for prefix in ["#", ";"] {
             erase_comment(&mut line, prefix, 0);
         }
-        let line = line.trim_matches([' ', '\t']);
+        let line = line.trim_matches(INI_WHITESPACE);
         if line.is_empty() {
             continue;
         }
@@ -720,8 +723,8 @@ pub fn parse_ini(text: &str) -> Result<Ini, String> {
             return Err(format!("l.{line_no}: ini parsing failed, no '=' found"));
         };
         ini.0.entry(name.clone()).or_default().insert(
-            key.trim_matches([' ', '\t']).to_string(),
-            value.trim_matches([' ', '\t']).to_string(),
+            key.trim_matches(INI_WHITESPACE).to_string(),
+            value.trim_matches(INI_WHITESPACE).to_string(),
         );
     }
     Ok(ini)
@@ -1131,8 +1134,9 @@ ChannelD=\"0.9527919082805758, 1.4346421308430505e-05\"
         let ini = parse_ini("[s]\nk = a ; note\nk = b # later wins\ne = x\\#y\n").unwrap();
         assert_eq!(ini.get("s", "k"), Some("b"));
         assert_eq!(ini.get("s", "e"), Some("x#y"));
-        let ini = parse_ini("[config]\r\nselected=direct\r\n").unwrap();
-        assert_eq!(ini.get("config", "selected"), Some("direct\r"));
+        let ini = parse_ini("[config]\r\nselected=direct\r\n\x0bv = 1\x0c\r\n").unwrap();
+        assert_eq!(ini.get("config", "selected"), Some("direct"));
+        assert_eq!(ini.get("config", "v"), Some("1"));
         assert_eq!(
             parse_ini("k=v\n").unwrap_err(),
             "l.1: ini parsing failed, field has no section or ini file in use by another \
