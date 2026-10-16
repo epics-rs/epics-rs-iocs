@@ -18,13 +18,12 @@ use epics_rs::asyn::trace::TraceMask;
 use epics_rs::asyn::user::AsynUser;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute};
+use epics_rs::ad_core::driver::ndarray_driver::ArrayOwner;
 use epics_rs::ad_core::driver::{ADDriverBase, ADStatus, ImageMode};
 use epics_rs::ad_core::ndarray::{NDArray, NDDataType, NDDimension};
 use epics_rs::ad_core::ndarray_pool::NDArrayPool;
 use epics_rs::ad_core::params::ad_driver::ADDriverParams;
-use epics_rs::ad_core::plugin::channel::{
-    ArrayPublisher, NDArrayOutput, NDArraySender, QueuedArrayCounter,
-};
+use epics_rs::ad_core::plugin::channel::{ArrayPublisher, NDArrayOutput, NDArraySender};
 use epics_rs::ad_core::runtime as rt;
 use epics_rs::ad_core::timestamp::EpicsTimestamp;
 
@@ -56,7 +55,8 @@ pub struct NdStdArraysDriver {
     pub params: ADDriverParams,
     pub ndsa: NdsaParams,
     pool: Arc<NDArrayPool>,
-    queued_counter: Arc<QueuedArrayCounter>,
+    /// Keeps the pool's owner alive; the pool holds it weakly.
+    _owner: Arc<ArrayOwner>,
     publish_tx: rt::CommandSender<Arc<NDArray>>,
     /// C `pArrays[0]` — the working buffer that waveform writes append into.
     current: Option<NDArray>,
@@ -79,7 +79,7 @@ impl NdStdArraysDriver {
             mut port_base,
             params,
             pool,
-            queued_counter,
+            owner,
             ..
         } = ADDriverBase::new(
             port_name,
@@ -117,7 +117,7 @@ impl NdStdArraysDriver {
             params,
             ndsa,
             pool,
-            queued_counter,
+            _owner: owner,
             publish_tx,
             current: None,
             array_dimensions: [0; ND_ARRAY_MAX_DIMS],
@@ -330,7 +330,12 @@ impl NdStdArraysDriver {
         // the plugin, so append-mode re-publishes share one growing buffer.
         // This port snapshots the buffer per publish, giving each queued frame
         // an independent copy (identical observable data, no shared-buffer race).
-        let mut snapshot = self.current.as_ref().unwrap().clone();
+        // The copy comes from the pool so it is counted on this driver as
+        // `pArrays[0]` is.
+        let current = self.current.as_ref().unwrap();
+        let mut snapshot = self.pool.wrap(current.dims.clone(), current.data.clone());
+        snapshot.attributes = current.attributes.clone();
+        snapshot.codec = current.codec.clone();
         snapshot.unique_id = counter;
         let now = EpicsTimestamp::now();
         snapshot.time_stamp = now.sec as f64 + now.nsec as f64 / 1.0e9;
@@ -487,7 +492,6 @@ pub struct NdStdArraysRuntime {
     pub ndsa: NdsaParams,
     pool: Arc<NDArrayPool>,
     output: Arc<parking_lot::Mutex<NDArrayOutput>>,
-    queued_counter: Arc<QueuedArrayCounter>,
     /// Owns the publisher thread for the lifetime of the IOC.
     pub task_handle: std::thread::JoinHandle<()>,
 }
@@ -506,8 +510,7 @@ impl NdStdArraysRuntime {
         &self.output
     }
 
-    pub fn connect_downstream(&self, mut sender: NDArraySender) {
-        sender.set_queued_counter(self.queued_counter.clone());
+    pub fn connect_downstream(&self, sender: NDArraySender) {
         self.output.lock().add(sender);
     }
 }
@@ -527,7 +530,6 @@ pub fn create_nd_std_arrays(
 
     let driver = NdStdArraysDriver::new(port_name, max_memory, publish_tx)?;
     let pool = driver.pool.clone();
-    let queued_counter = driver.queued_counter.clone();
     let params = driver.params;
     let ndsa = driver.ndsa;
 
@@ -546,7 +548,6 @@ pub fn create_nd_std_arrays(
         ndsa,
         pool,
         output,
-        queued_counter,
         task_handle,
     })
 }
@@ -717,6 +718,10 @@ mod tests {
         assert_eq!(arr.dims[0].size, 6);
         assert_eq!(f64s(arr), vec![10.0, 11.0, 12.0, 13.0, 0.0, 0.0]);
         assert_eq!(arr.unique_id, 1, "NDArrayCounter starts at 1");
+        assert!(
+            arr.owner().is_some_and(|o| Arc::ptr_eq(&o, &f.det._owner)),
+            "the published array is counted on this driver"
+        );
 
         // Single image mode: acquisition self-clears after one complete array.
         assert_eq!(f.get_i32(f.det.params.acquire), 0);
