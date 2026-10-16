@@ -615,7 +615,7 @@ impl PortDriver for EigerDriver {
             // C's ERR_ARGS, on pasynUserSelf (eigerDetector.cpp:590-594).
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &format!(
+                format_args!(
                     "eigerDetector::writeInt32: error status={} function={function}, value={value}",
                     e.status() as i32
                 ),

@@ -167,7 +167,9 @@ impl PslDetector {
 
     /// C `asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, ...)`.
     fn trace_error(&self, message: &str) {
-        self.ad.port_base.trace_print(TraceMask::ERROR, message);
+        self.ad
+            .port_base
+            .trace_print(TraceMask::ERROR, format_args!("{}", message));
     }
 
     fn get_choices(&mut self, command: &str) -> AsynResult<Choices> {

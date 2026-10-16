@@ -183,9 +183,10 @@ impl PortDriver for D435iColorDriver {
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Start).is_err() {
-                    self.ad
-                        .port_base
-                        .trace_print(TraceMask::ERROR, "D435i: acquisition task is not running");
+                    self.ad.port_base.trace_print(
+                        TraceMask::ERROR,
+                        format_args!("D435i: acquisition task is not running"),
+                    );
                     self.ad.port_base.set_string_param(
                         self.ad.params.status_message,
                         0,
@@ -201,9 +202,10 @@ impl PortDriver for D435iColorDriver {
                 )?;
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
                 if self.acq_tx.try_send(AcqCommand::Stop).is_err() {
-                    self.ad
-                        .port_base
-                        .trace_print(TraceMask::ERROR, "D435i: acquisition task is not running");
+                    self.ad.port_base.trace_print(
+                        TraceMask::ERROR,
+                        format_args!("D435i: acquisition task is not running"),
+                    );
                 }
             } else {
                 self.ad.port_base.set_int32_param(acquire_idx, 0, value)?;
@@ -239,7 +241,7 @@ impl PortDriver for D435iColorDriver {
             } else {
                 self.ad.port_base.trace_print(
                     TraceMask::WARNING,
-                    &format!(
+                    format_args!(
                         "D435i: invalid stream mode index {value}, this camera offers {}",
                         self.stream_modes.len()
                     ),

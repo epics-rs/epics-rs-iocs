@@ -360,9 +360,10 @@ impl PortDriver for MythenDriver {
         // C refuses every write except ADAcquire while an acquisition runs
         // (mythen.cpp:1111).
         if reason != acquire && self.det.state.acquiring.load(Ordering::Acquire) {
-            self.ad
-                .port_base
-                .trace_print(TraceMask::ERROR, "mythen:writeInt32: detector is busy");
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!("mythen:writeInt32: detector is busy"),
+            );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "mythen: detector is busy".into(),
@@ -438,9 +439,10 @@ impl PortDriver for MythenDriver {
         let addr = user.addr;
 
         if self.det.state.acquiring.load(Ordering::Acquire) {
-            self.ad
-                .port_base
-                .trace_print(TraceMask::ERROR, "mythen:writeFloat64: detector is busy");
+            self.ad.port_base.trace_print(
+                TraceMask::ERROR,
+                format_args!("mythen:writeFloat64: detector is busy"),
+            );
             return Err(AsynError::Status {
                 status: AsynStatus::Error,
                 message: "mythen: detector is busy".into(),

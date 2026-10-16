@@ -183,7 +183,7 @@ impl NdStdArraysDriver {
         let mut array = self.pool.alloc(dims, data_type).map_err(|e| {
             self.port_base.trace_print(
                 TraceMask::ERROR,
-                "NDDriverStdArrays:writeXXXArray: error allocating raw buffer",
+                format_args!("NDDriverStdArrays:writeXXXArray: error allocating raw buffer"),
             );
             pool_err(e)
         })?;

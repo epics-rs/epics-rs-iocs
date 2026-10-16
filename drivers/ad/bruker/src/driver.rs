@@ -122,7 +122,9 @@ impl BrukerDetector {
     }
 
     fn trace_error(&self, message: &str) {
-        self.ad.port_base.trace_print(TraceMask::ERROR, message);
+        self.ad
+            .port_base
+            .trace_print(TraceMask::ERROR, format_args!("{}", message));
     }
 
     fn get_i32(&self, reason: usize) -> i32 {

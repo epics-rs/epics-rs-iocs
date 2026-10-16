@@ -114,7 +114,7 @@ impl PhotonIIDetector {
                 };
                 self.ad.port_base.trace_print(
                     TraceMask::ERROR,
-                    &format!(
+                    format_args!(
                         "PhotonII::writePhotonII, status={}, sent\n{command}",
                         status as i32
                     ),

@@ -21,7 +21,7 @@ pub trait AsynPrint {
 
 impl AsynPrint for PortDriverBase {
     fn asyn_print(&self, mask: TraceMask, args: fmt::Arguments<'_>) {
-        self.trace_print(mask, &args.to_string());
+        self.trace_print(mask, args);
     }
 }
 

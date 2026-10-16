@@ -179,7 +179,9 @@ impl TimePix3Driver {
             }
         };
         if let Some((mask, line)) = line {
-            self.ad.port_base.trace_print(mask, &line);
+            self.ad
+                .port_base
+                .trace_print(mask, format_args!("{}", line));
         }
         AsynError::Status {
             status: AsynStatus::Error,
@@ -643,9 +645,12 @@ impl TimePix3Driver {
             );
             self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &adlog::err(
-                    adlog::WRITE_BPC_FILE,
-                    "WriteBPC: uploadBPC to SERVAL failed",
+                format_args!(
+                    "{}",
+                    adlog::err(
+                        adlog::WRITE_BPC_FILE,
+                        "WriteBPC: uploadBPC to SERVAL failed",
+                    )
                 ),
             );
             err
@@ -666,9 +671,12 @@ impl TimePix3Driver {
                 let err = self.http_failed(&format!("GET {path}"), &e, HttpPrint::None);
                 self.ad.port_base.trace_print(
                     TraceMask::ERROR,
-                    &adlog::err(
-                        adlog::REFRESH_PIXEL_CONFIG,
-                        &format!("chip {chip} PixelConfig GET failed: HTTP {}", e.code()),
+                    format_args!(
+                        "{}",
+                        adlog::err(
+                            adlog::REFRESH_PIXEL_CONFIG,
+                            &format!("chip {chip} PixelConfig GET failed: HTTP {}", e.code()),
+                        )
                     ),
                 );
                 err
@@ -1026,19 +1034,25 @@ impl PortDriver for TimePix3Driver {
         match &result {
             Err(e) => self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &adlog::err(
-                    adlog::WRITE_INT32,
-                    &format!(
-                        "ERROR status={} function={reason}, value={value}",
-                        e.status() as i32
-                    ),
+                format_args!(
+                    "{}",
+                    adlog::err(
+                        adlog::WRITE_INT32,
+                        &format!(
+                            "ERROR status={} function={reason}, value={value}",
+                            e.status() as i32
+                        ),
+                    )
                 ),
             ),
             Ok(()) => self.ad.port_base.trace_print(
                 TraceMask::IO_DRIVER,
-                &adlog::log(
-                    adlog::WRITE_INT32,
-                    &format!("function={reason} value={value}"),
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::WRITE_INT32,
+                        &format!("function={reason} value={value}"),
+                    )
                 ),
             ),
         }
@@ -1076,19 +1090,25 @@ impl PortDriver for TimePix3Driver {
         match &result {
             Err(e) => self.ad.port_base.trace_print(
                 TraceMask::ERROR,
-                &adlog::err(
-                    adlog::WRITE_FLOAT64,
-                    &format!(
-                        "ERROR status = {}, function ={reason}, value = {value:.6}",
-                        e.status() as i32
-                    ),
+                format_args!(
+                    "{}",
+                    adlog::err(
+                        adlog::WRITE_FLOAT64,
+                        &format!(
+                            "ERROR status = {}, function ={reason}, value = {value:.6}",
+                            e.status() as i32
+                        ),
+                    )
                 ),
             ),
             Ok(()) => self.ad.port_base.trace_print(
                 TraceMask::IO_DRIVER,
-                &adlog::log(
-                    adlog::WRITE_FLOAT64,
-                    &format!("function={reason} value={value:.6}"),
+                format_args!(
+                    "{}",
+                    adlog::log(
+                        adlog::WRITE_FLOAT64,
+                        &format!("function={reason} value={value:.6}"),
+                    )
                 ),
             ),
         }
@@ -1132,9 +1152,12 @@ impl PortDriver for TimePix3Driver {
         let value = String::from_utf8_lossy(&data[..end]);
         self.ad.port_base.trace_print(
             TraceMask::IO_DRIVER,
-            &adlog::log(
-                adlog::WRITE_OCTET,
-                &format!("function={reason}, paramName={name}, value={value}"),
+            format_args!(
+                "{}",
+                adlog::log(
+                    adlog::WRITE_OCTET,
+                    &format!("function={reason}, paramName={name}, value={value}"),
+                )
             ),
         );
         Ok(data.len())
