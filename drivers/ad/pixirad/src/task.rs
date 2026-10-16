@@ -14,8 +14,8 @@ use epics_rs::asyn::sync_io::SyncIOHandle;
 use epics_rs::asyn::trace::TraceMask;
 
 use epics_rs::ad_core::attributes::{NDAttrSource, NDAttrValue, NDAttribute, NDAttributeList};
-use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDimension};
-use epics_rs::ad_core::ndarray_pool::DriverPool;
+use epics_rs::ad_core::ndarray::{NDDataBuffer, NDDataType, NDDimension};
+use epics_rs::ad_core::ndarray_pool::{DriverArray, DriverPool};
 use epics_rs::ad_core::params::ADBaseParams;
 use epics_rs::ad_core::plugin::channel::ArrayPublisher;
 use epics_rs::ad_core::runtime as rt;
@@ -116,9 +116,20 @@ pub(crate) fn start_data_task(ctx: DataContext) -> std::thread::JoinHandle<()> {
 
 /// The image being built out of one frame per colour.
 struct Image {
-    pixels: Vec<u16>,
+    array: DriverArray,
     colors: usize,
-    timestamp: EpicsTimestamp,
+}
+
+/// C's `dims` at the colour-0 alloc (pixirad.cpp:1026-1033).
+fn image_dims(sensor: Sensor, colors: usize) -> Vec<NDDimension> {
+    let mut dims = vec![
+        NDDimension::new(sensor.rows),
+        NDDimension::new(sensor.cols * sensor.modules),
+    ];
+    if colors > 1 {
+        dims.push(NDDimension::new(colors));
+    }
+    dims
 }
 
 async fn data_loop(ctx: DataContext) {
@@ -127,8 +138,8 @@ async fn data_loop(ctx: DataContext) {
     let pixels_per_color = ctx.sensor.image_pixels();
     // C allocated the NDArray only when ColorsCollected was 0 and memcpy'd into
     // it whatever the count was, so a first frame that arrived with a stale
-    // non-zero count wrote through a null pointer. The image being assembled is
-    // owned here instead: there is no path on which a frame has nowhere to go.
+    // non-zero count wrote through a null pointer. Here any frame with no image
+    // to go into allocates one.
     let mut image: Option<Image> = None;
 
     loop {
@@ -172,23 +183,36 @@ async fn data_loop(ctx: DataContext) {
             Err(_) => continue,
         };
 
-        let building = image.get_or_insert_with(|| Image {
-            pixels: vec![0u16; pixels_per_color * num_colors],
-            colors: num_colors,
-            timestamp: EpicsTimestamp::now(),
-        });
-        if building.colors != num_colors {
-            building.pixels = vec![0u16; pixels_per_color * num_colors];
-            building.colors = num_colors;
-            building.timestamp = EpicsTimestamp::now();
+        if image.as_ref().is_some_and(|i| i.colors != num_colors) {
+            image = None;
         }
+        if image.is_none() {
+            // C allocates whether or not NDArrayCallbacks is set
+            // (pixirad.cpp:1033) and dereferences a refusal; here the frame is
+            // dropped after the pool's limit line.
+            let Ok(mut array) = ctx
+                .pool
+                .alloc(image_dims(ctx.sensor, num_colors), NDDataType::UInt16)
+            else {
+                continue;
+            };
+            array.timestamp = EpicsTimestamp::now();
+            image = Some(Image {
+                array,
+                colors: num_colors,
+            });
+        }
+        let building = image.as_mut().expect("allocated above");
+        let NDDataBuffer::U16(pixels) = &mut building.array.data else {
+            unreachable!("allocated as NDUInt16")
+        };
 
         let offset = if num_colors == 1 {
             0
         } else {
             COLOR_OFFSET_MAP[colors_collected] * pixels_per_color
         };
-        building.pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
+        pixels[offset..offset + pixels_per_color].copy_from_slice(decoded);
         colors_collected += 1;
 
         let udp_updates = vec![
@@ -238,11 +262,7 @@ async fn data_loop(ctx: DataContext) {
 
         // The next colour 0 starts a new image with its own start time
         // (pixirad.cpp:1023-1025).
-        let Image {
-            pixels: taken,
-            colors,
-            timestamp: ts,
-        } = image.take().expect("an image is being built");
+        let Image { array, colors } = image.take().expect("an image is being built");
 
         let mut updates = vec![
             ParamSetValue::new(
@@ -258,7 +278,7 @@ async fn data_loop(ctx: DataContext) {
             ParamSetValue::new(
                 ctx.ad_params.base.array_size,
                 0,
-                ParamValue::Int32((taken.len() * 2) as i32),
+                ParamValue::Int32((array.data.len() * 2) as i32),
             ),
         ];
         if images_taken >= num_images {
@@ -278,26 +298,14 @@ async fn data_loop(ctx: DataContext) {
         let _ = ctx.handle.set_params_and_notify(0, updates).await;
 
         if array_callbacks {
-            publish(&ctx, taken, colors, unique_id, ts).await;
+            publish(&ctx, array, colors, unique_id).await;
         }
     }
 }
 
-async fn publish(
-    ctx: &DataContext,
-    pixels: Vec<u16>,
-    colors: usize,
-    unique_id: i32,
-    ts: EpicsTimestamp,
-) {
-    let mut dims = vec![
-        NDDimension::new(ctx.sensor.rows),
-        NDDimension::new(ctx.sensor.cols * ctx.sensor.modules),
-    ];
-    if colors > 1 {
-        dims.push(NDDimension::new(colors));
-    }
-    let n_dims = dims.len();
+async fn publish(ctx: &DataContext, mut array: DriverArray, colors: usize, unique_id: i32) {
+    let n_dims = array.dims.len();
+    let ts = array.timestamp;
 
     let mut attributes = NDAttributeList::new();
     attributes.add(NDAttribute {
@@ -308,14 +316,7 @@ async fn publish(
         source_impl: None,
     });
 
-    let data = NDDataBuffer::U16(pixels);
-    // C dereferences a refused alloc unchecked (pixirad.cpp:1033); here the frame
-    // is dropped after the pool's limit line.
-    let Ok(mut array) = ctx.pool.wrap(dims, data) else {
-        return;
-    };
     array.unique_id = unique_id;
-    array.timestamp = ts;
     array.time_stamp = ts.as_f64();
     array.attributes = attributes;
 

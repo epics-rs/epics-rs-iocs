@@ -731,6 +731,7 @@ mod tests {
         frames: std::sync::mpsc::SyncSender<Frame>,
         arrays: epics_rs::ad_core::plugin::channel::NDArrayReceiver,
         frame_bytes: usize,
+        pool: DriverPool,
     }
 
     impl DataTask {
@@ -748,11 +749,13 @@ mod tests {
                 epics_rs::ad_core::plugin::channel::ndarray_channel("PIXI_SINK", 8);
             let mut output = NDArrayOutput::new();
             output.add(sink);
-            let (frames, frame_rx) = std::sync::mpsc::sync_channel(8);
+            // A rendezvous: a send returns once the task is back for the next
+            // frame, so the frame before it is done.
+            let (frames, frame_rx) = std::sync::mpsc::sync_channel(0);
             task::start_data_task(DataContext {
                 handle: handle.clone(),
                 output: ArrayPublisher::new(Arc::new(parking_lot::Mutex::new(output))),
-                pool,
+                pool: pool.clone(),
                 ad_params: ad,
                 params,
                 sensor,
@@ -765,6 +768,7 @@ mod tests {
                 frames,
                 arrays,
                 frame_bytes: crate::decode::Decoder::new(sensor).frame_bytes(false),
+                pool,
             }
         }
 
@@ -776,6 +780,12 @@ mod tests {
                     payload: vec![0; self.frame_bytes],
                 })
                 .unwrap();
+        }
+
+        fn counter(&self) -> i32 {
+            self.handle
+                .read_int32_blocking(self.ad.base.array_counter, 0)
+                .unwrap()
         }
     }
 
@@ -791,5 +801,41 @@ mod tests {
         t.send_frame();
         let second = t.arrays.blocking_recv().unwrap();
         assert!(second.timestamp.as_f64() > first.timestamp.as_f64());
+    }
+
+    /// C bumps NDArrayCounter only after the colour-0 alloc
+    /// (pixirad.cpp:1033, :1055-1057).
+    #[test]
+    fn a_frame_the_pool_refuses_leaves_the_counter_alone() {
+        // Room for one 476 x 512 NDUInt16 image.
+        let mut t = DataTask::start("PIXI_REFUSE", 600_000);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 1)
+            .unwrap();
+        t.send_frame();
+        let held = t.arrays.blocking_recv().unwrap();
+        assert_eq!(held.unique_id, 1);
+        t.send_frame();
+        t.send_frame();
+        assert_eq!(t.counter(), 1);
+        drop(held);
+        t.send_frame();
+        assert_eq!(t.arrays.blocking_recv().unwrap().unique_id, 2);
+    }
+
+    /// The colour-0 alloc does not depend on NDArrayCallbacks.
+    #[test]
+    fn an_image_is_allocated_from_the_pool_with_callbacks_off() {
+        let t = DataTask::start("PIXI_NOCB", 1 << 20);
+        t.handle
+            .write_int32_blocking(t.ad.base.array_callbacks, 0, 0)
+            .unwrap();
+        t.send_frame();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while t.counter() != 1 {
+            assert!(std::time::Instant::now() < deadline, "no image");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(t.pool.num_alloc_buffers(), 1);
     }
 }
