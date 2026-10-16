@@ -13,7 +13,7 @@
 #============================================================
 
 epicsEnvSet("P",      "NPOINT:")
-epicsEnvSet("CARD",   "0")
+epicsEnvSet("CTRL",   "C300_1")
 epicsEnvSet("IPPORT", "C300")
 epicsEnvSet("HOST",   "192.168.0.100:23")
 epicsEnvSet("NAXES",  "3")
@@ -27,14 +27,14 @@ drvAsynIPPortConfigure("$(IPPORT)", "$(HOST)", 0, 0, 0)
 asynOctetSetInputEos("$(IPPORT)", 0, "\n")
 
 # ---- C300 controller ----
-# C300CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]).
-C300CreateController(0, "$(IPPORT)", $(NAXES), 100, 1000)
+# C300CreateController(portName, C300PortName, numAxes, movingPollPeriod, idlePollPeriod).
+C300CreateController("$(CTRL)", "$(IPPORT)", $(NAXES), 100, 1000)
 
-# One motor record per axis (DTYP C300_$(CARD)_0, _1, _2). Positions cross the
+# One motor record per axis (OUT @asyn($(CTRL),axis)). Positions cross the
 # driver boundary in the controller's native units, so MRES = 1.
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m1,N=0,CARD=$(CARD)")
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m2,N=1,CARD=$(CARD)")
-dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m3,N=2,CARD=$(CARD)")
+dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m1,PORT=$(CTRL),ADDR=0")
+dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m2,PORT=$(CTRL),ADDR=1")
+dbLoadRecords("$(NPOINT_IOC)/db/c300.template", "P=$(P),M=m3,PORT=$(CTRL),ADDR=2")
 
 iocInit()
 

@@ -2,9 +2,8 @@
 //!
 //! Mirrors C `C300CreateController(portName, C300PortName, numAxes,
 //! movingPollPeriod, idlePollPeriod)`: connect the asyn octet port, unlock the
-//! controller ([`C300Controller::new`]), and register `numAxes` axes behind a
-//! `DTYP`-keyed motor device support (`C300_{card}_{index}`, 0-based). The C
-//! `portName` (the asyn motor port) has no analogue here; `card` keys the DTYP.
+//! controller ([`C300Controller::new`]), and create controller port `portName`
+//! whose `numAxes` axes records address as `@asyn(portName,axis)`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,35 +15,31 @@ use motor_common::connect::connect_ip;
 use motor_common::iocsh::{
     arg_int_opt, arg_int_req, arg_str_req, poll_intervals, req_int, req_string,
 };
-use motor_common::{MotorHolder, asyn_user};
+use motor_common::{PortDriver, asyn_user, install, register_port};
 
 use crate::c300::{C300Axis, C300Controller};
 
 /// Command timeout (C `C300_TIMEOUT` 1 s).
 const C300_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Build the `C300CreateController(card, asynPort, numAxes, [movingPollMs],
-/// [idlePollMs])` command bound to `holder`.
-pub fn c300_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
-    let holder = holder.clone();
+/// Build the `C300CreateController(portName, C300PortName, numAxes,
+/// movingPollPeriod, idlePollPeriod)` command, periods in ms.
+pub fn c300_create_controller_command() -> CommandDef {
     CommandDef::new(
         "C300CreateController",
         vec![
-            arg_int_req("card"),
-            arg_str_req("asynPort"),
-            arg_int_req("numAxes"),
-            arg_int_opt("movingPollMs"),
-            arg_int_opt("idlePollMs"),
+            arg_str_req("Port name"),
+            arg_str_req("C300 port name"),
+            arg_int_req("Number of axes"),
+            arg_int_opt("Moving poll period (ms)"),
+            arg_int_opt("Idle poll period (ms)"),
         ],
-        "C300CreateController(card, asynPort, numAxes, [movingPollMs], [idlePollMs]) - \
-         Create an nPoint C300 controller (DTYP C300_{card}_{index}) with numAxes axes",
+        "C300CreateController(portName, C300PortName, numAxes, movingPollPeriod, \
+         idlePollPeriod)",
         move |args: &[ArgValue], ctx: &CommandContext| {
-            let card = req_int(args, 0, "card")?;
-            if card < 0 {
-                return Err("C300CreateController: card must be >= 0".into());
-            }
-            let asyn_port = req_string(args, 1, "asynPort")?;
-            let num_axes = req_int(args, 2, "numAxes")?;
+            let port_name = req_string(args, 0, "Port name")?;
+            let asyn_port = req_string(args, 1, "C300 port name")?;
+            let num_axes = req_int(args, 2, "Number of axes")?;
             if num_axes < 1 {
                 return Err("C300CreateController: numAxes must be > 0".into());
             }
@@ -55,24 +50,19 @@ pub fn c300_create_controller_command(holder: &Arc<MotorHolder>) -> CommandDef {
                 .map_err(|e| format!("C300CreateController: {e}"))?;
             let controller = Arc::new(Mutex::new(controller));
 
+            register_port(&port_name, PortDriver::Controller, num_axes as i32)?;
+
             for index in 0..num_axes as usize {
                 let ax = C300Axis::new(controller.clone(), index);
-                let dtyp_key = format!("C300_{card}_{index}");
                 let motor: Arc<Mutex<dyn AsynMotor>> = Arc::new(Mutex::new(ax));
-                holder.install(
+                install(
                     ctx,
-                    asyn_user(&card.to_string(), index as i32),
-                    dtyp_key,
+                    asyn_user(&port_name, index as i32),
                     motor,
                     moving_poll_ms,
                     idle_poll_ms,
-                );
+                )?;
             }
-            println!(
-                "C300CreateController: card={card} asynPort={asyn_port} axes={num_axes} \
-                 poll=[{moving_poll_ms}/{idle_poll_ms}]ms (DTYP=C300_{card}_{{0..{}}})",
-                (num_axes - 1).max(0)
-            );
             Ok(CommandOutcome::Continue)
         },
     )
